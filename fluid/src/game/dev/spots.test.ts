@@ -11,11 +11,22 @@
 import { describe, expect, it } from "vitest";
 
 import { galleryRoom, heroHallRoom } from "../world/canned";
-import { heroFootprint, propFootprint } from "../world/footprints";
+import { curioBox, curioSize, CURIO_KINDS } from "../world/curios";
+import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
+import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
-import { blockersFor, spawnPlayer } from "../world/move";
+import { isFloor } from "../world/layout";
+import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
+import { PROP_KINDS } from "../world/props";
 import type { Box, Fixture, RoomSpec } from "../world/types";
-import { SPOT_KINDS, circleOverlapsBox, spotSpawn } from "./spots";
+import { CELL } from "../world/units";
+import {
+  CURIO_FAR,
+  SPOT_KINDS,
+  circleOverlapsBox,
+  spotSpawn,
+  spotView,
+} from "./spots";
 
 /** The slot of the n-th fixture of `kind`, in fixture order. */
 function slotOf(room: RoomSpec, kind: Fixture["kind"], n: number) {
@@ -137,5 +148,102 @@ describe("prop spots (H16)", () => {
     expect(spotSpawn(hall, "prop:turret:1")).toBeNull();
     expect(spotSpawn(hall, "prop:nothing:0")).toBeNull();
     expect(spotSpawn(hall, "prop:turret")).toBeNull();
+  });
+});
+
+describe("spotView (C18)", () => {
+  const hall = heroHallRoom();
+  const gallery = galleryRoom();
+
+  it("frames every curio of the hero hall close and tilted down", () => {
+    const blockers = blockersFor(hall);
+    const counts = new Map<string, number>();
+    for (const c of hall.curios) {
+      const n = counts.get(c.kind) ?? 0;
+      counts.set(c.kind, n + 1);
+      const spot = `prop:${c.kind}:${String(n)}`;
+      const view = spotView(hall, spot);
+      expect(view, spot).not.toBeNull();
+      if (view === null) continue;
+
+      const player = spawnPlayer({ ...hall, spawn: view.spawn });
+      expect(
+        blockers.some((b) => circleOverlapsBox(player.x, player.z, b)),
+        spot,
+      ).toBe(false);
+      const onFloor = [player.x - 0.35, player.x + 0.35].every((x) =>
+        [player.z - 0.35, player.z + 0.35].every((z) =>
+          isFloor(hall.grid, Math.floor(x / CELL), Math.floor(z / CELL)),
+        ),
+      );
+      expect(onFloor, spot).toBe(true);
+
+      const box = curioBox(c);
+      const cx = (box.x0 + box.x1) / 2;
+      const cz = (box.z0 + box.z1) / 2;
+      const dist = Math.hypot(player.x - cx, player.z - cz);
+      expect(dist, spot).toBeLessThanOrEqual(CURIO_FAR + 1e-6);
+
+      expect(view.pitch, spot).toBeGreaterThanOrEqual(-MAX_PITCH - 1e-9);
+      const top = curioSize(c).top;
+      if (Math.abs(c.h + top / 2 - EYE_HEIGHT) < 1e-9) {
+        expect(view.pitch, spot).toBeCloseTo(0, 9);
+      } else {
+        expect(view.pitch, spot).toBeLessThan(0);
+      }
+
+      // Facing the curio: the player's yaw is exactly the angle of the
+      // direction it stands away from the curio's centre (yaw 0 looks
+      // north, forward = (-sin(yaw), -cos(yaw))), the same formula
+      // `frameSpot` and `frameCurio` both build the spawn's yaw from.
+      const expectedYaw = Math.atan2(player.x - cx, player.z - cz);
+      expect(player.yaw, spot).toBeCloseTo(expectedYaw, 6);
+    }
+  });
+
+  it("frames the laptop from behind with :back", () => {
+    const laptop = hall.curios.find((c) => c.kind === "beige-laptop");
+    if (laptop === undefined) throw new Error("no laptop in the hero hall");
+    const view = spotView(hall, "prop:beige-laptop:0:back");
+    expect(view).not.toBeNull();
+    if (view === null) return;
+    const player = spawnPlayer({ ...hall, spawn: view.spawn });
+    const front = HERO_FRONT[laptop.turn] ?? [0, -1];
+    const box = curioBox(laptop);
+    const cx = (box.x0 + box.x1) / 2;
+    const cz = (box.z0 + box.z1) / 2;
+    // The player stands on the curio's -front side: its offset from the
+    // curio's centre points opposite the curio's own front.
+    const dx = player.x - cx;
+    const dz = player.z - cz;
+    expect(dx * -front[0] + dz * -front[1]).toBeGreaterThan(0);
+  });
+
+  it("keeps hero and prop spots as they were", () => {
+    for (const spot of ["door:4", "hatch:0", "portal:2", "prop:crate:0"]) {
+      const view = spotView(gallery, spot);
+      expect(view?.spawn, spot).toEqual(spotSpawn(gallery, spot));
+      expect(view?.pitch, spot).toBe(0);
+    }
+    const counts = new Map<string, number>();
+    for (const h of hall.heroes) {
+      const n = counts.get(h.kind) ?? 0;
+      counts.set(h.kind, n + 1);
+      const spot = `prop:${h.kind}:${String(n)}`;
+      const view = spotView(hall, spot);
+      expect(view?.spawn, spot).toEqual(spotSpawn(hall, spot));
+      expect(view?.pitch, spot).toBe(0);
+    }
+  });
+
+  it("never matches a curio kind name against the prop or hero branch first", () => {
+    for (const kind of CURIO_KINDS) {
+      expect((HERO_KINDS as readonly string[]).includes(kind), kind).toBe(
+        false,
+      );
+      expect((PROP_KINDS as readonly string[]).includes(kind), kind).toBe(
+        false,
+      );
+    }
   });
 });

@@ -130,6 +130,10 @@ describe("instanceGroups", () => {
   it("puts the props first, then the heroes, and a room without heroes gives only props", () => {
     const room = {
       ...galleryRoom(),
+      // Curios are their own family (see "gives curio groups their own key
+      // space" below); stripped here so this test's own claim (props, then
+      // heroes) isn't muddied by where a curio group falls.
+      curios: [],
       heroes: [
         { kind: "core-wall", variant: 0, x: 6, y: 4, turn: 0, seed: 1 },
       ] satisfies Hero[],

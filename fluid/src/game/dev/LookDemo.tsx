@@ -26,6 +26,16 @@
  * never throwing; the HUD's frame line names the hero once it lands
  * (`HERO <KIND>`). An unknown kind is ignored, same as an absent `?hero=`.
  *
+ * `?curio=<kind>` (C18, 2.6b) does the same for a curio kind
+ * (`roomWithForcedCurio`), so one can be judged standing on real set
+ * dressing rather than only in the hero hall's own curios. It takes
+ * priority over `?hero=` when both are given, and the HUD names it
+ * `CURIO <KIND>` once it lands; an unknown kind is ignored, same as an
+ * absent `?curio=`. `?at=prop:<kind>:<n>[:back]`, read only alongside
+ * `?hero=` or `?curio=`, frames the forced hero or curio close instead of
+ * showing the room from its entrance (`spotView`, the same pattern the
+ * model gallery's `?at=` reads).
+ *
  * The screen is `ui/StationView.tsx`, shared with the game route and the
  * model gallery, and its HUD is `ui/Hud.tsx`, the game's own: its text lines are written
  * straight into the DOM through refs, not through React state, because the
@@ -43,8 +53,9 @@ import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../world/canned";
+import { CURIO_KINDS } from "../world/curios";
 import { HERO_KINDS } from "../world/heroes";
-import type { HeroKind, PlaceInput } from "../world/types";
+import type { CurioKind, HeroKind, PlaceInput } from "../world/types";
 import { startDemo } from "./demo";
 
 /** The keys, along the top of the screen. */
@@ -89,6 +100,14 @@ function heroFor(params: URLSearchParams): HeroKind | undefined {
     : undefined;
 }
 
+/** The curio kind `?curio=` names, or undefined for an absent or unknown one. */
+function curioFor(params: URLSearchParams): CurioKind | undefined {
+  const raw = params.get("curio");
+  return raw !== null && (CURIO_KINDS as readonly string[]).includes(raw)
+    ? (raw as CurioKind)
+    : undefined;
+}
+
 /**
  * The demo screen. The refusal is decided once, in a lazy state
  * initialiser: the lazy route only renders in a browser, where `window` is
@@ -113,12 +132,16 @@ export default function LookDemo() {
     if (refusal !== null || canvas === null) return;
     const params = new URLSearchParams(window.location.search);
     const hero = heroFor(params);
+    const curio = curioFor(params);
+    const at = params.get("at") ?? undefined;
     const { session, stop } = startDemo(canvas, sink, {
       forceRgba8: params.get("bloom") === "rgba8",
       openFluid,
       place: placeFor(params),
       props: params.get("props") !== "0",
       ...(hero === undefined ? {} : { hero }),
+      ...(curio === undefined ? {} : { curio }),
+      ...(at === undefined ? {} : { at }),
     });
     sessionRef.current = session;
     return () => {

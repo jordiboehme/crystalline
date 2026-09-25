@@ -22,6 +22,15 @@ import { HERO_CATALOGUE, HERO_KINDS, heroEdges } from "./heroes";
 import { blockersFor, PLAYER_RADIUS, spawnPlayer } from "./move";
 import { PROP_CATALOGUE, PROP_KINDS } from "./props";
 import {
+  CURIO_CATALOGUE,
+  CURIO_KINDS,
+  CURIO_ORDER,
+  curioBox,
+  curioFits,
+  curiosClash,
+  hostSurfaces,
+} from "./curios";
+import {
   dressingSites,
   edgeKey,
   fitsFloor,
@@ -409,5 +418,99 @@ describe("heroHallRoom", () => {
 
   it("is the same room on every call", () => {
     expect(JSON.stringify(heroHallRoom())).toBe(JSON.stringify(hall));
+  });
+
+  /** The host surface a curio's box sits exactly inside, or undefined. */
+  function hostOf(room: RoomSpec, c: (typeof hall.curios)[number]) {
+    const box = curioBox(c);
+    return hostSurfaces(room).find(
+      (s) =>
+        Math.abs(s.h - c.h) < 1e-6 &&
+        box.x0 >= s.box.x0 - 1e-6 &&
+        box.x1 <= s.box.x1 + 1e-6 &&
+        box.z0 >= s.box.z0 - 1e-6 &&
+        box.z1 <= s.box.z1 + 1e-6,
+    );
+  }
+
+  it("holds one of every curio kind and variant, each fitting its hero's surface", () => {
+    const counts = new Map<string, number>();
+    for (const c of hall.curios) {
+      const key = `${c.kind}:${String(c.variant)}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const expected = new Map<string, number>();
+    for (const kind of CURIO_KINDS)
+      for (let variant = 0; variant < CURIO_CATALOGUE[kind].variants; variant++)
+        expected.set(`${kind}:${String(variant)}`, 1);
+    expect(counts).toEqual(expected);
+
+    for (const c of hall.curios) {
+      const s = hostOf(hall, c);
+      expect(s, `${c.kind}:${String(c.variant)}`).toBeDefined();
+      if (s !== undefined) expect(curioFits(hall, c, s)).toBe(true);
+    }
+
+    for (let i = 0; i < hall.curios.length; i++)
+      for (let j = i + 1; j < hall.curios.length; j++) {
+        const a = hall.curios[i];
+        const b = hall.curios[j];
+        if (a === undefined || b === undefined) continue;
+        expect(curiosClash(a, b), `${a.kind} ${b.kind}`).toBe(false);
+      }
+
+    expect([...hall.curios].sort(CURIO_ORDER)).toEqual(hall.curios);
+  });
+});
+
+describe("galleryRoom curios", () => {
+  const room = galleryRoom();
+
+  /** The host surface a curio's box sits exactly inside, or undefined. */
+  function hostOf(c: (typeof room.curios)[number]) {
+    const box = curioBox(c);
+    return hostSurfaces(room).find(
+      (s) =>
+        Math.abs(s.h - c.h) < 1e-6 &&
+        box.x0 >= s.box.x0 - 1e-6 &&
+        box.x1 <= s.box.x1 + 1e-6 &&
+        box.z0 >= s.box.z0 - 1e-6 &&
+        box.z1 <= s.box.z1 + 1e-6,
+    );
+  }
+
+  it("shows a curio on every non-hero host kind", () => {
+    const hosts = new Set<string>();
+    for (const c of room.curios) {
+      const s = hostOf(c);
+      expect(s, c.kind).toBeDefined();
+      if (s === undefined) continue;
+      expect(curioFits(room, c, s), c.kind).toBe(true);
+      hosts.add(s.host);
+    }
+    expect([...hosts].sort()).toEqual(
+      [
+        "terminal",
+        "machine:workbench",
+        "machine:lab-bench",
+        "decor:lab-island",
+        "decor:round-table",
+        "prop:storage-shelf",
+        "prop:filing-cabinet",
+      ].sort(),
+    );
+
+    const heights = (host: string) =>
+      new Set(
+        room.curios.filter((c) => hostOf(c)?.host === host).map((c) => c.h),
+      );
+    // terminal: a top and the knee space.
+    expect(heights("terminal").size).toBe(2);
+    // machine:workbench: top and shelf.
+    expect(heights("machine:workbench").size).toBe(2);
+    // prop:storage-shelf: a v1 level and the v0 top.
+    expect(heights("prop:storage-shelf").size).toBe(2);
+    // prop:filing-cabinet: its two variants' tops.
+    expect(heights("prop:filing-cabinet").size).toBe(2);
   });
 });

@@ -20,12 +20,16 @@
  * Three more parameters are dev-only and not on the legend. `?hall=heroes`
  * shows `heroHallRoom()` (H15) instead of `galleryRoom()`: one of every hero
  * kind and variant, for judging them and for the `?at=` shots below.
- * `?at=prop:<kind>:<n>` (H16, see `spotSpawn`) puts the player in front of
+ * `?at=prop:<kind>:<n>` (H16, see `spotView`) puts the player in front of
  * the n-th hero or prop of that kind in whichever room is shown, framed
- * from its front instead of just facing it; `?at=<kind>:<n>` still puts the
- * player in front of the n-th fixture of that kind, facing it, instead of
- * the room's own entrance, to judge a malfunctioning fixture without
- * walking across the hall. `?fault=missing` or `?fault=denied` answers
+ * from its front instead of just facing it; `?at=prop:<kind>:<n>[:back]`
+ * (C18, 2.6b) now reaches curios too, framed close and tilted down (and
+ * from behind with `:back`), which is why the room is shown through
+ * `session.showRoom`'s `view` argument rather than only its `spawn`;
+ * `?at=<kind>:<n>` still puts the player in front of the n-th fixture of
+ * that kind, facing it, instead of the room's own entrance, to judge a
+ * malfunctioning fixture without walking across the hall. `?fault=missing`
+ * or `?fault=denied` answers
  * every travel with that failure instead of `SIGNAL LOST`, so every open
  * door, portal and hatch in the gallery malfunctions once the player walks
  * into or crawls through it, and stays broken for the rest of the visit.
@@ -44,7 +48,7 @@ import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { galleryRoom, heroHallRoom } from "../world/canned";
-import { spotSpawn } from "./spots";
+import { spotView } from "./spots";
 
 /** The keys, along the top of the screen. */
 const LEGEND =
@@ -73,7 +77,7 @@ export default function Gallery() {
     const base =
       params.get("hall") === "heroes" ? heroHallRoom() : galleryRoom();
     const at = params.get("at");
-    const spawn = at === null ? null : spotSpawn(base, at);
+    const atView = at === null ? null : spotView(base, at);
     const fault = params.get("fault");
     const load: PlaceLoader | undefined =
       fault === "missing" || fault === "denied"
@@ -89,7 +93,10 @@ export default function Gallery() {
       ...(load === undefined ? {} : { load }),
     });
     sessionRef.current = session;
-    session.showRoom(spawn === null ? base : { ...base, spawn });
+    session.showRoom(
+      atView === null ? base : { ...base, spawn: atView.spawn },
+      atView === null ? undefined : { pitch: atView.pitch },
+    );
     return () => {
       sessionRef.current = null;
       session.dispose();

@@ -7,9 +7,11 @@
 import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_WORKSHOP } from "../world/canned";
+import { CURIO_KINDS } from "../world/curios";
+import { generateRoom } from "../world/generate";
 import { heroBlocker, propFootprint } from "../world/footprints";
 import { overlaps } from "../world/sites";
-import { roomWithForcedHero } from "./demo";
+import { roomWithForcedCurio, roomWithForcedHero } from "./demo";
 
 describe("roomWithForcedHero", () => {
   it("places the turret in a workshop, reporting it placed", () => {
@@ -56,6 +58,36 @@ describe("roomWithForcedHero", () => {
       const propBox = propFootprint(p);
       if (propBox === null) continue;
       expect(overlaps(propBox, box), p.kind).toBe(false);
+    }
+  });
+});
+
+describe("roomWithForcedCurio", () => {
+  // The workshop has no terminal or table (only benches and desks); a
+  // terminal's desk ends are too narrow for the laptop even where a
+  // terminal exists (C8), so it is the one kind the workshop never has a
+  // host for.
+  const NO_HOST_IN_WORKSHOP: readonly string[] = ["beige-laptop"];
+
+  it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
+    const base = generateRoom(CANNED_WORKSHOP);
+    for (const kind of CURIO_KINDS) {
+      const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, kind);
+      expect(room.heroes, kind).toEqual(base.heroes);
+      expect(room.props, kind).toEqual(base.props);
+      if (NO_HOST_IN_WORKSHOP.includes(kind)) {
+        expect(placed, kind).toBeNull();
+        expect(
+          room.curios.some((c) => c.kind === kind),
+          kind,
+        ).toBe(false);
+      } else {
+        expect(placed, kind).toBe(kind);
+        expect(
+          room.curios.some((c) => c.kind === kind),
+          kind,
+        ).toBe(true);
+      }
     }
   });
 });

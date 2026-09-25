@@ -89,6 +89,7 @@ import {
 } from "./world/malfunction";
 import {
   EYE_HEIGHT,
+  MAX_PITCH,
   blockersFor,
   headBob,
   lookDelta,
@@ -208,7 +209,11 @@ export type PlaceLoader = (
  * - `showRoom` shows a room built by hand, with no place behind it (the
  *   dev-only model gallery): no load, no navigation, the player at the
  *   room's entrance and every door shut. Its terminals open no reader,
- *   since there is no engram to read.
+ *   since there is no engram to read. `view`, when given, sets the
+ *   player's pitch after entering, clamped to `MAX_PITCH` (C18, 2.6b): the
+ *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
+ *   for those dev seams only; every other caller omits it and keeps the
+ *   entrance's own pitch of 0.
  * - `go`, `showCanned` and `showRoom` close an open CRT reader first.
  * - `closeReader` tells the session the CRT reader was closed, which gives
  *   it the keys back.
@@ -219,7 +224,7 @@ export type PlaceLoader = (
 export interface Session {
   go(address: PlaceAddress, arrival?: Arrival | null): void;
   showCanned(place: PlaceInput): void;
-  showRoom(room: RoomSpec): void;
+  showRoom(room: RoomSpec, view?: { pitch: number }): void;
   closeReader(): void;
   dispose(): void;
   readonly current: PlaceAddress | null;
@@ -595,10 +600,14 @@ export function createSession(opts: SessionOptions): Session {
     enter(next, generateRoom(next), null, same);
   };
 
-  const showRoom = (built: RoomSpec) => {
+  const showRoom = (built: RoomSpec, view?: { pitch: number }) => {
     if (disposed) return;
     leave();
-    enter(null, built, null, false);
+    if (!enter(null, built, null, false) || view === undefined) return;
+    if (player === null) return;
+    const pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, view.pitch));
+    player = { ...player, pitch };
+    previous = player;
   };
 
   const takeTravel = (travel: Travel) => {

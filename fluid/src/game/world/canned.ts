@@ -23,16 +23,31 @@
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
  * model gallery: one of every model the station draws, machines in bays 1
  * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
- * judged without an engram that happens to need it.
+ * judged without an engram that happens to need it. Task 7 (2.6b) adds one
+ * curio on the first host of every non-hero host kind it carries
+ * (`galleryCurios`), so a curio can be judged sitting on a terminal, a
+ * machine, a piece of decor and a floor prop alike.
  *
  * `heroHallRoom` (H15) is the gallery's second hand-built room, for the
  * `?hall=heroes` dev route: one of every hero kind and variant, hand-placed
  * in a 23 by 24 hall with no other fixture, no decor and no props, so
- * nothing competes with a hero for a screenshot.
+ * nothing competes with a hero for a screenshot. Task 7 (2.6b) adds one of
+ * every curio kind and variant, hand-placed on the hero surfaces they fit
+ * (`heroHallCurios`, `row`), for the `?at=prop:<kind>:<n>` shots that frame
+ * them close and tilted (`spotView` in `dev/spots.ts`).
  */
 
 import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
+import {
+  CURIO_CATALOGUE,
+  CURIO_GAP,
+  CURIO_MARGIN,
+  CURIO_ORDER,
+  curioOn,
+  hostSurfaces,
+  type HostSurface,
+} from "./curios";
 import { PROP_ORDER } from "./dress";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
 import { faceCentre, HERO_ORDER } from "./heroes";
@@ -47,6 +62,8 @@ import {
 import { PROP_CATALOGUE, PROP_KINDS } from "./props";
 import { wallAnchor } from "./sites";
 import type {
+  Curio,
+  CurioKind,
   Decor,
   DecorKind,
   Fixture,
@@ -60,6 +77,7 @@ import type {
   Rect,
   RoomSpec,
   Side,
+  SurfaceClass,
   WallSlot,
 } from "./types";
 
@@ -527,7 +545,7 @@ export function galleryRoom(): RoomSpec {
     }
   }
 
-  return {
+  const base: RoomSpec = {
     version: GAME_VERSION,
     seed,
     domain: GALLERY.domain,
@@ -554,6 +572,65 @@ export function galleryRoom(): RoomSpec {
     dropped: 0,
     inboundMore: 0,
   };
+  return { ...base, curios: galleryCurios(seed, base) };
+}
+
+/**
+ * The gallery's curios (2.6b, task 7): one curio on the first host surface
+ * of every non-hero host kind the gallery carries (`hostSurfaces`,
+ * `curioOn`), at the surface's own centre (`u = v = 0.5`): the terminal's
+ * first desk end and its knee space, the workbench's top and its shelf,
+ * one end of the lab bench, the lab island, the round table's first spot,
+ * the lower level of the second storage shelf (v1, at `h` 1.08) and the top
+ * of the first (v0), and the tops of both filing cabinets (v0 and v1, told
+ * apart by their different `h`).
+ *
+ * The lab bench's top is `cls: "bench"`, and neither ball kind
+ * (`CURIO_CATALOGUE["star-ball"|"catch-ball"].classes`) nor the pink
+ * gadget's cluster variant (`pink-gadget` 1, 0.36 m wide against the
+ * bench's 0.25 m usable span) stands on a bench, so it carries the lit
+ * sword's blue stand (`light-sword` 1) instead, the nearest legal kind
+ * (`curioFits`) that isn't already shown elsewhere in the gallery.
+ *
+ * Every seed is `seedFor(seed, "curio", host, j)`, `j` the surface's own
+ * index in its host's table. No host is added beyond what the gallery
+ * already carries.
+ */
+function galleryCurios(seed: number, room: RoomSpec): Curio[] {
+  const surfaces = hostSurfaces(room);
+  const firstOf = (host: string, cls: SurfaceClass): HostSurface => {
+    const s = surfaces.find((x) => x.host === host && x.cls === cls);
+    if (s === undefined) throw new Error(`gallery: no ${host} ${cls} surface`);
+    return s;
+  };
+  const atHeight = (host: string, h: number): HostSurface => {
+    const s = surfaces.find((x) => x.host === host && Math.abs(x.h - h) < 1e-9);
+    if (s === undefined) {
+      throw new Error(`gallery: no ${host} surface at ${String(h)}`);
+    }
+    return s;
+  };
+  const place = (
+    s: HostSurface,
+    kind: CurioKind,
+    variant: number,
+    j: number,
+  ): Curio =>
+    curioOn(s, kind, variant, 0.5, 0.5, seedFor(seed, "curio", s.host, j));
+
+  return [
+    place(firstOf("terminal", "desk"), "pocket-console", 0, 0),
+    place(firstOf("terminal", "under"), "trap-box", 0, 2),
+    place(firstOf("machine:workbench", "bench"), "beige-laptop", 0, 0),
+    place(firstOf("machine:workbench", "under"), "fuel-case", 0, 1),
+    place(firstOf("machine:lab-bench", "bench"), "light-sword", 1, 0),
+    place(firstOf("decor:lab-island", "bench"), "green-pistol", 0, 0),
+    place(firstOf("decor:round-table", "table"), "video-tape", 0, 0),
+    place(atHeight("prop:filing-cabinet", 0.8), "catch-ball", 0, 0),
+    place(atHeight("prop:filing-cabinet", 1.4), "pink-gadget", 0, 0),
+    place(atHeight("prop:storage-shelf", 1.08), "tape-drive", 0, 1),
+    place(atHeight("prop:storage-shelf", 1.6), "light-sword", 0, 0),
+  ].sort(CURIO_ORDER);
 }
 
 /**
@@ -920,7 +997,7 @@ export function heroHallRoom(): RoomSpec {
     at("field-pack", 1, 21.5, 1.5, 2),
   ].sort(HERO_ORDER);
 
-  return {
+  const base: RoomSpec = {
     version: GAME_VERSION,
     seed,
     domain: "station",
@@ -941,7 +1018,12 @@ export function heroHallRoom(): RoomSpec {
       {
         kind: "placard",
         slot: layout.placard,
-        lines: ["Hero Hall", "ONE OF EVERY", "HERO PROP", "?AT=PROP:KIND:N"],
+        lines: [
+          "Hero Hall",
+          "ONE OF EVERY",
+          "HERO PROPS AND CURIOS",
+          "?AT=PROP:KIND:N",
+        ],
       },
     ],
     decor: [],
@@ -953,4 +1035,127 @@ export function heroHallRoom(): RoomSpec {
     dropped: 0,
     inboundMore: 0,
   };
+  return { ...base, curios: heroHallCurios(seed, base) };
+}
+
+/**
+ * Lays `items` along surface `s`'s longer world axis (world x or world z,
+ * whichever `s.box` spans more), in order, `2 * CURIO_GAP` apart, from its
+ * margin (`CURIO_MARGIN`): a curio placed at its own host's turn is
+ * axis-aligned with the host's own local frame (`curioBox`'s width/depth
+ * swap and `turnedPoint`'s rotation share the same turn), so each item's
+ * extent along the row's axis is simply its `width` when the row runs along
+ * the host's local `a` axis and its `depth` when it runs along `d`.
+ * `curioOn` places each item's centre at the cumulative offset, centred on
+ * the cross axis. Every curio in a row takes the surface's own turn.
+ */
+function row(
+  s: HostSurface,
+  items: readonly { kind: CurioKind; variant: number; seed: number }[],
+): Curio[] {
+  const alongX = s.box.x1 - s.box.x0 >= s.box.z1 - s.box.z0;
+  const surfaceLen = alongX ? s.box.x1 - s.box.x0 : s.box.z1 - s.box.z0;
+  const sideways = (((Math.round(s.turn) % 4) + 4) % 4) % 2 === 1;
+  const extentOf = (kind: CurioKind, variant: number): number => {
+    const size = CURIO_CATALOGUE[kind].sizes[variant];
+    if (size === undefined) {
+      throw new Error(`row: ${kind} has no variant ${String(variant)}`);
+    }
+    const xLen = sideways ? size.depth : size.width;
+    const zLen = sideways ? size.width : size.depth;
+    return alongX ? xLen : zLen;
+  };
+  let pos = 0;
+  const out: Curio[] = [];
+  for (const it of items) {
+    const len = extentOf(it.kind, it.variant);
+    const slack = surfaceLen - len - 2 * CURIO_MARGIN;
+    const frac = slack > 0 ? pos / slack : 0;
+    out.push(
+      curioOn(
+        s,
+        it.kind,
+        it.variant,
+        alongX ? frac : 0.5,
+        alongX ? 0.5 : frac,
+        it.seed,
+        s.turn,
+      ),
+    );
+    pos += len + 2 * CURIO_GAP;
+  }
+  return out;
+}
+
+/**
+ * The hero hall's curios (2.6b, task 7): one of every curio kind and
+ * variant, hand-placed on the hero surfaces they fit (`hostSurfaces`,
+ * `curioOn` and `row`):
+ *
+ * - the mess table's top, in a row: the laptop, the tape drive, the tape
+ *   player, both video tapes, the pocket console and both balls (the
+ *   gadget's cluster does not stand on a table, C19's classes, so it moves
+ *   below);
+ * - the laser desk's top: the pistol, then the meter;
+ * - the tube bench's top: the lit sword's two variants, then the gadget's
+ *   cluster (moved here from the mess table, which is a "table" surface
+ *   the cluster's classes exclude; the tube bench's top is a "bench", which
+ *   they include);
+ * - the gun bench's top: the sword lying in its cradle, then the gadget
+ *   alone (moved here from the tube bench, to make room for the cluster);
+ * - the laser desk's under spot: the trap;
+ * - the gun bench's under spot: the fuel case.
+ *
+ * Every seed is `seedFor(seed, "curio", kind, variant)`, and the output is
+ * sorted by `CURIO_ORDER`.
+ */
+function heroHallCurios(seed: number, room: RoomSpec): Curio[] {
+  const surfaces = hostSurfaces(room);
+  const at = (token: string): HostSurface => {
+    const s = surfaces.find((x) => x.key[2] === token);
+    if (s === undefined) throw new Error(`hero hall: no ${token} surface`);
+    return s;
+  };
+  const item = (kind: CurioKind, variant: number) => ({
+    kind,
+    variant,
+    seed: seedFor(seed, "curio", kind, variant),
+  });
+  const one = (token: string, kind: CurioKind, variant: number): Curio =>
+    curioOn(
+      at(token),
+      kind,
+      variant,
+      0.5,
+      0.5,
+      seedFor(seed, "curio", kind, variant),
+    );
+
+  return [
+    ...row(at("hero-mess-table-0"), [
+      item("beige-laptop", 0),
+      item("tape-drive", 0),
+      item("tape-player", 0),
+      item("video-tape", 0),
+      item("video-tape", 1),
+      item("pocket-console", 0),
+      item("star-ball", 0),
+      item("catch-ball", 0),
+    ]),
+    ...row(at("hero-laser-desk-0"), [
+      item("green-pistol", 0),
+      item("wing-meter", 0),
+    ]),
+    ...row(at("hero-tube-bench-0"), [
+      item("light-sword", 1),
+      item("light-sword", 2),
+      item("pink-gadget", 1),
+    ]),
+    ...row(at("hero-gun-bench-0"), [
+      item("light-sword", 0),
+      item("pink-gadget", 0),
+    ]),
+    one("hero-laser-desk-under-0", "trap-box", 0),
+    one("hero-gun-bench-under-0", "fuel-case", 0),
+  ].sort(CURIO_ORDER);
 }

@@ -36,11 +36,33 @@
  * the hero once it lands (`HERO <KIND>`), and stays quiet otherwise. R
  * rebuilds with the same forced kind, so it still shows whether the hero
  * holds through a condition switch.
+ *
+ * `options.curio` forces a curio into the shown room the same way, through
+ * the curio pass's own forced-draws path (`roomWithForcedCurio`): a canned
+ * demo room draws curios of its own too, but rarely the kind being judged,
+ * so this is how one is shown for certain. It also overrides
+ * `options.props`, like `hero`, and takes priority over it when both are
+ * given (only one of `HERO <KIND>` or `CURIO <KIND>` is ever what the demo
+ * is being pointed at). A kind that finds no host in this room (its slot's
+ * classes hold no surface the room carries) falls back to the room drawn
+ * without it, never throwing; the HUD's frame line names it once it lands
+ * (`CURIO <KIND>`).
+ *
+ * `options.at`, read only together with `options.hero` or `options.curio`,
+ * runs `spotView` on the room those build and, when it finds a spot, shows
+ * the room there with that spot's pitch instead of at its entrance (C18,
+ * 2.6b): the same close, tilted framing the gallery's `?at=` reads,
+ * without leaving the look demo.
  */
 
 import { createSession, type HudSink, type Session } from "../session";
 import { CANNED_BRIDGE } from "../world/canned";
-import { placeCurios } from "../world/curios";
+import {
+  CURIO_CATALOGUE,
+  placeCurios,
+  type CurioDraws,
+  type SlotDraw,
+} from "../world/curios";
 import { dressRoom } from "../world/dress";
 import { generateRoom } from "../world/generate";
 import {
@@ -50,7 +72,14 @@ import {
   type HeroDraws,
 } from "../world/heroes";
 import { dressingSites } from "../world/sites";
-import type { Archetype, HeroKind, PlaceInput, RoomSpec } from "../world/types";
+import type {
+  Archetype,
+  CurioKind,
+  HeroKind,
+  PlaceInput,
+  RoomSpec,
+} from "../world/types";
+import { spotView } from "./spots";
 
 /** The status R switches to. */
 const RETIRED_STATUS = "archived";
@@ -145,6 +174,46 @@ export function roomWithForcedHero(
 }
 
 /**
+ * The draws that make `placeCurios` try `kind` before anything else in its
+ * own slot (`CURIO_CATALOGUE[kind].slot`): that slot's draw is `{ take:
+ * true, roll: 0, kind }` (`roll: 0` always picks the first fitting kind in
+ * `pickByRoll`'s order, and a forced draw's pool is only `kind` anyway, so
+ * the roll never matters), a floor ball's `floor` is false (it tries the
+ * surfaces, not the hall's corners, since a forced kind is meant to be
+ * judged sitting on something), and the other three slots take nothing.
+ */
+function forcedCurioDraws(kind: CurioKind): CurioDraws {
+  const untaken: SlotDraw = { take: false, roll: 0 };
+  const forced: SlotDraw = { take: true, roll: 0, kind };
+  const slot = CURIO_CATALOGUE[kind].slot;
+  return {
+    retro: slot === "retro" ? forced : untaken,
+    gear: slot === "gear" ? forced : untaken,
+    ball: { ...(slot === "ball" ? forced : untaken), floor: false },
+    under: slot === "under" ? forced : untaken,
+  };
+}
+
+/**
+ * The room `place` becomes with curio `kind` forced into it: `generateRoom`'s
+ * room, its curios replaced by `placeCurios` run again on the same room with
+ * `forcedCurioDraws(kind)` in place of the room's own draws. Curios never
+ * move anything else, so nothing here needs re-dressing the way
+ * `roomWithForcedHero` does. `placed` is `kind` when it landed (it found a
+ * host among the room's own surfaces), else null: the caller reads it to
+ * decide whether to say so on the HUD.
+ */
+export function roomWithForcedCurio(
+  place: PlaceInput,
+  kind: CurioKind,
+): { room: RoomSpec; placed: CurioKind | null } {
+  const built = generateRoom(place);
+  const curios = placeCurios(built, forcedCurioDraws(kind));
+  const placed = curios.some((c) => c.kind === kind) ? kind : null;
+  return { room: { ...built, curios }, placed };
+}
+
+/**
  * Starts the look demo on `canvas` and returns its cleanup and the session,
  * which the shell needs to close the CRT reader.
  *
@@ -162,6 +231,14 @@ export function roomWithForcedHero(
  * `showCanned`, so it keeps no client-side `PlaceInput` and its terminals
  * open no reader; R still rebuilds with the same forced kind, resetting the
  * player to the room's entrance the way `showRoom` always does.
+ *
+ * `options.curio` does the same for a curio kind (`roomWithForcedCurio`),
+ * taking priority over `options.hero` when both are given: only one of them
+ * is what a given shot is judging. `options.at`, read only alongside
+ * `options.hero` or `options.curio`, runs `spotView` on the room `curio` or
+ * `hero` built and shows it there instead of at the entrance, with that
+ * spot's pitch; ignored otherwise, and ignored (with a spawn at the
+ * entrance) when the spot does not resolve.
  */
 export function startDemo(
   canvas: HTMLCanvasElement,
@@ -172,38 +249,60 @@ export function startDemo(
     place?: PlaceInput;
     props?: boolean;
     hero?: HeroKind;
+    curio?: CurioKind;
+    at?: string;
   },
 ): { session: Session; stop: () => void } {
   const place = options.place ?? CANNED_BRIDGE;
   const withProps = options.props ?? true;
   const hero = options.hero;
+  const curio = options.curio;
+  const at = options.at;
   let retired = false;
   let placedHero: HeroKind | null = null;
-  const heroHud: HudSink =
-    hero === undefined
+  let placedCurio: CurioKind | null = null;
+  const labelledHud: HudSink =
+    hero === undefined && curio === undefined
       ? hud
       : {
           ...hud,
-          frame: (text) =>
+          frame: (text) => {
+            const labels = [
+              placedHero === null ? null : `HERO ${placedHero.toUpperCase()}`,
+              placedCurio === null
+                ? null
+                : `CURIO ${placedCurio.toUpperCase()}`,
+            ].filter((label): label is string => label !== null);
             hud.frame(
-              placedHero === null
-                ? text
-                : `${text}  HERO ${placedHero.toUpperCase()}`,
-            ),
+              labels.length === 0 ? text : `${text}  ${labels.join("  ")}`,
+            );
+          },
         };
   const session = createSession({
     canvas,
     client: null,
-    hud: heroHud,
+    hud: labelledHud,
     navigate: () => {},
     openFluid: options.openFluid,
     forceRgba8: options.forceRgba8,
   });
+  /** Shows a room built by `hero` or `curio`, framed at `at` when it resolves. */
+  const showBuilt = (room: RoomSpec) => {
+    const spot = at === undefined ? null : spotView(room, at);
+    session.showRoom(
+      spot === null ? room : { ...room, spawn: spot.spawn },
+      spot === null ? undefined : { pitch: spot.pitch },
+    );
+  };
   const show = (p: PlaceInput) => {
-    if (hero !== undefined) {
+    if (curio !== undefined) {
+      const forced = roomWithForcedCurio(p, curio);
+      placedCurio = forced.placed;
+      showBuilt(forced.room);
+    } else if (hero !== undefined) {
       const forced = roomWithForcedHero(p, hero);
       placedHero = forced.placed;
-      session.showRoom(forced.room);
+      showBuilt(forced.room);
     } else if (withProps) session.showCanned(p);
     else
       session.showRoom({

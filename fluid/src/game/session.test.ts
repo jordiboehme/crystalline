@@ -33,7 +33,7 @@ import { CANNED_BRIDGE, galleryRoom } from "./world/canned";
 import { generateRoom } from "./world/generate";
 import { wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
-import { PLAYER_RADIUS } from "./world/move";
+import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
 import type { Fixture, RoomSpec } from "./world/types";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -697,6 +697,32 @@ describe("showRoom", () => {
     expect(lastCamera().eye[0]).toBeCloseTo((built.spawn.x + 0.5) * 2);
     expect(navigate).not.toHaveBeenCalled();
     expect(apiMock).not.toHaveBeenCalled();
+  });
+
+  it("takes the view's pitch after entering (the dev seams only)", () => {
+    const built: RoomSpec = {
+      ...generateRoom(CANNED_BRIDGE),
+      domain: "dev",
+      permalink: "gallery",
+      title: "Gallery",
+    };
+    const session = start();
+    session.showRoom(built, { pitch: -0.4 });
+    frames(1);
+    expect(lastCamera().pitch).toBeCloseTo(-0.4);
+  });
+
+  it("clamps the view's pitch to MAX_PITCH", () => {
+    const built: RoomSpec = {
+      ...generateRoom(CANNED_BRIDGE),
+      domain: "dev",
+      permalink: "gallery",
+      title: "Gallery",
+    };
+    const session = start();
+    session.showRoom(built, { pitch: -2 });
+    frames(1);
+    expect(lastCamera().pitch).toBeCloseTo(-MAX_PITCH);
   });
 });
 
