@@ -18,7 +18,9 @@
  *   tube, so every hero stays under 1500 triangles.
  * - A lens is always `lens`: a dark bezel ring with a glowing disc set just
  *   in front of its middle, so every eye in the station is built the same
- *   way and blinks with its kind's bank.
+ *   way and blinks with its kind's bank. Extras may sit on top of a `lens`
+ *   (the eye panel's red dome and yellow centre dot), but the ring and disc
+ *   under them always come from it.
  * - Colours are the look's surfaces, or the named tints below for what no
  *   palette carries (a white shell, a red lens, a screen's own hue).
  */
@@ -87,6 +89,19 @@ const CASING_BROWN: Rgb = [0.24, 0.16, 0.1];
 
 /** The photo console's picture: a cold grey blue, a still under a scanning tube. */
 const SCREEN_GREY_BLUE: Rgb = [0.44, 0.54, 0.62];
+
+/**
+ * The tones of the photograph on the photo console's picture, all in the
+ * picture's grey blue: a pale window, a mid-grey floor and a dark shape.
+ */
+const PHOTO_TONES = {
+  light: [0.64, 0.72, 0.78],
+  mid: [0.34, 0.42, 0.5],
+  shadow: [0.2, 0.25, 0.32],
+} as const satisfies Record<string, Rgb>;
+
+/** The photo console's trackball: a smoky grey, lighter than its brown pad so its roundness shows. */
+const TRACKBALL_GREY: Rgb = [0.6, 0.6, 0.62];
 
 /** The photo console's grid lines over the picture: a paler blue. */
 const SCREEN_GRID: Rgb = [0.72, 0.82, 0.9];
@@ -240,10 +255,13 @@ export function officeChair(
  * edge), their width, the foot pads and the hub; the egg's profile
  * (`[r, h]`, a flat-ish base, widest at the shoulders near h 1.0) and its
  * facets; the vertical seam (how far it stands proud of the shell, the
- * share of the radius its inner edge keeps, its half thickness and its
- * foot); the side panels' seams (their foot and head, and the yaw of the
- * two planes they lie in, a lathe corner's multiple so they ride ridges);
- * and the eye: its height, its plane (`d`, just proud of the
+ * share of the radius its inner edge keeps, its half thickness, its foot
+ * and `apex`, the height where its inner edge meets over the crown, just
+ * under the crown's point so the band keeps some thickness there); the
+ * side panels (their foot and head, the yaw of the two seam planes that
+ * bound them, a lathe corner's multiple so they ride ridges, and the
+ * middle yaws of the two facets between those planes, where the black
+ * bars that close each panel at its foot and head lie); and the eye: its height, its plane (`d`, just proud of the
  * shell), its socket's back and radius, and the lens radius.
  */
 const TURRET = {
@@ -268,7 +286,12 @@ const TURRET = {
   ],
   eggSides: 12,
   seam: { out: 0.008, inner: 0.9, half: 0.005, h0: 0.4, apex: 1.285 },
-  pod: { h0: 0.52, h1: 1.16, yaw: Math.PI / 3 },
+  pod: {
+    h0: 0.62,
+    h1: 1.08,
+    yaw: Math.PI / 3,
+    facets: [(5 * Math.PI) / 12, (7 * Math.PI) / 12],
+  },
   eye: { h: 1.04, d: 0.27, socketBack: 0.15, socketR: 0.09, r: 0.06 },
 } as const;
 
@@ -283,14 +306,46 @@ function eggRadius(h: number): number {
   return 0;
 }
 
+/** The heights a seam run samples from `h0` up to `h1`: both ends and every egg profile height between them. */
+function eggHeights(h0: number, h1: number): number[] {
+  return [
+    h0,
+    ...TURRET.egg.map(([, h]) => h).filter((h) => h > h0 && h < h1),
+    h1,
+  ];
+}
+
+/** A seam's outer edge at height `h`: `seam.out` proud of the egg, pushed out sideways only. */
+function seamOuter(h: number): number {
+  return eggRadius(h) + TURRET.seam.out;
+}
+
+/** A seam's inner edge at height `h`: a share of the egg's radius, inside the shell. */
+function seamInner(h: number): number {
+  return eggRadius(h) * TURRET.seam.inner;
+}
+
+/**
+ * A straight run of the turret's seam in the side view (`[d, h]`), from
+ * `h0` up to `h1` on the `+d` face (`side` 1) or the `-d` face (`side`
+ * -1): a band from `seamOuter` to `seamInner`, pushed across a plane
+ * through the egg's axis.
+ */
+function seamBand(h0: number, h1: number, side: 1 | -1): [number, number][] {
+  const hs = eggHeights(h0, h1);
+  return [
+    ...hs.map((h): [number, number] => [side * seamOuter(h), h]),
+    ...[...hs].reverse().map((h): [number, number] => [side * seamInner(h), h]),
+  ];
+}
+
 /**
  * The turret's vertical seam as two outlines in the side view (`[d, h]`),
  * to push a hair across the plane `a = 0`: `below`, on the front from the
- * seam's foot up to the eye socket, and `over`, from the socket's top up
- * over the crown and down the back to the foot. Each is a band whose outer
- * edge stands `seam.out` proud of the egg (pushed out sideways only, so the
- * crown stays at the top) and whose inner edge lies inside the shell. The
- * lathe puts a corner on `+d` and `-d`, so the band rides that ridge.
+ * seam's foot up to the eye socket (a `seamBand`), and `over`, from the
+ * socket's top up over the crown and down the back to the foot, its inner
+ * edge meeting at `seam.apex` so the crown stays at the top. The lathe
+ * puts a corner on `+d` and `-d`, so the band rides that ridge.
  */
 function seamOutlines(): {
   below: [number, number][];
@@ -299,46 +354,23 @@ function seamOutlines(): {
   const { seam, eye, egg } = TURRET;
   const crown = egg[egg.length - 1]?.[1] ?? 0;
   const neck = egg[egg.length - 2]?.[1] ?? 0;
-  const heights = (h0: number, h1: number) => [
-    h0,
-    ...egg.map(([, h]) => h).filter((h) => h > h0 && h < h1),
-    h1,
-  ];
-  const out = (h: number) => eggRadius(h) + seam.out;
-  const inn = (h: number) => eggRadius(h) * seam.inner;
   const lo = eye.h - eye.socketR;
   const hi = eye.h + eye.socketR;
-  const below = seamBand(seam.h0, lo, 1);
   const over: [number, number][] = [
-    ...heights(hi, crown).map((h): [number, number] => [out(h), h]),
-    ...heights(seam.h0, crown)
+    ...eggHeights(hi, crown).map((h): [number, number] => [seamOuter(h), h]),
+    ...eggHeights(seam.h0, crown)
       .reverse()
-      .map((h): [number, number] => [-out(h), h]),
-    ...heights(seam.h0, neck).map((h): [number, number] => [-inn(h), h]),
+      .map((h): [number, number] => [-seamOuter(h), h]),
+    ...eggHeights(seam.h0, neck).map((h): [number, number] => [
+      -seamInner(h),
+      h,
+    ]),
     [0, seam.apex],
-    ...heights(hi, neck)
+    ...eggHeights(hi, neck)
       .reverse()
-      .map((h): [number, number] => [inn(h), h]),
+      .map((h): [number, number] => [seamInner(h), h]),
   ];
-  return { below, over };
-}
-
-/**
- * A straight run of the turret's seam in the side view (`[d, h]`), from
- * `h0` up to `h1` on the `+d` face (`side` 1) or the `-d` face (`side`
- * -1): a band whose outer edge stands `seam.out` proud of the egg and
- * whose inner edge lies inside the shell, pushed across a plane through
- * the egg's axis.
- */
-function seamBand(h0: number, h1: number, side: 1 | -1): [number, number][] {
-  const { seam, egg } = TURRET;
-  const hs = [h0, ...egg.map(([, h]) => h).filter((h) => h > h0 && h < h1), h1];
-  return [
-    ...hs.map((h): [number, number] => [side * (eggRadius(h) + seam.out), h]),
-    ...[...hs]
-      .reverse()
-      .map((h): [number, number] => [side * eggRadius(h) * seam.inner, h]),
-  ];
+  return { below: seamBand(seam.h0, lo, 1), over };
 }
 
 /**
@@ -352,9 +384,10 @@ function seamBand(h0: number, h1: number, side: 1 | -1): [number, number][] {
  *   widest (r 0.276) at the shoulders near h 1.0.
  * - A thin black seam splits it front to back in the plane `a = 0`, over
  *   the crown and down both faces, broken only by the eye socket.
- * - Two more seams on each side, 60 and 120 degrees round from the front
- *   and running from h 0.52 to 1.16, mark off a side panel on `+a` and on
- *   `-a`, so the sides look as if they could swing open.
+ * - A small side panel on `+a` and on `-a` (h 0.62 to 1.08), closed all
+ *   round in black: two seams 60 and 120 degrees round from the front, and
+ *   a short bar across each of the two facets between them at the panel's
+ *   foot and head, so the sides look as if they could swing open.
  * - The eye sits high on the front (h 1.04) in a black socket: a red
  *   `lens` of r 0.06, blink group 0, which the breathe bank pulses slowly.
  */
@@ -396,6 +429,29 @@ const turret: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
         black,
       );
   }
+  // The bars: each lies on a facet's flat face (its apothem, `cos` of the
+  // facet's half angle times the radius), spanning it corner to corner, so
+  // its ends meet the two seams on the ridges.
+  const halfAngle = Math.PI / T.eggSides;
+  for (const mid of P.facets)
+    for (const yaw of [mid, -mid]) {
+      const kb = kitAt(yawed(ORIGIN, 0, 0, yaw));
+      for (const h of [P.h0, P.h1]) {
+        const [lo, hi] = [h - T.seam.half, h + T.seam.half];
+        const rLo = Math.min(eggRadius(lo), eggRadius(hi));
+        const rHi = Math.max(eggRadius(lo), eggRadius(hi));
+        const w = eggRadius(h) * Math.sin(halfAngle);
+        kb.box(
+          -w,
+          w,
+          rLo * T.seam.inner * Math.cos(halfAngle),
+          rHi * Math.cos(halfAngle) + T.seam.out,
+          lo,
+          hi,
+          black,
+        );
+      }
+    }
   const e = T.eye;
   k.extrude(
     discOutline(0, e.h, e.socketR, LENS_SIDES),
@@ -425,7 +481,8 @@ const blackSlab: HeroRecipe = ({ k, s, variant, kind }) => {
  * radius and depth, the lens radius, the red dome's radius and how far it
  * stands out of the bezel, the yellow centre dot's radius and reach); and
  * the grille (half width, heights, backing depth, the slats' count, first
- * height, pitch, height and depth).
+ * height, pitch, height, depth and how far in from the backing's ends
+ * they stop).
  */
 const EYE_PANEL = {
   half: 0.3,
@@ -460,6 +517,7 @@ const EYE_PANEL = {
     pitch: 0.06,
     slat: 0.028,
     slatDepth: 0.008,
+    slatInset: 0.015,
   },
 } as const;
 
@@ -525,8 +583,8 @@ const eyePanel: HeroRecipe = ({ k, s, variant, kind }) => {
   for (let i = 0; i < g.slats; i++) {
     const h = g.first + i * g.pitch;
     k.box(
-      -g.half + 0.015,
-      g.half - 0.015,
+      -g.half + g.slatInset,
+      g.half - g.slatInset,
       face + g.back,
       face + g.back + g.slatDepth,
       h,
@@ -542,9 +600,14 @@ const eyePanel: HeroRecipe = ({ k, s, variant, kind }) => {
  * `h`); the toe recess; the hood (half width, the brown cheeks' width, the
  * lip under its screen face, the face's top corner `[d, h]` and the back
  * of its roof); the screen's bezel and picture on the sloped face (half
- * widths, heights and how far each stands off the face) and the grid lines
- * over it; the print slot in the lip; the chunky buttons; the knobs; and
- * the trackball.
+ * widths, heights and how far each stands off the face), the tonal
+ * blocks of the photograph on it (each an `a` and `h` range and a tone of
+ * `PHOTO_TONES`) and how far they stand off, and the grid lines over it;
+ * the print slot in the lip; the chunky buttons; how far a slab on the
+ * deck sinks under it; the knobs (with their own sink); and the trackball
+ * (its place, its pad's half side and top over the deck, its radius, its
+ * profile over the pad's top as `[share of the radius, height]` pairs, and
+ * the share of the radius its foot keeps).
  */
 const PHOTO_CONSOLE = {
   baseTop: 0.7,
@@ -560,11 +623,31 @@ const PHOTO_CONSOLE = {
   },
   bezel: { half: 0.43, h0: 1.05, h1: 1.72, off0: -0.003, off1: 0.012 },
   screen: { half: 0.36, h0: 1.1, h1: 1.67, off1: 0.016 },
+  photo: [
+    { a0: -0.3, a1: -0.08, h0: 1.38, h1: 1.6, tone: "light" },
+    { a0: -0.3, a1: 0.0, h0: 1.14, h1: 1.3, tone: "mid" },
+    { a0: 0.06, a1: 0.28, h0: 1.14, h1: 1.44, tone: "shadow" },
+  ],
+  toneOff1: 0.0175,
   grid: { width: 0.008, off1: 0.019 },
   slot: { half: 0.2, h0: 0.962, h1: 0.99, depth: 0.006 },
   buttons: { a0: -0.76, pitch: 0.13, a: 0.1, d0: 0.58, d: 0.09, above: 0.035 },
-  knobs: { as: [0.1, 0.24], d: 0.66, r: 0.035, h: 0.035 },
-  ball: { a: 0.56, d: 0.66, pad: 0.1, r: 0.065 },
+  sink: 0.005,
+  knobs: { as: [0.1, 0.24], d: 0.66, r: 0.035, h: 0.035, sink: 0.01 },
+  ball: {
+    a: 0.56,
+    d: 0.66,
+    pad: 0.1,
+    padTop: 0.01,
+    r: 0.065,
+    profile: [
+      [1, 0.02],
+      [0.9, 0.045],
+      [0.56, 0.06],
+      [0, 0.065],
+    ],
+    footShare: 0.9,
+  },
 } as const;
 
 /** The photo console's sloped deck: its top at depth `d`, from its back edge down to its front edge. */
@@ -612,8 +695,10 @@ const CONSOLE_LIGHTS: readonly Rgb[] = [
  * - On that sloped face: a black bezel and a grey-blue picture (`s.glow`)
  *   with a pale grid of two lines each way over it; a dark print slot in
  *   the lip under it.
+ * - The picture carries three tonal blocks under the grid (a pale
+ *   window, a mid-grey floor, a dark shape), so it reads as a photograph.
  * - On the deck: a row of six chunky lit buttons (blink groups 0 to 5 of
- *   the status bank), two brown knobs and a trackball on a brown pad, all
+ *   the status bank), two brown knobs and a grey trackball on a brown pad, all
  *   following the slope.
  */
 const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
@@ -707,6 +792,16 @@ const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     sc.off1,
     s.glow(SCREEN_GREY_BLUE),
   );
+  for (const blk of C.photo)
+    onFace(
+      blk.a0,
+      blk.a1,
+      blk.h0,
+      blk.h1,
+      sc.off1,
+      C.toneOff1,
+      s.glow(PHOTO_TONES[blk.tone]),
+    );
   const grid = s.glow(SCREEN_GRID);
   const w = C.grid.width / 2;
   for (const third of [1, 2]) {
@@ -744,30 +839,43 @@ const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const B = C.buttons;
   CONSOLE_LIGHTS.forEach((tint, i) => {
     const a0 = B.a0 + i * B.pitch;
-    slab(a0, a0 + B.a, B.d0, B.d0 + B.d, 0.005, B.above, s.blink(tint, i));
+    slab(a0, a0 + B.a, B.d0, B.d0 + B.d, C.sink, B.above, s.blink(tint, i));
   });
   const n = C.knobs;
   for (const a of n.as)
-    k.cylinder(a, n.d, deckTop(n.d) - 0.01, deckTop(n.d) + n.h, n.r, 8, brown);
+    k.cylinder(
+      a,
+      n.d,
+      deckTop(n.d) - n.sink,
+      deckTop(n.d) + n.h,
+      n.r,
+      8,
+      brown,
+    );
   // The trackball: a brown pad flush on the deck, and the ball, whose foot
   // reaches below the deck at its front so it never floats on the slope.
   const t = C.ball;
-  slab(t.a - t.pad, t.a + t.pad, t.d - t.pad, t.d + t.pad, 0.005, 0.01, brown);
-  const th = deckTop(t.d) + 0.01;
-  const foot = deckTop(t.d + t.r) - 0.005;
+  slab(
+    t.a - t.pad,
+    t.a + t.pad,
+    t.d - t.pad,
+    t.d + t.pad,
+    C.sink,
+    t.padTop,
+    brown,
+  );
+  const th = deckTop(t.d) + t.padTop;
+  const foot = deckTop(t.d + t.r) - C.sink;
   k.lathe(
     t.a,
     t.d,
     [
       [0, foot],
-      [t.r * 0.9, foot],
-      [t.r, th + 0.02],
-      [t.r * 0.9, th + 0.045],
-      [t.r * 0.56, th + 0.06],
-      [0, th + 0.065],
+      [t.r * t.footShare, foot],
+      ...t.profile.map(([r, h]): [number, number] => [t.r * r, th + h]),
     ],
     12,
-    s.dark,
+    s.tinted(TRACKBALL_GREY),
   );
 };
 
