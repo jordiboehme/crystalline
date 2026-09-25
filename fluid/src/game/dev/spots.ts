@@ -21,6 +21,7 @@
  * pitch is always 0).
  */
 
+import { TERMINAL_OCCLUDERS } from "../render/models/terminal";
 import { curioBox, curioSize, hostSurfaces } from "../world/curios";
 import {
   HERO_FRONT,
@@ -30,6 +31,7 @@ import {
   heroFootprint,
   heroTurn,
   propFootprint,
+  turnedBox,
 } from "../world/footprints";
 import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn, wallPoint } from "../world/interact";
@@ -41,7 +43,7 @@ import {
   PLAYER_RADIUS,
 } from "../world/move";
 import { PROP_KINDS } from "../world/props";
-import { edgeOf } from "../world/sites";
+import { edgeOf, wallAnchor } from "../world/sites";
 import type { Box, Curio, Fixture, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
 
@@ -220,7 +222,7 @@ const SLAB_THICKNESS = 0.05;
 
 /**
  * Every solid volume in `room` a curio-framing sight line must not cross,
- * other than `c`'s own box (H15's browser-shots review, item 4): every
+ * other than `c`'s own box (2.6b's browser-shots review, item 4): every
  * fixture's, decor piece's and floor prop's footprint (`footprintOf`,
  * `decorFootprint`, `propFootprint`) stood up from the floor to
  * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
@@ -232,11 +234,23 @@ const SLAB_THICKNESS = 0.05;
  * is already in the room model curios are placed from.
  *
  * The one host `c` itself stands on or under (found the way
- * `canned.test.ts`'s own `hostOf` does, by its box and height) is left out
- * twice over: its fixture, decor, prop or hero record is skipped from the
- * footprint pass (so a sight line is free to reach in under or past the
- * very thing `c` is mounted to), and its own surface is skipped from the
- * slab pass (so `c` never occludes the line drawn to its own centre).
+ * `canned.test.ts`'s own `hostOf` does, by its box and height) is not
+ * skipped wholesale any more (review round 1's bug): the chair, monitor
+ * and keyboard the review's browser pass found hiding a curio are part of
+ * that very fixture's own model, so excluding its whole footprint dropped
+ * them too, leaving only the thin top slab behind. Instead, for a
+ * `"terminal"` fixture (the only host the review's five URLs implicate),
+ * every part `TERMINAL_OCCLUDERS` names (`render/models/terminal.ts`'s own
+ * box and cylinder calls, read from the model rather than guessed) is
+ * turned into a world volume (`turnedBox`, the fixture's own `wallAnchor`)
+ * and added instead of the fixture's plain footprint: the pedestals, the
+ * keyboard deck, the CRT and the chair all still occlude, while the desk
+ * top and the open knee space between the pedestals, which
+ * `TERMINAL_OCCLUDERS` never covers, stay clear for a curio standing on or
+ * under them. A fixture kind with no parts table (every other kind, for
+ * now) keeps the old whole-footprint skip. `c`'s own surface is still
+ * skipped from the slab pass on top of this, so `c` never occludes the
+ * line drawn to its own centre.
  */
 function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const surfaces = hostSurfaces(room);
@@ -252,7 +266,19 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const ownAnchor: object | undefined = ownSurface?.anchorOf;
   const out: Volume[] = [];
   for (const f of room.fixtures) {
-    if ((f as object) === ownAnchor) continue;
+    if ((f as object) === ownAnchor) {
+      if (f.kind === "terminal") {
+        const at = wallAnchor(f.slot);
+        for (const part of TERMINAL_OCCLUDERS) {
+          out.push({
+            ...turnedBox(at.x, at.y, at.turn, part),
+            y0: part.h0,
+            y1: part.h1,
+          });
+        }
+      }
+      continue;
+    }
     const fp = footprintOf(f);
     if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
   }

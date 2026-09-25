@@ -54,6 +54,93 @@ const CRT_BACK = 0.12;
 /** The chair: its centre out from the wall and the seat's radius. */
 const CHAIR_D = 0.69;
 const SEAT_HALF = 0.2;
+/** The chair's foot disc radius (`buildTerminal`'s own `k.cylinder` call), the widest part. */
+const CHAIR_FOOT_R = 0.21;
+/** The backrest's outer depth, `CHAIR_D + 0.2` in `buildTerminal`. */
+const CHAIR_BACK_D = CHAIR_D + 0.2;
+/** The backrest's own top, in `buildTerminal`'s own numbers. */
+const CHAIR_TOP = 0.98;
+
+/** The CRT housing's half-width and top, `buildTerminal`'s own numbers. */
+const CRT_HALF_W = SCREEN_W / 2 + BEZEL;
+const CRT_TOP = SCREEN_BOTTOM + SCREEN_H + BEZEL;
+
+/**
+ * A part's box in the terminal's own local a/d/h frame (`a` along the
+ * wall, `d` out from it, `h` up): the same terms `turnedBox` (`world/
+ * footprints.ts`) turns into world metres.
+ */
+export interface TerminalPart {
+  a0: number;
+  a1: number;
+  d0: number;
+  d1: number;
+  h0: number;
+  h1: number;
+}
+
+/**
+ * The terminal's own solid parts, read from `buildTerminal`'s own box and
+ * cylinder calls (2.6b's browser-shots review, item 4): the two pedestals
+ * (the desk's own support, floor to `DESK_H0`), the keyboard deck, the CRT
+ * housing and the swivel chair (one bounding box over its foot, column,
+ * seat and back, out to `CHAIR_FOOT_R` and up to `CHAIR_TOP`) - everything
+ * the model builds solid, except the desk top itself (already a curio
+ * host surface, `world/curios.ts`'s `FIXTURE_SURFACES.terminal`) and the
+ * open knee space between the pedestals (where an under-desk curio
+ * stands). `dev/spots.ts`'s curio-framing sight-line check turns these
+ * into occluding volumes the way `hostSurfaces` turns a `SurfaceSpec`
+ * into a world box, so a chair pulled up to the desk, or the monitor and
+ * keyboard on top of it, blocks a framing spot's view exactly as it
+ * blocks a player's in the rendered room.
+ */
+export const TERMINAL_OCCLUDERS: readonly TerminalPart[] = [
+  // The left pedestal (the modesty panel's own support).
+  {
+    a0: -DESK_HALF,
+    a1: -DESK_HALF + 0.18,
+    d0: 0.02,
+    d1: DESK_DEPTH - 0.03,
+    h0: 0,
+    h1: DESK_H0,
+  },
+  // The right pedestal, with its drawers.
+  {
+    a0: DESK_HALF - 0.38,
+    a1: DESK_HALF,
+    d0: 0.02,
+    d1: DESK_DEPTH - 0.03,
+    h0: 0,
+    h1: DESK_H0,
+  },
+  // The sloped keyboard deck.
+  {
+    a0: -DECK_HALF,
+    a1: DECK_HALF,
+    d0: DECK_BACK,
+    d1: DECK_FRONT,
+    h0: DECK_BACK_H,
+    h1: DECK_FRONT_H,
+  },
+  // The CRT housing.
+  {
+    a0: -CRT_HALF_W,
+    a1: CRT_HALF_W,
+    d0: CRT_BACK,
+    d1: CRT_FRONT,
+    h0: DESK_H1,
+    h1: CRT_TOP,
+  },
+  // The swivel chair, one box over its foot, column, seat and back.
+  {
+    a0: -CHAIR_FOOT_R,
+    a1: CHAIR_FOOT_R,
+    d0: CHAIR_D - CHAIR_FOOT_R,
+    d1: CHAIR_BACK_D,
+    h0: 0,
+    h1: CHAIR_TOP,
+  },
+];
 
 /** The deck's surface height at depth `d`. */
 const deckAt = (d: number) =>
