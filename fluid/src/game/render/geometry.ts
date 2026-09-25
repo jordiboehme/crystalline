@@ -30,7 +30,7 @@
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
-import { LAMP_HALF_D, LAMP_HALF_W, lampCentre } from "../world/lamps";
+import { lampBoxes } from "../world/lamps";
 import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
@@ -467,20 +467,12 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   }
 
   // One lamp panel per light zone, just under the ceiling.
-  for (const z of room.lights) {
-    const c = lampCentre(room, z, doorways);
-    if (c === null) continue;
-    flatQuad(
-      b,
-      c[0] - LAMP_HALF_W,
-      c[0] + LAMP_HALF_W,
-      c[1] - LAMP_HALF_D,
-      c[1] + LAMP_HALF_D,
-      H - LAMP_DROP,
-      false,
-      { layer: LAYER.ceiling, tint: p.lamp, flag: FLAG.lamp },
-    );
-  }
+  for (const l of lampBoxes(room))
+    flatQuad(b, l.x0, l.x1, l.z0, l.z1, H - LAMP_DROP, false, {
+      layer: LAYER.ceiling,
+      tint: p.lamp,
+      flag: FLAG.lamp,
+    });
 
   // Under construction: the scaffold frames the player walks around.
   const pole: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };

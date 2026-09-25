@@ -91,7 +91,9 @@ export interface Palette {
   /**
    * The ceiling span kind hung across a large hall (D9), or null for none:
    * engineering's decor already runs pipes along its ceiling, and the
-   * council's ceiling stays bare.
+   * council's ceiling stays bare. An archetype whose decor can include a
+   * `pipe-run` must have none, since the pipe runs already cross its hall
+   * overhead (`props.test.ts` holds the two together).
    */
   ceilingSpan: "span-duct" | "span-tray" | null;
   /** Corner-zone props: 1 always (bridge) or 1 to 2. */

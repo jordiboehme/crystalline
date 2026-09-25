@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import { FOOTPRINTS } from "./footprints";
+import { generateRoom } from "./generate";
 import { EXTRAS, FILLER, PALETTES, PROP_CATALOGUE, PROP_KINDS } from "./props";
 import type { Archetype, Condition, PropKind } from "./types";
 
@@ -128,6 +130,24 @@ describe("the prop catalogue", () => {
     }
     expect(PALETTES.engineering.ceilingSpan).toBeNull();
     expect(PALETTES.council.ceilingSpan).toBeNull();
+  });
+
+  it("gives no span to an archetype whose decor can include a pipe run", () => {
+    const withPipes = new Set<Archetype>();
+    for (const place of [CANNED_WORKSHOP, CANNED_HUB])
+      for (const type of [
+        "manifest",
+        "decision",
+        "runbook",
+        "reference",
+        "guide",
+      ]) {
+        const room = generateRoom({ ...place, type });
+        if (room.decor.some((d) => d.kind === "pipe-run"))
+          withPipes.add(room.archetype);
+      }
+    expect(withPipes.size).toBeGreaterThan(0);
+    for (const a of withPipes) expect(PALETTES[a].ceilingSpan, a).toBeNull();
   });
 
   it("makes spans ceiling kinds that are neither runs nor extras", () => {

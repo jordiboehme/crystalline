@@ -1083,7 +1083,8 @@ describe("ceiling spans", () => {
   });
 
   it("keeps every span box clear of the ceiling band along the walls, lamps, decor and scaffolding", () => {
-    for (const room of SEEDS.slice(0, 60)) {
+    let checked = 0;
+    for (const room of [...SEEDS.slice(0, 60), ...HUBS.map((h) => h.room)]) {
       const h = room.hall;
       const solid = [
         ...room.decor.map(decorFootprint).filter((b) => b !== null),
@@ -1091,6 +1092,7 @@ describe("ceiling spans", () => {
         ...lampBoxes(room),
       ];
       for (const p of room.props.filter((q) => PROP_CATALOGUE[q.kind].span)) {
+        checked++;
         const axis = p.turn === 0 ? "x" : "y";
         const first =
           axis === "x"
@@ -1108,6 +1110,7 @@ describe("ceiling spans", () => {
         for (const s of solid) expect(overlaps(b, s)).toBe(false);
       }
     }
+    expect(checked).toBeGreaterThan(0);
   });
 });
 
