@@ -377,8 +377,10 @@ const arcadeDeck = (d: number) => 0.86 + ((0.75 - d) * 0.12) / 0.2;
  *   little smaller standing on it, so only the white rim shows.
  * - MAZE HUNT: maze lines in the body's black, with the yellow chaser in
  *   the middle.
- * Each entry lists `[outline, surface]` pairs; the art stands between the
- * side panel's face and the footprint's edge.
+ * Each entry is an outline, its surface and its layer (`lift`): layer 0
+ * stands `DECAL_LIFT` proud of the side panel's face, layer 1 (the rocks'
+ * amber middles) another `DECAL_LIFT` on top of it, out to the footprint's
+ * edge, so no two faces sit closer than the decal spacing.
  */
 function sideArt(
   game: ArcadeGame,
@@ -490,9 +492,10 @@ function sideArt(
  *   slope, the marquee's upright face (d 0.56, h 1.6 to 1.9) and the top.
  *   Over the screen's width the slope stands upright at d 0.45
  *   (`ARCADE_SCREEN_PROFILE`).
- * - Side panels of the same profile out to 5 mm inside the footprint's
- *   edge, in the game's side colour, the game's side art on their outer
- *   faces (`sideArt`).
+ * - Side panels of the same profile from `a` +-0.36 out to two
+ *   `DECAL_LIFT` inside the footprint's edge, in the game's side colour,
+ *   the game's side art on their outer faces (`sideArt`), so the art ends
+ *   on the footprint's edge rather than past it.
  * - The screen, upright at d 0.45 from h 1.08 to 1.5: a dark bezel, a
  *   black glass, the title card (`textRows(title)`, groups 0 to 3) in the
  *   band h 1.33 to 1.47 and the demo (groups 4 to 7) in h 1.10 to 1.30,
@@ -510,7 +513,7 @@ const arcadeCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   if (!game) throw new Error(`arcade: no game for variant ${String(variant)}`);
   const body = s.tinted(game.body);
   const inner = hw - 0.04;
-  const panelOut = hw - 0.005;
+  const panelOut = hw - 2 * DECAL_LIFT;
   const screenHalf = 0.33;
   // The body: two strips keeping the slope, the middle with the screen face.
   for (const [a0, a1] of [
@@ -533,8 +536,8 @@ const arcadeCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const art = sideArt(game, variant, s);
   for (const side of [1, -1] as const)
     for (const { outline, surface, lift } of art) {
-      const out0 = panelOut + lift * 0.0035;
-      sideShape(kitAt, side, outline, out0, lift ? hw : out0 + 0.0035, surface);
+      const out0 = panelOut + lift * DECAL_LIFT;
+      sideShape(kitAt, side, outline, out0, out0 + DECAL_LIFT, surface);
     }
   // The screen.
   const { d: sd, h0: sh0, h1: sh1 } = ARCADE_SCREEN;
@@ -706,11 +709,12 @@ const FIGHTER: readonly DH[] = [
  *   -0.46 to 0.46: a deep control deck rising from h 0.82 to 1.02, the
  *   screen slope, a hood over the screen and the top at 2.0. Over the
  *   screen's width the slope stands upright at d 0.62.
- * - The side panels of the same profile glow a steady deep blue-violet
- *   (`s.signal`), with brighter star dots (small signal squares set into
- *   the panel from inside, so they touch the body) and a fighter
- *   silhouette (a flat dark arrowhead with two swept wings) standing on
- *   their outer faces.
+ * - The side panels of the same profile (`a` +-0.46 out to one
+ *   `DECAL_LIFT` inside the footprint's edge) glow a steady deep
+ *   blue-violet (`s.signal`), with brighter star dots (small signal
+ *   squares set into the panel from inside, so they touch the body) and a
+ *   fighter silhouette (a flat dark arrowhead with two swept wings)
+ *   standing `DECAL_LIFT` proud on their outer faces.
  * - The screen, upright at d 0.62 from h 1.25 to 1.7: a dark bezel, a
  *   black glass, `VOID WING` in the upper band (groups 0 to 3) and the
  *   demo (`RECRUIT_DEMO`, groups 4 to 7) in the lower band, in the swap
@@ -724,7 +728,7 @@ const recruitCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const { hw } = heroHalf(kind, variant);
   const body = s.tinted(RECRUIT_BLACK);
   const inner = hw - 0.04;
-  const panelOut = hw - 0.005;
+  const panelOut = hw - DECAL_LIFT;
   const screenHalf = 0.38;
   for (const [a0, a1] of [
     [-inner, -screenHalf],
@@ -802,7 +806,7 @@ const recruitCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     q0[0] + u * (q1[0] - q0[0]) + n * normal[0],
     q0[1] + u * (q1[1] - q0[1]) + n * normal[1],
   ];
-  const thick = 0.006;
+  const thick = DECAL_LIFT;
   profileAlong(
     kitAt,
     ORIGIN,
@@ -830,8 +834,8 @@ const recruitCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
       [
         onHood(u - e, -0.01),
         onHood(u + e, -0.01),
-        onHood(u + e, thick + 0.003),
-        onHood(u - e, thick + 0.003),
+        onHood(u + e, thick + DECAL_LIFT),
+        onHood(u - e, thick + DECAL_LIFT),
       ],
       a - 0.006,
       a + 0.006,
