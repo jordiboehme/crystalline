@@ -97,4 +97,13 @@ describe("hueToRgb", () => {
     expect(g).toBeCloseTo(0);
     expect(b).toBeCloseTo(0);
   });
+
+  it("leave the palette alone under every condition, so prop meshes cache by look", () => {
+    const conditions = ["clean", "construction", "dim", "derelict"] as const;
+    for (const id of LOOK_ORDER) {
+      for (const c of conditions) {
+        expect(applyCondition(LOOKS[id], c).palette).toBe(LOOKS[id].palette);
+      }
+    }
+  });
 });

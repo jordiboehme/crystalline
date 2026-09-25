@@ -5,11 +5,23 @@
  * static room mesh and one small mesh per moving door panel, fills the
  * texture array (procedural layers, the pictogram set, and the text layers
  * of `layerPlan`: one per screen, poster and placard, one per six labels),
- * makes the room's light grid texture and keeps the look's numbers - and
- * `draw` is then a handful of uniform uploads, one small light upload, the
- * room and its door panels, and six full-screen passes. The scene is
- * rendered at the canvas size handed to `resize`, the bloom at half of that
- * and below.
+ * makes the room's light grid texture, uploads the set dressing and keeps
+ * the look's numbers - and `draw` is then a handful of uniform uploads, one
+ * small light upload, the room and its door panels, one instanced draw per
+ * prop kind and variant, and six full-screen passes. The scene is rendered
+ * at the canvas size handed to `resize`, the bloom at half of that and
+ * below.
+ *
+ * The set dressing is drawn instanced (see `instances.ts`). Each prop kind
+ * and variant the room needs is built once as its own mesh in the look's
+ * colours and kept in a cache keyed by kind and variant; the cache is
+ * cleared when the look's id changes and otherwise grows lazily, bounded by
+ * the prop catalogue. The condition does not enter the key: it changes
+ * only grime and light scale, never the palette a mesh is coloured from (a
+ * look test pins that). The room's instance buffers depend only on the
+ * room, so a look switch, which calls `setRoom` again with the very same
+ * room object, keeps them and only rebuilds the small vertex arrays that
+ * bind them to the new look's meshes.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
  * calls on unmount. After a lost context the demo does not call it: the
@@ -19,20 +31,34 @@
 
 import type { GlCaps } from "../gl/context";
 import { mat4, multiply, perspective, fpsView, type Vec3 } from "../gl/math";
-import { createFullscreen, createMesh, type Mesh } from "../gl/mesh";
+import {
+  createFullscreen,
+  createInstanceBuffer,
+  createInstancedMesh,
+  createMesh,
+  createVertexBuffer,
+  type InstanceBuffer,
+  type InstancedMesh,
+  type Mesh,
+  type VertexBuffer,
+} from "../gl/mesh";
 import { createProgram, type Program } from "../gl/program";
 import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
-import type { RoomSpec } from "../world/types";
-import { buildRoomMesh, type V3 } from "./geometry";
+import type { PropKind, RoomSpec } from "../world/types";
+import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
+import { propInstances } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
-import { C64_PALETTE, applyCondition, type Look } from "./looks";
+import { C64_PALETTE, applyCondition, type Look, type LookId } from "./looks";
+import { buildPropMesh } from "./models/props";
 import {
   BRIGHT_FS,
   COMPOSITE_FS,
   DOWN_FS,
   FULLSCREEN_VS,
+  INSTANCE_OFFSET_LOCATION,
+  INSTANCE_TURN_LOCATION,
   SCENE_FS,
   SCENE_VS,
   UP_FS,
@@ -60,8 +86,10 @@ export interface Camera {
  *   at least 256 in WebGL2), a limit error like a failed shader: a shorter
  *   array would make the shader clamp the missing layers to the last one
  *   and show readable, wrong labels. That throw, and one from building the
- *   meshes, come before the old room is released, so the old room stays
- *   drawn; only a failure on the GPU itself leaves nothing to draw.
+ *   meshes (the room's and any prop model the cache lacks), come before
+ *   the old room is released, so the old room stays drawn; only a failure
+ *   on the GPU itself leaves nothing to draw. Called again with the same
+ *   room object, it keeps the room's prop instance buffers.
  * - `resize` rebuilds the offscreen targets for a new canvas size in device
  *   pixels.
  * - `draw` renders one frame: `levels` holds the zones' current light
@@ -91,6 +119,19 @@ interface GpuMover {
   key: string;
   mesh: Mesh;
   slide: V3;
+}
+
+/**
+ * One prop kind and variant of the room on the GPU: its instance buffer,
+ * kept while the room stays the same, and the vertex array that binds it to
+ * the cached mesh of the current look, remade on every `setRoom`.
+ */
+interface GpuPropGroup {
+  key: string;
+  kind: PropKind;
+  variant: number;
+  instances: InstanceBuffer;
+  mesh: InstancedMesh | null;
 }
 
 /**
@@ -154,12 +195,19 @@ export function createRenderer(
   let light: GpuLight | null = null;
   let room: RoomSpec | null = null;
   let look: Look | null = null;
+  let propLook: LookId | null = null;
+  const propMeshes = new Map<string, VertexBuffer>();
+  let groups: GpuPropGroup[] = [];
   let targets: Targets | null = null;
   let size = { width: 1, height: 1 };
   const projection = mat4();
   const view = mat4();
   const viewProjection = mat4();
   const palette = new Float32Array(C64_PALETTE.flatMap((c) => [...c]));
+  // The static room and the door movers leave the instance attributes
+  // disabled, so they read these generic values: offset 0 and turn 0.
+  gl.vertexAttrib3f(INSTANCE_OFFSET_LOCATION, 0, 0, 0);
+  gl.vertexAttrib2f(INSTANCE_TURN_LOCATION, 0, 0);
 
   const releaseTargets = () => {
     if (targets === null) return;
@@ -179,6 +227,28 @@ export function createRenderer(
     light = null;
     room = null;
     look = null;
+  };
+
+  /** Deletes every group's vertex array; the instance buffers stay. */
+  const releaseGroupMeshes = () => {
+    for (const g of groups) {
+      g.mesh?.dispose();
+      g.mesh = null;
+    }
+  };
+
+  /** Deletes every group's vertex array and instance buffer. */
+  const releaseGroups = () => {
+    releaseGroupMeshes();
+    for (const g of groups) g.instances.dispose();
+    groups = [];
+  };
+
+  /** Deletes every cached prop mesh. */
+  const releasePropMeshes = () => {
+    for (const v of propMeshes.values()) v.dispose();
+    propMeshes.clear();
+    propLook = null;
   };
 
   const makeTarget = (w: number, h: number, depth: boolean): Target => {
@@ -259,7 +329,47 @@ export function createRenderer(
       // cannot be built leaves the old one on the GPU and drawn.
       const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
       const built = buildRoomMesh(nextRoom, nextLookApplied);
+      // A look switch hands the very same room back: its instance buffers
+      // stay. This is read before anything is released.
+      const sameRoom = nextRoom === room;
+      const lookChanged = nextLook.id !== propLook;
+      const nextGroups = sameRoom ? null : propInstances(nextRoom);
+      const needed: { key: string; kind: PropKind; variant: number }[] =
+        nextGroups ?? groups;
+      // The prop meshes this room lacks in this look are built on the CPU
+      // before the old room is let go, like the room mesh, so a prop that
+      // cannot be built leaves the old room drawn too.
+      const fresh = new Map<string, MeshData>();
+      for (const g of needed) {
+        if (!lookChanged && propMeshes.has(g.key)) continue;
+        fresh.set(g.key, buildPropMesh(g.kind, g.variant, nextLook));
+      }
       releaseRoom();
+      releaseGroupMeshes();
+      if (lookChanged) {
+        releasePropMeshes();
+        propLook = nextLook.id;
+      }
+      if (nextGroups !== null) {
+        releaseGroups();
+        groups = nextGroups.map((g) => ({
+          key: g.key,
+          kind: g.kind,
+          variant: g.variant,
+          instances: createInstanceBuffer(gl, g.data),
+          mesh: null,
+        }));
+      }
+      for (const g of groups) {
+        let vertices = propMeshes.get(g.key);
+        if (vertices === undefined) {
+          const data =
+            fresh.get(g.key) ?? buildPropMesh(g.kind, g.variant, nextLook);
+          vertices = createVertexBuffer(gl, data);
+          propMeshes.set(g.key, vertices);
+        }
+        g.mesh = createInstancedMesh(gl, vertices, g.instances);
+      }
       mesh = createMesh(gl, built.static);
       movers = built.movers.map((m) => ({
         key: m.key,
@@ -395,6 +505,8 @@ export function createRenderer(
         );
         m.mesh.draw();
       }
+      gl.uniform3f(offset, 0, 0, 0);
+      for (const g of groups) g.mesh?.draw();
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);
 
@@ -440,6 +552,8 @@ export function createRenderer(
       disposed = true;
       releaseTargets();
       releaseRoom();
+      releaseGroups();
+      releasePropMeshes();
       for (const p of [scene, bright, down, up, composite]) p.dispose();
       fullscreen.dispose();
     },

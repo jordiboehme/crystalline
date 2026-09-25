@@ -16,6 +16,7 @@
  */
 
 import { CELL } from "../world/units";
+import { turnMat2Columns } from "./kit";
 
 /**
  * How far, in metres, the surface shader moves a fragment along its normal
@@ -27,14 +28,56 @@ import { CELL } from "../world/units";
 export const LIGHT_NUDGE = 0.05;
 
 /**
+ * The attribute location of an instance's anchor offset, a `vec3` in world
+ * metres. Only a prop's instanced vertex array enables it, with a divisor
+ * of one; everything else reads the generic value, which the renderer sets
+ * to zero.
+ */
+export const INSTANCE_OFFSET_LOCATION = 6;
+
+/**
+ * The attribute location of an instance's turn and slot, a `vec2`: x the
+ * quarter turns, y a reserved slot that is 0 for now. It is kept apart from
+ * the offset, never packed into one `vec4`, so a disabled attribute's
+ * generic (0, 0, 0, 1) cannot leak a 1 into the turn.
+ */
+export const INSTANCE_TURN_LOCATION = 7;
+
+/**
+ * The shader's four quarter turns as GLSL `mat2` literals, emitted from
+ * `turnMat2Columns` (and so from `TURN_XZ` in `kit.ts`), the same table
+ * the model checks turn the props by, so the GPU and the tests can never
+ * disagree on a rotation.
+ */
+const TURN_TABLE = [0, 1, 2, 3]
+  .map(
+    (t) =>
+      `mat2(${turnMat2Columns(t)
+        .map((n) => n.toFixed(1))
+        .join(", ")})`,
+  )
+  .join(", ");
+
+/**
  * The surface vertex shader. It reads the 13-float vertex the geometry
  * writes, at the attribute locations `gl/mesh.ts` binds (position 0, normal
- * 1, uv 2, layer 3, tint 4, flag 5), moves it by `uModelOffset` (a door
- * panel's slide while it opens; zero for the static room), passes the moved
- * world position on for the distance and light-grid lookups, and hands
- * layer, tint and flag through flat so a triangle never blends between two
- * surfaces. The flag is rounded to an int once here, so the fragment shader
- * compares whole numbers.
+ * 1, uv 2, layer 3, tint 4, flag 5), plus two instance attributes: the
+ * anchor offset at location 6 (`INSTANCE_OFFSET_LOCATION`) and the turn
+ * and reserved slot at location 7 (`INSTANCE_TURN_LOCATION`). A prop's
+ * instanced vertex array feeds those once per instance; the static room
+ * and the door movers leave them disabled, so they read the generic
+ * attribute value, which the renderer sets to zero once: offset 0 and turn
+ * 0, the identity. The vertex is turned by `TURNS` (emitted from
+ * `turnMat2Columns`), moved by the instance offset and by `uModelOffset`
+ * (a door panel's slide while it opens; zero for the static room and the
+ * props), and its normal turns with it, so a prop is lit and nudged into
+ * the light grid the way it faces. The moved world position goes on for
+ * the distance and light-grid lookups, and layer, tint and flag go through
+ * flat so a triangle never blends between two surfaces. The flag is
+ * rounded to an int once here, so the fragment shader compares whole
+ * numbers. The fragment shader is unchanged by instancing, so the light
+ * grid, the bands, the grime, the edge lines and the dither apply to props
+ * as to everything else.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;
@@ -43,6 +86,8 @@ layout(location = 2) in vec2 aUv;
 layout(location = 3) in float aLayer;
 layout(location = 4) in vec3 aTint;
 layout(location = 5) in float aFlag;
+layout(location = 6) in vec3 aInstanceOffset;
+layout(location = 7) in vec2 aInstanceTurn; // x: quarter turns, y: slot (reserved, 0)
 uniform mat4 uViewProjection;
 uniform vec3 uModelOffset;
 out vec3 vWorld;
@@ -51,10 +96,14 @@ out vec2 vUv;
 flat out float vLayer;
 flat out vec3 vTint;
 flat out int vFlag;
+const mat2 TURNS[4] = mat2[4](${TURN_TABLE});
 void main() {
-  vec3 world = aPosition + uModelOffset;
+  mat2 turn = TURNS[int(aInstanceTurn.x + 0.5) & 3];
+  vec2 xz = turn * aPosition.xz;
+  vec3 world = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset + uModelOffset;
+  vec2 nxz = turn * aNormal.xz;
   vWorld = world;
-  vNormal = aNormal;
+  vNormal = vec3(nxz.x, aNormal.y, nxz.y);
   vUv = aUv;
   vLayer = aLayer;
   vTint = aTint;
