@@ -27,10 +27,11 @@
  *   the fume cabinet still sits in a regular palette;
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
- *   `LANE_WIDTH`, `LANE_DEPTH`, `TALL_MIN`, the cluster constants
+ *   `LANE_WIDTH`, `LANE_DEPTH`, `USE_LANE_DEPTH`, `TALL_MIN`, the cluster
+ *   constants
  *   (`CLUSTER_BLOCK`, `CLUSTER_INNER`, `CLUSTER_SHARE`, `CLUSTER_MIN`,
- *   `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants (`SPAN_CELLS`,
- *   `SPAN_HALF` and `SPAN_SHARE`).
+ *   `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants
+ *   (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
  * pictograms (ruling 13).
@@ -92,7 +93,11 @@ export interface Palette {
   wall: readonly (readonly [WallPropKind, number])[];
   /** The wall run kind, or null. */
   wallRun: "cable-tray" | "pipe-bundle" | null;
-  /** Weighted picks for floor spots. */
+  /**
+   * Weighted picks for floor spots. Every palette holds at least one tall
+   * kind (E5), weighted 2 beside its plain kinds at 3, so a large hall
+   * shows some height along its walls and in its corners.
+   */
   floor: readonly (readonly [FloorPropKind, number])[];
   /** The ceiling run kind, or null. */
   ceilingRun: "duct" | "ceiling-tray" | null;
@@ -106,7 +111,11 @@ export interface Palette {
   ceilingSpan: "span-duct" | "span-tray" | null;
   /** Corner-zone props: 1 always (bridge) or 1 to 2. */
   cornerMax: 1 | 2;
-  /** Chance a free wall-side cell gets a floor prop. */
+  /**
+   * Chance a free wall-side cell gets a floor prop: 1/4 on the bridge, 1/2
+   * everywhere else (E7). Keep-clear wall props still close the spots in
+   * front of them.
+   */
   wallSide: number;
   /**
    * Weighted picks for the members of a mid-hall cluster (D6): plain floor
@@ -696,11 +705,12 @@ export const PALETTES = {
     floor: [
       ["stool", 3],
       ["crate", 3],
+      ["crate-stack", 2],
     ],
     ceilingRun: "ceiling-tray",
     ceilingSpan: "span-tray",
     cornerMax: 1,
-    wallSide: 1 / 8,
+    wallSide: 1 / 4,
     cluster: [
       ["crate", 3],
       ["trolley", 2],
@@ -719,11 +729,13 @@ export const PALETTES = {
       ["barrel", 3],
       ["crate", 3],
       ["trolley", 3],
+      ["crate-stack", 2],
+      ["drum-rack", 2],
     ],
     ceilingRun: "duct",
     ceilingSpan: null,
     cornerMax: 2,
-    wallSide: 1 / 4,
+    wallSide: 1 / 2,
     cluster: [
       ["crate", 3],
       ["barrel", 3],
@@ -741,11 +753,12 @@ export const PALETTES = {
       ["filing-cabinet", 3],
       ["storage-shelf", 3],
       ["crate", 3],
+      ["crate-stack", 2],
     ],
     ceilingRun: "ceiling-tray",
     ceilingSpan: "span-tray",
     cornerMax: 2,
-    wallSide: 1 / 4,
+    wallSide: 1 / 2,
     cluster: [
       ["crate", 3],
       ["trolley", 2],
@@ -766,11 +779,12 @@ export const PALETTES = {
       ["specimen-shelf", 3],
       ["stool", 3],
       ["trolley", 3],
+      ["gas-rack", 2],
     ],
     ceilingRun: "duct",
     ceilingSpan: "span-duct",
     cornerMax: 2,
-    wallSide: 1 / 4,
+    wallSide: 1 / 2,
     cluster: [
       ["trolley", 3],
       ["crate", 2],
@@ -785,11 +799,12 @@ export const PALETTES = {
     floor: [
       ["planter", 3],
       ["bench", 3],
+      ["potted-tree", 2],
     ],
     ceilingRun: null,
     ceilingSpan: null,
     cornerMax: 2,
-    wallSide: 1 / 4,
+    wallSide: 1 / 2,
     cluster: [
       ["planter", 3],
       ["crate", 1],
@@ -829,8 +844,21 @@ export const LOOP_SHARE = 1 / 4;
 export const EXTINGUISHER_EVERY = 6;
 /** Width of a clear lane, in metres. */
 export const LANE_WIDTH = 1.6;
-/** Depth of a clear lane from the wall, in metres. */
+/**
+ * Depth of a clear lane from the wall in front of a door, hatch or portal,
+ * in metres: the ways out keep the full 4 m, since a sliding door opens
+ * from `APPROACH` (3 m) and nothing was shown to hold at less (E6).
+ */
 export const LANE_DEPTH = 4.0;
+/**
+ * Depth of the clear lane in front of a terminal or a machine, in metres
+ * (E6). A fixture is used from within `REACH` (2.2 m) of its wall point, so
+ * its whole usable depth lies inside the lane, and the use point the
+ * reachability test aims at (at most 1.45 m out) keeps the player's circle
+ * inside it too. Shallower than `LANE_DEPTH`, it frees the second-row cells
+ * of a corner zone near a fixture for floor props.
+ */
+export const USE_LANE_DEPTH = 2.5;
 /**
  * Width of the viewing lane in front of a poster or the placard, in metres:
  * the sheet's width along its wall. Floor props never enter it, so nothing

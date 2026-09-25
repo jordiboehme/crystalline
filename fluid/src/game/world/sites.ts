@@ -24,8 +24,12 @@
  *   wall or ceiling run may cover either; free is exactly wall edges minus
  *   `noRun`, so the two never drift apart (ruling 6).
  * - **Lanes** (ruling 10), which floor props never enter:
- *   - for every door, hatch, portal, terminal and machine, sealed or not:
- *     `footprint(slot, { along: LANE_WIDTH, out: LANE_DEPTH })`;
+ *   - for every door, hatch and portal, sealed or not:
+ *     `footprint(slot, { along: LANE_WIDTH, out: LANE_DEPTH })` (4 m deep);
+ *   - for every terminal and machine:
+ *     `footprint(slot, { along: LANE_WIDTH, out: USE_LANE_DEPTH })`
+ *     (2.5 m deep, E6): a fixture is used from within `REACH` of its wall
+ *     point, so the shallower lane still holds its whole use range;
  *   - for every poster and the placard, a viewing lane:
  *     `footprint(slot, { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH })`
  *     (1.2 m by 1.5 m), so no floor prop stands in front of the sheet;
@@ -101,6 +105,7 @@ import {
   SHEET_LANE_WIDTH,
   SPAN_CELLS,
   SPAN_HALF,
+  USE_LANE_DEPTH,
 } from "./props";
 import type { Box, Rect, RoomSpec, Side, WallSlot } from "./types";
 import { CELL } from "./units";
@@ -285,16 +290,19 @@ export function dressingSites(room: RoomBase): DressingSites {
   const free = new Set([...wallEdges].filter((k) => !noRun.has(k)));
 
   const lanes: Box[] = [];
-  const size = { along: LANE_WIDTH, out: LANE_DEPTH };
+  const way = { along: LANE_WIDTH, out: LANE_DEPTH };
+  const use = { along: LANE_WIDTH, out: USE_LANE_DEPTH };
   const sheet = { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH };
   for (const f of room.fixtures) {
     switch (f.kind) {
       case "door":
       case "hatch":
       case "portal":
+        lanes.push(footprint(f.slot, way));
+        break;
       case "terminal":
       case "machine":
-        lanes.push(footprint(f.slot, size));
+        lanes.push(footprint(f.slot, use));
         break;
       case "poster":
       case "placard":
@@ -511,7 +519,7 @@ const LARGE_LONG = 9;
  * True when a hall is large (D5): its shorter side is at least 8 cells and
  * its longer side at least 9, either way round. Its interior band is then
  * at least 5 by 4 cells, enough for one cluster block. The workshop
- * (13x10), the hub (24x24) and the fullest probed room qualify; the bridge
+ * (13x12), the hub (24x24) and the fullest probed room qualify; the bridge
  * (7x6), the empty hall (5x6) and the narrow hall (5x12) do not. Only a
  * large hall gets mid-hall clusters and spans, and the density ceiling of
  * `dress.test.ts` is held against large halls alone.

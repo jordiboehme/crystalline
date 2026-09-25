@@ -577,7 +577,10 @@ describe("sliding around corners", () => {
   });
 
   it("slides past both room-side corners of a terminal", () => {
-    const terminal = room.fixtures.find((f) => f.kind === "terminal");
+    // Undressed: a wall-side floor prop may stand between the bridge's
+    // terminals since the wall-side chance went up (E7).
+    const bare: RoomSpec = { ...room, props: [] };
+    const terminal = bare.fixtures.find((f) => f.kind === "terminal");
     if (terminal === undefined) throw new Error("the bridge has terminals");
     const box = footprintOf(terminal) as Box;
     const corners: [{ x: number; z: number }, Diagonal][] = [
@@ -586,7 +589,7 @@ describe("sliding around corners", () => {
     ];
     for (const [corner, dir] of corners) {
       for (const offset of offsets) {
-        const p = diagonalInto(room, corner, dir, offset, 40);
+        const p = diagonalInto(bare, corner, dir, offset, 40);
         // Past the corner, or slid along the desk into the pocket between
         // it and the wall; frozen at the corner is neither.
         const inPocket =
@@ -639,8 +642,11 @@ describe("sliding around corners", () => {
 
   it("stops the stride at a wall on the grid's edge", () => {
     // The bridge's west wall is the grid's west edge: between its terminals.
-    expect(room.hall.x0).toBe(0);
-    const west = runIn(room, at(3, 7), { ...idle, strafe: -1 }, 60);
+    // Undressed: a wall-side floor prop may stand there since the wall-side
+    // chance went up (E7).
+    const bridge: RoomSpec = { ...room, props: [] };
+    expect(bridge.hall.x0).toBe(0);
+    const west = runIn(bridge, at(3, 7), { ...idle, strafe: -1 }, 60);
     expect(west.x).toBeCloseTo(PLAYER_RADIUS, 6);
     expect(west.vx).toBeCloseTo(0, 9);
     expect(west.vz).toBeCloseTo(0, 9);

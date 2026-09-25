@@ -27,7 +27,7 @@ import {
 } from "./footprints";
 import { generateRoom } from "./generate";
 import generateSource from "./generate.ts?raw";
-import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
+import { ARRIVAL_DISTANCE, REACH, wallPoint } from "./interact";
 import { lampBoxes } from "./lamps";
 import { doorwayColumns, isFloor, wallSlots } from "./layout";
 import { PLAYER_RADIUS, blockersFor } from "./move";
@@ -42,6 +42,7 @@ import {
   PROP_CATALOGUE,
   PROP_CAP,
   SPAN_CELLS,
+  USE_LANE_DEPTH,
 } from "./props";
 import {
   dressingSites,
@@ -532,6 +533,45 @@ describe("floor props", () => {
     expect(checked).toBeGreaterThan(500);
   });
 
+  it("keeps a terminal's and a machine's use range and the player's circle there inside its lane", () => {
+    // focusOf offers a fixture within REACH of its wall point, so the whole
+    // usable depth along the lane's axis lies inside it (E6).
+    expect(REACH).toBeLessThanOrEqual(USE_LANE_DEPTH);
+    const outs = [
+      FOOTPRINTS.terminal.out,
+      ...Object.values(FOOTPRINTS.machine).map((m) => m.out),
+    ];
+    for (const out of outs)
+      expect(out + PLAYER_RADIUS + 0.1 + PLAYER_RADIUS).toBeLessThanOrEqual(
+        USE_LANE_DEPTH,
+      );
+  });
+
+  it("leave the player's circle at every terminal and machine use point clear", () => {
+    let checked = 0;
+    for (const { name, room } of [...ALL, ...REACH_EXTRA]) {
+      const boxes = floorProps(room).map(boxOf);
+      for (const f of room.fixtures) {
+        if (f.kind !== "terminal" && f.kind !== "machine") continue;
+        const size =
+          f.kind === "terminal"
+            ? FOOTPRINTS.terminal
+            : FOOTPRINTS.machine[f.machine];
+        const w = wallPoint(f.slot);
+        const d = size.out + PLAYER_RADIUS + 0.1;
+        const x = w.x + w.inward[0] * d;
+        const z = w.z + w.inward[1] * d;
+        for (const b of boxes)
+          expect(
+            distanceTo(x, z, b),
+            `${name} ${f.kind} ${edgeKey(f.slot)}`,
+          ).toBeGreaterThanOrEqual(PLAYER_RADIUS);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(200);
+  });
+
   it("leave the viewing lane in front of every poster and the placard clear", () => {
     // The sheet's bottom edge hangs at SHEET_BOTTOM (1.2 m, `wall.ts`), lower
     // than most floor props stand, so no floor prop may stand within the
@@ -924,18 +964,25 @@ describe("density measure", () => {
     expect(share).toBeLessThanOrEqual(0.6);
   });
 
-  it("puts at least 0.07 floor props per wall-side spot, and at most 0.35", () => {
-    // Baseline 0.049: 82% of the spots were dropped behind any wall prop.
-    // Forecast about 0.085: keep-clear kinds still close 0.625 of the spots.
+  it("puts at least 0.15 floor props per wall-side spot, and at most 0.35", () => {
+    // 0.128 before iteration 2, forecast 0.175 (E7).
     const per =
       sum(SEEDS, (d) => d.wallSideProps) / sum(SEEDS, (d) => d.wallSideSpots);
-    expect(per).toBeGreaterThanOrEqual(0.07);
+    expect(per).toBeGreaterThanOrEqual(0.15);
     expect(per).toBeLessThanOrEqual(0.35);
   });
 
+  it("makes at least 0.14 of the floor props tall", () => {
+    // 0.060 on the 13x12 seeds before Task 2, forecast 0.188 (E9).
+    expect(
+      sum(SEEDS, (d) => d.tallProps) / sum(SEEDS, (d) => d.floorProps),
+    ).toBeGreaterThanOrEqual(0.14);
+  });
+
   it("keeps every large dressed room at or under 16 floor props per 100 floor cells", () => {
-    // The densest room measured is a seed at 13.08 (w-13, engineering); the
-    // ceiling of 16 leaves room for one more tuning iteration.
+    // The densest room measured is a seed at 14.74 (w-15, engineering, on
+    // the 13x12 workshop); the ceiling of 16 leaves room until the clusters
+    // grow.
     const rooms = [
       ...ALL,
       ...BRIDGES,
@@ -953,11 +1000,11 @@ describe("density measure", () => {
     expect(large).toBe(ALL.length + SEEDS.length + REACH_EXTRA.length);
   });
 
-  it("raises large workshops to at least 6 floor props per 100 floor cells", () => {
-    // Baseline 4.70, forecast about 6.5.
+  it("raises large workshops to at least 8 floor props per 100 floor cells", () => {
+    // Baseline 4.70 before iteration 1, 7.39 after it; forecast 8.81 (E9).
     const per100 =
       (sum(SEEDS, (d) => d.floorProps) * 100) / sum(SEEDS, (d) => d.floorCells);
-    expect(per100).toBeGreaterThanOrEqual(6);
+    expect(per100).toBeGreaterThanOrEqual(8);
   });
 
   it("raises the canned hub to at least 5 floor props per 100 floor cells in every archetype", () => {
@@ -1117,7 +1164,7 @@ describe("ceiling spans", () => {
 
 describe("mandatory props", () => {
   it("gives the workshop the hall it was made for", () => {
-    expect(workshop.hall).toEqual({ x0: 0, y0: 0, x1: 13, y1: 10 });
+    expect(workshop.hall).toEqual({ x0: 0, y0: 0, x1: 13, y1: 12 });
     expect(workshop.bays).toEqual([]);
     expect(workshop.corridor).toBeNull();
     expect(workshop.dropped).toBe(0);
@@ -1128,7 +1175,7 @@ describe("mandatory props", () => {
       workshop.fixtures.filter((f) => f.kind === kind).length;
     expect(count("door")).toBe(6);
     expect(count("terminal")).toBe(3);
-    expect(count("machine")).toBe(4);
+    expect(count("machine")).toBe(5);
     expect(count("hatch")).toBe(3);
     expect(count("poster")).toBe(2);
     expect(count("placard")).toBe(1);

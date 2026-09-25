@@ -13,11 +13,14 @@
  *   workshop and hub in every archetype and condition, the canned bridge
  *   (never large), all 300 seed rooms and the over-cap room ("keeps every
  *   large dressed room at or under 16 floor props per 100 floor cells").
- *   The same measure has floors: at least 6 summed over the seeds, and at
+ *   The same measure has floors: at least 8 summed over the seeds, and at
  *   least 5 in the clean canned hub of every archetype.
  * - `wallSideProps / wallSideSpots`, the floor props standing in a
- *   wall-side spot per spot, summed over the seeds: at least 0.07 and at
- *   most 0.35 ("puts at least 0.07 floor props per wall-side spot").
+ *   wall-side spot per spot, summed over the seeds: at least 0.15 and at
+ *   most 0.35 ("puts at least 0.15 floor props per wall-side spot").
+ * - `tallProps / floorProps`, the share of floor props whose kind is
+ *   `tall` (E5), summed over the seeds: at least 0.14 ("makes at least
+ *   0.14 of the floor props tall").
  * - `wideEdges / freeEdges`, the free wall edges carrying a wide wall prop,
  *   summed over the seeds: at least 0.12 and at most 0.6 ("covers at least
  *   0.12 of free edges with wide wall props").
@@ -41,6 +44,8 @@ export interface Density {
   /** Floor cells of the hall and the bays (the corridor is never dressed). */
   floorCells: number;
   floorProps: number;
+  /** Floor props whose kind is `tall` in `PROP_CATALOGUE` (E5). */
+  tallProps: number;
   /** Floor props per 100 floor cells. */
   floorPer100: number;
   /** Wall-side spots (`dressingSites(room).wallSide`) and the floor props standing in one. */
@@ -91,6 +96,7 @@ export function measureDensity(room: RoomSpec): Density {
     large: isLargeHall(room.hall),
     floorCells,
     floorProps: floor.length,
+    tallProps: floor.filter((p) => PROP_CATALOGUE[p.kind].tall).length,
     floorPer100: floorCells === 0 ? 0 : (floor.length * 100) / floorCells,
     wallSideSpots: sites.wallSide.length,
     wallSideProps: floor.filter((p) => wallSide.has(cellOf(p))).length,

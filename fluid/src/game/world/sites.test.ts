@@ -17,6 +17,7 @@ import {
   LANE_WIDTH,
   SHEET_LANE_DEPTH,
   SHEET_LANE_WIDTH,
+  USE_LANE_DEPTH,
 } from "./props";
 import lampsSource from "./lamps.ts?raw";
 import propsSource from "./props.ts?raw";
@@ -260,10 +261,36 @@ describe("lanes", () => {
     expect(sites.lanes).toHaveLength(hub.fixtures.length + 1 + cols);
     for (const f of hub.fixtures) {
       if (!wayKinds.has(f.kind)) continue;
+      const out =
+        f.kind === "terminal" || f.kind === "machine"
+          ? USE_LANE_DEPTH
+          : LANE_DEPTH;
       expect(sites.lanes).toContainEqual(
-        footprint(f.slot, { along: LANE_WIDTH, out: LANE_DEPTH }),
+        footprint(f.slot, { along: LANE_WIDTH, out }),
       );
     }
+  });
+
+  it("makes a terminal's and a machine's lane USE_LANE_DEPTH deep and a way out's LANE_DEPTH", () => {
+    const room = generateRoom(CANNED_BRIDGE);
+    const lanes = dressingSites(room).lanes;
+    let use = 0;
+    let way = 0;
+    for (const f of room.fixtures) {
+      const deep =
+        f.kind === "terminal" || f.kind === "machine"
+          ? USE_LANE_DEPTH
+          : LANE_DEPTH;
+      if (!["door", "hatch", "portal", "terminal", "machine"].includes(f.kind))
+        continue;
+      expect(lanes).toContainEqual(
+        footprint(f.slot, { along: LANE_WIDTH, out: deep }),
+      );
+      if (deep === USE_LANE_DEPTH) use++;
+      else way++;
+    }
+    expect(use).toBeGreaterThan(0);
+    expect(way).toBeGreaterThan(0);
   });
 
   it("gives every poster and the placard a 1.2 m by 1.5 m viewing lane", () => {
@@ -560,12 +587,14 @@ describe("the interior band and large halls", () => {
 });
 
 describe("cluster blocks", () => {
-  it("tiles the workshop band into two blocks with 2 by 2 inner cells", () => {
+  it("tiles the workshop band into four blocks with 2 by 2 inner cells", () => {
     const blocks = dressingSites(generateRoom(CANNED_WORKSHOP)).clusterBlocks;
-    expect(blocks.map((b) => b.key)).toEqual(["2,2", "6,2"]);
+    expect(blocks.map((b) => b.key)).toEqual(["2,2", "6,2", "2,6", "6,6"]);
     expect(blocks.map((b) => [b.x, b.y])).toEqual([
       [2, 2],
       [6, 2],
+      [2, 6],
+      [6, 6],
     ]);
     expect(blocks[0]?.cells.map((c) => [c.cx, c.cy])).toEqual([
       [3, 3],

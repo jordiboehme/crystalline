@@ -347,8 +347,8 @@
       "seed": 7113353366359555
     },
     {
-      "kind": "crate",
-      "variant": 2,
+      "kind": "crate-stack",
+      "variant": 1,
       "anchor": "floor",
       "x": 6.5,
       "y": 0.5,
@@ -368,19 +368,37 @@
       "kind": "stool",
       "variant": 1,
       "anchor": "floor",
+      "x": 6.85,
+      "y": 2.5,
+      "turn": 3,
+      "seed": 793710617531822
+    },
+    {
+      "kind": "crate-stack",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 0.475,
+      "y": 3.5,
+      "turn": 1,
+      "seed": 6354344531687045
+    },
+    {
+      "kind": "crate",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 1.5,
+      "y": 4.5,
+      "turn": 2,
+      "seed": 5867523987053919
+    },
+    {
+      "kind": "stool",
+      "variant": 1,
+      "anchor": "floor",
       "x": 6.5,
       "y": 4.5,
       "turn": 2,
       "seed": 5726256422500225
-    },
-    {
-      "kind": "crate",
-      "variant": 2,
-      "anchor": "floor",
-      "x": 1.5,
-      "y": 5.5,
-      "turn": 0,
-      "seed": 6124279725318152
     },
     {
       "kind": "ceiling-tray",

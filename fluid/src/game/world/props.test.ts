@@ -9,9 +9,11 @@ import {
   CLUSTER_MAX,
   EXTRAS,
   FILLER,
+  LANE_DEPTH,
   PALETTES,
   PROP_CATALOGUE,
   PROP_KINDS,
+  USE_LANE_DEPTH,
 } from "./props";
 import type { Archetype, Condition, PropKind } from "./types";
 
@@ -191,6 +193,19 @@ describe("the prop catalogue", () => {
       expect(PROP_CATALOGUE[k].run).toBe(false);
       expect(PROP_CATALOGUE[k].extra).toBe(false);
     }
+  });
+
+  it("gives terminals and machines a shallower lane than the ways out", () => {
+    expect(USE_LANE_DEPTH).toBe(2.5);
+    expect(USE_LANE_DEPTH).toBeLessThan(LANE_DEPTH);
+  });
+
+  it("gives every palette at least one tall floor pick", () => {
+    for (const a of ARCHETYPES)
+      expect(
+        PALETTES[a].floor.some(([k]) => PROP_CATALOGUE[k].tall),
+        a,
+      ).toBe(true);
   });
 
   it("fits CLUSTER_MAX members into a block's inner square, one cell in from its corner", () => {

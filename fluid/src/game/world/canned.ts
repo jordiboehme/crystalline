@@ -139,25 +139,29 @@ export const CANNED_BRIDGE: PlaceInput = {
  *   the north wall with doors, every one open, so each gets a keycard reader
  *   and the extinguishers of the north run find every edge near their index
  *   taken; that makes the hall 13 cells wide. Three `## ` sections (west) and
- *   four tags (east) make it 10 deep, and no bay is needed.
+ *   five tags (east) make it 12 deep, and no bay is needed. Its interior
+ *   band is 9 by 8 cells, four cluster blocks (E2).
  * - **South wall.** Three inbound references, three hatches beside the
  *   entrance and the placard, each with its sign plate.
  * - **Posters.** Two observations in two categories.
  * - **Dressing.** `runbook` is the engineering archetype (pipe bundles on the
- *   walls, ducts on the ceiling, barrels, crates and trolleys) and `draft`
+ *   walls, ducts on the ceiling, barrels, crates, trolleys, crate stacks
+ *   and drum racks) and `draft`
  *   puts it under construction: two scaffold frames and the construction
  *   extras (traffic cones, a ladder, a tool cart).
+ * - **Permalink.** It seeds the room, and is chosen so its span stream
+ *   draws a line in every archetype that hangs one (E2).
  */
 export const CANNED_WORKSHOP: PlaceInput = {
   domain: "station",
-  permalink: "workshop",
+  permalink: "pipe-shop",
   title: "Pump Workshop",
   type: "runbook",
   status: "draft",
   salience: 5,
   validFrom: null,
   validTo: null,
-  tags: ["pressure", "valves", "tools", "safety"],
+  tags: ["pressure", "valves", "tools", "safety", "gauges"],
   content: [
     "# Pump Workshop",
     "",
