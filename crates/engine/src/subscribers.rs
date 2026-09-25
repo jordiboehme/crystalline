@@ -6,7 +6,7 @@
 //! needs somewhere to keep the sinks of everyone currently listening, and this
 //! is it.
 //!
-//! **It lives on the shared [`crate::Engine`] rather than on the MCP handler,
+//! **It lives on the shared `crate::Engine` rather than on the MCP handler,
 //! and that placement is the whole reason the module exists.** On the
 //! streamable-HTTP path rmcp builds a fresh service per request
 //! (`get_service()`, rmcp 3.1.2 `tower.rs:1822` and `:1948`) and every modern

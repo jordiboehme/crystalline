@@ -504,7 +504,8 @@ impl Engine {
     ///
     /// `what` is what the caller was doing, so the refusal reads as an answer
     /// to their own request rather than as a fact about the domain.
-    pub(crate) fn refuse_write_into_reviewed_folder(&self, domain: &str, what: &str) -> Result<()> {
+    #[doc(hidden)]
+    pub fn refuse_write_into_reviewed_folder(&self, domain: &str, what: &str) -> Result<()> {
         if !self.reviews_changes(domain) {
             return Ok(());
         }

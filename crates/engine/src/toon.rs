@@ -27,7 +27,8 @@ use serde_json::{Map, Value};
 /// TOON document, so it falls back to the compact JSON of the untouched value,
 /// keeping today's behavior for the defensive path rather than erroring the
 /// tool call - engine payloads are always objects.
-pub(crate) fn render(value: &Value) -> String {
+#[doc(hidden)]
+pub fn render(value: &Value) -> String {
     let normalized = normalize(value.clone());
     let Value::Object(map) = &normalized else {
         return value.to_string();

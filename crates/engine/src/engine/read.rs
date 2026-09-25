@@ -248,7 +248,8 @@ impl Engine {
     /// socket, its `expected_checksum` is compared by the verb that composes
     /// into the document, and being answered the bytes the engram actually says
     /// right now is the whole of Task 14.
-    pub(crate) async fn read_engram_stored(
+    #[doc(hidden)]
+    pub async fn read_engram_stored(
         &self,
         p: &ReadParams,
         scope: &crate::scope::Scope,

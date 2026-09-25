@@ -1961,11 +1961,8 @@ impl Engine {
     /// (a read and hash of every file in the domain, or a reviewing domain's
     /// overlay read) once per change, so a domain with a hundred unshared
     /// changes paid for a hundred walks to answer one call.
-    pub(crate) async fn local_changes_detailed(
-        &self,
-        domain: &str,
-        actor: &ShareActor,
-    ) -> Result<Value> {
+    #[doc(hidden)]
+    pub async fn local_changes_detailed(&self, domain: &str, actor: &ShareActor) -> Result<Value> {
         self.local_changes_listing(domain, actor, true).await
     }
 

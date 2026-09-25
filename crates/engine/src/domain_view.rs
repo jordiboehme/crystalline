@@ -69,7 +69,8 @@ use crate::share_staging::{OVERLAY_STAGING_DIR, OverlayStaging, write_staged_fil
 
 /// What one reader sees in one domain: the folder the team reviewed, with that
 /// reader's own drafts laid over it.
-pub(crate) struct DomainView<'a> {
+#[doc(hidden)]
+pub struct DomainView<'a> {
     /// The engine the substrates live behind. A view is a lens, never an owner:
     /// it borrows for the length of one verb.
     engine: &'a Engine,
@@ -134,7 +135,8 @@ impl<'a> DomainView<'a> {
     /// [`OVERLAY_NEEDS_IDENTITY`] says "this domain reviews changes before they
     /// land", which is a fact about a domain a screened-out reader must not
     /// learn exists.
-    pub(crate) fn for_read(
+    #[doc(hidden)]
+    pub fn for_read(
         engine: &'a Engine,
         domain: &str,
         hidden: &HashSet<String>,
@@ -1638,7 +1640,8 @@ impl<'a> DomainView<'a> {
     /// and it is what makes `sha256`, `size` and `modified` on an overlay row
     /// mean exactly what they mean on a base row, so a client caching on the
     /// checksum is not lied to about bytes only it can see.
-    pub(crate) async fn attachments(&self) -> Result<Vec<AttachmentRow>> {
+    #[doc(hidden)]
+    pub async fn attachments(&self) -> Result<Vec<AttachmentRow>> {
         let base = self.engine.attachment_list(&self.domain).await?;
         let Some(actor) = self.actor.as_deref() else {
             return Ok(base);
@@ -1704,7 +1707,8 @@ impl<'a> DomainView<'a> {
     /// when they hold some, [`EngineError::NotFound`] when they hold a deletion
     /// of the path, and the folder's own answer otherwise - row heal included,
     /// since that arm is the base's unchanged.
-    pub(crate) async fn attachment_bytes(&self, path: &str) -> Result<(Vec<u8>, AttachmentRow)> {
+    #[doc(hidden)]
+    pub async fn attachment_bytes(&self, path: &str) -> Result<(Vec<u8>, AttachmentRow)> {
         if let Some((bytes, row)) = self.own_attachment(path)? {
             return Ok((bytes, row));
         }

@@ -1,5 +1,5 @@
 //! Real-time co-editing sessions: one yrs document per open engram, served
-//! over the axum WebSocket route in [`ws`], saved through the engine's own
+//! over the axum WebSocket route in `ws`, saved through the engine's own
 //! write path. Sessions are in-memory only - the file stays the source of
 //! truth, and a daemon restart drops sessions by design (clients rejoin from
 //! the saved file).
@@ -8,6 +8,5 @@ pub mod control;
 pub mod merge;
 pub mod session;
 pub mod text;
-pub mod ws;
 
 pub use session::{IDLE_CHECK_MS, SAVE_DEBOUNCE_MS, SAVE_MAX_LAG_MS};

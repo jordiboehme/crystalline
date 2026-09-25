@@ -1361,6 +1361,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "crystalline-engine"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "crystalline-core",
+ "crystalline-identity",
+ "crystalline-index",
+ "crystalline-remote",
+ "diffy",
+ "futures",
+ "globset",
+ "http",
+ "indexmap 2.14.2",
+ "libc",
+ "percent-encoding",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "similar 3.2.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "yrs",
+]
+
+[[package]]
 name = "crystalline-identity"
 version = "0.20.0"
 dependencies = [
@@ -1438,7 +1472,6 @@ name = "crystalline-service"
 version = "0.20.0"
 dependencies = [
  "anyhow",
- "argon2",
  "async-trait",
  "axum",
  "axum-extra",
@@ -1446,18 +1479,16 @@ dependencies = [
  "bytes",
  "chrono",
  "crystalline-core",
+ "crystalline-engine",
  "crystalline-identity",
  "crystalline-index",
  "crystalline-remote",
  "crystalline-service",
- "diffy",
  "flate2",
  "fs4 1.1.0",
  "futures",
  "getrandom 0.4.3",
- "globset",
  "http",
- "indexmap 2.14.2",
  "interprocess",
  "jsonwebtoken",
  "libc",
@@ -1468,12 +1499,10 @@ dependencies = [
  "rmcp",
  "rsa",
  "rust-embed",
- "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
- "similar 3.2.0",
  "tar",
  "tempfile",
  "thiserror 2.0.20",

@@ -1839,7 +1839,7 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
     // The engine is a directory of section files: every one of them is
     // scanned, each on its own, so a function never inherits the last name
     // of the file before it.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/src/engine");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

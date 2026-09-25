@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/index",
     "crates/identity",
+    "crates/engine",
     "crates/remote",
     "crates/service",
     "crates/cli",
@@ -24,6 +25,9 @@ crystalline-core = { path = "crates/core" }
 # from the whole build rather than pulling it back in through a dependency edge.
 crystalline-index = { path = "crates/index", default-features = false }
 crystalline-identity = { path = "crates/identity" }
+# default-features off for the same reason as the index: every dependent opts
+# in to the embedding and Postgres features explicitly.
+crystalline-engine = { path = "crates/engine", default-features = false }
 crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 

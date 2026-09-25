@@ -10,7 +10,7 @@
 //! on its own author's text and saving into that author's draft row - never
 //! into the folder the team reviewed and never into somebody else's overlay.
 //! Who may open a room over whose document is decided at the door, in
-//! [`super::ws::join`]: your own needs nothing, and somebody else's needs the
+//! `super::ws::join`: your own needs nothing, and somebody else's needs the
 //! share-link their author minted plus the join this session opened on it.
 //!
 //! **One room's awareness ceiling is 32 names, not [`MAX_PARTICIPANTS`]'s 16.**
@@ -274,7 +274,7 @@ impl CollabSessions {
     /// `overlay` is whose document to open: `None` for the one a direct domain
     /// keeps, `Some(actor)` for that actor's draft of the page. It is the
     /// caller's job to have decided that the caller may be in that document -
-    /// see [`super::ws::join`], which is the one surface that opens rooms.
+    /// see `super::ws::join`, which is the one surface that opens rooms.
     pub async fn join(
         self: &Arc<Self>,
         domain: &str,

@@ -1258,7 +1258,8 @@ impl Engine {
     /// the suffix off, which are the three spellings the editor and the API
     /// address an engram by. A link whose draft has gone matches nothing, so a
     /// dead link teaches nothing and opens nothing.
-    pub(crate) async fn granted_draft_named(
+    #[doc(hidden)]
+    pub async fn granted_draft_named(
         &self,
         domain: &str,
         identifier: &str,

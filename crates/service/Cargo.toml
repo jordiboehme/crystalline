@@ -16,8 +16,8 @@ path = "src/lib.rs"
 # drops candle and sqlx while the daemon still compiles and serves text search
 # over Turso.
 default = ["local-embeddings", "postgres", "fluid-ui"]
-local-embeddings = ["crystalline-index/local-embeddings"]
-postgres = ["crystalline-index/postgres"]
+local-embeddings = ["crystalline-index/local-embeddings", "crystalline-engine/local-embeddings"]
+postgres = ["crystalline-index/postgres", "crystalline-engine/postgres"]
 # The Fluid web bundle, compiled into the binary and served by every daemon on
 # its HTTP endpoint (on at 127.0.0.1:7411 unless it is turned off).
 # On by default so a plain `cargo build` produces the same code paths a release
@@ -26,8 +26,8 @@ postgres = ["crystalline-index/postgres"]
 # and tolerates its absence, so a clone without node still builds and tests
 # green with this on - the embed is then simply empty.
 fluid-ui = ["dep:rust-embed"]
-# The test seams this crate carries outside plain `cfg(test)`, and nothing
-# else: the engine's own arming method and the branch that reads it, its
+# The test seams outside plain `cfg(test)`, which live in crystalline-engine
+# and are forwarded to its `testing` feature, and nothing else: the engine's own arming method and the branch that reads it, its
 # counters (`prune_statements_issued`, `detection_walks`), plus
 # `crate::nudge`'s share-walk counter (`SHARE_WALKS`, `share_walks_for`,
 # `count_walk`), which moved out of the engine into its own module but is
@@ -35,20 +35,18 @@ fluid-ui = ["dep:rust-embed"]
 # of it; turned on for this package's own test builds by the self
 # dev-dependency below, which is how an integration test - a separate crate -
 # reaches something `cfg(test)` alone would hide from it.
-testing = []
+testing = ["crystalline-engine/testing"]
 
 [dependencies]
 crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
 crystalline-identity = { workspace = true }
+crystalline-engine = { workspace = true }
 crystalline-remote = { workspace = true }
-argon2 = { workspace = true }
 getrandom = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
-turso = { workspace = true }
-indexmap = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
@@ -74,25 +72,17 @@ axum-extra = { workspace = true }
 tower-service = { workspace = true }
 time = { workspace = true }
 utoipa = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
-globset = { workspace = true }
-walkdir = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 yrs = { workspace = true }
-similar = { workspace = true }
 bytes = { workspace = true }
-# diffy has a workspace pin already (crates/remote uses it), but this crate
-# does not inherit it automatically: plain-text merge conflict surfacing here
-# needs its own line.
-diffy = { workspace = true }
 zip = { workspace = true }
 # The OpenID Connect relying party (rest::oidc). Built with no default
 # features (see the workspace pin), so its HTTP calls go through the client
@@ -129,6 +119,9 @@ crystalline-service = { path = ".", default-features = false, features = [
 # crate boundary (see crystalline-identity's `testing` feature).
 crystalline-identity = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
+# The integration tests open a Turso database and walk a tree directly.
+turso = { workspace = true }
+walkdir = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
 # log lines through; both are test-only additions to crates this package

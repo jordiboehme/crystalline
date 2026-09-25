@@ -11,44 +11,35 @@
 
 pub(crate) use crystalline_identity::auth_store;
 pub mod client;
-pub mod collab;
 pub mod control;
 pub mod daemon;
-pub(crate) mod domain_view;
-pub mod engine;
-pub mod harness_cli;
-mod index_files;
 pub mod instance;
 pub use crystalline_identity::join;
-pub mod maintenance;
 pub mod mcp;
 pub mod mcp_gate;
-pub mod nudge;
-mod origin;
-pub mod overlay;
-pub(crate) mod overlay_files;
-pub mod overlay_journal;
-pub mod params;
-mod poller;
 pub mod rest;
-// Internal: only the two types below are anybody else's business, and they are
-// re-exported at the root. Kept `pub(crate)` so the module doc's links to its
-// own `pub(crate)` functions are consistent with what rustdoc publishes -
-// `pub mod` made every one of them a broken link for a reader of the docs.
-pub(crate) mod review;
 pub use crystalline_identity::scope;
-mod serving;
-pub mod settings;
-pub(crate) mod share_staging;
-pub mod similar;
 pub mod stub;
-pub mod subscribers;
-pub mod temp_store;
 mod tool_schema;
-mod toon;
 #[cfg(feature = "fluid-ui")]
 pub mod ui;
-pub mod web_url;
+
+pub use crystalline_engine::{
+    engine, harness_cli, maintenance, nudge, overlay, overlay_journal, params, settings, similar,
+    subscribers, temp_store, web_url,
+};
+// Were crate-private modules of this crate; still only this crate's business.
+pub(crate) use crystalline_engine::{domain_view, origin, review, serving, toon};
+pub mod collab {
+    //! Real-time co-editing sessions: one yrs document per open engram, served
+    //! over the axum WebSocket route in [`ws`], saved through the engine's own
+    //! write path. Sessions are in-memory only - the file stays the source of
+    //! truth, and a daemon restart drops sessions by design (clients rejoin from
+    //! the saved file).
+
+    pub use crystalline_engine::collab::*;
+    pub mod ws;
+}
 
 /// The name the consolidation sweep is advertised and dispatched under.
 ///
@@ -65,26 +56,28 @@ pub use client::{
     origin_discard, origin_resolve, origin_share, origin_status, origin_update, origin_withdraw,
     run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
-pub use crystalline_remote::ops::DiscardTarget;
-pub use daemon::run_serve;
-pub use engine::{
+pub use crystalline_engine::engine::{
     ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
     WrittenAttachment,
 };
-pub use harness_cli::{
+pub use crystalline_engine::harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
+pub use crystalline_engine::origin::{
+    MAX_DIFF_TEXT_BYTES, UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work,
+};
+pub use crystalline_engine::overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use crystalline_engine::review::{FoldChoice, ReviewModeConfirm};
+pub use crystalline_engine::similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
+pub use crystalline_identity::join::{Holder, Join, Joins};
+pub use crystalline_identity::scope::{
+    DomainAccess, DomainRight, DomainVisibility, Scope, overlay_actor,
+};
+pub use crystalline_remote::ops::DiscardTarget;
+pub use daemon::run_serve;
 pub use instance::{EXIT_LOCK_HELD, HttpBinding, LockHeld, ServeIntent, StartMode};
-pub use join::{Holder, Join, Joins};
 pub use mcp::McpServer;
 pub use mcp_gate::{
     MCP_AUTH_REQUIRED, MCP_SESSION_IDENTITY_MISMATCH, McpGate, McpIdentity, SessionOwners,
 };
-pub use origin::{
-    MAX_DIFF_TEXT_BYTES, UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work,
-};
-pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
-pub use review::{FoldChoice, ReviewModeConfirm};
-pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope, overlay_actor};
-pub use similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
 pub use stub::{DegradedServer, StubStatus};

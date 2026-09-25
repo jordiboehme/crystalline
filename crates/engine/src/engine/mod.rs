@@ -220,7 +220,8 @@ pub const CLI_ACTOR: &str = "process:crystalline-cli";
 /// The ceiling [`sanitize_actor`] keeps an actor token to, in kept characters.
 /// Exposed with it, because a caller composing an actor out of two halves has
 /// to budget against the same number to know what will survive the pass.
-pub(crate) const ACTOR_MAX_CHARS: usize = 120;
+#[doc(hidden)]
+pub const ACTOR_MAX_CHARS: usize = 120;
 
 /// Normalize a client-supplied identity into an OKF actor token: whitespace
 /// runs collapse to a single hyphen, control characters and the flow-mapping
@@ -232,7 +233,8 @@ pub(crate) const ACTOR_MAX_CHARS: usize = 120;
 /// each half on its own rather than the composition (`mcp::acting_actor`): a
 /// single pass over the joined string lets the client-supplied half spend the
 /// whole budget and truncate away the half the server asserts.
-pub(crate) fn sanitize_actor(raw: &str) -> String {
+#[doc(hidden)]
+pub fn sanitize_actor(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut kept = 0usize;
     let mut pending_gap = false;
@@ -1937,7 +1939,8 @@ impl Engine {
     ///
     /// Either half failing propagates rather than resolving to an empty set: a
     /// read that cannot learn what it may answer from refuses, and never widens.
-    pub(crate) async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
+    #[doc(hidden)]
+    pub async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
         let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         hidden.extend(self.unregistered_domains().await?);
         Ok(hidden)
@@ -2605,7 +2608,8 @@ impl Engine {
     /// registers reviews nothing: the verb that asked is about to refuse it as
     /// unregistered anyway, and answering "yes" here would route a write into a
     /// draft of a domain that does not exist.
-    pub(crate) fn reviews_changes(&self, name: &str) -> bool {
+    #[doc(hidden)]
+    pub fn reviews_changes(&self, name: &str) -> bool {
         self.domain_entry(name)
             .map(|entry| entry.is_overlay())
             .unwrap_or(false)
@@ -4523,7 +4527,8 @@ pub enum ProvisionAction {
 /// `name` is not one of them, and with [`EngineError::Invalid`] when `name`
 /// is a virtual domain - it has no filesystem root to ship artifacts from,
 /// so no decision is recorded.
-pub(crate) fn set_domain_provision_decision(
+#[doc(hidden)]
+pub fn set_domain_provision_decision(
     file: &mut GlobalConfig,
     name: &str,
     allow: bool,
@@ -4548,7 +4553,8 @@ pub(crate) fn set_domain_provision_decision(
 /// static fallback return, since neither the report nor its nested types
 /// derive `Serialize` (the format crate keeps that derive off types whose
 /// JSON shape a caller-facing envelope, not a Rust API, should own).
-pub(crate) fn apply_report_json(report: &crystalline_core::provision::ApplyReport) -> Value {
+#[doc(hidden)]
+pub fn apply_report_json(report: &crystalline_core::provision::ApplyReport) -> Value {
     let harnesses: Vec<Value> = report
         .harnesses
         .iter()
@@ -4568,7 +4574,8 @@ pub(crate) fn apply_report_json(report: &crystalline_core::provision::ApplyRepor
 
 /// Serialize a [`crystalline_core::provision::StatusReport`] into JSON, the
 /// read-only sibling of [`apply_report_json`].
-pub(crate) fn status_report_json(report: &crystalline_core::provision::StatusReport) -> Value {
+#[doc(hidden)]
+pub fn status_report_json(report: &crystalline_core::provision::StatusReport) -> Value {
     json!({
         "domains": report.domains.iter().map(domain_status_json).collect::<Vec<_>>(),
         "harnesses": report.harnesses.iter().map(harness_status_json).collect::<Vec<_>>(),

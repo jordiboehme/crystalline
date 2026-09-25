@@ -1147,7 +1147,8 @@ fn api_effective(config: &GlobalConfig) -> (String, bool) {
 /// Split a comma-separated Host list into trimmed, non-empty entries. Shared by
 /// the settings apply path and the daemon's flag resolver so both normalize the
 /// same way.
-pub(crate) fn parse_allowed_hosts(value: &str) -> Vec<String> {
+#[doc(hidden)]
+pub fn parse_allowed_hosts(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)

@@ -6488,7 +6488,7 @@ async fn a_write_with_no_identity_still_refuses_and_a_read_still_answers_the_bas
 /// reach another actor's drafts and stay green.
 fn call_sites(needle: &str) -> Vec<(String, String)> {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let roots = ["src", "../identity/src"].map(|dir| manifest.join(dir));
+    let roots = ["src", "../identity/src", "../engine/src"].map(|dir| manifest.join(dir));
     /// The name a line declares a function under, if it declares one.
     fn declared_fn(line: &str) -> Option<&str> {
         let rest = line.trim_start();
