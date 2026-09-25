@@ -14,8 +14,6 @@
 //! a wait. Integration test crates share no helpers, so the fixtures here are
 //! copied from that file rather than imported.
 
-mod support;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,8 +53,12 @@ fn write_manifest(dir: &std::path::Path, name: &str) {
 /// agent's write meets its own overlay document rather than the folder's.
 async fn engine_fixture(
     review: bool,
-) -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
-    let scratch = support::ScratchStateDir::acquire();
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -1331,7 +1333,7 @@ async fn a_person_typing_in_alpha() -> (
     Arc<CollabSessions>,
     Joined,
     Doc,
-    support::ScratchStateDir,
+    crate::support::ScratchStateDir,
 ) {
     let (tmp, engine, scratch) = engine_fixture(false).await;
     let sessions = CollabSessions::new(engine.clone());
@@ -2069,7 +2071,7 @@ async fn a_capture_without_overwrite_never_morphs_an_open_document() {
 /// claim in a comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache() {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();

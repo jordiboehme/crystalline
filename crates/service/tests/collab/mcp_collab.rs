@@ -8,18 +8,17 @@
 //! collaboration-gated and work on a fresh instance with GitHub off.
 //!
 //! Every test that touches a GitHub connection injects either
-//! `support::MockProvider` (via `Engine::with_origin_provider`) or
-//! `support::StubConnectAuth` (via `Engine::with_connect_auth`), and points
+//! `crate::support::MockProvider` (via `Engine::with_origin_provider`) or
+//! `crate::support::StubConnectAuth` (via `Engine::with_connect_auth`), and points
 //! token and origin state at a tempdir (`Engine::with_token_store_dir`,
 //! `Engine::with_origins_dir`), so nothing here reaches a network, a real
 //! GitHub repository, or the developer's actual OS keychain.
-
-mod support;
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::{RemoteError, StoredToken, TokenStore};
@@ -31,7 +30,6 @@ use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RunningService};
 use rmcp::{ClientHandler, RoleClient, RoleServer};
 use serde_json::{Value, json};
-use support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
 use tokio::sync::Mutex;
 
 // --- shared fixtures ---------------------------------------------------------
@@ -1320,7 +1318,7 @@ async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
 /// and the access token never appear.
 #[tokio::test]
 async fn a_landed_device_sign_in_logs_every_step_and_no_secret() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
     let auth = fake_auth(
         Ok(device_flow_start()),
@@ -1371,7 +1369,7 @@ async fn a_landed_device_sign_in_logs_every_step_and_no_secret() {
 /// error - the other half of answering "it looks stuck" from the log.
 #[tokio::test]
 async fn a_failed_device_sign_in_logs_the_step_it_failed_at() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
     let auth = fake_auth(
         Ok(device_flow_start()),

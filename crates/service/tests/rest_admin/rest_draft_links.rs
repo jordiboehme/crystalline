@@ -8,8 +8,6 @@
 //! from that one resolution. A test that called the engine directly would be
 //! asserting about a caller the door never produced.
 
-mod support;
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -44,13 +42,13 @@ struct Fixture {
     root: std::path::PathBuf,
     /// Held for the test's duration: every successful write marks its domain
     /// pending under the state directory, which this redirects into a scratch
-    /// home. See `support::ScratchStateDir`.
-    _state: support::ScratchStateDir,
+    /// home. See `crate::support::ScratchStateDir`.
+    _state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve() -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
@@ -278,7 +276,7 @@ impl Fixture {
 /// somebody else's link has always answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_demoted_author_takes_her_own_link_back_and_a_stranger_never_can() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let author = login(f.addr, "alice").await;
@@ -365,7 +363,7 @@ async fn a_demoted_author_takes_her_own_link_back_and_a_stranger_never_can() {
 /// invented one is told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_author_mints_and_a_stranger_binds() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -468,7 +466,7 @@ async fn the_author_mints_and_a_stranger_binds() {
 /// be a way to ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_author_mint_is_404() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let bob = login(f.addr, "bob").await;
@@ -511,7 +509,7 @@ async fn a_non_author_mint_is_404() {
 /// case is that they differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_viewer_role_grantee_opens_read_only_with_a_reason() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -565,7 +563,7 @@ async fn a_viewer_role_grantee_opens_read_only_with_a_reason() {
 /// visibility there is, and they are reached through the link surface alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grantees_search_still_excludes_the_owners_draft() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f
         .draft("alice", "Fresh", "A distinctive marmalade sentence.")
@@ -661,7 +659,7 @@ async fn a_grantees_search_still_excludes_the_owners_draft() {
 /// carries bob's sentence, and bob is holding nothing at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_at_a_granted_path_needs_a_join_and_then_lands_in_the_owners_draft() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -818,7 +816,7 @@ async fn a_write_at_a_granted_path_needs_a_join_and_then_lands_in_the_owners_dra
 /// for anybody the key reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_accounts_join_key_is_not_a_join() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -891,7 +889,7 @@ async fn another_accounts_join_key_is_not_a_join() {
 /// references it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_upload_lands_in_the_owners_files() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -970,7 +968,7 @@ async fn a_joined_upload_lands_in_the_owners_files() {
 /// domain at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folding_the_draft_ends_the_link_and_the_join() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -1064,7 +1062,7 @@ async fn folding_the_draft_ends_the_link_and_the_join() {
 /// widens one path, not a neighbourhood.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_granted_read_answers_the_draft_and_names_whose() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     // Two drafts of alice's, and only one of them is shared. The shared one
     // points at the other, which is what makes the no-transitivity assertion
@@ -1170,7 +1168,7 @@ async fn a_granted_read_answers_the_draft_and_names_whose() {
 /// grantee at all once its author drops it, so the refusal is never reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_whose_draft_is_gone_stops_refusing_the_grantees_own_write() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1265,7 +1263,7 @@ async fn a_grant_whose_draft_is_gone_stops_refusing_the_grantees_own_write() {
 /// somebody who was removed from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_does_not_outlive_the_grantees_access_to_the_domain() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -1367,7 +1365,7 @@ impl Fixture {
 /// nowhere yet is a file the join may make.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_upload_of_a_new_file_lands_in_the_owners_overlay() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1414,7 +1412,7 @@ async fn a_joined_upload_of_a_new_file_lands_in_the_owners_overlay() {
 /// work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_overwrite_of_a_referenced_attachment_lands() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1465,7 +1463,7 @@ async fn a_joined_overwrite_of_a_referenced_attachment_lands() {
 /// under her name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_overwrite_of_an_unreferenced_path_refuses() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1524,7 +1522,7 @@ async fn a_joined_overwrite_of_an_unreferenced_path_refuses() {
 /// would be a deletion nobody refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joined_delete_of_an_unreferenced_file_refuses_and_leaves_no_tombstone() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1580,7 +1578,7 @@ async fn a_joined_delete_of_an_unreferenced_file_refuses_and_leaves_no_tombstone
 /// path revives nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_discarded_draft_ends_its_grant_and_a_redraft_revives_nothing() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1653,7 +1651,7 @@ async fn a_discarded_draft_ends_its_grant_and_a_redraft_revives_nothing() {
 /// drafts it was reviewing are over, whichever way they ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_a_domain_ends_the_links_in_it() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1696,7 +1694,7 @@ async fn removing_a_domain_ends_the_links_in_it() {
 /// join decided and the read order says nothing about it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grantees_own_draft_at_the_granted_path_wins_for_reads() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1789,7 +1787,7 @@ async fn a_grantees_own_draft_at_the_granted_path_wins_for_reads() {
 /// it, and the person it was meant for could never open it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reader_of_no_such_domain_does_not_burn_the_link() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1845,7 +1843,7 @@ async fn a_reader_of_no_such_domain_does_not_burn_the_link() {
 /// rename by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_renamed_draft_ends_its_grant_and_a_redraft_at_the_old_path_revives_nothing() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -1965,7 +1963,7 @@ async fn a_renamed_draft_ends_its_grant_and_a_redraft_at_the_old_path_revives_no
 /// next look, and a write still presenting the key reaches nothing of alice's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rename_ends_a_live_join_at_the_old_path() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2063,7 +2061,7 @@ async fn a_rename_ends_a_live_join_at_the_old_path() {
 ///   tombstoned, their draft at the path they moved it to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overlay_rename_leaves_the_base_permalink_answering_for_everybody_else() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2174,7 +2172,7 @@ async fn an_overlay_rename_leaves_the_base_permalink_answering_for_everybody_els
 /// than two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_author_saves_at_the_address_her_own_move_left_standing() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2289,7 +2287,7 @@ async fn an_author_saves_at_the_address_her_own_move_left_standing() {
 /// would land in dave's, under his name, for the wrong person to review.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_authors_drafts_of_one_page_are_two_joins() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let dave = login(f.addr, "dave").await;
@@ -2413,7 +2411,7 @@ async fn two_authors_drafts_of_one_page_are_two_joins() {
 /// does not say to somebody who was never in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_a_link_ends_the_join_that_was_open_on_it() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2557,7 +2555,7 @@ async fn revoking_a_link_ends_the_join_that_was_open_on_it() {
 /// written, ask for a fresh one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_save_on_a_link_that_ran_out_is_refused_in_the_links_own_words() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2666,7 +2664,7 @@ async fn a_save_on_a_link_that_ran_out_is_refused_in_the_links_own_words() {
 /// meeting it in the UI should find it written down rather than surprising.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_one_link_leaves_the_other_grantee_one_press_away() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let alice = login(f.addr, "alice").await;
     let bob = login(f.addr, "bob").await;
@@ -2800,7 +2798,7 @@ fn append_edit(line: &str) -> crystalline_service::params::EditParams {
 /// will review it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agent_presenting_a_share_link_edits_inside_the_owners_draft() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -2867,7 +2865,7 @@ async fn an_agent_presenting_a_share_link_edits_inside_the_owners_draft() {
 /// joined it for their agent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;
@@ -2940,7 +2938,7 @@ async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
 /// closed their socket. A holder is what makes the two keys two keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let f = serve().await;
     let path = f.draft("alice", "Fresh", "A page only alice has.").await;
     let alice = login(f.addr, "alice").await;

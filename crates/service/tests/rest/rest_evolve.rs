@@ -7,12 +7,10 @@
 //! captures nobody has reviewed, which is the finding a person opening the page
 //! is meant to see first.
 //!
-//! Every fixture holds a [`support::ScratchStateDir`]: the run recorder writes
+//! Every fixture holds a [`crate::support::ScratchStateDir`]: the run recorder writes
 //! under the state directory, and the point of the last test here is that this
 //! route never writes there at all - which is only worth asserting if a failure
 //! could not touch the developer's own state directory.
-
-mod support;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -37,7 +35,7 @@ struct Fixture {
     /// Held for the test's duration: it redirects the state directory the
     /// maintenance file lives in into a scratch home, so nothing this suite
     /// does can reach the developer's own.
-    state: support::ScratchStateDir,
+    state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
@@ -70,7 +68,7 @@ fn engram(title: &str, permalink: &str, generated_by: Option<&str>, body: &str) 
 /// linked into a live reference so the orphan and stub rules stay quiet, plus a
 /// second registered domain that holds nothing.
 async fn serve(opts: Options) -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -903,7 +901,7 @@ async fn a_multi_line_note_never_breaks_the_engram_it_lands_in() {
 /// under one member's own identity, which is what an authenticated write on
 /// this instance resolves to, and the assertions are then made over HTTP.
 async fn serve_review() -> (Fixture, Arc<Engine>) {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");

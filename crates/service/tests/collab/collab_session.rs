@@ -2,8 +2,6 @@
 //! clients and exchange encoded protocol frames through handle_frame, so
 //! every assertion is about session semantics rather than transport.
 
-mod support;
-
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
@@ -28,8 +26,12 @@ const WIDE: &str = "---\ntype: engram\ntitle: Wide\npermalink: wide\ntags:\n  - 
 /// mixed-endings one, synced into an in-memory store. Mirrors
 /// `engine_writes.rs::engine_fixture`; integration test crates share no
 /// helpers, so it is copied rather than imported.
-async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
-    let scratch = support::ScratchStateDir::acquire();
+async fn engine_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -413,8 +415,12 @@ async fn a_populated_session_survives_dispose_if_empty() {
 /// this file rather than a parameter on the first: a reviewing domain is a
 /// different world from a direct one, and every assertion about it reads
 /// better beside the domain it is about.
-async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
-    let scratch = support::ScratchStateDir::acquire();
+async fn review_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();

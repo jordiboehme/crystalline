@@ -2,8 +2,6 @@
 //! move/delete, manifest save, the validation dry-run, user admin, and the
 //! auth/CSRF and If-Match matrices over all of them.
 
-mod support;
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -37,12 +35,12 @@ struct Fixture {
     /// redirects that directory into a scratch home for the test's duration.
     /// Held rather than dropped: the redirection lasts exactly as long as this
     /// value, and the requests that write happen while a test holds it.
-    state: support::ScratchStateDir,
+    state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve(opts: Options) -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -105,7 +103,7 @@ async fn serve(opts: Options) -> Fixture {
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
             .with_read_only(opts.read_only)
             .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo"))),
+            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo"))),
     );
     engine.sync(None).await.unwrap();
     // A deterministic embedder, so the neighbours advisory on create and save
@@ -113,7 +111,7 @@ async fn serve(opts: Options) -> Fixture {
     // it does any work, and every write here would look quiet for the wrong
     // reason. No embed worker is wired, so nothing is embedded until a test
     // asks for it with `embed_pending`.
-    engine.set_provider(Arc::new(support::TopicEmbedder));
+    engine.set_provider(Arc::new(crate::support::TopicEmbedder));
 
     let auth = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
@@ -243,8 +241,8 @@ async fn read_alpha(addr: std::net::SocketAddr, session: &(String, String)) -> (
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -297,8 +295,8 @@ async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_created_title_that_will_not_read_back_carries_its_notice() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -344,8 +342,8 @@ async fn a_created_title_that_will_not_read_back_carries_its_notice() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_walks_the_if_match_contract() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -420,8 +418,8 @@ async fn save_walks_the_if_match_contract() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_accepts_a_bare_or_a_versioned_if_match() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -502,8 +500,8 @@ async fn save_accepts_a_bare_or_a_versioned_if_match() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -550,8 +548,8 @@ async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -606,8 +604,8 @@ async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     // The scratch state directory is one per process, so an earlier test's
     // write outlives that test: start from no state at all, which makes
@@ -685,8 +683,8 @@ async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -726,8 +724,8 @@ async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -777,8 +775,8 @@ async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_import_does_not_mark_its_domain_pending() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let before = crystalline_service::maintenance::load();
@@ -828,8 +826,8 @@ async fn an_archive_import_does_not_mark_its_domain_pending() {
 async fn a_body_past_the_limit_is_refused_with_413() {
     // The second leg of this test saves successfully, which marks `eng`
     // pending, so it belongs to the serialized set even though it is not a
-    // maintenance test. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance test. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -1178,8 +1176,8 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retire_move_and_delete_run_through_their_endpoints() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -1295,8 +1293,8 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_move_receipt_names_the_permalink_the_engram_landed_at() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -1360,8 +1358,8 @@ async fn the_move_receipt_names_the_permalink_the_engram_landed_at() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     // Manifest saves are admin, not editor (spec section 5: MANIFEST editing
@@ -1479,7 +1477,7 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
 /// `the_manifest_reads_with_an_etag_and_saves_under_if_match` already pins
 /// for a file domain.
 async fn serve_with_a_virtual_domain() -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -1578,8 +1576,8 @@ async fn serve_with_a_virtual_domain() -> Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve_with_a_virtual_domain().await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     // Reads stay open to any account; the save below is admin-only.
@@ -1681,8 +1679,8 @@ async fn validate_reports_findings_without_writing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proxy_identity_writes_once_it_is_an_editor_carrying_its_token() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options {
         trusted_header: Some("remote-user"),
         ..Options::default()
@@ -2504,7 +2502,7 @@ fn draft_link_routes_are_in_the_write_matrix() {
         "POST /api/v1/draft-links/leave",
     ] {
         assert!(
-            support::MOUNTED_OPERATIONS.contains(&op),
+            crate::support::MOUNTED_OPERATIONS.contains(&op),
             "the router's own operation list carries {op}"
         );
     }
@@ -2567,8 +2565,8 @@ fn request_for(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_write_matrix_holds_on_every_route() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     // Plain instance: role and CSRF rows.
     let fx = serve(Options::default()).await;
     let admin = login(fx.addr, "root", "rootpw").await;
@@ -2708,7 +2706,7 @@ async fn the_write_matrix_holds_on_every_route() {
 }
 
 /// Maps a matrix fixture's concrete path to the template form
-/// `support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
+/// `crate::support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
 /// `/api/v1/domains/eng/engrams/alpha` becomes
 /// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has a fixed
 /// handful of fixture names in play - `eng` the one domain and `scrap` the
@@ -2798,7 +2796,7 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
     // The route is in the matrix at all, which is what keeps it from shipping
     // ungated: the enumeration test below fails by name otherwise.
     assert!(
-        support::MOUNTED_OPERATIONS.contains(&"PUT /api/v1/domains/{domain}/review"),
+        crate::support::MOUNTED_OPERATIONS.contains(&"PUT /api/v1/domains/{domain}/review"),
         "the router's own operation list carries the route"
     );
 
@@ -2912,7 +2910,7 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// The enumeration property: `write_ops()` covers every mutating route this
 /// surface mounts, and nothing else.
 ///
-/// Built from `support::MOUNTED_OPERATIONS` - the same list
+/// Built from `crate::support::MOUNTED_OPERATIONS` - the same list
 /// `openapi_snapshot.rs`'s `the_document_covers_every_mounted_path` already
 /// checks against the served document - rather than a second hand-kept copy.
 /// A route added to the router is forced into that list by the OpenAPI
@@ -2977,7 +2975,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/oauth/token",
     ];
 
-    let mutating: BTreeSet<String> = support::MOUNTED_OPERATIONS
+    let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS
         .iter()
         .filter(|op| {
             op.starts_with("POST ")
@@ -3010,7 +3008,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
 // --- the neighbours advisory on the create and save answers ------------------
 
 /// Two documents about one topic, close in meaning and different in wording.
-/// Under `support::TopicEmbedder` both land on the retry axis, so one is a
+/// Under `crate::support::TopicEmbedder` both land on the retry axis, so one is a
 /// neighbour of the other and a manifest or the alpha fixture is not.
 const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
 const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
@@ -3030,8 +3028,8 @@ fn similar_permalinks(body: &serde_json::Value) -> Vec<&str> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_and_save_answer_with_the_neighbours_advisory() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let eddy = login(fx.addr, "eddy", "eddypw").await;
 
@@ -3159,8 +3157,8 @@ async fn create_and_save_answer_with_the_neighbours_advisory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     // `scrap` gets one retry engram and is then closed under `root`. Eddy is an
     // instance editor and no member of it, so it is not his to see; root is an
@@ -3273,8 +3271,8 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn creating_a_domain_a_stranger_holds_privately_is_a_conflict() {
     // Serialized against every other test here that writes the shared
-    // maintenance state file. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let root = login(fx.addr, "root", "rootpw").await;
     // `set_domain_visibility` requires a live account behind the owner it
@@ -3379,7 +3377,7 @@ async fn creating_a_domain_a_stranger_holds_privately_is_a_conflict() {
 /// against this exact state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_direct_hand_over_works_on_a_registered_domain_a_stranger_holds_privately() {
-    let _serialized = support::maintenance_guard().await;
+    let _serialized = crate::support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let root = login(fx.addr, "root", "rootpw").await;
     fx.auth

@@ -32,8 +32,6 @@ use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
 use crystalline_service::rest::{AuthStore, Role};
 
-mod support;
-
 /// The client id and secret every test configures. The secret is also the
 /// needle the leak assertions look for, so it is deliberately unmistakable in
 /// any body or log line it might turn up in.
@@ -45,8 +43,8 @@ const CLIENT_SECRET: &str = "shhh-this-is-the-oidc-client-secret";
 const LOCAL_PASSWORD: &str = "correct horse battery staple";
 
 /// The first key the fake provider signs with, and the one it rotates to.
-const KEY_ONE: &str = include_str!("fixtures/oidc/test-idp-key.pem");
-const KEY_TWO: &str = include_str!("fixtures/oidc/test-idp-key-2.pem");
+const KEY_ONE: &str = include_str!("../fixtures/oidc/test-idp-key.pem");
+const KEY_TWO: &str = include_str!("../fixtures/oidc/test-idp-key-2.pem");
 
 // --- the fake provider ------------------------------------------------------
 
@@ -1147,7 +1145,7 @@ async fn a_provider_refusal_is_reported_without_echoing_its_words() {
 /// not in a response body, not in a redirect, and not in a log line.
 #[tokio::test]
 async fn the_client_secret_never_reaches_a_response_or_a_log() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
 
@@ -1556,7 +1554,7 @@ async fn every_callback_answer_is_uncacheable() {
 /// provider that puts them in the token is never asked.
 #[tokio::test]
 async fn presentation_claims_missing_from_the_id_token_are_filled_from_userinfo() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
 
@@ -1601,7 +1599,7 @@ async fn a_userinfo_answer_for_another_subject_refuses_the_sign_in() {
 /// token's `(issuer, subject)`, and that is already in hand.
 #[tokio::test]
 async fn an_unreachable_userinfo_endpoint_does_not_block_the_sign_in() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let idp = FakeIdp::start().await;
     idp.point_userinfo_at_a_dead_port().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
@@ -1633,7 +1631,7 @@ async fn an_unreachable_userinfo_endpoint_does_not_block_the_sign_in() {
 /// state, no code, no nonce, no token, no secret, no claim value.
 #[tokio::test]
 async fn a_refused_callback_warns_the_operator_and_leaks_nothing() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
     idp.lie_about_the_token_issuer("https://evil.example");

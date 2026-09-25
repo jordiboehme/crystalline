@@ -10,9 +10,7 @@
 
 use std::collections::BTreeSet;
 
-mod support;
-
-use support::MOUNTED_OPERATIONS;
+use crate::support::MOUNTED_OPERATIONS;
 
 /// Where the committed snapshot lives, as an absolute path, for the writer.
 const SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/openapi/fluid-v1.json");
@@ -34,7 +32,7 @@ fn generated() -> String {
 /// is being pinned.
 #[test]
 fn openapi_snapshot_is_current() {
-    let committed = include_str!("../openapi/fluid-v1.json");
+    let committed = include_str!("../../openapi/fluid-v1.json");
     assert_eq!(
         generated().trim(),
         committed.trim(),

@@ -13,12 +13,13 @@ max-threads = 4
 
 [[profile.default.overrides]]
 filter = '''
-    package(crystalline-remote) & (binary(github_client) | binary(github_auth))
-    | package(crystalline-service) & (binary(collab_ws) | binary(rest_draft_links) | binary(rest_admin_api)
-        | binary(rest_api) | binary(rest_evolve) | binary(rest_files)
-        | binary(rest_setup_api) | binary(rest_write_api) | binary(ui_serving)
-        | binary(oidc) | binary(oauth))
-    | package(crystalline) & binary(service)
+    (package(crystalline-remote) & (binary(github_client) | binary(github_auth)))
+    | (package(crystalline-service) & (
+        binary(collab_ws)
+        | (binary(rest_admin) & test(/^(rest_admin_api|rest_draft_links|rest_write_api)::/))
+        | (binary(rest) & test(/^(rest_api|rest_evolve|rest_files|rest_setup_api|ui_serving)::/))
+        | (binary(auth) & test(/^(oauth|oidc)::/))))
+    | (package(crystalline) & binary(service))
 '''
 test-group = 'forge-wire'
 

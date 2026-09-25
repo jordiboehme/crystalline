@@ -17,8 +17,6 @@
 //! HTTP leg posts raw JSON-RPC at the daemon's own router with the era's
 //! `_meta` and standard headers, exactly as `tests/mcp_modern_era.rs` does.
 
-mod support;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -894,12 +892,12 @@ async fn a_draft_attachment_is_a_resource_for_its_author_and_unknown_to_everybod
         .await
         .unwrap();
 
-    let alice = support::McpTestSession::open(
+    let alice = crate::support::McpTestSession::open(
         &h.addr,
         Some(&h.auth.issue_mcp_token("alice", "t").await.unwrap().token),
     )
     .await;
-    let bob = support::McpTestSession::open(
+    let bob = crate::support::McpTestSession::open(
         &h.addr,
         Some(&h.auth.issue_mcp_token("bob", "t").await.unwrap().token),
     )

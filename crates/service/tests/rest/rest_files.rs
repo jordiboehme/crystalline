@@ -14,11 +14,9 @@
 //! walked per route rather than assumed from the router, because a wildcard route
 //! is exactly the shape that gets registered below a guard by accident.
 //!
-//! Every fixture holds a [`support::ScratchStateDir`]: an attachment write marks
+//! Every fixture holds a [`crate::support::ScratchStateDir`]: an attachment write marks
 //! its domain pending in the maintenance state file, which lives under the state
 //! directory, so a run must never reach the developer's own.
-
-mod support;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -68,7 +66,7 @@ struct Fixture {
     /// Held for the test's duration: an attachment write marks its domain
     /// pending in the maintenance state file, and this redirects the state
     /// directory into a scratch home so nothing here reaches the developer's.
-    _state: support::ScratchStateDir,
+    _state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
@@ -91,7 +89,7 @@ fn write_manifest(dir: &std::path::Path, name: &str) {
 /// attachment that was only ever uploaded through this API would leave them with
 /// nothing to fetch.
 async fn serve(opts: Options) -> Fixture {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -281,7 +279,7 @@ async fn an_upload_round_trips_with_the_security_headers() {
     assert_eq!(body["path"], "assets/deep/diagram.png");
     assert_eq!(body["mime"], "image/png");
     assert_eq!(body["size"], PNG.len());
-    assert_eq!(body["sha256"], support::sha256_hex(PNG));
+    assert_eq!(body["sha256"], crate::support::sha256_hex(PNG));
 
     // The bytes really landed under the domain root, in a subfolder the upload
     // created.
@@ -303,7 +301,7 @@ async fn an_upload_round_trips_with_the_security_headers() {
     assert_eq!(header(&resp, "content-type"), "image/png");
     assert_eq!(
         header(&resp, "etag"),
-        format!("\"{}\"", support::sha256_hex(PNG)),
+        format!("\"{}\"", crate::support::sha256_hex(PNG)),
         "the ETag is the strong quoted sha256 of the bytes served"
     );
     assert_eq!(header(&resp, "x-content-type-options"), "nosniff");
@@ -327,7 +325,7 @@ async fn an_upload_round_trips_with_the_security_headers() {
 async fn a_matching_if_none_match_is_answered_304_with_no_body() {
     let fx = serve(Options::default()).await;
     let viewer = login(fx.addr, "vera", "verapw").await;
-    let etag = format!("\"{}\"", support::sha256_hex(PNG));
+    let etag = format!("\"{}\"", crate::support::sha256_hex(PNG));
 
     let resp = as_session(
         fx.addr,
@@ -594,7 +592,7 @@ async fn the_listing_is_complete_and_ordered() {
     let row = &listing.as_array().unwrap()[2];
     assert_eq!(row["mime"], "image/png");
     assert_eq!(row["size"], PNG.len());
-    assert_eq!(row["sha256"], support::sha256_hex(PNG));
+    assert_eq!(row["sha256"], crate::support::sha256_hex(PNG));
     assert!(
         !row["modified"].as_str().unwrap().is_empty(),
         "every row carries its modification instant: {row}"
@@ -674,7 +672,7 @@ async fn a_virtual_domain_round_trips_the_bytes() {
     .await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["sha256"], support::sha256_hex(PPTX));
+    assert_eq!(body["sha256"], crate::support::sha256_hex(PPTX));
 
     let resp = as_session(
         fx.addr,

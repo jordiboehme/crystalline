@@ -34,11 +34,10 @@
 //! 2026-07-28 past it. Asserted rather than assumed below, because it is the
 //! deployment fact an operator behind a load balancer needs.
 
-mod support;
-
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::support::MockProvider;
 use crystalline_core::config::{
     DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
 };
@@ -47,7 +46,6 @@ use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
 use crystalline_service::mcp::McpServer;
 use serde_json::{Value, json};
-use support::MockProvider;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -4247,12 +4245,12 @@ struct ReviewInstance {
     /// her and write nothing.
     viewer_bearer: String,
     path: String,
-    _scratch: support::ScratchStateDir,
+    _scratch: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve_review_instance() -> ReviewInstance {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
@@ -4710,7 +4708,7 @@ async fn an_era_meta_call_naming_a_legacy_revision_is_stateless_on_a_minted_sess
     // claimed for bob. Both halves of the ownership clause hold.
     let opened = post_as_at(
         fx.addr,
-        &support::initialize_body_as("dual-era-client"),
+        &crate::support::initialize_body_as("dual-era-client"),
         "initialize",
         None,
         &fx.bearer,
@@ -4871,7 +4869,7 @@ async fn a_legacy_sessions_draft_join_ends_when_the_transport_ends_the_session()
     // The legacy handshake, which is the only shape that gets a session.
     let opened = post_as_at(
         fx.addr,
-        &support::initialize_body_as("legacy-join-test"),
+        &crate::support::initialize_body_as("legacy-join-test"),
         "initialize",
         None,
         &fx.bearer,

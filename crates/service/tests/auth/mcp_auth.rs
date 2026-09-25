@@ -19,9 +19,7 @@
 //! session to the identity that opened it and refuses anyone else who names it.
 //! Two accounts that both hold valid tokens are still two accounts.
 
-mod support;
-
-use support::{McpTestSession, initialize_body_as, raw_post};
+use crate::support::{McpTestSession, initialize_body_as, raw_post};
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -273,7 +271,7 @@ async fn serve_personal_share_with_mcp_auth()
     };
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
 
-    let mock = Arc::new(support::MockProvider::new());
+    let mock = Arc::new(crate::support::MockProvider::new());
     let commit = mock.add_commit(
         [(
             "MANIFEST.md".to_string(),

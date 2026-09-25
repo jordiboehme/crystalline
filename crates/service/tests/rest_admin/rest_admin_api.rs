@@ -4,12 +4,10 @@
 //!
 //! A fresh, smaller fixture rather than a share of `rest_write_api.rs`'s: the
 //! engine here is built with the token store pinned into the temp dir and a
-//! stub [`support::StubConnectAuth`], so nothing in this suite can read, write
+//! stub [`crate::support::StubConnectAuth`], so nothing in this suite can read, write
 //! or delete the developer's real GitHub credential, and `github.enabled` is
 //! a per-test option because the settings screen's own contract is that
 //! connecting turns the feature on.
-
-mod support;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -51,7 +49,7 @@ struct Options {
     /// The forge a team-domain registration downloads from. Set for the
     /// github-mode tests so nothing here dials github.com; unset means no
     /// override, which is fine for every test that never reaches a provider.
-    origin_provider: Option<Arc<support::MockProvider>>,
+    origin_provider: Option<Arc<crate::support::MockProvider>>,
     /// `github.api_url`, for the one test that needs REAL credential
     /// resolution (the injected provider above short-circuits it) and so has
     /// to point the built client at a local stand-in rather than at
@@ -71,12 +69,12 @@ struct Fixture {
     /// archive import carrying one) marks its domain pending in the
     /// maintenance state file, and this redirects the state directory into a
     /// scratch home so nothing here reaches the developer's own.
-    _state: support::ScratchStateDir,
+    _state: crate::support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve(opts: Options) -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let state = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -153,7 +151,7 @@ async fn serve(opts: Options) -> Fixture {
     let store = TursoStore::open_in_memory().await.unwrap();
     let connect_auth: Arc<dyn ConnectAuth> = opts
         .connect_auth
-        .unwrap_or_else(|| Arc::new(support::StubConnectAuth::accepting("octo")));
+        .unwrap_or_else(|| Arc::new(crate::support::StubConnectAuth::accepting("octo")));
     // Both overrides are load-bearing, not tidiness: without the token-store
     // dir a disconnect here would delete the developer's REAL keychain GitHub
     // token, and without the stub a connect would dial github.com.
@@ -374,7 +372,7 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
 /// on-disk folder to match - the very thing the name check exists to stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_team_domain_registers_under_the_trimmed_name() {
-    let mock = Arc::new(support::MockProvider::new());
+    let mock = Arc::new(crate::support::MockProvider::new());
     let commit = mock.add_commit(std::collections::BTreeMap::from([(
         "MANIFEST.md".to_string(),
         b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n".to_vec(),
@@ -442,7 +440,7 @@ async fn a_team_domain_registers_under_the_trimmed_name() {
 /// move branches and read what was proposed. The registered domain's working
 /// tree lands under the server's domains root:
 /// `fx._tmp.path().join("domains-root/kb")`.
-async fn serve_team_with_mock() -> (Fixture, Arc<support::MockProvider>) {
+async fn serve_team_with_mock() -> (Fixture, Arc<crate::support::MockProvider>) {
     serve_team_with_mock_sharing(false).await
 }
 
@@ -457,7 +455,9 @@ const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: m
 /// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
 /// `personal` makes a share run as the acting account's own GitHub identity,
 /// which is the mode the share routes accept an editor in.
-async fn serve_team_with_mock_sharing(personal: bool) -> (Fixture, Arc<support::MockProvider>) {
+async fn serve_team_with_mock_sharing(
+    personal: bool,
+) -> (Fixture, Arc<crate::support::MockProvider>) {
     serve_team_with_mock_manifest(personal, KB_MANIFEST).await
 }
 
@@ -467,8 +467,8 @@ async fn serve_team_with_mock_sharing(personal: bool) -> (Fixture, Arc<support::
 async fn serve_team_with_mock_manifest(
     personal: bool,
     manifest: &[u8],
-) -> (Fixture, Arc<support::MockProvider>) {
-    let mock = Arc::new(support::MockProvider::new());
+) -> (Fixture, Arc<crate::support::MockProvider>) {
+    let mock = Arc::new(crate::support::MockProvider::new());
     let commit = mock.add_commit(std::collections::BTreeMap::from([
         ("MANIFEST.md".to_string(), manifest.to_vec()),
         (
@@ -2687,7 +2687,7 @@ async fn the_device_flow_polls_over_get_and_reports_failure_once() {
     // The gate is load-bearing: start_device_connect SPAWNS the flow task,
     // so an instantly-failing stub could land (and clear) the outcome
     // before the 202 body is even read.
-    let (auth, release) = support::StubConnectAuth::denying("authorization denied");
+    let (auth, release) = crate::support::StubConnectAuth::denying("authorization denied");
     let fx = serve(Options {
         github: true,
         connect_auth: Some(std::sync::Arc::new(auth)),
@@ -2946,8 +2946,8 @@ async fn an_account_name_that_cannot_hold_an_identity_is_taught_at_connect_time(
 async fn one_device_sign_in_runs_at_a_time_and_lands_in_its_own_slot() {
     // The run arm blocks on the stub's gate until this test releases it, so
     // the "still waiting on the user" state is observable before it lands.
-    let auth = support::fake_auth(
-        Ok(support::device_flow_start()),
+    let auth = crate::support::fake_auth(
+        Ok(crate::support::device_flow_start()),
         Ok("device-issued-token".to_string()),
         Ok("octo".to_string()),
     );

@@ -16,8 +16,6 @@
 //! declared routes, the embedded bundle and the MCP transport - is pinned end
 //! to end rather than per function.
 
-#![cfg(feature = "fluid-ui")]
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 

@@ -2,8 +2,6 @@
 //! saver pass takes `now`, so a debounce window is a value rather than a wait.
 //! Every assertion is about what reaches the file and what the room is told.
 
-mod support;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,8 +37,12 @@ fn write_manifest(dir: &std::path::Path, name: &str) {
 /// `oak` holding MANIFEST and one note - synced into an in-memory store.
 /// Mirrors `collab_session.rs::engine_fixture`; integration test crates share
 /// no helpers, so it is copied rather than imported.
-async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
-    let scratch = support::ScratchStateDir::acquire();
+async fn engine_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -781,7 +783,7 @@ async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
 /// below.
 #[tokio::test]
 async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -853,8 +855,12 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
 
 /// A reviewing domain's room over one actor's overlay document: its text is
 /// that actor's draft, and its save is a draft of theirs.
-async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
-    let scratch = support::ScratchStateDir::acquire();
+async fn review_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();

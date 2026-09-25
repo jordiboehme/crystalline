@@ -13,8 +13,6 @@
 //! invisibly, and with no cookie jar, so a browser's cookies are carried by
 //! hand and a client's requests provably carry none.
 
-mod support;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -2647,7 +2645,7 @@ async fn a_foreign_resource_at_exchange_is_invalid_target_and_an_unknown_client_
 /// which client caused it, and that is exactly what is there.
 #[tokio::test]
 async fn token_answers_are_uncacheable_and_carry_no_secret_in_a_log() {
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let ctx = OauthCtx::start().await;
     ctx.create_user("ada", Role::Editor).await;
     let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
