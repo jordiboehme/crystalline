@@ -2,7 +2,10 @@
  * The optics heroes' shape tests: what `heroModels.test.ts` does not check
  * for every kind. The laser desk's catalogue top lies on an upward face of
  * its mesh and stays clear, the slab keeps its 1 : 4 : 9, the turret's eye
- * looks out of its front, and the laser's lens hangs over the chair's seat.
+ * looks out of its front and a seam splits its shell, the eye panel is a
+ * portrait plate with a small dot at the middle of its lens, the photo
+ * console's picture leans back, and the laser's lens hangs over the
+ * chair's seat.
  */
 
 import { describe, expect, it } from "vitest";
@@ -13,6 +16,7 @@ import { CELL } from "../../../world/units";
 import {
   blinkFlag,
   createBuilder,
+  FLAG,
   type MeshData,
   type V3,
 } from "../../geometry";
@@ -181,5 +185,58 @@ describe("optics hero models", () => {
     const [sa, sd] = centre(local(seat));
     expect(Math.hypot(la - sa, ld - sd)).toBeLessThan(0.25);
     expect(lh).toBeGreaterThan(s1);
+  });
+
+  it("splits the turret's shell with a seam down its front", () => {
+    const seams = partsOf("turret").filter((p) => {
+      const ps = local(p);
+      const b = bounds(ps);
+      return (
+        p.flag === FLAG.lit &&
+        Math.max(Math.abs(b.lo[0]), Math.abs(b.hi[0])) < 0.006 &&
+        b.hi[1] > 0.27 &&
+        b.lo[2] < 0.45
+      );
+    });
+    expect(seams.length).toBeGreaterThan(0);
+  });
+
+  it("the eye panel is a portrait plate with a small dot in the middle of its lens", () => {
+    const parts = partsOf("eye-panel");
+    const plate = one(parts.filter((p) => p.method === "bevelBox"));
+    const b = bounds(local(plate));
+    const ratio = (b.hi[2] - b.lo[2]) / (b.hi[0] - b.lo[0]);
+    expect(ratio).toBeGreaterThan(2.8);
+    expect(ratio).toBeLessThan(3.2);
+    const eye = parts.filter((p) => p.flag === blinkFlag(0)).map(local);
+    const mids = eye.map(centre);
+    for (const m of mids) {
+      expect(m[0]).toBeCloseTo(mids[0]?.[0] ?? NaN, 6);
+      expect(m[2]).toBeCloseTo(mids[0]?.[2] ?? NaN, 6);
+    }
+    const front = eye.reduce((f, p) =>
+      bounds(p).hi[1] > bounds(f).hi[1] ? p : f,
+    );
+    const fb = bounds(front);
+    expect(fb.hi[0] - fb.lo[0]).toBeLessThan(0.05);
+  });
+
+  it("the photo console's picture leans back", () => {
+    const glows = partsOf("photo-console")
+      .filter((p) => p.flag === FLAG.emissive)
+      .map(local);
+    const picture = glows.reduce((f, p) => {
+      const area = (q: V3[]) => {
+        const b = bounds(q);
+        return (b.hi[0] - b.lo[0]) * (b.hi[2] - b.lo[2]);
+      };
+      return area(p) > area(f) ? p : f;
+    });
+    const b = bounds(picture);
+    const dAt = (h: number) =>
+      Math.max(
+        ...picture.filter((q) => Math.abs(q[2] - h) < 0.01).map((q) => q[1]),
+      );
+    expect(dAt(b.lo[2]) - dAt(b.hi[2])).toBeGreaterThan(0.05);
   });
 });

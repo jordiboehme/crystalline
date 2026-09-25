@@ -26,6 +26,7 @@
 import type { HeroKind } from "../../../world/types";
 import type { Surface } from "../../geometry";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
+import { LAYER } from "../../layers";
 import type { Rgb } from "../../looks";
 import {
   discOutline,
@@ -38,7 +39,13 @@ import {
 import { heroHalf, type HeroRecipe } from "./common";
 
 /** The turret's shell: a clean glossy white, the same in every look. */
-const WHITE_SHELL: Rgb = [0.93, 0.93, 0.9];
+const WHITE_SHELL: Rgb = [0.92, 0.92, 0.9];
+
+/**
+ * The turret's black trim: its legs, hub, seam, eye socket and the gaps
+ * round its side panels, a near black with a hint of blue.
+ */
+const TURRET_BLACK: Rgb = [0.12, 0.12, 0.13];
 
 /**
  * A deep warning red, for every red light here: the lenses, the laser's
@@ -46,11 +53,44 @@ const WHITE_SHELL: Rgb = [0.93, 0.93, 0.9];
  */
 const SIGNAL_RED: Rgb = [1.0, 0.1, 0.06];
 
-/** The slab's finish: near black, matte (lit, so it still takes a faint edge). */
-const SLAB_BLACK: Rgb = [0.02, 0.02, 0.025];
+/** The slab's finish: a flat matte black (lit, so it still takes a faint edge). */
+const SLAB_BLACK: Rgb = [0.02, 0.02, 0.02];
 
-/** The photo console's screen: a sepia grey, an old print under glass. */
-const SEPIA_GREY: Rgb = [0.62, 0.56, 0.46];
+/**
+ * The eye panel's face: a warm brushed metal, champagne rather than
+ * steel, drawn on the metal layer so its grain shows.
+ */
+const FACEPLATE_CHAMPAGNE: Rgb = [0.75, 0.7, 0.6];
+
+/** The eye panel's round bezel, name badge and grille backing: a deep black. */
+const BEZEL_BLACK: Rgb = [0.05, 0.05, 0.055];
+
+/** The eye panel's grille slats: a plain brushed aluminium. */
+const GRILLE_GREY: Rgb = [0.55, 0.55, 0.57];
+
+/** The small bright dot in the middle of the eye panel's lens. */
+const LENS_YELLOW: Rgb = [1.0, 0.85, 0.25];
+
+/** The blue field on the right of the eye panel's blank name badge. */
+const BADGE_BLUE: Rgb = [0.16, 0.32, 0.72];
+
+/** The photo console's casing: an old cream plastic, gone warm with age. */
+const CASING_CREAM: Rgb = [0.84, 0.79, 0.66];
+
+/** The photo console's base, cheeks and knobs: a dark brown, like old wood-effect trim. */
+const CASING_BROWN: Rgb = [0.24, 0.16, 0.1];
+
+/** The photo console's picture: a cold grey blue, a still under a scanning tube. */
+const SCREEN_GREY_BLUE: Rgb = [0.44, 0.54, 0.62];
+
+/** The photo console's grid lines over the picture: a paler blue. */
+const SCREEN_GRID: Rgb = [0.72, 0.82, 0.9];
+
+/** The laser's barrel and nose: a matte black. */
+const LASER_BLACK: Rgb = [0.07, 0.07, 0.08];
+
+/** The laser rig's column, arm and foot: an industrial off-white grey. */
+const RIG_GREY: Rgb = [0.65, 0.65, 0.63];
 
 /** The laser desk's monitor: a dark cyan glow, a terminal late at night. */
 const DARK_CYAN: Rgb = [0.1, 0.42, 0.48];
@@ -198,48 +238,131 @@ export function officeChair(
 /**
  * The turret's measures, in metres: the legs' hub and foot ends (`[d, h]`
  * in a leg's own side view, the foot's `d` measured in from the box's
- * edge), their width, the foot pads, the hub, the egg's profile
- * (`[r, h]`, widest at 0.85), the seam ring's height and radius, and the
- * eye: its height, its plane (`d`, just proud of the shell at the lens's
- * foot), its socket's back and radius, and the lens radius.
+ * edge), their width, the foot pads and the hub; the egg's profile
+ * (`[r, h]`, a flat-ish base, widest at the shoulders near h 1.0) and its
+ * facets; the vertical seam (how far it stands proud of the shell, the
+ * share of the radius its inner edge keeps, its half thickness and its
+ * foot); the side panels' seams (their foot and head, and the yaw of the
+ * two planes they lie in, a lathe corner's multiple so they ride ridges);
+ * and the eye: its height, its plane (`d`, just proud of the
+ * shell), its socket's back and radius, and the lens radius.
  */
 const TURRET = {
-  legHub: [0.03, 0.56],
+  legHub: [0.03, 0.42],
   legFootIn: 0.06,
   legFootH: 0.03,
-  legWidth: 0.035,
-  pad: { r: 0.045, h: 0.03 },
-  hub: { r: 0.07, h0: 0.48, h1: 0.6 },
+  legWidth: 0.03,
+  pad: { r: 0.04, h: 0.03 },
+  hub: { r: 0.06, h0: 0.36, h1: 0.46 },
   egg: [
-    [0, 0.5],
-    [0.14, 0.53],
-    [0.22, 0.6],
-    [0.275, 0.7],
-    [0.3, 0.85],
-    [0.285, 0.98],
-    [0.25, 1.08],
-    [0.19, 1.17],
-    [0.11, 1.25],
+    [0, 0.38],
+    [0.1, 0.39],
+    [0.17, 0.44],
+    [0.215, 0.53],
+    [0.25, 0.66],
+    [0.27, 0.82],
+    [0.276, 0.98],
+    [0.26, 1.1],
+    [0.215, 1.2],
+    [0.14, 1.27],
     [0, 1.3],
   ],
-  eggSides: 10,
-  seam: { h: 0.92, r: 0.29, tube: 0.012 },
-  eye: { h: 1.02, d: 0.285, socketBack: 0.15, socketR: 0.09, r: 0.06 },
+  eggSides: 12,
+  seam: { out: 0.008, inner: 0.9, half: 0.005, h0: 0.4, apex: 1.285 },
+  pod: { h0: 0.52, h1: 1.16, yaw: Math.PI / 3 },
+  eye: { h: 1.04, d: 0.27, socketBack: 0.15, socketR: 0.09, r: 0.06 },
 } as const;
 
+/** The turret egg's radius at height `h`, read off its profile by straight lines. */
+function eggRadius(h: number): number {
+  const p = TURRET.egg;
+  for (let i = 0; i + 1 < p.length; i++) {
+    const [r0, h0] = p[i] ?? [0, 0];
+    const [r1, h1] = p[i + 1] ?? [0, 0];
+    if (h >= h0 && h <= h1) return r0 + ((h - h0) * (r1 - r0)) / (h1 - h0);
+  }
+  return 0;
+}
+
 /**
- * The turret: a white egg on three thin splayed legs, with one red eye.
- * The legs run from a dark hub under the egg (h 0.55) out to near the
- * box's edge on the floor, 120 degrees apart with one pointing back
- * (`-d`), each a `tiltedBar` in a yawed frame's side view on a small foot
- * pad. The egg is a 10-sided lathe from h 0.5 to 1.3, widest (r 0.3) at
- * h 0.85, with a dark seam ring at h 0.92. The eye sits in a dark socket
- * on the front at h 1.02, its plane just proud of the shell at the lens's
- * foot (the shell leans back above it, so the socket shows there): a red
- * `lens` of r 0.06, blink group 0, which the breathe bank pulses slowly.
+ * The turret's vertical seam as two outlines in the side view (`[d, h]`),
+ * to push a hair across the plane `a = 0`: `below`, on the front from the
+ * seam's foot up to the eye socket, and `over`, from the socket's top up
+ * over the crown and down the back to the foot. Each is a band whose outer
+ * edge stands `seam.out` proud of the egg (pushed out sideways only, so the
+ * crown stays at the top) and whose inner edge lies inside the shell. The
+ * lathe puts a corner on `+d` and `-d`, so the band rides that ridge.
+ */
+function seamOutlines(): {
+  below: [number, number][];
+  over: [number, number][];
+} {
+  const { seam, eye, egg } = TURRET;
+  const crown = egg[egg.length - 1]?.[1] ?? 0;
+  const neck = egg[egg.length - 2]?.[1] ?? 0;
+  const heights = (h0: number, h1: number) => [
+    h0,
+    ...egg.map(([, h]) => h).filter((h) => h > h0 && h < h1),
+    h1,
+  ];
+  const out = (h: number) => eggRadius(h) + seam.out;
+  const inn = (h: number) => eggRadius(h) * seam.inner;
+  const lo = eye.h - eye.socketR;
+  const hi = eye.h + eye.socketR;
+  const below = seamBand(seam.h0, lo, 1);
+  const over: [number, number][] = [
+    ...heights(hi, crown).map((h): [number, number] => [out(h), h]),
+    ...heights(seam.h0, crown)
+      .reverse()
+      .map((h): [number, number] => [-out(h), h]),
+    ...heights(seam.h0, neck).map((h): [number, number] => [-inn(h), h]),
+    [0, seam.apex],
+    ...heights(hi, neck)
+      .reverse()
+      .map((h): [number, number] => [inn(h), h]),
+  ];
+  return { below, over };
+}
+
+/**
+ * A straight run of the turret's seam in the side view (`[d, h]`), from
+ * `h0` up to `h1` on the `+d` face (`side` 1) or the `-d` face (`side`
+ * -1): a band whose outer edge stands `seam.out` proud of the egg and
+ * whose inner edge lies inside the shell, pushed across a plane through
+ * the egg's axis.
+ */
+function seamBand(h0: number, h1: number, side: 1 | -1): [number, number][] {
+  const { seam, egg } = TURRET;
+  const hs = [h0, ...egg.map(([, h]) => h).filter((h) => h > h0 && h < h1), h1];
+  return [
+    ...hs.map((h): [number, number] => [side * (eggRadius(h) + seam.out), h]),
+    ...[...hs]
+      .reverse()
+      .map((h): [number, number] => [side * eggRadius(h) * seam.inner, h]),
+  ];
+}
+
+/**
+ * The turret: a glossy white egg on three thin black legs, with one red
+ * eye.
+ * - The legs run from a black hub under the egg (h 0.42) out to near the
+ *   box's edge on the floor, 120 degrees apart with one pointing back
+ *   (`-d`), each a `tiltedBar` in a yawed frame's side view on a small
+ *   foot pad.
+ * - The egg is a 12-sided lathe from h 0.38 to 1.3 with a flat-ish base,
+ *   widest (r 0.276) at the shoulders near h 1.0.
+ * - A thin black seam splits it front to back in the plane `a = 0`, over
+ *   the crown and down both faces, broken only by the eye socket.
+ * - Two more seams on each side, 60 and 120 degrees round from the front
+ *   and running from h 0.52 to 1.16, mark off a side panel on `+a` and on
+ *   `-a`, so the sides look as if they could swing open.
+ * - The eye sits high on the front (h 1.04) in a black socket: a red
+ *   `lens` of r 0.06, blink group 0, which the breathe bank pulses slowly.
  */
 const turret: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const T = TURRET;
+  const black = s.tinted(TURRET_BLACK);
+  const white = s.tinted(WHITE_SHELL);
   const { d1 } = heroHalf(kind, variant);
   const [d0, h0] = T.legHub;
   const [dF, hF] = [d1 - T.legFootIn, T.legFootH];
@@ -253,27 +376,42 @@ const turret: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const half = T.legWidth / 2;
   for (const yaw of [Math.PI, Math.PI / 3, -Math.PI / 3]) {
     const fl = yawed(ORIGIN, 0, 0, yaw);
-    profileAlong(kitAt, fl, leg, -half, half, s.dark);
-    kitAt(fl).cylinder(0, dF, 0, T.pad.h, T.pad.r, 8, s.dark);
+    profileAlong(kitAt, fl, leg, -half, half, black);
+    kitAt(fl).cylinder(0, dF, 0, T.pad.h, T.pad.r, 8, black);
   }
-  k.cylinder(0, 0, T.hub.h0, T.hub.h1, T.hub.r, 10, s.dark);
-  k.lathe(0, 0, T.egg, T.eggSides, s.tinted(WHITE_SHELL));
-  k.ring(0, 0, T.seam.h, T.seam.r, T.seam.tube, 4, 20, s.dark, "up");
+  k.cylinder(0, 0, T.hub.h0, T.hub.h1, T.hub.r, 10, black);
+  k.lathe(0, 0, T.egg, T.eggSides, white);
+  const { below, over } = seamOutlines();
+  for (const band of [below, over])
+    profileAlong(kitAt, ORIGIN, band, -T.seam.half, T.seam.half, black);
+  const P = T.pod;
+  for (const yaw of [P.yaw, -P.yaw]) {
+    const fp = yawed(ORIGIN, 0, 0, yaw);
+    for (const side of [1, -1] as const)
+      profileAlong(
+        kitAt,
+        fp,
+        seamBand(P.h0, P.h1, side),
+        -T.seam.half,
+        T.seam.half,
+        black,
+      );
+  }
   const e = T.eye;
   k.extrude(
     discOutline(0, e.h, e.socketR, LENS_SIDES),
     e.socketBack,
     e.d,
-    s.dark,
+    black,
   );
   lens(k, s, 0, e.d, e.h, e.r, SIGNAL_RED, 0);
 };
 
 /**
  * The black slab: one plain box over the whole footprint from the floor
- * to its top, 1 : 4 : 9 (0.3 by 1.2 by 2.7 m), near black and lit. No
- * bevel and no light: its crisp edges are the whole of it. Every measure
- * is the catalogue's, so it needs no table.
+ * to its top, exactly 1 : 4 : 9 (0.3 by 1.2 by 2.7 m), a flat matte black
+ * and lit. No bevel, no seam, no light: its crisp edges are the whole of
+ * it. Every measure is the catalogue's, so it needs no table.
  */
 const blackSlab: HeroRecipe = ({ k, s, variant, kind }) => {
   const { hw, d0, d1, top } = heroHalf(kind, variant);
@@ -281,89 +419,153 @@ const blackSlab: HeroRecipe = ({ k, s, variant, kind }) => {
 };
 
 /**
- * The eye panel's measures, in metres: the panel's inset from the
- * footprint's sides, its depth, bottom and the dark face's depth; the
- * lens housing's height, barrel radius, rim ring (`d` of its middle,
- * radius and tube, its front at 0.2) and the lens radius; the grille's
- * six bars (lowest bottom, pitch, height, half width) and the name plate.
+ * The eye panel's measures, in metres: the faceplate's half width, depth
+ * and bottom (a portrait plate of about 3 : 1, 0.6 by 1.8 m); the blank
+ * name badge at the top (half width, heights, depth, its blue field's `a`
+ * range, lift and inset); the eye (its height, the black bezel disc's
+ * radius and depth, the lens radius, the red dome's radius and how far it
+ * stands out of the bezel, the yellow centre dot's radius and reach); and
+ * the grille (half width, heights, backing depth, the slats' count, first
+ * height, pitch, height and depth).
  */
 const EYE_PANEL = {
-  inset: 0.05,
-  depth: 0.08,
+  half: 0.3,
+  depth: 0.05,
   bottom: 0.4,
-  face: 0.09,
-  eye: {
-    h: 1.35,
-    barrelR: 0.15,
-    rimD: 0.17,
-    rimR: 0.13,
-    rimTube: 0.03,
-    r: 0.09,
+  badge: {
+    half: 0.17,
+    h0: 1.98,
+    h1: 2.07,
+    depth: 0.012,
+    blue: [0.06, 0.155],
+    lift: 0.004,
+    inset: 0.014,
   },
-  grille: { h0: 0.8, pitch: 0.055, h: 0.025, half: 0.2 },
-  plate: { half: 0.22, h0: 1.7, h1: 1.8 },
+  eye: {
+    h: 1.62,
+    bezelR: 0.26,
+    bezel: 0.03,
+    r: 0.14,
+    domeR: 0.085,
+    domeOut: 0.075,
+    dotR: 0.02,
+    dotOut: 0.085,
+  },
+  grille: {
+    half: 0.16,
+    h0: 0.78,
+    h1: 1.2,
+    back: 0.008,
+    slats: 7,
+    first: 0.8,
+    pitch: 0.06,
+    slat: 0.028,
+    slatDepth: 0.008,
+  },
 } as const;
 
 /**
- * The eye panel, flush on its wall: a tall brushed-metal panel (d 0 to
- * 0.08, h 0.4 to the top, the width less 0.05 each side) with a dark inset
- * face, a round metal lens housing standing out to d 0.2 at h 1.35 with a
- * red `lens` (r 0.09, blink group 0) in it, a speaker grille of six thin
- * bars from h 0.8 to 1.1, a blank name plate at h 1.75 and four bolts.
+ * The eye panel, flush on its wall: a tall portrait faceplate of warm
+ * brushed metal (d 0 to 0.05, h 0.4 to the top, 0.6 m wide), and on it,
+ * from the top down:
+ * - a blank black name badge with a blue field on its right, no text;
+ * - the eye, high on the plate (h 1.62): a black round bezel disc, a red
+ *   `lens` (r 0.14) in it, a smaller red dome standing out of the lens
+ *   like a fisheye's glass, and a small yellow dot at its very middle, all
+ *   in blink group 0 so the whole eye breathes as one;
+ * - a speaker grille of seven aluminium slats on a black backing.
  */
 const eyePanel: HeroRecipe = ({ k, s, variant, kind }) => {
   const P = EYE_PANEL;
-  const { hw, top } = heroHalf(kind, variant);
-  const pw = hw - P.inset;
-  const face = P.face;
-  k.bevelBox(-pw, pw, 0, P.depth, P.bottom, top, HOUSING_BEVEL, s.metal);
-  k.box(
-    -pw + 0.06,
-    pw - 0.06,
-    P.depth,
+  const { top } = heroHalf(kind, variant);
+  const face = P.depth;
+  const black = s.tinted(BEZEL_BLACK);
+  k.bevelBox(
+    -P.half,
+    P.half,
+    0,
     face,
-    P.bottom + 0.1,
-    top - 0.1,
-    s.dark,
+    P.bottom,
+    top,
+    HOUSING_BEVEL,
+    s.tinted(FACEPLATE_CHAMPAGNE, LAYER.metal),
   );
-  for (const a of [-pw + 0.03, pw - 0.03])
-    for (const h of [P.bottom + 0.05, top - 0.05])
-      k.box(a - 0.015, a + 0.015, P.depth, face, h - 0.015, h + 0.015, s.dark);
-  // The housing: a short metal barrel with a rim ring whose front is at 0.2.
+  const b = P.badge;
+  const [blue0, blue1] = b.blue;
+  k.box(-b.half, b.half, face, face + b.depth, b.h0, b.h1, black);
+  k.box(
+    blue0,
+    blue1,
+    face + b.depth,
+    face + b.depth + b.lift,
+    b.h0 + b.inset,
+    b.h1 - b.inset,
+    s.tinted(BADGE_BLUE),
+  );
+  // The eye: the bezel disc, the lens seated on it, the dome and the dot.
   const e = P.eye;
-  k.extrude(discOutline(0, e.h, e.barrelR, 16), face, e.rimD, s.metal);
-  k.ring(0, e.rimD, e.h, e.rimR, e.rimTube, 4, 16, s.metal, "inward");
-  lens(k, s, 0, e.rimD, e.h, e.r, SIGNAL_RED, 0);
+  const front = face + e.bezel;
+  k.extrude(discOutline(0, e.h, e.bezelR, 16), face, front, black);
+  const tube = Math.max(BEZEL_MIN, e.r * BEZEL_SHARE);
+  lens(k, s, 0, front + tube, e.h, e.r, SIGNAL_RED, 0);
+  k.extrude(
+    discOutline(0, e.h, e.domeR, LENS_SIDES),
+    front,
+    front + e.domeOut,
+    s.blink(SIGNAL_RED, 0),
+  );
+  k.extrude(
+    discOutline(0, e.h, e.dotR, 8),
+    front,
+    front + e.dotOut,
+    s.blink(LENS_YELLOW, 0),
+  );
   const g = P.grille;
-  for (let i = 0; i < 6; i++) {
-    const h = g.h0 + i * g.pitch;
-    k.box(-g.half, g.half, face, face + 0.015, h, h + g.h, s.metal);
+  const slat = s.tinted(GRILLE_GREY, LAYER.metal);
+  k.box(-g.half, g.half, face, face + g.back, g.h0, g.h1, black);
+  for (let i = 0; i < g.slats; i++) {
+    const h = g.first + i * g.pitch;
+    k.box(
+      -g.half + 0.015,
+      g.half - 0.015,
+      face + g.back,
+      face + g.back + g.slatDepth,
+      h,
+      h + g.slat,
+      slat,
+    );
   }
-  const n = P.plate;
-  k.box(-n.half, n.half, face, face + 0.01, n.h0, n.h1, s.panel);
 };
 
 /**
- * The photo console's measures, in metres: the tower's half width and
- * depth; the deck's high back edge (`d`, `h`) and its low front edge
- * (`d`, `h`); the toe recess; the screen, its bezel and its visor; the
- * buttons beside the screen; the keypad grid; the print tray; the
- * trackball; and the status lights' row.
+ * The photo console's measures, in metres: the brown base's top; the
+ * cream deck's high back edge (`d`, `h`) and its low front edge (`d`,
+ * `h`); the toe recess; the hood (half width, the brown cheeks' width, the
+ * lip under its screen face, the face's top corner `[d, h]` and the back
+ * of its roof); the screen's bezel and picture on the sloped face (half
+ * widths, heights and how far each stands off the face) and the grid lines
+ * over it; the print slot in the lip; the chunky buttons; the knobs; and
+ * the trackball.
  */
 const PHOTO_CONSOLE = {
-  towerHalf: 0.6,
-  tower: 0.4,
+  baseTop: 0.7,
   deckBack: [0.45, 0.95],
   deckFront: [0.9, 0.75],
   toe: { depth: 0.06, h: 0.1 },
-  screen: { half: 0.35, h0: 1.0, h1: 1.7 },
-  bezel: { half: 0.42, depth: 0.04, h0: 0.96, h1: 1.74 },
-  visor: { half: 0.45, depth: 0.1, h0: 1.76, h1: 1.84 },
-  buttons: { a: 0.515, hs: [1.2, 1.35, 1.5] },
-  keys: { a0: -0.7, d0: 0.55, pitchA: 0.1, pitchD: 0.09, a: 0.07, d: 0.065 },
-  tray: { a0: -0.2, a1: 0.25, d0: 0.52, d1: 0.82 },
-  ball: { a: 0.55, d: 0.66, pad: 0.07, r: 0.05 },
-  lights: { a0: -0.5, pitch: 0.2, h0: 0.66, h1: 0.7 },
+  hood: {
+    half: 0.52,
+    cheek: 0.06,
+    lip: 1.0,
+    faceTop: [0.33, 1.76],
+    roof: 0.25,
+  },
+  bezel: { half: 0.43, h0: 1.05, h1: 1.72, off0: -0.003, off1: 0.012 },
+  screen: { half: 0.36, h0: 1.1, h1: 1.67, off1: 0.016 },
+  grid: { width: 0.008, off1: 0.019 },
+  slot: { half: 0.2, h0: 0.962, h1: 0.99, depth: 0.006 },
+  buttons: { a0: -0.76, pitch: 0.13, a: 0.1, d0: 0.58, d: 0.09, above: 0.035 },
+  knobs: { as: [0.1, 0.24], d: 0.66, r: 0.035, h: 0.035 },
+  ball: { a: 0.56, d: 0.66, pad: 0.1, r: 0.065 },
 } as const;
 
 /** The photo console's sloped deck: its top at depth `d`, from its back edge down to its front edge. */
@@ -373,10 +575,23 @@ function deckTop(d: number): number {
   return hb + ((d - db) * (hf - hb)) / (df - db);
 }
 
-/** How far a small status light stands out of its face, in metres. */
-const LIGHT_DEPTH = 0.01;
+/**
+ * A point of the photo console's sloped screen face in the side view
+ * (`[d, h]`): on the face's line at height `h`, moved `off` out along the
+ * face's normal (negative is into the hood).
+ */
+function screenFace(h: number, off: number): [number, number] {
+  const [d0] = PHOTO_CONSOLE.deckBack;
+  const { lip, faceTop } = PHOTO_CONSOLE.hood;
+  const [d1, h1] = faceTop;
+  const run = d1 - d0;
+  const rise = h1 - lip;
+  const len = Math.hypot(run, rise);
+  const d = d0 + ((h - lip) * run) / rise;
+  return [d + (off * rise) / len, h - (off * run) / len];
+}
 
-/** The six status lights along the photo console's front edge, one per blink group. */
+/** The six chunky lit buttons on the photo console's deck, one per blink group. */
 const CONSOLE_LIGHTS: readonly Rgb[] = [
   STATUS_GREEN,
   STATUS_GREEN,
@@ -387,69 +602,123 @@ const CONSOLE_LIGHTS: readonly Rgb[] = [
 ];
 
 /**
- * The photo console, backed against its wall: a tall tower (d 0 to 0.4,
- * up to the top) holding a large square screen facing `+d` (h 1.0 to 1.7,
- * a dark bezel, a sepia-grey `s.glow` screen, a visor above and two rows
- * of buttons beside it), and in front of it a console desk whose deck
- * slopes from 0.95 at d 0.45 down to 0.75 at the front edge (d 0.9),
- * carrying a keypad (a grid of small keys following the slope), a dark
- * print tray and a trackball on a dark pad, both following the slope too.
- * Six status lights along the deck's front edge blink in groups 0 to 5 of
- * the status bank.
+ * The photo console, backed against its wall: a boxy old console in cream
+ * and dark brown.
+ * - A dark brown base cabinet (up to h 0.7, a toe recess under its front)
+ *   carries a cream deck that slopes from 0.95 at d 0.45 down to 0.75 at
+ *   the front edge (d 0.9).
+ * - Behind the deck stands a big cream screen hood with brown cheeks, its
+ *   face leaning back as it rises (from d 0.45 at h 1.0 to d 0.33 at h
+ *   1.76), the roof sloping to the wall at the top.
+ * - On that sloped face: a black bezel and a grey-blue picture (`s.glow`)
+ *   with a pale grid of two lines each way over it; a dark print slot in
+ *   the lip under it.
+ * - On the deck: a row of six chunky lit buttons (blink groups 0 to 5 of
+ *   the status bank), two brown knobs and a trackball on a brown pad, all
+ *   following the slope.
  */
 const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const C = PHOTO_CONSOLE;
   const { hw, d1, top } = heroHalf(kind, variant);
-  // The desk's front face stands a light's depth behind the footprint's
-  // edge, so the status lights on it end exactly on that edge.
-  const front = d1 - LIGHT_DEPTH;
-  const tower = C.tower;
-  k.bevelBox(
-    -C.towerHalf,
-    C.towerHalf,
-    0,
-    tower,
-    0,
-    top,
-    HOUSING_BEVEL * 1.5,
-    s.body,
-  );
-  // The desk, with a toe recess under its front edge.
+  const cream = s.tinted(CASING_CREAM);
+  const brown = s.tinted(CASING_BROWN);
   const dw = hw - 0.02;
-  const [backD] = C.deckBack;
+  const [backD, backH] = C.deckBack;
+  // The base, with a toe recess under its front edge, and the deck on it.
   profileAlong(
     kitAt,
     ORIGIN,
     [
-      [tower, 0],
-      [front - C.toe.depth, 0],
-      [front - C.toe.depth, C.toe.h],
-      [front, C.toe.h],
-      [front, deckTop(front)],
-      [backD, deckTop(backD)],
-      [tower, deckTop(backD)],
+      [0, 0],
+      [d1 - C.toe.depth, 0],
+      [d1 - C.toe.depth, C.toe.h],
+      [d1, C.toe.h],
+      [d1, C.baseTop],
+      [0, C.baseTop],
     ],
     -dw,
     dw,
-    s.body,
+    brown,
   );
-  // The screen.
+  profileAlong(
+    kitAt,
+    ORIGIN,
+    [
+      [0, C.baseTop],
+      [d1, C.baseTop],
+      [d1, deckTop(d1)],
+      [backD, backH],
+      [0, backH],
+    ],
+    -dw,
+    dw,
+    cream,
+  );
+  // The hood, its cheeks and its sloped screen face.
+  const H = C.hood;
+  const hood: [number, number][] = [
+    [0, backH],
+    [backD, backH],
+    [backD, H.lip],
+    [H.faceTop[0], H.faceTop[1]],
+    [H.roof, top],
+    [0, top],
+  ];
+  profileAlong(kitAt, ORIGIN, hood, -H.half, H.half, cream);
+  for (const side of [1, -1])
+    profileAlong(
+      kitAt,
+      ORIGIN,
+      hood,
+      side * H.half,
+      side * (H.half + H.cheek),
+      brown,
+    );
+  const onFace = (
+    a0: number,
+    a1: number,
+    h0: number,
+    h1: number,
+    off0: number,
+    off1: number,
+    sf: Surface,
+  ) =>
+    profileAlong(
+      kitAt,
+      ORIGIN,
+      [
+        screenFace(h0, off0),
+        screenFace(h1, off0),
+        screenFace(h1, off1),
+        screenFace(h0, off1),
+      ],
+      a0,
+      a1,
+      sf,
+    );
   const b = C.bezel;
-  k.box(-b.half, b.half, tower, tower + b.depth, b.h0, b.h1, s.dark);
-  k.panel(
-    -C.screen.half,
-    C.screen.half,
-    tower + b.depth + DECAL_LIFT,
-    C.screen.h0,
-    C.screen.h1,
-    s.glow(SEPIA_GREY),
+  onFace(-b.half, b.half, b.h0, b.h1, b.off0, b.off1, s.tinted(BEZEL_BLACK));
+  const sc = C.screen;
+  onFace(
+    -sc.half,
+    sc.half,
+    sc.h0,
+    sc.h1,
+    b.off1,
+    sc.off1,
+    s.glow(SCREEN_GREY_BLUE),
   );
-  const v = C.visor;
-  k.bevelBox(-v.half, v.half, tower, tower + v.depth, v.h0, v.h1, 0.01, s.body);
-  for (const a of [-C.buttons.a, C.buttons.a])
-    for (const h of C.buttons.hs)
-      k.box(a - 0.03, a + 0.03, tower, tower + 0.015, h, h + 0.04, s.dark);
-  // On the deck: keys, tray and the ball's pad follow the slope, as thin
+  const grid = s.glow(SCREEN_GRID);
+  const w = C.grid.width / 2;
+  for (const third of [1, 2]) {
+    const a = -sc.half + (third * 2 * sc.half) / 3;
+    onFace(a - w, a + w, sc.h0, sc.h1, sc.off1, C.grid.off1, grid);
+    const h = sc.h0 + (third * (sc.h1 - sc.h0)) / 3;
+    onFace(-sc.half, sc.half, h - w, h + w, sc.off1, C.grid.off1, grid);
+  }
+  const sl = C.slot;
+  k.box(-sl.half, sl.half, backD, backD + sl.depth, sl.h0, sl.h1, s.dark);
+  // On the deck: buttons, knobs and the ball's pad follow the slope, as
   // sloped slabs from `below` under the deck to `above` over it.
   const slab = (
     a0: number,
@@ -473,28 +742,20 @@ const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
       a1,
       sf,
     );
-  const K = C.keys;
-  for (let r = 0; r < 3; r++)
-    for (let c = 0; c < 4; c++) {
-      const e0 = K.d0 + r * K.pitchD;
-      const a0 = K.a0 + c * K.pitchA;
-      slab(a0, a0 + K.a, e0, e0 + K.d, 0.005, 0.015, s.dark);
-    }
-  slab(C.tray.a0, C.tray.a1, C.tray.d0, C.tray.d1, 0.01, 0.01, s.dark);
-  // The trackball: a dark pad flush on the deck, and the ball, whose foot
+  const B = C.buttons;
+  CONSOLE_LIGHTS.forEach((tint, i) => {
+    const a0 = B.a0 + i * B.pitch;
+    slab(a0, a0 + B.a, B.d0, B.d0 + B.d, 0.005, B.above, s.blink(tint, i));
+  });
+  const n = C.knobs;
+  for (const a of n.as)
+    k.cylinder(a, n.d, deckTop(n.d) - 0.01, deckTop(n.d) + n.h, n.r, 8, brown);
+  // The trackball: a brown pad flush on the deck, and the ball, whose foot
   // reaches below the deck at its front so it never floats on the slope.
   const t = C.ball;
-  slab(
-    t.a - t.pad,
-    t.a + t.pad,
-    t.d - t.pad,
-    t.d + t.pad,
-    0.005,
-    0.008,
-    s.dark,
-  );
-  const th = deckTop(t.d);
-  const foot = th - (deckTop(t.d) - deckTop(t.d + t.r)) - 0.005;
+  slab(t.a - t.pad, t.a + t.pad, t.d - t.pad, t.d + t.pad, 0.005, 0.01, brown);
+  const th = deckTop(t.d) + 0.01;
+  const foot = deckTop(t.d + t.r) - 0.005;
   k.lathe(
     t.a,
     t.d,
@@ -502,28 +763,29 @@ const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
       [0, foot],
       [t.r * 0.9, foot],
       [t.r, th + 0.02],
-      [t.r * 0.9, th + 0.04],
-      [t.r * 0.56, th + 0.055],
-      [0, th + 0.06],
+      [t.r * 0.9, th + 0.045],
+      [t.r * 0.56, th + 0.06],
+      [0, th + 0.065],
     ],
-    10,
-    s.panel,
+    12,
+    s.dark,
   );
-  const L = C.lights;
-  CONSOLE_LIGHTS.forEach((tint, i) => {
-    const a = L.a0 + i * L.pitch;
-    k.box(a - 0.025, a + 0.025, front, d1, L.h0, L.h1, s.blink(tint, i));
-  });
 };
+
+/** How far a small status light stands out of its face, in metres. */
+const LIGHT_DEPTH = 0.01;
 
 /**
  * The laser desk's measures, in metres: the desk (its top's depth range
  * and height, the slab's underside), the monitor and its screen, the
- * keyboard, the chair's place, the column (its place, the foot plate's
- * half sizes and height, its own half side and top), the column lights,
- * the arm (its height band, the elbow's `d`, the drums' radius), the
- * barrel (its foot and radius, the fins' lowest height and pitch), the
- * lens radius and the beam guide rod.
+ * keyboard, the chair's place; the rig: the column (its place, the foot
+ * plate's half sizes and height, its own half side and top), the
+ * counterweight behind the shoulder, the brace under the upper arm (its
+ * two ends `[d, h]`, width and half thickness), the column lights, the arm
+ * (its height band and half width, the elbow's `d`, the drums' radius and
+ * foot); the emitter: the barrel (foot and radius), its nose collar, the
+ * fins (count, radius, thickness, lowest height, pitch), the lens radius
+ * and the beam guide (radius, lowest height).
  */
 const LASER_DESK = {
   desk: { d0: -0.3, d1: 0.5, under: 0.7, top: 0.74 },
@@ -534,17 +796,21 @@ const LASER_DESK = {
   column: {
     a: -0.9,
     d: -1.3,
-    plateA: 0.25,
-    plateD: 0.18,
-    plateH: 0.06,
-    half: 0.1,
-    top: 2.1,
+    plateA: 0.3,
+    plateD: 0.19,
+    plateH: 0.08,
+    half: 0.14,
+    top: 2.12,
   },
-  lights: { h0: 1.2, pitch: 0.12, h: 0.06 },
-  arm: { h0: 1.95, h1: 2.1, elbowD: 0, drumR: 0.11 },
-  barrel: { h0: 1.35, r: 0.12, fin0: 1.48, finPitch: 0.12 },
+  weight: { half: 0.13, d0: -1.48, h0: 1.78 },
+  brace: { foot: [-1.16, 1.5], head: [-0.6, 1.93], width: 0.06, half: 0.04 },
+  lights: { h0: 1.0, pitch: 0.12, h: 0.06 },
+  arm: { h0: 1.92, h1: 2.12, half: 0.1, elbowD: 0, drumR: 0.15, drumH0: 1.905 },
+  barrel: { h0: 1.12, r: 0.11 },
+  nose: { r: 0.14, h1: 1.2 },
+  fins: { n: 6, r: 0.19, t: 0.016, h0: 1.32, pitch: 0.09 },
   lensR: 0.09,
-  rod: { r: 0.01, h0: 1.3, h1: 1.9 },
+  beam: { r: 0.008, h0: 0.52 },
 } as const;
 
 /**
@@ -555,14 +821,17 @@ const LASER_DESK = {
  *   keyboard in front of it (`d` 0.2 to 0.4). The desk top from `a` -1.1
  *   to -0.35 stays clear: it is the catalogue's surface.
  * - An empty office chair at `a` 0.3, `d` 1.0, facing the desk.
- * - The gantry: a heavy column on a bevelled foot plate at `a` -0.9, `d`
- *   -1.3, up to 2.1, carrying three status lights; an articulated arm
- *   (h 1.95 to 2.1) from a shoulder drum on the column forward to an elbow
- *   drum at `d` 0, then on a diagonal forearm to a wrist drum right over
- *   the chair; from the wrist the emitter hangs: a vertical barrel (r 0.12,
- *   h 1.35 to 1.95) with four cooling fins and a red lens at its foot
- *   looking down at the seat, and a thin beam guide rod (r 0.01) touching
- *   its side from h 1.9 to 1.3.
+ * - The rig, in an off-white industrial grey: a heavy column on a bevelled
+ *   foot plate at `a` -0.9, `d` -1.3, carrying three status lights, with a
+ *   black counterweight behind its shoulder and a diagonal brace under the
+ *   arm; a heavy articulated arm (h 1.92 to 2.12) from a shoulder drum
+ *   forward to an elbow drum at `d` 0, then on a diagonal forearm to a
+ *   wrist drum right over the chair. Everything over the clear desk top
+ *   stays above h 1.9.
+ * - The emitter hangs from the wrist: a long black barrel (r 0.11, h 1.12
+ *   up to the wrist) with six thin cooling fins and a nose collar, a red
+ *   lens at its foot looking down at the seat, and a thin red beam guide
+ *   dropping from the lens to just over the seat.
  * Lights: the lens is blink group 0, the beam guide group 1 and the column
  * lights groups 2 to 4, all in the breathe bank.
  */
@@ -600,8 +869,11 @@ const laserDesk: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   // The chair, pulled up to the desk.
   const { a: chairA, d: chairD } = L.chair;
   officeChair(kitAt, ORIGIN, s, chairA, chairD, 2);
-  // The column.
+  // The column, its lights, the counterweight and the brace.
+  const rig = s.tinted(RIG_GREY);
+  const black = s.tinted(LASER_BLACK);
   const C = L.column;
+  const A = L.arm;
   k.bevelBox(
     C.a - C.plateA,
     C.a + C.plateA,
@@ -620,11 +892,11 @@ const laserDesk: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     C.plateH,
     C.top,
     HOUSING_BEVEL,
-    s.body,
+    rig,
   );
+  const face = C.d + C.half;
   [STATUS_GREEN, STATUS_AMBER, SIGNAL_RED].forEach((tint, i) => {
     const h = L.lights.h0 + i * L.lights.pitch;
-    const face = C.d + C.half;
     k.box(
       C.a - 0.04,
       C.a + 0.04,
@@ -635,20 +907,45 @@ const laserDesk: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
       s.blink(tint, 2 + i),
     );
   });
+  const W = L.weight;
+  k.bevelBox(
+    C.a - W.half,
+    C.a + W.half,
+    W.d0,
+    C.d,
+    W.h0,
+    A.h1,
+    HOUSING_BEVEL,
+    black,
+  );
+  const [[fd, fh], [bd, bh]] = [L.brace.foot, L.brace.head];
+  profileAlong(
+    kitAt,
+    ORIGIN,
+    tiltedBar(
+      (fd + bd) / 2,
+      (fh + bh) / 2,
+      Math.atan2(bh - fh, bd - fd),
+      Math.hypot(bd - fd, bh - fh),
+      L.brace.width,
+    ),
+    C.a - L.brace.half,
+    C.a + L.brace.half,
+    rig,
+  );
   // The arm: shoulder, upper arm along d, elbow, diagonal forearm, wrist.
-  const A = L.arm;
   const drum = (a: number, d: number) =>
-    k.cylinder(a, d, A.h0 - 0.03, top - 0.02, A.drumR, 12, s.dark);
+    k.cylinder(a, d, A.drumH0, top - 0.02, A.drumR, 12, s.dark);
   drum(C.a, C.d);
   k.bevelBox(
-    C.a - 0.08,
-    C.a + 0.08,
+    C.a - A.half,
+    C.a + A.half,
     C.d,
     A.elbowD,
     A.h0,
     A.h1,
     HOUSING_BEVEL,
-    s.body,
+    rig,
   );
   drum(C.a, A.elbowD);
   const reach = Math.hypot(chairA - C.a, chairD - A.elbowD);
@@ -659,39 +956,36 @@ const laserDesk: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     Math.atan2(C.a - chairA, chairD - A.elbowD),
   );
   kitAt(fore).bevelBox(
-    -0.07,
-    0.07,
+    -A.half,
+    A.half,
     0,
     reach,
     A.h0,
     A.h1,
     HOUSING_BEVEL,
-    s.body,
+    rig,
   );
   drum(chairA, chairD);
   // The emitter, pointing down at the seat.
   const B = L.barrel;
-  k.cylinder(chairA, chairD, B.h0, A.h0, B.r, 12, s.metal);
-  for (let i = 0; i < 4; i++)
-    k.ring(
-      chairA,
-      chairD,
-      B.fin0 + i * B.finPitch,
-      B.r + 0.025,
-      0.025,
-      4,
-      12,
-      s.dark,
-      "up",
-    );
-  lens(k, s, chairA, chairD, B.h0, L.lensR, SIGNAL_RED, 0, "down");
-  // The rod touches the barrel: the barrel's 12 facets put a corner on +a.
+  k.cylinder(chairA, chairD, B.h0, A.drumH0, B.r, 12, black);
+  k.cylinder(chairA, chairD, B.h0, L.nose.h1, L.nose.r, 12, black);
+  const F = L.fins;
+  for (let i = 0; i < F.n; i++) {
+    const h = F.h0 + i * F.pitch;
+    k.cylinder(chairA, chairD, h, h + F.t, F.r, 12, s.dark);
+  }
+  // The lens hangs under the nose, its bezel's top on the nose's foot.
+  const tube = Math.max(BEZEL_MIN, L.lensR * BEZEL_SHARE);
+  const lensH = B.h0 - tube;
+  lens(k, s, chairA, chairD, lensH, L.lensR, SIGNAL_RED, 0, "down");
+  // The beam guide: from inside the lens down to just over the seat.
   k.cylinder(
-    chairA + B.r + L.rod.r,
+    chairA,
     chairD,
-    L.rod.h0,
-    L.rod.h1,
-    L.rod.r,
+    L.beam.h0,
+    lensH,
+    L.beam.r,
     6,
     s.blink(SIGNAL_RED, 1),
   );
