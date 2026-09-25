@@ -256,6 +256,75 @@ export interface Decor {
   seed: number;
 }
 
+/** Where a prop hangs: on a wall, on the floor, or from the ceiling. */
+export type PropAnchor = "wall" | "floor" | "ceiling";
+
+/** The kinds of prop that hang or stand flush against a wall. */
+export type WallPropKind =
+  | "locker-bank"
+  | "extinguisher"
+  | "first-aid"
+  | "intercom"
+  | "keycard-reader"
+  | "vent-grille"
+  | "sign-plate"
+  | "breaker-box"
+  | "wall-monitor"
+  | "padded-panel"
+  | "light-strip"
+  | "cable-tray"
+  | "pipe-bundle";
+
+/** The kinds of prop that stand on the floor and collide with the player. */
+export type FloorPropKind =
+  | "crate"
+  | "barrel"
+  | "trolley"
+  | "stool"
+  | "filing-cabinet"
+  | "storage-shelf"
+  | "planter"
+  | "bench"
+  | "specimen-shelf"
+  | "fume-cabinet"
+  // condition extras
+  | "traffic-cone"
+  | "ladder"
+  | "tool-cart"
+  | "toppled-crate"
+  | "debris-pile"
+  | "cable-coil";
+
+/** The kinds of prop that hang from the ceiling, out of the player's way. */
+export type CeilingPropKind =
+  | "duct"
+  | "ceiling-tray"
+  | "cable-loop"
+  | "beacon"
+  // condition extra
+  | "loose-cable";
+
+/** Every kind of set dressing the dressing pass can place. */
+export type PropKind = WallPropKind | FloorPropKind | CeilingPropKind;
+
+/**
+ * One piece of set dressing: pure decoration, never data. `x` and `y` follow
+ * `Decor`'s continuous cell convention; a wall or ceiling prop sits at its
+ * wall edge's wall point (see `wallAnchor` in `sites.ts`). `turn` is 0-3
+ * quarter turns clockwise from facing north. `variant` indexes the kind's
+ * variants in `PROP_CATALOGUE`. `seed` is
+ * `seedFor(roomSeed, "prop", cx, cy, token)` from the integer anchor cell.
+ */
+export interface Prop {
+  kind: PropKind;
+  variant: number;
+  anchor: PropAnchor;
+  x: number;
+  y: number;
+  turn: number;
+  seed: number;
+}
+
 /**
  * A rectangle of cells, `x1` and `y1` exclusive, in grid coordinates (the
  * same convention as a light zone).

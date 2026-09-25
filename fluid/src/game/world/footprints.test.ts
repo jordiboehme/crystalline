@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { propFootprint } from "./footprints";
 import footprintsSource from "./footprints.ts?raw";
 import unitsSource from "./units.ts?raw";
+import type { Prop } from "./types";
 
 /** Every module specifier a source file imports or re-exports from. */
 function specifiersOf(source: string): string[] {
@@ -35,5 +37,79 @@ describe("the leaf modules of the world", () => {
         expect(s).not.toMatch(/(^|\/)(generate|move)(\.ts)?$/);
       }
     }
+  });
+});
+
+describe("propFootprint", () => {
+  it("centres a crate's footprint on its cell point, at turn 0", () => {
+    const crate: Prop = {
+      kind: "crate",
+      variant: 1,
+      anchor: "floor",
+      x: 3.5,
+      y: 2.5,
+      turn: 0,
+      seed: 0,
+    };
+    expect(propFootprint(crate)).toEqual({
+      x0: 6.4,
+      x1: 7.6,
+      z0: 4.4,
+      z1: 5.6,
+    });
+  });
+
+  it("swaps width and depth at a quarter turn, for a bench", () => {
+    const facingNorth: Prop = {
+      kind: "bench",
+      variant: 0,
+      anchor: "floor",
+      x: 5,
+      y: 5,
+      turn: 0,
+      seed: 0,
+    };
+    const turned: Prop = { ...facingNorth, turn: 1 };
+    const box0 = propFootprint(facingNorth);
+    const box1 = propFootprint(turned);
+    if (box0 === null || box1 === null) throw new Error("expected a footprint");
+    expect(box1.x1 - box1.x0).toBeCloseTo(box0.z1 - box0.z0);
+    expect(box1.z1 - box1.z0).toBeCloseTo(box0.x1 - box0.x0);
+  });
+
+  it("gives null for a wall or ceiling prop", () => {
+    const wall: Prop = {
+      kind: "sign-plate",
+      variant: 0,
+      anchor: "wall",
+      x: 0,
+      y: 0,
+      turn: 0,
+      seed: 0,
+    };
+    const ceiling: Prop = {
+      kind: "beacon",
+      variant: 0,
+      anchor: "ceiling",
+      x: 0,
+      y: 0,
+      turn: 0,
+      seed: 0,
+    };
+    expect(propFootprint(wall)).toBeNull();
+    expect(propFootprint(ceiling)).toBeNull();
+  });
+
+  it("throws on a variant index out of range", () => {
+    const outOfRange: Prop = {
+      kind: "crate",
+      variant: 5,
+      anchor: "floor",
+      x: 0,
+      y: 0,
+      turn: 0,
+      seed: 0,
+    };
+    expect(() => propFootprint(outOfRange)).toThrow();
   });
 });

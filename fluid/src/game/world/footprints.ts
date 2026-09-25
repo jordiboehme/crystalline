@@ -13,8 +13,10 @@ import type {
   Box,
   Decor,
   DecorKind,
+  FloorPropKind,
   Fixture,
   MachineKind,
+  Prop,
   WallSlot,
 } from "./types";
 
@@ -56,6 +58,8 @@ export interface Footprints {
   machine: Readonly<Record<MachineKind, WallSize>>;
   /** Null for decor the player walks under or past (the ceiling pipe runs). */
   decor: Readonly<Record<DecorKind, FloorSize | null>>;
+  /** floor props, one size per variant */
+  prop: Readonly<Record<FloorPropKind, readonly FloorSize[]>>;
 }
 
 /** Every machine kind that is not given a size of its own. */
@@ -98,6 +102,73 @@ export const FOOTPRINTS: Footprints = {
     "shelf-row": { width: 2 * CELL, depth: 0.8 },
     "lab-island": { width: 3.0, depth: 1.4 },
     "specimen-tank": { width: 0.9, depth: 0.9 },
+  },
+  prop: {
+    crate: [
+      { width: 0.8, depth: 0.8 },
+      { width: 1.2, depth: 1.2 },
+      { width: 1.2, depth: 1.2 },
+    ],
+    barrel: [
+      { width: 0.65, depth: 0.65 },
+      { width: 1.35, depth: 1.25 },
+    ],
+    trolley: [
+      { width: 1.0, depth: 0.6 },
+      { width: 1.1, depth: 0.65 },
+    ],
+    stool: [
+      { width: 0.45, depth: 0.45 },
+      { width: 0.5, depth: 0.5 },
+    ],
+    "filing-cabinet": [
+      { width: 0.5, depth: 0.65 },
+      { width: 0.5, depth: 0.65 },
+    ],
+    "storage-shelf": [
+      { width: 1.2, depth: 0.5 },
+      { width: 1.0, depth: 0.5 },
+    ],
+    planter: [
+      { width: 0.7, depth: 0.7 },
+      { width: 1.2, depth: 0.5 },
+    ],
+    bench: [
+      { width: 1.4, depth: 0.5 },
+      { width: 1.4, depth: 0.6 },
+    ],
+    "specimen-shelf": [
+      { width: 1.0, depth: 0.45 },
+      { width: 1.2, depth: 0.45 },
+    ],
+    "fume-cabinet": [
+      { width: 1.2, depth: 0.75 },
+      { width: 1.0, depth: 0.75 },
+    ],
+    "traffic-cone": [
+      { width: 0.4, depth: 0.4 },
+      { width: 0.4, depth: 0.4 },
+    ],
+    ladder: [
+      { width: 0.55, depth: 0.8 },
+      { width: 0.55, depth: 0.9 },
+    ],
+    "tool-cart": [
+      { width: 0.9, depth: 0.55 },
+      { width: 1.0, depth: 0.6 },
+    ],
+    "toppled-crate": [
+      { width: 1.3, depth: 1.0 },
+      { width: 1.3, depth: 1.3 },
+    ],
+    "debris-pile": [
+      { width: 1.3, depth: 1.1 },
+      { width: 1.4, depth: 1.2 },
+    ],
+    "cable-coil": [
+      { width: 0.8, depth: 0.8 },
+      { width: 1.0, depth: 0.7 },
+    ],
   },
 };
 
@@ -180,5 +251,29 @@ export function decorFootprint(decor: Decor): Box | null {
   const hz = (sideways ? size.width : size.depth) / 2;
   const cx = decor.x * CELL;
   const cz = decor.y * CELL;
+  return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
+}
+
+/**
+ * The floor a prop takes: its variant's size from `FOOTPRINTS.prop`,
+ * centred on `(x * CELL, y * CELL)` and turned like `decorFootprint`, width
+ * and depth swapped at a quarter or three-quarter turn. Null for a wall or
+ * ceiling prop, which does not collide. Throws on a variant index out of
+ * range for the kind: a generator bug should not pass silently.
+ */
+export function propFootprint(prop: Prop): Box | null {
+  if (prop.anchor !== "floor") return null;
+  const sizes = FOOTPRINTS.prop[prop.kind as keyof typeof FOOTPRINTS.prop];
+  const size = sizes[prop.variant];
+  if (size === undefined) {
+    throw new Error(
+      `propFootprint: ${prop.kind} has no variant ${String(prop.variant)}`,
+    );
+  }
+  const sideways = prop.turn % 2 === 1;
+  const hx = (sideways ? size.depth : size.width) / 2;
+  const hz = (sideways ? size.width : size.depth) / 2;
+  const cx = prop.x * CELL;
+  const cz = prop.y * CELL;
   return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
 }
