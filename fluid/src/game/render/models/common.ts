@@ -2,6 +2,9 @@
  * What every model recipe shares: the context a room hands them, the
  * movers they give back, sub-frames for parts that do not stand square to
  * their wall, the look's surfaces and the sign plate a label is mounted on.
+ * The tints no look's palette carries and that read the same in every
+ * look (`RECESS`, `LAMP_TINT`, `SPARK_TINT`) live here too, so a recipe
+ * file that needs one never reaches into another recipe file for it.
  *
  * Kept apart from `index.ts` so the recipe files can import it without an
  * import cycle through the dispatcher.
@@ -100,6 +103,24 @@ export const FLUSH_DEPTH = 0.3;
 
 /** How far below the ceiling every model stays. */
 export const HEADROOM = 0.05;
+
+/**
+ * The colour of the dark passage behind an open door, and of the dark
+ * crack behind a hatch lid that pops open.
+ */
+export const RECESS: V3 = [0.02, 0.02, 0.025];
+
+/**
+ * The hazard lamp lens's colour: amber, a warning light of its own that
+ * no look's palette carries, so it reads the same in every look.
+ */
+export const LAMP_TINT: V3 = [1.0, 0.55, 0.1];
+
+/**
+ * The sparks' colour: a hot white-yellow, the colour of welding sparks
+ * rather than of any look, drawn emissive so it ignores the room's light.
+ */
+export const SPARK_TINT: V3 = [1.0, 0.85, 0.55];
 
 /** A frame moved by `a` along and `d` inward, same directions. */
 export function offset(f: Frame, a: number, d: number): Frame {

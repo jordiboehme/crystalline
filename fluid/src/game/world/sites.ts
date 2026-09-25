@@ -89,6 +89,11 @@
  * Coordinates follow `Decor` (ruling 1): cells for spots and anchors,
  * metres for boxes. Pure and deterministic.
  *
+ * `Reserved` (`{ boxes, edges }`), `NO_RESERVE` and `mergeReserved` are
+ * what a pass that runs before the dressing, such as the hero pass, hands
+ * `dress.ts` to keep its own boxes and wall edges out of the set dressing;
+ * see `Reserved`'s own doc comment for what each field keeps clear of.
+ *
  * This is the generator side: it imports `footprints.ts`, `lamps.ts`,
  * `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
  * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
@@ -245,6 +250,30 @@ export function wallAnchor(e: WallSlot): {
  */
 export function overlaps(a: Box, b: Box): boolean {
   return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
+}
+
+/**
+ * What a pass that runs before the dressing has claimed (H4): `boxes`, in
+ * metres, that no floor prop overlaps, that a cluster member's ring keeps
+ * clear of and that no span segment crosses; and `edges`, wall edges keyed
+ * by `edgeKey`, that no wall prop (mandatory ones included), wall run,
+ * ceiling run, cable loop or loose cable takes. The hero pass fills it
+ * (`heroReserve` in `heroes.ts`).
+ */
+export interface Reserved {
+  boxes: readonly Box[];
+  edges: ReadonlySet<string>;
+}
+
+/** Nothing reserved: the dressing of a room without heroes. */
+export const NO_RESERVE: Reserved = { boxes: [], edges: new Set<string>() };
+
+/** Both reservations at once: their boxes and their edges together. */
+export function mergeReserved(a: Reserved, b: Reserved): Reserved {
+  return {
+    boxes: [...a.boxes, ...b.boxes],
+    edges: new Set([...a.edges, ...b.edges]),
+  };
 }
 
 /**

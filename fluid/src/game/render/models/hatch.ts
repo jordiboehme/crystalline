@@ -22,6 +22,7 @@ import { DECAL_LIFT, createKit, frameForSlot } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import { PICTOGRAM } from "../text";
 import {
+  RECESS,
   shade,
   surfaces,
   textPanel,
@@ -29,7 +30,6 @@ import {
   type ModelContext,
   type Mover,
 } from "./common";
-import { RECESS } from "./doors";
 
 type Hatch = Extract<Fixture, { kind: "hatch" }>;
 

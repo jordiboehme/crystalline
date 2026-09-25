@@ -277,7 +277,8 @@ export function stepFaults(
 /**
  * The faults with fixture `index` armed: it just failed on travel, so it
  * runs once by itself (a door once it has shut). The session calls it
- * right after adding `index` to `failed`.
+ * right after adding `index` to `failed`. A fault that is running is left
+ * as it is.
  */
 export function armFault(
   room: RoomSpec,
@@ -288,7 +289,11 @@ export function armFault(
   const fx = room.fixtures[index];
   const kind = kindOf(room, index);
   if (fx === undefined || fx.kind === "placard" || kind === null) return out;
-  const f = out.get(index) ?? newFault(kind, faultSeed(fx.slot, fx.seed));
+  const was = out.get(index);
+  // A running fault already shows the failure; arming it as well would
+  // queue a second run right behind the first (H22).
+  if (was !== undefined && was.frames !== null) return out;
+  const f = was ?? newFault(kind, faultSeed(fx.slot, fx.seed));
   out.set(index, { ...f, armed: true, wait: 0 });
   return out;
 }

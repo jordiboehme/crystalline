@@ -13,7 +13,7 @@ import { galleryRoom } from "../world/canned";
 import { wallFacingSpawn } from "../world/interact";
 import { PLAYER_RADIUS, blockersFor, spawnPlayer } from "../world/move";
 import type { Box, Fixture, RoomSpec } from "../world/types";
-import { spotSpawn } from "./spots";
+import { SPOT_KINDS, spotSpawn } from "./spots";
 
 /** The slot of the n-th fixture of `kind`, in fixture order. */
 function slotOf(room: RoomSpec, kind: Fixture["kind"], n: number) {
@@ -33,17 +33,6 @@ function circleOverlapsBox(x: number, z: number, b: Box): boolean {
   const dz = z - nz;
   return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
 }
-
-/** Every kind `spotSpawn`'s regex accepts. */
-const SPOT_KINDS: readonly Fixture["kind"][] = [
-  "terminal",
-  "door",
-  "portal",
-  "hatch",
-  "machine",
-  "poster",
-  "placard",
-];
 
 describe("spotSpawn", () => {
   it("faces the n-th door of the room, from its own cell", () => {
@@ -87,7 +76,7 @@ describe("spotSpawn", () => {
     const room = galleryRoom();
     const blockers = blockersFor(room);
     const bad: string[] = [];
-    for (const kind of SPOT_KINDS) {
+    for (const kind of Object.keys(SPOT_KINDS) as Fixture["kind"][]) {
       const count = room.fixtures.filter((f) => f.kind === kind).length;
       for (let n = 0; n < count; n++) {
         const spot = `${kind}:${n}`;
@@ -100,5 +89,11 @@ describe("spotSpawn", () => {
       }
     }
     expect(bad).toEqual([]);
+  });
+
+  it("accepts exactly the fixture kinds", () => {
+    const room = galleryRoom();
+    const kinds = new Set(room.fixtures.map((f) => f.kind));
+    expect(Object.keys(SPOT_KINDS).sort()).toEqual([...kinds].sort());
   });
 });

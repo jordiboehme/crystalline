@@ -32,6 +32,10 @@
  * runs, and a spark cluster (`spark:<index>`), six tiny glowing boxes on
  * the recess at the leaves' meeting line, drawn only while a fault lights
  * them and hidden by the closed leaves.
+ *
+ * The recess, lamp and spark tints (`RECESS`, `LAMP_TINT`, `SPARK_TINT`)
+ * live in `./common`, since `hatch.ts` shares `RECESS` for its own recess
+ * panel.
  */
 
 import type { DoorStyle, Fixture } from "../../world/types";
@@ -46,6 +50,9 @@ import {
 import { ASPECT, LAYER } from "../layers";
 import {
   HEADROOM,
+  LAMP_TINT,
+  RECESS,
+  SPARK_TINT,
   label,
   shade,
   surfaces,
@@ -91,12 +98,6 @@ const DOWN: V3 = [0, -1, 0];
 const neg = (v: V3): V3 => [-v[0], -v[1], -v[2]];
 
 /**
- * The colour of the dark passage behind an open door, and of the dark
- * crack behind a hatch lid that pops open.
- */
-export const RECESS: V3 = [0.02, 0.02, 0.025];
-
-/**
  * The hazard lamp lens's gain while no fault runs: a dim amber glow, so a
  * blink to `LAMP_ON` (in `world/malfunction.ts`) reads as the lamp
  * lighting up.
@@ -104,23 +105,11 @@ export const RECESS: V3 = [0.02, 0.02, 0.025];
 export const LAMP_IDLE = 0.3;
 
 /**
- * The hazard lamp lens's colour: amber, a warning light of its own that
- * no look's palette carries, so it reads the same in every look.
- */
-export const LAMP_TINT: V3 = [1.0, 0.55, 0.1];
-
-/**
  * The lens's side, in metres: a small square light. On a blast door it is
  * `BLAST_LAMP_SIZE`, so it stays on the narrow flat face of its jamb.
  */
 const LAMP_SIZE = 0.12;
 const BLAST_LAMP_SIZE = 0.09;
-
-/**
- * The sparks' colour: a hot white-yellow, the colour of welding sparks
- * rather than of any look, drawn emissive so it ignores the room's light.
- */
-export const SPARK_TINT: V3 = [1.0, 0.85, 0.55];
 
 /** Each spark box's side, in metres. */
 const SPARK_SIZE = 0.02;

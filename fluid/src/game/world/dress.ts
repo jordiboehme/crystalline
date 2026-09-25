@@ -11,23 +11,28 @@
  * 1. `sites = dressingSites(room)`, `used` (the wall edges a wall prop took),
  *    `wallKinds` (the kind of the wall prop on each of those edges),
  *    `floorBoxes` (the boxes of the floor props placed so far) and
- *    `floorCells` (the cells that have a floor prop). `reserved` joins
- *    `sites.taken`.
- * 2. Mandatory wall props (ruling 7), each on a free edge not in `used`: a
- *    keycard reader beside each unsealed door, then a sign plate beside each
- *    door and hatch, both trying the next edge of the fixture's wall run and
- *    then the previous one; then an extinguisher on each run at along-run
- *    index `3 + 6k`, falling back to `+1` and then `-1`. Its variant is the
- *    first draw of `createRng(seed)` (a sign's variant is its pictogram).
- *    Each is recorded in `used` and `wallKinds`.
+ *    `floorCells` (the cells that have a floor prop). `reserved` is
+ *    `{ boxes, edges }` (`sites.ts`): `blocked` joins `sites.taken` and
+ *    `reserved.boxes`, and `wallFree` is a free edge that is not also a
+ *    reserved one.
+ * 2. Mandatory wall props (ruling 7), each on a free, unreserved edge not in
+ *    `used`: a keycard reader beside each unsealed door, then a sign plate
+ *    beside each door and hatch, both trying the next edge of the fixture's
+ *    wall run and then the previous one; then an extinguisher on each run at
+ *    along-run index `3 + 6k`, falling back to `+1` and then `-1`. Its
+ *    variant is the first draw of `createRng(seed)` (a sign's variant is its
+ *    pictogram). Each is recorded in `used` and `wallKinds`; a mandatory
+ *    prop whose edges are all reserved is left out, as it is today when
+ *    they are taken.
  * 3. Wall runs, when the palette has one: `createRng(seedFor(roomSeed,
  *    "prop-runs", "wall"))` draws the count (1 or 2), with 1 the long wall,
  *    then the variant the whole run shares; one segment per long-wall edge
- *    not in `noRun`, token `run-<side>`. Runs do not add to `used`.
- * 4. Optional wall props: every free edge not in `used`, in run order,
- *    draws from `createRng(seed)` a chance of `WALL_SHARE`, then a kind
- *    weighted over the palette's wall picks plus `FILLER`, then a variant.
- *    Each is recorded in `used` and `wallKinds`.
+ *    not in `noRun` and not reserved, token `run-<side>`. Runs do not add to
+ *    `used`.
+ * 4. Optional wall props: every free, unreserved edge not in `used`, in run
+ *    order, draws from `createRng(seed)` a chance of `WALL_SHARE`, then a
+ *    kind weighted over the palette's wall picks plus `FILLER`, then a
+ *    variant. Each is recorded in `used` and `wallKinds`.
  * 5. Floor spots and their backing. A spot's backing is what stands behind
  *    it. A zone spot has no wall and is always `bare`, whatever hangs on
  *    its cell's walls. A wall-side spot is `clear` when any of its cell's
@@ -86,13 +91,15 @@
  *    is dropped when a corner-zone prop stands within 1.0 m of it.
  * 10. Ceiling, anchored at wall points like a wall prop: the ceiling run
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
- *     `ceiling-<side>`; under each ceiling tray segment a cable loop when
- *     `createRng` of the loop's own seed (token `loop-<side>`) draws
- *     `LOOP_SHARE`; then one span line (D9) when the palette has a
- *     `ceilingSpan` and the hall has clear `sites.spanLines` (a large hall
- *     only): `createRng(seedFor(roomSeed, "prop-runs", "span"))` draws a
- *     chance of `SPAN_SHARE` and then the variant every segment shares,
- *     and the line is the first of `sites.spanLines` in the order of
+ *     `ceiling-<side>` (also skipping a reserved edge like a used one);
+ *     under each ceiling tray segment a cable loop when `createRng` of the
+ *     loop's own seed (token `loop-<side>`) draws `LOOP_SHARE`; then one
+ *     span line (D9) when the palette has a `ceilingSpan` and the hall has
+ *     clear `sites.spanLines` (a large hall only): `createRng(seedFor(
+ *     roomSeed, "prop-runs", "span"))` draws a chance of `SPAN_SHARE` and
+ *     then the variant every segment shares, unchanged by what is reserved;
+ *     the line is the first *clear* line, one none of whose segments'
+ *     `spanBox` crosses a reserved box, of `sites.spanLines` in the order of
  *     `seedFor(roomSeed, "prop-span", axis, index)`. Each segment is
  *     anchored at its middle under the ceiling, `(x + 1, y + 0.5)` with
  *     turn 0 along a row and `(x + 0.5, y + 1)` with turn 1 along a column,
@@ -101,8 +108,8 @@
  *     walls, and clear of lamps, decor, pipe runs and scaffolding
  *     (`sites.ts`); then the beacon on the entrance edge, token `beacon-s`;
  *     and the loose cables of step 6 on the hall's wall edges that carry
- *     neither a fixture nor a ceiling segment nor the beacon, in the order
- *     of their own seeds (token `loose-<side>`).
+ *     neither a fixture nor a ceiling segment nor the beacon and are not
+ *     reserved, in the order of their own seeds (token `loose-<side>`).
  * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
  *     everything else optional. A group, the span line, takes the place of
@@ -156,13 +163,16 @@ import {
   WALL_SHARE,
 } from "./props";
 import {
+  NO_RESERVE,
   dressingSites,
   edgeKey,
   fitsFloor,
   overlaps,
+  spanBox,
   turnForSide,
   wallAnchor,
   type FloorSpot,
+  type Reserved,
   type RoomBase,
   type SpanLine,
 } from "./sites";
@@ -307,12 +317,13 @@ function isFloorKind(kind: PropKind): kind is FloorPropKind {
 
 /**
  * Every prop the pass would place in a room, before the cap, each marked
- * mandatory or optional: steps 1 to 10 of the module doc. `reserved` joins
- * the taken boxes and keeps floor props out of what a later pass claimed.
+ * mandatory or optional: steps 1 to 10 of the module doc. `reserved` keeps
+ * floor props, wall props, runs, loops, span lines and loose cables out of
+ * what a hero pass has claimed.
  */
 export function dressCandidates(
   room: RoomBase,
-  reserved: readonly Box[] = [],
+  reserved: Reserved = NO_RESERVE,
 ): Candidate[] {
   const sites = dressingSites(room);
   const palette = PALETTES[room.archetype];
@@ -320,7 +331,8 @@ export function dressCandidates(
   const wallKinds = new Map<string, PropKind>();
   const floorBoxes: Box[] = [];
   const floorCells = new Set<string>();
-  const blocked = [...sites.taken, ...reserved];
+  const blocked = [...sites.taken, ...reserved.boxes];
+  const wallFree = (k: string) => sites.free.has(k) && !reserved.edges.has(k);
   const out: Candidate[] = [];
   const propSeed = (x: number, y: number, token: string) =>
     seedFor(room.seed, "prop", x, y, token);
@@ -348,7 +360,7 @@ export function dressCandidates(
   for (const run of sites.runs)
     run.forEach((e, i) => where.set(edgeKey(e), { run, i }));
   const open = (e: WallSlot | undefined): e is WallSlot =>
-    e !== undefined && sites.free.has(edgeKey(e)) && !used.has(edgeKey(e));
+    e !== undefined && wallFree(edgeKey(e)) && !used.has(edgeKey(e));
   const onWall = (kind: PropKind, e: WallSlot, mandatory: boolean) => {
     const seed = propSeed(e.x, e.y, e.side);
     used.add(edgeKey(e));
@@ -387,7 +399,8 @@ export function dressCandidates(
     const segments: { e: WallSlot; prop: Prop }[] = [];
     for (const wall of walls)
       for (const e of wall) {
-        if (sites.noRun.has(edgeKey(e))) continue;
+        const k = edgeKey(e);
+        if (sites.noRun.has(k) || reserved.edges.has(k)) continue;
         const seed = propSeed(e.x, e.y, `${token}-${e.side}`);
         segments.push({ e, prop: atWall(kind, e, variant, seed) });
       }
@@ -401,7 +414,7 @@ export function dressCandidates(
   const wallPicks = [...palette.wall, ...FILLER];
   for (const e of sites.runs.flat()) {
     const k = edgeKey(e);
-    if (!sites.free.has(k) || used.has(k)) continue;
+    if (!wallFree(k) || used.has(k)) continue;
     const seed = propSeed(e.x, e.y, e.side);
     const rng = createRng(seed);
     if (!rng.chance(WALL_SHARE)) continue;
@@ -589,7 +602,12 @@ export function dressCandidates(
       const variant = variantOf(span, rng);
       const order = (l: SpanLine) =>
         seedFor(room.seed, "prop-span", l.axis, l.index);
-      const line = [...sites.spanLines].sort(
+      const clear = sites.spanLines.filter((l) =>
+        l.segments.every(
+          (c) => !reserved.boxes.some((b) => overlaps(spanBox(l.axis, c), b)),
+        ),
+      );
+      const line = [...clear].sort(
         (a, b) => order(a) - order(b) || a.index - b.index,
       )[0];
       if (line !== undefined)
@@ -628,6 +646,7 @@ export function dressCandidates(
       ...sites.fixtureEdges,
       ...carriers,
       edgeKey(entrance),
+      ...reserved.edges,
     ]);
     const looseSeed = (e: WallSlot) => propSeed(e.x, e.y, `loose-${e.side}`);
     const edges = sites.runs
@@ -660,12 +679,13 @@ export function dressCandidates(
 /**
  * The set dressing of a room: `dressCandidates`, capped at `PROP_CAP`
  * (`capProps`) and sorted by `PROP_ORDER`. See the module doc for the pass.
- * `reserved` keeps floor props out of boxes a later pass has claimed; the
- * generator passes none.
+ * `reserved` keeps floor props, wall props, runs, loops, span lines and
+ * loose cables out of what a hero pass has claimed; the generator passes
+ * none.
  */
 export function dressRoom(
   room: RoomBase,
-  reserved: readonly Box[] = [],
+  reserved: Reserved = NO_RESERVE,
 ): Prop[] {
   return capProps(dressCandidates(room, reserved), PROP_CAP).sort(PROP_ORDER);
 }

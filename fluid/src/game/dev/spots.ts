@@ -2,7 +2,9 @@
  * Dev-only spawn points: places the player in front of a gallery fixture
  * for the gallery's `?at=` parameter, so the controller's browser shots
  * start every malfunction already facing it, clear of the fixture's own
- * footprint when it has one.
+ * footprint when it has one. `SPOT_KINDS` pins the fixture kinds
+ * `spotSpawn` accepts to `Fixture["kind"]`, so a new kind is a type error
+ * here until it is added.
  */
 
 import { footprintOf } from "../world/footprints";
@@ -10,6 +12,25 @@ import { wallFacingSpawn, wallPoint } from "../world/interact";
 import { PLAYER_RADIUS } from "../world/move";
 import type { Fixture, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
+
+/**
+ * The fixture kinds `spotSpawn` accepts, one entry per kind of `Fixture`:
+ * the `satisfies` makes a new fixture kind a type error here until it is
+ * added, so the dev seam can never silently miss one.
+ */
+export const SPOT_KINDS = {
+  terminal: true,
+  door: true,
+  portal: true,
+  hatch: true,
+  machine: true,
+  poster: true,
+  placard: true,
+} as const satisfies Record<Fixture["kind"], true>;
+
+const FIXTURE_SPOT = new RegExp(
+  `^(${Object.keys(SPOT_KINDS).join("|")}):(\\d+)$`,
+);
 
 /**
  * How clear of its own footprint a backed-off spot keeps the player's
@@ -54,9 +75,7 @@ export function spotSpawn(
   room: RoomSpec,
   spot: string,
 ): RoomSpec["spawn"] | null {
-  const m = /^(terminal|door|portal|hatch|machine|poster|placard):(\d+)$/.exec(
-    spot,
-  );
+  const m = FIXTURE_SPOT.exec(spot);
   if (m === null) return null;
   const [, kind, n] = m;
   const f = room.fixtures.filter((x) => x.kind === kind)[Number(n)];

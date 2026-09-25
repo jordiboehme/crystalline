@@ -49,6 +49,7 @@ import {
   USE_LANE_DEPTH,
 } from "./props";
 import {
+  NO_RESERVE,
   dressingSites,
   edgeKey,
   fitsFloor,
@@ -59,6 +60,7 @@ import {
   turnForSide,
   wallAnchor,
   type DressingSites,
+  type Reserved,
   type RoomBase,
 } from "./sites";
 import type {
@@ -663,12 +665,94 @@ describe("floor props", () => {
     const props = floorProps(workshop);
     const first = props[0];
     if (first === undefined) throw new Error("the workshop has floor props");
-    const reserved = boxOf(first);
-    const again = dressRoom(workshop, [reserved]);
+    const box = boxOf(first);
+    const again = dressRoom(workshop, {
+      boxes: [box],
+      edges: new Set<string>(),
+    });
     const floors = again.filter((p) => p.anchor === "floor");
     expect(floors.length).toBeGreaterThan(0);
-    for (const p of floors) expect(overlaps(boxOf(p), reserved)).toBe(false);
+    for (const p of floors) expect(overlaps(boxOf(p), box)).toBe(false);
     expect(dressRoom(workshop)).toEqual(workshop.props);
+  });
+});
+
+/** The first cell of the span segment `p` hangs over, and its axis. */
+function spanCellOf(p: Prop): {
+  axis: "x" | "y";
+  cell: { x: number; y: number };
+} {
+  return p.turn === 0
+    ? { axis: "x", cell: { x: p.x - SPAN_CELLS / 2, y: p.y - 0.5 } }
+    : { axis: "y", cell: { x: p.x - 0.5, y: p.y - SPAN_CELLS / 2 } };
+}
+
+describe("reserved boxes and edges", () => {
+  it("dresses every room exactly as before when nothing is reserved", () => {
+    for (const { name, room } of [...ALL, ...BRIDGES]) {
+      expect(dressRoom(room), name).toEqual(room.props);
+      expect(dressRoom(room, NO_RESERVE), name).toEqual(room.props);
+    }
+  }, 20_000);
+
+  it("drops a span line crossing a reserved box before the pick, and still hangs another", () => {
+    const spans = workshop.props.filter((p) => PROP_CATALOGUE[p.kind].span);
+    const first = spans[0];
+    if (first === undefined) throw new Error("the workshop hangs a span");
+    expect(dressingSites(workshop).spanLines.length).toBeGreaterThan(1);
+    const { axis, cell } = spanCellOf(first);
+    const box = spanBox(axis, cell);
+    const again = dressRoom(workshop, {
+      boxes: [box],
+      edges: new Set<string>(),
+    });
+    const segments = again.filter((p) => PROP_CATALOGUE[p.kind].span);
+    expect(segments.length).toBeGreaterThan(0);
+    for (const s of segments) {
+      const c = spanCellOf(s);
+      expect(overlaps(spanBox(c.axis, c.cell), box)).toBe(false);
+    }
+  });
+
+  it("keeps wall props, runs, loops and loose cables off reserved edges, mandatory ones too", () => {
+    let runsBefore = 0;
+    for (const { name, room } of WORKSHOPS) {
+      const sites = dressingSites(room);
+      // Only free edges, as a hero only ever takes those: the entrance edge
+      // (the beacon's) and its neighbours are in noRun, never reserved.
+      const edges = new Set(
+        sites.longWalls
+          .flat()
+          .map(edgeKey)
+          .filter((k) => sites.free.has(k)),
+      );
+      const reserved: Reserved = { boxes: [], edges };
+      runsBefore += room.props.filter(isRun).length;
+      const again = dressRoom(room, reserved);
+      for (const p of again) {
+        if (p.anchor === "floor" || PROP_CATALOGUE[p.kind].span) continue;
+        expect(edges.has(edgeKey(edgeOf(p))), `${name} ${p.kind}`).toBe(false);
+      }
+      // Runs and their loops only ever hang on the long walls.
+      expect(again.filter(isRun), name).toEqual([]);
+      expect(
+        again.filter((p) => p.kind === "cable-loop"),
+        name,
+      ).toEqual([]);
+    }
+    expect(runsBefore).toBeGreaterThan(0);
+  });
+
+  it("keeps the dim room's loose cables off reserved edges and still hangs them elsewhere", () => {
+    const dim = WORKSHOPS.find((w) => w.condition === "dim");
+    if (dim === undefined) throw new Error("no dim workshop");
+    const loose = dim.room.props.filter((p) => p.kind === "loose-cable");
+    expect(loose.length).toBeGreaterThan(0);
+    const edges = new Set(loose.map((p) => edgeKey(edgeOf(p))));
+    const again = dressRoom(dim.room, { boxes: [], edges });
+    const moved = again.filter((p) => p.kind === "loose-cable");
+    expect(moved.length).toBe(loose.length);
+    for (const p of moved) expect(edges.has(edgeKey(edgeOf(p)))).toBe(false);
   });
 });
 

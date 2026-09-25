@@ -28,7 +28,9 @@ import {
   armFault,
   brokenWays,
   faultFrames,
+  faultSeed,
   isBrokenWay,
+  newFault,
   planRun,
   stepFaults,
   type Fault,
@@ -398,5 +400,34 @@ describe("stepFaults", () => {
       new Map(),
     );
     expect(hFaults.get(hi)?.frames).not.toBeNull();
+  });
+});
+
+describe("armFault", () => {
+  it("leaves a running fault alone and arms only an idle one", () => {
+    const room = galleryRoom();
+    const i = room.fixtures.findIndex(
+      (f) => f.kind === "door" && f.address !== null,
+    );
+    const fx = room.fixtures[i];
+    if (fx === undefined || fx.kind !== "door") throw new Error("no open door");
+    const idle = newFault("door", faultSeed(fx.slot, fx.seed));
+    const running: Fault = {
+      ...idle,
+      runs: 1,
+      frames: planRun("door", idle.seed, 0),
+      at: 2,
+    };
+    expect(armFault(room, i, new Map([[i, running]])).get(i)).toEqual(running);
+    expect(armFault(room, i, new Map([[i, idle]])).get(i)).toEqual({
+      ...idle,
+      armed: true,
+      wait: 0,
+    });
+    expect(armFault(room, i, new Map()).get(i)).toEqual({
+      ...idle,
+      armed: true,
+      wait: 0,
+    });
   });
 });
