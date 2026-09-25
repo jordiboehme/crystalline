@@ -4,12 +4,10 @@ Eight crates, one daemon and one rule: every domain has exactly one source of tr
 
 ```
 crystalline-core       format layer: parser, emitter, Picoschema, verify, prompt
-       |                (no async runtime, no database, no ML - stays static)
-       v
-crystalline-index      Store trait, embedded database, sync engine, search, embeddings
-       |         \
+       |         \      (no async runtime, no database, no ML - stays static)
        v          v
-       |     crystalline-remote  GitHub-backed team collaboration plumbing
+crystalline-index      crystalline-remote  GitHub-backed team collaboration plumbing
+       |
        v
 crystalline-identity   accounts, roles, domain access, joins and scope
        |

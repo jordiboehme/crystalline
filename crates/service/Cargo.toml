@@ -27,14 +27,15 @@ postgres = ["crystalline-index/postgres", "crystalline-engine/postgres"]
 # green with this on - the embed is then simply empty.
 fluid-ui = ["dep:rust-embed"]
 # The test seams outside plain `cfg(test)`, which live in crystalline-engine
-# and are forwarded to its `testing` feature, and nothing else: the engine's own arming method and the branch that reads it, its
-# counters (`prune_statements_issued`, `detection_walks`), plus
-# `crate::nudge`'s share-walk counter (`SHARE_WALKS`, `share_walks_for`,
-# `count_walk`), which moved out of the engine into its own module but is
-# the same shape of seam. Off by default, so a released binary carries none
-# of it; turned on for this package's own test builds by the self
-# dev-dependency below, which is how an integration test - a separate crate -
-# reaches something `cfg(test)` alone would hide from it.
+# and are forwarded to its `testing` feature, and nothing else: the engine's
+# own arming method and the branch that reads it, its counters
+# (`prune_statements_issued`, `detection_walks`), plus `crate::nudge`'s
+# share-walk counter (`SHARE_WALKS`, `share_walks_for`, `count_walk`), which
+# moved out of the engine into its own module but is the same shape of seam.
+# Off by default, so a released binary carries none of it; turned on for this
+# package's own test builds by the self dev-dependency below, which is how an
+# integration test - a separate crate - reaches something `cfg(test)` alone
+# would hide from it.
 testing = ["crystalline-engine/testing"]
 
 [dependencies]

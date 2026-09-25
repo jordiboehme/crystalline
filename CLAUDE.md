@@ -27,7 +27,7 @@ Cargo workspace, Rust edition 2024, pinned toolchain in rust-toolchain.toml.
 - `crates/service` (crystalline-service) - single-instance daemon, MCP server, control protocol; the facade the CLI and the integration tests reach everything through
 - `crates/cli` (crystalline) - the single user-facing binary
 
-Dependency direction: core <- index <- identity <- engine <- rest <- service <- cli, with remote beside index (it depends on core and is used by engine, service and cli).
+Dependency direction: core <- index <- identity <- engine <- rest <- service <- cli, with remote beside index (it depends on core and is used by engine, rest, service and cli).
 
 ## Commands
 

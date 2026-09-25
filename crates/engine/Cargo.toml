@@ -12,6 +12,8 @@ name = "crystalline_engine"
 path = "src/lib.rs"
 
 [features]
+# Both defaults only pass through to crystalline-index; this crate has no
+# candle or sqlx code of its own.
 default = ["local-embeddings", "postgres"]
 local-embeddings = ["crystalline-index/local-embeddings"]
 postgres = ["crystalline-index/postgres"]
