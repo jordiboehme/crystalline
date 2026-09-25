@@ -40,6 +40,7 @@
 
 import { createSession, type HudSink, type Session } from "../session";
 import { CANNED_BRIDGE } from "../world/canned";
+import { placeCurios } from "../world/curios";
 import { dressRoom } from "../world/dress";
 import { generateRoom } from "../world/generate";
 import {
@@ -122,8 +123,10 @@ function forcedHeroDraws(
  * pick the pool, so this is the one field the forced call overrides) and
  * its props re-dressed (`dressRoom`) to keep off what that hero reserves,
  * exactly as `generateRoom` dresses a room around the heroes it draws on
- * its own. The returned room keeps its own archetype throughout; only the
- * `placeHeroes` call sees the forced one. `placed` is `kind` when it
+ * its own. Its curios are placed again (`placeCurios`) on the re-dressed
+ * room, with the room's own draws, so no curio stands on a host that moved
+ * or was dropped. The returned room keeps its own archetype throughout;
+ * only the `placeHeroes` call sees the forced one. `placed` is `kind` when it
  * landed, else null: the caller reads it to decide whether to say so on
  * the HUD.
  */
@@ -137,7 +140,8 @@ export function roomWithForcedHero(
   const heroes = placeHeroes({ ...built, archetype }, draws, sites);
   const placed = heroes.length > 0 ? kind : null;
   const withHeroes: RoomSpec = { ...built, heroes };
-  return { room: { ...withHeroes, props: dressRoom(withHeroes) }, placed };
+  const withProps: RoomSpec = { ...withHeroes, props: dressRoom(withHeroes) };
+  return { room: { ...withProps, curios: placeCurios(withProps) }, placed };
 }
 
 /**

@@ -41,6 +41,9 @@
  *    after everything else and only ever adds decoration, so a prop never
  *    moves a fixture, and the room states its entrance, bays and corridor
  *    so the dressing never has to work them out again.
+ * 9. Last, the curios (`placeCurios`, `curios.ts`), after the dressing,
+ *    since shelves and cabinets are props; they read everything and move
+ *    nothing.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -55,9 +58,10 @@ import {
   type SlotPref,
 } from "./layout";
 import { dressRoom } from "./dress";
+import { placeCurios } from "./curios";
 import { decorFootprint } from "./footprints";
 import { placeHeroes } from "./heroes";
-import type { RoomBase } from "./sites";
+import type { CurioBase, RoomBase } from "./sites";
 import { sectionsOf } from "./sections";
 import {
   HATCH_CAP,
@@ -620,11 +624,14 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   // reserve. They replace the empty list in place, so the keys (and the
   // goldens) read fixtures, decor, scaffold, heroes, props, curios, lights.
   const room: RoomBase = { ...base, heroes: placeHeroes(base) };
+  // The curios come last, on the dressed room, since shelves and filing
+  // cabinets are props; they read everything and move nothing.
+  const dressed: CurioBase = { ...room, props: dressRoom(room) };
   const { lights, dropped: left, inboundMore: more, ...head } = room;
   return {
     ...head,
-    props: dressRoom(room),
-    curios: [],
+    props: dressed.props,
+    curios: placeCurios(dressed),
     lights,
     dropped: left,
     inboundMore: more,

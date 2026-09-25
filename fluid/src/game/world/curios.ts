@@ -45,15 +45,69 @@
  * - **C12. Heights.** A curio's top stays under its surface's `clear` and
  *   `CURIO_CEILING_GAP` under the ceiling.
  *
- * This is the generator side: it imports `footprints.ts`, `heroes.ts`,
- * `sites.ts`, `types.ts` and `units.ts`, and never `move.ts`,
- * `generate.ts`, `interact.ts`, `malfunction.ts` or anything under
- * `render/` (ruling 20). `sites.test.ts` and `dress.test.ts` keep it so.
+ * The pass (`placeCurios`), in order:
+ *
+ * 1. **Draws.** `curioDraws(room)`: one stream of `seedFor(room.seed,
+ *    "curio", "draw")` draws the retro slot's chance (`RETRO_SHARE`) and
+ *    roll, the gear slot's (`GEAR_SHARE`), the ball slot's (`BALL_SHARE`)
+ *    and its floor chance (`BALL_FLOOR`), then the under slot's
+ *    (`UNDER_SHARE`). Everything is always drawn.
+ * 2. **Surfaces.** `hostSurfaces(room)`, once.
+ * 3. **Slots, in order: retro, gear, ball, under.** A slot that drew its
+ *    chance takes its pool (`RETRO_POOL`, `GEAR_POOLS[room.archetype]`,
+ *    `BALL_POOL`, `UNDER_POOL`, or only the kind its draw forces), keeps
+ *    the kinds with a candidate that fits right now, picks one by
+ *    `pickByRoll` and places it. A slot with no fitting kind stays empty.
+ * 4. **Candidates of a kind.** A floor ball (the ball slot when it drew
+ *    its floor chance) takes the hall's corners (`cornerSpots`); any other
+ *    kind takes every host surface of one of its classes. A floor ball
+ *    that fits no corner falls back to the surfaces: step 3 runs again for
+ *    its slot with the same roll, so the ball rate stays `BALL_SHARE`. A candidate's
+ *    seed is `seedFor(room.seed, "curio", ...key)` of its surface, or
+ *    `seedFor(room.seed, "curio", cx, cy, "floor")` for a corner (C9).
+ *    They are tried in seed order, ties by their order in `hostSurfaces`.
+ * 5. **A trial.** The candidate's own stream draws the variant (the pink
+ *    gadget's cluster only in a lab or an engineering room), a turn roll
+ *    and the fractions `u` and `v`; the facing turns the curio (C10), and
+ *    `u` and `v` place its box in the surface's slack inside
+ *    `CURIO_MARGIN`. The first candidate that fits its surface
+ *    (`curioFits`) and clashes with no curio placed before
+ *    (`curiosClash`) is the curio, with its candidate's seed.
+ * 6. **The output** is sorted by `CURIO_ORDER`.
+ *
+ * `curioOn` makes one curio on a given surface the same way, for the
+ * hand-built rooms.
+ *
+ * This is the generator side: it imports `core/seed.ts`, `footprints.ts`,
+ * `heroes.ts`, `layout.ts`, `sites.ts`, `types.ts` and `units.ts`, and
+ * never `move.ts`, `generate.ts`, `interact.ts`, `malfunction.ts` or
+ * anything under `render/` (ruling 20). `sites.test.ts` and
+ * `dress.test.ts` keep it so.
  */
 
-import { HERO_FOOTING, OPEN_CLEAR, heroTurn, turnedBox } from "./footprints";
-import { heroSurfaces, heroUnder } from "./heroes";
-import { wallAnchor, type CurioBase } from "./sites";
+import { createRng, seedFor } from "../core/seed";
+import {
+  HERO_FOOTING,
+  OPEN_CLEAR,
+  heroFootprint,
+  heroTurn,
+  propFootprint,
+  turnedBox,
+} from "./footprints";
+import { heroEdges, heroSurfaces, heroUnder } from "./heroes";
+import { isFloor } from "./layout";
+import {
+  EPS,
+  dressingSites,
+  edgeKey,
+  edgeOf,
+  grow,
+  overlaps,
+  pickByRoll,
+  round3,
+  wallAnchor,
+  type CurioBase,
+} from "./sites";
 import type {
   Archetype,
   Box,
@@ -676,3 +730,403 @@ export const CURIO_ORDER = (a: Curio, b: Curio): number =>
   a.x - b.x ||
   a.h - b.h ||
   (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+
+/**
+ * One slot's draw (C6): whether the room takes the slot, the roll that
+ * picks its kind from the kinds that fit, and, on the dev seam's forced
+ * path only, the one `kind` the slot then tries instead of its pool.
+ */
+export interface SlotDraw {
+  take: boolean;
+  roll: number;
+  kind?: CurioKind;
+}
+
+/** A room's four slot draws (C6); the ball slot also carries its floor chance (`BALL_FLOOR`). */
+export interface CurioDraws {
+  retro: SlotDraw;
+  gear: SlotDraw;
+  ball: SlotDraw & { floor: boolean };
+  under: SlotDraw;
+}
+
+/** The slots in the order the pass fills them (C6). */
+const SLOTS: readonly CurioSlot[] = ["retro", "gear", "ball", "under"];
+
+/**
+ * A room's curio draws (the module doc's step 1): one stream of
+ * `seedFor(room.seed, "curio", "draw")` draws, in this order, the retro
+ * slot's chance of `RETRO_SHARE` and its roll, the gear slot's chance of
+ * `GEAR_SHARE` and its roll, the ball slot's chance of `BALL_SHARE`, its
+ * roll and its floor chance of `BALL_FLOOR`, then the under slot's chance
+ * of `UNDER_SHARE` and its roll. Everything is drawn whether it is used or
+ * not, so no draw ever moves another. No draw forces a kind.
+ */
+export function curioDraws(room: CurioBase): CurioDraws {
+  const rng = createRng(seedFor(room.seed, "curio", "draw"));
+  const slot = (share: number): SlotDraw => {
+    const take = rng.chance(share);
+    return { take, roll: rng.next() };
+  };
+  const retro = slot(RETRO_SHARE);
+  const gear = slot(GEAR_SHARE);
+  const ballTake = rng.chance(BALL_SHARE);
+  const ballRoll = rng.next();
+  const floor = rng.chance(BALL_FLOOR);
+  const under = slot(UNDER_SHARE);
+  return {
+    retro,
+    gear,
+    ball: { take: ballTake, roll: ballRoll, floor },
+    under,
+  };
+}
+
+/** How far in from both hall walls a floor ball's centre stands, in metres. */
+const CORNER_IN = 0.12;
+/** How far a floor ball's box keeps from lanes, footprints, props and heroes, in metres. */
+const CORNER_CLEAR = 0.05;
+
+/**
+ * The hall's usable corner spots for a floor ball (the module doc's step
+ * 4): of the four corner cells `(hall.x0, hall.y0)`, `(hall.x1 - 1,
+ * hall.y0)`, `(hall.x0, hall.y1 - 1)` and `(hall.x1 - 1, hall.y1 - 1)`, in
+ * that order, each with the point `CORNER_IN` in from both hall walls
+ * (`x` and `y` in cell units), only the ones where
+ *
+ * - the cell is floor;
+ * - both of its hall wall edges are free (`dressingSites(room).free`),
+ *   carry no wall prop and are no hero's edge (`heroEdges`);
+ * - the box of the biggest ball of `BALL_POOL` at that point, grown by
+ *   `CORNER_CLEAR`, overlaps no lane, no taken box (fixtures, decor,
+ *   scaffolding), no floor prop and no hero.
+ *
+ * Only the spots are returned, never the unusable corners. A hall one cell
+ * wide gives the same cell twice with two different points, which is
+ * harmless. This is the one path that calls `dressingSites`, so the pass
+ * calls it only for a ball that drew its floor chance.
+ */
+export function cornerSpots(
+  room: CurioBase,
+): { cx: number; cy: number; x: number; y: number }[] {
+  const hall = room.hall;
+  const sites = dressingSites(room);
+  const walled = new Set<string>();
+  for (const p of room.props)
+    if (p.anchor === "wall") walled.add(edgeKey(edgeOf(p)));
+  for (const h of room.heroes)
+    for (const e of heroEdges(h)) walled.add(edgeKey(e));
+  const floorBoxes: Box[] = [
+    ...sites.lanes,
+    ...sites.taken,
+    ...room.heroes.map((h) => heroFootprint(h)),
+  ];
+  for (const p of room.props) {
+    const box = propFootprint(p);
+    if (box !== null) floorBoxes.push(box);
+  }
+  let half = 0;
+  for (const [kind] of BALL_POOL)
+    for (const s of CURIO_CATALOGUE[kind].sizes)
+      half = Math.max(half, s.width / 2, s.depth / 2);
+  const inCells = CORNER_IN / CELL;
+  const corners = [
+    [hall.x0, hall.y0, "w", "n"],
+    [hall.x1 - 1, hall.y0, "e", "n"],
+    [hall.x0, hall.y1 - 1, "w", "s"],
+    [hall.x1 - 1, hall.y1 - 1, "e", "s"],
+  ] as const;
+  const out: { cx: number; cy: number; x: number; y: number }[] = [];
+  for (const [cx, cy, sx, sy] of corners) {
+    if (!isFloor(room.grid, cx, cy)) continue;
+    const edges = [sx, sy].map((side) => edgeKey({ x: cx, y: cy, side }));
+    if (edges.some((k) => !sites.free.has(k) || walled.has(k))) continue;
+    const x = round3(sx === "w" ? cx + inCells : cx + 1 - inCells);
+    const y = round3(sy === "n" ? cy + inCells : cy + 1 - inCells);
+    const box = grow(
+      {
+        x0: x * CELL - half,
+        x1: x * CELL + half,
+        z0: y * CELL - half,
+        z1: y * CELL + half,
+      },
+      CORNER_CLEAR,
+    );
+    if (floorBoxes.some((b) => overlaps(box, b))) continue;
+    out.push({ cx, cy, x, y });
+  }
+  return out;
+}
+
+/**
+ * True when curio `c` stands on surface `s` of `room` (the module doc's
+ * step 5, C12): its box lies inside the surface's box shrunk by
+ * `CURIO_MARGIN` (less 2 mm, for the rounding of its centre to three
+ * decimals of a cell), its top is at most the surface's `clear`, and the
+ * surface's height plus its top stays `CURIO_CEILING_GAP` under the
+ * ceiling.
+ */
+export function curioFits(room: CurioBase, c: Curio, s: HostSurface): boolean {
+  const box = curioBox(c);
+  const inner = grow(s.box, -(CURIO_MARGIN - 0.002));
+  const top = curioSize(c).top;
+  return (
+    box.x0 >= inner.x0 &&
+    box.x1 <= inner.x1 &&
+    box.z0 >= inner.z0 &&
+    box.z1 <= inner.z1 &&
+    top <= s.clear &&
+    s.h + top <= room.ceiling - CURIO_CEILING_GAP
+  );
+}
+
+/**
+ * True when two curios are too close: their plan boxes, one grown by
+ * `CURIO_GAP`, overlap, and their height ranges `[h, h + top]` overlap. So
+ * a curio on a shelf level never clashes with one on the level below.
+ */
+export function curiosClash(a: Curio, b: Curio): boolean {
+  if (!overlaps(grow(curioBox(a), CURIO_GAP), curioBox(b))) return false;
+  const ta = a.h + curioSize(a).top;
+  const tb = b.h + curioSize(b).top;
+  return a.h < tb && b.h < ta;
+}
+
+/**
+ * The quarter turn a curio of `facing` takes on surface `s` for a turn roll
+ * of 0 to 3 (C10): an `any` curio adds the whole roll to the host's turn; a
+ * `front` curio does too on a free host, and on a wall host reads a roll
+ * of 2 as 0, so it never faces the wall; a `fixed` curio faces its wall
+ * host's front, and on a free host its front or its back by the roll's
+ * lowest bit.
+ */
+function curioTurn(
+  facing: CurioEntry["facing"],
+  s: HostSurface,
+  roll: number,
+): number {
+  if (facing === "any" || (facing === "front" && s.free))
+    return (s.turn + roll) % 4;
+  if (facing === "front") return (s.turn + (roll === 2 ? 0 : roll)) % 4;
+  return s.free ? (s.turn + 2 * (roll % 2)) % 4 : s.turn;
+}
+
+/**
+ * Curio `kind` of `variant` at `turn` on `s`'s box, its box at fractions
+ * `u` and `v` of the slack the box leaves inside `CURIO_MARGIN`, or null
+ * when it leaves none (a slack within `EPS` of zero counts as zero). Its centre is rounded to three decimals of a cell
+ * and its height is the surface's. What a trial and `curioOn` share.
+ */
+function placeOn(
+  s: HostSurface,
+  kind: CurioKind,
+  variant: number,
+  turn: number,
+  u: number,
+  v: number,
+  seed: number,
+): Curio | null {
+  const probe: Curio = { kind, variant, x: 0, y: 0, h: s.h, turn, seed };
+  const b = curioBox(probe);
+  const w = b.x1 - b.x0;
+  const d = b.z1 - b.z0;
+  // A slack of a hair under zero is float noise on an exact fit (the
+  // laptop on a round table's place), not a curio too big.
+  const rawX = s.box.x1 - s.box.x0 - w - 2 * CURIO_MARGIN;
+  const rawZ = s.box.z1 - s.box.z0 - d - 2 * CURIO_MARGIN;
+  if (rawX < -EPS || rawZ < -EPS) return null;
+  const slackX = Math.max(0, rawX);
+  const slackZ = Math.max(0, rawZ);
+  const cx = s.box.x0 + CURIO_MARGIN + w / 2 + u * slackX;
+  const cz = s.box.z0 + CURIO_MARGIN + d / 2 + v * slackZ;
+  return { ...probe, x: round3(cx / CELL), y: round3(cz / CELL) };
+}
+
+/**
+ * A curio of `kind` and `variant` on surface `s`, at fractions `u` and `v`
+ * of the slack its box leaves inside `CURIO_MARGIN`, turned `turn` (the
+ * surface's own by default) and carrying `seed`: how the hand-built rooms
+ * put a curio exactly where they want it. It throws when the kind does not
+ * stand on the surface's class, when its box does not fit the surface at
+ * that turn, or when its top passes the surface's `clear`. It knows no
+ * room, so the caller keeps it under the ceiling.
+ */
+export function curioOn(
+  s: HostSurface,
+  kind: CurioKind,
+  variant: number,
+  u: number,
+  v: number,
+  seed: number,
+  turn: number = s.turn,
+): Curio {
+  const where = `curioOn: ${kind} ${String(variant)} on ${s.host}`;
+  if (!CURIO_CATALOGUE[kind].classes.includes(s.cls))
+    throw new Error(`${where}: no ${s.cls} curio`);
+  const c = placeOn(s, kind, variant, turn, u, v, seed);
+  if (c === null) throw new Error(`${where}: too big for the surface`);
+  if (curioSize(c).top > s.clear) throw new Error(`${where}: too tall`);
+  return c;
+}
+
+/** One place a curio may be tried at: its seed, its order among its fellows and the surface or corner. */
+interface CurioCandidate {
+  seed: number;
+  order: number;
+  surface: HostSurface | null;
+  spot: { x: number; y: number } | null;
+}
+
+/**
+ * The candidates of `kind` in `room` (the module doc's step 4), in the
+ * order they are tried: by seed, ties by their order in `surfaces` or
+ * among the corners. A floor ball takes the corners (`corners`, worked out
+ * once and only when asked), any other kind the surfaces of its classes.
+ */
+function candidatesOf(
+  room: CurioBase,
+  kind: CurioKind,
+  floor: boolean,
+  surfaces: readonly HostSurface[],
+  corners: () => readonly { cx: number; cy: number; x: number; y: number }[],
+): CurioCandidate[] {
+  const out: CurioCandidate[] = floor
+    ? corners().map((c, order) => ({
+        seed: seedFor(room.seed, "curio", c.cx, c.cy, "floor"),
+        order,
+        surface: null,
+        spot: { x: c.x, y: c.y },
+      }))
+    : surfaces.flatMap((s, order) =>
+        CURIO_CATALOGUE[kind].classes.includes(s.cls)
+          ? [
+              {
+                seed: seedFor(room.seed, "curio", s.key[0], s.key[1], s.key[2]),
+                order,
+                surface: s,
+                spot: null,
+              },
+            ]
+          : [],
+      );
+  return out.sort((a, b) => a.seed - b.seed || a.order - b.order);
+}
+
+/**
+ * One trial (the module doc's step 5): the candidate's stream draws the
+ * variant (the pink gadget's cluster only in a lab or an engineering
+ * room), a turn roll and `u` and `v`, all of them always. A floor ball
+ * stands at its corner point at the turn roll; anything else is turned by
+ * its facing and placed in its surface's slack. The curio, or null when it
+ * does not fit (`curioFits`, or the ceiling for a floor ball) or clashes
+ * with one of `placed`.
+ */
+function trial(
+  room: CurioBase,
+  kind: CurioKind,
+  cand: CurioCandidate,
+  placed: readonly Curio[],
+): Curio | null {
+  const e = CURIO_CATALOGUE[kind];
+  const rng = createRng(cand.seed);
+  let variant = rng.int(0, e.variants - 1);
+  if (
+    kind === "pink-gadget" &&
+    room.archetype !== "lab" &&
+    room.archetype !== "engineering"
+  )
+    variant = 0;
+  const turnRoll = rng.int(0, 3);
+  const u = rng.next();
+  const v = rng.next();
+  let c: Curio | null;
+  if (cand.surface === null) {
+    const spot = cand.spot ?? { x: 0, y: 0 };
+    c = {
+      kind,
+      variant,
+      x: spot.x,
+      y: spot.y,
+      h: 0,
+      turn: turnRoll,
+      seed: cand.seed,
+    };
+    if (curioSize(c).top > room.ceiling - CURIO_CEILING_GAP) return null;
+  } else {
+    const s = cand.surface;
+    const turn = curioTurn(e.facing, s, turnRoll);
+    c = placeOn(s, kind, variant, turn, u, v, cand.seed);
+    if (c === null || !curioFits(room, c, s)) return null;
+  }
+  const mine = c;
+  return placed.some((p) => curiosClash(p, mine)) ? null : c;
+}
+
+/** A slot's pool: the kind its draw forces, or its own weighted pool (C7). */
+function poolOf(
+  slot: CurioSlot,
+  draw: SlotDraw,
+  archetype: Archetype,
+): readonly (readonly [CurioKind, number])[] {
+  if (draw.kind !== undefined) return [[draw.kind, 1]];
+  switch (slot) {
+    case "retro":
+      return RETRO_POOL;
+    case "gear":
+      return GEAR_POOLS[archetype];
+    case "ball":
+      return BALL_POOL;
+    case "under":
+      return UNDER_POOL;
+  }
+}
+
+/**
+ * The curio pass (see the module doc's numbered list): the curios of
+ * `room`, at most one per slot, sorted by `CURIO_ORDER`. `draws` default
+ * to the room's own (`curioDraws`); the tests and the dev seam pass forced
+ * ones. It reads the fixtures, decor, heroes and props and changes none
+ * of them, and it never throws on a room with no host for a drawn kind:
+ * that slot just stays empty. The fit filter and the placement share one
+ * loop (`tryPlace`), so a kind that counted as fitting always lands.
+ */
+export function placeCurios(
+  room: CurioBase,
+  draws: CurioDraws = curioDraws(room),
+): Curio[] {
+  const surfaces = hostSurfaces(room);
+  let corners: ReturnType<typeof cornerSpots> | null = null;
+  const cornersOnce = () => (corners ??= cornerSpots(room));
+  const placed: Curio[] = [];
+  for (const slot of SLOTS) {
+    const draw = draws[slot];
+    if (!draw.take) continue;
+    const pool = poolOf(slot, draw, room.archetype);
+    let floor = slot === "ball" && draws.ball.floor;
+    const tryPlace = (kind: CurioKind): Curio | null => {
+      for (const cand of candidatesOf(
+        room,
+        kind,
+        floor,
+        surfaces,
+        cornersOnce,
+      )) {
+        const c = trial(room, kind, cand, placed);
+        if (c !== null) return c;
+      }
+      return null;
+    };
+    let fitting = pool.filter(([kind]) => tryPlace(kind) !== null);
+    // A floor ball with no corner it fits falls back to the surfaces, so
+    // the ball rate stays at `BALL_SHARE`; nothing is drawn again.
+    if (floor && fitting.length === 0) {
+      floor = false;
+      fitting = pool.filter(([kind]) => tryPlace(kind) !== null);
+    }
+    const kind = pickByRoll(draw.roll, fitting);
+    if (kind === null) continue;
+    const c = tryPlace(kind);
+    if (c !== null) placed.push(c);
+  }
+  return placed.sort(CURIO_ORDER);
+}
