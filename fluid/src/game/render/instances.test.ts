@@ -83,6 +83,11 @@ describe("propInstances", () => {
 });
 
 describe("instanceGroups", () => {
+  // Review Focus 3's key-space pin: a hero key never collides with a prop
+  // key (`props.has(g.key)` below), and grouping stays deterministic once
+  // heroes are in the room (`instanceGroups(room)` called twice). It does
+  // not exercise the rebuild Review Focus 3 also names, a look switch or a
+  // restored context: no test here runs the renderer that rebuilds on.
   it("gives hero groups their own key space and their bank slot, the same arrays for the same room (Review Focus 3)", () => {
     const room = {
       ...galleryRoom(),

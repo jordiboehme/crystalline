@@ -1,20 +1,28 @@
 import { describe, expect, it } from "vitest";
 
 import { HERO_FOOTING, heroFootprint } from "../world/footprints";
-import { HERO_CATALOGUE, HERO_KINDS, HERO_WALL_TOP } from "../world/heroes";
+import {
+  HERO_CATALOGUE,
+  HERO_KINDS,
+  HERO_WALL_TOP,
+  heroSurfaces,
+} from "../world/heroes";
 import { turnForSide, wallAnchor } from "../world/sites";
 import type { Hero, HeroKind, Side, WallSlot } from "../world/types";
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
-import { frameForSlot, type Frame } from "./kit";
+import { frameAt, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
+  clearAbove,
   floatingGlow,
   inBox,
+  looseParts,
   placeMesh,
   placeParts,
   positions,
   recordingKitAt,
+  upwardFaceAt,
   worstWinding,
   type Part,
 } from "./modelChecks";
@@ -26,6 +34,18 @@ const EPS = 1e-4;
 /** A free hero's anchor, in cell units: the middle of a cell's width, on a row line. */
 const FREE_AT = { x: 4.5, y: 3 } as const;
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
+
+/** The grid a catalogue surface is sampled on, in each direction. */
+const SURFACE_GRID = 7;
+
+/**
+ * How high above a catalogue surface must stay clear of mesh, in metres:
+ * enough room for a hand or a held object. The laser desk's arm passes
+ * well above this over its desk top, so the rule holds there too; a kind
+ * that turns out to need less is a finding for the report, not a reason to
+ * shrink this number.
+ */
+const HEADROOM = 0.25;
 
 /** The wall edge whose side takes turn `t`. */
 function sideFor(t: number): Side {
@@ -87,6 +107,12 @@ describe("hero models", () => {
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
 
+      it(`${kind} variant ${String(v)} stands on the floor, its wall or another part`, () => {
+        const wall =
+          HERO_FOOTING[kind] === "free" ? null : frameAt([0, 0, 0], 0);
+        expect(looseParts(parts, wall)).toEqual([]);
+      });
+
       for (let t = 0; t < 4; t++) {
         describe(`${kind} variant ${String(v)} turned ${String(t)}`, () => {
           const { hero, at, edge } = heroAt(kind, v, t);
@@ -122,6 +148,32 @@ describe("hero models", () => {
           it("glows only on or in its body", () => {
             expect(floatingGlow(placeParts(parts, t, at), wall)).toEqual([]);
           });
+
+          if (entry.surfaces.length > 0) {
+            it("puts every catalogue surface on a real, clear face of the mesh", () => {
+              const tops = heroSurfaces(hero);
+              expect(tops.length).toBeGreaterThan(0);
+              for (const surf of tops) {
+                for (let ix = 0; ix < SURFACE_GRID; ix++)
+                  for (let iz = 0; iz < SURFACE_GRID; iz++) {
+                    const x =
+                      surf.box.x0 +
+                      ((surf.box.x1 - surf.box.x0) * ix) / (SURFACE_GRID - 1);
+                    const z =
+                      surf.box.z0 +
+                      ((surf.box.z1 - surf.box.z0) * iz) / (SURFACE_GRID - 1);
+                    const label = `${kind} v${String(v)} t${String(t)} (${String(ix)},${String(iz)})`;
+                    expect(upwardFaceAt(placed, x, z, surf.h), label).toBe(
+                      true,
+                    );
+                    expect(
+                      clearAbove(placed, x, z, surf.h, HEADROOM),
+                      label,
+                    ).toBe(true);
+                  }
+              }
+            });
+          }
         });
       }
     }

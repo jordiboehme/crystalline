@@ -3,30 +3,40 @@
  * import. Nothing in the game reads it, so it never reaches a bundle.
  *
  * The fixture and decor tests (`models.test.ts`), the prop tests
- * (`propModels.test.ts`) and the hero tests (`heroModels.test.ts`) measure
- * a built model the same ways: the winding of every triangle against its
- * stored normal, points in a frame's local terms, points inside a floor
- * box, and whether every glowing part (a screen, a frame, a portal, a
- * signal light or a blinking one) touches a lit host or its wall. A prop
- * or hero mesh, built once at the origin, is turned and placed the way the
- * GPU places an instance (`placeMesh`, `placeParts`) before it is
- * measured. The glow check works on a list of recorded kit calls (`Part`),
- * which `recordingKitAt` records for a model built through a kit factory,
- * and which the fixture tests record for the movers too.
+ * (`propModels.test.ts`) and the hero tests (`heroModels.test.ts` and the
+ * per-batch hero tests under `models/heroes/`) measure a built model the
+ * same ways: the winding of every triangle against its stored normal,
+ * points in a frame's local terms, points inside a floor box, whether a
+ * catalogue surface sits on a real upward face and stays clear above it
+ * (`upwardFaceAt`, `clearAbove`), whether every part traces a path back to
+ * the floor or its wall through the parts it touches (`touching`,
+ * `looseParts`), and whether every glowing part (a screen, a frame, a
+ * portal, a signal light or a blinking one) touches a lit host or its
+ * wall. A prop or hero mesh, built once at the origin, is turned and
+ * placed the way the GPU places an instance (`placeMesh`, `placeParts`)
+ * before it is measured. The glow check works on a list of recorded kit
+ * calls (`Part`), which `recordingKitAt` records for a model built through
+ * a kit factory, and which the fixture tests record for the movers too;
+ * `heroAt`, `anchorOf` and `partsOf` are the one way every hero test
+ * builds a hero and its recorded parts at the origin.
  */
 
-import type { Box } from "../world/types";
+import type { Box, Hero, HeroKind } from "../world/types";
+import { CELL } from "../world/units";
 import { BLINK_GROUPS } from "./blink";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
+  createBuilder,
   type Builder,
   type MeshData,
   type Surface,
   type V3,
 } from "./geometry";
 import { createKit, turnPoint, type Frame, type Kit } from "./kit";
+import { LOOKS } from "./looks";
 import type { KitAt } from "./models";
+import { buildHero } from "./models/heroes";
 
 /**
  * One kit call, as a recording kit saw it: the builder it emitted into
@@ -198,6 +208,206 @@ export function reaches(from: Shape, to: Shape): boolean {
     }
   }
   return false;
+}
+
+/**
+ * How close two parts must come to count as touching in the float check: a
+ * little over `DECAL_LIFT`, so a light or decal on its face counts, and
+ * well under `reaches`' 3 cm, so a 1.5 cm gap under a shelf or a pack does
+ * not.
+ */
+const TOUCH = 0.012;
+
+/**
+ * Whether one shape is a sleeve round the other: their bounds overlap on
+ * every axis, and on at least two axes one's range holds the other's whole
+ * (a collar round a barrel, a ring round a tube). No vertex of either lies
+ * near a triangle of the other, so the vertex test alone would call it
+ * loose.
+ */
+function sleeve(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (!axes.every((k) => p.lo[k] < q.hi[k] && q.lo[k] < p.hi[k])) return false;
+  const holds = (o: Shape, i: Shape) =>
+    axes.filter((k) => o.lo[k] <= i.lo[k] + 1e-6 && i.hi[k] <= o.hi[k] + 1e-6)
+      .length >= 2;
+  return holds(p, q) || holds(q, p);
+}
+
+/**
+ * Whether two shapes overlap in volume: their bounds overlap on every axis
+ * by more than 1 cm. Catches a part built to run through another on
+ * purpose (the laser desk's arm through the emitter housing) that neither
+ * `sleeve` nor a vertex-to-triangle distance would call touching, without
+ * loosening the check for a true floater, whose bounds miss every part it
+ * should be resting on entirely.
+ */
+function overlapsVolume(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  return axes.every(
+    (k) => Math.min(p.hi[k], q.hi[k]) - Math.max(p.lo[k], q.lo[k]) > 0.01,
+  );
+}
+
+/**
+ * Whether one shape sits directly on the other with no seam: one's lowest
+ * point lands within 0.1 mm of the other's highest (either way round), and
+ * their plan footprints (the other two axes) overlap by more than 1 cm on
+ * both. Catches a part built to abut another exactly at the height a model
+ * steps in or out (a dome planter's collar flaring past its drum, a rim
+ * wider than the band it caps): the two never share a height, so `sleeve`
+ * and `overlapsVolume` both call it loose, and the step can run wider than
+ * `TOUCH`, so the vertex-to-triangle distance misses it too.
+ */
+function stacked(p: Shape, q: Shape): boolean {
+  const flush = (a: Shape, b: Shape) => Math.abs(a.hi[1] - b.lo[1]) <= 1e-4;
+  if (!flush(p, q) && !flush(q, p)) return false;
+  const plan = [0, 2] as const;
+  return plan.every(
+    (k) => Math.min(p.hi[k], q.hi[k]) - Math.max(p.lo[k], q.lo[k]) > 0.01,
+  );
+}
+
+/**
+ * Whether two parts touch: one is a sleeve round the other (`sleeve`), they
+ * overlap in volume by more than 1 cm on every axis (`overlapsVolume`), one
+ * sits flush on the other with a footprint they share by more than 1 cm
+ * (`stacked`), or a vertex of one lies within `TOUCH` of a triangle of the
+ * other.
+ */
+export function touching(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (axes.some((k) => p.lo[k] > q.hi[k] + TOUCH || q.lo[k] > p.hi[k] + TOUCH))
+    return false;
+  if (sleeve(p, q) || overlapsVolume(p, q) || stacked(p, q)) return true;
+  const near = (from: Shape, to: Shape) => {
+    for (let t = 0; t + 2 < to.points.length; t += 3) {
+      const [a, b, c] = [to.points[t], to.points[t + 1], to.points[t + 2]];
+      if (!a || !b || !c) continue;
+      for (const v of from.points)
+        if (Math.hypot(...sub(v, closestOnTriangle(v, a, b, c))) <= TOUCH)
+          return true;
+    }
+    return false;
+  };
+  return near(p, q) || near(q, p);
+}
+
+/**
+ * Every part with no path back to the floor or the wall through the parts
+ * it touches (`touching`): held parts start on the floor (a shape whose
+ * lowest point sits within 0.1 mm of `y = 0`) or, when `wall` is given, on
+ * the wall plane (some vertex within 0.1 mm of it, in the wall frame's
+ * terms); every other part joins once it touches a held one, repeated to a
+ * fixed point. What is left after that is loose, named `"<index>:<method>"`
+ * in build order: a genuine floater, not a part chained to the floor only
+ * through parts still unheld when it was its turn to check. Pass every
+ * part of a hero, built once at the origin; a part with no points (an
+ * empty primitive) is dropped rather than counted loose.
+ */
+export function looseParts(
+  parts: readonly Part[],
+  wall: Frame | null,
+): string[] {
+  const solid = parts.filter((p) => p.points.length > 0);
+  const shapes = solid.map((p) => shape(p.points));
+  const held = shapes.map(
+    (s) =>
+      s.lo[1] <= 1e-4 ||
+      (wall !== null && s.points.some((q) => toLocal(wall, q)[1] <= 1e-4)),
+  );
+  for (let changed = true; changed;) {
+    changed = false;
+    shapes.forEach((s, i) => {
+      if (held[i]) return;
+      if (shapes.some((o, j) => held[j] && touching(s, o))) {
+        held[i] = true;
+        changed = true;
+      }
+    });
+  }
+  return solid
+    .map((p, i) => ({ p, i }))
+    .filter(({ i }) => !held[i])
+    .map(({ p, i }) => `${String(i)}:${p.method}`);
+}
+
+/**
+ * Whether some triangle of `mesh` faces straight up (its stored normal
+ * within 1e-3 of `(0, 1, 0)`), has all three corners at height `h` within
+ * 5 mm, and contains `(x, z)` in plan (the same half-plane sign on every
+ * edge): a catalogue surface is real geometry, not just a number in the
+ * catalogue.
+ */
+export function upwardFaceAt(
+  mesh: MeshData,
+  x: number,
+  z: number,
+  h: number,
+): boolean {
+  const ps = positions(mesh);
+  const ns = normals(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c, n] = [ps[t], ps[t + 1], ps[t + 2], ns[t]];
+    if (!a || !b || !c || !n) continue;
+    if (Math.hypot(n[0], n[1] - 1, n[2]) > 1e-3) continue;
+    if ([a, b, c].some((p) => Math.abs(p[1] - h) > 0.005)) continue;
+    const side = (p: V3, q: V3) =>
+      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
+    const s = [side(a, b), side(b, c), side(c, a)];
+    if (s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the column above `(x, z)`, from `h` up to `h + headroom` metres,
+ * is free of mesh: no triangle whose plan footprint contains the point
+ * rises above `h` (the surface's own top face, sitting at exactly `h`,
+ * does not count) while staying below `h + headroom`. A part hovering in
+ * reach over a catalogue surface fails this even where it never touches
+ * the surface's own height.
+ */
+export function clearAbove(
+  mesh: MeshData,
+  x: number,
+  z: number,
+  h: number,
+  headroom: number,
+): boolean {
+  const ps = positions(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!a || !b || !c) continue;
+    const side = (p: V3, q: V3) =>
+      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
+    const s = [side(a, b), side(b, c), side(c, a)];
+    if (!(s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9))) continue;
+    const lo = Math.min(a[1], b[1], c[1]);
+    const hi = Math.max(a[1], b[1], c[1]);
+    if (hi > h + 0.005 && lo < h + headroom) return false;
+  }
+  return true;
+}
+
+/** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
+export function heroAt(kind: HeroKind, variant = 0): Hero {
+  return { kind, variant, x: 4.5, y: 3, turn: 0, seed: 1 };
+}
+
+/** Where a hero's mesh is placed, in world metres. */
+export const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
+
+/** A hero's recorded parts, built at the origin at turn 0. */
+export function partsOf(kind: HeroKind, variant = 0): Part[] {
+  const parts: Part[] = [];
+  buildHero(
+    recordingKitAt(createBuilder(), parts),
+    kind,
+    variant,
+    LOOKS.aperture,
+  );
+  return parts;
 }
 
 /**

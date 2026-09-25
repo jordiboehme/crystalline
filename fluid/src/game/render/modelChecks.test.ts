@@ -8,14 +8,19 @@ import {
   createBuilder,
   type MeshData,
   type Surface,
+  type V3,
 } from "./geometry";
 import { createKit, frameForSlot } from "./kit";
 import {
   GLOWING,
   floatingGlow,
+  looseParts,
   recordingKitAt,
+  shape,
+  touching,
   worstWinding,
   type Part,
+  type Shape,
 } from "./modelChecks";
 
 const LIT: Surface = { layer: 1, tint: [0.5, 0.5, 0.5], flag: FLAG.lit };
@@ -149,5 +154,102 @@ describe("worstWinding", () => {
       }
     }
     expect(worstWinding(m)).toBeLessThan(0);
+  });
+});
+
+describe("touching", () => {
+  /** A shape's bounds from its two extreme corners: `stacked`, `sleeve` and
+   * `overlapsVolume` read only the bounds, and the `near` fallback never
+   * runs once one of them already says yes, so two points are enough. */
+  const box = (lo: V3, hi: V3): Shape => shape([lo, hi]);
+
+  it("does not touch a shape floating 5 cm above it", () => {
+    const held = box([0, 0, 0], [0.2, 0, 0.2]);
+    const floater = box([0, 0.05, 0], [0.2, 0.05, 0.2]);
+    expect(touching(held, floater)).toBe(false);
+    expect(touching(floater, held)).toBe(false);
+  });
+
+  it("does not touch a shape 1.5 cm clear, the shelf gap TOUCH keeps out", () => {
+    const lower = box([0, 0, 0], [0.2, 0.3, 0.2]);
+    const upper = box([0, 0.315, 0], [0.2, 0.4, 0.2]);
+    expect(touching(lower, upper)).toBe(false);
+    expect(touching(upper, lower)).toBe(false);
+  });
+
+  it("touches a shape it runs through by more than 1 cm on every axis", () => {
+    // The laser desk's arm through the emitter housing.
+    const housing = box([0, 0, 0], [0.3, 0.3, 0.3]);
+    const arm = box([0.1, 0.1, 0.1], [0.4, 0.4, 0.4]);
+    expect(touching(housing, arm)).toBe(true);
+  });
+
+  it("touches a shape it sits flush on even where the footprint steps out", () => {
+    // The dome planter's collar (r 0.7) flaring past its drum (r 0.68),
+    // their heights meeting exactly at 0.36: no shared height for `sleeve`
+    // or `overlapsVolume`, and the 2 cm step is wider than `TOUCH`.
+    const drum = box([-0.68, 0.1, -0.68], [0.68, 0.36, 0.68]);
+    const collar = box([-0.7, 0.36, -0.7], [0.7, 0.42, 0.7]);
+    expect(touching(drum, collar)).toBe(true);
+    expect(touching(collar, drum)).toBe(true);
+  });
+
+  it("does not call two shapes stacked when their footprints barely meet", () => {
+    // Flush in height, but their plan boxes clip corners by under 1 cm:
+    // not a real rest, just two boxes that happen to touch a shared plane.
+    const a = box([0, 0, 0], [0.2, 0.3, 0.2]);
+    const b = box([0.195, 0.3, 0.195], [0.4, 0.5, 0.4]);
+    expect(touching(a, b)).toBe(false);
+  });
+});
+
+describe("looseParts", () => {
+  /** A flat triangle `Part` at a given height, with no flag or layer. */
+  const partAt = (method: string, y: number): Part => ({
+    builder: {},
+    method,
+    layer: -1,
+    flag: -1,
+    points: [
+      [0, y, 0],
+      [0.1, y, 0],
+      [0, y, 0.1],
+    ],
+  });
+
+  it("names a synthetic floater with no path back to the floor", () => {
+    const held = partAt("floor", 0);
+    const floater: Part = {
+      ...partAt("floater", 1),
+      points: [
+        [5, 1, 5],
+        [5.1, 1, 5],
+        [5, 1, 5.1],
+      ],
+    };
+    expect(looseParts([held, floater], null)).toEqual(["1:floater"]);
+  });
+
+  it("holds a part two touches away from the floor, through the fixed point", () => {
+    const held = partAt("floor", 0);
+    // Within TOUCH (1.2 cm) of `held`: joins on the first pass.
+    const mid = partAt("mid", 0.005);
+    // Within TOUCH of `mid` but 1.5 cm clear of `held` directly: joins
+    // only once `mid` is already held, on the loop's second pass.
+    const far = partAt("far", 0.015);
+    expect(looseParts([held, mid, far], null)).toEqual([]);
+    expect(looseParts([held, far], null)).toEqual(["1:far"]);
+  });
+
+  it("drops a part with no points rather than counting it loose", () => {
+    const held = partAt("floor", 0);
+    const empty: Part = {
+      builder: {},
+      method: "empty",
+      layer: -1,
+      flag: -1,
+      points: [],
+    };
+    expect(looseParts([held, empty], null)).toEqual([]);
   });
 });

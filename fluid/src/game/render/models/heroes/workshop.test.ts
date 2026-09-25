@@ -1,58 +1,29 @@
 /**
  * The workshop heroes' shape tests: what `heroModels.test.ts` does not
- * check for every kind. The gun bench's and the tube bench's catalogue
- * tops lie on an upward face of their mesh; the core wall's lamps cover
- * all eight twinkle groups and never overlap; the big gun, taken from the
- * built rack and bench, is the same parts only moved, and nothing else
- * meets its grip; the tube bench's
- * three tubes meet at one round hub, two arms up and the stem down; the
- * field pack's chase climbs its cell one light per group and runs round
- * its cyclotron in ring order; and no part of any workshop hero floats:
- * each stands on the floor, on its wall or on another part.
+ * check for every kind. The core wall's lamps cover all eight twinkle
+ * groups and never overlap; the big gun, taken from the built rack and
+ * bench, is the same parts only moved, and nothing else meets its grip;
+ * the tube bench's three tubes meet at one round hub, two arms up and the
+ * stem down; and the field pack's chase climbs its cell one light per
+ * group and runs round its cyclotron in ring order. Whether a workshop
+ * hero's parts float, and whether the gun bench's and the tube bench's
+ * catalogue tops lie on a real, clear upward face, are
+ * `heroModels.test.ts`'s checks now, for every kind, not only these.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { HERO_FOOTING } from "../../../world/footprints";
-import { HERO_CATALOGUE, heroSurfaces } from "../../../world/heroes";
-import type { Hero, HeroKind } from "../../../world/types";
-import { CELL } from "../../../world/units";
-import { FLAG, createBuilder, type MeshData, type V3 } from "../../geometry";
+import { HERO_CATALOGUE } from "../../../world/heroes";
+import { FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
 import {
-  closestOnTriangle,
-  positions,
-  placeMesh,
+  partsOf,
   reaches,
-  recordingKitAt,
   shape,
   sub,
   toLocal,
   type Part,
-  type Shape,
 } from "../../modelChecks";
-import { buildHero, buildHeroMesh } from ".";
-
-/** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
-function heroAt(kind: HeroKind): Hero {
-  return { kind, variant: 0, x: 4.5, y: 3, turn: 0, seed: 1 };
-}
-
-/** Where a hero's mesh is placed, in world metres. */
-const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
-
-/** A hero's recorded parts, built at the origin at turn 0. */
-function partsOf(kind: HeroKind, variant = 0): Part[] {
-  const parts: Part[] = [];
-  buildHero(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
-  return parts;
-}
 
 /** Whether a part is a light in one of the eight blink groups. */
 const blinks = (p: Part) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 8;
@@ -77,81 +48,6 @@ function sameMoved(p: Part, q: Part): boolean {
     const b = q.points[i];
     return b !== undefined && gap(sub(b, a), shift) < 1e-6;
   });
-}
-
-/**
- * Whether some triangle of `mesh` faces straight up (normal within 1e-3
- * of `(0, 1, 0)`), has all three corners at height `h` within 0.005, and
- * contains `(x, z)` in plan.
- */
-function upwardFaceAt(mesh: MeshData, x: number, z: number, h: number) {
-  const ps = positions(mesh);
-  for (let t = 0; t + 2 < ps.length; t += 3) {
-    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
-    if (!a || !b || !c) continue;
-    const ab: V3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    const ac: V3 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    const n: V3 = [
-      ab[1] * ac[2] - ab[2] * ac[1],
-      ab[2] * ac[0] - ab[0] * ac[2],
-      ab[0] * ac[1] - ab[1] * ac[0],
-    ];
-    const len = Math.hypot(n[0], n[1], n[2]);
-    if (len < 1e-9) continue;
-    const nn: V3 = [n[0] / len, n[1] / len, n[2] / len];
-    if (Math.hypot(nn[0], nn[1] - 1, nn[2]) > 1e-3) continue;
-    if ([a, b, c].some((p) => Math.abs(p[1] - h) > 0.005)) continue;
-    const side = (p: V3, q: V3) =>
-      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
-    const s = [side(a, b), side(b, c), side(c, a)];
-    if (s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9)) return true;
-  }
-  return false;
-}
-
-/**
- * How close two parts must come to count as touching in the float test:
- * a little over `DECAL_LIFT`, so a light or decal on its face counts, and
- * well under `reaches`' 3 cm, so a 1.5 cm gap under a shelf or a pack
- * does not.
- */
-const TOUCH = 0.012;
-
-/**
- * Whether one shape is a sleeve round the other: their bounds overlap on
- * every axis, and on at least two axes one's range holds the other's
- * whole (a collar round a barrel, a ring round a tube). No vertex of
- * either lies near a triangle of the other, so the vertex test alone
- * would call it loose.
- */
-function sleeve(p: Shape, q: Shape): boolean {
-  const axes = [0, 1, 2] as const;
-  if (!axes.every((k) => p.lo[k] < q.hi[k] && q.lo[k] < p.hi[k])) return false;
-  const holds = (o: Shape, i: Shape) =>
-    axes.filter((k) => o.lo[k] <= i.lo[k] + 1e-6 && i.hi[k] <= o.hi[k] + 1e-6)
-      .length >= 2;
-  return holds(p, q) || holds(q, p);
-}
-
-/**
- * Whether two parts touch: one is a sleeve round the other (`sleeve`), or
- * a vertex of one lies within `TOUCH` of a triangle of the other.
- */
-function touching(p: Shape, q: Shape): boolean {
-  const axes = [0, 1, 2] as const;
-  if (axes.some((k) => p.lo[k] > q.hi[k] + TOUCH || q.lo[k] > p.hi[k] + TOUCH))
-    return false;
-  if (sleeve(p, q)) return true;
-  const near = (from: Shape, to: Shape) => {
-    for (let t = 0; t + 2 < to.points.length; t += 3) {
-      const [a, b, c] = [to.points[t], to.points[t + 1], to.points[t + 2]];
-      if (!a || !b || !c) continue;
-      for (const v of from.points)
-        if (gap(v, closestOnTriangle(v, a, b, c)) <= TOUCH) return true;
-    }
-    return false;
-  };
-  return near(p, q) || near(q, p);
 }
 
 /**
@@ -181,34 +77,7 @@ function gunRun() {
   return { rack, bench, ...best };
 }
 
-/** The workshop kinds, each tested in every variant. */
-const WORKSHOP_KINDS = [
-  "core-wall",
-  "gun-rack",
-  "gun-bench",
-  "tube-bench",
-  "field-pack",
-] as const satisfies readonly HeroKind[];
-
 describe("workshop hero models", () => {
-  it("puts every surface on an upward face of the mesh", () => {
-    for (const kind of ["gun-bench", "tube-bench"] as const) {
-      const h = heroAt(kind);
-      const mesh = placeMesh(
-        buildHeroMesh(kind, 0, LOOKS.aperture),
-        0,
-        anchorOf(h),
-      );
-      const tops = heroSurfaces(h);
-      expect(tops.length, kind).toBeGreaterThan(0);
-      for (const surf of tops) {
-        const cx = (surf.box.x0 + surf.box.x1) / 2;
-        const cz = (surf.box.z0 + surf.box.z1) / 2;
-        expect(upwardFaceAt(mesh, cx, cz, surf.h), kind).toBe(true);
-      }
-    }
-  });
-
   it("the core wall's lamps cover all eight groups, many small ones to a cabinet", () => {
     const lamps = partsOf("core-wall").filter(blinks);
     const groups = new Set(lamps.map((p) => p.flag - FLAG.blink));
@@ -347,36 +216,5 @@ describe("workshop hero models", () => {
       expect(Math.abs(Math.abs(first) - Math.PI / 2)).toBeLessThan(1e-6);
       for (const step of steps) expect(step).toBeCloseTo(first, 6);
     }
-  });
-
-  it("stands every part on the floor, its wall or another part", () => {
-    const f = frameAt([0, 0, 0], 0);
-    const loose: string[] = [];
-    for (const kind of WORKSHOP_KINDS)
-      for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++) {
-        const parts = partsOf(kind, v).filter((p) => p.points.length > 0);
-        const shapes: Shape[] = parts.map((p) => shape(p.points));
-        const onWall = HERO_FOOTING[kind] !== "free";
-        const held = shapes.map(
-          (s) =>
-            s.lo[1] <= 1e-4 ||
-            (onWall && s.points.some((q) => toLocal(f, q)[1] <= 1e-4)),
-        );
-        for (let changed = true; changed;) {
-          changed = false;
-          shapes.forEach((s, i) => {
-            if (held[i]) return;
-            if (shapes.some((o, j) => held[j] && touching(s, o))) {
-              held[i] = true;
-              changed = true;
-            }
-          });
-        }
-        parts.forEach((p, i) => {
-          if (!held[i])
-            loose.push(`${kind} ${String(v)} ${String(i)}:${p.method}`);
-        });
-      }
-    expect(loose).toEqual([]);
   });
 });

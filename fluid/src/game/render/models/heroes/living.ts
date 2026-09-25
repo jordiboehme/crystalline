@@ -99,7 +99,7 @@ const LEAF_DARK: Rgb = [0.13, 0.33, 0.12];
 const GROW_TINT: Rgb = [0.95, 0.7, 0.35];
 
 /** The chamfer of this file's housings, in metres. */
-const BEVEL = 0.02;
+const LIVING_BEVEL = 0.02;
 
 /**
  * A flat stadium (a box with a half round at each end, seen from above)
@@ -149,17 +149,26 @@ const messTable: HeroRecipe = ({ k, s }) => {
   const chrome = s.tinted(CHROME);
 
   // The top with rounded ends, a grey skirt under it, a spine and a foot.
-  stadium(k, -2.38, 2.38, 0, 0.48, 0.72, 0.76, 16, white, BEVEL);
+  stadium(k, -2.38, 2.38, 0, 0.48, 0.72, 0.76, 16, white, LIVING_BEVEL);
   stadium(k, -2.2, 2.2, 0, 0.4, 0.66, 0.72, 12, trim);
-  k.bevelBox(-1.5, 1.5, -0.16, 0.16, 0.05, 0.66, BEVEL, white);
-  k.bevelBox(-1.65, 1.65, -0.3, 0.3, 0, 0.05, BEVEL, trim);
+  k.bevelBox(-1.5, 1.5, -0.16, 0.16, 0.05, 0.66, LIVING_BEVEL, white);
+  k.bevelBox(-1.65, 1.65, -0.3, 0.3, 0, 0.05, LIVING_BEVEL, trim);
 
   // A bench down each side: a white seat with rounded ends on three
   // white supports.
   for (const dm of [1.13, -1.13]) {
-    stadium(k, -2.15, 2.15, dm, 0.13, 0.38, 0.45, 10, white, BEVEL);
+    stadium(k, -2.15, 2.15, dm, 0.13, 0.38, 0.45, 10, white, LIVING_BEVEL);
     for (const a of [-1.6, 0, 1.6])
-      k.bevelBox(a - 0.1, a + 0.1, dm - 0.08, dm + 0.08, 0, 0.38, BEVEL, white);
+      k.bevelBox(
+        a - 0.1,
+        a + 0.1,
+        dm - 0.08,
+        dm + 0.08,
+        0,
+        0.38,
+        LIVING_BEVEL,
+        white,
+      );
   }
 
   // The drinking bird: a chrome stand, two legs and a pivot bar.
@@ -265,10 +274,10 @@ const helperRobot: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   }
 
   // The chassis, the waist, the white body and its grey hood.
-  k.bevelBox(-0.4, 0.4, -0.5, 0.5, 0.2, 0.34, BEVEL, grey);
-  k.bevelBox(-0.32, 0.32, -0.36, 0.38, 0.34, 0.5, BEVEL, grey);
+  k.bevelBox(-0.4, 0.4, -0.5, 0.5, 0.2, 0.34, LIVING_BEVEL, grey);
+  k.bevelBox(-0.32, 0.32, -0.36, 0.38, 0.34, 0.5, LIVING_BEVEL, grey);
   k.bevelBox(-0.42, 0.42, -0.42, 0.46, 0.5, 1.42, 0.03, white);
-  k.bevelBox(-0.44, 0.44, -0.44, 0.48, 1.42, 1.5, BEVEL, grey);
+  k.bevelBox(-0.44, 0.44, -0.44, 0.48, 1.42, 1.5, LIVING_BEVEL, grey);
 
   // The square screen: a grey bezel, the black glass on it.
   k.box(-0.3, 0.3, 0.46, 0.48, 0.78, 1.36, grey);
@@ -518,7 +527,7 @@ const domePlanters: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const deep = s.tinted(LEAF_DARK);
 
   // The long low base.
-  k.bevelBox(-(hw - 0.05), hw - 0.05, -0.55, 0.55, 0, 0.1, BEVEL, hull);
+  k.bevelBox(-(hw - 0.05), hw - 0.05, -0.55, 0.55, 0, 0.1, LIVING_BEVEL, hull);
 
   domePositions(variant === 0 ? 2 : 3).forEach((a, i) => {
     // The drum, its collar and the soil bed, which also caps the collar

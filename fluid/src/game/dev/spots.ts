@@ -18,6 +18,7 @@ import {
   footprint,
   footprintOf,
   heroFootprint,
+  heroTurn,
   propFootprint,
 } from "../world/footprints";
 import { HERO_KINDS } from "../world/heroes";
@@ -195,7 +196,11 @@ export function spotSpawn(
   if ((HERO_KINDS as readonly string[]).includes(kind)) {
     const h = room.heroes.filter((x) => x.kind === kind)[i];
     if (h === undefined) return null;
-    return frameSpot(room, heroFootprint(h), HERO_FRONT[h.turn] ?? [0, -1]);
+    return frameSpot(
+      room,
+      heroFootprint(h),
+      HERO_FRONT[heroTurn(h)] ?? [0, -1],
+    );
   }
   if ((PROP_KINDS as readonly string[]).includes(kind)) {
     const p = room.props.filter((x) => x.kind === kind)[i];

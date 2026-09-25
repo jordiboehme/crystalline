@@ -1,52 +1,36 @@
 /**
  * The optics heroes' shape tests: what `heroModels.test.ts` does not check
- * for every kind. The laser desk's catalogue top lies on an upward face of
- * its mesh and stays clear, the slab keeps its 1 : 4 : 9, the turret's eye
- * looks out of its front and a seam splits its shell, the eye panel is a
- * portrait plate with a small dot at the middle of its lens, the photo
- * console's picture leans back, and the laser's lens hangs over the
- * chair's seat.
+ * for every kind. Whether the laser desk's catalogue top lies on a real,
+ * clear upward face is `heroModels.test.ts`'s check now, for every kind;
+ * here, the laser desk's own top stays clear in the recipe's own terms
+ * too, the slab keeps its 1 : 4 : 9, the turret's eye looks out of its
+ * front and a seam splits its shell, the eye panel is a portrait plate
+ * with a small dot at the middle of its lens, the photo console's picture
+ * leans back, and the laser's lens hangs over the chair's seat.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { heroSurfaces } from "../../../world/heroes";
-import type { Hero, HeroKind } from "../../../world/types";
-import { CELL } from "../../../world/units";
-import {
-  blinkFlag,
-  createBuilder,
-  FLAG,
-  type MeshData,
-  type V3,
-} from "../../geometry";
+import { HERO_CATALOGUE } from "../../../world/heroes";
+import { blinkFlag, FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import {
-  normals,
+  partsOf,
   placeMesh,
   positions,
-  recordingKitAt,
   toLocal,
   type Part,
 } from "../../modelChecks";
-import { buildHero, buildHeroMesh } from ".";
+import { buildHeroMesh } from ".";
 import { OFFICE_CHAIR } from "./optics";
 
-/** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
-function heroAt(kind: HeroKind): Hero {
-  return { kind, variant: 0, x: 4.5, y: 3, turn: 0, seed: 1 };
-}
-
-/** Where a hero's mesh is placed, in world metres. */
-const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
-
-/** A hero's recorded parts, built at the origin at turn 0. */
-function partsOf(kind: HeroKind): Part[] {
-  const parts: Part[] = [];
-  buildHero(recordingKitAt(createBuilder(), parts), kind, 0, LOOKS.aperture);
-  return parts;
-}
+/**
+ * How high the laser desk's catalogue top must stay clear of a part, in
+ * the recipe's own `h`, in metres: below the arm, which passes over it
+ * from 1.92.
+ */
+const CLEAR_TO = 1.9;
 
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
@@ -76,52 +60,16 @@ function centre(points: readonly V3[]): V3 {
   return [mid(0), mid(1), mid(2)];
 }
 
-/**
- * Whether some triangle of `mesh` faces straight up (normal within 1e-3
- * of `(0, 1, 0)`), has all three corners at height `h` within 0.005, and
- * contains `(x, z)` in plan.
- */
-function upwardFaceAt(mesh: MeshData, x: number, z: number, h: number) {
-  const ps = positions(mesh);
-  const ns = normals(mesh);
-  for (let t = 0; t + 2 < ps.length; t += 3) {
-    const [a, b, c, n] = [ps[t], ps[t + 1], ps[t + 2], ns[t]];
-    if (!a || !b || !c || !n) continue;
-    if (Math.hypot(n[0], n[1] - 1, n[2]) > 1e-3) continue;
-    if ([a, b, c].some((p) => Math.abs(p[1] - h) > 0.005)) continue;
-    const side = (p: V3, q: V3) =>
-      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
-    const s = [side(a, b), side(b, c), side(c, a)];
-    if (s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9)) return true;
-  }
-  return false;
-}
-
 describe("optics hero models", () => {
-  it("puts every surface on an upward face of the mesh", () => {
-    for (const kind of ["laser-desk"] as const) {
-      const h = heroAt(kind);
-      const mesh = placeMesh(
-        buildHeroMesh(kind, 0, LOOKS.aperture),
-        0,
-        anchorOf(h),
-      );
-      const tops = heroSurfaces(h);
-      expect(tops.length, kind).toBeGreaterThan(0);
-      for (const s of tops) {
-        const cx = (s.box.x0 + s.box.x1) / 2;
-        const cz = (s.box.z0 + s.box.z1) / 2;
-        expect(upwardFaceAt(mesh, cx, cz, s.h), kind).toBe(true);
-      }
-    }
-  });
-
   it("keeps the laser desk's catalogue top clear in the recipe's own terms", () => {
-    // The catalogue's top: a -1.1 to -0.35, d -0.2 to 0.4, at h 0.74. The
-    // arm passes high over it (from h 1.92); nothing may stand on it below
-    // that, neither a vertex nor a part whose bounds span the area (a long
-    // box whose corners all lie outside it).
-    const [a0, a1, d0, d1, h0, h1] = [-1.1, -0.35, -0.2, 0.4, 0.74, 1.9];
+    // The catalogue's own rectangle and height; the arm passes high over
+    // it (from h 1.92), so nothing may stand on it below `CLEAR_TO`,
+    // neither a vertex nor a part whose bounds span the area (a long box
+    // whose corners all lie outside it).
+    const [surf] = HERO_CATALOGUE["laser-desk"].surfaces;
+    if (!surf) throw new Error("laser-desk has no catalogue surface");
+    const { a0, a1, d0, d1, h: h0 } = surf;
+    const h1 = CLEAR_TO;
     const parts = partsOf("laser-desk");
     const inside = (p: V3) =>
       p[0] > a0 &&

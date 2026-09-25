@@ -26,16 +26,16 @@
  * still swaps the condition, rebuilding the same way.
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
- * own forced-draws path (`roomWithForcedHero`, the controller's ruling): a
- * canned demo room draws no hero on its own, so this is how Jordi sees one
- * standing in a real, generated room rather than only in the hand-built
- * hero hall. It overrides `options.props`, since the point is to see the
- * hero dressed into the room, not undressed. A kind that finds no fitting
- * place (its own room's hall has no spot the moat rule and its placement
- * leave clear) falls back to the room drawn without it, never throwing; the
- * HUD's frame line names the hero once it lands (`HERO <KIND>`), and stays
- * quiet otherwise. R rebuilds with the same forced kind, so it still shows
- * whether the hero holds through a condition switch.
+ * own forced-draws path (`roomWithForcedHero`): a canned demo room draws no
+ * hero on its own, so this is how the demo shows one standing in a real,
+ * generated room rather than only in the hand-built hero hall. It overrides
+ * `options.props`, since the point is to see the hero dressed into the
+ * room, not undressed. A kind that finds no fitting place (its own room's
+ * hall has no spot the moat rule and its placement leave clear) falls back
+ * to the room drawn without it, never throwing; the HUD's frame line names
+ * the hero once it lands (`HERO <KIND>`), and stays quiet otherwise. R
+ * rebuilds with the same forced kind, so it still shows whether the hero
+ * holds through a condition switch.
  */
 
 import { createSession, type HudSink, type Session } from "../session";
@@ -69,17 +69,17 @@ function poolArchetypeFor(kind: HeroKind, own: Archetype): Archetype {
 
 /**
  * The forced draws that make `placeHeroes` try `kind` before anything else
- * (the controller's ruling: Task 8 exposes forced draws, `{slab, turret,
- * picks}`), and the archetype to place it under. The slab and the turret
- * force their own draw, since `placeHeroes` draws them apart from the
- * archetype's pool. Any other kind forces the first pool slot to roll
- * exactly `kind`, the same arithmetic `pickByRoll` runs, out of
- * `poolArchetypeFor`'s pool rather than `room`'s own, so `?hero=` forces a
- * kind foreign to the shown room's own archetype too (the ruling's "forces
- * that hero into the shown room", not only into its own kind of room).
- * `placeHeroes` itself never throws on a kind that finds no fitting
- * candidate: it just leaves the slot empty, so the fallback the controller
- * asked for (a hall with no place for it) falls out of the draws alone.
+ * (exposing forced draws directly as `{slab, turret, picks}`), and the
+ * archetype to place it under. The slab and the turret force their own
+ * draw, since `placeHeroes` draws them apart from the archetype's pool.
+ * Any other kind forces the first pool slot to roll exactly `kind`, the
+ * same arithmetic `pickByRoll` runs, out of `poolArchetypeFor`'s pool
+ * rather than `room`'s own, so `?hero=` forces a kind foreign to the shown
+ * room's own archetype too: it forces that hero into the shown room, not
+ * only into a room of its own kind of archetype. `placeHeroes` itself
+ * never throws on a kind that finds no fitting candidate: it just leaves
+ * the slot empty, so the fallback this function exists for (a hall with no
+ * place for the kind) falls out of the draws alone.
  */
 function forcedHeroDraws(
   kind: HeroKind,

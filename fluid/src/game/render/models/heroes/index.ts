@@ -14,8 +14,13 @@
  * `common.ts`. The hero test (`heroModels.test.ts`) builds every kind and
  * variant, places it at every turn the way the GPU does and checks the
  * envelope (its footprint and its top), that it reaches its top, the
- * winding, the triangle budget, that nothing glows in mid-air, and that
- * blinking parts appear exactly in the kinds whose bank blinks.
+ * winding, the triangle budget, that nothing glows in mid-air, that no
+ * part floats clear of the floor, its wall or another part, that blinking
+ * parts appear exactly in the kinds whose bank blinks, and, for a kind
+ * with a catalogue surface, that a grid over it lands on a real upward
+ * face with its headroom clear. What that grid does not reach (a shape
+ * only a kind's own recipe carries, a seam, a chase order) is the
+ * per-batch tests' job, one file per batch under `models/heroes/`.
  */
 
 import { HERO_CATALOGUE } from "../../../world/heroes";
