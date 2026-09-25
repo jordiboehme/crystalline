@@ -842,7 +842,7 @@ impl SaveStateTag {
 ///
 /// **This is the co-editing saver's seam onto another actor's rows**, and the
 /// allow-list guard `another_actors_view_is_reached_only_by_the_owner_gated_surfaces`
-/// in crates/service/tests/overlay_domains.rs names it. What makes it safe is
+/// in crates/service/tests/overlay/overlay_domains.rs names it. What makes it safe is
 /// where the owner comes from: never from the socket, never from a path
 /// segment, only from the key the room was opened under - and that key was
 /// decided by [`super::ws::join`], which lets a caller name somebody else's

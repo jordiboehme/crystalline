@@ -157,7 +157,7 @@
 //! failure mode this file's `discover` doc comment spells out with its
 //! evidence. The mitigations - the `onboarding` prompt, `list_domains` with
 //! `include_routing=true`, the served skills - are all pull-shaped and all
-//! need the client to know to ask. `tests/mcp_instructions.rs` drives the
+//! need the client to know to ask. `tests/mcp/mcp_instructions.rs` drives the
 //! block over every advertised revision by that revision's own path, so a
 //! revision added without an onboarding path fails there rather than shipping
 //! silence.
@@ -303,7 +303,7 @@ fn is_write_tool(name: &str) -> bool {
 /// we advertise as a side effect of a dependency bump: adding a revision here is
 /// an edit somebody made on purpose. Both ends of the range are pinned by
 /// `the_advertised_protocol_set_is_exactly_this` in
-/// `tests/mcp_instructions.rs`, which also pins rmcp's own list, so a crate that
+/// `tests/mcp/mcp_instructions.rs`, which also pins rmcp's own list, so a crate that
 /// learns a new revision fails the build and asks for the decision instead of
 /// taking it.
 ///
@@ -317,7 +317,7 @@ fn is_write_tool(name: &str) -> bool {
 /// (`crate::client`) and rmcp classifies and answers it. A fifth obligation,
 /// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
 /// is not on the legacy lifecycle (`handler/server.rs:112-118`), and we
-/// implement no `ping`. `tests/mcp_modern_era.rs` is what a client at this
+/// implement no `ping`. `tests/mcp/mcp_modern_era.rs` is what a client at this
 /// revision actually receives, over both transports.
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
@@ -468,7 +468,7 @@ const RESOLUTION_MERGED: &str = "merged";
 /// The engine words one message for this failure
 /// (`crate::engine::Engine::write_engram_as`) and this is the phrase it is
 /// recognized by; `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
-/// in `tests/engine_writes.rs` pins it there, so a rewording breaks a test
+/// in `tests/engine/engine_writes.rs` pins it there, so a rewording breaks a test
 /// beside the sentence rather than silently disarming the round here.
 const COLLISION_MARKER: &str = "already exists in domain";
 
@@ -935,8 +935,9 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
 /// control socket or the REST API (see [`crate::subscribers`]).
 ///
 /// `read_only` is the gate that genuinely cannot move: `Engine::with_read_only`
-/// (`engine.rs:788-791`) takes `self` by value at construction and the engine
-/// is shared behind an `Arc`, so no request can reach it.
+/// (`crates/engine/src/engine/mod.rs:2172-2175`) takes `self` by value at
+/// construction and the engine is shared behind an `Arc`, so no request can
+/// reach it.
 ///
 /// Hidden means hidden, not disabled. Every route stays registered and
 /// [`refused_collab_tool`] still answers a direct call with the message naming
@@ -958,9 +959,10 @@ fn hidden_collab_tool(name: &str, read_only: bool, github_enabled: bool) -> bool
 ///
 /// The refusal itself is [`RemoteError::NotEnabled`]'s message, which names
 /// the setting and both ways to change it. The engine keeps its own copy of
-/// this guard (`engine.rs:6075` and friends) for the REST and CLI surfaces;
-/// this one exists so the MCP caller reads the reason as tool output rather
-/// than as a JSON-RPC error the client renders opaquely.
+/// this guard (`crates/engine/src/engine/origins.rs`, repeated per verb) for
+/// the REST and CLI surfaces; this one exists so the MCP caller reads the
+/// reason as tool output rather than as a JSON-RPC error the client renders
+/// opaquely.
 fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
     !github_enabled && name != "configure"
 }
@@ -3504,7 +3506,7 @@ impl McpServer {
     /// A legacy peer reads the result out of `InitializeResult.instructions`
     /// and a 2026-07-28 peer out of `DiscoverResult.instructions`; both call
     /// this, which is what the per-era arrival test in
-    /// `tests/mcp_instructions.rs` pins.
+    /// `tests/mcp/mcp_instructions.rs` pins.
     ///
     /// When [`minimal_instructions`] says so, the full routing prose is
     /// replaced by the header plus a pointer: the harness that spawned this
@@ -3841,7 +3843,7 @@ impl ServerHandler for McpServer {
     /// stateless routing its own request chose and the two halves agree; if it
     /// goes on to send the era's request shape (per-request `_meta` plus the
     /// standard headers) it is served with no session at all, which is what
-    /// SEP-2575 asks for. `tests/mcp_modern_era.rs` drives exactly that. The
+    /// SEP-2575 asks for. `tests/mcp/mcp_modern_era.rs` drives exactly that. The
     /// one ragged corner left is a client that declares the era in a handshake
     /// and then sends *legacy-shaped* requests: those ask for the session
     /// branch, there is no session, and rmcp answers 422. That is a client
@@ -3939,7 +3941,7 @@ impl ServerHandler for McpServer {
     /// per-request `_meta`"). The mitigations are all pull-shaped and all
     /// require the client to already know to ask: the `onboarding` prompt,
     /// `list_domains` with `include_routing=true`, and the served skills.
-    /// `tests/mcp_instructions.rs` pins that this server offers the block by
+    /// `tests/mcp/mcp_instructions.rs` pins that this server offers the block by
     /// every era's own path; no server-side test can prove a client pulled it.
     ///
     /// Overridden rather than inherited for one reason: rmcp's default builds
@@ -4045,7 +4047,7 @@ impl ServerHandler for McpServer {
     /// is the specification's "acknowledgment first, id in `_meta`" pair, and
     /// `SubscriptionSink::send` re-attaches that id and enforces the accepted
     /// filter on anything sent later (`:184-257`). Both are pinned by
-    /// `tests/mcp_subscriptions.rs` off the wire, not assumed.
+    /// `tests/mcp/mcp_subscriptions.rs` off the wire, not assumed.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         let _registered = crate::subscribers::ListSubscribers::register(
             self.engine.list_subscribers(),
@@ -4072,8 +4074,9 @@ impl ServerHandler for McpServer {
     /// deployment or instance state, never anything derived from who is asking.
     ///
     /// Three of the four gates cannot move at all. `read_only` is fixed at
-    /// engine construction (`Engine::with_read_only`, `engine.rs:788-791`,
-    /// takes `self` by value; the engine is shared behind an `Arc`),
+    /// engine construction (`Engine::with_read_only`,
+    /// `crates/engine/src/engine/mod.rs:2172-2175`, takes `self` by value;
+    /// the engine is shared behind an `Arc`),
     /// `skills.serve` is snapshotted at the same point
     /// (`Engine::skills_serve`) and the harness answer was resolved by the
     /// spawned process before the session started - see
@@ -6133,7 +6136,7 @@ mod tests {
     /// The engine message is parsed for the permalink, and a message that does
     /// not carry one never becomes a question naming the wrong thing.
     ///
-    /// The positive case is worded exactly as `engine.rs` words it - the same
+    /// The positive case is worded exactly as the engine words it - the same
     /// sentence `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
     /// pins from the engine side - so the two halves of the seam are asserted
     /// against the same string.

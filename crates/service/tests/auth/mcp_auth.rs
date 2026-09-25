@@ -230,7 +230,7 @@ async fn serve_reviewed_domain_with_mcp_auth_off()
 /// gate on and nobody connected to anything.
 ///
 /// Built in two phases, and both halves are load-bearing (the pattern is
-/// `tests/mcp_modern_era.rs`'s `Harness::share_personally`). Phase one
+/// `tests/mcp/mcp_modern_era.rs`'s `Harness::share_personally`). Phase one
 /// subscribes a team domain through an injected mock forge, so no network is
 /// touched and no credential is needed. Phase two re-opens the engine from the
 /// config the subscription left on disk with NO provider injected: an injected
@@ -349,7 +349,7 @@ async fn serve_personal_share_with_mcp_auth()
 }
 
 /// The `initialize` a legacy client opens with - the same shape
-/// `tests/http_stream.rs` drives the handshake through, so a refusal here can
+/// `tests/mcp/http_stream.rs` drives the handshake through, so a refusal here can
 /// only be the gate and never a malformed body.
 fn initialize_body() -> String {
     initialize_body_as("mcp-auth-test")
@@ -1202,7 +1202,7 @@ async fn a_client_that_is_only_the_join_word_composes_as_the_stand_in() {
 // The gate says who a caller is; this half says what that entitles them to.
 // Every read verb answers from the domains its caller may see and every write
 // verb refuses what it may not change, and both hold over the wire rather than
-// only in the engine (`tests/visibility.rs` is the engine's own leg).
+// only in the engine (`tests/domains/visibility.rs` is the engine's own leg).
 //
 // The property under all of it is the one the whole program is built on: a
 // domain somebody may not see is answered exactly as a domain nobody

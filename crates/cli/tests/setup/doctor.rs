@@ -1479,7 +1479,7 @@ fn harnesses_section_is_absent_with_no_trace_on_either_harness() {
 //
 // The scenario below needs a real install receipt to tamper with, which only
 // `crystalline install` writes. `receipt_file`, `tamper_receipt` and
-// `write_shim` mirror the same-named helpers in `tests/install.rs` - test
+// `write_shim` mirror the same-named helpers in `tests/setup/install.rs` - test
 // binaries do not share code across files, so they are duplicated here rather
 // than factored out.
 
@@ -1633,7 +1633,7 @@ fn provision_receipt_file(home: &Path) -> PathBuf {
 
 /// Write a claude-code install receipt at the isolated home's state
 /// directory, marking it onboarded at user scope - the same shape
-/// `tests/provision.rs`'s `write_install_receipt` writes. Doctor's
+/// `tests/setup/provision.rs`'s `write_install_receipt` writes. Doctor's
 /// provisioning section is gated to installed harnesses only, the same gate
 /// `apply` and `provision status` use.
 #[cfg(unix)]

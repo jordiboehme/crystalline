@@ -1507,7 +1507,7 @@ impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
 /// setup, valid only while this instance has no accounts at all.
 ///
 /// Three rules carry it, each pinned by a named test in
-/// `tests/rest_setup_api.rs`:
+/// `crates/service/tests/rest/rest_setup_api.rs`:
 ///
 /// 1. **Once any account exists this endpoint is [`gone`], permanently.** The
 ///    count is checked first, before locality and before the token, so a remote
@@ -2837,7 +2837,7 @@ mod tests {
         // The daemon guards in `http_base` (`service.api`, `service.ui`) are
         // private to `daemon.rs` and not reachable from here;
         // `a_derived_oauth_value_never_trips_the_daemon_guards` in
-        // `tests/rest_api.rs` pins the property this config algebra implies -
+        // `crates/service/tests/rest/rest_api.rs` pins the property this config algebra implies -
         // an instance that only ever set `auth.mcp` true keeps starting.
     }
 }

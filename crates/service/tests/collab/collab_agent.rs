@@ -1779,7 +1779,7 @@ fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams
 /// every line before any comment skip, and it never resets - so a nested `fn`
 /// (this function is itself that shape, nested inside the guard until this
 /// round moved it out) re-points every later line at the nested name for the
-/// rest of the enclosing body. Neither `engine.rs` function this guard
+/// rest of the enclosing body. Neither engine function this guard
 /// watches has that shape today, which is the whole of why the guard is
 /// still sound; the other test is what keeps that a checked fact rather than
 /// an assumption.
@@ -1936,7 +1936,7 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
 /// to the function it is textually still inside. The guard's own real
 /// target, `apply_source_edit_staged` and the write's live arm, has no
 /// nested `fn` today, so this is a synthetic case rather than a finding
-/// against `engine.rs`; it is what stands between "the guard is sound" being
+/// against the engine module; it is what stands between "the guard is sound" being
 /// a checked fact and an assumption a nested `fn` added later could quietly
 /// break.
 #[test]

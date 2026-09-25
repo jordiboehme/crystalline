@@ -2941,7 +2941,7 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 ///   has six accounts, so every leg of every row would see the same 410 and
 ///   assert nothing about roles or CSRF. Its auth story - the 410 once any
 ///   account exists, the loopback-or-token gate, the CSRF exemption and the
-///   read-only carve-out - is pinned by `tests/rest_setup_api.rs` instead,
+///   read-only carve-out - is pinned by `tests/rest/rest_setup_api.rs` instead,
 ///   which serves a deliberately account-less instance.
 ///
 /// The fourth and fifth are `POST /api/v1/oauth/register` and
@@ -2955,14 +2955,14 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// `PUBLIC_PATHS` means. What actually bounds it is not an identity but a burst
 /// limit, a stored-registration ceiling and a thirty-day prune, and those,
 /// together with its CSRF behaviour and its refusal on an instance with
-/// `auth.oauth` off, are pinned by `tests/oauth.rs`.
+/// `auth.oauth` off, are pinned by `tests/auth/oauth.rs`.
 ///
 /// The token endpoint is the same case one leg later: it answers a program
 /// holding an authorization code, which every fixture account here would be
 /// answered identically for, because the account a grant is issued to comes off
 /// the code rather than off the caller. What bounds it is the PKCE verifier
 /// behind the challenge the authorization was started with, and that, the RFC
-/// 6749 refusals and the rotation rules are pinned by `tests/oauth.rs`.
+/// 6749 refusals and the rotation rules are pinned by `tests/auth/oauth.rs`.
 #[test]
 fn write_ops_covers_every_mutating_route_mounted() {
     use std::collections::BTreeSet;

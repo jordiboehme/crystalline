@@ -122,7 +122,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-tungstenite = { workspace = true }
-# The fake identity provider in tests/oidc.rs: `jsonwebtoken` signs its ID
+# The fake identity provider in tests/auth/oidc.rs: `jsonwebtoken` signs its ID
 # tokens (RS256, from the committed PEM fixtures) and `rsa` reads the same PEM
 # back to publish the matching modulus and exponent as a JWKS, so the key set
 # the relying party validates against cannot drift from the key that signed.

@@ -17,7 +17,7 @@
 //!
 //! The caller throughout is [`Scope::Unrestricted`], the machine owner, because
 //! that is who felt this. The privacy screen is the same set and is pinned by
-//! `tests/visibility.rs`; nothing here needs an accounts database.
+//! `tests/domains/visibility.rs`; nothing here needs an accounts database.
 
 use std::sync::Arc;
 

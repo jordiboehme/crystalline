@@ -13,11 +13,11 @@
 //! Three obligations earlier tasks proved another way and handed here to be
 //! proved on the wire:
 //!
-//! - **the caching MUST.** `tests/mcp_cache_hints.rs` builds a
+//! - **the caching MUST.** `tests/mcp/mcp_cache_hints.rs` builds a
 //!   `RequestContext` directly and calls the handler methods, because no modern
 //!   peer was reachable. Both transports carry the hints here, `resources/read`
 //!   included, and a legacy session on the same binary still carries none.
-//! - **subscriptions over HTTP.** `tests/mcp_subscriptions.rs` reaches the
+//! - **subscriptions over HTTP.** `tests/mcp/mcp_subscriptions.rs` reaches the
 //!   modern dispatch over stdio through the metadata latch
 //!   (`service/server.rs:541`, the crate's only call site). Nothing arms that
 //!   latch on the streamable-HTTP path, so `subscriptions/listen` was
@@ -505,7 +505,7 @@ async fn discovery_carries_the_routing_block_and_names_the_era() {
 /// `/server/utilities/caching`: "Servers MUST include caching hints on results
 /// with `resultType: "complete"` returned by the following operations:
 /// `server/discover`, `tools/list`, `prompts/list`, `resources/list`,
-/// `resources/templates/list`, `resources/read`." `tests/mcp_cache_hints.rs`
+/// `resources/templates/list`, `resources/read`." `tests/mcp/mcp_cache_hints.rs`
 /// proves the same six by calling the handler methods with a fabricated
 /// context, which was the only way to reach a modern peer before the era was
 /// advertised. This is the leg it could not run.
@@ -746,7 +746,7 @@ async fn a_modern_write_records_the_client_from_its_request_metadata() {
 // --- streamable HTTP --------------------------------------------------------
 
 /// One raw HTTP/1.1 POST, read for a bounded window. Mirrors
-/// `tests/http_stream.rs`'s helper rather than sharing it, because an
+/// `tests/mcp/http_stream.rs`'s helper rather than sharing it, because an
 /// integration test binary cannot reach another one's helpers.
 async fn post(
     addr: std::net::SocketAddr,
@@ -893,7 +893,7 @@ async fn a_modern_request_over_http_is_served_statelessly_with_its_hints() {
 /// onboarding channel for a remote modern client - and it is a different code
 /// path from the stdio one, which is why it is asserted separately.
 ///
-/// A **bare** probe over HTTP is still the `422` `tests/http_stream.rs` pins:
+/// A **bare** probe over HTTP is still the `422` `tests/mcp/http_stream.rs` pins:
 /// it carries no `_meta`, so it is classified legacy and takes the session
 /// branch. Over stdio the same probe is answered `-32602` by rmcp itself
 /// (since 3.1.4, rust-sdk #1157); nothing on our side rewrites it any more, so
@@ -931,7 +931,7 @@ async fn discovery_over_http_answers_the_routing_block() {
 /// the stream and it carries the subscription id in `_meta`. Nothing follows
 /// it here because nothing moved a list during this request - the one mover is
 /// a `configure` flipping `github.enabled`, and
-/// `tests/mcp_subscriptions.rs::a_subscribed_client_is_told_when_the_tool_list_moves`
+/// `tests/mcp/mcp_subscriptions.rs::a_subscribed_client_is_told_when_the_tool_list_moves`
 /// is where the announcement itself is pinned. This POST reads its stream once
 /// and returns, so a second connection would be needed to make the flip land
 /// while it is open.

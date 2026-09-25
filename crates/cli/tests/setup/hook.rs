@@ -2,7 +2,7 @@
 //! `crystalline` binary. Every scenario needs control over the state
 //! directory (`<state_dir>/hooks/<session_id>.json`), reachable only through
 //! `HOME`/`XDG_*` and never a CLI flag - the same isolation technique
-//! `crates/cli/tests/configure.rs` uses for its environment-driven tests,
+//! `crates/cli/tests/setup/configure.rs` uses for its environment-driven tests,
 //! applied here because `hook stop` itself takes no `--config` flag: the
 //! config path comes from `CRYSTALLINE_CONFIG` or the default, set per child
 //! with `assert_cmd`'s `.env`, never a process-global `std::env::set_var`.
@@ -1295,7 +1295,7 @@ fn write_daemon_config(path: &Path, domain_dir: &Path, endpoint: Option<&str>) {
 /// An isolated, short-path environment holding one daemon.
 ///
 /// The base is `/tmp` rather than a `tempfile` directory for the reason
-/// `crates/cli/tests/service.rs` gives: the daemon's unix socket path has to
+/// `crates/cli/tests/daemon/service.rs` gives: the daemon's unix socket path has to
 /// stay inside the platform's 104-byte limit.
 struct DaemonEnv {
     dir: PathBuf,

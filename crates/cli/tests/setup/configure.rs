@@ -1,8 +1,8 @@
 //! Smoke tests for `crystalline config show|set|unset` against a temp config,
 //! no daemon involved (the in-process path). The daemon/ctl `configure` round
-//! trip is covered at the engine level by `crates/service/tests/configure.rs`;
+//! trip is covered at the engine level by `crates/service/tests/domains/configure.rs`;
 //! there is no existing daemon-lifecycle test for it here (see
-//! `crates/cli/tests/service.rs` for that harness), noted as a gap.
+//! `crates/cli/tests/daemon/service.rs` for that harness), noted as a gap.
 
 use assert_cmd::Command;
 

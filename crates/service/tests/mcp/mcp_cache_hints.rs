@@ -38,7 +38,7 @@
 //! and call the handler methods the dispatcher would call.
 //!
 //! **The era is advertised now and the wire leg exists**, in
-//! `tests/mcp_modern_era.rs`: all six operations over stdio and five of them
+//! `tests/mcp/mcp_modern_era.rs`: all six operations over stdio and five of them
 //! over HTTP, hints asserted on real bytes. These tests keep their place
 //! rather than being folded into it, because they reach two things a wire
 //! cannot: `DegradedServer`, which is stdio-only and built on a failure path,

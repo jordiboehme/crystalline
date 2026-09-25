@@ -76,7 +76,7 @@ fn manifest() -> Vec<u8> {
 }
 
 /// The same MANIFEST, declaring the policy that commits straight to the
-/// branch. Copied from `tests/origin.rs`, which pins the engine side of it.
+/// branch. Copied from `tests/origins/origin.rs`, which pins the engine side of it.
 fn manifest_sharing_direct() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
@@ -213,7 +213,7 @@ const ALL_SEVEN: [&str; 7] = [
 /// SEP-2567 forbids a list varying per connection or as a side effect of
 /// another request; the setting is one shared value on the engine, so every
 /// client listing at the same instant is served the same list, and the flip
-/// announces itself to subscribers (see `tests/mcp_subscriptions.rs`).
+/// announces itself to subscribers (see `tests/mcp/mcp_subscriptions.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
@@ -680,7 +680,7 @@ impl ClientHandler for NotifyClient {
 /// open, so the only way it could hear about the change is a push it never
 /// requested, and MCP 2026-07-28 removed that channel outright. It re-reads
 /// `tools/list` at its own discretion instead, which is the contract it always
-/// had. `tests/mcp_subscriptions.rs` carries the other half - a modern peer
+/// had. `tests/mcp/mcp_subscriptions.rs` carries the other half - a modern peer
 /// that did subscribe is told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configure_flipping_github_enabled_never_pushes_at_an_unsubscribed_peer() {
@@ -741,7 +741,7 @@ async fn configure_flipping_github_enabled_never_pushes_at_an_unsubscribed_peer(
 // --- configure: GitHub connect state machine (engine-level) -----------------
 //
 // The `ConnectAuth` fake (`StubConnectAuth`, `fake_auth`, `device_flow_start`)
-// lives in `support` now, shared with `tests/domain_admin.rs`'s GitHub
+// lives in `support` now, shared with `tests/domains/domain_admin.rs`'s GitHub
 // status/ready/disconnect tests.
 
 async fn engine_for_connect(auth: Arc<StubConnectAuth>, dir: &std::path::Path) -> Engine {

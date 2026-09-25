@@ -4,7 +4,7 @@
 //! [`DegradedServer`] in the same process, driving the actual JSON-RPC
 //! initialize handshake, `tools/list` and `tools/call`. `StubStatus`'s fields
 //! are public, so the status is built directly with no lock, socket or
-//! environment involved; the same duplex pattern as `tests/mcp_instructions.rs`.
+//! environment involved; the same duplex pattern as `tests/mcp/mcp_instructions.rs`.
 
 use crystalline_service::mcp::newest_legacy_handshake_version;
 use crystalline_service::{DegradedServer, StubStatus};

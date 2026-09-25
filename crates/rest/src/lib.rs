@@ -14,9 +14,13 @@ pub(crate) use crystalline_engine::{
 pub(crate) use crystalline_engine::overlay;
 pub(crate) use crystalline_identity::{join, scope};
 
-/// The co-editing modules: the engine's sessions, and the WebSocket route
-/// that serves them.
 pub mod collab {
+    //! Real-time co-editing sessions: one yrs document per open engram, served
+    //! over the axum WebSocket route in [`crate::collab::ws`], saved through
+    //! the engine's own write path. Sessions are in-memory only - the file
+    //! stays the source of truth, and a daemon restart drops sessions by
+    //! design (clients rejoin from the saved file).
+
     pub use crystalline_engine::collab::*;
     pub mod ws;
 }
@@ -305,7 +309,7 @@ struct ApiDoc;
 /// This surface's OpenAPI document.
 ///
 /// One definition with two consumers: the [`openapi_json`] route serves it, and
-/// `tests/openapi_snapshot.rs` compares it against the committed
+/// `crates/service/tests/rest/openapi_snapshot.rs` compares it against the committed
 /// `openapi/fluid-v1.json` the UI generates its client types from. Neither can
 /// drift from the annotations without the other noticing.
 pub fn openapi_document() -> utoipa::openapi::OpenApi {
@@ -512,7 +516,7 @@ impl RestState {
 /// `collab::ws::WS_MAX_MESSAGE_BYTES` sits a megabyte above it, so a
 /// collaborative edit that can be saved can also be transmitted. And
 /// `fluid/nginx.conf.template` sets `client_max_body_size` to match, guarded
-/// by `tests/nginx_body_cap.rs` because nginx cannot read a Rust constant.
+/// by `crates/service/tests/rest/nginx_body_cap.rs` because nginx cannot read a Rust constant.
 /// Changing this value moves the first two by construction; the third is the
 /// one that needs the template edited with it.
 ///
@@ -540,7 +544,7 @@ pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// on a route nobody anonymous can reach.
 ///
 /// `fluid/nginx.conf.template` gives the same two paths their own
-/// `client_max_body_size`, guarded by `tests/nginx_body_cap.rs`.
+/// `client_max_body_size`, guarded by `crates/service/tests/rest/nginx_body_cap.rs`.
 pub const ARCHIVE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths

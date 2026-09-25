@@ -9,7 +9,7 @@
 //!
 //! The policy that decides who sees what lives in `crate::scope` and its own
 //! tests; the wiring between it and the engine is pinned by
-//! `tests/domain_access.rs`. This is the third leg: the verbs.
+//! `tests/domains/domain_access.rs`. This is the third leg: the verbs.
 
 use std::sync::Arc;
 

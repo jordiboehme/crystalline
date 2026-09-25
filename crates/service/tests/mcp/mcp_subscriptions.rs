@@ -24,7 +24,7 @@
 //! same request was classified legacy there and refused `method not found`.
 //! That gap is closed: a `subscriptions/listen` POST declaring the era in its
 //! own `_meta` reaches this handler, and
-//! `tests/mcp_modern_era.rs::the_http_subscription_stream_acknowledges_first_and_stays_silent`
+//! `tests/mcp/mcp_modern_era.rs::the_http_subscription_stream_acknowledges_first_and_stays_silent`
 //! drives it.
 //!
 //! **What this file pins that is not ours.** The two server MUSTs on a

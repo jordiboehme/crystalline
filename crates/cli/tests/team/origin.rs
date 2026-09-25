@@ -8,7 +8,7 @@
 //! being off refuses before an engine method ever tries to build a GitHub
 //! provider. The successful connect/update/status paths against a real (or
 //! mocked) origin are covered at the engine level by
-//! `crates/service/tests/origin.rs`, which injects a mock provider; there is
+//! `crates/service/tests/origins/origin.rs`, which injects a mock provider; there is
 //! no HTTP-mocking harness in this crate to exercise them here, and
 //! `connect github` needs a live GitHub connection to test end to end, so it
 //! is not covered by an automated test in this crate (noted as a gap; its
@@ -685,7 +685,7 @@ fn already_connected_team_config(config: &Path, root: &Path) {
 /// The other half of the fix's `true` condition - a fresh, origin-less
 /// domain adopted in place by `--origin`, which needs a real connect to
 /// reach - is covered at the engine level by the `adopted: true` assertion
-/// in `crates/service/tests/origin.rs`, against a mock provider this crate
+/// in `crates/service/tests/origins/origin.rs`, against a mock provider this crate
 /// has no harness for; both conditions feed the same `already_registered ||
 /// already_connected` return in `domain_add_origin_dispatch`, and this test
 /// exercises the CLI-only half of the fix, the `--private` refusal in

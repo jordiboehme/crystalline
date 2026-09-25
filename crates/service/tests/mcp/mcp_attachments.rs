@@ -15,7 +15,7 @@
 //! Both transports run here rather than one, because they are different code
 //! paths in rmcp: the stdio leg drives a real client over a duplex pair, the
 //! HTTP leg posts raw JSON-RPC at the daemon's own router with the era's
-//! `_meta` and standard headers, exactly as `tests/mcp_modern_era.rs` does.
+//! `_meta` and standard headers, exactly as `tests/mcp/mcp_modern_era.rs` does.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -610,7 +610,7 @@ async fn the_tool_list_is_unchanged_by_the_attachment_surface() {
 // --- streamable HTTP --------------------------------------------------------
 
 /// One raw HTTP/1.1 POST, read for a bounded window. Mirrors the helper in
-/// `tests/mcp_modern_era.rs` rather than sharing it: an integration test binary
+/// `tests/mcp/mcp_modern_era.rs` rather than sharing it: an integration test binary
 /// cannot reach another one's helpers.
 async fn post(addr: std::net::SocketAddr, id: u32, method: &str, mut params: Value) -> String {
     let name = params

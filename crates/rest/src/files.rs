@@ -24,7 +24,7 @@
 //! well formed and holds nothing is **404**: the caller cannot. The engine
 //! reports the first as `Invalid` and the second as `NotFound`, and the only
 //! translation this module makes is bending `Invalid` down from the generic 422
-//! that [`crate::rest::ApiError`]'s classification would otherwise give it -
+//! that [`crate::ApiError`]'s classification would otherwise give it -
 //! a malformed path is a malformed request, not an unprocessable one.
 
 use axum::Json;

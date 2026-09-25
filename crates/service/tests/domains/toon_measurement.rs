@@ -153,7 +153,7 @@ async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<S
 /// listing, browse listing) both as TOON (the default) and as JSON (the
 /// escape hatch), and prints a byte/token table for each. This is
 /// measurement, not a correctness check; see mcp_tools.rs and the encoder's
-/// own unit tests in crates/service/src/toon.rs for exact-output and
+/// own unit tests in crates/engine/src/toon.rs for exact-output and
 /// data-semantics coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn toon_vs_json_payload_sizes() {

@@ -25,7 +25,7 @@ impl Engine {
     ///
     /// **Its callers, by name and exhaustively**, and
     /// `another_actors_draft_is_read_only_by_the_grant_surface` in
-    /// crates/service/tests/overlay_domains.rs scans for any other:
+    /// crates/service/tests/overlay/overlay_domains.rs scans for any other:
     /// `rest::draft_links`'s `mint` and `list`, which name the CALLER's own
     /// account and so read nobody else's rows at all; `rest::draft_links`'s
     /// `open_link`, which names the grant row's `owner`; and, on the engine

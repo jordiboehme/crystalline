@@ -19,7 +19,7 @@
 //! `/oauth/authorize` -> consent -> `/oauth/token` dance: those endpoints are
 //! Tasks 4-6's, this surface only reads and deletes rows the store already
 //! knows how to make, and going straight to the store is exactly how
-//! `tests/mcp_auth.rs`'s own OAuth gate tests build their fixtures.
+//! `tests/auth/mcp_auth.rs`'s own OAuth gate tests build their fixtures.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -437,7 +437,7 @@ async fn a_revoked_grant_is_refused_at_the_mcp_gate_at_once() {
 
     // Revoke through the real route, as ada, under a real session and CSRF
     // token - proving the wiring end to end rather than calling the store
-    // directly the way `tests/mcp_auth.rs`'s own OAuth gate tests do.
+    // directly the way `tests/auth/mcp_auth.rs`'s own OAuth gate tests do.
     let session = login(addr, "ada", "pw12345678").await;
     let client = SessionClient {
         addr,

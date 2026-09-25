@@ -4463,7 +4463,7 @@ mod tests {
     /// one is a test nobody runs; the route-level half - that a spent code and
     /// a never-issued one come back as byte-identical `invalid_grant` answers -
     /// is `a_wrong_verifier_a_reused_code_and_a_foreign_redirect_are_invalid_grant`
-    /// in `tests/oauth.rs`.
+    /// in `crates/service/tests/auth/oauth.rs`.
     #[test]
     fn an_unknown_a_spent_and_an_expired_code_are_one_answer() {
         let mut codes = CodeStore::default();

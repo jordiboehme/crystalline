@@ -12,7 +12,8 @@
 //! was decided here.
 //!
 //! Two pieces live here, and the second exists because of the first.
-//! [`build`] stages the tree. [`PinnedHead`] wraps the provider for the one call
+//! [`crate::domain_view::DomainView::materialise`] stages the tree.
+//! [`PinnedHead`] wraps the provider for the one call
 //! that runs against that tree: `ops::propose` and `ops::propose_preview` open
 //! with a pull of their own, and a pull into the staged tree would write the
 //! team's merged work into a folder that is deleted moments later while the base

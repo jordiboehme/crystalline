@@ -169,7 +169,7 @@ impl<'a> DomainView<'a> {
     /// request that did would answer one reader with another reader's drafts,
     /// which is the single worst failure this mode can have, and
     /// `another_actors_view_is_reached_only_by_the_owner_gated_surfaces` in
-    /// crates/service/tests/overlay_domains.rs scans for exactly that.
+    /// crates/service/tests/overlay/overlay_domains.rs scans for exactly that.
     pub(crate) fn for_actor(
         engine: &'a Engine,
         domain: &str,
@@ -270,7 +270,7 @@ impl<'a> DomainView<'a> {
     ///
     /// **This is the one caller allowed to build another actor's view from a
     /// write path**, and `another_actors_view_is_reached_only_by_the_owner_gated_surfaces`
-    /// in crates/service/tests/overlay_domains.rs names it. What makes that
+    /// in crates/service/tests/overlay/overlay_domains.rs names it. What makes that
     /// safe is that the join is not something a caller asserts: it is a record
     /// this process minted, when an account presented a share-link its author
     /// minted on that very draft, and it names the owner rather than taking
@@ -569,7 +569,7 @@ impl<'a> DomainView<'a> {
     ///
     /// Both movers end the links themselves once they know the move happened,
     /// and there is no third caller. The deferred-removal guard in
-    /// crates/service/tests/overlay_domains.rs is what keeps it that way: a
+    /// crates/service/tests/overlay/overlay_domains.rs is what keeps it that way: a
     /// caller that took a row away and ended nothing would leave a link
     /// standing on a draft that is not there.
     pub(crate) async fn drop_mid_move(&self, domain_id: DomainId, path: &str) -> Result<()> {

@@ -21,10 +21,13 @@ Cargo workspace, Rust edition 2024, pinned toolchain in rust-toolchain.toml.
 - `crates/core` (crystalline-core) - format layer: parser, emitter, schema, verify, prompt. Must never depend on async runtimes, databases or ML crates
 - `crates/index` (crystalline-index) - Store trait, embedded database backend, sync engine, search, embeddings
 - `crates/remote` (crystalline-remote) - GitHub-backed team collaboration plumbing: the forge-neutral Provider trait, the plain-text merge engine and the on-disk origin state. Git is never invoked; everything goes through the GitHub APIs
-- `crates/service` (crystalline-service) - single-instance daemon, MCP server, control protocol
+- `crates/identity` (crystalline-identity) - accounts, roles, domain access, joins and scope
+- `crates/engine` (crystalline-engine) - the shared engine, review-mode overlay, origins, co-editing sessions
+- `crates/rest` (crystalline-rest) - the JSON API, sign-in and the co-editing socket
+- `crates/service` (crystalline-service) - single-instance daemon, MCP server, control protocol; the facade the CLI and the integration tests reach everything through
 - `crates/cli` (crystalline) - the single user-facing binary
 
-Dependency direction: core <- index <- service <- cli, with remote beside index (it depends on core and is used by service and cli).
+Dependency direction: core <- index <- identity <- engine <- rest <- service <- cli, with remote beside index (it depends on core and is used by engine, service and cli).
 
 ## Commands
 
@@ -62,6 +65,7 @@ rustup enforces the `rust-toolchain.toml` pin: inside this repo every proxy reso
 - MCP tool descriptions double as the client-side tool-search corpus, not only per-session context: keep them keyword-rich and prescriptive about when to call the tool. Do not rely on a description alone to make a new tool get called, though: measured on the evolve benchmark (2026-08-04), a deliberately keyword-rich description with no skill guidance beside it produced zero calls in sixteen opportunities across two independent runs, and rewriting it to front-load the triggers and add the missing vocabulary changed nothing. Skill text is what drives discovery of a novel verb, so budget for a sentence in the skill whenever a new tool needs to be found rather than merely understood
 - Store every implementation plan in plans/ with a dated filename before starting work; store research notes in research/
 - Delegate implementation to subagents with the model matched to task complexity: opus for design-heavy or intricate work, sonnet for routine or mechanical work. The orchestrator reviews, gates and commits
+- A new type lives in the lowest crate that can name every type in its signature; identity never names the engine or a route, the engine never names a route, rest never reaches the daemon, the MCP router or the control socket
 
 ## Known upstream workarounds
 

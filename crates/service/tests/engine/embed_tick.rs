@@ -120,7 +120,7 @@ async fn tick_stays_silent_with_no_backlog() {
 // --- WAL hygiene -------------------------------------------------------------
 
 /// The WAL sidecar path turso writes next to a local db file. Mirrors the CLI
-/// test helpers in crates/cli/tests/data.rs.
+/// test helpers in crates/cli/tests/knowledge/data.rs.
 fn wal_path(db: &Path) -> PathBuf {
     let mut s = db.as_os_str().to_os_string();
     s.push("-wal");

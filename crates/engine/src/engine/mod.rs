@@ -229,10 +229,11 @@ pub const ACTOR_MAX_CHARS: usize = 120;
 /// a client that calls itself "Some Client (beta)" still yields a clean
 /// `generated.by`.
 ///
-/// `pub(crate)` because an actor composed out of two halves has to sanitize
-/// each half on its own rather than the composition (`mcp::acting_actor`): a
-/// single pass over the joined string lets the client-supplied half spend the
-/// whole budget and truncate away the half the server asserts.
+/// Doc-hidden and `pub` rather than `pub(crate)`, because an actor composed
+/// out of two halves has to sanitize each half on its own rather than the
+/// composition (the service crate's `mcp::acting_actor`): a single pass over
+/// the joined string lets the client-supplied half spend the whole budget and
+/// truncate away the half the server asserts.
 #[doc(hidden)]
 pub fn sanitize_actor(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());

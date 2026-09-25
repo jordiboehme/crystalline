@@ -2,7 +2,7 @@
 //! spawning the real `crystalline` binary. Every scenario needs control over
 //! the harness paths (`~/.claude`, `~/.codex`, `~/.agents`, `~/.copilot`),
 //! reachable only through `HOME` and the XDG base directories, so the same
-//! isolation technique `crates/cli/tests/hook.rs` uses applies here: the
+//! isolation technique `crates/cli/tests/setup/hook.rs` uses applies here: the
 //! environment is set per child with `assert_cmd`'s `.env`, never a
 //! process-global `std::env::set_var`.
 //!

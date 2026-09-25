@@ -2,7 +2,7 @@
 //! `provision allow` / `provision deny`, spawning the real `crystalline`
 //! binary.
 //!
-//! Mirrors `crates/cli/tests/install.rs`'s isolation technique: `HOME` and
+//! Mirrors `crates/cli/tests/setup/install.rs`'s isolation technique: `HOME` and
 //! the XDG base directories are redirected per child with `assert_cmd`'s
 //! `.env`, and a tiny shell shim stands in for the `claude` CLI, logging the
 //! arguments it was called with. Provisioning targets a harness's config

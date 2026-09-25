@@ -1,18 +1,29 @@
 # Architecture
 
-Four crates, one daemon and one rule: every domain has exactly one source of truth, and the index is derived.
+Eight crates, one daemon and one rule: every domain has exactly one source of truth, and the index is derived.
 
 ```
-crystalline-core     format layer: parser, emitter, Picoschema, verify, prompt
-       |              (no async runtime, no database, no ML - stays static)
+crystalline-core       format layer: parser, emitter, Picoschema, verify, prompt
+       |                (no async runtime, no database, no ML - stays static)
        v
-crystalline-index    Store trait, embedded database, sync engine, search, embeddings
+crystalline-index      Store trait, embedded database, sync engine, search, embeddings
+       |         \
+       v          v
+       |     crystalline-remote  GitHub-backed team collaboration plumbing
+       v
+crystalline-identity   accounts, roles, domain access, joins and scope
        |
        v
-crystalline-service  single-instance daemon, MCP tool router, control protocol
+crystalline-engine     the shared engine, review-mode overlay, origins, co-editing sessions
        |
        v
-crystalline (cli)    the one user-facing binary
+crystalline-rest       the JSON API, sign-in and the co-editing socket
+       |
+       v
+crystalline-service    single-instance daemon, MCP tool router, control protocol
+       |
+       v
+crystalline (cli)      the one user-facing binary
 ```
 
 Exactly one process ever holds the database open: the first `crystalline mcp` or `crystalline serve` takes an advisory lock and becomes the daemon. Every later CLI command or MCP connection attaches to it over a local socket, or opens the database directly for a brief operation when no daemon is running.

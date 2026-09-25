@@ -139,7 +139,7 @@ fn declaring_domain_dir(parent: &Path, name: &str, scope: &str) -> std::path::Pa
 /// overlay re-inserts a fresh entry on every read), so the session pending
 /// block must never nag about it - while a regular undecided declaring
 /// domain in the same run still produces its pending line, mirroring
-/// `prompt_appends_pending_decision_block` in `tests/provision.rs`.
+/// `prompt_appends_pending_decision_block` in `tests/setup/provision.rs`.
 #[test]
 fn prompt_system_never_marks_an_env_domain_pending_while_a_regular_domain_still_is() {
     let work = tempfile::tempdir().unwrap();

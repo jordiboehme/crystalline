@@ -542,7 +542,7 @@ async fn an_index_wipe_leaves_the_files_overlay_alone() {
 /// The wipe is reproduced as `Store::wipe` plus a rebuilding sync, which is
 /// what `crystalline reindex --wipe` does to the database - the CLI verb
 /// itself needs the index file to itself and cannot run against this in-memory
-/// store, so its own wiring is pinned by `crates/cli/tests/data.rs`.
+/// store, so its own wiring is pinned by `crates/cli/tests/knowledge/data.rs`.
 ///
 /// Three shapes, because they fail differently: a draft over a file that is
 /// still there, a draft at a path no file holds, and one actor's tombstone of
@@ -6606,7 +6606,7 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         // key: your own document needs nothing, and somebody else's needs a
         // live share-link of that author's naming you plus a live join this
         // session opened on it. See `room_view` in
-        // crates/service/src/collab/session.rs.
+        // crates/engine/src/collab/session.rs.
         ("session.rs", "room_view"),
     ];
     only_these_reach(

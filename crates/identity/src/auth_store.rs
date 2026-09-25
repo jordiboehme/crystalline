@@ -171,7 +171,7 @@ pub fn normalize_account_name(name: &str) -> Result<String> {
 }
 
 /// [`normalize_account_name`] for a name that is about to become an ACCOUNT,
-/// which is where one name is reserved: [`crate::engine::OWNER_IDENTITY_NAME`],
+/// which is where one name is reserved: [`crate::OWNER_IDENTITY_NAME`],
 /// the key the machine owner's own private drafts are written under in every
 /// domain that reviews changes.
 ///
@@ -1039,7 +1039,7 @@ pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
 /// The two ages measure different things. A row nobody has authorized is the
 /// residue of a client that registered and walked away - or of an anonymous
 /// caller filling the table, which is the only way
-/// [`crate::rest::MAX_OAUTH_CLIENTS`] is ever reached, since registration is
+/// `crystalline_rest::MAX_OAUTH_CLIENTS` is ever reached, since registration is
 /// the one write nobody has to authenticate for. Keeping such a row for thirty
 /// days is exactly what would make that filling stick: the table would stay
 /// full for a month and every real client would be refused for as long. An

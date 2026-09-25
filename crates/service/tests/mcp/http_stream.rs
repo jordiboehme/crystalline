@@ -185,7 +185,7 @@ fn init_body(version: &str) -> String {
 /// which echoes a legacy revision and substitutes the newest legacy one for
 /// anything else. A modern peer never sends `initialize` - it carries the
 /// SEP-2575 `_meta` on each request and routes statelessly, which
-/// `tests/mcp_modern_era.rs` covers. Driven off `SERVED_PROTOCOL_VERSIONS`
+/// `tests/mcp/mcp_modern_era.rs` covers. Driven off `SERVED_PROTOCOL_VERSIONS`
 /// rather than a literal list, so a revision added without a decision about its
 /// session model fails here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -504,7 +504,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // decision.** It removed the unsolicited pushes and gave the capability the
     // only delivery channel the 2026-07-28 era has: a client may open a
     // `subscriptions/listen` stream for exactly these three categories
-    // (`tests/mcp_subscriptions.rs`). Nothing is ever sent on it, because after
+    // (`tests/mcp/mcp_subscriptions.rs`). Nothing is ever sent on it, because after
     // Tasks 4 and 5 no request can move a list; retracting the capability would
     // have been a user-visible change to every client we serve today for no
     // behavioural gain, so it stays and the stream stays silent.
@@ -607,7 +607,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // inventing wire shape for a revision that has none, so these five stay
     // absent for the whole program. Advertising the era added a **new**
     // modern-peer leg below rather than moving these lines, which is what that
-    // prediction should have said; `tests/mcp_modern_era.rs` carries the rest
+    // prediction should have said; `tests/mcp/mcp_modern_era.rs` carries the rest
     // of the modern surface.
     for (label, result) in [
         ("tools/list", &tools),
@@ -660,7 +660,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // hints, and with the same 20 tools every other client of this instance is
     // served (GitHub is off here, so the six collaboration tools are withheld
     // from every era alike).
-    // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
+    // `tests/mcp/mcp_modern_era.rs` is where the rest of that surface lives.
     let era = post_with_standard_headers(
         addr,
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,

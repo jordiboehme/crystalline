@@ -598,7 +598,7 @@ async fn the_skills_serve_setting_decides_in_both_directions() {
 /// from the 2026-07-28 schema, so a peer that sent one is speaking the legacy
 /// lifecycle whatever it names - and the era is now reached only the way the
 /// specification provides for: `server/discover` and inline requests carrying
-/// the SEP-2575 `_meta`, which `tests/mcp_modern_era.rs` covers.
+/// the SEP-2575 `_meta`, which `tests/mcp/mcp_modern_era.rs` covers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handshake_naming_the_era_is_answered_with_the_newest_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
@@ -653,7 +653,7 @@ async fn every_revision_we_serve_is_answered_with_a_handshake_revision() {
 /// handshake rather than only to an unknown one - see
 /// `a_handshake_naming_the_era_is_answered_with_the_newest_handshake_revision`.
 /// A peer reaches the modern lifecycle through `server/discover` and inline
-/// requests instead - `tests/mcp_modern_era.rs`.
+/// requests instead - `tests/mcp/mcp_modern_era.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_protocol_version_string_is_answered_with_the_newest_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
@@ -677,7 +677,7 @@ async fn an_unknown_protocol_version_string_is_answered_with_the_newest_handshak
 ///
 /// 2026-07-28 was added on 2026-08-14, once the four obligations it carries
 /// were implemented and verified over both transports
-/// (`tests/mcp_modern_era.rs`); 2024-11-05 is present on purpose and its
+/// (`tests/mcp/mcp_modern_era.rs`); 2024-11-05 is present on purpose and its
 /// removal would be a deprecation, not a cleanup. The two lists are equal
 /// today, and they are asserted separately on purpose: that is a fact about
 /// this moment rather than a rule, and the day rmcp learns a sixth revision

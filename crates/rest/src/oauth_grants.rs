@@ -25,8 +25,9 @@
 //! Revoking deletes the row outright rather than marking it - the same
 //! `AuthStore::revoke_oauth_grant` a disabled or removed account's sweep
 //! already calls - so both of the grant's tokens stop resolving at the MCP
-//! gate at once, on the very next request: [`crate::mcp_gate`]'s OAuth lookup
-//! is a fresh query every time, there is nothing cached to invalidate.
+//! gate at once, on the very next request: the service crate's `mcp_gate`
+//! module's OAuth lookup is a fresh query every time, there is nothing
+//! cached to invalidate.
 //!
 //! Nothing here ever carries a token: the store keeps only hashes, and
 //! [`super::auth_store::OauthGrantInfo`] was never given a field for one.

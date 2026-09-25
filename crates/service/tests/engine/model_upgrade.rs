@@ -142,8 +142,8 @@ async fn the_first_start_after_the_flip_answers_in_text_mode() {
         "with no vectors for the active model, search falls back to text rather than failing: {after}"
     );
     assert!(
-        // The search envelope's results key is `hits` (engine.rs:9377), not
-        // `results`.
+        // The search envelope's results key is `hits`
+        // (`crates/engine/src/engine/search.rs`), not `results`.
         after["hits"].as_array().is_some_and(|r| !r.is_empty()),
         "and still answers: {after}"
     );

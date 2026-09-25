@@ -7,22 +7,22 @@
 //! is it.
 //!
 //! **It lives on the shared `crate::Engine` rather than on the MCP handler,
-//! and that placement is the whole reason the module exists.** On the
-//! streamable-HTTP path rmcp builds a fresh service per request
-//! (`get_service()`, rmcp 3.1.2 `tower.rs:1822` and `:1948`) and every modern
-//! peer routes statelessly, so the handler that takes a subscription and the
-//! handler that later flips a setting are different objects which share only
-//! the engine. A handler-local registry would work over stdio and on the
-//! legacy session path and silently do nothing over HTTP. The flip is not
-//! even always an MCP call: the control socket and the REST API write the same
-//! setting, which is why `Engine::configure` is what sends on these sinks.
+//! and that placement is the whole reason the module exists.** A server that
+//! builds a fresh handler per request and routes every modern peer statelessly
+//! has no handler-local place to keep a subscription alive: the handler that
+//! takes a subscription and the handler that later flips a setting are
+//! different objects which share only the engine. A handler-local registry
+//! would work over stdio and on the legacy session path and silently do
+//! nothing over a stateless transport. The flip is not even always an MCP
+//! call: the control socket and the REST API write the same setting, which is
+//! why `Engine::configure` is what sends on these sinks.
 //!
-//! `SubscriptionSink` is `Clone`, every field is `Send + Sync + 'static`
-//! (`service/server.rs:139-144`), and it holds a `Peer` plus a child
-//! cancellation token - so an entry left behind after its stream ended would
-//! pin a dead peer. [`Subscriber`] is the RAII guard that prevents that:
-//! `listen` holds one for the life of the stream and dropping it removes the
-//! entry, however the stream ended.
+//! [`ToolListSink`] is the seam: whatever wraps the live stream on the MCP
+//! side (see the service crate's `RmcpListSink` in `mcp.rs`) is
+//! `Send + Sync + 'static`, so an entry left behind after its stream ended
+//! would pin a dead peer. [`Subscriber`] is the RAII guard that prevents
+//! that: `listen` holds one for the life of the stream and dropping it
+//! removes the entry, however the stream ended.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,15 +97,15 @@ impl ListSubscribers {
     /// stream and to nobody else.
     ///
     /// A peer that has gone away since it subscribed is dropped rather than
-    /// retried: `SubscriptionSink::send` reports a cancelled stream as
-    /// `SubscriptionSendError::SubscriptionClosed`, and the guard normally
-    /// removes such an entry already, so this is the belt to that braces.
+    /// retried: a closed stream reports [`SinkDelivery::Closed`], and the
+    /// guard normally removes such an entry already, so this is the belt to
+    /// that braces.
     ///
-    /// `SubscriptionSendError::NotificationNotAccepted` is not a failure at
-    /// all: it is what a live stream that subscribed to other categories
-    /// answers, which is the ordinary outcome for every sink here that did not
-    /// ask for tools. It stays registered - its other categories are still
-    /// live - and is not worth a word of alarm. Anything else is a live peer's
+    /// [`SinkDelivery::NotAccepted`] is not a failure at all: it is what a
+    /// live stream that subscribed to other categories answers, which is the
+    /// ordinary outcome for every sink here that did not ask for tools. It
+    /// stays registered - its other categories are still live - and is not
+    /// worth a word of alarm. [`SinkDelivery::Failed`] is a live peer's
     /// transport trouble and is logged, also without unregistering, so the
     /// next flip tries again.
     pub async fn notify_tool_list_changed(&self) {
