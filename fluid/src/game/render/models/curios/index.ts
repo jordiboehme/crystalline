@@ -42,8 +42,9 @@ const RECIPES = {
 /**
  * Builds variant `variant` of a curio kind into the kits `kitAt` makes, in
  * `frameAt([0, 0, 0], 0)`: centred on the origin, its base at `h` 0 and
- * its front towards `+d`. Throws on a variant the catalogue does not give
- * the kind, as `curioSize` does: a generator bug should not pass silently.
+ * its front towards `+d`. Throws `buildCurio: <kind> has no variant <n>`
+ * on a variant the catalogue does not give the kind, as `buildHero` does:
+ * a generator bug should not pass silently.
  */
 export function buildCurio(
   kitAt: KitAt,

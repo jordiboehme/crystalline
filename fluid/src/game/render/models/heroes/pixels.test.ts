@@ -62,8 +62,13 @@ describe("block-pixel font", () => {
 
   it("sets the laptop's mark from its three glyphs", () => {
     const rows = textRows("<=>");
-    expect(rows).toHaveLength(5);
-    for (const r of rows) expect(r).toHaveLength(11);
+    expect(rows).toEqual([
+      "..#.....#..",
+      ".#..###..#.",
+      "#.........#",
+      ".#..###..#.",
+      "..#.....#..",
+    ]);
     for (const c of "<=>") {
       const g = PIXEL_FONT[c];
       expect(g, c).toHaveLength(5);

@@ -16,7 +16,12 @@
 import { describe, expect, it } from "vitest";
 
 import { galleryRoom } from "../world/canned";
-import { DECOR_SURFACES, PROP_SURFACES, hostSurfaces } from "../world/curios";
+import {
+  DECOR_SURFACES,
+  FIXTURE_SURFACES,
+  PROP_SURFACES,
+  hostSurfaces,
+} from "../world/curios";
 import {
   HERO_FOOTING,
   decorFootprint,
@@ -151,8 +156,18 @@ function heroAt(kind: HeroKind, t: number): Hero {
   return { kind, variant: 0, x: a.x, y: a.y, turn: t, seed: 0 };
 }
 
+/** The fixture hosts: the terminal and every machine with a surface table. */
+const FIXTURE_HOSTS: readonly ("terminal" | MachineKind)[] = [
+  "terminal",
+  ...(Object.keys(FIXTURE_SURFACES.machine) as MachineKind[]),
+];
+
 describe("host surfaces on their hosts' meshes", () => {
-  for (const host of ["terminal", "workbench", "lab-bench"] as const)
+  it("covers the terminal and every machine with a surface table", () => {
+    expect(FIXTURE_HOSTS).toEqual(["terminal", "workbench", "lab-bench"]);
+  });
+
+  for (const host of FIXTURE_HOSTS)
     for (const t of TURNS)
       for (const seed of SEEDS)
         it(`${host} at turn ${String(t)}, seed ${String(seed)}`, () => {

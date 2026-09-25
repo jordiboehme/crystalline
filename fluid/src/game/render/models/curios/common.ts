@@ -31,7 +31,11 @@ import type { Kit } from "../../kit";
 import type { Look, Rgb } from "../../looks";
 import type { KitAt, Surfaces } from "../common";
 
-/** One curio kind's recipe: builds `variant` of `kind` with `k` in `frameAt([0, 0, 0], 0)`, centred on the origin. Pure in kind, variant and look. */
+/**
+ * One curio kind's recipe: builds `variant` of `kind` with `k` in
+ * `frameAt([0, 0, 0], 0)`, centred on the origin. Pure in kind, variant
+ * and look.
+ */
 export type CurioRecipe = (r: {
   k: Kit;
   kitAt: KitAt;

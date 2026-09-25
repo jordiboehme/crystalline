@@ -177,11 +177,14 @@ describe("instanceGroups", () => {
 
 describe("curioInstances", () => {
   // Review Focus 3's key-space pin for the third family: a curio key
-  // never collides with a prop or hero key, and each curio keeps its
-  // height and its kind's bank slot.
+  // never collides with a prop or hero key (the room holds all three
+  // families), and each curio keeps its height and its kind's bank slot.
   it("gives curio groups their own key space, their height and their bank slot", () => {
     const room = {
       ...galleryRoom(),
+      heroes: [
+        { kind: "turret", variant: 0, x: 4.5, y: 14, turn: 1, seed: 3 },
+      ] satisfies Hero[],
       curios: [
         {
           kind: "wing-meter" as const,
@@ -216,7 +219,11 @@ describe("curioInstances", () => {
       1,
       bankSlot("chase"),
     ]);
-    const keys = instanceGroups(room).map((g) => g.key);
+    const all = instanceGroups(room);
+    expect(new Set(all.map((g) => g.family))).toEqual(
+      new Set(["prop", "hero", "curio"]),
+    );
+    const keys = all.map((g) => g.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(instanceGroups(room).at(-1)?.family).toBe("curio");
     expect(curioInstances(room)).toEqual(curioInstances(room));

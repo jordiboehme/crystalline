@@ -12,10 +12,11 @@
  * the uniforms `moverDraw` in `parts.ts` gives it), one instanced draw per
  * prop, hero or curio kind and variant, and six full-screen passes. The
  * scene is rendered at the canvas size handed to `resize`, the bloom at
- * half of that and below. The static room is drawn at `restDraw`, the movers at
- * their own uniforms, and the uniforms go back to `restDraw` before the
- * instance groups and once more after them, so `uGain` is 1 for every
- * prop, hero and curio and no later draw inherits a mover's gain.
+ * half of that and below. The static room is drawn at `restDraw`, the
+ * movers at their own uniforms, and the uniforms go back to `restDraw`
+ * before the instance groups and once more after them, so `uGain` is 1
+ * for every prop, hero and curio and no later draw inherits a mover's
+ * gain.
  *
  * The set dressing, the heroes and the curios are drawn instanced (see
  * `instances.ts`). Heroes are instanced like props, in their own key space
@@ -27,12 +28,12 @@
  * needs is built once as its own mesh in the look's colours and kept in a
  * cache keyed by the group's key; the cache is cleared when the look's id
  * changes and otherwise grows lazily, bounded by the prop, hero and curio
- * catalogues. The condition does not enter the key: it
- * changes only grime and light scale, never the palette a mesh is coloured
- * from (a look test pins that). The room's instance buffers depend only on
- * the room, so a look switch, which calls `setRoom` again with the very
- * same room object, keeps them and only rebuilds the small vertex arrays
- * that bind them to the new look's meshes.
+ * catalogues. The condition does not enter the key: it changes only grime
+ * and light scale, never the palette a mesh is coloured from (a look test
+ * pins that). The room's instance buffers depend only on the room, so a
+ * look switch, which calls `setRoom` again with the very same room object,
+ * keeps them and only rebuilds the small vertex arrays that bind them to
+ * the new look's meshes.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
  * calls on unmount. After a lost context the demo does not call it: the
@@ -183,10 +184,10 @@ function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
 }
 
 /**
- * One prop, hero or curio kind and variant of the room on the GPU: which mesh it
- * draws (`id`), its instance buffer, kept while the room stays the same,
- * and the vertex array that binds it to the cached mesh of the current
- * look, remade on every `setRoom`.
+ * One prop, hero or curio kind and variant of the room on the GPU: which
+ * mesh it draws (`id`), its instance buffer, kept while the room stays the
+ * same, and the vertex array that binds it to the cached mesh of the
+ * current look, remade on every `setRoom`.
  */
 interface GpuGroup {
   id: GroupMesh;

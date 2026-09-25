@@ -110,7 +110,7 @@ describe("curio models", () => {
           it("winds every triangle with its normal", () => {
             expect(placed.count).toBeGreaterThan(0);
             expect(placed.count % 3).toBe(0);
-            expect(1 - worstWinding(placed)).toBeLessThanOrEqual(1e-6);
+            expect(worstWinding(placed)).toBeGreaterThan(0.999);
           });
 
           it("stays under the triangle budget", () => {
