@@ -1065,9 +1065,9 @@ function packBody(k: Kit, kitAt: KitAt, s: Surfaces, p: PackPose): void {
 /**
  * The details on the body's front face (the side that faces the room):
  * the round cyclotron low on it (a grey disc, a black centre and four red
- * lenses at its quarters, status groups 0 to 3 in order round the ring),
+ * lenses at its quarters, chase groups 0 to 3 in order round the ring),
  * the power-cell housing above it on the left with a column of eight blue
- * lights (status groups 4 to 7, bottom to top, twice), two ribbed booster
+ * lights (chase groups 4 to 7, bottom to top, twice), two ribbed booster
  * tubes lying across the face above the cyclotron, a black cable along
  * the top, and a bent carrying arm on the right side.
  */
@@ -1174,7 +1174,7 @@ function packFace(k: Kit, kitAt: KitAt, s: Surfaces, p: PackPose): void {
 /**
  * The wand, standing tip up with its bottom at `base` on the axis `(a,
  * d)`: a grey gunbox with a black grip jutting forward, a finned dark
- * heat-sink collar, a slim grey barrel and a small orange tip (status
+ * heat-sink collar, a slim grey barrel and a small orange tip (chase
  * group 7), and a dark socket under the gunbox where the hose plugs in.
  */
 function wand(k: Kit, s: Surfaces, a: number, d: number, base: number): void {
@@ -1386,10 +1386,10 @@ function packV1Rack(
  * on the body's side, the hose dropping from high on the side to its
  * socket.
  *
- * The kind's bank is status, whose groups strobe out of step, so the
- * cyclotron's four lights (groups 0 to 3 round the ring) and the power
- * cell's column (groups 4 to 7, bottom to top) are laid out in chase and
- * climb order but blink independently.
+ * The kind's bank is chase, which lights one group at a time in order:
+ * the light runs round the cyclotron's ring (groups 0 to 3), then climbs
+ * the power cell's column (groups 4 to 7, both halves of the column
+ * together), and the wand's tip flashes with the column's top step.
  */
 const fieldPack: HeroRecipe = ({ k, kitAt, s, variant }) => {
   const p = packPose(variant);

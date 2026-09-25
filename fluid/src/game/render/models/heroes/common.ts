@@ -84,7 +84,7 @@ export const HERO_BANK = {
   "gun-rack": "breathe",
   "gun-bench": "breathe",
   "tube-bench": "chase",
-  "field-pack": "status",
+  "field-pack": "chase",
   "arcade-cabinet": "swap",
   "recruit-cabinet": "swap",
 } as const satisfies Record<HeroKind, BlinkBank>;
