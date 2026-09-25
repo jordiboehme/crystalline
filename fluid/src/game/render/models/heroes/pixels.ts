@@ -16,10 +16,12 @@ import type { Surface } from "../../geometry";
 import type { Kit } from "../../kit";
 
 /**
- * The block-pixel font: `A` to `Z`, `0` to `9` and the space, each glyph
- * 5 rows of 3 cells from the top, `#` lit and `.` dark. It is the smallest
- * grid a capital letter still reads in, the size an old attract screen
- * used, and every on-screen title of the station is set in it.
+ * The block-pixel font: `A` to `Z`, `0` to `9`, the space and a one-pixel
+ * period, each glyph 5 rows of 3 cells from the top, `#` lit and `.` dark
+ * (the period glyph's own single lit cell sits at its bottom middle). It
+ * is the smallest grid a capital letter still reads in, the size an old
+ * attract screen used, and every on-screen title of the station is set
+ * in it.
  */
 export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   A: [".#.", "#.#", "###", "#.#", "#.#"],
@@ -59,6 +61,7 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   "8": ["###", "#.#", "###", "#.#", "###"],
   "9": ["###", "#.#", "###", "..#", "##."],
   " ": ["...", "...", "...", "...", "..."],
+  ".": ["...", "...", "...", "...", ".#."],
 };
 
 /** One horizontal run of equal characters: its first column, its row (0 at the top) and its length. */
