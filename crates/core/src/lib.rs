@@ -24,6 +24,7 @@ pub mod harness;
 pub mod import;
 pub mod index;
 pub mod manifest;
+pub mod names;
 pub mod parse;
 pub mod path;
 pub mod prompt;
@@ -64,6 +65,7 @@ pub use manifest::{
     generated_indexes_at, in_root_artifact_dirs, manifest_template, policy_registry, sharing_at,
     starter_stanzas, tag_alias_pairs,
 };
+pub use names::{NameInput, NameTable};
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use path::fold_path_case;
 pub use prompt::{
