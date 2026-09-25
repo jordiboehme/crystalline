@@ -89,6 +89,14 @@ export const NOT_FOUND = "?FILE NOT FOUND";
 /** What a sealed way says: resolved, but the graph did not locate it. */
 export const NO_ROUTE = "NO ROUTE";
 
+/**
+ * What a way says when its target refused the player: the answer to a 403
+ * on travel. The generator never seals a way with it (a permission answer
+ * comes from a load, not from the index); the session uses it for a way
+ * that failed on travel, and `world/malfunction.ts` counts it as broken.
+ */
+export const ACCESS_DENIED = "ACCESS DENIED";
+
 /** Cells a side of one light zone. */
 const LIGHT_BLOCK = 4;
 

@@ -6,6 +6,7 @@ import {
   CANNED_WORKSHOP,
   galleryRoom,
 } from "./canned";
+import { dressRoom } from "./dress";
 import {
   decorFootprint,
   footprint,
@@ -635,12 +636,12 @@ describe("cluster blocks", () => {
 
 describe("span lines", () => {
   it("lists only lines that stay a cell off every hall wall and clear of decor, pipe runs, scaffolding and lamps", () => {
-    // The workshop and the hub come out engineering as runbooks, with pipe
-    // runs overhead (E3).
+    // The workshop comes out engineering as a runbook, with pipe runs
+    // overhead (E3); the hub is a reference, an archive, and joins as a
+    // runbook too.
     for (const room of [
       generateRoom(CANNED_WORKSHOP),
       generateRoom(CANNED_HUB),
-      generateRoom({ ...CANNED_WORKSHOP, type: "runbook" }),
       generateRoom({ ...CANNED_HUB, type: "runbook" }),
     ]) {
       const sites = dressingSites(room);
@@ -670,24 +671,46 @@ describe("span lines", () => {
   it("gives a small hall none", () => {
     expect(dressingSites(generateRoom(CANNED_BRIDGE)).spanLines).toEqual([]);
   });
+
+  it("gives a large hall whose every line is blocked no line and no span props", () => {
+    const base = generateRoom({ ...CANNED_WORKSHOP, type: "runbook" });
+    const h = base.hall;
+    expect(isLargeHall(h)).toBe(true);
+    const room: RoomBase = {
+      ...base,
+      scaffold: [
+        {
+          x0: (h.x0 + 1) * CELL,
+          z0: (h.y0 + 1) * CELL,
+          x1: (h.x1 - 1) * CELL,
+          z1: (h.y1 - 1) * CELL,
+        },
+      ],
+    };
+    expect(dressingSites(room).spanLines).toEqual([]);
+    const spans = dressRoom(room).filter(
+      (p) => p.kind === "span-duct" || p.kind === "span-tray",
+    );
+    expect(spans).toEqual([]);
+  });
 });
 
 describe("the generator side's imports (ruling 20)", () => {
   // `interact.ts` imports `./generate`, and `CELL` comes from `./units`,
-  // never from `./generate`, so none of the three may be reached from here.
+  // never from `./generate`, so none of the four may be reached from here.
   // The pattern catches `from "..."`, a bare `import "..."` and a dynamic
-  // `import("...")`, of the three modules and of anything under `render/`.
-  it("keeps sites.ts, props.ts and lamps.ts away from move, generate, interact and render", () => {
+  // `import("...")`, of the four modules and of anything under `render/`.
+  it("keeps sites.ts, props.ts and lamps.ts away from move, generate, interact, malfunction and render", () => {
     for (const source of [sitesSource, propsSource, lampsSource]) {
       expect(source).not.toMatch(
-        /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact)|\.\.\/render(?:\/[^"']*)?)["']/,
+        /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
       );
     }
   });
 
   it("catches every import form the guard is meant to", () => {
     const guard =
-      /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact)|\.\.\/render(?:\/[^"']*)?)["']/;
+      /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/;
     for (const line of [
       'import { x } from "./move";',
       'import "../render/geometry";',

@@ -19,6 +19,9 @@
  *   and an unsealed portal needs nothing at all: walking into it is the
  *   action, so neither is offered for E.
  * - A sealed door or portal is offered only to say why it is sealed.
+ *
+ * A way that failed on travel (the session's `failed` map) is treated as
+ * sealed: it is offered only to say why, heads shut and carries no one.
  */
 
 import type { Player } from "./move";
@@ -83,7 +86,8 @@ const OPEN_ENOUGH = 0.9;
  * - `E OPEN <label>` or `E CLOSE <label>` at a bulkhead or blast door,
  *   after where the door is heading;
  * - `E CRAWL <label>` at a hatch;
- * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing.
+ * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing;
+ * - `SEALED <label>` at a way in `failed`.
  */
 export type Interactable = {
   kind: "terminal" | "door" | "hatch" | "portal";
@@ -144,6 +148,22 @@ export function wallPoint(slot: WallSlot): WallPoint {
 }
 
 /**
+ * A spawn in a slot's own cell, facing its wall: the cell centre, 1 m in
+ * front of the wall point, with `yaw` turned so the player's forward
+ * `(-sin yaw, -cos yaw)` points into the wall. `RoomSpec.spawn` uses the
+ * same cell and yaw convention, so a dev view can put the player in front
+ * of a fixture by spreading this into a room's `spawn`.
+ */
+export function wallFacingSpawn(slot: WallSlot): {
+  x: number;
+  y: number;
+  yaw: number;
+} {
+  const w = wallPoint(slot);
+  return { x: slot.x, y: slot.y, yaw: Math.atan2(w.inward[0], w.inward[1]) };
+}
+
+/**
  * Where the player stands relative to a wall: `depth` metres in front of it
  * (negative behind it) and `side` metres along it from its middle.
  */
@@ -183,33 +203,34 @@ function offer(
   fixture: Fixture,
   index: number,
   doors: ReadonlyMap<number, DoorState>,
+  failed: ReadonlyMap<number, string>,
 ): Interactable | null {
   switch (fixture.kind) {
     case "terminal":
       return { kind: "terminal", index, prompt: `E READ ${fixture.heading}` };
-    case "hatch":
+    case "hatch": {
+      const seal = failed.get(index);
+      if (seal !== undefined) {
+        return { kind: "hatch", index, prompt: `SEALED ${seal}` };
+      }
       return { kind: "hatch", index, prompt: `E CRAWL ${fixture.label}` };
+    }
     case "door": {
-      if (fixture.sealedLabel !== null || fixture.address === null) {
-        return {
-          kind: "door",
-          index,
-          prompt: `SEALED ${fixture.sealedLabel ?? ""}`,
-        };
+      const seal = failed.get(index) ?? fixture.sealedLabel;
+      if (seal !== null || fixture.address === null) {
+        return { kind: "door", index, prompt: `SEALED ${seal ?? ""}` };
       }
       if (fixture.style === "sliding") return null;
       const verb = doors.get(index)?.target === 1 ? "CLOSE" : "OPEN";
       return { kind: "door", index, prompt: `E ${verb} ${fixture.label}` };
     }
-    case "portal":
-      if (fixture.sealedLabel !== null || fixture.address === null) {
-        return {
-          kind: "portal",
-          index,
-          prompt: `SEALED ${fixture.sealedLabel ?? ""}`,
-        };
+    case "portal": {
+      const seal = failed.get(index) ?? fixture.sealedLabel;
+      if (seal !== null || fixture.address === null) {
+        return { kind: "portal", index, prompt: `SEALED ${seal ?? ""}` };
       }
       return null;
+    }
     case "machine":
     case "poster":
     case "placard":
@@ -230,6 +251,7 @@ export function focusOf(
   room: RoomSpec,
   player: Player,
   doors: ReadonlyMap<number, DoorState> = new Map(),
+  failed: ReadonlyMap<number, string> = new Map(),
 ): Interactable | null {
   const fx = -Math.sin(player.yaw);
   const fz = -Math.cos(player.yaw);
@@ -244,7 +266,7 @@ export function focusOf(
     const distance = Math.hypot(dx, dz);
     if (distance > REACH || distance >= bestDistance) continue;
     if (distance > 0 && (dx * fx + dz * fz) / distance < cosFacing) continue;
-    const candidate = offer(fixture, index, doors);
+    const candidate = offer(fixture, index, doors, failed);
     if (candidate === null) continue;
     best = candidate;
     bestDistance = distance;
@@ -260,21 +282,23 @@ export function focusOf(
  * of its wall and within `APPROACH` of its wall point) and shut otherwise; a bulkhead or blast door keeps heading
  * where it was until `pressed`, the index of the fixture E was pressed at
  * this tick, names it, which turns it round. A sealed door always heads
- * shut. Then each door moves `DOOR_STEP` towards where it is heading.
- * Returns a new map; `doors` is left as it was.
+ * shut, and so does a door in `failed`, whatever the player does. Then each
+ * door moves `DOOR_STEP` towards where it is heading. Returns a new map;
+ * `doors` is left as it was.
  */
 export function stepDoors(
   room: RoomSpec,
   player: Player,
   doors: ReadonlyMap<number, DoorState>,
   pressed: number | null,
+  failed: ReadonlyMap<number, string> = new Map(),
 ): Map<number, DoorState> {
   const out = new Map<number, DoorState>();
   room.fixtures.forEach((fixture, index) => {
     if (fixture.kind !== "door") return;
     const was = doors.get(index) ?? { open: 0, target: 0 };
     let target: 0 | 1;
-    if (fixture.address === null) {
+    if (fixture.address === null || failed.has(index)) {
       target = 0;
     } else if (fixture.style === "sliding") {
       target = approaches(fixture.slot, player) ? 1 : 0;
@@ -303,15 +327,18 @@ export function stepDoors(
  * (`DOOR_HALF`). An unsealed portal carries the player through on contact:
  * in front of its wall, within `PORTAL_REACH` of it, and inside its ring
  * (`PORTAL_HALF`). Nothing carries the player from behind a wall, where a
- * bay or the backlink corridor may lie.
+ * bay or the backlink corridor may lie. A way in `failed` carries no one,
+ * whatever its `DoorState` says.
  * Hatches are crawled through on E instead (`hatchTravel`).
  */
 export function travelOf(
   room: RoomSpec,
   player: Player,
   doors: ReadonlyMap<number, DoorState>,
+  failed: ReadonlyMap<number, string> = new Map(),
 ): Travel | null {
   for (const [index, fixture] of room.fixtures.entries()) {
+    if (failed.has(index)) continue;
     if (fixture.kind === "door" && fixture.address !== null) {
       if ((doors.get(index)?.open ?? 0) <= OPEN_ENOUGH) continue;
       const r = relative(wallPoint(fixture.slot), player.x, player.z);

@@ -1569,11 +1569,12 @@ describe("locality", () => {
     // tags, and a third relation adds one door at (5,0,n) without moving the
     // hall or any other fixture. The canned rooms do not serve here: a
     // relation grows the workshop's hall, and reshuffles the hub's slots.
-    // Probed with a cluster in every block, the 3x3 inner squares and the
-    // engineering span over 288 clean pairs (4 span archetypes, 3 to 6
-    // sections, 1 to 3 relations, 3 to 5 inbound, 0 or 2 tags), every
-    // changed prop lay within 1 cell of the new slot, no cluster member
-    // changed and the span props never did. Under the other conditions the
+    // Probe note (planner, 2026-09-25, not re-run here): with a cluster in
+    // every block, the 3x3 inner squares and the engineering span, over 288
+    // clean pairs (4 span archetypes, 3 to 6 sections, 1 to 3 relations, 3
+    // to 5 inbound, 0 or 2 tags) every changed prop lay within 1 cell of the
+    // new slot, and no cluster member or span prop changed. This test pins
+    // the radius on the four cases below. Under the other conditions the
     // extras move further, since each goes to the first spot in floor-seed
     // order that accepts it (ruling 12), so this case is clean.
     const RADIUS = 1;
@@ -1788,16 +1789,16 @@ describe("degenerate rooms (Review Focus 5)", () => {
 });
 
 describe("the generator side's imports (ruling 20)", () => {
-  it("keeps dress.ts and density.ts away from move, generate, interact and render", () => {
+  it("keeps dress.ts and density.ts away from move, generate, interact, malfunction and render", () => {
     for (const source of [dressSource, densitySource])
       expect(source).not.toMatch(
-        /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact)|\.\.\/render(?:\/[^"']*)?)["']/,
+        /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
       );
   });
 
-  it("keeps generate.ts away from move, interact and render", () => {
+  it("keeps generate.ts away from move, interact, malfunction and render", () => {
     expect(generateSource).not.toMatch(
-      /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|interact)|\.\.\/render(?:\/[^"']*)?)["']/,
+      /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
     );
   });
 });

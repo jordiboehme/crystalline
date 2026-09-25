@@ -45,7 +45,7 @@ import { gameEngramRoute, placeKeyOf } from "./paths";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
-import { NOT_FOUND, generateRoom } from "./world/generate";
+import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
   focusOf,
@@ -194,7 +194,7 @@ const NO_DEVICE = "?DEVICE NOT PRESENT ERROR";
 /** What each failed answer tells the player. */
 const FAILED: Record<Exclude<LoadedPlace["kind"], "place">, string> = {
   missing: NOT_FOUND,
-  denied: "ACCESS DENIED",
+  denied: ACCESS_DENIED,
   offline: "SIGNAL LOST",
 };
 

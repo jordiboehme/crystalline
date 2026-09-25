@@ -99,11 +99,10 @@
  *     seeded with token `span` at its first cell. A span line keeps a full
  *     cell (2 m) off every hall wall, clear of the ceiling band along the
  *     walls, and clear of lamps, decor, pipe runs and scaffolding
- *     (`sites.ts`); then
- *     the beacon on the entrance edge, token `beacon-s`; and the loose
- *     cables of step 6 on the hall's wall edges that carry neither a
- *     fixture nor a ceiling segment nor the beacon, in the order of their
- *     own seeds (token `loose-<side>`).
+ *     (`sites.ts`); then the beacon on the entrance edge, token `beacon-s`;
+ *     and the loose cables of step 6 on the hall's wall edges that carry
+ *     neither a fixture nor a ceiling segment nor the beacon, in the order
+ *     of their own seeds (token `loose-<side>`).
  * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
  *     everything else optional. A group, the span line, takes the place of

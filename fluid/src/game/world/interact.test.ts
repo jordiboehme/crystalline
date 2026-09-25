@@ -12,12 +12,13 @@
 import { describe, expect, it } from "vitest";
 
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
-import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
-import { NOT_FOUND, generateRoom } from "./generate";
+import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
 import { isFloor } from "./layout";
 import {
   APPROACH,
   DOOR_HALF,
+  DOOR_STEP,
   FACING,
   REACH,
   approaches,
@@ -26,11 +27,12 @@ import {
   hatchTravel,
   stepDoors,
   travelOf,
+  wallFacingSpawn,
   wallPoint,
   type DoorState,
 } from "./interact";
 import { PLAYER_RADIUS, blockersFor, type Player } from "./move";
-import type { Fixture, RoomSpec } from "./types";
+import type { Fixture, RoomSpec, WallSlot } from "./types";
 import { CELL } from "./units";
 
 const bridge = generateRoom(CANNED_BRIDGE);
@@ -450,4 +452,100 @@ describe("arrivals land on clear floor", () => {
       expect(checked).toBeGreaterThan(0);
     });
   }
+});
+
+describe("ways in the failed map", () => {
+  /** The index of the `n`th fixture of `kind`, in fixture order. */
+  const nth = (room: RoomSpec, kind: Fixture["kind"], n: number) => {
+    let seen = -1;
+    const i = room.fixtures.findIndex((f) => f.kind === kind && ++seen === n);
+    if (i < 0) throw new Error(`no ${kind} ${String(n)}`);
+    return i;
+  };
+
+  /** The player 1 m in front of fixture `i`, facing it. */
+  const facing = (room: RoomSpec, i: number, d = 1): Player => {
+    const f = room.fixtures[i];
+    if (f === undefined) throw new Error("no fixture");
+    const w = wallPoint(f.slot);
+    return {
+      x: w.x + w.inward[0] * d,
+      z: w.z + w.inward[1] * d,
+      yaw: Math.atan2(w.inward[0], w.inward[1]),
+      vx: 0,
+      vz: 0,
+      pitch: 0,
+      bob: 0,
+    };
+  };
+
+  it("offers SEALED <label> at a way that failed on travel", () => {
+    const room = galleryRoom();
+    const doorI = nth(room, "door", 1);
+    const hatchI = nth(room, "hatch", 0);
+    expect(
+      focusOf(
+        room,
+        facing(room, doorI),
+        new Map(),
+        new Map([[doorI, NOT_FOUND]]),
+      )?.prompt,
+    ).toBe(`SEALED ${NOT_FOUND}`);
+    expect(
+      focusOf(
+        room,
+        facing(room, hatchI),
+        new Map(),
+        new Map([[hatchI, ACCESS_DENIED]]),
+      )?.prompt,
+    ).toBe(`SEALED ${ACCESS_DENIED}`);
+    expect(focusOf(room, facing(room, doorI))?.prompt).toMatch(/^E OPEN /);
+    expect(focusOf(room, facing(room, hatchI))?.prompt).toMatch(/^E CRAWL /);
+  });
+
+  it("heads a failed door shut, even a sliding one the player stands at", () => {
+    const room = galleryRoom();
+    const i = nth(room, "door", 0);
+    const failed = new Map([[i, NOT_FOUND]]);
+    const player = facing(room, i);
+    const doors = new Map([[i, { open: 1, target: 1 as const }]]);
+    const stepped = stepDoors(room, player, doors, null, failed);
+    expect(stepped.get(i)?.target).toBe(0);
+    expect(stepped.get(i)?.open).toBeCloseTo(1 - DOOR_STEP, 9);
+    let out: Map<number, DoorState> = doors;
+    for (let t = 0; t < 12; t++) {
+      out = stepDoors(room, player, out, null, failed);
+    }
+    expect(out.get(i)?.open).toBe(0);
+  });
+
+  it("never carries the player through a failed door or portal", () => {
+    const room = galleryRoom();
+    const doorI = nth(room, "door", 0);
+    const doors = new Map([[doorI, { open: 1, target: 1 as const }]]);
+    const atDoor = facing(room, doorI, 0.4);
+    expect(travelOf(room, atDoor, doors)).not.toBeNull();
+    expect(
+      travelOf(room, atDoor, doors, new Map([[doorI, NOT_FOUND]])),
+    ).toBeNull();
+
+    const portalI = nth(room, "portal", 0);
+    const atPortal = facing(room, portalI, 0.3);
+    expect(travelOf(room, atPortal, new Map())).not.toBeNull();
+    expect(
+      travelOf(room, atPortal, new Map(), new Map([[portalI, NOT_FOUND]])),
+    ).toBeNull();
+  });
+
+  it("faces the wall from a slot's own cell", () => {
+    for (const side of ["n", "e", "s", "w"] as const) {
+      const slot: WallSlot = { x: 3, y: 4, side };
+      const spawn = wallFacingSpawn(slot);
+      expect(spawn.x).toBe(slot.x);
+      expect(spawn.y).toBe(slot.y);
+      const w = wallPoint(slot);
+      expect(-Math.sin(spawn.yaw)).toBeCloseTo(-w.inward[0], 9);
+      expect(-Math.cos(spawn.yaw)).toBeCloseTo(-w.inward[1], 9);
+    }
+  });
 });
