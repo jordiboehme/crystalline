@@ -36,6 +36,7 @@ import {
   FLUSH_DEPTH,
   HEADROOM,
   HOUSING_DEPTH,
+  OPENING,
   PIPE_DROP,
   SLIDE_TRAVEL,
   buildDecor,
@@ -138,13 +139,6 @@ const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 const slotOn = (side: Side): WallSlot => ({ x: 3, y: 4, side });
 
 const ADDRESS = { domain: "d", permalink: "p" };
-
-/** Each door style's clear opening: half width and height range. */
-const OPENING: Record<DoorStyle, { half: number; h0: number; h1: number }> = {
-  sliding: { half: 0.5, h0: 0.02, h1: 2.4 },
-  bulkhead: { half: 0.5, h0: 0.18, h1: 2.2 },
-  blast: { half: 0.8, h0: 0, h1: 2.2 },
-};
 
 /** The index every fixture is built at, which names its keys. */
 const INDEX = 7;

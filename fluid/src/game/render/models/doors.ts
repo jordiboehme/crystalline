@@ -21,7 +21,7 @@
  * plate or a locking bar across them.
  */
 
-import type { Fixture } from "../../world/types";
+import type { DoorStyle, Fixture } from "../../world/types";
 import { FLAG, createBuilder, type Surface, type V3 } from "../geometry";
 import {
   DECAL_LIFT,
@@ -189,8 +189,9 @@ function housing(
   );
 }
 
-/** The sliding door's opening: half width and height. */
+/** The sliding door's opening: half width, bottom and top. */
 export const SLIDE_HALF = 0.5;
+const SLIDE_SILL = 0.02;
 const SLIDE_TOP = 2.4;
 /**
  * The gap each leaf keeps from the door's centre line, in metres. A leaf
@@ -224,7 +225,7 @@ function sliding(st: Style) {
   const seam: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
   const [w, j, t] = [SLIDE_HALF, SLIDE_JAMB, SLIDE_FRAME_D];
   const top = SLIDE_TOP + SLIDE_LINTEL;
-  recess(k, w, 0.02, SLIDE_TOP);
+  recess(k, w, SLIDE_SILL, SLIDE_TOP);
   // Jambs, lintel and the floor track.
   k.bevelBox(-j, -w, 0, t, 0, top, 0.02, s.metal);
   k.bevelBox(w, j, 0, t, 0, top, 0.02, s.metal);
@@ -232,8 +233,8 @@ function sliding(st: Style) {
   k.box(-j, j, 0, t + 0.02, 0, 0.02, s.dark);
   // Seams in the door colour along the inside of the frame.
   const [s0, s1] = [t - 0.02, t + 0.005];
-  k.box(-w - 0.02, -w + 0.02, s0, s1, 0.02, SLIDE_TOP, seam);
-  k.box(w - 0.02, w + 0.02, s0, s1, 0.02, SLIDE_TOP, seam);
+  k.box(-w - 0.02, -w + 0.02, s0, s1, SLIDE_SILL, SLIDE_TOP, seam);
+  k.box(w - 0.02, w + 0.02, s0, s1, SLIDE_SILL, SLIDE_TOP, seam);
   k.box(-w - 0.02, w + 0.02, s0, s1, SLIDE_TOP - 0.02, SLIDE_TOP, seam);
 
   const leaf = s.tinted(p.door, LAYER.metal);
@@ -243,7 +244,16 @@ function sliding(st: Style) {
         ? [-SLIDE_HALF + LEAF_GAP, -LEAF_GAP]
         : [LEAF_GAP, SLIDE_HALF - LEAF_GAP];
     out.add(dir < 0 ? neg(f.along) : [...f.along], SLIDE_TRAVEL, (m) => {
-      m.bevelBox(a0, a1, SLIDE_D0, SLIDE_D1, 0.02, SLIDE_TOP, 0.012, leaf);
+      m.bevelBox(
+        a0,
+        a1,
+        SLIDE_D0,
+        SLIDE_D1,
+        SLIDE_SILL,
+        SLIDE_TOP,
+        0.012,
+        leaf,
+      );
       // A window slot, a kick plate and the pull recess by the meeting edge.
       m.box(
         a0 + 0.12,
@@ -416,6 +426,23 @@ const NEON_D0 = 0.23;
 const LEAF_D0 = 0.06;
 const LEAF_D1 = 0.2;
 const CHEVRON = 0.025;
+
+/**
+ * Each door style's clear opening in its wall frame: `half` the half width
+ * along the wall either side of the slot's centre, and `h0` to `h1` the
+ * height from the sill to the underside of the lintel. A fully open door
+ * clears it (the models test checks that no part of an open door is left
+ * inside), which is what makes the doorway something the player can see
+ * through and walk into. Read from the same constants the recipes build
+ * with, so the test can never check a stale copy.
+ */
+export const OPENING: Readonly<
+  Record<DoorStyle, { half: number; h0: number; h1: number }>
+> = {
+  sliding: { half: SLIDE_HALF, h0: SLIDE_SILL, h1: SLIDE_TOP },
+  bulkhead: { half: BULK_HALF, h0: BULK_SILL, h1: BULK_TOP },
+  blast: { half: BLAST_HALF, h0: 0, h1: BLAST_TOP },
+};
 
 /** A chevron pointing up (`dir` 1) or down (-1) with its base at `h`. */
 function chevron(h: number, dir: 1 | -1): [number, number][] {

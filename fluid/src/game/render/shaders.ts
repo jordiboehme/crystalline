@@ -83,7 +83,11 @@ void main() {
  *
  * The uv's screen-space derivatives are taken once, at the top of `main`
  * before any early return, so they are defined for every fragment of the
- * quad; the edge lines and the grime lookup (`textureGrad`) share them.
+ * quad; the edge lines and the grime lookup (`textureGrad`) share them. The
+ * portal's swirl is sampled there too, for every fragment, and only used
+ * by the portal branch: an implicit-lod `texture()` needs its neighbours'
+ * coordinates just as a derivative does, and a branch some fragments of a
+ * 2x2 quad take and others do not leaves them undefined.
  */
 export const SCENE_FS = `#version 300 es
 precision highp float;
@@ -135,6 +139,8 @@ void main() {
   vec3 texel = texture(uTextures, vec3(vUv, vLayer)).rgb;
   vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
   float level = cellLevel(vWorld, vNormal);
+  vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);
+  float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
 
   if (vFlag == 1) {
     outColour = vec4(vTint * texel * 1.4, 1.0);
@@ -147,8 +153,6 @@ void main() {
   if (vFlag == 2) {
     vec2 centred = vUv / vec2(1.7, 2.45) - 0.5;
     float rim = smoothstep(0.25, 0.5, max(abs(centred.x), abs(centred.y)));
-    vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);
-    float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
     outColour = vec4(vTint * (0.6 + swirl * 0.9 + rim * 1.6), 1.0);
     return;
   }

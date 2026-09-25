@@ -46,6 +46,7 @@ export {
   BLAST_UP_TRAVEL,
   BULKHEAD_TRAVEL,
   HOUSING_DEPTH,
+  OPENING,
   SLIDE_TRAVEL,
 } from "./doors";
 
