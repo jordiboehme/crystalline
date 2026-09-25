@@ -30,7 +30,7 @@
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
-import { BAY, isFloor } from "../world/layout";
+import { doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import { createKit } from "./kit";
@@ -277,19 +277,6 @@ const TOP_RAIL = 2.2;
 export interface RoomMesh {
   static: MeshData;
   movers: Mover[];
-}
-
-/**
- * The grid columns of the doorways: the void column between the corridor
- * and the hall (only when there is a corridor, which pushes the hall east)
- * and the one before each bay, which `planLayout` opens on two rows. The
- * floor cells in these columns are the doorways.
- */
-function doorwayColumns(room: RoomSpec): Set<number> {
-  const cols = new Set<number>();
-  if (room.hall.x0 > 0) cols.add(room.hall.x0 - 1);
-  for (let x = room.hall.x1; x < room.width; x += BAY + 1) cols.add(x);
-  return cols;
 }
 
 /** The neighbour across each side of a cell. */

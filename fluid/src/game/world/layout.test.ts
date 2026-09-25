@@ -5,12 +5,15 @@ import {
   CORRIDOR_WIDTH,
   MAX_BAYS,
   createSlotPool,
+  doorwayColumns,
   isFloor,
   planLayout,
+  wallRuns,
   wallSlots,
   type Layout,
   type LayoutNeed,
 } from "./layout";
+import { galleryRoom } from "./canned";
 import type { Side, WallSlot } from "./types";
 
 const none: LayoutNeed = {
@@ -320,5 +323,70 @@ describe("createSlotPool", () => {
       layout.bays.findIndex((b) => s.x >= b.x0 && s.x < b.x1);
     const order = slots.slice(firstBay).map(bayOf);
     expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+});
+
+describe("wallRuns", () => {
+  const hubLike: LayoutNeed = {
+    north: 20,
+    west: 20,
+    east: 20,
+    south: 0,
+    any: 40,
+    hatches: 20,
+  };
+
+  it("walks the runs in wallSlots' order: every second edge is a slot", () => {
+    const hub = planLayout(hubLike);
+    expect(hub.corridor).not.toBeNull();
+    expect(hub.bays.length).toBeGreaterThan(0);
+    for (const grid of [planLayout(small).grid, hub.grid, galleryRoom().grid]) {
+      const odd = wallRuns(grid).flatMap((r) =>
+        r.filter((_, i) => i % 2 === 1),
+      );
+      expect(odd).toEqual(wallSlots(grid));
+    }
+  });
+
+  it("finds four runs of 7, 6, 7 and 6 edges in a plain 7x6 hall", () => {
+    const runs = wallRuns(planLayout(small).grid);
+    expect(runs.map((r) => r.length)).toEqual([7, 6, 7, 6]);
+    expect(runs.map((r) => r[0]?.side)).toEqual(["n", "e", "s", "w"]);
+  });
+
+  it("covers every wall edge once, each a floor cell facing void", () => {
+    const { grid } = planLayout(hubLike);
+    const edges = wallRuns(grid).flat();
+    expect(new Set(edges.map(key)).size).toBe(edges.length);
+    for (const e of edges) {
+      expect(isFloor(grid, e.x, e.y)).toBe(true);
+      const [bx, by] = beyond(e);
+      expect(isFloor(grid, bx, by)).toBe(false);
+    }
+  });
+});
+
+describe("doorwayColumns", () => {
+  it("returns the corridor's doorway and the column before each bay", () => {
+    const layout = planLayout({
+      north: 5,
+      west: 5,
+      east: 5,
+      south: 0,
+      any: 25,
+      hatches: 12,
+    });
+    const corridor = layout.corridor;
+    if (corridor === null) throw new Error("no corridor");
+    expect(layout.bays).toHaveLength(2);
+    const expected = [
+      layout.hall.x0 - 1,
+      ...layout.bays.map((b) => b.x0 - 1),
+    ].sort((a, b) => a - b);
+    expect([...doorwayColumns(layout)].sort((a, b) => a - b)).toEqual(expected);
+  });
+
+  it("is empty for a plain hall", () => {
+    expect(doorwayColumns(planLayout(small)).size).toBe(0);
   });
 });

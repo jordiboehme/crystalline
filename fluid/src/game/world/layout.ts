@@ -44,6 +44,9 @@
  *   slot. A corridor's south wall runs on into
  *   the hall's, and walking it from the hall's east end keeps the hall's
  *   slots where they would be without a corridor.
+ * - **Wall runs and doorways.** `wallRuns` hands out the same runs whole,
+ *   for the set dressing, and `doorwayColumns` names the void columns the
+ *   doorways are cut through, for the room mesh's lintels and the dressing.
  * - **Slot pool.** `north`, `west`, `east` and `south` ask for that wall of
  *   the hall, `corridor` for the corridor's walls, and `any` for the hall's
  *   walls in the order north, east, south, west and then each bay's walls in
@@ -285,6 +288,79 @@ export function wallSlots(grid: readonly string[]): WallSlot[] {
       0,
     );
   return slots;
+}
+
+/**
+ * Every maximal straight run of wall edges in a grid, each as its edges in
+ * walk order. A wall edge is the one `wallSlots` uses: a floor cell's side
+ * whose neighbour is void or outside the grid. The lines are swept exactly as
+ * `wallSlots` sweeps them: north walls row by row from the top, each west to
+ * east; east walls column by column from the west, each north to south;
+ * south walls row by row from the top, each east to west; and west walls
+ * column by column from the west, each south to north. A run ends where a
+ * line meets a cell that is not a wall of that side, or where the line ends,
+ * so a run never turns a corner and never spans two lines.
+ *
+ * Every second edge of a run, starting at its second, is exactly a slot of
+ * `wallSlots`, in the same order; `layout.test.ts` pins the two together, so
+ * `wallSlots` is left as it is and keeps the fixture goldens safe. The
+ * dressing sites (`sites.ts`) read the runs for wall props, cable trays and
+ * pipe bundles.
+ */
+export function wallRuns(grid: readonly string[]): WallSlot[][] {
+  const depth = grid.length;
+  const width = grid.reduce((w, row) => Math.max(w, row.length), 0);
+  const runs: WallSlot[][] = [];
+  const sweep = (
+    lines: number,
+    length: number,
+    at: (line: number, i: number) => [number, number],
+    side: Side,
+  ) => {
+    const [dx, dy] = STEP[side];
+    for (let line = 0; line < lines; line++) {
+      let run: WallSlot[] = [];
+      for (let i = 0; i < length; i++) {
+        const [x, y] = at(line, i);
+        if (isFloor(grid, x, y) && !isFloor(grid, x + dx, y + dy)) {
+          run.push({ x, y, side });
+        } else if (run.length > 0) {
+          runs.push(run);
+          run = [];
+        }
+      }
+      if (run.length > 0) runs.push(run);
+    }
+  };
+  sweep(depth, width, (y, i) => [i, y], "n");
+  sweep(width, depth, (x, i) => [x, i], "e");
+  sweep(depth, width, (y, i) => [width - 1 - i, y], "s");
+  sweep(width, depth, (x, i) => [x, depth - 1 - i], "w");
+  return runs;
+}
+
+/** The neighbour across each side of a cell. */
+const STEP: Record<Side, readonly [number, number]> = {
+  n: [0, -1],
+  e: [1, 0],
+  s: [0, 1],
+  w: [-1, 0],
+};
+
+/**
+ * The grid columns of the doorways: the void column between the corridor
+ * and the hall (only when there is a corridor, which pushes the hall east)
+ * and the one before each bay, which `planLayout` opens on two rows. The
+ * floor cells in these columns are the doorways.
+ */
+export function doorwayColumns(room: {
+  hall: Rect;
+  width: number;
+}): Set<number> {
+  const cols = new Set<number>();
+  if (room.hall.x0 > 0) cols.add(room.hall.x0 - 1);
+  for (let x = room.hall.x1; x < room.width; x += BAY + 1) cols.add(x);
+  return cols;
 }
 
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
