@@ -249,36 +249,124 @@ describe("the shape of every prop", () => {
   });
 });
 
+/**
+ * The wall-prop invariants, for any room: every wall prop (runs aside) sits
+ * at the anchor of a free edge, turned to face into the room, one to an
+ * edge, never on a fixture edge, the entrance edge or its neighbours, or a
+ * doorway-column edge. Returns how many it checked.
+ */
+function expectWallInvariants(name: string, room: RoomSpec) {
+  const sites = dressingSites(room);
+  const cols = doorwayColumns(room);
+  const fixtures = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
+  const e0 = room.entrance;
+  const seen = new Set<string>();
+  const props = wallProps(room);
+  for (const p of props) {
+    const e = edgeOf(p);
+    const k = edgeKey(e);
+    expect(wallAnchor(e), `${name} ${p.kind}`).toEqual({
+      x: p.x,
+      y: p.y,
+      turn: p.turn,
+    });
+    expect(p.turn).toBe(turnForSide(e.side));
+    expect(sites.free.has(k), `${name} ${k}`).toBe(true);
+    expect(seen.has(k), `${name} ${k} twice`).toBe(false);
+    seen.add(k);
+    expect(fixtures.has(k), `${name} ${k}`).toBe(false);
+    expect(
+      e.side === "s" && e.y === e0.y && Math.abs(e.x - e0.x) <= 1,
+      `${name} ${k}`,
+    ).toBe(false);
+    expect(cols.has(e.x), `${name} ${k}`).toBe(false);
+  }
+  return props.length;
+}
+
+/**
+ * The floor-prop invariants, for any room: every floor prop's footprint
+ * fits the floor and overlaps no lane, no fixture, decor or scaffold box
+ * and no other floor prop; no cell under it is a doorway cell, next to one
+ * (ruling 10) or in the corridor; and no two floor props share a cell.
+ * Returns how many it checked.
+ */
+function expectFloorInvariants(name: string, room: RoomSpec) {
+  const sites = dressingSites(room);
+  const taken = takenBoxes(room);
+  const cols = doorwayColumns(room);
+  const doorway = (x: number, y: number) =>
+    cols.has(x) && isFloor(room.grid, x, y);
+  const nearDoorway = (x: number, y: number) =>
+    doorway(x, y) ||
+    doorway(x + 1, y) ||
+    doorway(x - 1, y) ||
+    doorway(x, y + 1) ||
+    doorway(x, y - 1);
+  const boxes = floorProps(room).map(boxOf);
+  for (const [i, box] of boxes.entries()) {
+    const label = `${name} ${JSON.stringify(box)}`;
+    expect(fitsFloor(room, box), label).toBe(true);
+    for (const lane of sites.lanes)
+      expect(overlaps(box, lane), label).toBe(false);
+    for (const t of taken) expect(overlaps(box, t), label).toBe(false);
+    for (const other of boxes.slice(i + 1))
+      expect(overlaps(box, other), label).toBe(false);
+    const c = room.corridor;
+    for (
+      let y = Math.floor(box.z0 / CELL);
+      y <= Math.floor((box.z1 - 1e-9) / CELL);
+      y++
+    )
+      for (
+        let x = Math.floor(box.x0 / CELL);
+        x <= Math.floor((box.x1 - 1e-9) / CELL);
+        x++
+      ) {
+        expect(cols.has(x), label).toBe(false);
+        expect(nearDoorway(x, y), label).toBe(false);
+        if (c !== null)
+          expect(x >= c.x0 && x < c.x1 && y >= c.y0 && y < c.y1, label).toBe(
+            false,
+          );
+      }
+  }
+  const cells = floorProps(room).map(
+    (p) => `${String(Math.floor(p.x))},${String(Math.floor(p.y))}`,
+  );
+  expect(new Set(cells).size, name).toBe(cells.length);
+  return boxes.length;
+}
+
 describe("wall props", () => {
   it("stand at the anchor of a free edge, one to an edge, never on a fixture, the entrance or a doorway", () => {
+    for (const { name, room } of ALL)
+      expect(expectWallInvariants(name, room), name).toBeGreaterThan(0);
+  });
+
+  it("put a sign plate beside every door and hatch, unless both neighbours are taken or excluded", () => {
+    let signs = 0;
     for (const { name, room } of ALL) {
       const sites = dressingSites(room);
-      const cols = doorwayColumns(room);
-      const fixtures = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
-      const e0 = room.entrance;
-      const seen = new Set<string>();
-      const props = wallProps(room);
-      expect(props.length, name).toBeGreaterThan(0);
-      for (const p of props) {
-        const e = edgeOf(p);
-        const k = edgeKey(e);
-        expect(wallAnchor(e), `${name} ${p.kind}`).toEqual({
-          x: p.x,
-          y: p.y,
-          turn: p.turn,
-        });
-        expect(p.turn).toBe(turnForSide(e.side));
-        expect(sites.free.has(k), `${name} ${k}`).toBe(true);
-        expect(seen.has(k), `${name} ${k} twice`).toBe(false);
-        seen.add(k);
-        expect(fixtures.has(k), `${name} ${k}`).toBe(false);
-        expect(
-          e.side === "s" && e.y === e0.y && Math.abs(e.x - e0.x) <= 1,
-          `${name} ${k}`,
-        ).toBe(false);
-        expect(cols.has(e.x), `${name} ${k}`).toBe(false);
+      const onEdge = new Map(
+        wallProps(room).map((p) => [edgeKey(edgeOf(p)), p]),
+      );
+      for (const f of room.fixtures) {
+        if (f.kind !== "door" && f.kind !== "hatch") continue;
+        const near = neighbours(sites, f.slot);
+        if (near.some((e) => onEdge.get(edgeKey(e))?.kind === "sign-plate")) {
+          signs++;
+          continue;
+        }
+        for (const e of near) {
+          const k = edgeKey(e);
+          expect(!sites.free.has(k) || onEdge.has(k), `${name} ${k}`).toBe(
+            true,
+          );
+        }
       }
     }
+    expect(signs).toBeGreaterThan(100);
   });
 });
 
@@ -341,35 +429,7 @@ const PROP_KIND_RUNS = (
 describe("floor props", () => {
   it("fit the floor and keep out of lanes, fixtures, decor, scaffolding, each other, doorways and the corridor", () => {
     let n = 0;
-    for (const { name, room } of ALL) {
-      const sites = dressingSites(room);
-      const taken = takenBoxes(room);
-      const cols = doorwayColumns(room);
-      const boxes = floorProps(room).map(boxOf);
-      for (const [i, box] of boxes.entries()) {
-        const label = `${name} ${JSON.stringify(box)}`;
-        expect(fitsFloor(room, box), label).toBe(true);
-        for (const lane of sites.lanes)
-          expect(overlaps(box, lane), label).toBe(false);
-        for (const t of taken) expect(overlaps(box, t), label).toBe(false);
-        for (const other of boxes.slice(i + 1))
-          expect(overlaps(box, other), label).toBe(false);
-        for (
-          let x = Math.floor(box.x0 / CELL);
-          x <= Math.floor((box.x1 - 1e-9) / CELL);
-          x++
-        ) {
-          expect(cols.has(x), label).toBe(false);
-          const c = room.corridor;
-          if (c !== null) expect(x >= c.x0 && x < c.x1, label).toBe(false);
-        }
-        n++;
-      }
-      const cells = floorProps(room).map(
-        (p) => `${String(Math.floor(p.x))},${String(Math.floor(p.y))}`,
-      );
-      expect(new Set(cells).size, name).toBe(cells.length);
-    }
+    for (const { name, room } of ALL) n += expectFloorInvariants(name, room);
     expect(n).toBeGreaterThan(100);
   });
 
@@ -862,6 +922,67 @@ describe("the cap (Review Focus 4)", () => {
     expect(wallsLost).toBeGreaterThan(0);
   });
 
+  /**
+   * The fullest room a probe of the generator found: a manifest under
+   * construction with 24 relations, 24 sections, 40 tags and 30 inbound
+   * references (24 listed). A 24 by 24 hall, four bays and a corridor give
+   * it 203 candidates, three over the cap.
+   */
+  const OVER_CAP: PlaceInput = {
+    domain: "t",
+    permalink: "p24-24-40-30",
+    title: "R",
+    type: "manifest",
+    status: "draft",
+    salience: null,
+    validFrom: null,
+    validTo: null,
+    tags: Array.from({ length: 40 }, (_, k) => `t${String(k)}`),
+    content: Array.from({ length: 24 }, (_, i) => `## P${String(i)}\nx`).join(
+      "\n",
+    ),
+    relations: Array.from({ length: 24 }, (_, k) => {
+      const t = `r${String(k).padStart(2, "0")}`;
+      return {
+        relType: "r",
+        target: { domain: null, target: t },
+        resolved: true,
+        address: { domain: "t", permalink: t },
+        targetTitle: t,
+        targetSalience: 3,
+      };
+    }),
+    links: [],
+    inbound: Array.from({ length: 24 }, (_, i) => ({
+      address: { domain: "t", permalink: `i${String(i)}` },
+      title: `i${String(i)}`,
+      relType: "l",
+    })),
+    inboundTotal: 30,
+    observations: [],
+  };
+
+  it("caps a room that really overflows, dropping only optional ceiling props", () => {
+    const room = generateRoom(OVER_CAP);
+    expect(room.hall).toEqual({ x0: 26, y0: 0, x1: 50, y1: 24 });
+    expect(room.bays).toHaveLength(4);
+    expect(room.corridor).not.toBeNull();
+    const candidates = dressCandidates(room);
+    expect(candidates).toHaveLength(PROP_CAP + 3);
+    expect(room.props).toHaveLength(PROP_CAP);
+    const kept = capProps(candidates, PROP_CAP);
+    expect(room.props).toEqual([...kept].sort(PROP_ORDER));
+    expect(expectTiers("over cap", candidates, kept)).toBe(3);
+    const left = new Set(kept.map((p) => JSON.stringify(p)));
+    const dropped = candidates.filter((c) => !left.has(JSON.stringify(c.prop)));
+    expect(dropped).toHaveLength(3);
+    for (const c of dropped) {
+      expect(c.prop.anchor).toBe("ceiling");
+      expect(c.mandatory).toBe(false);
+    }
+    expect(room.props.filter((p) => p.kind === "beacon")).toHaveLength(1);
+  });
+
   const prop = (anchor: PropAnchor, seed: number, x = 0): Prop => ({
     kind:
       anchor === "wall"
@@ -931,6 +1052,9 @@ describe("the cap (Review Focus 4)", () => {
 });
 
 describe("locality", () => {
+  // Locality holds only below the cap: near PROP_CAP a new fixture can
+  // change which props are dropped anywhere in the room, so both rooms here
+  // are asserted to stay under it.
   it("changes only props near a new door's slot", () => {
     const P = place({
       type: "runbook",
@@ -997,22 +1121,20 @@ describe("condition extras", () => {
 });
 
 describe("degenerate rooms (Review Focus 5)", () => {
-  it("dresses an empty place without throwing, keeping its lanes and its floor", () => {
+  it("dresses an empty place without throwing, keeping every invariant", () => {
+    let walls = 0;
     for (const status of Object.values(STATUS))
       for (const type of Object.values(ARCHETYPE_TYPES)) {
         const room = generateRoom(place({ type, status }));
         expect(room.hall).toEqual({ x0: 0, y0: 0, x1: 5, y1: 6 });
-        const sites = dressingSites(room);
-        for (const p of floorProps(room)) {
-          const box = boxOf(p);
-          expect(fitsFloor(room, box)).toBe(true);
-          for (const lane of sites.lanes)
-            expect(overlaps(box, lane)).toBe(false);
-        }
+        const name = `empty ${type} ${status}`;
+        walls += expectWallInvariants(name, room);
+        expectFloorInvariants(name, room);
       }
+    expect(walls).toBeGreaterThan(0);
   });
 
-  it("gives a hall full of fixtures only wall props off the slots and no floor prop in a lane", () => {
+  it("gives a hall full of fixtures only wall props off the slots, keeping every invariant", () => {
     const full = place({
       type: "runbook",
       status: "draft",
@@ -1035,25 +1157,26 @@ describe("degenerate rooms (Review Focus 5)", () => {
     for (const k of slots)
       expect(used.has(k) || k === entrance, `slot ${k}`).toBe(true);
     const slotSet = new Set(slots);
-    const walls = wallProps(room);
-    expect(walls.length).toBeGreaterThan(0);
-    for (const p of walls) expect(slotSet.has(edgeKey(edgeOf(p)))).toBe(false);
-    const { lanes } = dressingSites(room);
-    for (const p of floorProps(room))
-      for (const lane of lanes) expect(overlaps(boxOf(p), lane)).toBe(false);
+    expect(expectWallInvariants("full", room)).toBeGreaterThan(0);
+    for (const p of wallProps(room))
+      expect(slotSet.has(edgeKey(edgeOf(p)))).toBe(false);
+    expectFloorInvariants("full", room);
   });
 
-  it("dresses a narrow, deep hall", () => {
-    const room = generateRoom(
-      place({
-        type: "guide",
-        status: "archived",
-        tags: ["a", "b", "c", "d", "e"],
-      }),
-    );
-    expect(room.hall.x1 - room.hall.x0).toBe(5);
-    for (const p of floorProps(room))
-      expect(fitsFloor(room, boxOf(p))).toBe(true);
+  it("dresses a narrow, deep hall, keeping every invariant", () => {
+    for (const status of Object.values(STATUS)) {
+      const room = generateRoom(
+        place({
+          type: "guide",
+          status,
+          tags: ["a", "b", "c", "d", "e"],
+        }),
+      );
+      expect(room.hall.x1 - room.hall.x0).toBe(5);
+      expect(room.hall.y1 - room.hall.y0).toBe(12);
+      expect(expectWallInvariants(`narrow ${status}`, room)).toBeGreaterThan(0);
+      expectFloorInvariants(`narrow ${status}`, room);
+    }
   });
 
   it("leaves the gallery undressed", () => {

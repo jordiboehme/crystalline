@@ -66,6 +66,8 @@
  * Every seed is keyed by the integer anchor cell and a token (ruling 2),
  * never by a position in a list, and every draw comes from the rng of that
  * one prop's seed, so adding a fixture only changes the props near it.
+ * That locality holds only below the cap: near `PROP_CAP` a new fixture can
+ * change which props the cap drops anywhere in the room.
  *
  * This is the generator side: it imports `props.ts`, `sites.ts`,
  * `footprints.ts`, `types.ts`, `units.ts` and the seeds, and never

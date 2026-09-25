@@ -38,6 +38,7 @@ function key(s: WallSlot) {
   return `${s.x},${s.y},${s.side}`;
 }
 
+// A copy of layout.ts's STEP on purpose: an independent oracle for it.
 const STEP: Record<Side, [number, number]> = {
   n: [0, -1],
   e: [1, 0],
