@@ -29,8 +29,9 @@ import {
   toLocal,
   type Part,
 } from "../../modelChecks";
+import { surfaces } from "../common";
 import { buildHero, buildHeroMesh } from ".";
-import { BIRD_A } from "./living";
+import { BIRD_A, sleepPod } from "./living";
 
 /** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
 function heroAt(kind: HeroKind, variant = 0): Hero {
@@ -157,27 +158,47 @@ describe("living hero models", () => {
     }
   });
 
-  it("each pod's lit lid lies over its own pod, on the side of its light", () => {
-    // The plan centre of a part's points, and its heading from the hub.
-    const heading = (p: Part) => {
+  it("each pod's lit lid lies over its own shell, on the pod's outward heading", () => {
+    // Build one pod at a time, so a lid built over the opposite pod cannot
+    // be matched to a neighbour: all six pods look alike, but each is
+    // checked on its own parts only.
+    const look = surfaces(LOOKS.aperture);
+    const f = frameAt([0, 0, 0], 0);
+    const centre = (p: Part) => {
       const pts = local(p);
-      const a = pts.reduce((t, q) => t + q[0], 0) / pts.length;
-      const d = pts.reduce((t, q) => t + q[1], 0) / pts.length;
-      return { angle: Math.atan2(d, a), reach: Math.hypot(a, d) };
+      return [
+        pts.reduce((t, q) => t + q[0], 0) / pts.length,
+        pts.reduce((t, q) => t + q[1], 0) / pts.length,
+      ] as const;
     };
-    const parts = partsOf("sleep-ring");
-    const lids = parts
-      .filter((p) => p.flag === FLAG.signal && p.method === "cylinderAlong")
-      .map(heading);
-    expect(lids).toHaveLength(6);
-    for (let group = 0; group < 6; group++) {
-      const light = parts.find((p) => p.flag === blinkFlag(group));
-      if (!light) throw new Error(`no light in group ${String(group)}`);
-      const { angle } = heading(light);
-      const turn = (x: number) =>
-        Math.abs(Math.atan2(Math.sin(x - angle), Math.cos(x - angle)));
-      const over = lids.filter((l) => l.reach > 1 && turn(l.angle) < 0.05);
-      expect(over, `pod ${String(group)}`).toHaveLength(1);
+    for (let pod = 0; pod < 6; pod++) {
+      const parts: Part[] = [];
+      sleepPod(recordingKitAt(createBuilder(), parts), f, look, pod);
+      // The yawed frame's `inward` (the pod's outward `d`) in `(a, d)`.
+      const out = [
+        -Math.sin((pod * Math.PI) / 3),
+        Math.cos((pod * Math.PI) / 3),
+      ] as const;
+      const along = (p: Part) => {
+        const [a, d] = centre(p);
+        return {
+          reach: a * out[0] + d * out[1],
+          off: -a * out[1] + d * out[0],
+        };
+      };
+      const shells = parts.filter((p) => p.method === "bevelBox");
+      const lids = parts.filter((p) => p.flag === FLAG.signal);
+      const lights = parts.filter((p) => p.flag === blinkFlag(pod));
+      expect(shells, `pod ${String(pod)}`).toHaveLength(1);
+      expect(lids, `pod ${String(pod)}`).toHaveLength(2);
+      expect(lights, `pod ${String(pod)}`).toHaveLength(1);
+      for (const p of [...shells, ...lids, ...lights]) {
+        const { reach, off } = along(p);
+        expect(reach, `pod ${String(pod)} ${p.method}`).toBeGreaterThan(0.5);
+        expect(Math.abs(off), `pod ${String(pod)} ${p.method}`).toBeLessThan(
+          1e-6,
+        );
+      }
     }
   });
 

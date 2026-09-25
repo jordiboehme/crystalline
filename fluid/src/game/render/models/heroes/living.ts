@@ -29,7 +29,13 @@ import type { HeroKind } from "../../../world/types";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import type { Surface } from "../../geometry";
-import { sideways, tiltedBar, yawed, type KitAt } from "../common";
+import {
+  sideways,
+  tiltedBar,
+  yawed,
+  type KitAt,
+  type Surfaces,
+} from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
 
 /** The mess table, its benches and the sleep pods' shells: a clean warm off-white. */
@@ -318,6 +324,56 @@ const helperRobot: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
 const POD = { start: 0.6, end: 2.0, half: 0.38, top: 0.42 } as const;
 
 /**
+ * One sleep pod, number `pod` (0 to 5), built into the ring's frame `f`:
+ * the frame yawed `pod` sixths of a turn, the pod lying outward along its
+ * `d`, so its outward heading in `f` is `(-sin, cos)` of `pod * 60`
+ * degrees in `(a, d)`. A white shell with a rounded outer end, a soft blue lit lid
+ * with a domed outer end over it, and the status light (blink group
+ * `pod`) on the shell's top at the hub end. Exported so a test can build a
+ * single pod and check its lid lies over its own shell.
+ */
+export function sleepPod(
+  kitAt: KitAt,
+  f: Frame,
+  s: Surfaces,
+  pod: number,
+): void {
+  const white = s.tinted(TABLE_WHITE);
+  const lid = s.signal(POD_GLOW);
+  const fp = yawed(f, 0, 0, (pod * Math.PI) / 3);
+  const kp = kitAt(fp);
+  // The shell, its rounded outer end.
+  kp.bevelBox(-POD.half, POD.half, POD.start, POD.end, 0, POD.top, 0.04, white);
+  kp.cylinder(0, POD.end, 0, POD.top - 0.001, POD.half, 12, white);
+  // The lid along the pod: in the sideways frame `a'` runs along `-d`,
+  // so the pod's `d` from 0.88 to `POD.end` is `a'` from `-POD.end` to
+  // -0.88. The lid's lower half sinks into the shell.
+  kitAt(sideways(fp)).cylinderAlong(-POD.end, -0.88, 0, POD.top, 0.28, 10, lid);
+  kp.lathe(
+    0,
+    POD.end,
+    [
+      [0, POD.top - 0.1],
+      [0.28, POD.top],
+      [0.2, POD.top + 0.2],
+      [0, POD.top + 0.28],
+    ],
+    10,
+    lid,
+  );
+  // The status light on the shell's top at the hub end.
+  kp.box(
+    -0.06,
+    0.06,
+    0.76,
+    0.84,
+    POD.top,
+    POD.top + 0.05,
+    s.blink(POD_LIGHT, pod),
+  );
+}
+
+/**
  * The sleep ring: six white pods lying like the petals of a flower round a
  * round white hub. The hub is a low drum with a rounded shoulder and a
  * white column up to the catalogue's top, banded in grey, with a steady
@@ -331,7 +387,6 @@ const POD = { start: 0.6, end: 2.0, half: 0.38, top: 0.42 } as const;
 const sleepRing: HeroRecipe = ({ k, kitAt, s }) => {
   const f = frameAt([0, 0, 0], 0);
   const white = s.tinted(TABLE_WHITE);
-  const lid = s.signal(POD_GLOW);
 
   // The hub: a drum with a rounded shoulder, a banded column and a ring.
   k.lathe(
@@ -353,56 +408,7 @@ const sleepRing: HeroRecipe = ({ k, kitAt, s }) => {
   k.ring(0, 0, 1.3, 0.17, 0.02, 4, 16, s.signal(SIGNAL_TINT), "up");
 
   // Six pods, each yawed a further 60 degrees, lying radially outward.
-  for (let pod = 0; pod < 6; pod++) {
-    const fp = yawed(f, 0, 0, (pod * Math.PI) / 3);
-    const kp = kitAt(fp);
-    // The shell, its rounded outer end.
-    kp.bevelBox(
-      -POD.half,
-      POD.half,
-      POD.start,
-      POD.end,
-      0,
-      POD.top,
-      0.04,
-      white,
-    );
-    kp.cylinder(0, POD.end, 0, POD.top - 0.001, POD.half, 12, white);
-    // The lid along the pod: in the sideways frame `a'` runs along `-d`,
-    // so the pod's `d` from 0.88 to `POD.end` is `a'` from `-POD.end` to
-    // -0.88. The lid's lower half sinks into the shell.
-    kitAt(sideways(fp)).cylinderAlong(
-      -POD.end,
-      -0.88,
-      0,
-      POD.top,
-      0.28,
-      10,
-      lid,
-    );
-    kp.lathe(
-      0,
-      POD.end,
-      [
-        [0, POD.top - 0.1],
-        [0.28, POD.top],
-        [0.2, POD.top + 0.2],
-        [0, POD.top + 0.28],
-      ],
-      10,
-      lid,
-    );
-    // The status light on the shell's top at the hub end.
-    kp.box(
-      -0.06,
-      0.06,
-      0.76,
-      0.84,
-      POD.top,
-      POD.top + 0.05,
-      s.blink(POD_LIGHT, pod),
-    );
-  }
+  for (let pod = 0; pod < 6; pod++) sleepPod(kitAt, f, s, pod);
 };
 
 /** The planters' dome: its sphere's radius, the drum top it sits on and the lattice's strut width. */
