@@ -364,12 +364,16 @@ export function travelOf(
 }
 
 /**
- * The way through hatch `index`, or null when that fixture is not a hatch.
- * The session calls it when E is pressed at a hatch.
+ * The way through hatch `index`, or null when that fixture is not a hatch
+ * or is in `failed`. The session calls it when E is pressed at a hatch.
  */
-export function hatchTravel(room: RoomSpec, index: number): Travel | null {
+export function hatchTravel(
+  room: RoomSpec,
+  index: number,
+  failed: ReadonlyMap<number, string> = new Map(),
+): Travel | null {
   const fixture = room.fixtures[index];
-  if (fixture?.kind !== "hatch") return null;
+  if (fixture?.kind !== "hatch" || failed.has(index)) return null;
   return { via: "hatch", fixture: index, address: fixture.address };
 }
 

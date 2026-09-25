@@ -7,9 +7,10 @@
  * A way sealed `NO ROUTE` is not a failure and stays calm.
  *
  * Each broken way has a `Fault`: a clock in 35 Hz ticks that starts a run
- * when the player comes near (`approaches`, after a seeded delay) or
- * presses E at it, plays the run's frames one per tick, then waits 2 to 5
- * s before the next run may start. A run is a list of `FaultFrame`s
+ * when the player comes near (`approaches`, after a seeded delay counted
+ * down only while the player is near) or presses E at it, plays the run's
+ * frames one per tick, then waits 2 to 5 s before the next run may start,
+ * this wait counted down unconditionally. A run is a list of `FaultFrame`s
  * planned in full when it starts (`planRun`), from a seed keyed by the
  * fixture's own seed and slot and the run's number, so two broken ways
  * never stutter in step and a way malfunctions the same way on every
@@ -218,11 +219,15 @@ export function planRun(
  * for a way that just broke, none for a way that is no longer broken.
  *
  * A running fault moves to its next frame and goes idle after its last,
- * with a seeded wait of `WAIT_MIN` to `WAIT_MAX` ticks. An idle fault
- * counts its wait down and starts a run when it is armed (a door only once
- * its `DoorState` has shut), when E was pressed at it this tick
- * (`pressed`), or when the player `approaches` it and the wait is over.
- * Returns a new map; `faults` is left as it was.
+ * with a seeded wait of `WAIT_MIN` to `WAIT_MAX` ticks, counted down
+ * unconditionally. Before a way's first run, its wait is the seeded
+ * `START_MAX` delay (`newFault`) instead, and that one counts down only
+ * while the player `approaches` it, not from room entry: a way the player
+ * has not reached yet keeps its full delay, so two ways reached at
+ * different times still start at different ticks. An idle fault starts a
+ * run when it is armed (a door only once its `DoorState` has shut), when E
+ * was pressed at it this tick (`pressed`), or when the player `approaches`
+ * it and the wait is over. Returns a new map; `faults` is left as it was.
  */
 export function stepFaults(
   room: RoomSpec,
@@ -250,11 +255,13 @@ export function stepFaults(
         );
       }
     } else {
-      if (f.wait > 0) f.wait--;
+      const near = approaches(fx.slot, player);
+      // The pre-first-run delay (M11) counts down only while the player is
+      // near, so a way not yet reached keeps its full delay; the wait
+      // between runs, once one has run, counts down unconditionally.
+      if (f.wait > 0 && (f.runs > 0 || near)) f.wait--;
       const shut = kind !== "door" || (doors.get(i)?.open ?? 0) === 0;
-      const start = f.armed
-        ? shut
-        : pressed === i || (f.wait === 0 && approaches(fx.slot, player));
+      const start = f.armed ? shut : pressed === i || (f.wait === 0 && near);
       if (start) {
         f.frames = planRun(kind, f.seed, f.runs);
         f.runs++;

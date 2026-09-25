@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
-import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
 import {
   FIXTURE_DEPTH,
   FIXTURE_WIDTH,
@@ -698,10 +698,10 @@ describe("lookDelta", () => {
 });
 
 describe("blockersFor", () => {
-  it("builds the same blockers whatever the doors do", () => {
-    // Its only parameter is the room, so no door or fault state can reach
-    // collision.
-    const gallery = galleryRoom();
-    expect(blockersFor(gallery)).toEqual(blockersFor(gallery));
+  it("takes no door or fault state: its signature is the room alone", () => {
+    // blockersFor(room: RoomSpec): Box[] - a second parameter (doors, a
+    // fault frame map) would raise this past 1, so no door or fault state
+    // can reach collision.
+    expect(blockersFor.length).toBe(1);
   });
 });

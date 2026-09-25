@@ -12,7 +12,7 @@
 import { describe, expect, it } from "vitest";
 
 import { galleryRoom } from "./canned";
-import { NOT_FOUND } from "./generate";
+import { ACCESS_DENIED, NOT_FOUND } from "./generate";
 import { approaches, wallPoint, type DoorState } from "./interact";
 import {
   DOOR_JERK,
@@ -82,6 +82,27 @@ describe("brokenWays", () => {
     );
 
     expect(isBrokenWay(room, nth(room, "door", 3), new Map())).toBe(false);
+  });
+
+  it("counts a statically sealed ACCESS_DENIED fixture as broken too", () => {
+    // The generator never produces this seal (M2), but the type allows it,
+    // and a denied target must count the same as an unresolved one.
+    const room = galleryRoom();
+    const doorI = nth(room, "door", 1);
+    const original = room.fixtures[doorI];
+    if (original === undefined || original.kind !== "door") {
+      throw new Error("no door");
+    }
+    const sealed: RoomSpec = {
+      ...room,
+      fixtures: room.fixtures.map((f, i) =>
+        i === doorI
+          ? { ...original, address: null, sealedLabel: ACCESS_DENIED }
+          : f,
+      ),
+    };
+    expect(isBrokenWay(sealed, doorI, new Map())).toBe(true);
+    expect(brokenWays(sealed, new Map())).toContain(doorI);
   });
 });
 
@@ -283,6 +304,57 @@ describe("stepFaults", () => {
       firstFrame1 !== undefined &&
       JSON.stringify(firstFrame0) === JSON.stringify(firstFrame1);
     expect(sameStart && sameFrame).toBe(false);
+  });
+
+  it("delays the first run only while the player approaches, not from room entry (M11)", () => {
+    const room = galleryRoom();
+    const d0 = nth(room, "door", 0);
+    const d1 = nth(room, "door", 1);
+    const failed = new Map([
+      [d0, NOT_FOUND],
+      [d1, NOT_FOUND],
+    ]);
+    const f0 = room.fixtures[d0];
+    const f1 = room.fixtures[d1];
+    if (f0 === undefined || f1 === undefined) throw new Error("no door");
+    const w0 = wallPoint(f0.slot);
+    const w1 = wallPoint(f1.slot);
+    const nearBoth: Player = {
+      x: (w0.x + w1.x) / 2 + w0.inward[0],
+      z: (w0.z + w1.z) / 2 + w0.inward[1],
+      yaw: 0,
+      vx: 0,
+      vz: 0,
+      pitch: 0,
+      bob: 0,
+    };
+    const farAway: Player = {
+      ...nearBoth,
+      x: nearBoth.x + 100,
+      z: nearBoth.z + 100,
+    };
+    expect(approaches(f0.slot, nearBoth)).toBe(true);
+    expect(approaches(f1.slot, nearBoth)).toBe(true);
+    expect(approaches(f0.slot, farAway)).toBe(false);
+    expect(approaches(f1.slot, farAway)).toBe(false);
+
+    // The player walks for 50 ticks, well past START_MAX, before it ever
+    // approaches either door: room entry must not spend the delay.
+    let faults = new Map<number, Fault>();
+    for (let t = 0; t < 50; t++) {
+      faults = stepFaults(room, farAway, faults, failed, null, new Map());
+    }
+
+    let firstStart0 = -1;
+    let firstStart1 = -1;
+    for (let t = 1; t <= START_MAX + 1; t++) {
+      faults = stepFaults(room, nearBoth, faults, failed, null, new Map());
+      if (firstStart0 < 0 && faults.get(d0)?.frames !== null) firstStart0 = t;
+      if (firstStart1 < 0 && faults.get(d1)?.frames !== null) firstStart1 = t;
+    }
+    expect(firstStart0).toBeGreaterThan(0);
+    expect(firstStart1).toBeGreaterThan(0);
+    expect(firstStart0).not.toBe(firstStart1);
   });
 
   it("keeps no fault for a way that is not broken", () => {

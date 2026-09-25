@@ -537,6 +537,15 @@ describe("ways in the failed map", () => {
     ).toBeNull();
   });
 
+  it("never crawls the player through a failed hatch", () => {
+    const room = galleryRoom();
+    const hatchI = nth(room, "hatch", 0);
+    expect(hatchTravel(room, hatchI)).not.toBeNull();
+    expect(
+      hatchTravel(room, hatchI, new Map([[hatchI, NOT_FOUND]])),
+    ).toBeNull();
+  });
+
   it("faces the wall from a slot's own cell", () => {
     for (const side of ["n", "e", "s", "w"] as const) {
       const slot: WallSlot = { x: 3, y: 4, side };
