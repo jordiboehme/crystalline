@@ -14,12 +14,12 @@
 
 import { FOOTPRINTS, type FloorSize } from "../../../world/footprints";
 import type { FloorPropKind } from "../../../world/types";
-import { sideways, yawed } from "../common";
+import { sideways, tiltedBar, yawed } from "../common";
 import { frameAt, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import type { PropRecipe } from "./common";
 
-/** A warm hazard red: the tool cart's body and the debris pile's plate rust. */
+/** A warm hazard red: the tool cart's body. */
 const RED: Rgb = [0.74, 0.09, 0.07];
 
 /** A muted plant green: every bush and leaf. */
@@ -29,30 +29,11 @@ const PLANT: Rgb = [0.22, 0.42, 0.24];
 const CLAY: Rgb = [0.62, 0.4, 0.3];
 
 /**
- * A thin rectangle in a 2D plane, centred at `(cx, cy)`, `length` long at
- * `angle` radians from the first axis and `width` wide across it: the
- * cross-section of a tilted bar, fed to `extrude` either directly (in the
- * `(a, h)` plane) or through `sideways` (in the `(d, h)` plane, for a rail
- * that leans towards or away from the wall rather than sideways along it).
+ * A pale glass tint: the specimen shelf's jars. Kept fixed across looks,
+ * since a jar's glass reads the same regardless of the room's machine or
+ * panel colours, unlike a surface that is meant to belong to the room.
  */
-function tiltedBar(
-  cx: number,
-  cy: number,
-  angle: number,
-  length: number,
-  width: number,
-): [number, number][] {
-  const dx = Math.cos(angle) * (length / 2);
-  const dy = Math.sin(angle) * (length / 2);
-  const nx = -Math.sin(angle) * (width / 2);
-  const ny = Math.cos(angle) * (width / 2);
-  return [
-    [cx - dx + nx, cy - dy + ny],
-    [cx + dx + nx, cy + dy + ny],
-    [cx + dx - nx, cy + dy - ny],
-    [cx - dx - nx, cy - dy - ny],
-  ];
-}
+const GLASS: Rgb = [0.85, 0.9, 0.86];
 
 /**
  * A straight rail leaning from `(d0, h0)` to `(d1, h1)`, `thick` wide along
@@ -104,8 +85,8 @@ const CRATE_H = { small: 0.55, large: 0.85, stackedSmall: 0.45 };
  * the true footprint edge); variant 1 a large plain bevelled crate;
  * variant 2 a small crate stacked, offset, on a large one.
  */
-function crate({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("crate", variant);
   if (variant === 0) {
     const H = CRATE_H.small;
     const post = 0.045;
@@ -201,8 +182,8 @@ function oneBarrel(
  * Barrel: variant 0 one barrel with ribs and a lid at the anchor; variant 1
  * three smaller barrels clustered so the group fills the wider footprint.
  */
-function barrel({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("barrel", variant);
   if (variant === 0) {
     oneBarrel(k, s, 0, 0, Math.min(hw, hd) - 0.025, 0.85, 12);
     return;
@@ -244,8 +225,8 @@ function trolleyDeck(
  * Trolley: a flat cart on four casters with a handle at the back (`-d`).
  * Variant 0 a single deck, variant 1 two decks stacked on corner posts.
  */
-function trolley({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("trolley", variant);
   const T = TROLLEY;
   const casterD = hd - T.caster - 0.02;
   const casterA = hw - 0.06;
@@ -303,8 +284,8 @@ function trolley({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
  * Stool: variant 0 a round seat on a post with a foot ring, variant 1 a
  * square seat on four straight legs.
  */
-function stool({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function stool({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("stool", variant);
   const r = Math.min(hw, hd) - 0.03;
   const H = 0.75;
   if (variant === 0) {
@@ -333,13 +314,8 @@ const CABINET = { inset: 0.02, handle: 0.05 };
  * Filing cabinet: a metal body with drawer bands and handles, `drawers`
  * deep, `height` tall.
  */
-function filingCabinet({
-  k,
-  s,
-  kind,
-  variant,
-}: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function filingCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("filing-cabinet", variant);
   const drawers = variant === 0 ? 2 : 4;
   const H = variant === 0 ? 0.8 : 1.4;
   const C = CABINET;
@@ -402,13 +378,8 @@ function shelfBox(
  * from the footprint edge. Variant 0 has 4 shelves with boxes on the lower
  * three, variant 1 has 5 bare shelves.
  */
-function storageShelf({
-  k,
-  s,
-  kind,
-  variant,
-}: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function storageShelf({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("storage-shelf", variant);
   const shelves = variant === 0 ? 4 : 5;
   const top = variant === 0 ? 1.6 : 1.8;
   const postA = hw - 0.02;
@@ -439,8 +410,8 @@ function storageShelf({
  * Planter: variant 0 a round lathed tub with a single lathed bush, variant
  * 1 a long box tub with three smaller bushes.
  */
-function planter({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function planter({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("planter", variant);
   const tub = s.tinted(CLAY);
   const bush = s.tinted(PLANT);
   if (variant === 0) {
@@ -507,8 +478,8 @@ function planter({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
  * Bench: a slab seat on two legs, front towards `+d`. Variant 1 adds a
  * back panel behind the seat (`-d`).
  */
-function bench({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function bench({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("bench", variant);
   const seatD0 = variant === 0 ? -hd + 0.02 : -hd * 0.35;
   const seatD1 = hd - 0.02;
   k.bevelBox(-hw + 0.02, hw - 0.02, seatD0, seatD1, 0.42, 0.48, 0.012, s.body);
@@ -553,7 +524,7 @@ function jar(
       [0, base + height * 0.9],
     ],
     8,
-    s.tinted([0.85, 0.9, 0.86]),
+    s.tinted(GLASS),
   );
 }
 
@@ -567,10 +538,9 @@ function specimenShelf({
   k,
   s,
   ctx,
-  kind,
   variant,
 }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+  const { hw, hd } = halfSize("specimen-shelf", variant);
   const shelves = 3;
   const top = 1.7;
   const postA = hw - 0.02;
@@ -608,20 +578,12 @@ function specimenShelf({
  * Fume cabinet: a tall flat-backed body with a sash window, a top duct
  * stub and a hazard warning strip. Variant 1 is narrower.
  */
-function fumeCabinet({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function fumeCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("fume-cabinet", variant);
   const H = 1.85;
   const front = hd - 0.02;
   k.bevelBox(-hw + 0.02, hw - 0.02, -hd, front, 0, H, 0.02, s.body);
-  k.box(
-    -hw * 0.6,
-    hw * 0.6,
-    front - 0.01,
-    front + 0.006,
-    0.55,
-    1.5,
-    s.tinted([0.55, 0.62, 0.6]),
-  );
+  k.box(-hw * 0.6, hw * 0.6, front - 0.01, front + 0.006, 0.55, 1.5, s.dark);
   k.box(
     -hw + 0.02,
     hw - 0.02,
@@ -638,8 +600,8 @@ function fumeCabinet({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
 const CONE_ORANGE: Rgb = [0.85, 0.35, 0.05];
 
 /** Traffic cone: a lathed cone on a square base with a hazard band. Variant 1 is taller. */
-function trafficCone({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function trafficCone({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("traffic-cone", variant);
   const base = Math.min(hw, hd) - 0.02;
   const H = variant === 0 ? 0.55 : 0.8;
   const h0 = 0.03;
@@ -690,8 +652,8 @@ const LADDER = { rungRadius: 0.014, railThick: 0.04, inset: 0.05 };
  * to its back edge with rungs between them, topped under 2.2 m; variant 1 a
  * self-supporting step ladder, front rails leaning back to a single brace.
  */
-function ladder({ kitAt, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function ladder({ kitAt, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("ladder", variant);
   const L = LADDER;
   const railA = hw - L.railThick - L.inset;
   if (variant === 0) {
@@ -754,8 +716,8 @@ function ladder({ kitAt, s, kind, variant }: Parameters<PropRecipe>[0]): void {
 const CART = { drawerH: 0.1 };
 
 /** Tool cart: a red body with stacked drawers and small tools on top. */
-function toolCart({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("tool-cart", variant);
   const drawers = variant === 0 ? 2 : 3;
   const top = 0.55 + (drawers - 2) * CART.drawerH;
   const red = s.tinted(RED);
@@ -811,10 +773,9 @@ function toppledCrate({
   k,
   kitAt,
   s,
-  kind,
   variant,
 }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+  const { hw, hd } = halfSize("toppled-crate", variant);
   if (variant === 0) {
     const angle = 0.26;
     const halfW = Math.min(hw, hd) * 0.62;
@@ -892,14 +853,8 @@ function debrisBox(
  * variant 1 the same heap with a bent pipe laid across it (two straight
  * segments joined at an angle).
  */
-function debrisPile({
-  k,
-  kitAt,
-  s,
-  kind,
-  variant,
-}: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function debrisPile({ k, kitAt, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("debris-pile", variant);
   const boxes: [number, number, number, number, number][] = [
     [-hw * 0.5, -hd * 0.35, 0.3, 0.3, 0.2],
     [-hw * 0.15, hd * 0.3, -0.25, 0.32, 0.28],
@@ -933,8 +888,8 @@ function debrisPile({
  * Cable coil: variant 0 one flat ring coil on the floor, variant 1 two
  * smaller coils side by side.
  */
-function cableCoil({ k, s, kind, variant }: Parameters<PropRecipe>[0]): void {
-  const { hw, hd } = halfSize(kind as FloorPropKind, variant);
+function cableCoil({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("cable-coil", variant);
   if (variant === 0) {
     const r = Math.min(hw, hd) - 0.1;
     k.ring(0, 0, 0.035, r, 0.03, 8, 16, s.dark, "up");

@@ -125,6 +125,34 @@ export function sideways(f: Frame): Frame {
 }
 
 /**
+ * A thin rectangle in a 2D plane, centred at `(cx, cy)`, `length` long at
+ * `angle` radians from the first axis and `width` wide across it: an
+ * outline for `k.extrude`, used for a fan blade, a slanted louvre, a
+ * leaning rail or a sagging cable link, or any other flat bar that does
+ * not sit flush along one axis alone. The plane is whichever two axes the
+ * caller extrudes across: `(a, h)` directly, or `(d, h)` through
+ * `sideways`.
+ */
+export function tiltedBar(
+  cx: number,
+  cy: number,
+  angle: number,
+  length: number,
+  width: number,
+): [number, number][] {
+  const dx = Math.cos(angle) * (length / 2);
+  const dy = Math.sin(angle) * (length / 2);
+  const nx = -Math.sin(angle) * (width / 2);
+  const ny = Math.cos(angle) * (width / 2);
+  return [
+    [cx - dx + nx, cy - dy + ny],
+    [cx + dx + nx, cy + dy + ny],
+    [cx + dx - nx, cy + dy - ny],
+    [cx - dx - nx, cy - dy - ny],
+  ];
+}
+
+/**
  * Extrudes a profile of `[d, h]` points (depth out from the wall, height),
  * drawn in the frame's side view, along the wall from `a0` to `a1`: the
  * wedge of a keyboard deck, the slant of a nav table, a half ring standing

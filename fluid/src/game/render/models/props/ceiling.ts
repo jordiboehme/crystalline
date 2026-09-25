@@ -14,7 +14,7 @@
 
 import type { CeilingPropKind } from "../../../world/types";
 import type { Rgb } from "../../looks";
-import { HEADROOM } from "../common";
+import { HEADROOM, tiltedBar } from "../common";
 import type { Kit } from "../../kit";
 import {
   CEILING_DROP,
@@ -33,30 +33,6 @@ const RED: Rgb = [0.8, 0.08, 0.06];
  * both sides for a hanger's own width or a run's rails.
  */
 const D_MID = (CEILING_SETBACK + CEILING_OUT) / 2;
-
-/**
- * A thin rectangle in the `(a, h)` plane, centred at `(cx, cy)`, `length`
- * long at `angle` radians from the `a` axis and `width` wide: the
- * cross-section of a tilted chain link, fed to `extrude`.
- */
-function tiltedBar(
-  cx: number,
-  cy: number,
-  angle: number,
-  length: number,
-  width: number,
-): [number, number][] {
-  const dx = Math.cos(angle) * (length / 2);
-  const dy = Math.sin(angle) * (length / 2);
-  const nx = -Math.sin(angle) * (width / 2);
-  const ny = Math.cos(angle) * (width / 2);
-  return [
-    [cx - dx + nx, cy - dy + ny],
-    [cx + dx + nx, cy + dy + ny],
-    [cx + dx - nx, cy + dy - ny],
-    [cx - dx - nx, cy - dy - ny],
-  ];
-}
 
 /** A hanger strap from its host's nearest-to-ceiling surface up to exactly `-HEADROOM`. */
 function hanger(

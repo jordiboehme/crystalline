@@ -17,7 +17,7 @@ import { LAYER } from "../../layers";
 import type { Rgb } from "../../looks";
 import { PICTOGRAM, SIGN_PICTOGRAMS } from "../../text";
 import type { WallPropKind } from "../../../world/types";
-import { yawed } from "../common";
+import { tiltedBar, yawed } from "../common";
 import { RUN_BAND, type PropRecipe } from "./common";
 
 /** A warm hazard red: the extinguisher's cylinder and the first-aid cross. */
@@ -25,31 +25,6 @@ const RED: Rgb = [0.74, 0.09, 0.07];
 
 /** A status green: the keycard reader's ready glow. */
 const GREEN: Rgb = [0.22, 0.92, 0.34];
-
-/**
- * A thin rectangle in the `(a, h)` plane, centred at `(cx, cy)`, `length`
- * long at `angle` radians from the `a` axis and `width` wide: an outline
- * for `k.extrude`, used for a fan blade, a slanted louvre or any other
- * flat bar that does not sit flush along `a` or `h` alone.
- */
-function tiltedBar(
-  cx: number,
-  cy: number,
-  angle: number,
-  length: number,
-  width: number,
-): [number, number][] {
-  const dx = Math.cos(angle) * (length / 2);
-  const dy = Math.sin(angle) * (length / 2);
-  const nx = -Math.sin(angle) * (width / 2);
-  const ny = Math.cos(angle) * (width / 2);
-  return [
-    [cx - dx + nx, cy - dy + ny],
-    [cx + dx + nx, cy + dy + ny],
-    [cx + dx - nx, cy + dy - ny],
-    [cx - dx - nx, cy - dy - ny],
-  ];
-}
 
 /** The locker bank: its overall box and how tall its doors run. */
 const LOCKER = { half: 0.85, depth: 0.26, h1: 2.0 };
