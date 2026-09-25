@@ -9,10 +9,10 @@
  * straight into the DOM.
  *
  * Places come in two ways. `go` loads one through Fluid's query cache
- * (`loadPlace`), with the connector shown while it loads, and replaces the
- * room when it lands; `showCanned` shows a place that is already in hand (the
- * look demo's bridge) at once, and `showRoom` a room built by hand (the model
- * gallery). A room is generated once per entry and kept until the next one.
+ * (`loadPlace`), or through the `load` seam when the session was given one,
+ * with the connector shown while it loads, and replaces the room when it
+ * lands; `showCanned` shows a place that is already in hand (the look demo's
+ * bridge) at once, and `showRoom` a room built by hand (the model gallery). A room is generated once per entry and kept until the next one.
  *
  * Loads race, and the session settles every race the same way: each `go`
  * takes a new generation and aborts the load before it, and a load whose
@@ -21,9 +21,25 @@
  * player where they stand with a notice for three seconds; with no room to
  * stand in yet, the notice stays over the dark screen.
  *
- * Each tick, in order: the look and command keys, movement, the doors, what
- * the player faces (the HUD prompt), E at it, the ways out of the room, and
- * warming the cache for the places behind the doors the player walks up to.
+ * Each tick, in order: the look and command keys, movement, what the player
+ * faces and E at it, the doors, the faults of the broken ways, the HUD
+ * prompt, the ways out of the room, and warming the cache for the places
+ * behind the doors the player walks up to.
+ *
+ * Malfunctions belong to one visit of a room. A travel that settles as
+ * missing (404) or denied (403) marks the way it went through as failed
+ * (`failed`, the fixture index to its seal label): the way then says
+ * `SEALED <label>`, heads shut, carries no one and runs its fault once by
+ * itself (a door once it has shut), then stutters like every broken way
+ * while the player stays near (`world/malfunction.ts`). Nothing else marks
+ * a way: not `SIGNAL LOST`, not a thrown `?LOAD ERROR`, not a room the
+ * renderer refuses, and not a `go` from outside, which went through no
+ * way. A failure that settles after the player has left for another place
+ * is dropped with its generation. The marks and the running faults are
+ * kept while the same place is shown again (`showCanned`'s keep, a look
+ * switch, a restored GPU context) and cleared on every fresh entry. Their
+ * frames go to the renderer as `draw`'s fifth argument, never into the
+ * door states that decide travel, and collision reads neither.
  *
  * Keys, by `KeyboardEvent.code`: W, A, S and D walk, the arrows turn and
  * look, E uses what the player faces, F opens the current engram in Fluid,
@@ -58,6 +74,14 @@ import {
   type DoorState,
   type Travel,
 } from "./world/interact";
+import {
+  armFault,
+  faultFrames,
+  isBrokenWay,
+  stepFaults,
+  type Fault,
+  type FaultFrame,
+} from "./world/malfunction";
 import {
   EYE_HEIGHT,
   blockersFor,
@@ -128,8 +152,8 @@ export type RendererFactory = (
  * What a session is started with.
  *
  * - `client`: Fluid's query client, or null when the session only shows
- *   canned places (the look demo); without one every `go` answers
- *   `SIGNAL LOST`.
+ *   canned places (the look demo); without one and without `load`, every
+ *   `go` answers `SIGNAL LOST`.
  * - `navigate`: replaces the URL with a game route once a place has loaded
  *   and the URL does not already show it.
  * - `openFluid`: opens a Fluid path (the F key) outside the game.
@@ -138,6 +162,10 @@ export type RendererFactory = (
  * - `initialLook`: the look to start in; `aperture` when not given.
  * - `clock`: the loop's clock; the browser's when not given. Tests crank it
  *   by hand.
+ * - `load`: loads a place in place of the query client. The gallery's
+ *   `?fault=` answers every travel with a failure through it, and tests use
+ *   it to fail a travel without the API. Without it, `go` loads through
+ *   `client`, or says `SIGNAL LOST` when there is none.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -149,7 +177,20 @@ export interface SessionOptions {
   createRenderer?: RendererFactory;
   initialLook?: LookId;
   clock?: Clock;
+  load?: PlaceLoader;
 }
+
+/**
+ * Loads the place at `address` for a travel or a `go`, and settles as
+ * `loadPlace` does: a place, or the reason there is none. It rejects with
+ * an `AbortError` once `signal` aborts, and with anything else for a
+ * failure the server did not explain (`?LOAD ERROR`). See
+ * `SessionOptions.load`.
+ */
+export type PlaceLoader = (
+  address: PlaceAddress,
+  signal: AbortSignal,
+) => Promise<LoadedPlace>;
 
 /**
  * A running station.
@@ -269,6 +310,14 @@ export function createSession(opts: SessionOptions): Session {
   let latched: number | null = null;
   let readerOpen = false;
   let lastPrompt: string | null = null;
+  /** Ways whose travel failed this visit: fixture index to its seal label. */
+  let failed = new Map<number, string>();
+  /** The fault clock of every broken way this visit. */
+  let faults = new Map<number, Fault>();
+  /** The running faults' frames, as the renderer draws them. */
+  let faultNow: ReadonlyMap<number, FaultFrame> = new Map();
+  /** The travel in flight: its generation and the fixture it went through. */
+  let travelling: { gen: number; fixture: number } | null = null;
 
   let generation = 0;
   let controller: AbortController | null = null;
@@ -379,8 +428,8 @@ export function createSession(opts: SessionOptions): Session {
    * Enters a generated room: hands it to the renderer and resets everything
    * that belongs to the room before it. `next` is the place the room was
    * generated from, or null for a room built by hand (`showRoom`), whose
-   * terminals then open no reader. `keep` keeps the player and the doors,
-   * for the same place shown again.
+   * terminals then open no reader. `keep` keeps the player, the doors and
+   * this visit's failed ways and faults, for the same place shown again.
    *
    * The renderer is asked first. When it refuses the room, nothing of the
    * session has changed yet: the player stays in the room they were in,
@@ -410,6 +459,9 @@ export function createSession(opts: SessionOptions): Session {
       player = { ...spawn, vx: 0, vz: 0, pitch: 0, bob: 0 };
       doors = new Map();
       doorOpen = new Map();
+      failed = new Map();
+      faults = new Map();
+      faultNow = new Map();
     }
     previous = player;
     prefetched = new Set();
@@ -432,8 +484,22 @@ export function createSession(opts: SessionOptions): Session {
     hud.connector(false, labelFor(address), lookId);
     if (loaded.kind !== "place") {
       fail(FAILED[loaded.kind]);
+      // Only a missing or denied target breaks the way the travel went
+      // through; the generation guard above already dropped a stale one.
+      const t = travelling;
+      travelling = null;
+      if (
+        t !== null &&
+        t.gen === gen &&
+        room !== null &&
+        (loaded.kind === "missing" || loaded.kind === "denied")
+      ) {
+        failed = new Map(failed).set(t.fixture, FAILED[loaded.kind]);
+        faults = armFault(room, t.fixture, faults);
+      }
       return;
     }
+    travelling = null;
     if (!enter(loaded.place, generateRoom(loaded.place), arrival, false)) {
       return;
     }
@@ -467,6 +533,7 @@ export function createSession(opts: SessionOptions): Session {
    */
   const leave = (): number => {
     closeReader();
+    travelling = null;
     const gen = ++generation;
     controller?.abort();
     controller = null;
@@ -480,7 +547,12 @@ export function createSession(opts: SessionOptions): Session {
   const go = (address: PlaceAddress, arrival: Arrival | null = null) => {
     if (disposed) return;
     const gen = leave();
-    if (client === null) {
+    const loader: PlaceLoader | null =
+      opts.load ??
+      (client === null
+        ? null
+        : (a, signal) => loadPlace(client, a.domain, a.permalink, signal));
+    if (loader === null) {
       fail(FAILED.offline);
       return;
     }
@@ -490,7 +562,7 @@ export function createSession(opts: SessionOptions): Session {
     hud.connector(true, label, lookId);
     const abort = new AbortController();
     controller = abort;
-    loadPlace(client, address.domain, address.permalink, abort.signal).then(
+    loader(address, abort.signal).then(
       (loaded) => {
         settle(gen, address, arrival, loaded);
       },
@@ -498,6 +570,7 @@ export function createSession(opts: SessionOptions): Session {
         if (disposed || gen !== generation) return;
         loading = false;
         controller = null;
+        travelling = null;
         hud.connector(false, label, lookId);
         if (!isAbort(error)) fail(LOAD_ERROR);
       },
@@ -523,6 +596,8 @@ export function createSession(opts: SessionOptions): Session {
     if (current === null) return;
     latched = travel.fixture;
     go(travel.address, { via: travel.via, from: current });
+    // Only a travel the session took can mark its way failed (M2).
+    if (loading) travelling = { gen: generation, fixture: travel.fixture };
   };
 
   const openReader = (index: number) => {
@@ -678,26 +753,31 @@ export function createSession(opts: SessionOptions): Session {
       blockers,
     );
 
-    const focus = readerOpen ? null : focusOf(room, player, doors);
+    const focus = readerOpen ? null : focusOf(room, player, doors, failed);
     let pressedDoor: number | null = null;
+    let pressedWay: number | null = null;
     if (!still && input.pressed("KeyE") && focus !== null) {
+      if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
       if (focus.kind === "terminal") {
         openReader(focus.index);
       } else if (focus.kind === "door") {
         pressedDoor = focus.index;
       } else if (focus.kind === "hatch") {
-        const travel = hatchTravel(room, focus.index);
+        // A failed hatch carries no one: `hatchTravel` reads `failed`.
+        const travel = hatchTravel(room, focus.index, failed);
         if (travel !== null) takeTravel(travel);
       }
     }
-    doors = stepDoors(room, player, doors, pressedDoor);
+    doors = stepDoors(room, player, doors, pressedDoor, failed);
+    faults = stepFaults(room, player, faults, failed, pressedWay, doors);
+    faultNow = faultFrames(faults);
     doorOpen = new Map();
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
     setPrompt(readerOpen || loading ? null : (focus?.prompt ?? null));
 
     if (!loading && !readerOpen) {
-      const travel = travelOf(room, player, doors);
+      const travel = travelOf(room, player, doors, failed);
       if (travel === null) {
         latched = null;
       } else if (travel.fixture !== latched) {
@@ -706,8 +786,12 @@ export function createSession(opts: SessionOptions): Session {
     }
 
     if (client !== null) {
-      for (const f of room.fixtures) {
-        if ((f.kind !== "door" && f.kind !== "portal") || f.address === null) {
+      for (const [index, f] of room.fixtures.entries()) {
+        if (
+          (f.kind !== "door" && f.kind !== "portal") ||
+          f.address === null ||
+          failed.has(index)
+        ) {
           continue;
         }
         const key = placeKeyOf(f.address.domain, f.address.permalink);
@@ -755,7 +839,7 @@ export function createSession(opts: SessionOptions): Session {
           lights.levels,
           (t - started) / 1000,
           doorOpen,
-          new Map(),
+          faultNow,
         );
       },
     },

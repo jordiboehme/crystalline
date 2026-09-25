@@ -24,12 +24,16 @@ import {
   NOTICE_MS,
   createSession,
   type HudSink,
+  type PlaceLoader,
   type RendererFactory,
   type Session,
 } from "./session";
-import { CANNED_BRIDGE } from "./world/canned";
+import { CANNED_BRIDGE, galleryRoom } from "./world/canned";
 import { generateRoom } from "./world/generate";
-import type { RoomSpec } from "./world/types";
+import { wallFacingSpawn, wallPoint } from "./world/interact";
+import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
+import { PLAYER_RADIUS } from "./world/move";
+import type { Fixture, RoomSpec } from "./world/types";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -179,6 +183,7 @@ function start(
     client?: QueryClient | null;
     canvas?: HTMLCanvasElement;
     factory?: RendererFactory;
+    load?: PlaceLoader;
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -196,6 +201,7 @@ function start(
     forceRgba8: false,
     createRenderer: factory,
     clock,
+    ...(options.load === undefined ? {} : { load: options.load }),
   });
   sessions.push(session);
   return session;
@@ -827,5 +833,438 @@ describe("keys", () => {
     frames(4);
     expect(lastCamera().pitch).toBeGreaterThan(0);
     key("keyup", "ArrowUp");
+  });
+});
+
+describe("malfunctions", () => {
+  /** The index of the `n`th fixture of `kind`, in fixture order. */
+  const nth = (room: RoomSpec, kind: Fixture["kind"], n: number) => {
+    let seen = -1;
+    const i = room.fixtures.findIndex((f) => f.kind === kind && ++seen === n);
+    if (i < 0) throw new Error(`no ${kind} ${String(n)}`);
+    return i;
+  };
+
+  /** The fixture at `i`, which must exist. */
+  const fixtureAt = (room: RoomSpec, i: number): Fixture => {
+    const f = room.fixtures[i];
+    if (f === undefined) throw new Error(`no fixture ${String(i)}`);
+    return f;
+  };
+
+  /** `room` with the player spawned in fixture `i`'s cell, facing it. */
+  const before = (room: RoomSpec, i: number): RoomSpec => ({
+    ...room,
+    spawn: wallFacingSpawn(fixtureAt(room, i).slot),
+  });
+
+  const gallery = galleryRoom();
+  const door0 = nth(gallery, "door", 0);
+  const door1 = nth(gallery, "door", 1);
+  const door3 = nth(gallery, "door", 3);
+  const door4 = nth(gallery, "door", 4);
+  const hatch0 = nth(gallery, "hatch", 0);
+  const portal0 = nth(gallery, "portal", 0);
+
+  /** The fault frames of every draw from call `from` on. */
+  const faultsSince = (from = 0): ReadonlyMap<number, FaultFrame>[] =>
+    renderer.draw.mock.calls.slice(from).map((c) => c[4]);
+
+  /** The fault frames of the last draw. */
+  const lastFaults = (): ReadonlyMap<number, FaultFrame> => {
+    const call = renderer.draw.mock.calls.at(-1);
+    if (call === undefined) throw new Error("nothing drawn");
+    return call[4];
+  };
+
+  /** The door fractions of the last draw. */
+  const lastDoors = (): ReadonlyMap<string, number> => {
+    const call = renderer.draw.mock.calls.at(-1);
+    if (call === undefined) throw new Error("nothing drawn");
+    return call[3];
+  };
+
+  /** A loader that answers every travel with `kind` at once. */
+  const failing =
+    (kind: "missing" | "denied" | "offline"): PlaceLoader =>
+    () =>
+      Promise.resolve({ kind });
+
+  /** How often the connector went up. */
+  const connectorUps = () =>
+    hud.connector.mock.calls.filter(([active]) => active).length;
+
+  /** The HUD prompts written from call `from` on. */
+  const promptsSince = (from: number) =>
+    hud.prompt.mock.calls.slice(from).map(([text]) => text);
+
+  /** How far in front of fixture `i`'s wall the eye of the last frame is. */
+  const depthAt = (room: RoomSpec, i: number) => {
+    const w = wallPoint(fixtureAt(room, i).slot);
+    const eye = lastCamera().eye;
+    return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+  };
+
+  /** Presses E for one frame. */
+  const pressE = () => {
+    key("keydown", "KeyE");
+    frames(1);
+    key("keyup", "KeyE");
+  };
+
+  /**
+   * Holds W until a travel starts, then lets go: until the connector goes
+   * up, or, with `loads` false (no client and no loader, where `go` fails
+   * at once), until a notice goes up.
+   */
+  const walkIn = (loads = true) => {
+    const ups = connectorUps();
+    const notices = hud.notice.mock.calls.length;
+    const started = () =>
+      loads
+        ? connectorUps() > ups
+        : hud.notice.mock.calls.slice(notices).some(([t]) => t !== null);
+    key("keydown", "KeyW");
+    for (let i = 0; i < 80 && !started(); i++) frames(1);
+    key("keyup", "KeyW");
+    expect(started()).toBe(true);
+    expect(connectorUps()).toBe(loads ? ups + 1 : ups);
+  };
+
+  it("stutters a ?FILE NOT FOUND door while the player stands near it", () => {
+    const session = start({ client: null });
+    session.showRoom(before(gallery, door4));
+    frames(60);
+    const opens = faultsSince().flatMap((m) => {
+      const f = m.get(door4);
+      return f === undefined ? [] : [f.open];
+    });
+    expect(opens.some((o) => o >= 0.3 && o <= 0.54)).toBe(true);
+    expect(hud.prompt).toHaveBeenCalledWith("SEALED ?FILE NOT FOUND");
+  });
+
+  it("leaves a NO ROUTE door still", () => {
+    const session = start({ client: null });
+    session.showRoom(before(gallery, door3));
+    frames(60);
+    expect(faultsSince().some((m) => m.has(door3))).toBe(false);
+    expect(hud.prompt).toHaveBeenCalledWith("SEALED NO ROUTE");
+  });
+
+  it("a broken door stays shut to collision and never carries the player", async () => {
+    const sealed = start({ client: null });
+    sealed.showRoom(before(gallery, door4));
+    key("keydown", "KeyW");
+    for (let i = 0; i < 175; i++) {
+      frames(1);
+      expect(depthAt(gallery, door4)).toBeGreaterThanOrEqual(
+        PLAYER_RADIUS - 1e-6,
+      );
+    }
+    key("keyup", "KeyW");
+    expect(hud.connector).not.toHaveBeenCalledWith(
+      true,
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(faultsSince().some((m) => m.has(door4))).toBe(true);
+    sealed.dispose();
+
+    const open = start({ client: null, load: failing("missing") });
+    open.showRoom(before(gallery, door0));
+    key("keydown", "KeyW");
+    for (let i = 0; i < 80 && connectorUps() === 0; i++) {
+      frames(1);
+      expect(depthAt(gallery, door0)).toBeGreaterThanOrEqual(
+        PLAYER_RADIUS - 1e-6,
+      );
+    }
+    expect(connectorUps()).toBe(1);
+    await flush();
+    expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
+    const calls = hud.connector.mock.calls.length;
+    for (let i = 0; i < 175; i++) {
+      frames(1);
+      expect(depthAt(gallery, door0)).toBeGreaterThanOrEqual(
+        PLAYER_RADIUS - 1e-6,
+      );
+    }
+    key("keyup", "KeyW");
+    expect(hud.connector.mock.calls.length).toBe(calls);
+    expect(connectorUps()).toBe(1);
+  });
+
+  it("shuts a door that failed on travel, runs it once, then keeps it sealed", async () => {
+    const session = start({ client: null, load: failing("denied") });
+    session.showRoom(before(gallery, door1));
+    pressE();
+    frames(15);
+    expect(lastDoors().get(`door:${String(door1)}`)).toBe(1);
+    walkIn();
+    await flush();
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      false,
+      expect.any(String),
+      expect.any(String),
+    );
+    expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
+
+    const mark = renderer.draw.mock.calls.length;
+    frames(60);
+    const draws = renderer.draw.mock.calls.slice(mark);
+    const shut = draws.findIndex(
+      (c) => c[3].get(`door:${String(door1)}`) === 0,
+    );
+    expect(shut).toBeGreaterThanOrEqual(0);
+    expect(shut).toBeLessThan(12);
+    const first = draws.findIndex((c) => c[4].has(door1));
+    expect(first).toBeGreaterThanOrEqual(shut);
+    expect(first).toBeLessThanOrEqual(shut + 2);
+    // No fault frame while the door was still shutting.
+    expect(draws.slice(0, shut).some((c) => c[4].has(door1))).toBe(false);
+    const peak = Math.max(
+      ...draws.flatMap((c) => {
+        const f = c[4].get(door1);
+        return f === undefined ? [] : [f.open];
+      }),
+    );
+    expect(peak).toBeGreaterThanOrEqual(0.3);
+    expect(peak).toBeLessThanOrEqual(0.54);
+    expect(hud.prompt).toHaveBeenCalledWith("SEALED ACCESS DENIED");
+
+    // E at the sealed door starts no travel and opens nothing.
+    const ups = connectorUps();
+    pressE();
+    frames(20);
+    expect(connectorUps()).toBe(ups);
+    expect(lastDoors().get(`door:${String(door1)}`)).toBe(0);
+  });
+
+  it("pops a hatch lid once when its crawl fails", async () => {
+    const session = start({ client: null, load: failing("missing") });
+    session.showRoom(before(gallery, hatch0));
+    frames(2);
+    expect(hud.prompt).toHaveBeenLastCalledWith(
+      expect.stringMatching(/^E CRAWL /),
+    );
+    pressE();
+    expect(connectorUps()).toBe(1);
+    await flush();
+    const mark = renderer.draw.mock.calls.length;
+    frames(2);
+    expect(faultsSince(mark).some((m) => m.has(hatch0))).toBe(true);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+
+    // The failed hatch carries no one: hatchTravel reads the failed map.
+    pressE();
+    frames(5);
+    expect(connectorUps()).toBe(1);
+  });
+
+  it("collapses a portal that fails on travel", async () => {
+    const session = start({ client: null, load: failing("missing") });
+    session.showRoom(before(gallery, portal0));
+    walkIn();
+    await flush();
+    const mark = renderer.draw.mock.calls.length;
+    frames(60);
+    expect(faultsSince(mark).some((m) => m.get(portal0)?.scale === 0)).toBe(
+      true,
+    );
+    expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+
+    // Back off and walk in again: the failed portal carries no one, even
+    // once the latch of the first travel is gone.
+    key("keydown", "KeyS");
+    frames(20);
+    key("keyup", "KeyS");
+    expect(depthAt(gallery, portal0)).toBeGreaterThan(1);
+    key("keydown", "KeyW");
+    frames(40);
+    key("keyup", "KeyW");
+    expect(depthAt(gallery, portal0)).toBeLessThan(0.5);
+    expect(connectorUps()).toBe(1);
+  });
+
+  describe("only a missing or denied travel seals its way", () => {
+    /**
+     * Walks into door 0 of the gallery, waits for the answer and checks the
+     * notice, then that the door never says SEALED, never runs a fault and
+     * still opens for the player.
+     */
+    const walksIntoDoor0 = async (
+      session: Session,
+      notice: string,
+      loads = true,
+    ): Promise<void> => {
+      session.showRoom(before(gallery, door0));
+      walkIn(loads);
+      const from = hud.prompt.mock.calls.length;
+      const mark = renderer.draw.mock.calls.length;
+      await flush();
+      expect(hud.notice).toHaveBeenCalledWith(notice);
+      frames(60);
+      expect(
+        promptsSince(from).some((p) => p?.startsWith("SEALED") === true),
+      ).toBe(false);
+      expect(faultsSince(mark).some((m) => m.has(door0))).toBe(false);
+      expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+    };
+
+    it("not SIGNAL LOST from the loader", async () => {
+      await walksIntoDoor0(
+        start({ client: null, load: failing("offline") }),
+        "SIGNAL LOST",
+      );
+    });
+
+    it("not a thrown ?LOAD ERROR", async () => {
+      await walksIntoDoor0(
+        start({ client: null, load: () => Promise.reject(new Error("x")) }),
+        "?LOAD ERROR",
+      );
+    });
+
+    it("not SIGNAL LOST with no client and no loader", async () => {
+      await walksIntoDoor0(start({ client: null }), "SIGNAL LOST", false);
+    });
+
+    it("not an outside go that answers missing", async () => {
+      const session = start({ client: null, load: failing("missing") });
+      session.showRoom(before(gallery, door0));
+      frames(20);
+      const from = hud.prompt.mock.calls.length;
+      const mark = renderer.draw.mock.calls.length;
+      const door = fixtureAt(gallery, door0);
+      if (door.kind !== "door" || door.address === null) {
+        throw new Error("door 0 leads somewhere");
+      }
+      session.go(door.address);
+      await flush();
+      expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
+      frames(60);
+      expect(
+        promptsSince(from).some((p) => p?.startsWith("SEALED") === true),
+      ).toBe(false);
+      // Only the ways sealed from the start run faults.
+      const faulted = new Set(faultsSince(mark).flatMap((m) => [...m.keys()]));
+      expect(faulted.has(door0)).toBe(false);
+      expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+    });
+
+    it("not a room the renderer refuses", async () => {
+      let setRooms = 0;
+      const refusing = stubRenderer();
+      refusing.setRoom.mockImplementation(() => {
+        if (++setRooms > 1) throw new Error("no layers left");
+      });
+      renderer = refusing;
+      const session = start({
+        client: null,
+        load: () =>
+          Promise.resolve({ kind: "place" as const, place: CANNED_BRIDGE }),
+      });
+      session.showRoom(before(gallery, door0));
+      const here = session.current;
+      walkIn();
+      const from = hud.prompt.mock.calls.length;
+      const mark = renderer.draw.mock.calls.length;
+      await flush();
+      expect(hud.notice).toHaveBeenCalledWith("?LOAD ERROR");
+      expect(session.current).toEqual(here);
+      frames(60);
+      expect(
+        promptsSince(from).some((p) => p?.startsWith("SEALED") === true),
+      ).toBe(false);
+      expect(faultsSince(mark).some((m) => m.has(door0))).toBe(false);
+      expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+    });
+  });
+
+  it("a stale failure seals nothing in the room entered since", async () => {
+    const answer = deferred<{ kind: "missing" }>();
+    const session = start({ client: null, load: () => answer.promise });
+    session.showRoom(before(gallery, door0));
+    walkIn();
+    session.showRoom(before(gallery, door4));
+    answer.resolve({ kind: "missing" });
+    await flush();
+    frames(60);
+    expect(faultsSince().some((m) => m.has(door0))).toBe(false);
+
+    session.showRoom(before(gallery, door0));
+    const from = hud.prompt.mock.calls.length;
+    const mark = renderer.draw.mock.calls.length;
+    frames(60);
+    expect(
+      promptsSince(from).some((p) => p?.startsWith("SEALED") === true),
+    ).toBe(false);
+    expect(faultsSince(mark).some((m) => m.has(door0))).toBe(false);
+    expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+  });
+
+  it("keeps a failure across a look switch and a restored context, and clears it on re-entry", async () => {
+    const canvas = document.createElement("canvas");
+    const session = start({
+      client: null,
+      canvas,
+      load: failing("missing"),
+    });
+    session.showRoom(before(gallery, door0));
+    walkIn();
+    await flush();
+    // The door shuts over twelve ticks, then its run starts.
+    for (let i = 0; i < 20 && !lastFaults().has(door0); i++) frames(1);
+    expect(lastFaults().has(door0)).toBe(true);
+
+    key("keydown", "Digit1");
+    frames(1);
+    key("keyup", "Digit1");
+    expect(hud.status).toHaveBeenLastCalledWith(expect.stringContaining("DAY"));
+    frames(3);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+    const beforeLoss = lastFaults().get(door0);
+
+    canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
+    canvas.dispatchEvent(new Event("webglcontextrestored"));
+    frames(5);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+    const afterRestore = lastFaults().get(door0);
+
+    // The run picks up where it was: both frames are from the door's first
+    // run, about five ticks apart, in its shudder where every frame differs.
+    const door = fixtureAt(gallery, door0);
+    if (door.kind !== "door") throw new Error("door 0 is a door");
+    const run = planRun("door", faultSeed(door.slot, door.seed), 0);
+    const at = (f: FaultFrame | undefined) =>
+      run.findIndex((r) => JSON.stringify(r) === JSON.stringify(f));
+    const was = at(beforeLoss);
+    const is = at(afterRestore);
+    expect(was).toBeGreaterThan(0);
+    expect(is - was).toBeGreaterThanOrEqual(4);
+    expect(is - was).toBeLessThanOrEqual(6);
+
+    // A fresh entry of the same room forgets the failure.
+    session.showRoom(before(gallery, door0));
+    const mark = renderer.draw.mock.calls.length;
+    frames(20);
+    expect(hud.prompt).toHaveBeenLastCalledWith(null);
+    expect(faultsSince(mark).some((m) => m.has(door0))).toBe(false);
+    expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+  });
+
+  it("gives the renderer the same frames for the same room on two sessions", () => {
+    const seen: ReadonlyMap<number, FaultFrame>[] = [];
+    for (let s = 0; s < 2; s++) {
+      now = 0;
+      renderer = stubRenderer();
+      const session = start({ client: null });
+      session.showRoom(before(gallery, door4));
+      frames(20);
+      seen.push(lastFaults());
+      session.dispose();
+    }
+    expect(seen[0]?.size).toBeGreaterThan(0);
+    expect(seen[1]).toEqual(seen[0]);
   });
 });
