@@ -222,6 +222,7 @@ describe("galleryRoom", () => {
     const seenCeiling = new Set<string>();
     for (const p of room.props) {
       if (p.anchor !== "wall" && p.anchor !== "ceiling") continue;
+      if (PROP_CATALOGUE[p.kind].span) continue;
       const e = edgeOf(p);
       const k = edgeKey(e);
       expect(wallAnchor(e), `${p.kind} ${k}`).toEqual({
@@ -244,6 +245,7 @@ describe("galleryRoom", () => {
     const propBays = room.bays.slice(2, 4);
     for (const p of room.props) {
       if (p.anchor !== "ceiling") continue;
+      if (PROP_CATALOGUE[p.kind].span) continue;
       const e = edgeOf(p);
       expect(e.side).toBe("n");
       expect(
@@ -251,6 +253,22 @@ describe("galleryRoom", () => {
           (b) => e.x >= b.x0 && e.x < b.x1 && e.y >= b.y0 && e.y < b.y1,
         ),
       ).toBe(true);
+    }
+  });
+
+  it("hangs every span over row 6 of bay 3 or bay 4, along x", () => {
+    const propBays = room.bays.slice(2, 4);
+    const spans = room.props.filter((p) => PROP_CATALOGUE[p.kind].span);
+    expect(spans).toHaveLength(4);
+    for (const p of spans) {
+      expect(p.anchor).toBe("ceiling");
+      expect(p.turn).toBe(0);
+      expect(p.y).toBe(6.5);
+      const first = p.x - 1; // the segment's first cell
+      expect(Number.isInteger(first)).toBe(true);
+      expect(propBays.some((b) => first >= b.x0 && first + 1 < b.x1)).toBe(
+        true,
+      );
     }
   });
 

@@ -34,8 +34,11 @@ export {
   FLOOR_TOP,
   RUN_BAND,
   RUN_REACH,
+  SPAN_HALF,
+  SPAN_REACH,
   WALL_REACH,
   WALL_TOP,
+  WIDE_REACH,
   type PropContext,
   type PropRecipe,
 } from "./common";

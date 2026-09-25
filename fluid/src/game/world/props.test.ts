@@ -16,7 +16,7 @@ describe("the prop catalogue", () => {
   it("lists every kind once, as PROP_CATALOGUE does", () => {
     expect(new Set(PROP_KINDS).size).toBe(PROP_KINDS.length);
     expect([...PROP_KINDS].sort()).toEqual(Object.keys(PROP_CATALOGUE).sort());
-    expect(PROP_KINDS).toHaveLength(34);
+    expect(PROP_KINDS).toHaveLength(40);
   });
 
   it("gives every kind 2 or 3 variants, the sign plate 6", () => {
@@ -63,5 +63,46 @@ describe("the prop catalogue", () => {
     expect(EXTRAS.clean).toEqual([]);
     for (const k of PROP_KINDS)
       expect(seen.get(k)?.length ?? 0).toBe(PROP_CATALOGUE[k].extra ? 1 : 0);
+  });
+
+  it("marks wide only wall kinds that are not runs, and six of them", () => {
+    const wide = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].wide);
+    expect(wide.sort()).toEqual([
+      "conduit-cabinet",
+      "locker-bank",
+      "padded-panel",
+      "pipe-riser",
+      "stowage-net",
+      "tool-board",
+    ]);
+    for (const k of wide) {
+      expect(PROP_CATALOGUE[k].anchor).toBe("wall");
+      expect(PROP_CATALOGUE[k].run).toBe(false);
+    }
+  });
+
+  it("keeps clear every kind a person reads or uses, and every mandatory kind", () => {
+    const clear = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].keepClear);
+    expect(clear.sort()).toEqual([
+      "extinguisher",
+      "first-aid",
+      "intercom",
+      "keycard-reader",
+      "sign-plate",
+      "wall-monitor",
+    ]);
+    // The kinds dress.ts places as mandatory (ruling 7).
+    for (const k of ["keycard-reader", "sign-plate", "extinguisher"] as const)
+      expect(PROP_CATALOGUE[k].keepClear).toBe(true);
+  });
+
+  it("makes spans ceiling kinds that are neither runs nor extras", () => {
+    const spans = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].span);
+    expect(spans.sort()).toEqual(["span-duct", "span-tray"]);
+    for (const k of spans) {
+      expect(PROP_CATALOGUE[k].anchor).toBe("ceiling");
+      expect(PROP_CATALOGUE[k].run).toBe(false);
+      expect(PROP_CATALOGUE[k].extra).toBe(false);
+    }
   });
 });

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import { propFootprint } from "../world/footprints";
-import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
+import {
+  PROP_CATALOGUE,
+  PROP_KINDS,
+  SPAN_HALF,
+  WALL_PROP_DEPTH,
+  WIDE_REACH,
+} from "../world/props";
 import { turnForSide, wallAnchor } from "../world/sites";
 import type { PropKind, Side } from "../world/types";
 import { CELL } from "../world/units";
@@ -11,7 +17,7 @@ import {
   type MeshData,
   type V3,
 } from "./geometry";
-import { frameForSlot, turnPoint, type Frame } from "./kit";
+import { frameAt, frameForSlot, turnPoint, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
   add,
@@ -33,6 +39,7 @@ import {
   FLOOR_TOP,
   RUN_BAND,
   RUN_REACH,
+  SPAN_REACH,
   WALL_REACH,
   WALL_TOP,
 } from "./models/props/common";
@@ -67,10 +74,12 @@ function buildRecorded(
 
 /** Where an instance goes: its world offset, in metres. */
 function anchorFor(kind: PropKind, t: number): V3 {
-  const anchor = PROP_CATALOGUE[kind].anchor;
-  if (anchor === "floor") return [FLOOR_AT.x * CELL, 0, FLOOR_AT.y * CELL];
+  const entry = PROP_CATALOGUE[kind];
+  if (entry.span) return [FLOOR_AT.x * CELL, CEILING, FLOOR_AT.y * CELL];
+  if (entry.anchor === "floor")
+    return [FLOOR_AT.x * CELL, 0, FLOOR_AT.y * CELL];
   const a = wallAnchor({ x: 3, y: 4, side: sideFor(t) });
-  return [a.x * CELL, anchor === "ceiling" ? CEILING : 0, a.y * CELL];
+  return [a.x * CELL, entry.anchor === "ceiling" ? CEILING : 0, a.y * CELL];
 }
 
 /**
@@ -138,6 +147,17 @@ describe("prop models", () => {
               }
               return;
             }
+            if (entry.span) {
+              const f = frameAt([FLOOR_AT.x * CELL, 0, FLOOR_AT.y * CELL], t);
+              for (const p of points) {
+                const [a, d, h] = toLocal(f, p);
+                expect(Math.abs(a)).toBeLessThanOrEqual(SPAN_REACH + EPS);
+                expect(Math.abs(d)).toBeLessThanOrEqual(SPAN_HALF + EPS);
+                expect(h).toBeGreaterThanOrEqual(CEILING - CEILING_DROP - EPS);
+                expect(h).toBeLessThanOrEqual(CEILING - HEADROOM + EPS);
+              }
+              return;
+            }
             if (!wall) throw new Error("no wall frame");
             const reach = entry.run ? RUN_REACH : WALL_REACH;
             for (const p of points) {
@@ -188,6 +208,32 @@ describe("prop models", () => {
     expect(() => buildPropMesh("duct", -1, LOOKS.aperture)).toThrow(
       /no variant -1/,
     );
+  });
+
+  it("gives the world the wall band's depth", () => {
+    expect(WALL_PROP_DEPTH).toBe(FLUSH_DEPTH);
+  });
+
+  it("makes every wide kind reach WIDE_REACH on both sides of its anchor", () => {
+    const wall = frameForSlot({ x: 3, y: 4, side: "s" });
+    for (const kind of PROP_KINDS) {
+      if (!PROP_CATALOGUE[kind].wide) continue;
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
+        const placed = placeMesh(
+          buildRecorded(kind, v).mesh,
+          0,
+          anchorFor(kind, 0),
+        );
+        const along = positions(placed).map((p) => toLocal(wall, p)[0]);
+        expect(Math.min(...along), `${kind} ${String(v)}`).toBeLessThanOrEqual(
+          -WIDE_REACH + EPS,
+        );
+        expect(
+          Math.max(...along),
+          `${kind} ${String(v)}`,
+        ).toBeGreaterThanOrEqual(WIDE_REACH - EPS);
+      }
+    }
   });
 
   it("lays every ladder rung across both rails, on both variants", () => {

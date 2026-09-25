@@ -326,7 +326,8 @@ const GALLERY_LIGHT = 210;
  *   one of each kind in `MACHINE_KINDS` order, six to a bay, labelled with
  *   their kind. Bays 3 and 4 hold one of every prop kind and variant
  *   (`galleryProps`): wall and ceiling kinds on their walls, floor kinds on
- *   their floor, a run kind's variant as a 2-segment run.
+ *   their floor, a run kind's variant as a 2-segment run, and a span kind's
+ *   variant as a segment hung over row 6.
  * - **Light.** One steady zone per block of four by four cells, so every
  *   floor cell is lit and nothing flickers while a model is looked at.
  *
@@ -607,20 +608,24 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
  *   (`cable-tray`, `pipe-bundle`) as a 2-segment run per variant, taken from
  *   two consecutive edges of one straight run so a run never turns a corner
  *   or crosses a bay's doorway;
- * - ceiling kinds along both bays' north wall edges, runs (`duct`,
- *   `ceiling-tray`) the same way; a ceiling prop may share an edge with a
- *   wall prop, since the two hang at different heights, exactly as the
- *   dressing pass allows;
+ * - ceiling kinds (spans excepted) along both bays' north wall edges, runs
+ *   (`duct`, `ceiling-tray`) the same way; a ceiling prop may share an edge
+ *   with a wall prop, since the two hang at different heights, exactly as
+ *   the dressing pass allows;
  * - floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
  *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0. The outer columns are left
  *   out because they sit next to a bay's doorway, which the real dressing
  *   pass always keeps floor props off; rows 0, 2, 4, 6 and 7 stay walkable.
+ * - span kinds (`span-duct`, `span-tray`) over row 6: each kind and variant
+ *   takes the next of four fixed first cells, `bay3.x0 + 1`, `bay3.x0 + 4`,
+ *   `bay4.x0 + 1` and `bay4.x0 + 4`, anchored at `(x + 1, 6.5)`, turn 0.
  *
  * Every seed follows ruling 2, `seedFor(roomSeed, "prop", cx, cy, token)`:
  * the token is the edge's side for a single wall or ceiling prop, `run-` or
- * `ceiling-` plus the side for a run's segments, and `"floor"` for a floor
- * prop, the same tokens `dress.ts` uses. The output is sorted by
- * `PROP_ORDER`, as a dressed room's `props` always are.
+ * `ceiling-` plus the side for a run's segments, `"floor"` for a floor prop
+ * and `"span"` for a span segment (keyed by its first cell), the same
+ * tokens `dress.ts` uses. The output is sorted by `PROP_ORDER`, as a
+ * dressed room's `props` always are.
  */
 function galleryProps(
   roomSeed: number,
@@ -693,10 +698,33 @@ function galleryProps(
   }
   for (const kind of kindsOf("ceiling")) {
     const entry = PROP_CATALOGUE[kind];
-    if (entry.run) continue;
+    if (entry.run || entry.span) continue;
     for (let variant = 0; variant < entry.variants; variant++) {
       const e = ceilingEdges.take();
       ceiling.push(atEdge(kind, e, variant, e.side));
+    }
+  }
+
+  // Spans: over row 6, the next of four fixed first cells of bay 3 or 4.
+  const spanFirstCells = [bay3.x0 + 1, bay3.x0 + 4, bay4.x0 + 1, bay4.x0 + 4];
+  let si = 0;
+  for (const kind of kindsOf("ceiling")) {
+    const entry = PROP_CATALOGUE[kind];
+    if (!entry.span) continue;
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const x = spanFirstCells[si++];
+      if (x === undefined) {
+        throw new Error("gallery: ran out of span cells");
+      }
+      ceiling.push({
+        kind,
+        variant,
+        anchor: "ceiling",
+        x: x + 1,
+        y: 6.5,
+        turn: 0,
+        seed: seedFor(roomSeed, "prop", x, 6, "span"),
+      });
     }
   }
 

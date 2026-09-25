@@ -273,7 +273,11 @@ export type WallPropKind =
   | "padded-panel"
   | "light-strip"
   | "cable-tray"
-  | "pipe-bundle";
+  | "pipe-bundle"
+  | "tool-board"
+  | "conduit-cabinet"
+  | "stowage-net"
+  | "pipe-riser";
 
 /** The kinds of prop that stand on the floor and collide with the player. */
 export type FloorPropKind =
@@ -302,7 +306,10 @@ export type CeilingPropKind =
   | "cable-loop"
   | "beacon"
   // condition extra
-  | "loose-cable";
+  | "loose-cable"
+  // spans the hall wall to wall
+  | "span-duct"
+  | "span-tray";
 
 /** Every kind of set dressing the dressing pass can place. */
 export type PropKind = WallPropKind | FloorPropKind | CeilingPropKind;

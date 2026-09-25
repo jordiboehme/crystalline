@@ -10,17 +10,25 @@
  * (`duct`, `ceiling-tray`). Every recipe is built at turn 0 in the kit's
  * local `(a, d, h)` terms, exactly like a wall prop, and never sees the
  * room.
+ *
+ * A span (`span-duct`, `span-tray`) hangs over the hall's interior rather
+ * than along a wall, so it reads `(a, d, h)` differently: `d` is centred on
+ * its line (`|d| <= SPAN_HALF`, not `D_MID`) and `a` reaches `SPAN_REACH`
+ * either side, the whole segment, so neighbouring segments meet exactly as
+ * a run's do. `h` keeps the same band as every ceiling prop.
  */
 
 import type { CeilingPropKind } from "../../../world/types";
 import type { Rgb } from "../../looks";
-import { HEADROOM, tiltedBar } from "../common";
+import { HEADROOM, tiltedBar, type Surfaces } from "../common";
 import type { Kit } from "../../kit";
 import {
   CEILING_DROP,
   CEILING_OUT,
   CEILING_SETBACK,
   RUN_REACH,
+  SPAN_HALF,
+  SPAN_REACH,
   type PropRecipe,
 } from "./common";
 
@@ -251,6 +259,109 @@ function looseCable({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   }
 }
 
+/** The round duct's height, radius and flange half-width along `a`. */
+const SPAN_DUCT_ROUND = { h: -0.45, radius: 0.2, flange: 0.03 };
+/** The square duct's height and half-size across it (D9's `SPAN_HALF` less its rail). */
+const SPAN_DUCT_SQUARE = { h: -0.45, halfW: SPAN_HALF - 0.05, halfH: 0.15 };
+
+/**
+ * Span duct: variant 0 a round duct the whole segment long with a flange
+ * collar at its anchor; variant 1 a square duct with seam lines every
+ * 0.5 m. Both carry hanger straps at `a = +-1.0`, and both stay within
+ * `SPAN_HALF` across their line, well inside a wall duct's own reach.
+ */
+function spanDuct({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  if (variant === 0) {
+    const D = SPAN_DUCT_ROUND;
+    k.cylinderAlong(-SPAN_REACH, SPAN_REACH, 0, D.h, D.radius, 10, s.metal);
+    k.cylinderAlong(-D.flange, D.flange, 0, D.h, D.radius + 0.03, 10, s.metal);
+    for (const a of [-1.0, 1.0]) hanger(k, s, a, 0, D.h + D.radius, 0.02);
+  } else {
+    const D = SPAN_DUCT_SQUARE;
+    k.box(
+      -SPAN_REACH,
+      SPAN_REACH,
+      -D.halfW,
+      D.halfW,
+      D.h - D.halfH,
+      D.h + D.halfH,
+      s.metal,
+    );
+    for (let a = -SPAN_REACH + 0.3; a <= SPAN_REACH - 0.15; a += 0.5) {
+      k.box(
+        a - 0.006,
+        a + 0.006,
+        -D.halfW - 0.004,
+        D.halfW + 0.004,
+        D.h - D.halfH,
+        D.h + D.halfH,
+        s.dark,
+      );
+    }
+    for (const a of [-1.0, 1.0]) hanger(k, s, a, 0, D.h + D.halfH, 0.02);
+  }
+}
+
+/** The ladder tray's half-width across the line (D9's `SPAN_HALF` less its rails). */
+const SPAN_TRAY = { halfW: SPAN_HALF - 0.1 };
+
+/** One ladder-tray tier at height `h`: two side rails, rungs and 3 resting cables. */
+function trayTier(k: Kit, s: Surfaces, h: number): void {
+  const half = SPAN_TRAY.halfW;
+  for (const d of [-half, half]) {
+    k.box(
+      -SPAN_REACH,
+      SPAN_REACH,
+      d - 0.01,
+      d + 0.01,
+      h - 0.015,
+      h + 0.015,
+      s.metal,
+    );
+  }
+  for (let a = -SPAN_REACH + 0.2; a <= SPAN_REACH - 0.2; a += 0.4) {
+    k.box(a - 0.008, a + 0.008, -half, half, h - 0.01, h + 0.01, s.dark);
+  }
+  for (const d of [-0.15, 0, 0.15]) {
+    k.cylinderAlong(
+      -SPAN_REACH + 0.05,
+      SPAN_REACH - 0.05,
+      d,
+      h + 0.03,
+      0.02,
+      6,
+      s.dark,
+    );
+  }
+}
+
+/**
+ * Span tray: variant 0 one ladder tray at `h = -0.5` with four threaded-rod
+ * hangers (reusing `hanger`) at `a = +-1.5`, one on each rail so they run
+ * up alongside the tray rather than through the cables in its middle;
+ * variant 1 two tiers, at `h = -0.35` and `h = -0.6`, joined by the same
+ * four hangers, which span from the lower tier's rail top past the upper
+ * tier's own rails to `-HEADROOM`.
+ */
+function spanTray({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const half = SPAN_TRAY.halfW;
+  const rods = (hostNear: number) => {
+    for (const a of [-1.5, 1.5])
+      for (const d of [-half, half]) hanger(k, s, a, d, hostNear, 0.012);
+  };
+  if (variant === 0) {
+    const h = -0.5;
+    trayTier(k, s, h);
+    rods(h + 0.015);
+  } else {
+    const upperH = -0.35;
+    const lowerH = -0.6;
+    trayTier(k, s, upperH);
+    trayTier(k, s, lowerH);
+    rods(lowerH + 0.015);
+  }
+}
+
 /** The recipe of every ceiling prop kind, runs included. */
 export const CEILING_RECIPES = {
   duct,
@@ -258,4 +369,6 @@ export const CEILING_RECIPES = {
   "cable-loop": cableLoop,
   beacon,
   "loose-cable": looseCable,
+  "span-duct": spanDuct,
+  "span-tray": spanTray,
 } satisfies Record<CeilingPropKind, PropRecipe>;

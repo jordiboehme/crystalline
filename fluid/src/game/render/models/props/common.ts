@@ -18,14 +18,23 @@
  * whatever the room puts next to what. The prop test checks every kind,
  * variant and turn against them.
  *
+ * A span's anchor is the midpoint of its segment on the hall's interior,
+ * raised to the ceiling: its `a` runs along the line the segment follows,
+ * `d` across it and `h` down from the ceiling, exactly as a ceiling prop's
+ * does. It stays within `SPAN_REACH` along and `SPAN_HALF` across (D9).
+ *
  * Kept apart from `index.ts` so the recipe files can import it without an
  * import cycle through the dispatcher.
  */
 
+import { SPAN_CELLS, SPAN_HALF, WIDE_REACH } from "../../../world/props";
 import type { PropKind } from "../../../world/types";
+import { CELL } from "../../../world/units";
 import type { Kit } from "../../kit";
 import type { Look } from "../../looks";
 import type { KitAt, Surfaces } from "../common";
+
+export { SPAN_HALF, WIDE_REACH };
 
 /**
  * How far along its wall a wall prop (or a ceiling prop that is not a run)
@@ -41,6 +50,14 @@ export const WALL_REACH = 0.9;
  * the segments of neighbouring edges meet and read as one run (ruling 3).
  */
 export const RUN_REACH = 1.0;
+
+/**
+ * How far along its line a span segment reaches either side of its anchor,
+ * in metres: half of `SPAN_CELLS` cells (2.0 m), the segment's full length,
+ * so the segments of neighbouring lines meet, exactly as `RUN_REACH` does
+ * for a wall or ceiling run (D9).
+ */
+export const SPAN_REACH = (SPAN_CELLS * CELL) / 2;
 
 /**
  * The highest a wall prop reaches, in metres. The runs above it start at

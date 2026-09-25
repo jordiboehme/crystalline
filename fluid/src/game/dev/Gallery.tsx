@@ -5,8 +5,9 @@
  * engram, and shown with `session.showRoom`: a door of every style, the
  * sealed ways, the portals, a terminal, a hatch, a poster and the placard in
  * the hall with every kind of furniture, the twelve machines in bays 1 and
- * 2, and one of every prop kind and variant in bays 3 and 4. Development
- * only - the route that renders this exists only under
+ * 2, one of every prop kind and variant in bays 3 and 4, and a row of every
+ * ceiling span kind and variant over row 6 of those same two bays.
+ * Development only - the route that renders this exists only under
  * `import.meta.env.DEV`, and stays that way for good.
  *
  * The session has no query client, so walking through a door says

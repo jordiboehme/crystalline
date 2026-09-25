@@ -11,20 +11,23 @@
  * against those bounds.
  */
 
-import { FLAG } from "../../geometry";
-import { DECAL_LIFT, frameAt } from "../../kit";
+import { FLAG, type Surface } from "../../geometry";
+import { DECAL_LIFT, frameAt, type Kit } from "../../kit";
 import { LAYER } from "../../layers";
 import type { Rgb } from "../../looks";
 import { PICTOGRAM, SIGN_PICTOGRAMS } from "../../text";
 import type { WallPropKind } from "../../../world/types";
-import { tiltedBar, yawed } from "../common";
+import { shade, tiltedBar, yawed } from "../common";
 import { RUN_BAND, type PropRecipe } from "./common";
 
 /** A warm hazard red: the extinguisher's cylinder and the first-aid cross. */
 const RED: Rgb = [0.74, 0.09, 0.07];
 
-/** A status green: the keycard reader's ready glow. */
+/** A status green: the keycard reader's ready glow, and the pipe riser's gauge face. */
 const GREEN: Rgb = [0.22, 0.92, 0.34];
+
+/** A muted upholstery tan: the padded panel's cushions. */
+const QUILT: Rgb = [0.55, 0.5, 0.46];
 
 /** The locker bank: its overall box and how tall its doors run. */
 const LOCKER = { half: 0.85, depth: 0.26, h1: 2.0 };
@@ -425,22 +428,23 @@ function wallMonitor({ k, s, ctx, variant }: Parameters<PropRecipe>[0]): void {
   );
 }
 
-/** The padded panel: its overall size and cushion depth. */
-const PADDED = { half: 0.4, h0: 0.6, h1: 2.0, depth: 0.06 };
+/** The padded panel: its overall size and cushion depth, widened to D4's reach. */
+const PADDED = { half: 0.85, h0: 0.6, h1: 2.0, depth: 0.06 };
 
 /**
- * Padded panel: a quilted wall of bevelled cushions, 2 by 3 in variant 0
- * and 3 by 4 in variant 1.
+ * Padded panel: a quilted wall of bevelled cushions, 4 by 3 in variant 0
+ * and 5 by 4 in variant 1, wide enough to reach `WIDE_REACH` on both sides
+ * of its anchor (D4).
  */
 function paddedPanel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const P = PADDED;
-  const cols = variant === 0 ? 2 : 3;
+  const cols = variant === 0 ? 4 : 5;
   const rows = variant === 0 ? 3 : 4;
   const gap = 0.01;
   const cw = (2 * P.half - gap * (cols - 1)) / cols;
   const rh = (P.h1 - P.h0 - gap * (rows - 1)) / rows;
   const bevel = Math.min(0.015, cw * 0.2, rh * 0.2);
-  const quilt = s.tinted([0.55, 0.5, 0.46]);
+  const quilt = s.tinted(QUILT);
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < rows; r++) {
       const a0 = -P.half + c * (cw + gap);
@@ -548,6 +552,334 @@ function pipeBundle({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   }
 }
 
+/** The tool board: its width, depth and height band. */
+const TOOL_BOARD = { half: 0.88, depth: 0.03, h0: 0.9, h1: 2.05 };
+
+/**
+ * A thin flat tool silhouette in the (a, h) plane at the given depth range:
+ * `tiltedBar` gives the outline, `extrude` gives it a hair of thickness.
+ */
+function toolShape(
+  k: Kit,
+  s: Surface,
+  a: number,
+  h: number,
+  angle: number,
+  length: number,
+  width: number,
+  d0: number,
+  d1: number,
+): void {
+  k.extrude(tiltedBar(a, h, angle, length, width), d0, d1, s);
+}
+
+/**
+ * A hung hammer silhouette: a thin vertical handle and a short head across
+ * its top, both flat boxes standing just off the board.
+ */
+function hammerShape(
+  k: Kit,
+  s: Surface,
+  a: number,
+  h: number,
+  d0: number,
+  d1: number,
+): void {
+  k.box(a - 0.012, a + 0.012, d0, d1, h - 0.14, h + 0.02, s);
+  k.box(a - 0.09, a + 0.09, d0, d1, h + 0.02, h + 0.07, s);
+}
+
+/** A pair of crossed flat bars: an open pair of pliers. */
+function pliersShape(
+  k: Kit,
+  s: Surface,
+  a: number,
+  h: number,
+  d0: number,
+  d1: number,
+): void {
+  k.extrude(tiltedBar(a, h, 0.5, 0.26, 0.03), d0, d1, s);
+  k.extrude(tiltedBar(a, h, -0.5, 0.26, 0.03), d0, d1, s);
+}
+
+/**
+ * Tool board: a perforated-looking board with a dark lip shelf along its
+ * foot and 6 to 8 thin tool silhouettes (spanners, hammers, pliers) hung on
+ * its face. Variant 1 adds a bin rail at `h = 0.95` holding 4 coloured bins
+ * and thins the tools above it out.
+ */
+function toolBoard({ k, s, ctx, variant }: Parameters<PropRecipe>[0]): void {
+  const T = TOOL_BOARD;
+  k.bevelBox(-T.half, T.half, 0, T.depth, T.h0, T.h1, 0.01, s.panel);
+  k.box(-T.half, T.half, T.depth, T.depth + 0.07, T.h0 - 0.05, T.h0, s.dark);
+  const HOLE = 0.012;
+  const step = 0.14;
+  for (let hy = T.h0 + 0.08; hy <= T.h1 - 0.08; hy += step) {
+    for (let a = -T.half + 0.08; a <= T.half - 0.08; a += step) {
+      k.panel(
+        a - HOLE,
+        a + HOLE,
+        T.depth + DECAL_LIFT,
+        hy - HOLE,
+        hy + HOLE,
+        s.dark,
+      );
+    }
+  }
+  const near = T.depth + 0.005;
+  const far = T.depth + 0.02;
+  const row = T.h1 - 0.35;
+  if (variant === 0) {
+    toolShape(k, s.dark, -0.68, row, 0.15, 0.32, 0.035, near, far);
+    toolShape(k, s.dark, -0.4, row, -0.15, 0.32, 0.035, near, far);
+    hammerShape(k, s.dark, -0.08, row, near, far);
+    pliersShape(k, s.metal, 0.2, row, near, far);
+    toolShape(k, s.dark, 0.48, row, 0.2, 0.32, 0.035, near, far);
+    hammerShape(k, s.dark, 0.72, row, near, far);
+    toolShape(k, s.dark, -0.55, row - 0.4, 0.3, 0.32, 0.035, near, far);
+    pliersShape(k, s.metal, 0.05, row - 0.4, near, far);
+  } else {
+    const railH = 0.95;
+    k.box(
+      -T.half,
+      T.half,
+      T.depth,
+      T.depth + 0.12,
+      railH,
+      railH + 0.02,
+      s.metal,
+    );
+    const binW = (2 * T.half - 0.08) / 4;
+    const bins = [
+      ctx.look.palette.screen,
+      ctx.look.palette.door,
+      ctx.look.palette.lamp,
+      shade(ctx.look.palette.metal, 0.6),
+    ];
+    for (let i = 0; i < 4; i++) {
+      const a0 = -T.half + 0.04 + i * binW;
+      const tint = bins[i] ?? ctx.look.palette.metal;
+      k.bevelBox(
+        a0,
+        a0 + binW - 0.02,
+        T.depth + 0.02,
+        T.depth + 0.12,
+        railH + 0.02,
+        railH + 0.16,
+        0.01,
+        s.tinted(tint),
+      );
+    }
+    toolShape(k, s.dark, -0.5, row, 0.15, 0.32, 0.035, near, far);
+    hammerShape(k, s.dark, 0.0, row, near, far);
+    pliersShape(k, s.metal, 0.5, row, near, far);
+  }
+}
+
+/** The conduit cabinet: its depth and the horizontal conduit's height. */
+const CONDUIT = { depth: 0.28, runH: 2.15 };
+
+/**
+ * Conduit cabinet: variant 0 one cabinet with a door seam, a handle and two
+ * conduits climbing to a horizontal run across the whole reach with a
+ * junction box at each end; variant 1 two narrower cabinets side by side,
+ * each feeding the same run.
+ */
+function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const C = CONDUIT;
+  const d = C.depth / 2;
+  if (variant === 0) {
+    k.bevelBox(-0.55, 0.25, 0, C.depth, 0, 1.9, 0.015, s.body);
+    const seam = -0.15;
+    k.box(
+      seam - 0.004,
+      seam + 0.004,
+      C.depth - 0.01,
+      C.depth + 0.002,
+      0.05,
+      1.85,
+      s.dark,
+    );
+    k.box(
+      seam - 0.09,
+      seam - 0.03,
+      C.depth - 0.005,
+      C.depth + 0.018,
+      0.9,
+      0.98,
+      s.metal,
+    );
+    for (const a of [-0.4, 0.1]) k.cylinder(a, d, 1.9, 2.2, 0.03, 8, s.metal);
+    k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
+    for (const a of [-0.85, 0.85]) {
+      k.box(
+        a - 0.04,
+        a + 0.04,
+        d - 0.05,
+        d + 0.05,
+        C.runH - 0.06,
+        C.runH + 0.06,
+        s.dark,
+      );
+    }
+  } else {
+    for (const [a0, a1] of [
+      [-0.88, -0.06],
+      [0.06, 0.88],
+    ] as const) {
+      k.bevelBox(a0, a1, 0, C.depth, 0, 1.7, 0.015, s.body);
+      const mid = (a0 + a1) / 2;
+      k.box(
+        mid - 0.004,
+        mid + 0.004,
+        C.depth - 0.01,
+        C.depth + 0.002,
+        0.05,
+        1.65,
+        s.dark,
+      );
+      k.cylinder(mid, d, 1.7, C.runH, 0.03, 8, s.metal);
+    }
+    k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
+  }
+}
+
+/** A regular polygon outline in the (a, h) plane, for a flat disc `extrude` faces the room with. */
+function discOutline(
+  a0: number,
+  h0: number,
+  r: number,
+  sides = 12,
+): [number, number][] {
+  return Array.from({ length: sides }, (_, i) => {
+    const t = (2 * Math.PI * i) / sides;
+    return [a0 + r * Math.cos(t), h0 + r * Math.sin(t)];
+  });
+}
+
+/** The pipe riser: the pipes' depth and its mounting strap's height. */
+const RISER = { depth: 0.12, strapH: 2.05 };
+
+/**
+ * Pipe riser: variant 0 three vertical pipes on wall brackets with flanges
+ * at `h = 0.4` and `1.8` and a hand-wheel valve on the middle one at
+ * `h = 1.2`; variant 1 two thicker pipes with a crossover pipe between them
+ * at `h = 0.9` and a glowing gauge disc on the left pipe at `h = 1.5`. A
+ * mounting strap ties the pipes to the wall at `RISER.strapH`, wide enough
+ * to reach `WIDE_REACH` on both sides (D4).
+ */
+function pipeRiser({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const R = RISER;
+  k.box(
+    -0.88,
+    0.88,
+    R.depth - 0.02,
+    R.depth + 0.02,
+    R.strapH,
+    R.strapH + 0.04,
+    s.dark,
+  );
+  if (variant === 0) {
+    for (const a of [-0.7, 0, 0.7]) {
+      k.cylinder(a, R.depth, 0, 2.2, 0.05, 10, s.metal);
+      for (const h of [0.4, 1.8]) {
+        k.cylinder(a, R.depth, h - 0.02, h + 0.02, 0.08, 10, s.dark);
+      }
+      k.box(a - 0.02, a + 0.02, 0, R.depth + 0.05, 0.88, 0.92, s.dark);
+    }
+    const pipeFront = R.depth + 0.05;
+    const ringD = pipeFront + 0.03;
+    k.ring(0, ringD, 1.2, 0.09, 0.012, 6, 10, s.metal, "inward");
+    k.box(-0.02, 0.02, pipeFront + 0.01, ringD + 0.02, 1.18, 1.22, s.dark);
+    k.cylinder(0, R.depth, 1.15, 1.25, 0.065, 8, s.dark);
+  } else {
+    for (const a of [-0.6, 0.6])
+      k.cylinder(a, R.depth, 0, 2.2, 0.07, 10, s.metal);
+    k.cylinderAlong(-0.6, 0.6, R.depth, 0.9, 0.045, 8, s.metal);
+    const pipeFront = R.depth + 0.07;
+    const gaugeFace = pipeFront + 0.04;
+    k.extrude(discOutline(-0.6, 1.5, 0.06), pipeFront, gaugeFace, s.dark);
+    k.panel(-0.64, -0.56, gaugeFace + DECAL_LIFT, 1.46, 1.54, s.glow(GREEN));
+  }
+}
+
+/** The stowage net: its posts' reach, the net's depth and the posts' band. */
+const NET = { half: 0.86, netD: 0.24, h0: 0.1, h1: 2.1 };
+
+/**
+ * Stowage net: two posts a whole edge apart with a diamond mesh of thin
+ * crossed bars strung between them, and 3 or 4 stowed items behind it.
+ * Variant 1 adds two horizontal straps and bulkier stowed items.
+ */
+function stowageNet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const N = NET;
+  for (const a of [-N.half, N.half]) {
+    k.cylinder(a, N.netD - 0.02, N.h0, N.h1, 0.025, 8, s.metal);
+    for (const h of [N.h0, N.h1]) {
+      k.box(a - 0.03, a + 0.03, 0, N.netD - 0.01, h - 0.02, h + 0.02, s.dark);
+    }
+  }
+  k.box(-N.half, N.half, 0.02, N.netD - 0.02, N.h0, N.h0 + 0.05, s.dark);
+  const rows = 4;
+  const bandH = (N.h1 - N.h0) / rows;
+  const diag = Math.atan2(bandH, 2 * N.half);
+  const length = Math.hypot(2 * N.half, bandH);
+  for (let i = 0; i < rows; i++) {
+    const cy = N.h0 + bandH * (i + 0.5);
+    toolShape(
+      k,
+      s.dark,
+      0,
+      cy,
+      diag,
+      length,
+      0.012,
+      N.netD - 0.006,
+      N.netD + 0.006,
+    );
+    toolShape(
+      k,
+      s.dark,
+      0,
+      cy,
+      -diag,
+      length,
+      0.012,
+      N.netD - 0.006,
+      N.netD + 0.006,
+    );
+  }
+  if (variant === 1) {
+    for (const h of [0.7, 1.5]) {
+      k.box(
+        -N.half,
+        N.half,
+        N.netD - 0.015,
+        N.netD + 0.015,
+        h - 0.02,
+        h + 0.02,
+        s.metal,
+      );
+    }
+  }
+  const items =
+    variant === 0
+      ? [
+          { a0: -0.62, a1: -0.28, h0: 0.15, h1: 0.75 },
+          { a0: -0.12, a1: 0.22, h0: 0.15, h1: 0.55 },
+          { a0: 0.32, a1: 0.6, h0: 0.15, h1: 0.9 },
+        ]
+      : [
+          { a0: -0.66, a1: -0.2, h0: 0.15, h1: 1.05 },
+          { a0: -0.1, a1: 0.34, h0: 0.15, h1: 0.85 },
+          { a0: 0.4, a1: 0.7, h0: 0.15, h1: 1.15 },
+          { a0: -0.3, a1: -0.02, h0: 1.05, h1: 1.35 },
+        ];
+  for (const it of items) {
+    k.bevelBox(it.a0, it.a1, 0.02, 0.22, it.h0, it.h1, 0.015, s.body);
+  }
+}
+
 /** The recipe of every wall prop kind, runs included. */
 export const WALL_RECIPES = {
   "locker-bank": lockerBank,
@@ -563,4 +895,8 @@ export const WALL_RECIPES = {
   "light-strip": lightStrip,
   "cable-tray": cableTray,
   "pipe-bundle": pipeBundle,
+  "tool-board": toolBoard,
+  "conduit-cabinet": conduitCabinet,
+  "stowage-net": stowageNet,
+  "pipe-riser": pipeRiser,
 } satisfies Record<WallPropKind, PropRecipe>;
