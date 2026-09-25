@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { lightGrid } from "../render/lightgrid";
 import { GAME_VERSION } from "../version";
 import { BAY, isFloor } from "./layout";
-import { decorFootprint, footprintOf } from "./footprints";
+import { decorFootprint, footprintOf, propFootprint } from "./footprints";
 import { blockersFor } from "./move";
 import { galleryRoom } from "./canned";
 import type {
@@ -147,9 +147,12 @@ describe("galleryRoom", () => {
   });
 
   it("lets nothing that blocks overlap anything else that blocks", () => {
+    // The gallery is undressed: no floor prop adds a blocker.
+    expect(room.props).toEqual([]);
     const boxes = [
       ...room.fixtures.map(footprintOf),
       ...room.decor.map(decorFootprint),
+      ...room.props.map(propFootprint),
     ].filter((b) => b !== null);
     expect(blockersFor(room)).toHaveLength(boxes.length);
     for (let i = 0; i < boxes.length; i++) {

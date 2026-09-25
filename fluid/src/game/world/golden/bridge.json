@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "seed": 4969199804483884,
+  "version": 3,
+  "seed": 1474239603151452,
   "domain": "station",
   "permalink": "manifest",
   "title": "Station Crystalline",
@@ -21,6 +21,12 @@
     "y0": 0,
     "x1": 7,
     "y1": 6
+  },
+  "bays": [],
+  "corridor": null,
+  "entrance": {
+    "x": 3,
+    "y": 5
   },
   "ceiling": 4.4,
   "spawn": {
@@ -58,7 +64,7 @@
         "permalink": "old-bridge"
       },
       "sealedLabel": null,
-      "seed": 1868917302888202
+      "seed": 3945860651236339
     },
     {
       "kind": "door",
@@ -75,7 +81,7 @@
         "permalink": "reactor-core"
       },
       "sealedLabel": null,
-      "seed": 442472345378148
+      "seed": 5736498266678518
     },
     {
       "kind": "portal",
@@ -91,7 +97,7 @@
       },
       "crossDomain": true,
       "sealedLabel": null,
-      "seed": 8517280116312970
+      "seed": 8564350657864169
     },
     {
       "kind": "terminal",
@@ -106,7 +112,7 @@
         "Decisions, runbooks and the odd warning about the reactor."
       ],
       "section": 0,
-      "seed": 619261139462864
+      "seed": 2510781472804312
     },
     {
       "kind": "terminal",
@@ -121,7 +127,7 @@
         "Cargo questions go through the portal to logistics."
       ],
       "section": 0,
-      "seed": 1516193241575896
+      "seed": 5259207943204841
     },
     {
       "kind": "machine",
@@ -133,7 +139,7 @@
       "machine": "containment",
       "tag": "navigation",
       "hue": 196,
-      "seed": 7940395711040613
+      "seed": 1206274509564404
     },
     {
       "kind": "machine",
@@ -145,7 +151,7 @@
       "machine": "fabricator",
       "tag": "reactor",
       "hue": 152,
-      "seed": 8041629008444292
+      "seed": 5755076367619376
     },
     {
       "kind": "hatch",
@@ -159,7 +165,7 @@
         "domain": "station",
         "permalink": "crew-handbook"
       },
-      "seed": 8186061733817658
+      "seed": 1781281134255863
     },
     {
       "kind": "poster",
@@ -172,11 +178,301 @@
       "lines": [
         "The reactor runs hot for an hour after every jump."
       ],
-      "seed": 8535066849268707
+      "seed": 6790036374806322
     }
   ],
   "decor": [],
   "scaffold": [],
+  "props": [
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 1200267460172412
+    },
+    {
+      "kind": "sign-plate",
+      "variant": 4,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2817194555060214
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 8804435152404179
+    },
+    {
+      "kind": "keycard-reader",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2732439372879637
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 5592039301943200
+    },
+    {
+      "kind": "keycard-reader",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 7278185513487768
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2567849430954135
+    },
+    {
+      "kind": "light-strip",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 0.5,
+      "turn": 1,
+      "seed": 6510771300869815
+    },
+    {
+      "kind": "light-strip",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 7,
+      "y": 0.5,
+      "turn": 3,
+      "seed": 3214697599861437
+    },
+    {
+      "kind": "extinguisher",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0,
+      "y": 1.5,
+      "turn": 1,
+      "seed": 1988428737779548
+    },
+    {
+      "kind": "light-strip",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 3.5,
+      "turn": 1,
+      "seed": 8424606828154710
+    },
+    {
+      "kind": "extinguisher",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 7,
+      "y": 4.5,
+      "turn": 3,
+      "seed": 7238002020838373
+    },
+    {
+      "kind": "light-strip",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 5.5,
+      "turn": 1,
+      "seed": 6177168825915259
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 669630369330755
+    },
+    {
+      "kind": "light-strip",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 2729718215741009
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 1.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 4398412402821368
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 3576725847611317
+    },
+    {
+      "kind": "sign-plate",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 7113353366359555
+    },
+    {
+      "kind": "crate",
+      "variant": 2,
+      "anchor": "floor",
+      "x": 6.5,
+      "y": 0.5,
+      "turn": 1,
+      "seed": 4140905444386157
+    },
+    {
+      "kind": "stool",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 0.5,
+      "y": 1.5,
+      "turn": 2,
+      "seed": 207621818426117
+    },
+    {
+      "kind": "stool",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 6.5,
+      "y": 4.5,
+      "turn": 2,
+      "seed": 5726256422500225
+    },
+    {
+      "kind": "crate",
+      "variant": 2,
+      "anchor": "floor",
+      "x": 1.5,
+      "y": 5.5,
+      "turn": 0,
+      "seed": 6124279725318152
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 6096850922754809
+    },
+    {
+      "kind": "cable-loop",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 4613106510095990
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 1737311593401343
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2622113022764495
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 6.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 6640664286645682
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 1234190892904149
+    },
+    {
+      "kind": "cable-loop",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 1.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 5084798574664765
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 1.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 4067821934942528
+    },
+    {
+      "kind": "beacon",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 5200900214491441
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 6423194859584089
+    }
+  ],
   "lights": [
     {
       "x0": 0,
@@ -185,7 +481,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 8101526731634864
+      "seed": 7666351571739203
     },
     {
       "x0": 4,
@@ -194,7 +490,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 1609555751484937
+      "seed": 6667534287569816
     },
     {
       "x0": 0,
@@ -203,7 +499,7 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 1584117278387558
+      "seed": 860357435923776
     },
     {
       "x0": 4,
@@ -212,7 +508,7 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 4422568095028690
+      "seed": 2794952394870058
     }
   ],
   "dropped": 0,

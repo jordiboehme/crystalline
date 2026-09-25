@@ -391,6 +391,19 @@ export interface RoomSpec {
   grid: string[];
   /** The main hall inside the grid; the entrance is on its south wall. */
   hall: Rect;
+  /**
+   * The overflow bays east of the hall, west to east, as `planLayout` built
+   * them; empty when the hall's walls hold everything.
+   */
+  bays: Rect[];
+  /** The backlink corridor west of the hall, or null when there is none. */
+  corridor: Rect | null;
+  /**
+   * The entrance cell, on the hall's south wall: the way in is that cell's
+   * `s` edge. The generator states it so the dressing never has to read it
+   * back from the spawn.
+   */
+  entrance: { x: number; y: number };
   /** Ceiling height in metres. */
   ceiling: number;
   /** Where the player enters: a cell, facing into the room. */
@@ -405,6 +418,11 @@ export interface RoomSpec {
    * renderer builds are read from the same boxes.
    */
   scaffold: Box[];
+  /**
+   * The set dressing (`dressRoom` in `dress.ts`): pure decoration, never
+   * data, placed after everything else so it never moves a fixture.
+   */
+  props: Prop[];
   lights: LightZone[];
   /** How many fixtures found no wall slot and were left out. */
   dropped: number;

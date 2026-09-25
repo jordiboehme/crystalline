@@ -8,6 +8,7 @@ import {
   FOOTPRINTS,
   decorFootprint,
   footprintOf,
+  propFootprint,
 } from "./footprints";
 import { generateRoom } from "./generate";
 import { BAY, isFloor } from "./layout";
@@ -22,7 +23,7 @@ import {
   type Intent,
   type Player,
 } from "./move";
-import type { Box, Decor, RoomSpec } from "./types";
+import type { Box, Decor, Prop, RoomSpec } from "./types";
 import { CELL } from "./units";
 
 const room = generateRoom(CANNED_BRIDGE);
@@ -366,6 +367,63 @@ describe("walking on the grid", () => {
     expect(FOOTPRINTS.decor["shelf-row"]).toEqual({ width: 4, depth: 0.8 });
   });
 
+  it("is blocked by a crate and not by a wall prop or a ceiling prop", () => {
+    // The bridge with nothing in it but three props on the middle column:
+    // a crate in the hall, a vent on the north wall, a beacon above it.
+    const crate: Prop = {
+      kind: "crate",
+      variant: 1,
+      anchor: "floor",
+      x: 3.5,
+      y: 2.5,
+      turn: 0,
+      seed: 1,
+    };
+    const vent: Prop = {
+      kind: "vent-grille",
+      variant: 0,
+      anchor: "wall",
+      x: 3.5,
+      y: 0,
+      turn: 2,
+      seed: 2,
+    };
+    const beacon: Prop = {
+      ...vent,
+      kind: "beacon",
+      anchor: "ceiling",
+      seed: 3,
+    };
+    const bare: RoomSpec = { ...room, fixtures: [], decor: [], props: [] };
+    const dressed: RoomSpec = { ...bare, props: [crate, vent, beacon] };
+    const box = propFootprint(crate);
+    if (box === null) throw new Error("a crate stands on the floor");
+    expect(blockersFor(dressed)).toEqual([box]);
+    expect(propFootprint(vent)).toBeNull();
+    expect(propFootprint(beacon)).toBeNull();
+    // Walking north from the spawn stops at the crate...
+    const x = 3.5 * CELL;
+    const stopped = runIn(
+      dressed,
+      at(x, 5.5 * CELL),
+      { ...idle, forward: 1 },
+      200,
+    );
+    expect(stopped.z).toBeGreaterThanOrEqual(box.z1 + PLAYER_RADIUS - 1e-6);
+    expect(stopped.z).toBeLessThanOrEqual(box.z1 + PLAYER_RADIUS + STEP);
+    // ...and from north of it the player reaches the wall under the vent.
+    const wall = runIn(
+      dressed,
+      at(x, 1.5 * CELL),
+      { ...idle, forward: 1 },
+      200,
+    );
+    expect(wall.z).toBeCloseTo(PLAYER_RADIUS, 3);
+    expect(
+      runIn(bare, at(x, 5.5 * CELL), { ...idle, forward: 1 }, 200).z,
+    ).toBeCloseTo(PLAYER_RADIUS, 3);
+  });
+
   it("is blocked by a council chair and walks under a pipe run", () => {
     const council = generateRoom({ ...CANNED_HUB, type: "decision" });
     const chair = council.decor.find((d) => d.kind === "council-chair");
@@ -605,8 +663,10 @@ describe("sliding around corners", () => {
   });
 
   it("stops head on at a wall's edge plus the radius", () => {
+    // Undressed: a floor prop may stand against this wall since GAME_VERSION 3.
+    const bare: RoomSpec = { ...hub, props: [] };
     const wall = hub.hall.x0 * CELL;
-    const p = runIn(hub, at(wall + 3, 3), { ...idle, strafe: -1 }, 60);
+    const p = runIn(bare, at(wall + 3, 3), { ...idle, strafe: -1 }, 60);
     expect(p.x).toBeCloseTo(wall + PLAYER_RADIUS, 6);
     expect(p.vx).toBeCloseTo(0, 6);
   });

@@ -11,17 +11,17 @@
  * solid square, so the walls between the hall, its bays and the backlink
  * corridor stop the player and the doorways between them let the player
  * through. The blockers are one box per free-standing thing: a terminal or
- * machine sized by its kind (`FOOTPRINTS` in `footprints.ts`), each piece of the archetype's
- * furniture turned with it, and the scaffold frames of a room under
- * construction. The grid's bounding rectangle is still clamped to as a
- * backstop. The two axes are resolved one after the other, which is what
- * lets the player slide along a wall instead of stopping dead when walking
- * into it at an angle.
+ * machine sized by its kind (`FOOTPRINTS` in `footprints.ts`), each piece
+ * of the archetype's furniture turned with it, the scaffold frames of a room
+ * under construction, and every floor prop of the set dressing. The grid's
+ * bounding rectangle is still clamped to as a backstop. The two axes are
+ * resolved one after the other, which is what lets the player slide along a
+ * wall instead of stopping dead when walking into it at an angle.
  */
 
 import { TICK_HZ } from "../core/loop";
 import { forwardOf, rightOf } from "../gl/math";
-import { decorFootprint, footprintOf } from "./footprints";
+import { decorFootprint, footprintOf, propFootprint } from "./footprints";
 import { isFloor } from "./layout";
 import type { Box, RoomSpec } from "./types";
 import { CELL } from "./units";
@@ -80,9 +80,11 @@ export function spawnPlayer(room: RoomSpec): Player {
 
 /**
  * The boxes the player collides with besides the grid: the terminals and
- * machines (`footprintOf`), the furniture (`decorFootprint`) and the
- * scaffold frames the generator put up (`room.scaffold`). Flush fixtures and
- * pipe runs are left out. Built once per room, not per tick.
+ * machines (`footprintOf`), the furniture (`decorFootprint`), the scaffold
+ * frames the generator put up (`room.scaffold`) and the floor props of the
+ * set dressing (`propFootprint`). Flush fixtures, pipe runs and the wall and
+ * ceiling props are left out: they hang on a wall or overhead. Built once
+ * per room, not per tick.
  */
 export function blockersFor(room: RoomSpec): Box[] {
   const out: Box[] = [];
@@ -95,6 +97,10 @@ export function blockersFor(room: RoomSpec): Box[] {
     if (box !== null) out.push(box);
   }
   out.push(...room.scaffold);
+  for (const p of room.props) {
+    const box = propFootprint(p);
+    if (box !== null) out.push(box);
+  }
   return out;
 }
 

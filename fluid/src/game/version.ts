@@ -8,4 +8,4 @@
  * and the golden rooms in `world/golden/` are rewritten in the same commit.
  * A generator change that moves a golden without bumping this is a bug.
  */
-export const GAME_VERSION = 2;
+export const GAME_VERSION = 3;

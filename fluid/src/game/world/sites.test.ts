@@ -4,7 +4,7 @@ import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
 import { decorFootprint, footprint, footprintOf } from "./footprints";
 import { generateRoom } from "./generate";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
-import { doorwayColumns, isFloor, wallRuns, wallSlots } from "./layout";
+import { STEP, doorwayColumns, isFloor, wallRuns, wallSlots } from "./layout";
 import { PLAYER_RADIUS } from "./move";
 import { LANE_DEPTH, LANE_WIDTH } from "./props";
 import propsSource from "./props.ts?raw";
@@ -18,7 +18,7 @@ import {
   type RoomBase,
 } from "./sites";
 import sitesSource from "./sites.ts?raw";
-import type { Box, PlaceInput, PlaceReference, Side, WallSlot } from "./types";
+import type { Box, PlaceInput, PlaceReference, WallSlot } from "./types";
 import { CELL } from "./units";
 
 /** A place with nothing in it, to be filled by `over`. */
@@ -59,13 +59,6 @@ function tags(n: number) {
   return Array.from({ length: n }, (_, i) => `tag-${String(i)}`);
 }
 
-const STEP: Record<Side, [number, number]> = {
-  n: [0, -1],
-  e: [1, 0],
-  s: [0, 1],
-  w: [-1, 0],
-};
-
 const bridge = generateRoom(CANNED_BRIDGE);
 const hub = generateRoom(CANNED_HUB);
 const empty = generateRoom(place({}));
@@ -82,7 +75,7 @@ const ROOMS: [string, RoomBase][] = [
 ];
 
 function entranceOf(room: RoomBase): WallSlot {
-  return { x: room.spawn.x, y: room.spawn.y, side: "s" };
+  return { ...room.entrance, side: "s" };
 }
 
 /** Every doorway cell: a floor cell in a doorway column. */
@@ -108,8 +101,22 @@ function isWallEdge(room: RoomBase, e: WallSlot) {
 }
 
 function bayCount(room: RoomBase) {
-  return [...doorwayColumns(room)].filter((c) => c >= room.hall.x1).length;
+  return room.bays.length;
 }
+
+describe("the layout a room states", () => {
+  it("names the doorway columns its corridor and bays open through, and the entrance at the spawn", () => {
+    for (const [name, room] of ROOMS) {
+      const want = new Set<number>();
+      if (room.corridor !== null) want.add(room.corridor.x1);
+      for (const b of room.bays) want.add(b.x0 - 1);
+      expect(doorwayColumns(room), name).toEqual(want);
+      expect(room.entrance, name).toEqual({ x: room.spawn.x, y: room.spawn.y });
+    }
+    expect(hub.corridor).not.toBeNull();
+    expect(hub.bays.length).toBeGreaterThan(0);
+  });
+});
 
 describe("wallAnchor and turnForSide", () => {
   it("anchors a prop at the middle of its wall, turned to face into the room", () => {

@@ -5,15 +5,12 @@
  * works out the places, from a room that has its fixtures, decor and
  * scaffolding but no props yet (`RoomBase`).
  *
- * A room does not carry its entrance, its bays or its corridor as fields, so
- * they are read back from what it does carry:
- * - the **entrance** is the south edge of the spawn cell, where both
- *   `generateRoom` and `galleryRoom` put the spawn (`layout.entrance`);
- * - the **bays** are the `BAY` by `BAY` rectangles east of each doorway
- *   column at or past the hall's east wall, the stepping `planLayout` builds
- *   them with;
- * - the **corridor** is everything west of the hall's doorway column, and
- *   the doorway columns themselves come from `doorwayColumns`.
+ * The room states its own layout (`RoomSpec.entrance`, `bays` and
+ * `corridor`, filled by the generator from `planLayout`), so nothing here is
+ * read back from the spawn or rebuilt from the doorway columns: the entrance
+ * edge is the `s` edge of `room.entrance`, and floor props may stand in the
+ * hall and in `room.bays`, never in the corridor or a doorway column. The
+ * doorway cells themselves are the floor cells of `doorwayColumns`.
  *
  * The rules, in the order `dressingSites` applies them:
  *
@@ -67,7 +64,7 @@
  */
 
 import { decorFootprint, footprint, footprintOf } from "./footprints";
-import { BAY, doorwayColumns, isFloor, wallRuns } from "./layout";
+import { STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import { LANE_DEPTH, LANE_WIDTH } from "./props";
 import type { Box, Rect, RoomSpec, Side, WallSlot } from "./types";
 import { CELL } from "./units";
@@ -209,7 +206,7 @@ export function dressingSites(room: RoomBase): DressingSites {
   const wallEdges = new Set(edges.map(edgeKey));
   const cols = doorwayColumns(room);
   const rects = roomRects(room);
-  const entrance: WallSlot = { x: room.spawn.x, y: room.spawn.y, side: "s" };
+  const entrance: WallSlot = { ...room.entrance, side: "s" };
 
   const fixtureEdges = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
   const noRun = new Set(fixtureEdges);
@@ -272,10 +269,9 @@ export function dressingSites(room: RoomBase): DressingSites {
   taken.push(...room.scaffold);
 
   const nextToDoorway = (x: number, y: number) =>
-    doorway.has(cellKey(x, y - 1)) ||
-    doorway.has(cellKey(x + 1, y)) ||
-    doorway.has(cellKey(x, y + 1)) ||
-    doorway.has(cellKey(x - 1, y));
+    Object.values(STEP).some(([dx, dy]) =>
+      doorway.has(cellKey(x + dx, y + dy)),
+    );
 
   const zones: DressingSites["zones"] = [];
   const zoneCells = new Set<string>();
@@ -343,15 +339,7 @@ function inside(r: Rect, x: number, y: number) {
   return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
 }
 
-/**
- * The hall and then each bay, west to east. A bay starts one column past
- * each doorway column at or east of the hall's east wall and is `BAY` cells
- * a side from row 0, as `planLayout` builds it.
- */
+/** The hall and then each bay, west to east, as the room states them. */
 function roomRects(room: RoomBase): Rect[] {
-  const bays = [...doorwayColumns(room)]
-    .filter((c) => c >= room.hall.x1)
-    .sort((a, b) => a - b)
-    .map((c) => ({ x0: c + 1, y0: 0, x1: c + 1 + BAY, y1: BAY }));
-  return [room.hall, ...bays];
+  return [room.hall, ...room.bays];
 }

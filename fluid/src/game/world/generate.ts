@@ -32,6 +32,12 @@
  *
  * The hall also gets its archetype's furniture (see `decorFor`), and the
  * grid is lit in blocks of four by four cells.
+ *
+ * 8. Last, the set dressing: `dressRoom` (`dress.ts`) reads the finished
+ *    room, fixtures, furniture and scaffolding included, and adds its props.
+ *    It runs after everything else and only ever adds decoration, so a prop
+ *    never moves a fixture, and the room states its entrance, bays and
+ *    corridor so the dressing never has to work them out again.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -44,7 +50,9 @@ import {
   planLayout,
   type SlotPref,
 } from "./layout";
+import { dressRoom } from "./dress";
 import { decorFootprint } from "./footprints";
+import type { RoomBase } from "./sites";
 import { sectionsOf } from "./sections";
 import {
   HATCH_CAP,
@@ -564,7 +572,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     });
   }
 
-  return {
+  const base: RoomBase = {
     version: GAME_VERSION,
     seed,
     domain: place.domain,
@@ -576,6 +584,9 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     depth: layout.depth,
     grid: layout.grid,
     hall: layout.hall,
+    bays: layout.bays,
+    corridor: layout.corridor,
+    entrance: { x: layout.entrance.x, y: layout.entrance.y },
     ceiling: Math.round((3 + salience * 0.2) * 100) / 100,
     spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
     fixtures,
@@ -592,5 +603,15 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     ),
     dropped,
     inboundMore,
+  };
+  // The props go right after the scaffold, so the keys (and the goldens)
+  // read fixtures, decor, scaffold, props, lights.
+  const { lights, dropped: left, inboundMore: more, ...head } = base;
+  return {
+    ...head,
+    props: dressRoom(base),
+    lights,
+    dropped: left,
+    inboundMore: more,
   };
 }

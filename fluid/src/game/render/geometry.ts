@@ -30,7 +30,7 @@
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
-import { doorwayColumns, isFloor } from "../world/layout";
+import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import { createKit } from "./kit";
@@ -279,13 +279,6 @@ export interface RoomMesh {
   movers: Mover[];
 }
 
-/** The neighbour across each side of a cell. */
-const STEP: Record<Side, readonly [number, number]> = {
-  n: [0, -1],
-  e: [1, 0],
-  s: [0, 1],
-  w: [-1, 0],
-};
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 
 /**

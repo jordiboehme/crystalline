@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import golden from "./golden/bridge.json?raw";
-import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
+import bridgeGolden from "./golden/bridge.json?raw";
+import workshopGolden from "./golden/workshop.json?raw";
+import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import {
   MACHINE_KINDS,
   archetypeFor,
@@ -57,6 +58,34 @@ describe("doorStyleFor", () => {
     expect(doorStyleFor(6)).toBe("bulkhead");
     expect(doorStyleFor(7)).toBe("blast");
     expect(doorStyleFor(10)).toBe("blast");
+  });
+});
+
+describe("the goldens", () => {
+  it("pins the workshop byte for byte", () => {
+    const room = generateRoom(CANNED_WORKSHOP);
+    expect(JSON.stringify(room, null, 2) + "\n").toBe(workshopGolden);
+  });
+
+  it("states the layout planLayout built, entrance on the spawn cell", () => {
+    for (const place of [CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP]) {
+      const room = generateRoom(place);
+      expect(room.entrance).toEqual({ x: room.spawn.x, y: room.spawn.y });
+      expect(room.entrance.y).toBe(room.hall.y1 - 1);
+    }
+    const hub = generateRoom(CANNED_HUB);
+    expect(hub.bays.length).toBeGreaterThan(0);
+    expect(hub.corridor).not.toBeNull();
+    expect(generateRoom(CANNED_BRIDGE).bays).toEqual([]);
+    expect(generateRoom(CANNED_BRIDGE).corridor).toBeNull();
+  });
+
+  it("puts props right after decor and scaffold, before the lights", () => {
+    const keys = Object.keys(generateRoom(CANNED_WORKSHOP));
+    const at = (k: string) => keys.indexOf(k);
+    expect(at("decor")).toBeLessThan(at("scaffold"));
+    expect(at("props")).toBe(at("scaffold") + 1);
+    expect(at("lights")).toBe(at("props") + 1);
   });
 });
 
@@ -127,7 +156,7 @@ describe("generateRoom on the canned bridge", () => {
   });
 
   it("matches the committed golden byte for byte", () => {
-    expect(JSON.stringify(room, null, 2) + "\n").toBe(golden);
+    expect(JSON.stringify(room, null, 2) + "\n").toBe(bridgeGolden);
   });
 
   it("covers every floor cell with exactly one light zone", () => {

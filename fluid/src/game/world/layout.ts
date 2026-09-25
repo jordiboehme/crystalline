@@ -339,8 +339,12 @@ export function wallRuns(grid: readonly string[]): WallSlot[][] {
   return runs;
 }
 
-/** The neighbour across each side of a cell. */
-const STEP: Record<Side, readonly [number, number]> = {
+/**
+ * The neighbour across each side of a cell: the grid step `[dx, dy]` from a
+ * cell to the cell on the other side of its `n`, `e`, `s` or `w` edge. The
+ * one table the layout, the dressing sites and the room mesh all step by.
+ */
+export const STEP: Record<Side, readonly [number, number]> = {
   n: [0, -1],
   e: [1, 0],
   s: [0, 1],

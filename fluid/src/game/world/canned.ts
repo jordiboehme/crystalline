@@ -14,6 +14,12 @@
  * corridor, overflow bays and a placard that names the inbound references
  * past the hatches. Nothing here is fetched.
  *
+ * `CANNED_WORKSHOP` is the middle ground the set dressing is judged on: an
+ * engineering runbook under construction whose hall is big enough for pipe
+ * runs, ducts, corner zones, wall-side floor props, scaffolding and the
+ * construction extras, and whose north wall is all doors. It is the second
+ * golden room.
+ *
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
  * model gallery: one of every model the station draws, so each can be
  * walked up to and judged without an engram that happens to need it.
@@ -108,6 +114,64 @@ export const CANNED_BRIDGE: PlaceInput = {
       category: "warning",
       content: "The reactor runs hot for an hour after every jump.",
     },
+  ],
+};
+
+/**
+ * The workshop: a mid-size engineering runbook under construction, the room
+ * the dressing pass is pinned against (the second golden, ruling 18).
+ *
+ * - **Hall.** Six relations to the located valves `valve-a` to `valve-f` fill
+ *   the north wall with doors, every one open, so each gets a keycard reader
+ *   and the extinguishers of the north run find every edge near their index
+ *   taken; that makes the hall 13 cells wide. Three `## ` sections (west) and
+ *   four tags (east) make it 10 deep, and no bay is needed.
+ * - **South wall.** Three inbound references, three hatches beside the
+ *   entrance and the placard, each with its sign plate.
+ * - **Posters.** Two observations in two categories.
+ * - **Dressing.** `runbook` is the engineering archetype (pipe bundles on the
+ *   walls, ducts on the ceiling, barrels, crates and trolleys) and `draft`
+ *   puts it under construction: two scaffold frames and the construction
+ *   extras (traffic cones, a ladder, a tool cart).
+ */
+export const CANNED_WORKSHOP: PlaceInput = {
+  domain: "station",
+  permalink: "workshop",
+  title: "Valve Workshop",
+  type: "runbook",
+  status: "draft",
+  salience: 5,
+  validFrom: null,
+  validTo: null,
+  tags: ["pressure", "valves", "tools", "safety"],
+  content: [
+    "# Valve Workshop",
+    "",
+    "## Isolate",
+    "Close the valve upstream and bleed the line.",
+    "## Replace",
+    "Swap the seat, torque the bonnet to spec.",
+    "## Test",
+    "Open slowly and watch the gauge for a minute.",
+  ].join("\n"),
+  relations: ["a", "b", "c", "d", "e", "f"].map((k) => ({
+    relType: "depends_on",
+    target: { domain: null, target: `valve-${k}` },
+    resolved: true,
+    address: { domain: "station", permalink: `valve-${k}` },
+    targetTitle: `Valve ${k.toUpperCase()}`,
+    targetSalience: 4,
+  })),
+  links: [],
+  inbound: ["boiler-room", "crew-handbook", "pump-deck"].map((permalink) => ({
+    address: { domain: "station", permalink },
+    title: permalink,
+    relType: "links_to",
+  })),
+  inboundTotal: 3,
+  observations: [
+    { category: "warning", content: "Valve C sticks when it is cold." },
+    { category: "decision", content: "Spare seats live in the east locker." },
   ],
 };
 
@@ -433,11 +497,15 @@ export function galleryRoom(): RoomSpec {
     depth: layout.depth,
     grid: layout.grid,
     hall: layout.hall,
+    bays: layout.bays,
+    corridor: layout.corridor,
+    entrance: { x: layout.entrance.x, y: layout.entrance.y },
     ceiling: 4,
     spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
     fixtures,
     decor,
     scaffold: scaffoldFor(condition, layout.hall, decor, seed),
+    props: [],
     lights,
     dropped: 0,
     inboundMore: 0,
