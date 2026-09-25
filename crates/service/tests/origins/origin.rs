@@ -497,6 +497,7 @@ async fn origin_add_connects_a_registered_domain_in_place() {
             origin: None,
             provision: None,
             review: None,
+            ..Default::default()
         },
     );
     let eng = Engine::new(
@@ -556,6 +557,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
             origin: None,
             provision: Some(false),
             review: Some(crystalline_core::config::ReviewMode::Overlay),
+            ..Default::default()
         },
     );
     let eng = Engine::new(
@@ -638,6 +640,7 @@ async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
             origin: None,
             provision: None,
             review: None,
+            ..Default::default()
         },
     );
     let eng = Engine::new(

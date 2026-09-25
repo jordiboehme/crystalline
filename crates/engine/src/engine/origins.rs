@@ -223,6 +223,7 @@ impl Engine {
                     }),
                     provision,
                     review,
+                    ..Default::default()
                 },
             );
             self.persist_config(&file)?;
