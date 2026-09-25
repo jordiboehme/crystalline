@@ -97,6 +97,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram body in its own table",
         sql: SCHEMA_V15,
     },
+    Migration {
+        version: 16,
+        label: "domain spellings",
+        sql: SCHEMA_V16,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -534,6 +539,23 @@ CREATE INDEX idx_engram_domain ON engram(domain_id);
 CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
+// Every spelling a domain answers to - its local name, its canonical name, its
+// aliases - mapped to the domain row, so the resolve pass reads the target
+// domain of a reference through one primary-key seek whatever spelling the
+// reference used. Every existing row is backfilled as its own spelling, which
+// is exactly what the resolve pass read before (`domain.name`), so nothing
+// resolves differently until a canonical name or an alias is recorded. The
+// cascade is declared for the record; this connection does not enforce foreign
+// keys, so the store deletes spellings by hand where it deletes their rows.
+const SCHEMA_V16: &str = r#"
+CREATE TABLE domain_spelling (
+    spelling TEXT PRIMARY KEY,
+    domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_domain_spelling_domain ON domain_spelling(domain_id);
+INSERT INTO domain_spelling (spelling, domain_id) SELECT name, id FROM domain;
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -553,8 +575,9 @@ CREATE TABLE attachment_blob (
 );
 "#;
 
-/// The tables cleared by `wipe()`, child rows first. `tag_alias`, `attachment`
-/// and `domain_lock` all reference `domain(id)`, so they are cleared before
+/// The tables cleared by `wipe()`, child rows first. `tag_alias`, `attachment`,
+/// `domain_lock` and `domain_spelling` all reference `domain(id)`, so they are
+/// cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes first of the
 /// three, and `engram_content` references `engram`, so it goes before it.
 pub const WIPE_TABLES: &[&str] = &[
@@ -571,6 +594,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "attachment_blob",
     "attachment",
     "domain_lock",
+    "domain_spelling",
     "domain",
 ];
 
@@ -1402,12 +1426,13 @@ mod tests {
             );
 
             // `WIPE_TABLES` has to name the new table, and every name in it has
-            // to still be a table after the swap.
+            // to still be a table after the swap. Tables a later migration
+            // creates are not there yet at v15; v16's own test checks them.
             assert!(
                 WIPE_TABLES.contains(&"engram_content"),
                 "a wipe that leaves the bodies behind leaves the whole index behind"
             );
-            for table in WIPE_TABLES {
+            for table in WIPE_TABLES.iter().filter(|t| **t != "domain_spelling") {
                 assert_eq!(
                     scalar(
                         &conn,
@@ -1460,6 +1485,88 @@ mod tests {
             hits.items.iter().any(|h| h.snippet.contains("needle")),
             "a lexical search still snippets out of the body: {:?}",
             hits.items
+        );
+    }
+
+    /// v16 against domains written before it: every existing domain row comes
+    /// out of the migration as its own spelling, so a reference by local name
+    /// resolves through `domain_spelling` from the first statement after the
+    /// upgrade, before any sync has run. Then a store opened on the file reads
+    /// the backfilled rows back through the trait.
+    #[tokio::test]
+    async fn v16_backfills_every_domain_as_its_own_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            for m in &MIGRATIONS[..15] {
+                conn.execute_batch(m.sql).await.unwrap();
+            }
+            assert_eq!(MIGRATIONS[15].version, 16, "the sixteenth migration is v16");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migration \
+                 (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);\n\
+                 INSERT INTO schema_migration(version, applied_at) VALUES (15,'2026-09-25T00:00:00Z');\n\
+                 INSERT INTO domain(id, name, path) VALUES (3,'eng','/tmp/eng'),(5,'ops','/tmp/ops');\n",
+            )
+            .await
+            .unwrap();
+
+            conn.execute_batch(MIGRATIONS[15].sql).await.unwrap();
+            conn.execute_batch(
+                "INSERT INTO schema_migration(version, applied_at) \
+                 VALUES (16,'2026-09-25T00:00:00Z');",
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                scalar(
+                    &conn,
+                    "SELECT COUNT(*) FROM domain_spelling s JOIN domain d \
+                     ON d.id=s.domain_id AND d.name=s.spelling"
+                )
+                .await,
+                2,
+                "both domain rows are backfilled as their own spelling"
+            );
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM domain_spelling").await,
+                2,
+                "and nothing else"
+            );
+            for table in WIPE_TABLES {
+                assert_eq!(
+                    scalar(
+                        &conn,
+                        &format!(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                        ),
+                    )
+                    .await,
+                    1,
+                    "wipe names a table that exists at v16: {table}"
+                );
+            }
+            let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);
+            assert!(
+                at("domain_spelling").is_some() && at("domain_spelling") < at("domain"),
+                "the spellings are wiped before the domains they point at"
+            );
+        }
+
+        let store = crate::TursoStore::open(&path).await.unwrap();
+        assert_eq!(
+            crate::Store::domain_spellings(&store).await.unwrap(),
+            vec![
+                ("eng".to_string(), crate::DomainId(3)),
+                ("ops".to_string(), crate::DomainId(5)),
+            ],
+            "the backfill reads back through the store"
         );
     }
 

@@ -96,6 +96,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram body in its own table",
         sql: SCHEMA_V14,
     },
+    Migration {
+        version: 15,
+        label: "domain spellings",
+        sql: SCHEMA_V15,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -452,6 +457,22 @@ END $$;
 ALTER TABLE engram DROP COLUMN IF EXISTS content;
 "#;
 
+// Every spelling a domain answers to - its local name, its canonical name, its
+// aliases - mapped to the domain row; the Turso v16 twin. Written to replay
+// cleanly (`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`) because the ledger stamp
+// below is a separate statement, as v14 is. On a shared index the backfill
+// covers every instance's rows, which is right: each row is its own name
+// whichever instance registered it.
+const SCHEMA_V15: &str = r#"
+CREATE TABLE IF NOT EXISTS domain_spelling (
+    spelling TEXT PRIMARY KEY,
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_domain_spelling_domain ON domain_spelling(domain_id);
+INSERT INTO domain_spelling (spelling, domain_id) SELECT name, id FROM domain
+ON CONFLICT (spelling) DO NOTHING;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -472,8 +493,8 @@ CREATE TABLE attachment_blob (
 "#;
 
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
-/// keys are satisfied at every step. `tag_alias`, `attachment` and
-/// `domain_lock` all reference `domain(id)`, so they are cleared before
+/// keys are satisfied at every step. `tag_alias`, `attachment`, `domain_lock`
+/// and `domain_spelling` all reference `domain(id)`, so they are cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes first of the
 /// three, and `engram_content` references `engram`, so it goes before it.
 pub const WIPE_TABLES: &[&str] = &[
@@ -490,6 +511,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "attachment_blob",
     "attachment",
     "domain_lock",
+    "domain_spelling",
     "domain",
 ];
 
@@ -921,6 +943,78 @@ mod tests {
         assert!(
             WIPE_TABLES.contains(&"engram_content"),
             "a wipe that leaves the bodies behind fails on the foreign key"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// v15 against domains written before it: every existing domain row is
+    /// backfilled as its own spelling, and a second application is a no-op
+    /// rather than a failure, since the ledger stamp is a separate statement
+    /// here and a crash between the two replays the step.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set.
+    #[tokio::test]
+    async fn v15_backfills_every_domain_as_its_own_spelling() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig15_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        for m in &MIGRATIONS[..14] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[14].version, 15, "the fifteenth migration is v15");
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path) VALUES ('eng','/tmp/eng'),('ops','/tmp/ops')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[14].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATIONS[14].sql)
+            .execute(&mut conn)
+            .await
+            .expect("v15 applies twice");
+
+        let own: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM domain_spelling s JOIN domain d \
+             ON d.id=s.domain_id AND d.name=s.spelling",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            own.0, 2,
+            "both domain rows are backfilled as their own spelling"
+        );
+        let all: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM domain_spelling")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(all.0, 2, "and nothing else, even after the replay");
+
+        let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);
+        assert!(
+            at("domain_spelling").is_some() && at("domain_spelling") < at("domain"),
+            "the spellings are wiped before the domains they point at, or the foreign key refuses"
         );
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

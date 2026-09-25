@@ -1016,7 +1016,47 @@ impl Store for PostgresStore {
         .fetch_one(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
+        // The row answers to its own name. A spelling another domain already
+        // holds is left with it; the name table's refresh settles precedence.
+        // No transaction of its own: a sync may already be inside one.
+        sqlx::query(
+            "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+             ON CONFLICT(spelling) DO NOTHING",
+        )
+        .bind(name)
+        .bind(row.0)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
         Ok(DomainId(row.0))
+    }
+
+    async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT spelling, domain_id FROM domain_spelling ORDER BY spelling COLLATE \"C\"",
+        )
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(spelling, id)| (spelling, DomainId(id)))
+            .collect())
+    }
+
+    async fn insert_domain_spelling_for_test(&self, spelling: &str, id: DomainId) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+             ON CONFLICT(spelling) DO NOTHING",
+        )
+        .bind(spelling)
+        .bind(id.0)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
     }
 
     async fn domain_id(&self, name: &str) -> Result<Option<DomainId>> {
@@ -1165,6 +1205,10 @@ impl Store for PostgresStore {
             "DELETE FROM attachment_blob WHERE attachment_id IN \
              (SELECT id FROM attachment WHERE domain_id=$1)",
             "DELETE FROM attachment WHERE domain_id=$1",
+            // Every spelling but the row's own name, which stays with the row.
+            // The declared cascade never fires: the row is kept.
+            "DELETE FROM domain_spelling WHERE domain_id=$1 \
+             AND spelling <> (SELECT name FROM domain WHERE id=$1)",
         ] {
             sqlx::query(sql)
                 .bind(domain.0)

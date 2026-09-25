@@ -97,20 +97,28 @@ pub struct ObservationRecord {
 /// there, and - only when the row names a domain nobody registered - the whole
 /// bracket text as a permalink and then a title in the row's OWN domain.
 ///
+/// "Target domain" and "registered" both mean a row of `domain_spelling`: a
+/// reference may name its domain by the local name, the canonical name its
+/// MANIFEST declares or a former name, and every one of those that resolves
+/// is recorded there against the domain row. Every domain row is at least its
+/// own name, so a reference by local name reads what it read when this
+/// consulted `domain.name` directly; the lookup is a primary-key seek either
+/// way.
+///
 /// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
 /// reachable. The parser splits that into a domain and a target exactly as it
 /// splits `ops:Runbook`, because nothing inside the brackets says which it is,
-/// and only the registry can settle it. It stays a second question rather than
+/// and only the spelling table can settle it. It stays a second question rather than
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
 /// true, so it resolves exactly as it did before until its engram is reindexed.
 pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
     let target_domain = format!(
-        "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
+        "COALESCE((SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain), {table}.domain_id)"
     );
     let unregistered = format!(
         "{table}.to_domain IS NOT NULL \
-         AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
+         AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = {table}.to_domain)"
     );
     // The tie-break itself: a bare `LIMIT 1` with no secondary sort key leaves
     // a tie between two candidate rows unpinned, and the row it hands back
@@ -1673,7 +1681,9 @@ pub trait Store: Send + Sync {
 
     /// Register or update a domain by name, root path and kind, returning its
     /// id. A file domain passes `Some(path)`; a virtual domain passes `None`,
-    /// since its engrams live in the database with no filesystem root.
+    /// since its engrams live in the database with no filesystem root. The name
+    /// is recorded as one of the domain's spellings too, unless another domain
+    /// already holds that spelling.
     async fn upsert_domain(
         &self,
         name: &str,
@@ -1691,6 +1701,19 @@ pub trait Store: Send + Sync {
     /// without registering a domain on the way - and has to stay answerable on
     /// a read-only instance, where a write is refused outright.
     async fn domain_id(&self, name: &str) -> Result<Option<DomainId>>;
+
+    /// Every recorded spelling of every domain with the id it resolves to,
+    /// sorted byte-wise by spelling. The resolve pass reads the same table to
+    /// find the domain a reference names; each domain row is at least its own
+    /// name, which [`Store::upsert_domain`] records with the row.
+    #[doc(hidden)]
+    async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>>;
+
+    /// Record one extra spelling for a domain, leaving a spelling some domain
+    /// already holds as it is. A test seam until the store can replace a
+    /// domain's spellings from the name table.
+    #[doc(hidden)]
+    async fn insert_domain_spelling_for_test(&self, spelling: &str, id: DomainId) -> Result<()>;
 
     /// The recorded file stamps for a domain, keyed by domain-relative path.
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>>;
@@ -1728,6 +1751,11 @@ pub trait Store: Send + Sync {
     /// keeping the domain row itself. The scoped clear behind `domain remove`
     /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
     /// everything.
+    ///
+    /// The domain's spellings go too, all but its own name: the row stays and
+    /// still answers to that, while a canonical name or former name left behind
+    /// would keep resolving references to a domain nobody registers and would
+    /// hold the spelling against the next domain that claims it.
     ///
     /// A reindex does not use this, and deliberately: `--full` re-reads and
     /// re-upserts instead, so rows a reader is using are never absent between

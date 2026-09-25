@@ -1096,7 +1096,43 @@ impl Store for TursoStore {
             vec![Value::Text(name.to_string())],
         )
         .await?;
+        // The row answers to its own name. A spelling another domain already
+        // holds is left with it; the name table's refresh settles precedence.
+        // No transaction of its own: a sync may already be inside one.
+        self.conn
+            .execute(
+                "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                 ON CONFLICT(spelling) DO NOTHING",
+                vec![Value::Text(name.to_string()), Value::Integer(id)],
+            )
+            .await?;
         Ok(DomainId(id))
+    }
+
+    async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
+        // TEXT sorts byte-wise here, the order the Postgres twin pins itself to
+        // with an explicit `COLLATE "C"`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT spelling, domain_id FROM domain_spelling ORDER BY spelling",
+            Vec::new(),
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Some((cell_text(r, 0)?, DomainId(cell_i64(r, 1)?))))
+            .collect())
+    }
+
+    async fn insert_domain_spelling_for_test(&self, spelling: &str, id: DomainId) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                 ON CONFLICT(spelling) DO NOTHING",
+                vec![Value::Text(spelling.to_string()), Value::Integer(id.0)],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn domain_id(&self, name: &str) -> Result<Option<DomainId>> {
@@ -1239,6 +1275,9 @@ impl Store for TursoStore {
             "DELETE FROM attachment_blob WHERE attachment_id IN \
              (SELECT id FROM attachment WHERE domain_id=?1)",
             "DELETE FROM attachment WHERE domain_id=?1",
+            // Every spelling but the row's own name, which stays with the row.
+            "DELETE FROM domain_spelling WHERE domain_id=?1 \
+             AND spelling <> (SELECT name FROM domain WHERE id=?1)",
         ] {
             self.conn.execute(sql, did.clone()).await?;
         }
@@ -3102,6 +3141,18 @@ mod tests {
                     "SEARCH {table} USING INDEX idx_{table}_unresolved"
                 )),
                 "the {table} pass itself stays bounded by the unresolved index, \
+                 plan was: {plan}"
+            );
+            // The target domain is read through the spelling table, and that
+            // read is a seek on its primary key in every arm, never a pass
+            // over the table.
+            assert!(
+                plan.contains("SEARCH s USING INDEX sqlite_autoindex_domain_spelling_1"),
+                "the {table} resolve pass must seek the spelling key, plan was: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN domain_spelling") && !plan.contains("SCAN s "),
+                "no arm of the {table} resolve pass may scan the spelling table, \
                  plan was: {plan}"
             );
         }

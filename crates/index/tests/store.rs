@@ -662,6 +662,171 @@ parity!(
     reference_match_tie_break_prefers_the_lower_id
 );
 
+/// Every domain row answers to its own name through `domain_spelling`, which is
+/// what keeps resolution by local name independent of the engine: the store
+/// records the spelling itself when it records the domain. An upsert of a name
+/// it already knows adds nothing, and a wipe that takes the table away gets the
+/// spelling back from the next upsert of the domain.
+async fn a_new_domain_row_is_its_own_spelling(store: &dyn Store) {
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "the new row is its own spelling"
+    );
+
+    let again = store
+        .upsert_domain("eng", Some("/tmp/eng2"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(again, eng, "the same name keeps its id");
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "a second upsert of the same name adds no second spelling"
+    );
+
+    let notes = store
+        .upsert_domain("notes", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng), ("notes".to_string(), notes)],
+        "a virtual domain is its own spelling too, and the read is sorted"
+    );
+
+    store.wipe().await.unwrap();
+    assert!(
+        store.domain_spellings().await.unwrap().is_empty(),
+        "a wipe clears the spellings with the domains they point at"
+    );
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "and the sync that re-creates the row restores its own name"
+    );
+}
+parity!(
+    a_new_domain_row_is_its_own_spelling_on_both_backends,
+    a_new_domain_row_is_its_own_spelling
+);
+
+/// A reference that names its target domain by a spelling other than the
+/// domain's local name - a canonical name or an alias - resolves once that
+/// spelling is recorded. Before it is, `eng` names no domain at all, so the
+/// link stays pending (the fallback reading of the whole bracket text as a
+/// permalink in `ops` finds nothing either); after it, the resolve pass reads
+/// the target domain through the spelling table and lands on the runbook.
+async fn a_reference_spelled_by_an_extra_spelling_resolves(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "See [[eng:runbook]] before paging.\n",
+        ),
+    );
+    sync_domain(store, "eng-knowledge", eng_dir.path())
+        .await
+        .unwrap();
+    let synced = sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    assert_eq!(
+        synced.links_resolved, 0,
+        "`eng` is nobody's spelling yet, so the link stays pending"
+    );
+
+    let eng = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    store
+        .insert_domain_spelling_for_test("eng", eng)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "the extra spelling reaches the domain the link means"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let runbook = store
+        .lookup_id("eng-knowledge", "runbook")
+        .await
+        .unwrap()
+        .unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == runbook),
+        "the resolved link is an edge to the runbook: {slice:?}"
+    );
+}
+parity!(
+    a_reference_spelled_by_an_extra_spelling_resolves_on_both_backends,
+    a_reference_spelled_by_an_extra_spelling_resolves
+);
+
+/// `clear_domain` is the store path behind `domain remove` and the orphan
+/// sweep, and it keeps the domain row by design, so the declared cascade never
+/// fires on either backend. The extra spellings go with the clear anyway: a
+/// removed domain's canonical name or alias left behind would still resolve to
+/// it and would keep that spelling from any domain registered under it later.
+/// Its own name stays, because the row stays and every row answers to its name.
+async fn a_removed_domain_takes_its_spellings_along(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let kept = store
+        .upsert_domain("kept", Some("/tmp/kept"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .insert_domain_spelling_for_test("gone-canonical", gone)
+        .await
+        .unwrap();
+    store
+        .insert_domain_spelling_for_test("gone-former", gone)
+        .await
+        .unwrap();
+    store
+        .insert_domain_spelling_for_test("kept-former", kept)
+        .await
+        .unwrap();
+
+    store.clear_domain(gone).await.unwrap();
+
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("gone".to_string(), gone),
+            ("kept".to_string(), kept),
+            ("kept-former".to_string(), kept),
+        ],
+        "the cleared domain keeps only its own name; the other domain keeps all of its spellings"
+    );
+}
+parity!(
+    a_removed_domain_takes_its_spellings_along_on_both_backends,
+    a_removed_domain_takes_its_spellings_along
+);
+
 /// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
 /// mentioned in prose (no relation type) stays unresolved until its target
 /// appears, then resolves on the later sync into a `links_to` graph edge. This
