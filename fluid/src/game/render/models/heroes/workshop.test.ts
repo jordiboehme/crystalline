@@ -4,9 +4,10 @@
  * tops lie on an upward face of their mesh; the core wall's lamps cover
  * all eight twinkle groups and never overlap; the big gun, taken from the
  * built rack and bench, is the same parts only moved; the tube bench's
- * three tubes meet at one round hub, two arms up and the stem down; and no
- * part of any workshop hero floats: each stands on the floor, on its wall
- * or on another part.
+ * three tubes meet at one round hub, two arms up and the stem down; the
+ * field pack's chase climbs its cell one light per group and runs round
+ * its cyclotron in ring order; and no part of any workshop hero floats:
+ * each stands on the floor, on its wall or on another part.
  */
 
 import { describe, expect, it } from "vitest";
@@ -263,6 +264,45 @@ describe("workshop hero models", () => {
     const hubH = (hb.lo[1] + hb.hi[1]) / 2;
     expect(tubes.filter((t) => t.hi[1] > hubH + 0.05)).toHaveLength(2);
     expect(tubes.filter((t) => t.lo[1] < hubH - 0.05)).toHaveLength(1);
+  });
+
+  it("runs the field pack's chase up the cell and round the cyclotron", () => {
+    const centre = (p: Part) => {
+      const b = shape(p.points);
+      return [(b.lo[0] + b.hi[0]) / 2, (b.lo[1] + b.hi[1]) / 2] as const;
+    };
+    const group = (p: Part) => p.flag - FLAG.blink;
+    for (let v = 0; v < HERO_CATALOGUE["field-pack"].variants; v++) {
+      const lights = partsOf("field-pack", v).filter(blinks);
+      // The cell: one light per group, 0 at the bottom to 7 at the top.
+      const cell = lights
+        .filter((p) => p.method === "panel")
+        .sort((p, q) => centre(p)[1] - centre(q)[1]);
+      expect(cell.map(group), `v${String(v)}`).toEqual([
+        0, 1, 2, 3, 4, 5, 6, 7,
+      ]);
+      // The cyclotron: four lenses on groups 0, 2, 4 and 6, each the next
+      // quarter round the ring in the same direction.
+      const ring = lights
+        .filter((p) => p.method === "extrude")
+        .sort((p, q) => group(p) - group(q));
+      expect(ring.map(group), `v${String(v)}`).toEqual([0, 2, 4, 6]);
+      const cs = ring.map(centre);
+      const mid = [0, 1].map(
+        (k) => cs.reduce((n, c) => n + (c[k] ?? 0), 0) / cs.length,
+      );
+      const angles = cs.map((c) =>
+        Math.atan2(c[1] - (mid[1] ?? 0), c[0] - (mid[0] ?? 0)),
+      );
+      const steps = angles.map((a, i) => {
+        const next = angles[(i + 1) % angles.length] ?? a;
+        const d = (((next - a) % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI);
+        return d - Math.PI;
+      });
+      const first = steps[0] ?? 0;
+      expect(Math.abs(Math.abs(first) - Math.PI / 2)).toBeLessThan(1e-6);
+      for (const step of steps) expect(step).toBeCloseTo(first, 6);
+    }
   });
 
   it("stands every part on the floor, its wall or another part", () => {
