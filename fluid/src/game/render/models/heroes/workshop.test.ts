@@ -19,6 +19,7 @@ import { FLAG, createBuilder, type MeshData, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import {
+  closestOnTriangle,
   positions,
   placeMesh,
   reaches,
@@ -104,6 +105,37 @@ function upwardFaceAt(mesh: MeshData, x: number, z: number, h: number) {
     if (s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9)) return true;
   }
   return false;
+}
+
+/**
+ * How close two parts must come to count as touching in the float test:
+ * a little over `DECAL_LIFT`, so a light or decal on its face counts, and
+ * well under `reaches`' 3 cm, so a 1.5 cm gap under a shelf or a pack
+ * does not.
+ */
+const TOUCH = 0.012;
+
+/**
+ * Whether two parts touch: their bounds overlap with some volume (a sleeve
+ * round a barrel, a part sunk into another), or a vertex of one lies
+ * within `TOUCH` of a triangle of the other.
+ */
+function touching(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (axes.some((k) => p.lo[k] > q.hi[k] + TOUCH || q.lo[k] > p.hi[k] + TOUCH))
+    return false;
+  if (axes.every((k) => p.lo[k] < q.hi[k] - 1e-6 && q.lo[k] < p.hi[k] - 1e-6))
+    return true;
+  const near = (from: Shape, to: Shape) => {
+    for (let t = 0; t + 2 < to.points.length; t += 3) {
+      const [a, b, c] = [to.points[t], to.points[t + 1], to.points[t + 2]];
+      if (!a || !b || !c) continue;
+      for (const v of from.points)
+        if (gap(v, closestOnTriangle(v, a, b, c)) <= TOUCH) return true;
+    }
+    return false;
+  };
+  return near(p, q) || near(q, p);
 }
 
 /** The workshop kinds, each tested in every variant. */
@@ -235,6 +267,7 @@ describe("workshop hero models", () => {
 
   it("stands every part on the floor, its wall or another part", () => {
     const f = frameAt([0, 0, 0], 0);
+    const loose: string[] = [];
     for (const kind of WORKSHOP_KINDS)
       for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++) {
         const parts = partsOf(kind, v).filter((p) => p.points.length > 0);
@@ -249,19 +282,17 @@ describe("workshop hero models", () => {
           changed = false;
           shapes.forEach((s, i) => {
             if (held[i]) return;
-            if (
-              shapes.some((o, j) => held[j] && (reaches(s, o) || reaches(o, s)))
-            ) {
+            if (shapes.some((o, j) => held[j] && touching(s, o))) {
               held[i] = true;
               changed = true;
             }
           });
         }
-        const loose = parts
-          .map((p, i) => ({ p, i }))
-          .filter(({ i }) => !held[i])
-          .map(({ p, i }) => `${String(i)}:${p.method}`);
-        expect(loose, `${kind} ${String(v)}`).toEqual([]);
+        parts.forEach((p, i) => {
+          if (!held[i])
+            loose.push(`${kind} ${String(v)} ${String(i)}:${p.method}`);
+        });
       }
+    expect(loose).toEqual([]);
   });
 });
