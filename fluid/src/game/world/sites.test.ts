@@ -18,6 +18,7 @@ import {
   SHEET_LANE_DEPTH,
   SHEET_LANE_WIDTH,
 } from "./props";
+import lampsSource from "./lamps.ts?raw";
 import propsSource from "./props.ts?raw";
 import {
   dressingSites,
@@ -624,9 +625,26 @@ describe("span lines", () => {
 describe("the generator side's imports (ruling 20)", () => {
   // `interact.ts` imports `./generate`, and `CELL` comes from `./units`,
   // never from `./generate`, so none of the three may be reached from here.
-  it("keeps sites.ts and props.ts away from move, generate and interact", () => {
-    for (const source of [sitesSource, propsSource]) {
-      expect(source).not.toMatch(/from\s+["']\.\/(move|generate|interact)["']/);
+  // The pattern catches `from "..."`, a bare `import "..."` and a dynamic
+  // `import("...")`, of the three modules and of anything under `render/`.
+  it("keeps sites.ts, props.ts and lamps.ts away from move, generate, interact and render", () => {
+    for (const source of [sitesSource, propsSource, lampsSource]) {
+      expect(source).not.toMatch(
+        /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact)|\.\.\/render(?:\/[^"']*)?)["']/,
+      );
     }
+  });
+
+  it("catches every import form the guard is meant to", () => {
+    const guard =
+      /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact)|\.\.\/render(?:\/[^"']*)?)["']/;
+    for (const line of [
+      'import { x } from "./move";',
+      'import "../render/geometry";',
+      'const m = import("../render");',
+      "import { y } from '../render/geometry';",
+    ])
+      expect(line).toMatch(guard);
+    expect('import { z } from "./moves";').not.toMatch(guard);
   });
 });

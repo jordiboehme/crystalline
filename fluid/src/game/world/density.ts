@@ -6,11 +6,15 @@
  *
  * What each number means, and which test pins it (`dress.test.ts`,
  * `describe("density measure")`, over 60 workshop seeds in every
- * archetype):
+ * archetype unless a line says otherwise):
  *
  * - `floorPer100`, floor props per 100 floor cells of the hall and the
- *   bays: at most 14 in every large dressed room ("keeps every dressed room
- *   at or under 14 floor props per 100 floor cells").
+ *   bays: at most 16 in every large dressed room, checked on the canned
+ *   workshop and hub in every archetype and condition, the canned bridge
+ *   (never large), all 300 seed rooms and the over-cap room ("keeps every
+ *   large dressed room at or under 16 floor props per 100 floor cells").
+ *   The same measure has floors: at least 6 summed over the seeds, and at
+ *   least 5 in the clean canned hub of every archetype.
  * - `wallSideProps / wallSideSpots`, the floor props standing in a
  *   wall-side spot per spot, summed over the seeds: at least 0.07 and at
  *   most 0.35 ("puts at least 0.07 floor props per wall-side spot").

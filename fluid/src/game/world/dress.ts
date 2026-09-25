@@ -38,12 +38,11 @@
  *    centred on its cell; a wall-side spot's is backed to its wall, facing
  *    away from it (`turnForSide`), its centre `WALL_GAP + depth / 2` metres
  *    off a bare wall and `SCREEN_GAP + depth / 2` off a screen. A prop is
- *    accepted when its `propFootprint`
- *    fits the floor, overlaps no lane, no taken box and no floor box placed
- *    before, and its cell has no floor prop yet. Every spot's draws come
- *    from `createRng` of its own seed, `seedFor(roomSeed, "prop", cx, cy,
- *    "floor")`: the kind when it is picked, then the variant, then the turn
- *    of a zone spot.
+ *    accepted when its `propFootprint` fits the floor, overlaps no lane, no
+ *    taken box and no floor box placed before, and its cell has no floor
+ *    prop yet. Every spot's draws come from `createRng` of its own seed,
+ *    `seedFor(roomSeed, "prop", cx, cy, "floor")`: the kind when it is
+ *    picked, then the variant, then the turn of a zone spot.
  * 6. Condition extras (ruling 12): `createRng(seedFor(roomSeed, "extras",
  *    condition))` draws each rule's count in `EXTRAS` order. Each floor
  *    extra goes to the first spot of step 5 in floor-seed order that
@@ -52,8 +51,8 @@
  *    10.
  * 7. Corner zones: each zone takes `1` prop on a bridge, otherwise `1 +
  *    (seedFor(roomSeed, "prop-zone", key) % 2)`. Its remaining spots are
- *    walked in seed order, each drawing a kind weighted
- *    over the palette's floor picks that are not wall-backed (`zonePicks`),
+ *    walked in seed order, each drawing a kind weighted over the palette's
+ *    floor picks that are not wall-backed (`zonePicks`),
  *    a variant and a turn, until that many are placed or the spots run
  *    out, so a cramped zone gets fewer.
  * 8. Wall-side cells: every remaining wall-side spot of step 5 draws a
@@ -74,7 +73,14 @@
  *    `CLUSTER_CLEAR` (1.0 m) on every side overlaps no taken box and no
  *    floor prop outside its own cluster, so every gap between a cluster
  *    and anything solid is wide enough to walk through. Members of one
- *    cluster may stand side by side, never overlapping.
+ *    cluster may stand side by side, never overlapping. The floor props
+ *    the ring is held against are a snapshot of the floor boxes taken
+ *    before the block's first member, so a cluster's own members are left
+ *    out. Today that check never binds: the other clusters' inner cells,
+ *    and the cells of the zone and wall-side props outside the band, all
+ *    lie at least 2 cells away. It is a future-proofing guard, kept so that a
+ *    later step or a smaller block cannot bring a floor prop within 1.0 m
+ *    of a cluster unnoticed.
  * 10. Ceiling, anchored at wall points like a wall prop: the ceiling run
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
  *     `ceiling-<side>`; under each ceiling tray segment a cable loop when
@@ -121,8 +127,8 @@
  *
  * This is the generator side: it imports `props.ts`, `sites.ts`,
  * `footprints.ts`, `types.ts`, `units.ts` and the seeds, and never
- * `move.ts`, `generate.ts` or `interact.ts` (ruling 20). `dress.test.ts`
- * keeps it so.
+ * `move.ts`, `generate.ts`, `interact.ts` or anything under `render/`
+ * (ruling 20). `dress.test.ts` keeps it so.
  */
 
 import { createRng, seedFor, type Rng } from "../core/seed";
@@ -505,6 +511,8 @@ export function dressCandidates(
     if (!rng.chance(CLUSTER_SHARE)) continue;
     const size = rng.int(CLUSTER_MIN, CLUSTER_MAX);
     // Every floor prop not in this cluster: its members are placed after.
+    // A future-proofing guard; today no floor prop outside the cluster comes
+    // within the ring (see step 9 of the module doc).
     const outside = [...floorBoxes];
     const clusterSeed = (s: FloorSpot) => propSeed(s.cx, s.cy, "cluster");
     let placed = 0;
