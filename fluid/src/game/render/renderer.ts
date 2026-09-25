@@ -220,7 +220,7 @@ export function createRenderer(
   const view = mat4();
   const viewProjection = mat4();
   const palette = new Float32Array(C64_PALETTE.flatMap((c) => [...c]));
-  // The static room and the door movers leave the instance attributes
+  // The static room and the movers leave the instance attributes
   // disabled, so they read these generic values: offset 0 and turn 0.
   gl.vertexAttrib3f(INSTANCE_OFFSET_LOCATION, 0, 0, 0);
   gl.vertexAttrib2f(INSTANCE_TURN_LOCATION, 0, 0);

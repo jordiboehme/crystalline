@@ -80,11 +80,10 @@ const TURN_TABLE = [0, 1, 2, 3]
  * faces; a uniform scale does not change a normal's direction. The moved
  * world position goes on for the distance and light-grid lookups, and
  * layer, tint and flag go through flat so a triangle never blends between
- * two surfaces. The flag is
- * rounded to an int once here, so the fragment shader compares whole
- * numbers. The fragment shader is unchanged by instancing, so the light
- * grid, the bands, the grime, the edge lines and the dither apply to props
- * as to everything else.
+ * two surfaces. The flag is rounded to an int once here, so the fragment
+ * shader compares whole numbers. The fragment shader is unchanged by
+ * instancing, so the light grid, the bands, the grime, the edge lines and
+ * the dither apply to props as to everything else.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;
