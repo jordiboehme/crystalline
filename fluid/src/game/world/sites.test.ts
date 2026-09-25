@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import {
+  CANNED_BRIDGE,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
+  galleryRoom,
+} from "./canned";
 import { decorFootprint, footprint, footprintOf } from "./footprints";
 import { generateRoom } from "./generate";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
@@ -548,6 +553,38 @@ describe("the interior band and large halls", () => {
       [5, 12],
     ] as const)
       expect(isLargeHall(hall(w, d))).toBe(false);
+  });
+});
+
+describe("cluster blocks", () => {
+  it("tiles the workshop band into two blocks with 2 by 2 inner cells", () => {
+    const blocks = dressingSites(generateRoom(CANNED_WORKSHOP)).clusterBlocks;
+    expect(blocks.map((b) => b.key)).toEqual(["2,2", "6,2"]);
+    expect(blocks.map((b) => [b.x, b.y])).toEqual([
+      [2, 2],
+      [6, 2],
+    ]);
+    expect(blocks[0]?.cells.map((c) => [c.cx, c.cy])).toEqual([
+      [3, 3],
+      [4, 3],
+      [3, 4],
+      [4, 4],
+    ]);
+    for (const b of blocks)
+      for (const c of b.cells) {
+        expect(c.wall).toBeNull();
+        expect(c.zone).toBeNull();
+      }
+  });
+  it("tiles the hub band into 25 blocks", () => {
+    expect(dressingSites(generateRoom(CANNED_HUB)).clusterBlocks).toHaveLength(
+      25,
+    );
+  });
+  it("gives a small hall none", () => {
+    expect(dressingSites(generateRoom(CANNED_BRIDGE)).clusterBlocks).toEqual(
+      [],
+    );
   });
 });
 

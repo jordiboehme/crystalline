@@ -13,10 +13,10 @@
  *   it, so nothing may stand in front of it) and whether it is a ceiling
  *   span that crosses the hall rather than hugging a wall;
  * - `PALETTES`, the weighted picks each archetype draws free wall edges,
- *   floor spots and runs from, plus `FILLER`, a low weight given to a few
- *   utility kinds in every archetype's wall palette so a palette with few
- *   wall entries (the archive's signs) does not read as a shop of one thing
- *   (ruling 8);
+ *   floor spots, mid-hall clusters and runs from, plus `FILLER`, a low
+ *   weight given to a few utility kinds in every archetype's wall palette
+ *   so a palette with few wall entries (the archive's signs) does not read
+ *   as a shop of one thing (ruling 8);
  * - `EXTRAS`, the condition-only kinds and their counts (ruling 12): they
  *   are placed before the regular floor props, on the same floor spots, and
  *   a regular palette never draws one of them, which is why the `extra`
@@ -26,7 +26,8 @@
  *   the fume cabinet still sits in a regular palette;
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
- *   `LANE_WIDTH` and `LANE_DEPTH`.
+ *   `LANE_WIDTH`, `LANE_DEPTH` and the cluster constants (`CLUSTER_BLOCK`,
+ *   `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
  * pictograms (ruling 13).
@@ -90,6 +91,12 @@ export interface Palette {
   cornerMax: 1 | 2;
   /** Chance a free wall-side cell gets a floor prop. */
   wallSide: number;
+  /**
+   * Weighted picks for the members of a mid-hall cluster (D6): plain floor
+   * kinds, never an extra and never a wall-backed kind, since a cluster
+   * stands in the open, away from every wall.
+   */
+  cluster: readonly (readonly [FloorPropKind, number])[];
 }
 
 /** How many of a condition's extra kind to place, drawn once from its own seed. */
@@ -588,6 +595,10 @@ export const PALETTES = {
     ceilingRun: "ceiling-tray",
     cornerMax: 1,
     wallSide: 1 / 8,
+    cluster: [
+      ["crate", 3],
+      ["trolley", 2],
+    ],
   },
   engineering: {
     wall: [
@@ -606,6 +617,11 @@ export const PALETTES = {
     ceilingRun: "duct",
     cornerMax: 2,
     wallSide: 1 / 4,
+    cluster: [
+      ["crate", 3],
+      ["barrel", 3],
+      ["trolley", 2],
+    ],
   },
   archive: {
     wall: [
@@ -622,6 +638,11 @@ export const PALETTES = {
     ceilingRun: "ceiling-tray",
     cornerMax: 2,
     wallSide: 1 / 4,
+    cluster: [
+      ["crate", 3],
+      ["trolley", 2],
+      ["filing-cabinet", 1],
+    ],
   },
   lab: {
     wall: [
@@ -641,6 +662,10 @@ export const PALETTES = {
     ceilingRun: "duct",
     cornerMax: 2,
     wallSide: 1 / 4,
+    cluster: [
+      ["trolley", 3],
+      ["crate", 2],
+    ],
   },
   council: {
     wall: [
@@ -655,6 +680,10 @@ export const PALETTES = {
     ceilingRun: null,
     cornerMax: 2,
     wallSide: 1 / 4,
+    cluster: [
+      ["planter", 3],
+      ["crate", 1],
+    ],
   },
 } satisfies Record<Archetype, Palette>;
 
@@ -711,6 +740,26 @@ export const WIDE_REACH = 0.8;
  * read from the models.
  */
 export const WALL_PROP_DEPTH = 0.3;
+/**
+ * The side of a mid-hall cluster block, in cells (D6). The hall's interior
+ * band is tiled from its north-west corner into blocks this size, partial
+ * blocks dropped, and a cluster uses only a block's inner 2 by 2 cells, so
+ * two clusters always stand at least 2 cells (4 m) apart.
+ */
+export const CLUSTER_BLOCK = 4;
+/** Chance a cluster block holds a cluster (D6, D8). */
+export const CLUSTER_SHARE = 1 / 2;
+/** The fewest members a cluster is drawn with (D6). */
+export const CLUSTER_MIN = 2;
+/** The most members a cluster is drawn with (D6). */
+export const CLUSTER_MAX = 3;
+/**
+ * How far a cluster member keeps clear of everything solid outside its own
+ * cluster, in metres (D7): its box grown by this much overlaps no taken box
+ * and no other floor prop. The player's circle is 0.7 m across, so a
+ * cluster narrows a way but never closes one.
+ */
+export const CLUSTER_CLEAR = 1.0;
 /** How many cells long one span segment is, in cell units (D9). */
 export const SPAN_CELLS = 2;
 /**

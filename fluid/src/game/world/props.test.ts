@@ -108,6 +108,19 @@ describe("the prop catalogue", () => {
     }
   });
 
+  it("gives every palette cluster kinds that are plain floor kinds", () => {
+    for (const a of ARCHETYPES) {
+      const cluster = PALETTES[a].cluster;
+      expect(cluster.length, a).toBeGreaterThan(0);
+      for (const [k, w] of cluster) {
+        expect(PROP_CATALOGUE[k].anchor, `${a} ${k}`).toBe("floor");
+        expect(PROP_CATALOGUE[k].extra, `${a} ${k}`).toBe(false);
+        expect(PROP_CATALOGUE[k].wallBacked, `${a} ${k}`).toBe(false);
+        expect(w, `${a} ${k}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
   it("makes spans ceiling kinds that are neither runs nor extras", () => {
     const spans = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].span);
     expect(spans.sort()).toEqual(["span-duct", "span-tray"]);

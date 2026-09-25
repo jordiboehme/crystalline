@@ -52,6 +52,13 @@
  *
  *   Whether a wall prop takes that edge later is decided by the pass, not
  *   here.
+ * - **Cluster blocks** (D6), in a large hall only (`isLargeHall`): the
+ *   hall's interior band (`interiorBand`) tiled from its north-west corner
+ *   into `CLUSTER_BLOCK` by `CLUSTER_BLOCK` blocks, row by row, partial
+ *   blocks dropped. Each is keyed `"x,y"` by its north-west cell, and its
+ *   spots are its inner 2 by 2 cells, row by row, with `wall: null` and
+ *   `zone: null`; an inner cell that is not floor is left out, and a block
+ *   is kept even when that leaves it none. A small hall has no blocks.
  * - **Long walls** (ruling 11). When the hall's width is at least its
  *   depth, the hall's `n` edges (west to east) and its `s` edges (east to
  *   west); otherwise its `w` edges (south to north) and its `e` edges (north
@@ -69,6 +76,7 @@
 import { decorFootprint, footprint, footprintOf } from "./footprints";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
+  CLUSTER_BLOCK,
   LANE_DEPTH,
   LANE_WIDTH,
   SHEET_LANE_DEPTH,
@@ -96,6 +104,21 @@ export interface FloorSpot {
 }
 
 /**
+ * A mid-hall cluster block (D6): a `CLUSTER_BLOCK` by `CLUSTER_BLOCK` tile
+ * of the hall's interior band. `x` and `y` are its north-west cell and
+ * `key` is `"x,y"`, which also keys the block's seed. A cluster stands only
+ * on `cells`, the block's inner 2 by 2 cells that are floor, row by row, as
+ * spots with no wall and no zone; the ring of cells around them keeps two
+ * clusters at least 2 cells apart.
+ */
+export interface ClusterBlock {
+  key: string;
+  x: number;
+  y: number;
+  cells: FloorSpot[];
+}
+
+/**
  * Everything the dressing pass needs to know about where props may go,
  * worked out once per room by `dressingSites`. See the module doc for the
  * rules behind each field.
@@ -119,6 +142,8 @@ export interface DressingSites {
   wallSide: FloorSpot[];
   /** The hall's two long walls, each its hall wall edges in walk order (ruling 11). */
   longWalls: [WallSlot[], WallSlot[]];
+  /** Mid-hall cluster blocks, row by row; empty unless the hall is large (D6). */
+  clusterBlocks: ClusterBlock[];
 }
 
 /**
@@ -205,8 +230,8 @@ export function fitsFloor(room: RoomBase, box: Box): boolean {
 
 /**
  * Where props may go in a room: runs, free edges, lanes, taken footprints,
- * corner zones, wall-side cells and long walls. See the module doc for the
- * rules.
+ * corner zones, wall-side cells, long walls and cluster blocks. See the
+ * module doc for the rules.
  */
 export function dressingSites(room: RoomBase): DressingSites {
   const runs = wallRuns(room.grid);
@@ -325,6 +350,23 @@ export function dressingSites(room: RoomBase): DressingSites {
   const hallEdges = (side: Side) =>
     edges.filter((e) => e.side === side && inside(hall, e.x, e.y));
 
+  const clusterBlocks: ClusterBlock[] = [];
+  const band = isLargeHall(hall) ? interiorBand(hall) : null;
+  if (band !== null)
+    for (let by = band.y0; by + CLUSTER_BLOCK <= band.y1; by += CLUSTER_BLOCK)
+      for (
+        let bx = band.x0;
+        bx + CLUSTER_BLOCK <= band.x1;
+        bx += CLUSTER_BLOCK
+      ) {
+        const cells: FloorSpot[] = [];
+        for (let y = by + 1; y < by + CLUSTER_BLOCK - 1; y++)
+          for (let x = bx + 1; x < bx + CLUSTER_BLOCK - 1; x++)
+            if (isFloor(room.grid, x, y))
+              cells.push({ cx: x, cy: y, wall: null, zone: null });
+        clusterBlocks.push({ key: cellKey(bx, by), x: bx, y: by, cells });
+      }
+
   return {
     runs,
     free,
@@ -335,6 +377,7 @@ export function dressingSites(room: RoomBase): DressingSites {
     zones,
     wallSide,
     longWalls: [hallEdges(a), hallEdges(b)],
+    clusterBlocks,
   };
 }
 

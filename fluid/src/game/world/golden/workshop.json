@@ -722,6 +722,24 @@
       "seed": 1890380874936611
     },
     {
+      "kind": "trolley",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 8.5,
+      "y": 3.5,
+      "turn": 2,
+      "seed": 1420534905910780
+    },
+    {
+      "kind": "barrel",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 8.5,
+      "y": 4.5,
+      "turn": 0,
+      "seed": 2398848646746428
+    },
+    {
       "kind": "ladder",
       "variant": 0,
       "anchor": "floor",

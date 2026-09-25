@@ -7,6 +7,7 @@ import {
   galleryRoom,
 } from "./canned";
 import { measureDensity, type Density } from "./density";
+import densitySource from "./density.ts?raw";
 import {
   PROP_ORDER,
   SCREEN_GAP,
@@ -29,11 +30,21 @@ import generateSource from "./generate.ts?raw";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
 import { doorwayColumns, isFloor, wallSlots } from "./layout";
 import { PLAYER_RADIUS, blockersFor } from "./move";
-import { EXTRAS, PALETTES, PROP_CATALOGUE, PROP_CAP } from "./props";
+import {
+  CLUSTER_BLOCK,
+  CLUSTER_CLEAR,
+  CLUSTER_MAX,
+  EXTRAS,
+  PALETTES,
+  PROP_CATALOGUE,
+  PROP_CAP,
+} from "./props";
 import {
   dressingSites,
   edgeKey,
   fitsFloor,
+  interiorBand,
+  isLargeHall,
   overlaps,
   turnForSide,
   wallAnchor,
@@ -99,6 +110,47 @@ const WORKSHOPS = matrix(CANNED_WORKSHOP);
 const ALL = [...WORKSHOPS, ...HUBS];
 const BRIDGES = matrix(CANNED_BRIDGE);
 const workshop = generateRoom(CANNED_WORKSHOP);
+
+/**
+ * The fullest room a probe of the generator found: a manifest under
+ * construction with 24 relations, 24 sections, 40 tags and 30 inbound
+ * references (24 listed). A 24 by 24 hall, four bays and a corridor give
+ * it more candidates than the cap, and the cap drops them by its tiers.
+ */
+const OVER_CAP: PlaceInput = {
+  domain: "t",
+  permalink: "p24-24-40-30",
+  title: "R",
+  type: "manifest",
+  status: "draft",
+  salience: null,
+  validFrom: null,
+  validTo: null,
+  tags: Array.from({ length: 40 }, (_, k) => `t${String(k)}`),
+  content: Array.from({ length: 24 }, (_, i) => `## P${String(i)}\nx`).join(
+    "\n",
+  ),
+  relations: Array.from({ length: 24 }, (_, k) => {
+    const t = `r${String(k).padStart(2, "0")}`;
+    return {
+      relType: "r",
+      target: { domain: null, target: t },
+      resolved: true,
+      address: { domain: "t", permalink: t },
+      targetTitle: t,
+      targetSalience: 3,
+    };
+  }),
+  links: [],
+  inbound: Array.from({ length: 24 }, (_, i) => ({
+    address: { domain: "t", permalink: `i${String(i)}` },
+    title: `i${String(i)}`,
+    relType: "l",
+  })),
+  inboundTotal: 30,
+  observations: [],
+};
+const overCap = generateRoom(OVER_CAP);
 
 /** A place with nothing in it, to be filled by `over`. */
 function place(over: Partial<PlaceInput>): PlaceInput {
@@ -459,7 +511,7 @@ describe("floor props", () => {
 
   it("leave the player's circle at every arrival point clear", () => {
     let checked = 0;
-    for (const { name, room } of ALL) {
+    for (const { name, room } of [...ALL, ...REACH_EXTRA]) {
       const boxes = floorProps(room).map(boxOf);
       for (const f of room.fixtures) {
         if (f.kind !== "door" && f.kind !== "hatch" && f.kind !== "portal")
@@ -569,6 +621,35 @@ describe("floor props", () => {
     expect(dressRoom(workshop)).toEqual(workshop.props);
   });
 });
+
+/**
+ * 60 workshop rooms in every archetype, the conditions cycling: the rooms
+ * the density measure's floors were forecast on (the plan's Baselines).
+ */
+const SEEDS: RoomSpec[] = Array.from({ length: 60 }, (_, i) => i).flatMap((i) =>
+  Object.values(ARCHETYPE_TYPES).map((type) =>
+    generateRoom({
+      ...CANNED_WORKSHOP,
+      type,
+      status: Object.values(STATUS)[i % 4] ?? "stable",
+      permalink: `w-${String(i)}`,
+    }),
+  ),
+);
+const sum = (rooms: RoomSpec[], f: (d: Density) => number) =>
+  rooms.reduce((a, r) => a + f(measureDensity(r)), 0);
+
+/**
+ * Every 16th of `SEEDS`, 19 rooms: `SEEDS` cycles the five types within a
+ * permalink and the four statuses across permalinks, so a step of 16 walks
+ * every archetype and every condition, where a step of 15 would give the
+ * bridge type only. With `OVER_CAP` they are the extra rooms the flood fill
+ * and the arrival circles are held on.
+ */
+const REACH_SEEDS = SEEDS.flatMap((room, k) =>
+  k % 16 === 0 ? [{ name: `seed ${String(k)}`, room }] : [],
+);
+const REACH_EXTRA = [{ name: "over cap", room: overCap }, ...REACH_SEEDS];
 
 /** The flood-fill grid step, in metres. */
 const FILL = 0.2;
@@ -693,16 +774,24 @@ describe("reachability (Review Focus 1)", () => {
     expect(open.size).toBeGreaterThan(shut.size);
   }, 20_000);
 
-  for (const { name, room } of ALL) {
+  const expectSameTargets = (name: string, room: RoomSpec) => {
+    const bare = { ...room, props: [] };
+    const without = reachedTargets(bare, blockersFor(bare));
+    expect(without.size, name).toBeGreaterThan(0);
+    const withProps = reachedTargets(room, blockersFor(room));
+    for (const t of without)
+      expect(withProps.has(t), `${name} ${t}`).toBe(true);
+  };
+  for (const { name, room } of ALL)
     it(`reaches with props every target ${name} reaches without them`, () => {
-      const bare = { ...room, props: [] };
-      const without = reachedTargets(bare, blockersFor(bare));
-      expect(without.size, name).toBeGreaterThan(0);
-      const withProps = reachedTargets(room, blockersFor(room));
-      for (const t of without)
-        expect(withProps.has(t), `${name} ${t}`).toBe(true);
+      expectSameTargets(name, room);
     }, 20_000);
-  }
+  // The fullest room and the seeds, where the mid-hall clusters stand among
+  // the most fixtures and decor: a cluster narrows a way but never seals it.
+  for (const { name, room } of REACH_EXTRA)
+    it(`reaches with props every target ${name} reaches without them`, () => {
+      expectSameTargets(name, room);
+    }, 30_000);
 });
 
 /** The workshop's clean room in every archetype. */
@@ -820,26 +909,10 @@ describe("density", () => {
   });
 });
 
-/**
- * 60 workshop rooms in every archetype, the conditions cycling: the rooms
- * the density measure's floors were forecast on (the plan's Baselines).
- */
-const SEEDS: RoomSpec[] = Array.from({ length: 60 }, (_, i) => i).flatMap((i) =>
-  Object.values(ARCHETYPE_TYPES).map((type) =>
-    generateRoom({
-      ...CANNED_WORKSHOP,
-      type,
-      status: Object.values(STATUS)[i % 4] ?? "stable",
-      permalink: `w-${String(i)}`,
-    }),
-  ),
-);
-const sum = (rooms: RoomSpec[], f: (d: Density) => number) =>
-  rooms.reduce((a, r) => a + f(measureDensity(r)), 0);
-
 describe("density measure", () => {
   it("covers at least 0.12 of free edges with wide wall props, and at most 0.6", () => {
-    // Baseline 0.016 (locker banks only), forecast 0.17.
+    // Baseline 0.037 (locker banks, and the padded panel once it was
+    // widened), forecast 0.17.
     const share =
       sum(SEEDS, (d) => d.wideEdges) / sum(SEEDS, (d) => d.freeEdges);
     expect(share).toBeGreaterThanOrEqual(0.12);
@@ -856,10 +929,113 @@ describe("density measure", () => {
   });
 
   it("keeps every dressed room at or under 14 floor props per 100 floor cells", () => {
+    let large = 0;
     for (const { name, room } of [...ALL, ...BRIDGES]) {
       const d = measureDensity(room);
-      if (d.large) expect(d.floorPer100, name).toBeLessThanOrEqual(14);
+      if (!d.large) continue;
+      expect(d.floorPer100, name).toBeLessThanOrEqual(14);
+      large++;
     }
+    expect(large).toBeGreaterThan(0);
+  });
+
+  it("raises large workshops to at least 6 floor props per 100 floor cells", () => {
+    // Baseline 4.70, forecast about 6.5.
+    const per100 =
+      (sum(SEEDS, (d) => d.floorProps) * 100) / sum(SEEDS, (d) => d.floorCells);
+    expect(per100).toBeGreaterThanOrEqual(6);
+  });
+
+  it("raises the canned hub to at least 5 floor props per 100 floor cells in every archetype", () => {
+    // Baseline 2.1 to 2.4.
+    for (const { name, condition, room } of HUBS)
+      if (condition === "clean")
+        expect(measureDensity(room).floorPer100, name).toBeGreaterThanOrEqual(
+          5,
+        );
+  });
+});
+
+/** A box grown by `m` metres on every side, as `dress.ts` grows a cluster ring. */
+const grow = (b: Box, m: number): Box => ({
+  x0: b.x0 - m,
+  x1: b.x1 + m,
+  z0: b.z0 - m,
+  z1: b.z1 + m,
+});
+
+describe("mid-hall clusters", () => {
+  const LARGE = [
+    ...ALL,
+    ...SEEDS.slice(0, 40).map((room, i) => ({
+      name: `seed ${String(i)}`,
+      room,
+    })),
+  ].filter(({ room }) => isLargeHall(room.hall));
+
+  it("keep every member inside a block's inner cells, 1.0 m clear of everything outside its cluster", () => {
+    let members = 0;
+    for (const { name, room } of LARGE) {
+      const band = interiorBand(room.hall);
+      if (band === null) throw new Error("large hall without a band");
+      const blockOf = (p: Prop) => {
+        const bx =
+          band.x0 +
+          CLUSTER_BLOCK *
+            Math.floor((Math.floor(p.x) - band.x0) / CLUSTER_BLOCK);
+        const by =
+          band.y0 +
+          CLUSTER_BLOCK *
+            Math.floor((Math.floor(p.y) - band.y0) / CLUSTER_BLOCK);
+        return `${String(bx)},${String(by)}`;
+      };
+      const inBand = floorProps(room).filter(
+        (p) =>
+          p.x >= band.x0 && p.x < band.x1 && p.y >= band.y0 && p.y < band.y1,
+      );
+      const inner = new Set(
+        dressingSites(room).clusterBlocks.flatMap((b) =>
+          b.cells.map((c) => `${String(c.cx)},${String(c.cy)}`),
+        ),
+      );
+      for (const p of inBand) {
+        expect(
+          inner.has(`${String(Math.floor(p.x))},${String(Math.floor(p.y))}`),
+          name,
+        ).toBe(true);
+        const ring = grow(boxOf(p), CLUSTER_CLEAR - 1e-9);
+        for (const t of takenBoxes(room))
+          expect(overlaps(ring, t), `${name} ${p.kind}`).toBe(false);
+        for (const q of floorProps(room))
+          if (q !== p && blockOf(q) !== blockOf(p))
+            expect(overlaps(ring, boxOf(q)), `${name} ${p.kind}`).toBe(false);
+        members++;
+      }
+      const sizes = new Map<string, number>();
+      for (const p of inBand)
+        sizes.set(blockOf(p), (sizes.get(blockOf(p)) ?? 0) + 1);
+      for (const n of sizes.values())
+        expect(n).toBeLessThanOrEqual(CLUSTER_MAX);
+    }
+    expect(members).toBeGreaterThan(50);
+  });
+
+  it("uses only the palette's cluster kinds in the band", () => {
+    for (const { name, room } of LARGE) {
+      const band = interiorBand(room.hall);
+      if (band === null) continue;
+      const kinds = new Set<string>(
+        PALETTES[room.archetype].cluster.map(([k]) => k),
+      );
+      for (const p of floorProps(room))
+        if (p.x >= band.x0 && p.x < band.x1 && p.y >= band.y0 && p.y < band.y1)
+          expect(kinds.has(p.kind), `${name} ${p.kind}`).toBe(true);
+    }
+  });
+
+  it("puts none in a hall that is not large", () => {
+    for (const { name, room } of BRIDGES)
+      expect(measureDensity(room).bandProps, name).toBe(0);
   });
 });
 
@@ -1033,48 +1209,14 @@ describe("the cap (Review Focus 4)", () => {
     expect(wallsLost).toBeGreaterThan(0);
   });
 
-  /**
-   * The fullest room a probe of the generator found: a manifest under
-   * construction with 24 relations, 24 sections, 40 tags and 30 inbound
-   * references (24 listed). A 24 by 24 hall, four bays and a corridor give
-   * it more candidates than the cap, and the cap drops them by its tiers.
-   */
-  const OVER_CAP: PlaceInput = {
-    domain: "t",
-    permalink: "p24-24-40-30",
-    title: "R",
-    type: "manifest",
-    status: "draft",
-    salience: null,
-    validFrom: null,
-    validTo: null,
-    tags: Array.from({ length: 40 }, (_, k) => `t${String(k)}`),
-    content: Array.from({ length: 24 }, (_, i) => `## P${String(i)}\nx`).join(
-      "\n",
-    ),
-    relations: Array.from({ length: 24 }, (_, k) => {
-      const t = `r${String(k).padStart(2, "0")}`;
-      return {
-        relType: "r",
-        target: { domain: null, target: t },
-        resolved: true,
-        address: { domain: "t", permalink: t },
-        targetTitle: t,
-        targetSalience: 3,
-      };
-    }),
-    links: [],
-    inbound: Array.from({ length: 24 }, (_, i) => ({
-      address: { domain: "t", permalink: `i${String(i)}` },
-      title: `i${String(i)}`,
-      relType: "l",
-    })),
-    inboundTotal: 30,
-    observations: [],
-  };
+  it("keeps the canned hub's candidates at or under PROP_CAP in every archetype and condition", () => {
+    // D8: the cap never drops a hub's ceiling tier.
+    for (const { name, room } of HUBS)
+      expect(dressCandidates(room).length, name).toBeLessThanOrEqual(PROP_CAP);
+  });
 
   it("caps a room that really overflows by the tier rules", () => {
-    const room = generateRoom(OVER_CAP);
+    const room = overCap;
     expect(room.hall).toEqual({ x0: 26, y0: 0, x1: 50, y1: 24 });
     expect(room.bays).toHaveLength(4);
     expect(room.corridor).not.toBeNull();
@@ -1238,6 +1380,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
         const name = `empty ${type} ${status}`;
         walls += expectWallInvariants(name, room);
         expectFloorInvariants(name, room);
+        expect(measureDensity(room).bandProps, name).toBe(0);
       }
     expect(walls).toBeGreaterThan(0);
   });
@@ -1284,6 +1427,32 @@ describe("degenerate rooms (Review Focus 5)", () => {
       expect(room.hall.y1 - room.hall.y0).toBe(12);
       expect(expectWallInvariants(`narrow ${status}`, room)).toBeGreaterThan(0);
       expectFloorInvariants(`narrow ${status}`, room);
+      expect(measureDensity(room).bandProps).toBe(0);
+    }
+  });
+
+  it("dresses a hall exactly at the large threshold, one cluster block, keeping every invariant", () => {
+    // A guide with 3 sections and 3 inbound references (inboundTotal 3), no
+    // tags and no relations: a 9 by 8 hall, the smallest large hall (D5).
+    // The generator makes odd widths and even depths, so 8 by 9 never comes
+    // out of it. Its band is 5 by 4 cells, which holds one block.
+    for (const status of Object.values(STATUS)) {
+      const room = generateRoom(
+        place({
+          type: "guide",
+          status,
+          content: sections(3),
+          inbound: inbound(3),
+          inboundTotal: 3,
+        }),
+      );
+      const name = `threshold ${status}`;
+      expect(room.hall.x1 - room.hall.x0, name).toBe(9);
+      expect(room.hall.y1 - room.hall.y0, name).toBe(8);
+      expect(isLargeHall(room.hall), name).toBe(true);
+      expect(dressingSites(room).clusterBlocks, name).toHaveLength(1);
+      expect(expectWallInvariants(name, room)).toBeGreaterThan(0);
+      expectFloorInvariants(name, room);
     }
   });
 
@@ -1299,14 +1468,17 @@ describe("degenerate rooms (Review Focus 5)", () => {
 });
 
 describe("the generator side's imports (ruling 20)", () => {
-  it("keeps dress.ts away from move, generate and interact", () => {
-    expect(dressSource).not.toMatch(
-      /from\s+["']\.\/(move|generate|interact)["']/,
-    );
+  it("keeps dress.ts and density.ts away from move, generate, interact and render", () => {
+    for (const source of [dressSource, densitySource])
+      expect(source).not.toMatch(
+        /from\s+["'](\.\/(move|generate|interact)|\.\.\/render(\/[^"']*)?)["']/,
+      );
   });
 
-  it("keeps generate.ts away from move and interact", () => {
-    expect(generateSource).not.toMatch(/from\s+["']\.\/(move|interact)["']/);
+  it("keeps generate.ts away from move, interact and render", () => {
+    expect(generateSource).not.toMatch(
+      /from\s+["'](\.\/(move|interact)|\.\.\/render(\/[^"']*)?)["']/,
+    );
   });
 });
 

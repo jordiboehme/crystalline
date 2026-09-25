@@ -34,10 +34,11 @@
  *    four wall edges carries a keep-clear wall prop (`PropEntry.keepClear`),
  *    otherwise `screen` when its own wall edge carries a wall prop,
  *    otherwise `bare`. The floor spots are every corner-zone spot and every
- *    wall-side spot whose backing is not `clear`. A zone spot's prop is centred on its cell; a wall-side
- *    spot's is backed to its wall, facing away from it (`turnForSide`), its
- *    centre `WALL_GAP + depth / 2` metres off a bare wall and `SCREEN_GAP +
- *    depth / 2` off a screen. A prop is accepted when its `propFootprint`
+ *    wall-side spot whose backing is not `clear`. A zone spot's prop is
+ *    centred on its cell; a wall-side spot's is backed to its wall, facing
+ *    away from it (`turnForSide`), its centre `WALL_GAP + depth / 2` metres
+ *    off a bare wall and `SCREEN_GAP + depth / 2` off a screen. A prop is
+ *    accepted when its `propFootprint`
  *    fits the floor, overlaps no lane, no taken box and no floor box placed
  *    before, and its cell has no floor prop yet. Every spot's draws come
  *    from `createRng` of its own seed, `seedFor(roomSeed, "prop", cx, cy,
@@ -47,7 +48,8 @@
  *    condition))` draws each rule's count in `EXTRAS` order. Each floor
  *    extra goes to the first spot of step 5 in floor-seed order that
  *    accepts it, a wall-backed one (the ladder) only to a wall-side spot
- *    whose backing is `bare`. The loose cables' count is kept for step 9.
+ *    whose backing is `bare`. The loose cables' count is kept for step
+ *    10.
  * 7. Corner zones: each zone takes `1` prop on a bridge, otherwise `1 +
  *    (seedFor(roomSeed, "prop-zone", key) % 2)`. Its remaining spots are
  *    walked in seed order, each drawing a kind weighted
@@ -60,20 +62,34 @@
  *    floor picks when the backing is `bare`, and over `zonePicks` in front
  *    of a screen, since a wall-backed kind 0.35 m off its wall would lean
  *    on air.
- * 9. Ceiling, anchored at wall points like a wall prop: the ceiling run when
- *    the palette has one, drawn as in step 3 from `"ceiling"`, token
- *    `ceiling-<side>`; under each ceiling tray segment a cable loop when
- *    `createRng` of the loop's own seed (token `loop-<side>`) draws
- *    `LOOP_SHARE`; the beacon on the entrance edge, token `beacon-s`; and
- *    the loose cables of step 6 on the hall's wall edges that carry neither
- *    a fixture nor a ceiling segment nor the beacon, in the order of their
- *    own seeds (token `loose-<side>`).
- * 10. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
+ * 9. Mid-hall clusters (D6, D7), in a large hall only: every block of
+ *    `sites.clusterBlocks` draws from `createRng(seedFor(roomSeed, "prop",
+ *    bx, by, "cluster-block"))`, keyed by its north-west cell, a chance of
+ *    `CLUSTER_SHARE` and then a size from `CLUSTER_MIN` to `CLUSTER_MAX`.
+ *    Its inner cells are walked in the order of their own seeds,
+ *    `seedFor(roomSeed, "prop", cx, cy, "cluster")`, each drawing a kind
+ *    weighted over the palette's `cluster` picks, a variant and a turn,
+ *    centred on its cell, until that many are placed or the cells run out.
+ *    A member is accepted as in step 5, and only when its box grown by
+ *    `CLUSTER_CLEAR` (1.0 m) on every side overlaps no taken box and no
+ *    floor prop outside its own cluster, so every gap between a cluster
+ *    and anything solid is wide enough to walk through. Members of one
+ *    cluster may stand side by side, never overlapping.
+ * 10. Ceiling, anchored at wall points like a wall prop: the ceiling run
+ *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
+ *     `ceiling-<side>`; under each ceiling tray segment a cable loop when
+ *     `createRng` of the loop's own seed (token `loop-<side>`) draws
+ *     `LOOP_SHARE`; the beacon on the entrance edge, token `beacon-s`; and
+ *     the loose cables of step 6 on the hall's wall edges that carry
+ *     neither a fixture nor a ceiling segment nor the beacon, in the order
+ *     of their own seeds (token `loose-<side>`).
+ * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
  *     everything else optional.
- * 11. The output: `x` and `y` rounded to three decimals (done as each prop
- *     is made, so acceptance measures exactly the prop that is returned),
- *     sorted by `PROP_ORDER`.
+ * 12. The output: `x` and `y` rounded to three decimals (done as each prop
+ *     is made, so acceptance measures exactly the prop that is returned;
+ *     a cluster member's cell centre needs no rounding), sorted by
+ *     `PROP_ORDER`.
  *
  * Keep-clear and screening (D2 as amended: wall-side spots only, D3). A
  * wall prop a person reads or works by hand at standing height (reader,
@@ -81,10 +97,10 @@
  * wall-side spot on its cell free of floor props, whether the prop is
  * mandatory or an optional palette pick. A corner-zone spot ignores wall
  * props, keep-clear ones included: its prop stands centred in the corner
- * cell, well off the wall, and hides nothing a person uses. Any other wall prop is a screen: a
- * floor prop may stand in front of it, `SCREEN_GAP` (0.35 m) off the wall,
- * so the two layers never meet; ruling 5's height bands keep them apart
- * above the floor.
+ * cell, well off the wall, and hides nothing a person uses. Any other wall
+ * prop is a screen: a floor prop may stand in front of it, `SCREEN_GAP`
+ * (0.35 m) off the wall, so the two layers never meet; ruling 5's height
+ * bands keep them apart above the floor.
  *
  * Every seed is keyed by the integer anchor cell and a token (ruling 2),
  * never by a position in a list, and every draw comes from the rng of that
@@ -101,6 +117,10 @@
 import { createRng, seedFor, type Rng } from "../core/seed";
 import { FOOTPRINTS, propFootprint } from "./footprints";
 import {
+  CLUSTER_CLEAR,
+  CLUSTER_MAX,
+  CLUSTER_MIN,
+  CLUSTER_SHARE,
   EXTINGUISHER_EVERY,
   EXTRAS,
   FILLER,
@@ -244,7 +264,7 @@ function isFloorKind(kind: PropKind): kind is FloorPropKind {
 
 /**
  * Every prop the pass would place in a room, before the cap, each marked
- * mandatory or optional: steps 1 to 9 of the module doc. `reserved` joins
+ * mandatory or optional: steps 1 to 10 of the module doc. `reserved` joins
  * the taken boxes and keeps floor props out of what a later pass claimed.
  */
 export function dressCandidates(
@@ -315,7 +335,7 @@ export function dressCandidates(
       if (e !== undefined) onWall("extinguisher", e, true);
     }
 
-  // Steps 3 and 9: a run along one or two long walls, one segment per edge.
+  // Steps 3 and 10: a run along one or two long walls, one segment per edge.
   const runOf = (kind: PropKind, which: "wall" | "ceiling", token: string) => {
     const rng = createRng(seedFor(room.seed, "prop-runs", which));
     const count = rng.int(1, 2);
@@ -459,7 +479,47 @@ export function dressCandidates(
     place(onFloor(weighted(rng, picks), s, rng), s);
   }
 
-  // Step 9: the ceiling.
+  // Step 9: mid-hall clusters (D6, D7), large halls only.
+  const grow = (b: Box, m: number): Box => ({
+    x0: b.x0 - m,
+    x1: b.x1 + m,
+    z0: b.z0 - m,
+    z1: b.z1 + m,
+  });
+  for (const block of sites.clusterBlocks) {
+    const rng = createRng(propSeed(block.x, block.y, "cluster-block"));
+    if (!rng.chance(CLUSTER_SHARE)) continue;
+    const size = rng.int(CLUSTER_MIN, CLUSTER_MAX);
+    // Every floor prop not in this cluster: its members are placed after.
+    const outside = [...floorBoxes];
+    const clusterSeed = (s: FloorSpot) => propSeed(s.cx, s.cy, "cluster");
+    let placed = 0;
+    for (const s of [...block.cells].sort(
+      (a, b) => clusterSeed(a) - clusterSeed(b) || a.cy - b.cy || a.cx - b.cx,
+    )) {
+      if (placed >= size) break;
+      const r = createRng(clusterSeed(s));
+      const kind = weighted(r, palette.cluster);
+      const variant = variantOf(kind, r);
+      const prop: Prop = {
+        kind,
+        variant,
+        anchor: "floor",
+        x: s.cx + 0.5,
+        y: s.cy + 0.5,
+        turn: r.int(0, 3),
+        seed: clusterSeed(s),
+      };
+      const box = propFootprint(prop);
+      if (box === null) continue;
+      const ring = grow(box, CLUSTER_CLEAR);
+      if (blocked.some((t) => overlaps(ring, t))) continue;
+      if (outside.some((o) => overlaps(ring, o))) continue;
+      if (place(prop, s)) placed++;
+    }
+  }
+
+  // Step 10: the ceiling.
   const carriers = new Set<string>();
   if (palette.ceilingRun !== null) {
     const tray = palette.ceilingRun === "ceiling-tray";
