@@ -1,7 +1,11 @@
 /**
  * The floor each thing that stands in a room takes: what the player collides
  * with, what the detailed models must stay inside and what the generator
- * keeps clear when it puts up scaffolding or dresses a room.
+ * keeps clear when it puts up scaffolding, places heroes or dresses a room.
+ * The things are fixtures, decor, floor props and the hero props
+ * (`FOOTPRINTS.hero`, `heroFootprint`, `heroBlocker`), whose sizes stand
+ * apart from the floor props' so `MAX_FLOOR_PROP` stays true of every
+ * floor prop kind (H2).
  *
  * This is a leaf of the world: it imports only `units.ts` and `types.ts`,
  * so the generator (`generate.ts`) and the walking code (`move.ts`) can both
@@ -15,6 +19,8 @@ import type {
   DecorKind,
   FloorPropKind,
   Fixture,
+  Hero,
+  HeroKind,
   MachineKind,
   Prop,
   PropKind,
@@ -71,6 +77,12 @@ export interface Footprints {
   decor: Readonly<Record<DecorKind, FloorSize | null>>;
   /** floor props, one size per variant */
   prop: Readonly<Record<FloorPropKind, readonly FloorSize[]>>;
+  /**
+   * The hero props, one size per variant, width by depth at turn 0: for a
+   * wall-anchored kind the width runs along the wall and the depth out from
+   * it (see `heroFootprint`).
+   */
+  hero: Readonly<Record<HeroKind, readonly FloorSize[]>>;
 }
 
 /** Every machine kind that is not given a size of its own. */
@@ -85,7 +97,8 @@ const MACHINE_DEFAULT: WallSize = { along: 1.8, out: FIXTURE_DEPTH };
  * with the wall and take no floor at all, so they are not listed. A server
  * rack, a cryo pod and a comms array have sizes of their own and every other
  * machine is 1.8 m by 0.9 m. Decor is centred on its point and turned with
- * the piece. A shelf row is two cells long.
+ * the piece. A shelf row is two cells long. The hero sizes are the
+ * catalogue's (H8, `heroes.ts`); no hero is limited by `MAX_FLOOR_PROP`.
  */
 export const FOOTPRINTS: Footprints = {
   terminal: { along: 1.4, out: 0.9 },
@@ -197,6 +210,34 @@ export const FOOTPRINTS: Footprints = {
       { width: 1.0, depth: 1.0 },
     ],
   },
+  hero: {
+    turret: [{ width: 0.9, depth: 0.9 }],
+    "black-slab": [{ width: 1.2, depth: 0.3 }],
+    "eye-panel": [{ width: 0.9, depth: 0.25 }],
+    "photo-console": [{ width: 1.8, depth: 0.9 }],
+    "laser-desk": [{ width: 2.4, depth: 3.0 }],
+    "mess-table": [{ width: 5.0, depth: 2.6 }],
+    "helper-robot": [{ width: 1.2, depth: 1.4 }],
+    "sleep-ring": [{ width: 5.0, depth: 5.0 }],
+    "dome-planters": [
+      { width: 3.2, depth: 1.6 },
+      { width: 4.8, depth: 1.6 },
+    ],
+    "core-wall": [{ width: 3.6, depth: 0.3 }],
+    "gun-rack": [{ width: 1.8, depth: 0.3 }],
+    "gun-bench": [{ width: 1.9, depth: 0.9 }],
+    "tube-bench": [{ width: 1.9, depth: 0.9 }],
+    "field-pack": [
+      { width: 0.9, depth: 0.7 },
+      { width: 1.0, depth: 0.8 },
+    ],
+    "arcade-cabinet": [
+      { width: 0.8, depth: 0.9 },
+      { width: 0.8, depth: 0.9 },
+      { width: 0.8, depth: 0.9 },
+    ],
+    "recruit-cabinet": [{ width: 1.0, depth: 1.2 }],
+  },
 };
 
 /**
@@ -306,6 +347,87 @@ export function propFootprint(prop: Prop): Box | null {
   const cx = prop.x * CELL;
   const cz = prop.y * CELL;
   return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
+}
+
+/**
+ * How a hero kind meets the floor: `flush` on its wall (a wall kind, no
+ * collision), `backed` against its wall (the box runs out from the wall
+ * point, like a fixture's footprint), or `free` (the box is centred on the
+ * anchor). `heroes.ts` pins it against each kind's placement.
+ */
+export const HERO_FOOTING = {
+  turret: "free",
+  "black-slab": "free",
+  "eye-panel": "flush",
+  "photo-console": "backed",
+  "laser-desk": "free",
+  "mess-table": "free",
+  "helper-robot": "free",
+  "sleep-ring": "free",
+  "dome-planters": "free",
+  "core-wall": "flush",
+  "gun-rack": "flush",
+  "gun-bench": "backed",
+  "tube-bench": "backed",
+  "field-pack": "free",
+  "arcade-cabinet": "backed",
+  "recruit-cabinet": "backed",
+} as const satisfies Record<HeroKind, "flush" | "backed" | "free">;
+
+/**
+ * The way a thing at each quarter turn faces, as `[x, z]`: north at turn 0,
+ * then east, south and west. A wall-anchored hero's box runs this way from
+ * its wall point; the dev seam stands the player this way from a hero.
+ */
+export const HERO_FRONT: readonly (readonly [number, number])[] = [
+  [0, -1],
+  [1, 0],
+  [0, 1],
+  [-1, 0],
+];
+
+/**
+ * The floor a hero takes, in metres: its variant's size, width and depth
+ * swapped at an odd turn, centred on the anchor for a `free` footing, and
+ * for a wall-anchored one centred along the wall and running `depth` out
+ * from the wall point along `HERO_FRONT`, so a backed hero's box equals
+ * `footprint(edge, { along: width, out: depth })` exactly.
+ * A flush hero has a box too (what its view box and the model checks
+ * start from), though it does not collide. Throws on a variant the kind
+ * does not have, in the words `propFootprint` uses.
+ */
+export function heroFootprint(h: Hero): Box {
+  const size = FOOTPRINTS.hero[h.kind][h.variant];
+  if (size === undefined)
+    throw new Error(
+      `heroFootprint: ${h.kind} has no variant ${String(h.variant)}`,
+    );
+  const t = ((Math.round(h.turn) % 4) + 4) % 4;
+  const sideways = t % 2 === 1;
+  const hx = (sideways ? size.depth : size.width) / 2;
+  const hz = (sideways ? size.width : size.depth) / 2;
+  const ax = h.x * CELL;
+  const az = h.y * CELL;
+  if (HERO_FOOTING[h.kind] === "free")
+    return { x0: ax - hx, x1: ax + hx, z0: az - hz, z1: az + hz };
+  // Out from the wall point by the whole depth, measured from the wall
+  // itself rather than from a centre, so the box's wall face and far face
+  // come out exactly where `footprint` puts them.
+  const [fx, fz] = HERO_FRONT[t] ?? [0, -1];
+  const out = (a: number, f: number, half: number): [number, number] =>
+    f === 0
+      ? [a - half, a + half]
+      : f > 0
+        ? [a, a + size.depth]
+        : [a - size.depth, a];
+  const [x0, x1] = out(ax, fx, hx);
+  const [z0, z1] = out(az, fz, hz);
+  return { x0, x1, z0, z1 };
+}
+
+/** What the player collides with: `heroFootprint`, or null for a flush hero. */
+export function heroBlocker(h: Hero): Box | null {
+  return HERO_FOOTING[h.kind] === "flush" ? null : heroFootprint(h);
 }
 
 /** The longest pipe run, in metres. */

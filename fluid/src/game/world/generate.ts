@@ -34,10 +34,14 @@
  * grid is lit in blocks of four by four cells.
  *
  * 8. Last, the set dressing: `dressRoom` (`dress.ts`) reads the finished
- *    room, fixtures, furniture and scaffolding included, and adds its props.
- *    It runs after everything else and only ever adds decoration, so a prop
- *    never moves a fixture, and the room states its entrance, bays and
- *    corridor so the dressing never has to work them out again.
+ *    room, fixtures, furniture, scaffolding and heroes included, and adds
+ *    its props. The heroes (`RoomSpec.heroes`) come before the props, and
+ *    the dressing keeps off what they reserve (`heroReserve` in
+ *    `heroes.ts`); the hero pass that fills them is still to come, so every
+ *    room has none for now. The dressing runs after everything else and
+ *    only ever adds decoration, so a prop never moves a fixture, and the
+ *    room states its entrance, bays and corridor so the dressing never has
+ *    to work them out again.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -599,6 +603,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     fixtures,
     decor,
     scaffold: scaffoldFor(condition, layout.hall, decor, seed),
+    heroes: [],
     lights: lightsFor(
       seed,
       layout.grid,
@@ -611,8 +616,9 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     dropped,
     inboundMore,
   };
-  // The props go right after the scaffold, so the keys (and the goldens)
-  // read fixtures, decor, scaffold, props, lights.
+  // The heroes go right after the scaffold and the props right after the
+  // heroes, so the keys (and the goldens) read fixtures, decor, scaffold,
+  // heroes, props, lights.
   const { lights, dropped: left, inboundMore: more, ...head } = base;
   return {
     ...head,

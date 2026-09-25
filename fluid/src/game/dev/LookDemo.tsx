@@ -12,7 +12,7 @@
  * them shown on the HUD's legend since they are for the controller
  * comparing runs, not a player: `?room=bridge|workshop|hub` picks the place
  * (the canned bridge when absent), `?type=` and `?status=` override that
- * place's own, and `?props=0` shows the same room with its set dressing
+ * place's own, and `?props=0` shows the same room with its props and heroes
  * stripped, so a build and a frame time can be judged dressed against
  * undressed. The HUD's frame line carries the comparison's other half,
  * `BUILD <ms> MS`: `session.ts` times every `renderer.setRoom` itself.

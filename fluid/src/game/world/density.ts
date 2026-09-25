@@ -28,6 +28,9 @@
  *   mid-hall clusters stand, and `spanSegments`, the span segments hung
  *   across the hall: measured, pinned where the clusters and spans are.
  *
+ * Heroes are not counted (H23): the measure reads `room.props` only, so a
+ * hero never lifts a room over its ceiling or holds it up to its floors.
+ *
  * This is the generator side: it imports only `props.ts`, `sites.ts`,
  * `layout.ts` and `types.ts`, and never `move.ts` or `render/`.
  */

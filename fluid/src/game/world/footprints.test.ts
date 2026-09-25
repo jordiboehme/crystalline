@@ -62,6 +62,13 @@ describe("MAX_FLOOR_PROP", () => {
         );
       }
   });
+  it("keeps the hero sizes apart from the floor props, which it does not bind (H2)", () => {
+    // Heroes are larger than MAX_FLOOR_PROP and never a FloorPropKind, so
+    // their sizes live in FOOTPRINTS.hero and the E4 proof stays true.
+    const props = new Set(Object.keys(FOOTPRINTS.prop));
+    for (const kind of Object.keys(FOOTPRINTS.hero))
+      expect(props.has(kind), kind).toBe(false);
+  });
 });
 
 describe("propFootprint", () => {

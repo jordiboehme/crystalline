@@ -29,6 +29,8 @@ import {
 } from "./footprints";
 import { generateRoom } from "./generate";
 import generateSource from "./generate.ts?raw";
+import { heroReserve } from "./heroes";
+import heroesSource from "./heroes.ts?raw";
 import { ARRIVAL_DISTANCE, REACH, wallPoint } from "./interact";
 import { lampBoxes } from "./lamps";
 import { doorwayColumns, isFloor, wallSlots } from "./layout";
@@ -67,6 +69,7 @@ import type {
   Archetype,
   Box,
   Condition,
+  Hero,
   PlaceInput,
   PlaceReference,
   Prop,
@@ -753,6 +756,23 @@ describe("reserved boxes and edges", () => {
     const moved = again.filter((p) => p.kind === "loose-cable");
     expect(moved.length).toBe(loose.length);
     for (const p of moved) expect(edges.has(edgeKey(edgeOf(p)))).toBe(false);
+  });
+
+  it("keeps floor props, wall props and spans off a hero's reserve, read from the room itself", () => {
+    const h: Hero = {
+      kind: "helper-robot",
+      variant: 0,
+      x: workshop.hall.x0 + 6.5,
+      y: workshop.hall.y0 + 6,
+      turn: 0,
+      seed: 1,
+    };
+    const room = { ...workshop, heroes: [h] };
+    const reserve = heroReserve([h]);
+    const props = dressRoom(room);
+    expect(props).toEqual(dressRoom(workshop, reserve));
+    for (const p of props.filter((q) => q.anchor === "floor"))
+      for (const b of reserve.boxes) expect(overlaps(boxOf(p), b)).toBe(false);
   });
 });
 
@@ -1873,8 +1893,8 @@ describe("degenerate rooms (Review Focus 5)", () => {
 });
 
 describe("the generator side's imports (ruling 20)", () => {
-  it("keeps dress.ts and density.ts away from move, generate, interact, malfunction and render", () => {
-    for (const source of [dressSource, densitySource])
+  it("keeps dress.ts, density.ts and heroes.ts away from move, generate, interact, malfunction and render", () => {
+    for (const source of [dressSource, densitySource, heroesSource])
       expect(source).not.toMatch(
         /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
       );

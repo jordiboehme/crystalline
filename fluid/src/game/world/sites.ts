@@ -3,7 +3,8 @@
  * footprints already taken, and the floor spots of a finished room. What
  * goes where is decided by the dressing pass (`dress.ts`); this module only
  * works out the places, from a room that has its fixtures, decor and
- * scaffolding but no props yet (`RoomBase`).
+ * scaffolding (`SiteBase`: no heroes and no props are read, so the hero
+ * pass and the dressing see the same sites).
  *
  * The room states its own layout (`RoomSpec.entrance`, `bays` and
  * `corridor`, filled by the generator from `planLayout`), so nothing here is
@@ -123,11 +124,20 @@ import { CELL } from "./units";
 
 /**
  * A room as the dressing pass sees it: everything of a `RoomSpec` except
- * its props, which are what the pass is about to make. The sites are
- * worked out from fixtures, decor and scaffolding alone, so this type is
- * valid before `RoomSpec` gains `props` and after.
+ * its props, which are what the pass is about to make. It carries the
+ * heroes, which the dressing reads to keep off what they reserve
+ * (`heroReserve` in `heroes.ts`, H3). Every `RoomBase` is a `SiteBase`.
  */
 export type RoomBase = Omit<RoomSpec, "props">;
+
+/**
+ * A room as the site rules and the hero pass see it: the sites are worked
+ * out from fixtures, decor and scaffolding alone, so this type leaves out
+ * both the props and the heroes. The hero pass (`heroes.ts`) reads the
+ * sites before any hero stands, and the dressing reads the same sites and
+ * then keeps off what the heroes reserved (`heroReserve`).
+ */
+export type SiteBase = Omit<RoomSpec, "props" | "heroes">;
 
 /** A floor cell a floor prop may stand in, centred on it or backed to a wall. */
 export interface FloorSpot {
@@ -289,7 +299,7 @@ const EPS = 1e-9;
  * columns (they lie between the hall and the bays, and between the corridor
  * and the hall) and the corridor. An empty box fits nowhere.
  */
-export function fitsFloor(room: RoomBase, box: Box): boolean {
+export function fitsFloor(room: SiteBase, box: Box): boolean {
   if (!(box.x1 > box.x0 && box.z1 > box.z0)) return false;
   const rects = roomRects(room);
   const cx0 = Math.floor((box.x0 + EPS) / CELL);
@@ -309,7 +319,7 @@ export function fitsFloor(room: RoomBase, box: Box): boolean {
  * corner zones, wall-side cells, long walls, cluster blocks and span lines.
  * See the module doc for the rules.
  */
-export function dressingSites(room: RoomBase): DressingSites {
+export function dressingSites(room: SiteBase): DressingSites {
   const runs = wallRuns(room.grid);
   const edges = runs.flat();
   const wallEdges = new Set(edges.map(edgeKey));
@@ -465,7 +475,7 @@ export function dressingSites(room: RoomBase): DressingSites {
  * The clear span lines of a large hall (D9), rows first and then columns;
  * none in a hall that is not large. See the module doc's "Span lines".
  */
-function spanLines(room: RoomBase): SpanLine[] {
+function spanLines(room: SiteBase): SpanLine[] {
   const hall = room.hall;
   if (!isLargeHall(hall)) return [];
   const solid: Box[] = [];
@@ -580,6 +590,6 @@ function inside(r: Rect, x: number, y: number) {
 }
 
 /** The hall and then each bay, west to east, as the room states them. */
-function roomRects(room: RoomBase): Rect[] {
+function roomRects(room: SiteBase): Rect[] {
   return [room.hall, ...room.bays];
 }

@@ -338,6 +338,55 @@ export interface Prop {
 }
 
 /**
+ * The hero props (H17): rare, large pieces a room is remembered by, named
+ * by their shape. They are not `PropKind`s: they have their own list
+ * (`RoomSpec.heroes`), their own footprints and their own pass (`heroes.ts`).
+ */
+export type HeroKind =
+  | "turret"
+  | "black-slab"
+  | "eye-panel"
+  | "photo-console"
+  | "laser-desk"
+  | "mess-table"
+  | "helper-robot"
+  | "sleep-ring"
+  | "dome-planters"
+  | "core-wall"
+  | "gun-rack"
+  | "gun-bench"
+  | "tube-bench"
+  | "field-pack"
+  | "arcade-cabinet"
+  | "recruit-cabinet";
+
+/**
+ * Where a hero kind stands (H8): flush on one or two hall wall edges
+ * (`wall`, no collision), on the floor against a hall wall edge (`backed`),
+ * free in the hall's interior band (`band`), centred on a hall corner zone
+ * (`corner`), or at the hall centre (`centre`, the slab).
+ */
+export type HeroPlacement = "wall" | "backed" | "band" | "corner" | "centre";
+
+/**
+ * One hero prop. `x` and `y` follow `Decor`'s continuous cell units: the
+ * centre of its box for a band, corner or centre hero, and its wall point
+ * for a wall or backed one (for a two-edge wall hero, the point where its
+ * two edges meet). `turn` is 0-3 quarter turns clockwise from facing north;
+ * a wall-anchored hero takes its wall's `turnForSide`. `variant` indexes
+ * `FOOTPRINTS.hero[kind]` (an arcade cabinet's variant is its game). `seed`
+ * is the seed of the candidate it was accepted on (H18).
+ */
+export interface Hero {
+  kind: HeroKind;
+  variant: number;
+  x: number;
+  y: number;
+  turn: number;
+  seed: number;
+}
+
+/**
  * A rectangle of cells, `x1` and `y1` exclusive, in grid coordinates (the
  * same convention as a light zone).
  */
@@ -430,6 +479,12 @@ export interface RoomSpec {
    * renderer builds are read from the same boxes.
    */
   scaffold: Box[];
+  /**
+   * The hero props (`placeHeroes` in `heroes.ts`), at most `heroCap` of
+   * them, placed after the scaffold and before the dressing, which keeps
+   * off what they reserve. Sorted by `HERO_ORDER`.
+   */
+  heroes: Hero[];
   /**
    * The set dressing (`dressRoom` in `dress.ts`): pure decoration, never
    * data, placed after everything else so it never moves a fixture.

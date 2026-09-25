@@ -20,7 +20,7 @@
  * clicked, E uses what the player faces and I inverts the vertical look.
  *
  * `options.props` false shows the place undressed: `session.showRoom` with
- * `generateRoom`'s props stripped, rather than `session.showCanned`, which
+ * `generateRoom`'s props and heroes stripped, rather than `session.showCanned`, which
  * is the dev-only comparison `?props=0` reads. That path has no client-side
  * `PlaceInput` kept by the session, so its terminals open no reader; R
  * still swaps the condition, rebuilding the same way.
@@ -42,7 +42,7 @@ const RETIRED_STATUS = "archived";
  * Safari takes can be judged on any browser. `options.openFluid` is where F
  * sends the engram's Fluid page. `options.place` is the canned bridge
  * unless the caller names another, and `options.props` is true unless the
- * caller asks for the undressed comparison. R shows the same place again
+ * caller asks for the undressed comparison (no props and no heroes). R shows the same place again
  * with its status swapped, which keeps the player where they stand.
  */
 export function startDemo(
@@ -68,7 +68,7 @@ export function startDemo(
   });
   const show = (p: PlaceInput) => {
     if (withProps) session.showCanned(p);
-    else session.showRoom({ ...generateRoom(p), props: [] });
+    else session.showRoom({ ...generateRoom(p), props: [], heroes: [] });
   };
   show(place);
 

@@ -25,6 +25,7 @@ import {
   SHEET_LANE_WIDTH,
   USE_LANE_DEPTH,
 } from "./props";
+import heroesSource from "./heroes.ts?raw";
 import lampsSource from "./lamps.ts?raw";
 import propsSource from "./props.ts?raw";
 import {
@@ -700,8 +701,13 @@ describe("the generator side's imports (ruling 20)", () => {
   // never from `./generate`, so none of the four may be reached from here.
   // The pattern catches `from "..."`, a bare `import "..."` and a dynamic
   // `import("...")`, of the four modules and of anything under `render/`.
-  it("keeps sites.ts, props.ts and lamps.ts away from move, generate, interact, malfunction and render", () => {
-    for (const source of [sitesSource, propsSource, lampsSource]) {
+  it("keeps sites.ts, props.ts, lamps.ts and heroes.ts away from move, generate, interact, malfunction and render", () => {
+    for (const source of [
+      sitesSource,
+      propsSource,
+      lampsSource,
+      heroesSource,
+    ]) {
       expect(source).not.toMatch(
         /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
       );

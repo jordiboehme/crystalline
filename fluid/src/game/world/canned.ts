@@ -538,6 +538,7 @@ export function galleryRoom(): RoomSpec {
     fixtures,
     decor,
     scaffold: scaffoldFor(condition, layout.hall, decor, seed),
+    heroes: [],
     props,
     lights,
     dropped: 0,

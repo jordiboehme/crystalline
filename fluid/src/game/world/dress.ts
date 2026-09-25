@@ -1,8 +1,9 @@
 /**
  * The set dressing: the props that make a room look lived in. They are pure
  * decoration and never data; the room's content speaks only through its
- * fixtures. The pass reads a finished room (fixtures, decor and scaffolding,
- * `RoomBase`) and only ever adds props, so a prop never moves a fixture.
+ * fixtures. The pass reads a finished room (fixtures, decor, scaffolding and
+ * heroes, `RoomBase`) and only ever adds props, so a prop never moves a
+ * fixture.
  *
  * Where props may go comes from `dressingSites` (`sites.ts`); what goes
  * there comes from the catalogue and palettes in `props.ts`. The pass, in
@@ -11,10 +12,11 @@
  * 1. `sites = dressingSites(room)`, `used` (the wall edges a wall prop took),
  *    `wallKinds` (the kind of the wall prop on each of those edges),
  *    `floorBoxes` (the boxes of the floor props placed so far) and
- *    `floorCells` (the cells that have a floor prop). `reserved` is
- *    `{ boxes, edges }` (`sites.ts`): `blocked` joins `sites.taken` and
- *    `reserved.boxes`, and `wallFree` is a free edge that is not also a
- *    reserved one.
+ *    `floorCells` (the cells that have a floor prop). `reserved` is the
+ *    heroes' reserve (`heroReserve(room.heroes)`, H3) merged with the
+ *    caller's, as `{ boxes, edges }` (`sites.ts`): `blocked` joins
+ *    `sites.taken` and `reserved.boxes`, and `wallFree` is a free edge that
+ *    is not also a reserved one.
  * 2. Mandatory wall props (ruling 7), each on a free, unreserved edge not in
  *    `used`: a keycard reader beside each unsealed door, then a sign plate
  *    beside each door and hatch, both trying the next edge of the fixture's
@@ -138,13 +140,14 @@
  * change which props the cap drops anywhere in the room.
  *
  * This is the generator side: it imports `props.ts`, `sites.ts`,
- * `footprints.ts`, `types.ts`, `units.ts` and the seeds, and never
- * `move.ts`, `generate.ts`, `interact.ts` or anything under `render/`
- * (ruling 20). `dress.test.ts` keeps it so.
+ * `heroes.ts`, `footprints.ts`, `types.ts`, `units.ts` and the seeds, and
+ * never `move.ts`, `generate.ts`, `interact.ts` or anything under
+ * `render/` (ruling 20). `dress.test.ts` keeps it so.
  */
 
 import { createRng, seedFor, type Rng } from "../core/seed";
 import { FOOTPRINTS, propFootprint } from "./footprints";
+import { heroReserve } from "./heroes";
 import {
   CLUSTER_CLEAR,
   CLUSTER_MAX,
@@ -167,6 +170,7 @@ import {
   dressingSites,
   edgeKey,
   fitsFloor,
+  mergeReserved,
   overlaps,
   spanBox,
   turnForSide,
@@ -317,22 +321,24 @@ function isFloorKind(kind: PropKind): kind is FloorPropKind {
 
 /**
  * Every prop the pass would place in a room, before the cap, each marked
- * mandatory or optional: steps 1 to 10 of the module doc. `reserved` keeps
- * floor props, wall props, runs, loops, span lines and loose cables out of
- * what a hero pass has claimed.
+ * mandatory or optional: steps 1 to 10 of the module doc. The room's own
+ * heroes are always kept clear of (`heroReserve(room.heroes)`, H3); the
+ * caller's `reserved` is merged with it, and keeps floor props, wall props,
+ * runs, loops, span lines and loose cables out of what else is claimed.
  */
 export function dressCandidates(
   room: RoomBase,
   reserved: Reserved = NO_RESERVE,
 ): Candidate[] {
+  const reserve = mergeReserved(heroReserve(room.heroes), reserved);
   const sites = dressingSites(room);
   const palette = PALETTES[room.archetype];
   const used = new Set<string>();
   const wallKinds = new Map<string, PropKind>();
   const floorBoxes: Box[] = [];
   const floorCells = new Set<string>();
-  const blocked = [...sites.taken, ...reserved.boxes];
-  const wallFree = (k: string) => sites.free.has(k) && !reserved.edges.has(k);
+  const blocked = [...sites.taken, ...reserve.boxes];
+  const wallFree = (k: string) => sites.free.has(k) && !reserve.edges.has(k);
   const out: Candidate[] = [];
   const propSeed = (x: number, y: number, token: string) =>
     seedFor(room.seed, "prop", x, y, token);
@@ -400,7 +406,7 @@ export function dressCandidates(
     for (const wall of walls)
       for (const e of wall) {
         const k = edgeKey(e);
-        if (sites.noRun.has(k) || reserved.edges.has(k)) continue;
+        if (sites.noRun.has(k) || reserve.edges.has(k)) continue;
         const seed = propSeed(e.x, e.y, `${token}-${e.side}`);
         segments.push({ e, prop: atWall(kind, e, variant, seed) });
       }
@@ -604,7 +610,7 @@ export function dressCandidates(
         seedFor(room.seed, "prop-span", l.axis, l.index);
       const clear = sites.spanLines.filter((l) =>
         l.segments.every(
-          (c) => !reserved.boxes.some((b) => overlaps(spanBox(l.axis, c), b)),
+          (c) => !reserve.boxes.some((b) => overlaps(spanBox(l.axis, c), b)),
         ),
       );
       const line = [...clear].sort(
@@ -646,7 +652,7 @@ export function dressCandidates(
       ...sites.fixtureEdges,
       ...carriers,
       edgeKey(entrance),
-      ...reserved.edges,
+      ...reserve.edges,
     ]);
     const looseSeed = (e: WallSlot) => propSeed(e.x, e.y, `loose-${e.side}`);
     const edges = sites.runs
@@ -679,8 +685,8 @@ export function dressCandidates(
 /**
  * The set dressing of a room: `dressCandidates`, capped at `PROP_CAP`
  * (`capProps`) and sorted by `PROP_ORDER`. See the module doc for the pass.
- * `reserved` keeps floor props, wall props, runs, loops, span lines and
- * loose cables out of what a hero pass has claimed; the generator passes
+ * The room's heroes are kept clear of whatever the caller passes
+ * (`dressCandidates`); `reserved` adds to them, and the generator passes
  * none.
  */
 export function dressRoom(

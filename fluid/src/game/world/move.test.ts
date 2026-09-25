@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
-import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
+import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
 import {
   FIXTURE_DEPTH,
   FIXTURE_WIDTH,
   FOOTPRINTS,
   decorFootprint,
   footprintOf,
+  heroFootprint,
   propFootprint,
 } from "./footprints";
 import { generateRoom } from "./generate";
@@ -23,7 +24,8 @@ import {
   type Intent,
   type Player,
 } from "./move";
-import type { Box, Decor, Prop, RoomSpec } from "./types";
+import { wallAnchor } from "./sites";
+import type { Box, Decor, Hero, Prop, RoomSpec } from "./types";
 import { CELL } from "./units";
 
 const room = generateRoom(CANNED_BRIDGE);
@@ -703,5 +705,81 @@ describe("blockersFor", () => {
     // fault frame map) would raise this past 1, so no door or fault state
     // can reach collision.
     expect(blockersFor.length).toBe(1);
+  });
+
+  it("collides with every hero but the flush ones (Review Focus 5)", () => {
+    // The gallery hall's cell (4, 14) is open floor with no blocker within
+    // 2 m of the turret's box, so every push below meets the turret alone.
+    const room = { ...galleryRoom(), heroes: [] as Hero[] };
+    const free: Hero = {
+      kind: "turret",
+      variant: 0,
+      x: 4.5,
+      y: 14,
+      turn: 0,
+      seed: 1,
+    };
+    const wall = wallAnchor({ x: 0, y: 13, side: "w" });
+    const flush: Hero = {
+      kind: "eye-panel",
+      variant: 0,
+      x: wall.x,
+      y: wall.y,
+      turn: wall.turn,
+      seed: 1,
+    };
+    const withHeroes = { ...room, heroes: [free, flush] };
+    const blockers = blockersFor(withHeroes);
+    expect(blockers).toContainEqual(heroFootprint(free));
+    expect(blockers).toHaveLength(blockersFor(room).length + 1);
+
+    // Pushed into the turret from the north, east, south and west for 2 s,
+    // the player stops PLAYER_RADIUS off its box.
+    const b = heroFootprint(free);
+    const cx = (b.x0 + b.x1) / 2;
+    const cz = (b.z0 + b.z1) / 2;
+    const pushes: {
+      from: Player;
+      intent: Intent;
+      gap: (p: Player) => number;
+    }[] = [
+      {
+        from: at(cx, b.z0 - 1.5),
+        intent: { ...idle, forward: -1 },
+        gap: (p) => b.z0 - p.z,
+      },
+      {
+        from: at(b.x1 + 1.5, cz),
+        intent: { ...idle, strafe: -1 },
+        gap: (p) => p.x - b.x1,
+      },
+      {
+        from: at(cx, b.z1 + 1.5),
+        intent: { ...idle, forward: 1 },
+        gap: (p) => p.z - b.z1,
+      },
+      {
+        from: at(b.x0 - 1.5, cz),
+        intent: { ...idle, strafe: 1 },
+        gap: (p) => b.x0 - p.x,
+      },
+    ];
+    for (const { from, intent, gap } of pushes) {
+      const p = runIn(withHeroes, from, intent, 70);
+      expect(Math.abs(gap(p) - PLAYER_RADIUS)).toBeLessThan(1e-6);
+    }
+
+    // Walking north along the west wall past the eye panel, between the
+    // two terminals either side of its edge, nothing stops the player: a
+    // flush hero does not collide.
+    const panel = heroFootprint(flush);
+    let q = at(PLAYER_RADIUS + 0.01, panel.z1 + 0.4);
+    expect(touchesBlocker(blockers, q)).toBe(false);
+    for (let i = 0; i < 70 && q.z > panel.z0 - 0.3; i++) {
+      q = stepPlayer(q, { ...idle, forward: 1 }, withHeroes, blockers);
+      expect(touchesBlocker(blockers, q)).toBe(false);
+    }
+    expect(q.z).toBeLessThan(panel.z0 - 0.3);
+    expect(q.x).toBeCloseTo(PLAYER_RADIUS + 0.01);
   });
 });
