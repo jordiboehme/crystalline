@@ -6,7 +6,12 @@ import { generateRoom } from "./generate";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
 import { STEP, doorwayColumns, isFloor, wallRuns, wallSlots } from "./layout";
 import { PLAYER_RADIUS } from "./move";
-import { LANE_DEPTH, LANE_WIDTH } from "./props";
+import {
+  LANE_DEPTH,
+  LANE_WIDTH,
+  SHEET_LANE_DEPTH,
+  SHEET_LANE_WIDTH,
+} from "./props";
 import propsSource from "./props.ts?raw";
 import {
   dressingSites,
@@ -238,18 +243,36 @@ describe("lanes", () => {
   const sites = dressingSites(hub);
   const wayKinds = new Set(["door", "hatch", "portal", "terminal", "machine"]);
 
-  it("gives the hub one lane per way and wall fixture, the entrance and each doorway column", () => {
-    const fixtures = hub.fixtures.filter((f) => wayKinds.has(f.kind)).length;
+  it("gives the hub one lane per fixture, the entrance and each doorway column", () => {
     const cols = doorwayColumns(hub).size;
     expect(cols).toBe(1 + bayCount(hub));
     expect(bayCount(hub)).toBeGreaterThan(0);
-    expect(sites.lanes).toHaveLength(fixtures + 1 + cols);
+    expect(sites.lanes).toHaveLength(hub.fixtures.length + 1 + cols);
     for (const f of hub.fixtures) {
       if (!wayKinds.has(f.kind)) continue;
       expect(sites.lanes).toContainEqual(
         footprint(f.slot, { along: LANE_WIDTH, out: LANE_DEPTH }),
       );
     }
+  });
+
+  it("gives every poster and the placard a 1.2 m by 1.5 m viewing lane", () => {
+    expect(SHEET_LANE_WIDTH).toBe(1.2);
+    expect(SHEET_LANE_DEPTH).toBe(1.5);
+    let checked = 0;
+    for (const room of [hub, bridge]) {
+      const lanes = dressingSites(room).lanes;
+      for (const f of room.fixtures) {
+        if (f.kind !== "poster" && f.kind !== "placard") continue;
+        expect(lanes, `${f.kind} ${edgeKey(f.slot)}`).toContainEqual(
+          footprint(f.slot, { along: 1.2, out: 1.5 }),
+        );
+        checked++;
+      }
+    }
+    expect(hub.fixtures.some((f) => f.kind === "placard")).toBe(true);
+    expect(hub.fixtures.some((f) => f.kind === "poster")).toBe(true);
+    expect(checked).toBeGreaterThan(2);
   });
 
   it("holds every arrival point of a door, hatch or portal with the player's radius to spare", () => {

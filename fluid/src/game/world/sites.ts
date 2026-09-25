@@ -26,6 +26,9 @@
  * - **Lanes** (ruling 10), which floor props never enter:
  *   - for every door, hatch, portal, terminal and machine, sealed or not:
  *     `footprint(slot, { along: LANE_WIDTH, out: LANE_DEPTH })`;
+ *   - for every poster and the placard, a viewing lane:
+ *     `footprint(slot, { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH })`
+ *     (1.2 m by 1.5 m), so no floor prop stands in front of the sheet;
  *   - the entrance: x `(entrance.x + 0.5) * CELL +- LANE_WIDTH / 2`, z from
  *     `((hall.y0 + hall.y1) / 2) * CELL` to `(entrance.y + 1) * CELL`;
  *   - every doorway column `c`: x from `(c - 1) * CELL` to `(c + 2) * CELL`,
@@ -65,7 +68,12 @@
 
 import { decorFootprint, footprint, footprintOf } from "./footprints";
 import { STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
-import { LANE_DEPTH, LANE_WIDTH } from "./props";
+import {
+  LANE_DEPTH,
+  LANE_WIDTH,
+  SHEET_LANE_DEPTH,
+  SHEET_LANE_WIDTH,
+} from "./props";
 import type { Box, Rect, RoomSpec, Side, WallSlot } from "./types";
 import { CELL } from "./units";
 
@@ -217,6 +225,7 @@ export function dressingSites(room: RoomBase): DressingSites {
 
   const lanes: Box[] = [];
   const size = { along: LANE_WIDTH, out: LANE_DEPTH };
+  const sheet = { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH };
   for (const f of room.fixtures) {
     switch (f.kind) {
       case "door":
@@ -228,6 +237,7 @@ export function dressingSites(room: RoomBase): DressingSites {
         break;
       case "poster":
       case "placard":
+        lanes.push(footprint(f.slot, sheet));
         break;
     }
   }

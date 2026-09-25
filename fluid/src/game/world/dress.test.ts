@@ -18,6 +18,7 @@ import dressSource from "./dress.ts?raw";
 import {
   FOOTPRINTS,
   decorFootprint,
+  footprint,
   footprintOf,
   propFootprint,
 } from "./footprints";
@@ -94,6 +95,7 @@ function matrix(place: PlaceInput): Dressed[] {
 const HUBS = matrix(CANNED_HUB);
 const WORKSHOPS = matrix(CANNED_WORKSHOP);
 const ALL = [...WORKSHOPS, ...HUBS];
+const BRIDGES = matrix(CANNED_BRIDGE);
 const workshop = generateRoom(CANNED_WORKSHOP);
 
 /** A place with nothing in it, to be filled by `over`. */
@@ -449,6 +451,29 @@ describe("floor props", () => {
       }
     }
     expect(checked).toBeGreaterThan(500);
+  });
+
+  it("leave the viewing lane in front of every poster and the placard clear", () => {
+    // The sheet's bottom edge hangs at SHEET_BOTTOM (1.2 m, `wall.ts`), lower
+    // than most floor props stand, so no floor prop may stand within the
+    // sheet's width and 1.5 m in front of it.
+    const SHEET_BOTTOM = 1.2;
+    const view = { along: SHEET_BOTTOM, out: 1.5 };
+    let checked = 0;
+    for (const { name, room } of [...ALL, ...BRIDGES]) {
+      const boxes = floorProps(room).map(boxOf);
+      for (const f of room.fixtures) {
+        if (f.kind !== "poster" && f.kind !== "placard") continue;
+        const lane = footprint(f.slot, view);
+        for (const b of boxes)
+          expect(
+            overlaps(b, lane),
+            `${name} ${f.kind} ${edgeKey(f.slot)}`,
+          ).toBe(false);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
   });
 
   it("backs a wall-side prop onto its wall, WALL_GAP off it and facing away, on all four walls", () => {

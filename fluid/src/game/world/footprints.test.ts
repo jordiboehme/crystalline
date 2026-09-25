@@ -115,4 +115,19 @@ describe("propFootprint", () => {
     };
     expect(() => propFootprint(outOfRange)).toThrow(/no variant 5/);
   });
+
+  it("names the kind when a floor-anchored prop's kind has no floor sizes", () => {
+    const misplaced: Prop = {
+      kind: "duct",
+      variant: 0,
+      anchor: "floor",
+      x: 0,
+      y: 0,
+      turn: 0,
+      seed: 0,
+    };
+    expect(() => propFootprint(misplaced)).toThrow(
+      /propFootprint: duct has no variant 0/,
+    );
+  });
 });

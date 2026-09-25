@@ -17,6 +17,7 @@ import type {
   Fixture,
   MachineKind,
   Prop,
+  PropKind,
   WallSlot,
 } from "./types";
 
@@ -259,12 +260,15 @@ export function decorFootprint(decor: Decor): Box | null {
  * centred on `(x * CELL, y * CELL)` and turned like `decorFootprint`, width
  * and depth swapped at a quarter or three-quarter turn. Null for a wall or
  * ceiling prop, which does not collide. Throws on a variant index out of
- * range for the kind: a generator bug should not pass silently.
+ * range for the kind, and in the same words on a floor-anchored prop whose
+ * kind has no floor sizes at all (a wall or ceiling kind): a generator bug
+ * should not pass silently.
  */
 export function propFootprint(prop: Prop): Box | null {
   if (prop.anchor !== "floor") return null;
-  const sizes = FOOTPRINTS.prop[prop.kind as keyof typeof FOOTPRINTS.prop];
-  const size = sizes[prop.variant];
+  const table: Partial<Record<PropKind, readonly FloorSize[]>> =
+    FOOTPRINTS.prop;
+  const size = table[prop.kind]?.[prop.variant];
   if (size === undefined) {
     throw new Error(
       `propFootprint: ${prop.kind} has no variant ${String(prop.variant)}`,

@@ -45,9 +45,12 @@ export const RUN_REACH = 1.0;
 /**
  * The highest a wall prop reaches, in metres. The runs above it start at
  * `RUN_BAND.h0`, 2.45 m, so a wall prop and a run on the same edge never
- * meet.
+ * meet. It is also no higher than the lowest ceiling prop (`CEILING_DROP`
+ * under a 3.0 m ceiling, 2.25 m), so at a hall corner, where a ceiling
+ * prop on one wall hangs over the end of the other wall, the wall band and
+ * the ceiling band never overlap.
  */
-export const WALL_TOP = 2.4;
+export const WALL_TOP = 2.25;
 
 /**
  * The height band of a wall run, in metres: above every wall prop

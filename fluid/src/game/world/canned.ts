@@ -151,7 +151,7 @@ export const CANNED_BRIDGE: PlaceInput = {
 export const CANNED_WORKSHOP: PlaceInput = {
   domain: "station",
   permalink: "workshop",
-  title: "Valve Workshop",
+  title: "Pump Workshop",
   type: "runbook",
   status: "draft",
   salience: 5,
@@ -159,7 +159,7 @@ export const CANNED_WORKSHOP: PlaceInput = {
   validTo: null,
   tags: ["pressure", "valves", "tools", "safety"],
   content: [
-    "# Valve Workshop",
+    "# Pump Workshop",
     "",
     "## Isolate",
     "Close the valve upstream and bleed the line.",

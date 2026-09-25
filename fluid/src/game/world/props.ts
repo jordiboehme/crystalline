@@ -487,3 +487,12 @@ export const EXTINGUISHER_EVERY = 6;
 export const LANE_WIDTH = 1.6;
 /** Depth of a clear lane from the wall, in metres. */
 export const LANE_DEPTH = 4.0;
+/**
+ * Width of the viewing lane in front of a poster or the placard, in metres:
+ * the sheet's width along its wall. Floor props never enter it, so nothing
+ * stands between the player and a sheet (its bottom edge hangs at 1.2 m,
+ * lower than most floor props are tall).
+ */
+export const SHEET_LANE_WIDTH = 1.2;
+/** Depth of the viewing lane in front of a poster or the placard, in metres. */
+export const SHEET_LANE_DEPTH = 1.5;

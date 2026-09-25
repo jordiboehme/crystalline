@@ -450,8 +450,8 @@ function paddedPanel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   }
 }
 
-/** The light strip housing: its height band. */
-const LIGHT_STRIP = { h0: 0.3, h1: 2.3 };
+/** The light strip housing: its height band, under `WALL_TOP`. */
+const LIGHT_STRIP = { h0: 0.3, h1: 2.2 };
 
 /**
  * Light strip: a vertical emissive bar in a thin housing. Variant 1 is two

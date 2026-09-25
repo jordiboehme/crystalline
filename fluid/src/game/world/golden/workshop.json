@@ -3,7 +3,7 @@
   "seed": 2834692296287951,
   "domain": "station",
   "permalink": "workshop",
-  "title": "Valve Workshop",
+  "title": "Pump Workshop",
   "archetype": "engineering",
   "condition": "construction",
   "width": 13,
@@ -47,7 +47,7 @@
         "side": "s"
       },
       "lines": [
-        "Valve Workshop",
+        "Pump Workshop",
         "TYPE runbook",
         "STATUS draft",
         "SALIENCE 5"
@@ -686,12 +686,12 @@
       "seed": 2453311243386724
     },
     {
-      "kind": "crate",
+      "kind": "tool-cart",
       "variant": 0,
       "anchor": "floor",
       "x": 12.5,
       "y": 0.5,
-      "turn": 3,
+      "turn": 1,
       "seed": 5442230551554003
     },
     {
@@ -738,15 +738,6 @@
       "y": 9.5,
       "turn": 2,
       "seed": 7377923476191885
-    },
-    {
-      "kind": "tool-cart",
-      "variant": 1,
-      "anchor": "floor",
-      "x": 12.5,
-      "y": 9.5,
-      "turn": 2,
-      "seed": 3783517594960896
     },
     {
       "kind": "duct",
