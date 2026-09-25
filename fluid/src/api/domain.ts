@@ -191,10 +191,22 @@ export interface StarterStanza {
 /** One MANIFEST policy key, as the registry describes it beside what this MANIFEST says. */
 export interface PolicyView {
   key: string;
+  /**
+   * `"choice"` (a closed set, drawn as a dropdown) or `"text"` (free text,
+   * changed through a different flow - `domain_name` through a rename, never
+   * this card's select). Defaults to `"choice"` for a daemon that predates
+   * this field, the shape every row had before it existed.
+   */
+  kind: "choice" | "text";
   /** As the frontmatter writes it, or null when the key is absent. */
   declared: string | null;
-  /** The value that holds: absent and unrecognized both fall to `default`. */
+  /**
+   * The value that holds: absent and unrecognized both fall to `default` for
+   * a `"choice"` key. For a `"text"` key, an absent or invalid declaration
+   * falls to this domain's local name instead.
+   */
   effective: string;
+  /** The values this key takes, in display order. Empty for a `"text"` key. */
   values: string[];
   default: string;
   meaning: string;
@@ -246,6 +258,7 @@ function readPolicies(value: unknown): PolicyView[] {
     return [
       {
         key,
+        kind: asString(record?.kind) === "text" ? "text" : "choice",
         declared: asString(record?.declared),
         effective,
         values: asStrings(record?.values),

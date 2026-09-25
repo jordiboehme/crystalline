@@ -1111,7 +1111,7 @@ fn policy_problems(path: &Path) -> Vec<PolicyProblem> {
         .filter_map(|spec| {
             let (declared, effective) = manifest.policy(spec.key)?;
             let declared = declared?;
-            (!spec.values.contains(&declared)).then(|| PolicyProblem {
+            (!spec.accepts(declared)).then(|| PolicyProblem {
                 key: spec.key.to_string(),
                 declared: declared.to_string(),
                 read_as: effective.to_string(),
@@ -1132,12 +1132,26 @@ fn policy_values(key: &str) -> &'static [&'static str] {
 }
 
 /// `a`, `a or b`, `a, b or c`: the values a key takes, read as a sentence
-/// rather than as a list a reader has to parse.
+/// rather than as a list a reader has to parse. A [`PolicyKind::Text`] key
+/// (`values` empty) has no enumerable list to join, so it reads as "a valid
+/// domain name" instead - the only free-text key today, and what an invalid
+/// declaration of it actually needs to become.
 fn join_or(values: &[&str]) -> String {
     match values {
-        [] => String::new(),
+        [] => "a valid domain name".to_string(),
         [one] => one.to_string(),
         [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// What a domain reads a policy key as, for the printed line: the value
+/// itself, or - for a [`PolicyKind::Text`] key an invalid declaration leaves
+/// with nothing to fall back to - "ignored; the local name holds".
+fn policy_read_as(read_as: &str) -> &str {
+    if read_as.is_empty() {
+        "ignored; the local name holds"
+    } else {
+        read_as
     }
 }
 
@@ -2182,7 +2196,7 @@ pub fn render_human(report: &DoctorReport) -> String {
                 p.key,
                 p.declared,
                 join_or(policy_values(&p.key)),
-                p.read_as
+                policy_read_as(&p.read_as)
             );
         }
         // Said once per domain so an empty orphan and unindexed list is never

@@ -24,8 +24,8 @@ use super::{
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
 use crystalline_core::{
-    Manifest, ProblemKind, TagAliasProblemKind, manifest_template, parse_engram, policy_registry,
-    starter_stanzas,
+    Manifest, PolicyKind, ProblemKind, TagAliasProblemKind, manifest_template, parse_engram,
+    policy_registry, starter_stanzas,
 };
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
@@ -508,13 +508,20 @@ pub struct PolicyView {
     /// The frontmatter key.
     #[schema(example = "sharing")]
     pub key: String,
+    /// `"choice"` (a closed set, shown as a dropdown) or `"text"` (free text,
+    /// changed by a different flow: `domain_name` changes through a rename).
+    #[schema(example = "choice")]
+    pub kind: String,
     /// The value as the frontmatter writes it, or `null` when the key is absent.
     #[schema(example = "direct")]
     pub declared: Option<String>,
-    /// The value that holds: absent and unrecognized both fall to `default`.
+    /// The value that holds: absent and unrecognized both fall to `default`
+    /// for a `"choice"` key. For the `"text"` key `domain_name`, an absent or
+    /// invalid declaration falls to this domain's local name instead - there
+    /// is no single stand-in value the way `default` is for a choice.
     #[schema(example = "direct")]
     pub effective: String,
-    /// The values the key takes, in display order.
+    /// The values the key takes, in display order. Empty for a `"text"` key.
     pub values: Vec<String>,
     /// What an absent or unrecognized declaration is read as.
     #[schema(example = "proposal")]
@@ -557,16 +564,25 @@ fn starters() -> Vec<StarterStanzaView> {
 
 /// The registry rows, joined with what `manifest` declares. A key the manifest
 /// does not know is at its registry default, which is what an absent
-/// declaration means.
-fn policies_of(manifest: &Manifest) -> Vec<PolicyView> {
+/// declaration means. `domain` is this domain's local name: a `"text"` key
+/// (`domain_name` today) whose effective value is empty - absent or invalid -
+/// reads as that local name instead, since there is no registry default for
+/// free text to fall back to.
+fn policies_of(manifest: &Manifest, domain: &str) -> Vec<PolicyView> {
     policy_registry()
         .iter()
         .map(|spec| {
             let (declared, effective) = manifest.policy(spec.key).unwrap_or((None, spec.default));
+            let effective = if spec.kind == PolicyKind::Text && effective.is_empty() {
+                domain.to_string()
+            } else {
+                effective.to_string()
+            };
             PolicyView {
                 key: spec.key.to_string(),
+                kind: spec.kind.as_str().to_string(),
                 declared: declared.map(str::to_string),
-                effective: effective.to_string(),
+                effective,
                 values: spec.values.iter().map(|v| v.to_string()).collect(),
                 default: spec.default.to_string(),
                 meaning: spec.meaning.to_string(),
@@ -665,7 +681,7 @@ impl ManifestSections {
                     })
                     .collect(),
             }),
-            policies: policies_of(&manifest),
+            policies: policies_of(&manifest, domain),
             starters: starters(),
             starter_document,
         }

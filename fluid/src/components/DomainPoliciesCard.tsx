@@ -162,7 +162,9 @@ export function DomainPoliciesCard({
             // differs from effective" - a known word the server reads
             // differently is the server's business, not a typo to report.
             const unrecognized =
-              row.declared !== null && !row.values.includes(row.declared);
+              row.kind !== "text" &&
+              row.declared !== null &&
+              !row.values.includes(row.declared);
             const shown = arming === row.key ? "direct" : row.effective;
             return (
               // The roles are spelled out because the row stacks below `sm`:
@@ -185,7 +187,13 @@ export function DomainPoliciesCard({
                   {row.declared ?? "not declared"}
                 </td>
                 <td role="cell" className="pr-3">
-                  {mayChange(row) ? (
+                  {row.kind === "text" ? (
+                    // A free-text key changes through a different flow
+                    // entirely (`domain_name` through a rename), never this
+                    // card's select: no save reaches it here, so the row is
+                    // read-only whatever `mayChange` would otherwise say.
+                    <output aria-labelledby={rowId}>{row.effective}</output>
+                  ) : mayChange(row) ? (
                     <select
                       ref={(el) => {
                         selects.current[row.key] = el;

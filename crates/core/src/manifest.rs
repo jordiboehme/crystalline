@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
+use crate::config::registration::validate_domain_name;
 use crate::engram::Engram;
 use crate::parse::{body_lines, fence_marker, locate, parse_engram, parse_heading};
 use crate::tags::is_lower_hyphen;
+use crate::yaml::YamlValue;
 
 const SCOPE: &str = "scope";
 const WHEN_TO_USE: &str = "when to use";
@@ -41,6 +43,13 @@ const SHARING_PROPOSAL: &str = "proposal";
 /// The `sharing` value that commits straight onto the connected branch.
 const SHARING_DIRECT: &str = "direct";
 
+/// The MANIFEST frontmatter key a domain declares its canonical name under:
+/// the name this domain is known by everywhere, which content addresses it
+/// with regardless of what any one machine calls it locally. Free text
+/// rather than a switch, which is why it needs [`PolicyKind::Text`] beside
+/// the enum kind the other two registry entries use.
+pub const DOMAIN_NAME_KEY: &str = "domain_name";
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -48,7 +57,7 @@ const SHARING_DIRECT: &str = "direct";
 /// `domain add --virtual` and the MCP `add_domain` tool so every scaffold looks
 /// the same.
 pub fn manifest_template(name: &str, today: &str) -> String {
-    format!(
+    let text = format!(
         "---\n\
 type: manifest\n\
 title: {name}\n\
@@ -65,7 +74,12 @@ recorded_at: {today}\n\
 ## Notes for Agents\n\n\
 - Add guidance for agents working in this domain\n\
 - Note the folder layout new engrams should reuse\n"
-    )
+    );
+    if validate_domain_name(name).is_ok() {
+        crate::emit::set_frontmatter_field(&text, DOMAIN_NAME_KEY, name)
+    } else {
+        text
+    }
 }
 
 /// A parsed Manifest: the H2 sections and their top-level bullets, plus the
@@ -88,6 +102,25 @@ pub struct Manifest {
     /// through [`Manifest::sharing`] for the policy in force and through
     /// [`Manifest::declared_sharing`] only to report on the text.
     sharing: Option<String>,
+    /// The [`DOMAIN_NAME_KEY`] frontmatter value as written, rendered to
+    /// text, or `None` when the key is absent. Private for the reason
+    /// `generated_indexes` is: go through [`Manifest::domain_name`] for the
+    /// name a caller may actually use and through
+    /// [`Manifest::declared_domain_name`] only to report on the text.
+    declared_domain_name: Option<String>,
+    /// The [`DOMAIN_NAME_KEY`] value, but only when it was written as a YAML
+    /// string (not a bare number, boolean or null that happens to look like
+    /// one) and it passes [`validate_domain_name`]. `None` otherwise -
+    /// absent, the wrong shape or an invalid name are all indistinguishable
+    /// to a caller that only wants a usable name.
+    domain_name: Option<String>,
+    /// Whether a declared `domain_name` was written as a YAML string at all,
+    /// valid or not. Crate-private: the only reader is the M008 verify rule,
+    /// which needs to tell "declared as text but not a valid name" (echo
+    /// [`validate_domain_name`]'s own sentence) apart from "declared as
+    /// something other than text" (a number, boolean, null, list or
+    /// mapping), and [`Manifest::domain_name`] collapses both to `None`.
+    domain_name_is_string: bool,
 }
 
 impl Manifest {
@@ -105,6 +138,13 @@ impl Manifest {
             .get(GENERATED_INDEXES_KEY)
             .map(scalar_text);
         let sharing = engram.frontmatter.extra.get(SHARING_KEY).map(scalar_text);
+        let domain_name_extra = engram.frontmatter.extra.get(DOMAIN_NAME_KEY);
+        let declared_domain_name = domain_name_extra.map(scalar_text);
+        let domain_name_is_string = matches!(domain_name_extra, Some(YamlValue::String(_)));
+        let domain_name = domain_name_extra.and_then(|value| match value {
+            YamlValue::String(s) if validate_domain_name(s).is_ok() => Some(s.clone()),
+            _ => None,
+        });
 
         let mut sections: IndexMap<String, Vec<String>> = IndexMap::new();
         let mut current: Option<String> = None;
@@ -141,6 +181,9 @@ impl Manifest {
             sections,
             generated_indexes,
             sharing,
+            declared_domain_name,
+            domain_name,
+            domain_name_is_string,
         }
     }
 
@@ -353,6 +396,32 @@ impl Manifest {
         }
     }
 
+    /// The `domain_name` declaration exactly as the frontmatter writes it,
+    /// rendered to text whatever YAML shape it took, or `None` when the key
+    /// is absent. For reporting only - a verify finding naming what a reader
+    /// wrote even when it cannot name a domain: [`Manifest::domain_name`] is
+    /// what a caller resolving the canonical name should use.
+    pub fn declared_domain_name(&self) -> Option<&str> {
+        self.declared_domain_name.as_deref()
+    }
+
+    /// This domain's declared canonical name, or `None` when the key is
+    /// absent, is not a YAML string, or does not pass
+    /// [`validate_domain_name`]. Unlike [`Manifest::generated_indexes`] and
+    /// [`Manifest::sharing`] there is no safe default to fall back to: a
+    /// name is either usable or it is not, and a caller that needs a name
+    /// regardless falls back to the domain's local name instead.
+    pub fn domain_name(&self) -> Option<&str> {
+        self.domain_name.as_deref()
+    }
+
+    /// Whether a declared `domain_name` was written as a YAML string, valid
+    /// or not. Crate-private; see the field doc comment for why the M008
+    /// verify rule needs it.
+    pub(crate) fn domain_name_is_string(&self) -> bool {
+        self.domain_name_is_string
+    }
+
     /// The declared and the effective value of one registry key, or `None`
     /// for a key the registry does not know. The one dispatch from a key to
     /// its accessors, which is what the registry guard test walks.
@@ -363,6 +432,10 @@ impl Manifest {
                 self.generated_indexes().as_str(),
             )),
             SHARING_KEY => Some((self.declared_sharing(), self.sharing().as_str())),
+            DOMAIN_NAME_KEY => Some((
+                self.declared_domain_name(),
+                self.domain_name().unwrap_or(""),
+            )),
             _ => None,
         }
     }
@@ -489,6 +562,28 @@ pub fn sharing_at(root: &Path) -> Sharing {
     Manifest::from_engram(&engram, &source).sharing()
 }
 
+/// This domain's declared canonical [`Manifest::domain_name`], parsed from a
+/// MANIFEST source already in hand. `None` when the source does not parse or
+/// declares no usable name, the same as [`Manifest::domain_name`] itself -
+/// for a caller (the write-back path, the name table) that has the text but
+/// not a domain root to read it from.
+pub fn domain_name_of_source(source: &str) -> Option<String> {
+    let engram = parse_engram(source).ok()?;
+    Manifest::from_engram(&engram, source)
+        .domain_name()
+        .map(str::to_string)
+}
+
+/// This domain's declared canonical [`Manifest::domain_name`], read from the
+/// `MANIFEST.md` at `root`. `None` whenever the MANIFEST is missing,
+/// unreadable, unparseable or declares no usable name - the shape of
+/// [`sharing_at`], except there is no safe default to fall back to: a caller
+/// that needs a name regardless falls back to the domain's local name.
+pub fn domain_name_at(root: &Path) -> Option<String> {
+    let source = std::fs::read_to_string(root.join("MANIFEST.md")).ok()?;
+    domain_name_of_source(&source)
+}
+
 /// Who may change a policy key from a surface that asks: the domain's owner
 /// (or an instance admin, who owns every domain), or an instance admin alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +604,28 @@ impl PolicyRole {
     }
 }
 
+/// The shape of values a policy key accepts: a closed set of choices shown as
+/// a dropdown, or free text with no enumerable options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKind {
+    /// A closed set: `values` lists every value the key accepts, and
+    /// `default` is one of them.
+    Choice,
+    /// Free text: `values` is empty and `default` is `""`. What counts as an
+    /// accepted value is decided per key in [`PolicyKey::accepts`].
+    Text,
+}
+
+impl PolicyKind {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyKind::Choice => "choice",
+            PolicyKind::Text => "text",
+        }
+    }
+}
+
 /// One MANIFEST configuration key, as the domain policies card and the doctor
 /// read it. Every policy key has exactly one entry here, and the standing
 /// rule is that a key joins this registry and the card in the same change:
@@ -519,9 +636,14 @@ impl PolicyRole {
 pub struct PolicyKey {
     /// The frontmatter key.
     pub key: &'static str,
-    /// The values the key takes, in display order.
+    /// Whether the key takes a closed set of values or free text.
+    pub kind: PolicyKind,
+    /// The values the key takes, in display order. Empty for
+    /// [`PolicyKind::Text`].
     pub values: &'static [&'static str],
-    /// What an absent or unrecognized declaration is read as.
+    /// What an absent or unrecognized declaration is read as. `""` for
+    /// [`PolicyKind::Text`], where an absent or invalid declaration has no
+    /// single stand-in value.
     pub default: &'static str,
     /// One line, user-facing, present tense.
     pub meaning: &'static str,
@@ -529,11 +651,29 @@ pub struct PolicyKey {
     pub changed_by: PolicyRole,
 }
 
+impl PolicyKey {
+    /// Whether `value` is a declaration this key would act on. A
+    /// [`PolicyKind::Choice`] key accepts exactly its listed `values`; a
+    /// [`PolicyKind::Text`] key accepts whatever its own rule says -
+    /// [`DOMAIN_NAME_KEY`] defers to [`validate_domain_name`], and any other
+    /// text key (there is none today) falls back to "not blank".
+    pub fn accepts(&self, value: &str) -> bool {
+        match self.kind {
+            PolicyKind::Choice => self.values.contains(&value),
+            PolicyKind::Text => match self.key {
+                DOMAIN_NAME_KEY => validate_domain_name(value).is_ok(),
+                _ => !value.trim().is_empty(),
+            },
+        }
+    }
+}
+
 /// The registry: every MANIFEST configuration key, in display order.
 pub fn policy_registry() -> &'static [PolicyKey] {
     &[
         PolicyKey {
             key: GENERATED_INDEXES_KEY,
+            kind: PolicyKind::Choice,
             values: &[GENERATED_INDEXES_LOCAL, GENERATED_INDEXES_SHARED],
             default: GENERATED_INDEXES_LOCAL,
             meaning: "Whether the generated folder listings travel with a share.",
@@ -541,9 +681,18 @@ pub fn policy_registry() -> &'static [PolicyKey] {
         },
         PolicyKey {
             key: SHARING_KEY,
+            kind: PolicyKind::Choice,
             values: &[SHARING_PROPOSAL, SHARING_DIRECT],
             default: SHARING_PROPOSAL,
             meaning: "Whether a share opens a proposal for review or commits straight to the branch.",
+            changed_by: PolicyRole::Owner,
+        },
+        PolicyKey {
+            key: DOMAIN_NAME_KEY,
+            kind: PolicyKind::Text,
+            values: &[],
+            default: "",
+            meaning: "The name this domain is known by everywhere; links from other domains use it.",
             changed_by: PolicyRole::Owner,
         },
     ]

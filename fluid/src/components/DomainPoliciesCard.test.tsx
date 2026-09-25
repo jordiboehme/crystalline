@@ -188,6 +188,20 @@ describe("the domain policies card", () => {
     ).toBeVisible();
   });
 
+  it("renders a text-kind row as read-only text, never a select", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    expect(within(domainName).getByText("eng")).toBeVisible();
+    expect(within(domainName).queryByRole("combobox")).toBeNull();
+    expect(
+      within(card).queryByRole("combobox", { name: "domain_name" }),
+    ).toBeNull();
+  });
+
   it("says nothing about a declaration the registry knows, whatever holds", async () => {
     serve({
       "/domains/eng/manifest": () =>

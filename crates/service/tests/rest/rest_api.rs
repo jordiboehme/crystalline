@@ -2036,8 +2036,9 @@ async fn domain_manifest_carries_every_section_it_declares() {
                 "problems": []
             },
             "policies": [
-                { "key": "generated_indexes", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                { "key": "generated_indexes", "kind": "choice", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+                { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -2069,8 +2070,9 @@ async fn domain_manifest_names_what_it_lacks() {
             "provisioning": null,
             "tag_aliases": null,
             "policies": [
-                { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+                { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),

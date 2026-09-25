@@ -422,7 +422,12 @@ impl Engine {
                     known.join(", ")
                 )));
             };
-            if !spec.values.contains(&value.as_str()) {
+            if spec.kind == crystalline_core::PolicyKind::Text {
+                return Err(EngineError::Invalid(format!(
+                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename on the domain page or `crystalline domain rename {domain} <new>`"
+                )));
+            }
+            if !spec.accepts(value) {
                 return Err(EngineError::Invalid(format!(
                     "`{key}: {value}` is not a value `{key}` takes; write one of {}",
                     spec.values.join(", ")

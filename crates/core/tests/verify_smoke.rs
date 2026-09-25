@@ -822,6 +822,64 @@ fn both_recognized_sharing_values_and_an_absent_key_are_clean() {
     );
 }
 
+// --- The domain_name declaration (M008) --------------------------------------
+
+fn manifest_declaring_domain_name(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_invalid_domain_name_is_m008_error() {
+    for (value, shown) in [("../up", "../up"), ("1.0", "1"), ("true", "true")] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        let m008 = report
+            .issues
+            .iter()
+            .find(|i| i.rule == "M008")
+            .expect("M008 present");
+        assert_eq!(m008.severity, Severity::Error, "{value}");
+        assert!(
+            m008.message
+                .starts_with(&format!("`domain_name: {shown}` cannot name a domain")),
+            "{}",
+            m008.message
+        );
+        assert_eq!(
+            m008.fix.as_deref(),
+            Some(
+                "ignored until fixed; write a quoted name of letters, digits, hyphens, underscores and dots, for example domain_name: 'platform'"
+            )
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+}
+
+#[test]
+fn a_valid_or_absent_domain_name_is_clean() {
+    for value in ["platform", "'1.0'", "eng.docs"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M008"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";

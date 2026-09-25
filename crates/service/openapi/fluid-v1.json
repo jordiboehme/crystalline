@@ -10052,6 +10052,7 @@
         "description": "One MANIFEST policy key: the registry row beside what this MANIFEST says.",
         "required": [
           "key",
+          "kind",
           "effective",
           "values",
           "default",
@@ -10079,13 +10080,18 @@
           },
           "effective": {
             "type": "string",
-            "description": "The value that holds: absent and unrecognized both fall to `default`.",
+            "description": "The value that holds: absent and unrecognized both fall to `default`\nfor a `\"choice\"` key. For the `\"text\"` key `domain_name`, an absent or\ninvalid declaration falls to this domain's local name instead - there\nis no single stand-in value the way `default` is for a choice.",
             "example": "direct"
           },
           "key": {
             "type": "string",
             "description": "The frontmatter key.",
             "example": "sharing"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`\"choice\"` (a closed set, shown as a dropdown) or `\"text\"` (free text,\nchanged by a different flow: `domain_name` changes through a rename).",
+            "example": "choice"
           },
           "meaning": {
             "type": "string",
@@ -10096,7 +10102,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The values the key takes, in display order."
+            "description": "The values the key takes, in display order. Empty for a `\"text\"` key."
           }
         }
       },

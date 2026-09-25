@@ -104,6 +104,7 @@ export function domainsResponse() {
 /** One policy row of a manifest payload, in the registry's own wire shape. */
 export interface PolicyRowFixture {
   key: string;
+  kind: "choice" | "text";
   declared: string | null;
   effective: string;
   values: string[];
@@ -112,7 +113,11 @@ export interface PolicyRowFixture {
   changed_by: string;
 }
 
-/** One row of the registry, at whatever this MANIFEST declares for it. */
+/**
+ * One row of the registry, at whatever this MANIFEST declares for it.
+ * `kind` defaults to `"choice"`, the shape every row had before `domain_name`
+ * introduced `"text"`.
+ */
 export function policyRow(
   key: string,
   declared: string | null,
@@ -120,9 +125,11 @@ export function policyRow(
   values: string[],
   dflt: string,
   meaning: string,
+  kind: "choice" | "text" = "choice",
 ): PolicyRowFixture {
   return {
     key,
+    kind,
     declared,
     effective,
     values,
@@ -156,6 +163,15 @@ export function defaultPolicyRows(): PolicyRowFixture[] {
       ["proposal", "direct"],
       "proposal",
       "Whether a share opens a proposal for review or commits straight to the branch.",
+    ),
+    policyRow(
+      "domain_name",
+      null,
+      "eng",
+      [],
+      "",
+      "The name this domain is known by everywhere; links from other domains use it.",
+      "text",
     ),
   ];
 }

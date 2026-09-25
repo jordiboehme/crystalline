@@ -220,7 +220,7 @@ pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue>
 }
 
 /// Run the MANIFEST rules over one MANIFEST text, without scanning a domain:
-/// `M002`-`M007`, `M101`-`M104`, `M106` and `M107`, plus `M105` when `root`
+/// `M002`-`M008`, `M101`-`M104`, `M106` and `M107`, plus `M105` when `root`
 /// names the domain folder its provisioned folders are looked up in.
 ///
 /// Backs the edit and write receipts, which report what a change did to a

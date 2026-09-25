@@ -906,8 +906,9 @@ async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
     assert_eq!(
         body["sections"]["policies"],
         serde_json::json!([
-            { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-            { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+            { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+            { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+            { "key": "domain_name", "kind": "text", "declared": null, "effective": "kb", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
         ]),
         "{body}"
     );
@@ -1034,6 +1035,42 @@ async fn the_policy_patch_validates_the_whole_body_before_it_writes() {
             "{body}: {problem}"
         );
     }
+    assert_eq!(
+        std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap(),
+        before,
+        "nothing was written"
+    );
+}
+
+/// `domain_name` is a `PolicyKind::Text` key: it changes through a rename,
+/// which also moves this machine's local name and rewrites links, never
+/// through the policy patch. A PATCH naming it is refused before anything is
+/// written, pointing at the rename command instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_refuses_domain_name_and_points_at_rename() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let before = std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap();
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"domain_name": "x"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 422, "{problem}");
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(detail.contains("rename"), "{problem}");
+    assert!(detail.contains("crystalline domain rename"), "{problem}");
+
     assert_eq!(
         std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap(),
         before,

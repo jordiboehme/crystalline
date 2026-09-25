@@ -2,7 +2,7 @@
 //!
 //! `MANIFEST.md` is checked with a hardcoded shape (`## Scope` and
 //! `## When to Use`, `M001`-`M004`, `M101`-`M103`), plus the frontmatter
-//! switches it declares (`M006`, `M007`). Every entry under a
+//! switches it declares (`M006`, `M007`, `M008`). Every entry under a
 //! domain's `.crystalline.yaml` `verify.required_files` is checked with the
 //! same rule ids against its own configured sections, so a domain can apply
 //! the identical structural checks to any other file it wants enforced (a
@@ -12,10 +12,11 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
+use crate::config::registration::validate_domain_name;
 use crate::engram::{Engram, Heading};
 use crate::manifest::{
-    GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind, ProvisioningSection,
-    SHARING_KEY, Sharing, TagAliasSection, in_root_artifact_dirs,
+    DOMAIN_NAME_KEY, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind,
+    ProvisioningSection, SHARING_KEY, Sharing, TagAliasSection, in_root_artifact_dirs,
 };
 
 use super::scanner::Domain;
@@ -52,7 +53,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
 }
 
 /// Every MANIFEST rule that reads the MANIFEST's own text, over one parsed
-/// MANIFEST: `M002`-`M007`, `M101`-`M104`, `M106`, `M107`, and `M105` when
+/// MANIFEST: `M002`-`M008`, `M101`-`M104`, `M106`, `M107`, and `M105` when
 /// `root` names a folder to look in.
 ///
 /// The one body both callers share, so what validate reports about a
@@ -200,6 +201,41 @@ pub(crate) fn check_manifest_text(
                 Sharing::Proposal.as_str(),
                 Sharing::Direct.as_str()
             )),
+        );
+    }
+
+    // `M008`: a `domain_name` declaration that cannot name a domain, whether
+    // because it was written as something other than text (a number, a
+    // boolean, `null`, a list or a mapping) or because it fails
+    // `validate_domain_name`. An error, not a warning, because the domain's
+    // canonical name is exactly what content addresses it by: a value that
+    // does not stick is a promise the MANIFEST cannot keep, not a cosmetic
+    // slip. It is ignored at runtime rather than obeyed on the safe side,
+    // since there is no safe stand-in name to fall back to - the domain
+    // simply keeps whatever name it already has locally.
+    if let Some(declared) = manifest.declared_domain_name()
+        && manifest.domain_name().is_none()
+    {
+        let reason = if manifest.domain_name_is_string() {
+            // `domain_name()` is `None` and this was declared as text, so
+            // `validate_domain_name` must have rejected it.
+            validate_domain_name(declared)
+                .err()
+                .unwrap_or_else(|| "it is not a valid domain name".to_string())
+        } else {
+            "it is not a text value".to_string()
+        };
+        sink.emit(
+            path,
+            None,
+            "M008",
+            Severity::Error,
+            format!("`{DOMAIN_NAME_KEY}: {declared}` cannot name a domain: {reason}"),
+            Some(
+                "ignored until fixed; write a quoted name of letters, digits, hyphens, \
+                 underscores and dots, for example domain_name: 'platform'"
+                    .to_string(),
+            ),
         );
     }
 

@@ -2767,7 +2767,10 @@ export interface components {
              */
             default: string;
             /**
-             * @description The value that holds: absent and unrecognized both fall to `default`.
+             * @description The value that holds: absent and unrecognized both fall to `default`
+             *     for a `"choice"` key. For the `"text"` key `domain_name`, an absent or
+             *     invalid declaration falls to this domain's local name instead - there
+             *     is no single stand-in value the way `default` is for a choice.
              * @example direct
              */
             effective: string;
@@ -2776,9 +2779,15 @@ export interface components {
              * @example sharing
              */
             key: string;
+            /**
+             * @description `"choice"` (a closed set, shown as a dropdown) or `"text"` (free text,
+             *     changed by a different flow: `domain_name` changes through a rename).
+             * @example choice
+             */
+            kind: string;
             /** @description One line, present tense. */
             meaning: string;
-            /** @description The values the key takes, in display order. */
+            /** @description The values the key takes, in display order. Empty for a `"text"` key. */
             values: string[];
         };
         /** @description An RFC 9457 problem detail, sent as `application/problem+json`. Every failure on this surface has this shape, so a client can branch on `status` alone. */

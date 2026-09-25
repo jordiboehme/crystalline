@@ -601,6 +601,84 @@ fn reports_a_manifest_policy_value_nobody_recognizes_and_what_it_reads_as() {
     );
 }
 
+/// A valid `domain_name` declaration is never a policy problem: the free-text
+/// registry entry accepts it, unlike the pre-3b bug where every declared
+/// value failed an empty `values` list.
+#[test]
+fn a_valid_domain_name_is_not_a_policy_problem() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(
+        &domain_dir,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: platform\n---\n\n# eng\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n",
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["policy_problems"],
+        serde_json::json!([]),
+        "{report}"
+    );
+}
+
+/// An invalid `domain_name` is a policy problem naming what a valid one looks
+/// like, since the key has no enumerable value list to join.
+#[test]
+fn an_invalid_domain_name_is_a_policy_problem_naming_a_valid_domain_name() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(
+        &domain_dir,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: ../up\n---\n\n# eng\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n",
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["policy_problems"],
+        serde_json::json!([{ "key": "domain_name", "declared": "../up", "read_as": "" }]),
+        "{report}"
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    cmd.args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .stdout(predicates::str::contains(
+            "MANIFEST domain_name: ../up is not a valid domain name; read as ignored; the local name holds",
+        ));
+}
+
 #[test]
 fn domain_filter_restricts_checks_to_one_domain() {
     let work = tempfile::tempdir().unwrap();
