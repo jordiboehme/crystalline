@@ -20,7 +20,7 @@
  * clicked, E uses what the player faces and I inverts the vertical look.
  *
  * `options.props` false shows the place undressed: `session.showRoom` with
- * `generateRoom`'s props and heroes stripped, rather than `session.showCanned`, which
+ * `generateRoom`'s props, heroes and curios stripped, rather than `session.showCanned`, which
  * is the dev-only comparison `?props=0` reads. That path has no client-side
  * `PlaceInput` kept by the session, so its terminals open no reader; R
  * still swaps the condition, rebuilding the same way.
@@ -201,7 +201,13 @@ export function startDemo(
       placedHero = forced.placed;
       session.showRoom(forced.room);
     } else if (withProps) session.showCanned(p);
-    else session.showRoom({ ...generateRoom(p), props: [], heroes: [] });
+    else
+      session.showRoom({
+        ...generateRoom(p),
+        props: [],
+        heroes: [],
+        curios: [],
+      });
   };
   show(place);
 

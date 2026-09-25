@@ -8,6 +8,7 @@ import {
   galleryRoom,
 } from "./canned";
 import { measureDensity, type Density } from "./density";
+import curiosSource from "./curios.ts?raw";
 import densitySource from "./density.ts?raw";
 import {
   PROP_ORDER,
@@ -1760,8 +1761,13 @@ describe("degenerate rooms (Review Focus 5)", () => {
 });
 
 describe("the generator side's imports (ruling 20)", () => {
-  it("keeps dress.ts, density.ts and heroes.ts away from move, generate, interact, malfunction and render", () => {
-    for (const source of [dressSource, densitySource, heroesSource])
+  it("keeps dress.ts, density.ts, heroes.ts and curios.ts away from move, generate, interact, malfunction and render", () => {
+    for (const source of [
+      dressSource,
+      densitySource,
+      heroesSource,
+      curiosSource,
+    ])
       expect(source).not.toMatch(
         /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
       );

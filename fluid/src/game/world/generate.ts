@@ -618,12 +618,13 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   };
   // The heroes stand before the dressing, which keeps off what they
   // reserve. They replace the empty list in place, so the keys (and the
-  // goldens) read fixtures, decor, scaffold, heroes, props, lights.
+  // goldens) read fixtures, decor, scaffold, heroes, props, curios, lights.
   const room: RoomBase = { ...base, heroes: placeHeroes(base) };
   const { lights, dropped: left, inboundMore: more, ...head } = room;
   return {
     ...head,
     props: dressRoom(room),
+    curios: [],
     lights,
     dropped: left,
     inboundMore: more,

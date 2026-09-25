@@ -60,10 +60,14 @@
  *    decimals before they are measured.
  * 6. The output, sorted by `HERO_ORDER`.
  *
- * The surface hook (H21): `HERO_CATALOGUE[kind].surfaces` lists each top in
- * the hero's local terms, and `heroSurfaces` gives them in world metres, for
- * the small surface props of a later milestone. `heroUsePoint` gives a
- * cabinet's use point the same way.
+ * The surface hook (H21, C3): `HERO_CATALOGUE[kind].surfaces` lists each
+ * top in the hero's local terms (`SurfaceSpec`, with its free height
+ * `clear` and its class `cls`), and `under` the spots below the top (the
+ * floor in a knee space, or a lower shelf), which bypass the reserve since
+ * they lie inside the hero's own box. `heroSurfaces` and `heroUnder` give
+ * them in world metres for the curios (`curios.ts`), through `heroPoint`
+ * and so `turnedPoint`. `heroUsePoint` gives a cabinet's use point the same
+ * way.
  *
  * This is the generator side: it imports `footprints.ts`, `sites.ts`,
  * `types.ts`, `units.ts` and the seeds (and may import `props.ts`), and
@@ -76,10 +80,12 @@ import { createRng, seedFor, type Rng } from "../core/seed";
 import {
   FOOTPRINTS,
   HERO_FOOTING,
-  HERO_FRONT,
+  OPEN_CLEAR,
   heroFootprint,
   heroTurn,
   pipeRunBox,
+  turnedBox,
+  turnedPoint,
 } from "./footprints";
 import {
   EPS,
@@ -105,6 +111,8 @@ import type {
   HeroPlacement,
   Rect,
   Side,
+  SurfaceClass,
+  SurfaceSpec,
   WallSlot,
 } from "./types";
 import { CELL } from "./units";
@@ -129,20 +137,6 @@ export const HERO_KINDS: readonly HeroKind[] = [
   "recruit-cabinet",
 ];
 
-/**
- * A top a later pass may set a small prop on (H21), in the hero's local
- * terms at turn 0: `a` along its width, `d` along its depth (from the wall
- * point for a wall-anchored hero, from the centre for a free one), `h` the
- * height of the top in metres.
- */
-export interface HeroSurfaceSpec {
-  a0: number;
-  a1: number;
-  d0: number;
-  d1: number;
-  h: number;
-}
-
 /** One kind's entry: where it stands, how many variants, how tall, its edges and its tops. */
 export interface HeroEntry {
   placement: HeroPlacement;
@@ -150,7 +144,18 @@ export interface HeroEntry {
   top: number;
   /** Wall edges a wall or backed kind takes: 1, or 2 for the core wall. */
   edges: 1 | 2;
-  surfaces: readonly HeroSurfaceSpec[];
+  /**
+   * The tops a curio may stand on (H21, C3), in the hero's local terms at
+   * turn 0 (`SurfaceSpec`: `a` along its width, `d` along its depth from
+   * the wall point for a wall-anchored hero or from the centre for a free
+   * one), each with its free height `clear` and its class `cls`.
+   */
+  surfaces: readonly SurfaceSpec[];
+  /**
+   * Spots below the top a curio of class `under` may stand on (C3); they
+   * bypass the reserve, since they lie inside the hero's own box.
+   */
+  under: readonly SurfaceSpec[];
   /**
    * Where a player would stand to use it, in the same local terms, or null:
    * the arcade cabinets keep one (spec: a later spec makes E open a game),
@@ -183,6 +188,7 @@ export const HERO_CATALOGUE = {
     top: 1.3,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "black-slab": {
@@ -191,6 +197,7 @@ export const HERO_CATALOGUE = {
     top: 2.7,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "eye-panel": {
@@ -199,6 +206,7 @@ export const HERO_CATALOGUE = {
     top: 2.2,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "photo-console": {
@@ -207,6 +215,7 @@ export const HERO_CATALOGUE = {
     top: 1.9,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "laser-desk": {
@@ -214,7 +223,28 @@ export const HERO_CATALOGUE = {
     variants: 1,
     top: 2.2,
     edges: 1,
-    surfaces: [{ a0: -1.1, a1: -0.35, d0: -0.2, d1: 0.4, h: 0.74 }],
+    surfaces: [
+      {
+        a0: -1.1,
+        a1: -0.35,
+        d0: -0.2,
+        d1: 0.4,
+        h: 0.74,
+        clear: 1.15,
+        cls: "desk",
+      },
+    ],
+    under: [
+      {
+        a0: -1.05,
+        a1: -0.3,
+        d0: -0.2,
+        d1: 0.4,
+        h: 0,
+        clear: 0.68,
+        cls: "under",
+      },
+    ],
     use: null,
   },
   "mess-table": {
@@ -222,7 +252,19 @@ export const HERO_CATALOGUE = {
     variants: 1,
     top: 1.1,
     edges: 1,
-    surfaces: [{ a0: -2.1, a1: 0.9, d0: -0.4, d1: 0.4, h: 0.76 }],
+    surfaces: [
+      {
+        a0: -2.1,
+        a1: 0.9,
+        d0: -0.4,
+        d1: 0.4,
+        h: 0.76,
+        clear: OPEN_CLEAR,
+        cls: "table",
+      },
+    ],
+    // Nothing under the top: the spine and its foot plate fill it (C3).
+    under: [],
     use: null,
   },
   "helper-robot": {
@@ -231,6 +273,7 @@ export const HERO_CATALOGUE = {
     top: 1.6,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "sleep-ring": {
@@ -239,6 +282,7 @@ export const HERO_CATALOGUE = {
     top: 1.4,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "dome-planters": {
@@ -247,6 +291,7 @@ export const HERO_CATALOGUE = {
     top: 1.5,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "core-wall": {
@@ -255,6 +300,7 @@ export const HERO_CATALOGUE = {
     top: 2.25,
     edges: 2,
     surfaces: [],
+    under: [],
     use: null,
   },
   "gun-rack": {
@@ -263,6 +309,7 @@ export const HERO_CATALOGUE = {
     top: 1.9,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "gun-bench": {
@@ -270,7 +317,28 @@ export const HERO_CATALOGUE = {
     variants: 1,
     top: 1.4,
     edges: 1,
-    surfaces: [{ a0: -0.9, a1: -0.55, d0: 0.1, d1: 0.8, h: 0.9 }],
+    surfaces: [
+      {
+        a0: -0.9,
+        a1: -0.55,
+        d0: 0.1,
+        d1: 0.8,
+        h: 0.9,
+        clear: OPEN_CLEAR,
+        cls: "bench",
+      },
+    ],
+    under: [
+      {
+        a0: -0.83,
+        a1: 0.83,
+        d0: 0.13,
+        d1: 0.77,
+        h: 0.31,
+        clear: 0.52,
+        cls: "under",
+      },
+    ],
     use: null,
   },
   "tube-bench": {
@@ -278,7 +346,28 @@ export const HERO_CATALOGUE = {
     variants: 1,
     top: 2.0,
     edges: 1,
-    surfaces: [{ a0: -0.9, a1: -0.3, d0: 0.1, d1: 0.8, h: 0.9 }],
+    surfaces: [
+      {
+        a0: -0.9,
+        a1: -0.3,
+        d0: 0.1,
+        d1: 0.8,
+        h: 0.9,
+        clear: OPEN_CLEAR,
+        cls: "bench",
+      },
+    ],
+    under: [
+      {
+        a0: -0.83,
+        a1: 0.2,
+        d0: 0.13,
+        d1: 0.77,
+        h: 0.31,
+        clear: 0.52,
+        cls: "under",
+      },
+    ],
     use: null,
   },
   "field-pack": {
@@ -287,6 +376,7 @@ export const HERO_CATALOGUE = {
     top: 1.6,
     edges: 1,
     surfaces: [],
+    under: [],
     use: null,
   },
   "arcade-cabinet": {
@@ -295,6 +385,7 @@ export const HERO_CATALOGUE = {
     top: 1.95,
     edges: 1,
     surfaces: [],
+    under: [],
     use: { a: 0, d: 0.9 + HERO_USE_OUT },
   },
   "recruit-cabinet": {
@@ -303,6 +394,7 @@ export const HERO_CATALOGUE = {
     top: 2.0,
     edges: 1,
     surfaces: [],
+    under: [],
     use: { a: 0, d: 1.2 + HERO_USE_OUT },
   },
 } satisfies Record<HeroKind, HeroEntry>;
@@ -450,51 +542,64 @@ export function heroReserve(heroes: readonly Hero[]): Reserved {
 /**
  * Where a hero's local point `(a, d)` lies in world metres: `a` along the
  * hero's width and `d` along its depth, in the terms the models are built
- * in (`frameAt` in `render/kit.ts`). The point is `anchor * CELL + along *
- * a + front * d`, with `front = HERO_FRONT[turn]` (the frame's `inward`)
- * and `along = [front[1], -front[0]]`, the frame's `along`: `[-1, 0]` at
- * turn 0, since a piece facing north has its `along` running west. Every
- * helper that turns a catalogue point into the world goes through here,
- * so they all mirror the kit alike (`heroes.test.ts` pins it against
- * `frameAt` and `turnPoint` at every turn).
+ * in (`frameAt` in `render/kit.ts`). It is `turnedPoint` (`footprints.ts`,
+ * C4) at the hero's anchor and turn: `anchor * CELL + along * a + front *
+ * d`, with `front = HERO_FRONT[turn]` (the frame's `inward`) and `along =
+ * [front[1], -front[0]]`, the frame's `along`: `[-1, 0]` at turn 0, since
+ * a piece facing north has its `along` running west. Every helper that
+ * turns a catalogue point into the world goes through `turnedPoint`, so
+ * they all mirror the kit alike (`heroes.test.ts` pins this against
+ * `frameAt` and `turnPoint` at every turn, `curios.test.ts` pins
+ * `turnedPoint` itself).
  */
 export function heroPoint(
   h: Hero,
   a: number,
   d: number,
 ): { x: number; z: number } {
-  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
-  const ax = fz;
-  const az = -fx;
-  return { x: h.x * CELL + ax * a + fx * d, z: h.y * CELL + az * a + fz * d };
+  return turnedPoint(h.x, h.y, heroTurn(h), a, d);
+}
+
+/** One of a hero's surfaces in world metres: its box, height, free height and class. */
+export interface HeroSurface {
+  box: Box;
+  h: number;
+  clear: number;
+  cls: SurfaceClass;
 }
 
 /**
- * The hero's tops (H21) in world metres, each with its height `h`: each
- * top's four corners through `heroPoint`, and its box spanning their
- * extremes.
+ * Each of `specs` in world metres for hero `h`: its four corners turned
+ * as `heroPoint` turns them (`turnedBox` in `footprints.ts`), and its box
+ * spanning their extremes. What `heroSurfaces` and `heroUnder` share.
  */
-export function heroSurfaces(h: Hero): { box: Box; h: number }[] {
-  const specs: readonly HeroSurfaceSpec[] = HERO_CATALOGUE[h.kind].surfaces;
-  return specs.map((s) => {
-    const xs: number[] = [];
-    const zs: number[] = [];
-    for (const a of [s.a0, s.a1])
-      for (const d of [s.d0, s.d1]) {
-        const p = heroPoint(h, a, d);
-        xs.push(p.x);
-        zs.push(p.z);
-      }
-    return {
-      box: {
-        x0: Math.min(...xs),
-        x1: Math.max(...xs),
-        z0: Math.min(...zs),
-        z1: Math.max(...zs),
-      },
-      h: s.h,
-    };
-  });
+function heroRects(h: Hero, specs: readonly SurfaceSpec[]): HeroSurface[] {
+  const turn = heroTurn(h);
+  return specs.map((s) => ({
+    box: turnedBox(h.x, h.y, turn, s),
+    h: s.h,
+    clear: s.clear,
+    cls: s.cls,
+  }));
+}
+
+/**
+ * The hero's tops (H21) in world metres, each with its height `h`, its
+ * free height `clear` and its class `cls`: each top's four corners through
+ * `heroPoint`, and its box spanning their extremes.
+ */
+export function heroSurfaces(h: Hero): HeroSurface[] {
+  const specs: readonly SurfaceSpec[] = HERO_CATALOGUE[h.kind].surfaces;
+  return heroRects(h, specs);
+}
+
+/**
+ * The hero's under spots (C3) in world metres, in the same shape as
+ * `heroSurfaces`: the catalogue's `under` list turned the same way.
+ */
+export function heroUnder(h: Hero): HeroSurface[] {
+  const specs: readonly SurfaceSpec[] = HERO_CATALOGUE[h.kind].under;
+  return heroRects(h, specs);
 }
 
 /** The heroes' order in `RoomSpec.heroes`: by `y`, then `x`, then kind by code point. */

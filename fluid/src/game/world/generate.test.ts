@@ -80,13 +80,14 @@ describe("the goldens", () => {
     expect(generateRoom(CANNED_BRIDGE).corridor).toBeNull();
   });
 
-  it("puts heroes right after decor and scaffold, then props, before the lights", () => {
+  it("puts heroes right after decor and scaffold, then props and curios, before the lights", () => {
     const keys = Object.keys(generateRoom(CANNED_WORKSHOP));
     const at = (k: string) => keys.indexOf(k);
     expect(at("decor")).toBeLessThan(at("scaffold"));
     expect(at("heroes")).toBe(at("scaffold") + 1);
     expect(at("props")).toBe(at("heroes") + 1);
-    expect(at("lights")).toBe(at("props") + 1);
+    expect(at("curios")).toBe(at("props") + 1);
+    expect(at("lights")).toBe(at("curios") + 1);
   });
 });
 

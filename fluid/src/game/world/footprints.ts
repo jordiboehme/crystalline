@@ -7,6 +7,11 @@
  * apart from the floor props' so `MAX_FLOOR_PROP` stays true of every
  * floor prop kind (H2).
  *
+ * It also holds the one local-to-world transform (`turnedPoint`, C4, and
+ * `turnedBox` over it) that the hero helpers and the curios' host surfaces
+ * share, and `OPEN_CLEAR`,
+ * the free height an open top promises a curio (C3).
+ *
  * This is a leaf of the world: it imports only `units.ts` and `types.ts`,
  * so the generator (`generate.ts`) and the walking code (`move.ts`) can both
  * read it without importing each other. `footprints.test.ts` keeps it so.
@@ -385,6 +390,64 @@ export const HERO_FRONT: readonly (readonly [number, number])[] = [
   [0, 1],
   [-1, 0],
 ];
+
+/**
+ * How much free height an open top promises a curio (C3), in metres: a
+ * lit sword in its stand (1.22) with a margin. The host-surface render
+ * test pins that nothing of the host stands in that box.
+ */
+export const OPEN_CLEAR = 1.3;
+
+/**
+ * Where a local point `(a, d)` of a thing anchored at `(x, y)` (cell units)
+ * and turned `turn` quarter turns lies, in world metres: `a` along its
+ * width and `d` along its depth, in the terms the models are built in
+ * (`frameAt` and `frameForSlot` in `render/kit.ts`). The point is
+ * `anchor * CELL + along * a + front * d`, with `front = HERO_FRONT[turn]`
+ * and `along = [front[1], -front[0]]`. Every helper that turns a local
+ * point into the world goes through here (`heroPoint`, `hostSurfaces`),
+ * so they all mirror the kit alike (C4).
+ */
+export function turnedPoint(
+  x: number,
+  y: number,
+  turn: number,
+  a: number,
+  d: number,
+): { x: number; z: number } {
+  const t = ((Math.round(turn) % 4) + 4) % 4;
+  const [fx, fz] = HERO_FRONT[t] ?? [0, -1];
+  return { x: x * CELL + fz * a + fx * d, z: y * CELL - fx * a + fz * d };
+}
+
+/**
+ * The world box, in metres, of a local rectangle `a0..a1` by `d0..d1` of a
+ * thing anchored at `(x, y)` (cell units) and turned `turn` quarter turns:
+ * its four corners through `turnedPoint`, the box spanning their extremes.
+ * The one corner loop the hero tops and under spots (`heroSurfaces`,
+ * `heroUnder`) and the curios' host surfaces (`hostSurfaces`) share.
+ */
+export function turnedBox(
+  x: number,
+  y: number,
+  turn: number,
+  r: { a0: number; a1: number; d0: number; d1: number },
+): Box {
+  const xs: number[] = [];
+  const zs: number[] = [];
+  for (const a of [r.a0, r.a1])
+    for (const d of [r.d0, r.d1]) {
+      const p = turnedPoint(x, y, turn, a, d);
+      xs.push(p.x);
+      zs.push(p.z);
+    }
+  return {
+    x0: Math.min(...xs),
+    x1: Math.max(...xs),
+    z0: Math.min(...zs),
+    z1: Math.max(...zs),
+  };
+}
 
 /** A hero's quarter turn, 0 to 3, whatever whole number `turn` holds. */
 export function heroTurn(h: Hero): number {

@@ -387,6 +387,63 @@ export interface Hero {
 }
 
 /**
+ * What a surface is for (C3): a desk top, a bench top, a table, a shelf
+ * level or cabinet top, or an `under` spot below a host's top (the floor
+ * in its knee space, or a lower shelf).
+ */
+export type SurfaceClass = "desk" | "bench" | "table" | "shelf" | "under";
+
+/**
+ * A rectangle a curio may stand on (C3), in its host's local terms at turn
+ * 0, the terms the host's model is built in: `a` along its width, `d`
+ * along its depth (from the wall for a wall host, from the centre for a
+ * free one), `h` the height of the surface in metres, `clear` the free
+ * height above it and `cls` what it is for.
+ */
+export interface SurfaceSpec {
+  a0: number;
+  a1: number;
+  d0: number;
+  d1: number;
+  h: number;
+  clear: number;
+  cls: SurfaceClass;
+}
+
+/** The small curios (C19), named by their shape. */
+export type CurioKind =
+  | "light-sword"
+  | "green-pistol"
+  | "pink-gadget"
+  | "wing-meter"
+  | "pocket-console"
+  | "tape-drive"
+  | "tape-player"
+  | "video-tape"
+  | "beige-laptop"
+  | "star-ball"
+  | "catch-ball"
+  | "trap-box"
+  | "fuel-case";
+
+/**
+ * One curio (C1): `x` and `y` in `Decor`'s continuous cell units, the
+ * centre of its box; `h` the height of the surface it stands on, in
+ * metres (0 on the floor); `turn` 0 to 3 quarter turns; `variant` indexes
+ * `CURIO_CATALOGUE[kind].sizes`; `seed` the seed of the candidate it was
+ * accepted on (C9).
+ */
+export interface Curio {
+  kind: CurioKind;
+  variant: number;
+  x: number;
+  y: number;
+  h: number;
+  turn: number;
+  seed: number;
+}
+
+/**
  * A rectangle of cells, `x1` and `y1` exclusive, in grid coordinates (the
  * same convention as a light zone).
  */
@@ -490,6 +547,12 @@ export interface RoomSpec {
    * data, placed after everything else so it never moves a fixture.
    */
   props: Prop[];
+  /**
+   * The curios (`placeCurios` in `curios.ts`, C1): small things on the
+   * room's desks, benches, tables and shelves and under its desks, placed
+   * last, after the dressing. They never collide and move nothing.
+   */
+  curios: Curio[];
   lights: LightZone[];
   /** How many fixtures found no wall slot and were left out. */
   dropped: number;

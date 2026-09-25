@@ -512,7 +512,7 @@ const reseeded = (base: SiteBase, n = 1000): SiteBase[] =>
 
 /** A room with these heroes, dressed around them. */
 function withHeroes(base: SiteBase, heroes: Hero[]): RoomSpec {
-  const room: RoomSpec = { ...base, heroes, props: [] };
+  const room: RoomSpec = { ...base, heroes, props: [], curios: [] };
   return { ...room, props: dressRoom(room) };
 }
 

@@ -23,8 +23,8 @@
  * `tiltedBar` given straight to `k.extrude`.
  */
 
-import { HERO_CATALOGUE, type HeroSurfaceSpec } from "../../../world/heroes";
-import type { HeroKind } from "../../../world/types";
+import { HERO_CATALOGUE } from "../../../world/heroes";
+import type { HeroKind, SurfaceSpec } from "../../../world/types";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import {
@@ -267,7 +267,7 @@ const SHELF_H1 = 0.31;
  * A bench kind's one catalogue surface: its top height and its clear end.
  * Throws for a kind without one (only the benches call it).
  */
-function benchSurface(kind: HeroKind): HeroSurfaceSpec {
+function benchSurface(kind: HeroKind): SurfaceSpec {
   const surface = HERO_CATALOGUE[kind].surfaces[0];
   if (surface === undefined)
     throw new Error(`workshop: ${kind} has no bench surface`);
