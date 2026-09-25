@@ -24,8 +24,11 @@
  *
  * Each tick, in order: the look and command keys, movement, what the player
  * faces and E at it, the doors, the faults of the broken ways, the HUD
- * prompt, the ways out of the room, and warming the cache for the places
- * behind the doors the player walks up to.
+ * prompt, the ways out of the room, warming the cache for the places
+ * behind the doors the player walks up to, the room's light specials and
+ * the blink banks (`render/blink.ts`, H11). The blink state is made once
+ * per session, not per room: a hero blinks the same way wherever it
+ * stands. Its gains go to the renderer as `draw`'s sixth argument.
  *
  * Malfunctions belong to one visit of a room. A travel that settles as
  * missing (404) or denied (403) marks the way it went through as failed
@@ -59,6 +62,7 @@ import { loadPlace, prefetchPlace, type LoadedPlace } from "./data/source";
 import { backbufferSize } from "./device";
 import { createContext } from "./gl/context";
 import { gameEngramRoute, placeKeyOf } from "./paths";
+import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
@@ -303,6 +307,8 @@ export function createSession(opts: SessionOptions): Session {
   let room: RoomSpec | null = null;
   let blockers: Box[] = [];
   let lights: LightState | null = null;
+  /** The blink banks' gains, one state for the whole session (H11). */
+  const blink = createBlink();
   let doors = new Map<number, DoorState>();
   let doorOpen = new Map<string, number>();
   let player: Player | null = null;
@@ -806,6 +812,7 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
     lights?.tick();
+    blink.tick();
   };
 
   const loop = createLoop(
@@ -843,6 +850,7 @@ export function createSession(opts: SessionOptions): Session {
           (t - started) / 1000,
           doorOpen,
           faultNow,
+          blink.gains,
         );
       },
     },

@@ -1,7 +1,9 @@
 /**
  * What every model recipe shares: the context a room hands them, the
  * movers they give back, sub-frames for parts that do not stand square to
- * their wall, the look's surfaces and the sign plate a label is mounted on.
+ * their wall, the look's surfaces (the self-lit `signal` light of H12 and
+ * the `blink` lights of a hero's blink bank, H11, among them) and the sign
+ * plate a label is mounted on.
  * The tints no look's palette carries and that read the same in every
  * look (`RECESS`, `LAMP_TINT`, `SPARK_TINT`) live here too, so a recipe
  * file that needs one never reaches into another recipe file for it.
@@ -11,7 +13,13 @@
  */
 
 import type { Rect } from "../../world/types";
-import { FLAG, type MeshData, type Surface, type V3 } from "../geometry";
+import {
+  FLAG,
+  blinkFlag,
+  type MeshData,
+  type Surface,
+  type V3,
+} from "../geometry";
 import { DECAL_LIFT, type Frame, type Kit } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import type { Look, Rgb } from "../looks";
@@ -230,8 +238,12 @@ export function shade(c: Rgb, k: number): Rgb {
 /**
  * The look's surfaces the recipes draw with: `body` the machine shell,
  * `metal` bare metal, `dark` gunmetal for keys, grilles and trim, `panel`
- * the white wall panel colour, `hazard` the stripes, and `glow` for a
- * light of a given colour.
+ * the white wall panel colour, `hazard` the stripes, `glow` for a screen
+ * or light of a given colour that carries the panel texture (emissive),
+ * `signal` for a light that shines by itself whatever the room's light
+ * (H12: a warning lamp, a hero's steady light) and `blink` for a signal
+ * light in group `group` (0 to 7) of its hero's blink bank (H11), whose
+ * gain the bank moves.
  */
 export function surfaces(look: Look) {
   const p = look.palette;
@@ -245,6 +257,16 @@ export function surfaces(look: Look) {
       layer: LAYER.panel,
       tint,
       flag: FLAG.emissive,
+    }),
+    signal: (tint: Rgb): Surface => ({
+      layer: LAYER.panel,
+      tint,
+      flag: FLAG.signal,
+    }),
+    blink: (tint: Rgb, group: number): Surface => ({
+      layer: LAYER.panel,
+      tint,
+      flag: blinkFlag(group),
     }),
     tinted: (tint: Rgb, layer: number = LAYER.panel): Surface => ({
       layer,

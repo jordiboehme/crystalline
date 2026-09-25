@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { CANNED_WORKSHOP } from "../world/canned";
+import { CANNED_WORKSHOP, galleryRoom } from "../world/canned";
 import { generateRoom } from "../world/generate";
+import type { Hero } from "../world/types";
 import { CELL } from "../world/units";
-import { INSTANCE_FLOATS, propInstances, propKey } from "./instances";
+import { bankSlot } from "./blink";
+import {
+  INSTANCE_FLOATS,
+  heroInstances,
+  heroKey,
+  instanceGroups,
+  propInstances,
+  propKey,
+} from "./instances";
 import { turnMat2Columns } from "./kit";
+import { HERO_BANK } from "./models/heroes/common";
 import { SCENE_VS } from "./shaders";
 
 const workshop = generateRoom(CANNED_WORKSHOP);
@@ -69,6 +79,93 @@ describe("propInstances", () => {
     a.forEach((g, i) => {
       expect(Array.from(b[i]?.data ?? [])).toEqual(Array.from(g.data));
     });
+  });
+});
+
+describe("instanceGroups", () => {
+  it("gives hero groups their own key space and their bank slot, the same arrays for the same room (Review Focus 3)", () => {
+    const room = {
+      ...galleryRoom(),
+      heroes: [
+        { kind: "turret", variant: 0, x: 4.5, y: 14, turn: 1, seed: 3 },
+        { kind: "black-slab", variant: 0, x: 8.5, y: 13.925, turn: 2, seed: 4 },
+      ] satisfies Hero[],
+    };
+    const groups = instanceGroups(room);
+    const heroes = groups.filter((g) => g.family === "hero");
+    expect(heroes.map((g) => g.key)).toEqual([
+      "hero:black-slab:0",
+      "hero:turret:0",
+    ]);
+    const props = new Set(
+      groups.filter((g) => g.family === "prop").map((g) => g.key),
+    );
+    for (const g of heroes) expect(props.has(g.key)).toBe(false);
+    const turret = heroes.find((g) => g.kind === "turret");
+    expect(Array.from(turret?.data ?? [])).toEqual([
+      4.5 * CELL,
+      0,
+      14 * CELL,
+      1,
+      bankSlot(HERO_BANK.turret),
+    ]);
+    const slab = heroes.find((g) => g.kind === "black-slab");
+    expect(slab?.data[4]).toBe(0);
+    expect(instanceGroups(room)).toEqual(groups);
+    expect(
+      propInstances(room).every(
+        (g) =>
+          g.family === "prop" &&
+          g.data.every((_, i) => i % 5 !== 4 || g.data[i] === 0),
+      ),
+    ).toBe(true);
+  });
+
+  it("puts the props first, then the heroes, and a room without heroes gives only props", () => {
+    const room = {
+      ...galleryRoom(),
+      heroes: [
+        { kind: "core-wall", variant: 0, x: 6, y: 4, turn: 0, seed: 1 },
+      ] satisfies Hero[],
+    };
+    const groups = instanceGroups(room);
+    const families = groups.map((g) => g.family);
+    expect(families.at(-1)).toBe("hero");
+    expect(families.indexOf("hero")).toBe(propInstances(room).length);
+    expect(heroInstances(room).map((g) => g.key)).toEqual([
+      heroKey("core-wall", 0),
+    ]);
+    expect(heroInstances(room)[0]?.data[4]).toBe(bankSlot("twinkle"));
+    const bare = { ...room, heroes: [] };
+    expect(instanceGroups(bare)).toEqual(propInstances(bare));
+  });
+
+  it("writes one record per hero, grouped by kind and variant", () => {
+    const room = {
+      ...galleryRoom(),
+      heroes: [
+        { kind: "arcade-cabinet", variant: 2, x: 3, y: 5, turn: 0, seed: 1 },
+        { kind: "arcade-cabinet", variant: 0, x: 7, y: 5, turn: 0, seed: 2 },
+        { kind: "arcade-cabinet", variant: 2, x: 9, y: 5, turn: 3, seed: 3 },
+      ] satisfies Hero[],
+    };
+    const groups = heroInstances(room);
+    expect(groups.map((g) => [g.key, g.count])).toEqual([
+      ["hero:arcade-cabinet:0", 1],
+      ["hero:arcade-cabinet:2", 2],
+    ]);
+    expect(Array.from(groups[1]?.data ?? [])).toEqual([
+      3 * CELL,
+      0,
+      5 * CELL,
+      0,
+      bankSlot("swap"),
+      9 * CELL,
+      0,
+      5 * CELL,
+      3,
+      bankSlot("swap"),
+    ]);
   });
 });
 

@@ -19,6 +19,7 @@ import type {
 } from "../world/types";
 import { CELL } from "../world/units";
 import {
+  FLAG,
   FLOATS_PER_VERTEX,
   createBuilder,
   type MeshData,
@@ -608,10 +609,18 @@ describe("fixture models", () => {
         }
 
         if (fx.kind === "door") {
+          it("draws its lamp lens as a signal light, off the room's light (H12)", () => {
+            const lens = partsOf(built, "lamp");
+            expect(lens.length).toBeGreaterThan(0);
+            for (const p of lens) expect(p.flag).toBe(FLAG.signal);
+          });
+
           it("sets its lamp lens on a flat face of its host", () => {
-            // The lens is a FLAG.lamp panel, which the glow check does not
-            // look at, so it is held here: every corner lies on a static
-            // triangle that faces into the room DECAL_LIFT behind it.
+            // The lens is a FLAG.signal panel, which the glow check now
+            // looks at too (it is in GLOWING), but only as touching some
+            // host within 3 cm; the lens's own face is held here tighter:
+            // every corner lies on a static triangle that faces into the
+            // room DECAL_LIFT behind it.
             const lens = partsOf(built, "lamp").flatMap((p) => p.points);
             expect(lens.length).toBe(6);
             const local = lens.map((q) => toLocal(wall, q));

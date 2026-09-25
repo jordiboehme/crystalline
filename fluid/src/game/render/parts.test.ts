@@ -179,7 +179,8 @@ describe("the identity draw", () => {
     const exits = SCENE_FS.split("\n").filter((l) =>
       l.includes("outColour = "),
     );
-    expect(exits).toHaveLength(4);
+    // Emissive, lamp, signal, blink, portal and the lit path.
+    expect(exits).toHaveLength(6);
     for (const line of exits) expect(line).toContain("uGain");
   });
 

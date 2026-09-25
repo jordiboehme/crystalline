@@ -29,7 +29,9 @@
  * (`render/parts.ts` turns a fault frame into their draw): a hazard lamp
  * lens (`lamp:<index>`), a flush amber panel near the top of the right
  * jamb or housing that glows dimly at `LAMP_IDLE` and blinks while a fault
- * runs, and a spark cluster (`spark:<index>`), six tiny glowing boxes on
+ * runs, a signal light (`FLAG.signal`, H12) that shines by itself and no
+ * longer follows the room's light, so it is as vivid in a dark room as in
+ * a lit one; and a spark cluster (`spark:<index>`), six tiny glowing boxes on
  * the recess at the leaves' meeting line, drawn only while a fault lights
  * them and hidden by the closed leaves.
  *
@@ -100,7 +102,9 @@ const neg = (v: V3): V3 => [-v[0], -v[1], -v[2]];
 /**
  * The hazard lamp lens's gain while no fault runs: a dim amber glow, so a
  * blink to `LAMP_ON` (in `world/malfunction.ts`) reads as the lamp
- * lighting up.
+ * lighting up. The lens is a signal light (H12), so this gain is the whole
+ * story: it no longer follows the room's light, and idles as faint in a
+ * bright room as in a dark one.
  */
 export const LAMP_IDLE = 0.3;
 
@@ -214,7 +218,8 @@ type Parts = [
  * The hazard lamp lens, mover `lamp:<index>`: a flush amber panel `size`
  * metres square, centred at `a` along and height `h`, `DECAL_LIFT` in
  * front of the face at depth `faceD`, glowing at `LAMP_IDLE` while no
- * fault runs.
+ * fault runs. It is a signal light (`FLAG.signal`, H12), never dimmed by
+ * the room.
  */
 function lamp(
   st: Style,
@@ -231,7 +236,7 @@ function lamp(
     faceD + DECAL_LIFT,
     h - half,
     h + half,
-    { layer: LAYER.panel, tint: LAMP_TINT, flag: FLAG.lamp },
+    { layer: LAYER.panel, tint: LAMP_TINT, flag: FLAG.signal },
   );
   return {
     key: `lamp:${st.index}`,

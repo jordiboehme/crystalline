@@ -2,16 +2,20 @@
  * The model checks the model tests share: test support, which only tests
  * import. Nothing in the game reads it, so it never reaches a bundle.
  *
- * The fixture and decor tests (`models.test.ts`) and the prop tests
- * (`propModels.test.ts`) measure a built model the same ways: the winding
- * of every triangle against its stored normal, points in a frame's local
- * terms, points inside a floor box, and whether every glowing part touches
- * a lit host or its wall. The glow check works on a list of recorded kit
+ * The fixture and decor tests (`models.test.ts`), the prop tests
+ * (`propModels.test.ts`) and the hero tests (`heroModels.test.ts`) measure
+ * a built model the same ways: the winding of every triangle against its
+ * stored normal, points in a frame's local terms, points inside a floor
+ * box, and whether every glowing part (a screen, a frame, a portal, a
+ * signal light or a blinking one) touches a lit host or its wall. A prop
+ * or hero mesh, built once at the origin, is turned and placed the way the
+ * GPU places an instance (`placeMesh`, `placeParts`) before it is measured. The glow check works on a list of recorded kit
  * calls (`Part`), which `recordingKitAt` records for a model built through
  * a kit factory, and which the fixture tests record for the movers too.
  */
 
 import type { Box } from "../world/types";
+import { BLINK_GROUPS } from "./blink";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
@@ -20,7 +24,7 @@ import {
   type Surface,
   type V3,
 } from "./geometry";
-import { createKit, type Frame, type Kit } from "./kit";
+import { createKit, turnPoint, type Frame, type Kit } from "./kit";
 import type { KitAt } from "./models";
 
 /**
@@ -195,23 +199,44 @@ export function reaches(from: Shape, to: Shape): boolean {
   return false;
 }
 
-const GLOWING: readonly number[] = [FLAG.emissive, FLAG.frame, FLAG.portal];
+/**
+ * The flags the glow check looks at: emissive, frame, portal, signal and
+ * every blink group's (`FLAG.blink` to `FLAG.blink + BLINK_GROUPS - 1`).
+ * A lamp (the ceiling panels' flag) is not among them: a panel is part of
+ * the ceiling, never a model's light.
+ */
+export const GLOWING: readonly number[] = [
+  FLAG.emissive,
+  FLAG.frame,
+  FLAG.portal,
+  FLAG.signal,
+  ...Array.from({ length: BLINK_GROUPS }, (_, g) => FLAG.blink + g),
+];
 
 /**
- * Every glowing part that floats: a part with an emissive, frame or portal
- * flag that is in contact with no lit host part (a vertex of one within
+ * Every glowing part that floats: a part with a flag in `GLOWING` that is
+ * in contact with no lit host part (a vertex of one within
  * `CONTACT` of a triangle of the other, either way round) and, when `wall`
  * is given, does not reach within `CONTACT` of the wall plane either.
  * Returns `"<index>:<method>"` for each, so the list must be empty: nothing
  * glows in mid-air. Pass every part of the model, a fixture's movers
  * included, since mover parts count as hosts too.
+ *
+ * A frame is a lit body whose edges glow (the shader lights it like any lit
+ * surface and adds its edge lines), so a frame part hosts every other
+ * glowing part: a door's warning lamp, a signal light, sits on the frame
+ * of its jamb. A frame itself still needs a lit host or the wall.
  */
 export function floatingGlow(
   parts: readonly Part[],
   wall: Frame | null,
 ): string[] {
-  const hosts = parts
-    .filter((p) => !GLOWING.includes(p.flag) && p.points.length > 0)
+  const solid = parts.filter((p) => p.points.length > 0);
+  const hosts = solid
+    .filter((p) => !GLOWING.includes(p.flag))
+    .map((p) => shape(p.points));
+  const frames = solid
+    .filter((p) => p.flag === FLAG.frame)
     .map((p) => shape(p.points));
   return parts
     .map((p, i) => ({ p, i }))
@@ -220,10 +245,39 @@ export function floatingGlow(
       if (wall && p.points.some((q) => toLocal(wall, q)[1] <= CONTACT))
         return false;
       const glow = shape(p.points);
-      return !hosts.some((h) => reaches(glow, h) || reaches(h, glow));
+      const own = p.flag === FLAG.frame ? hosts : [...hosts, ...frames];
+      return !own.some((h) => reaches(glow, h) || reaches(h, glow));
     })
     .map(({ p, i }) => `${String(i)}:${p.method}`);
 }
+
+/**
+ * A mesh turned and placed as the GPU places an instance: every position
+ * turned by `turnPoint` (quarter turns `t`) and moved to the anchor `at`,
+ * every normal turned. A prop or hero mesh is built at the origin, so this
+ * is where the model tests see it standing in a room.
+ */
+export function placeMesh(m: MeshData, t: number, at: V3): MeshData {
+  const vertices = Float32Array.from(m.vertices);
+  for (let i = 0; i < m.count; i++) {
+    const o = i * FLOATS_PER_VERTEX;
+    const v = (k: number) => vertices[o + k] ?? NaN;
+    const p = add(turnPoint([v(0), v(1), v(2)], t), at);
+    const n = turnPoint([v(3), v(4), v(5)], t);
+    vertices.set([...p, ...n], o);
+  }
+  return { vertices, count: m.count };
+}
+
+/**
+ * Recorded parts turned and placed the same way as `placeMesh` places
+ * their mesh, so the glow check sees them where the instance stands.
+ */
+export const placeParts = (parts: readonly Part[], t: number, at: V3): Part[] =>
+  parts.map((p) => ({
+    ...p,
+    points: p.points.map((q) => add(turnPoint(q, t), at)),
+  }));
 
 type Fn = (...args: unknown[]) => void;
 

@@ -7,22 +7,28 @@
  * of `layerPlan`: one per screen, poster and placard, one per six labels),
  * makes the room's light grid texture, uploads the set dressing and keeps
  * the look's numbers - and `draw` is then a handful of uniform uploads, one
- * small light upload, the room and its moving parts (each mover drawn
- * with the uniforms `moverDraw` in `parts.ts` gives it), one instanced
- * draw per prop kind and variant, and six full-screen passes. The scene
- * is rendered at the canvas size handed to `resize`, the bloom at half of
- * that and below.
+ * small light upload, the blink gains (`uBlink`, the blink banks of
+ * `blink.ts`, H11), the room and its moving parts (each mover drawn with
+ * the uniforms `moverDraw` in `parts.ts` gives it), one instanced draw per
+ * prop or hero kind and variant, and six full-screen passes. The scene is
+ * rendered at the canvas size handed to `resize`, the bloom at half of
+ * that and below. The static room is drawn at `restDraw`, the movers at
+ * their own uniforms, and the uniforms go back to `restDraw` before the
+ * instance groups and once more after them, so `uGain` is 1 for every
+ * prop and hero and no later draw inherits a mover's gain.
  *
- * The set dressing is drawn instanced (see `instances.ts`). Each prop kind
+ * The set dressing and the heroes are drawn instanced (see
+ * `instances.ts`). Heroes are instanced like props, in their own key space
+ * (`hero:<kind>:<variant>`), their slot their kind's blink bank. Each kind
  * and variant the room needs is built once as its own mesh in the look's
- * colours and kept in a cache keyed by kind and variant; the cache is
+ * colours and kept in a cache keyed by the group's key; the cache is
  * cleared when the look's id changes and otherwise grows lazily, bounded by
- * the prop catalogue. The condition does not enter the key: it changes
- * only grime and light scale, never the palette a mesh is coloured from (a
- * look test pins that). The room's instance buffers depend only on the
- * room, so a look switch, which calls `setRoom` again with the very same
- * room object, keeps them and only rebuilds the small vertex arrays that
- * bind them to the new look's meshes.
+ * the prop and hero catalogues. The condition does not enter the key: it
+ * changes only grime and light scale, never the palette a mesh is coloured
+ * from (a look test pins that). The room's instance buffers depend only on
+ * the room, so a look switch, which calls `setRoom` again with the very
+ * same room object, keeps them and only rebuilds the small vertex arrays
+ * that bind them to the new look's meshes.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
  * calls on unmount. After a lost context the demo does not call it: the
@@ -47,13 +53,14 @@ import { createProgram, type Program } from "../gl/program";
 import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
 import type { FaultFrame } from "../world/malfunction";
-import type { PropKind, RoomSpec } from "../world/types";
+import type { HeroKind, PropKind, RoomSpec } from "../world/types";
 import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
-import { propInstances } from "./instances";
+import { instanceGroups } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
 import { C64_PALETTE, applyCondition, type Look, type LookId } from "./looks";
 import type { MoverPart } from "./models";
+import { buildHeroMesh } from "./models/heroes";
 import { buildPropMesh } from "./models/props";
 import { moverDraw, restDraw, type MoverDraw } from "./parts";
 import {
@@ -105,7 +112,9 @@ export interface Camera {
  *   index (from `faultFrames` in `world/malfunction.ts`). A fixture with
  *   no entry draws its parts at rest: leaves by `doors`, the lamp at its
  *   idle glow, no sparks, a shut lid and a whole disc. A frame drives the
- *   leaves in place of `doors`; `doors` itself never sees it.
+ *   leaves in place of `doors`; `doors` itself never sees it. `blink` is
+ *   the blink banks' gains (`BlinkState.gains`, `BLINK_CHANNELS` floats),
+ *   uploaded as `uBlink` for the heroes' blinking lights.
  * - `dispose` frees every GPU object and may be called more than once.
  *
  * `draw` before `setRoom` or after `dispose` draws nothing.
@@ -119,6 +128,7 @@ export interface Renderer {
     seconds: number,
     doors: ReadonlyMap<string, number>,
     faults: ReadonlyMap<number, FaultFrame>,
+    blink: Float32Array,
   ): void;
   dispose(): void;
 }
@@ -138,17 +148,23 @@ interface GpuMover {
 }
 
 /**
- * One prop kind and variant of the room on the GPU: its instance buffer,
- * kept while the room stays the same, and the vertex array that binds it to
- * the cached mesh of the current look, remade on every `setRoom`.
+ * Which mesh an instance group draws: its key, its family and, per family,
+ * its kind, and its variant. The family picks the builder.
  */
-interface GpuPropGroup {
-  key: string;
-  kind: PropKind;
-  variant: number;
+type GroupMesh =
+  | { key: string; family: "prop"; kind: PropKind; variant: number }
+  | { key: string; family: "hero"; kind: HeroKind; variant: number };
+
+/**
+ * One prop or hero kind and variant of the room on the GPU: its instance
+ * buffer, kept while the room stays the same, and the vertex array that
+ * binds it to the cached mesh of the current look, remade on every
+ * `setRoom`.
+ */
+type GpuGroup = GroupMesh & {
   instances: InstanceBuffer;
   mesh: InstancedMesh | null;
-}
+};
 
 /**
  * The room's light on the GPU: an R8 texture of one texel per grid cell,
@@ -211,9 +227,9 @@ export function createRenderer(
   let light: GpuLight | null = null;
   let room: RoomSpec | null = null;
   let look: Look | null = null;
-  let propLook: LookId | null = null;
-  const propMeshes = new Map<string, VertexBuffer>();
-  let groups: GpuPropGroup[] = [];
+  let meshLook: LookId | null = null;
+  const groupMeshes = new Map<string, VertexBuffer>();
+  let groups: GpuGroup[] = [];
   let targets: Targets | null = null;
   let size = { width: 1, height: 1 };
   const projection = mat4();
@@ -260,11 +276,11 @@ export function createRenderer(
     groups = [];
   };
 
-  /** Deletes every cached prop mesh. */
-  const releasePropMeshes = () => {
-    for (const v of propMeshes.values()) v.dispose();
-    propMeshes.clear();
-    propLook = null;
+  /** Deletes every cached prop and hero mesh. */
+  const releaseGroupCache = () => {
+    for (const v of groupMeshes.values()) v.dispose();
+    groupMeshes.clear();
+    meshLook = null;
   };
 
   const makeTarget = (w: number, h: number, depth: boolean): Target => {
@@ -348,47 +364,63 @@ export function createRenderer(
       // A look switch hands the very same room back: its instance buffers
       // stay. This is read before anything is released.
       const sameRoom = nextRoom === room;
-      const lookChanged = nextLook.id !== propLook;
-      const nextGroups = sameRoom ? null : propInstances(nextRoom);
-      const needed: { key: string; kind: PropKind; variant: number }[] =
-        nextGroups ?? groups;
-      // The prop meshes this room lacks in this look are built on the CPU
-      // before the old room is let go, like the room mesh, so a prop that
-      // cannot be built leaves the old room drawn too.
+      const lookChanged = nextLook.id !== meshLook;
+      const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
+      const needed: readonly GroupMesh[] = nextGroups ?? groups;
+      // The prop and hero meshes this room lacks in this look are built on
+      // the CPU before the old room is let go, like the room mesh, so one
+      // that cannot be built leaves the old room drawn too.
       const fresh = new Map<string, MeshData>();
       for (const g of needed) {
-        if (!lookChanged && propMeshes.has(g.key)) continue;
-        fresh.set(g.key, buildPropMesh(g.kind, g.variant, nextLook));
+        if (!lookChanged && groupMeshes.has(g.key)) continue;
+        fresh.set(
+          g.key,
+          g.family === "prop"
+            ? buildPropMesh(g.kind, g.variant, nextLook)
+            : buildHeroMesh(g.kind, g.variant, nextLook),
+        );
       }
       releaseRoom();
       releaseGroupMeshes();
       if (lookChanged) {
-        releasePropMeshes();
-        propLook = nextLook.id;
+        releaseGroupCache();
+        meshLook = nextLook.id;
       }
       if (nextGroups !== null) {
         releaseGroups();
-        groups = nextGroups.map((g) => ({
-          key: g.key,
-          kind: g.kind,
-          variant: g.variant,
-          instances: createInstanceBuffer(gl, g.data),
-          mesh: null,
-        }));
+        groups = nextGroups.map((g): GpuGroup =>
+          g.family === "prop"
+            ? {
+                key: g.key,
+                family: g.family,
+                kind: g.kind,
+                variant: g.variant,
+                instances: createInstanceBuffer(gl, g.data),
+                mesh: null,
+              }
+            : {
+                key: g.key,
+                family: g.family,
+                kind: g.kind,
+                variant: g.variant,
+                instances: createInstanceBuffer(gl, g.data),
+                mesh: null,
+              },
+        );
       }
       for (const g of groups) {
-        let vertices = propMeshes.get(g.key);
+        let vertices = groupMeshes.get(g.key);
         if (vertices === undefined) {
           // Every mesh the cache lacks was built above, before the release;
           // building one here would break the old-room guarantee.
           const data = fresh.get(g.key);
           if (data === undefined) {
             throw new Error(
-              `renderer: prop mesh ${g.key} was not built before the release`,
+              `renderer: ${g.family} mesh ${g.key} was not built before the release`,
             );
           }
           vertices = createVertexBuffer(gl, data);
-          propMeshes.set(g.key, vertices);
+          groupMeshes.set(g.key, vertices);
         }
         g.mesh = createInstancedMesh(gl, vertices, g.instances);
       }
@@ -434,7 +466,7 @@ export function createRenderer(
       buildTargets();
     },
 
-    draw(camera, levels, seconds, doors, faults) {
+    draw(camera, levels, seconds, doors, faults, blink) {
       if (
         disposed ||
         mesh === null ||
@@ -517,6 +549,8 @@ export function createRenderer(
         look.edge.everywhere ? 1 : 0,
       );
       gl.uniform1f(scene.uniform("uLdr"), caps.color === "rgba8" ? 1 : 0);
+      // The blink banks' gains; `uBlink` names the whole array.
+      gl.uniform1fv(scene.uniform("uBlink"), blink);
       const offset = scene.uniform("uModelOffset");
       const pivot = scene.uniform("uModelPivot");
       const scaleU = scene.uniform("uModelScale");
@@ -543,9 +577,13 @@ export function createRenderer(
         set(d);
         m.mesh.draw();
       }
-      // Back to the identity before the props.
+      // Back to the identity before the props and heroes, so their uGain
+      // is 1 and only their blink channels move their lights.
       set(restDraw(seconds));
       for (const g of groups) g.mesh?.draw();
+      // And back to it once more, so nothing drawn after the instance
+      // groups inherits anything but the identity.
+      set(restDraw(seconds));
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);
 
@@ -592,7 +630,7 @@ export function createRenderer(
       releaseTargets();
       releaseRoom();
       releaseGroups();
-      releasePropMeshes();
+      releaseGroupCache();
       for (const p of [scene, bright, down, up, composite]) p.dispose();
       fullscreen.dispose();
     },

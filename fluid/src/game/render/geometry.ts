@@ -16,6 +16,10 @@
  * - `portal`: the shimmering portal surface.
  * - `frame`: a door or portal frame, which always carries a neon edge line.
  * - `lamp`: a ceiling light panel, as bright as its zone's current level.
+ * - `signal`: a light that shines by itself, never dimmed by the room
+ *   (H12): the doors' warning lamps and the heroes' steady lights.
+ * - `blink` to `blink + 7`: a signal light whose gain is its blink
+ *   channel's, one flag per group of the hero's blink bank (`blink.ts`).
  *
  * Every face is wound counter-clockwise seen from the side its normal points
  * to: the room shell faces inward, boxes face outward and wall panels face
@@ -34,6 +38,7 @@ import { lampBoxes } from "../world/lamps";
 import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
+import { BLINK_GROUPS } from "./blink";
 import { createKit } from "./kit";
 import { LAYER, layerPlan } from "./layers";
 import type { Look, Rgb } from "./looks";
@@ -55,7 +60,16 @@ export const FLOATS_PER_VERTEX = 13;
 /**
  * How the shader lights a surface, stored as the last float of each vertex.
  * The values are part of the contract with the shader, which compares them
- * as numbers.
+ * as numbers (the shader's source emits them from here).
+ *
+ * - `lit`, `emissive`, `portal`, `frame` and `lamp`: see the module doc.
+ *   `lamp` is the ceiling panels' flag and follows its cell's light.
+ * - `signal`: a light that shines by itself, never dimmed by the room
+ *   (H12): the warning lamps and hero lights. Its colour is its tint times
+ *   `SIGNAL_GAIN` times `uGain`, with no room light in it.
+ * - `blink`: the first of `BLINK_GROUPS` flags `blink + g`, a signal light
+ *   whose gain is its blink channel's: the group `g` of the bank named by
+ *   the instance slot (`blinkFlag`, H11).
  */
 export const FLAG = {
   lit: 0,
@@ -63,8 +77,22 @@ export const FLAG = {
   portal: 2,
   frame: 3,
   lamp: 4,
+  signal: 5,
+  blink: 6,
 } as const;
-type Flag = (typeof FLAG)[keyof typeof FLAG];
+
+/** A blink group's flag: `FLAG.blink + group`, group 0 to 7. */
+export type BlinkFlag = 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
+
+/** Every flag a surface may carry: one of `FLAG`, or a blink group's. */
+type Flag = (typeof FLAG)[keyof typeof FLAG] | BlinkFlag;
+
+/** The flag of blink group `group`; throws outside 0 to `BLINK_GROUPS - 1`. */
+export function blinkFlag(group: number): BlinkFlag {
+  if (!Number.isInteger(group) || group < 0 || group >= BLINK_GROUPS)
+    throw new Error(`blinkFlag: no group ${String(group)}`);
+  return (FLAG.blink + group) as BlinkFlag;
+}
 
 /**
  * Interleaved vertices ready for one `drawArrays(TRIANGLES)`: `count`

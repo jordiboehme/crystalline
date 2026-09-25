@@ -1,0 +1,81 @@
+/**
+ * The hero props' models: one mesh per hero kind, variant and look, built
+ * in code with the modelling kit like every other model, and drawn
+ * instanced like the props (`instances.ts`), in their own key space.
+ *
+ * A hero is built once at the origin, in `frameAt([0, 0, 0], 0)`, and every
+ * instance of it is turned by its quarter turn and moved to its anchor on
+ * the GPU, so a recipe is a pure function of kind, variant and look. Its
+ * slot is its kind's blink bank (`HERO_BANK`), which its blinking lights
+ * pulse with.
+ *
+ * The recipes live in four batch files grouped by the parts they share:
+ * `optics.ts`, `living.ts`, `workshop.ts` and `arcade.ts`, all built on
+ * `common.ts`. The hero test (`heroModels.test.ts`) builds every kind and
+ * variant, places it at every turn the way the GPU does and checks the
+ * envelope (its footprint and its top), that it reaches its top, the
+ * winding, the triangle budget, that nothing glows in mid-air, and that
+ * blinking parts appear exactly in the kinds whose bank blinks.
+ */
+
+import { HERO_CATALOGUE } from "../../../world/heroes";
+import type { HeroKind } from "../../../world/types";
+import { createBuilder, type MeshData } from "../../geometry";
+import { createKit, frameAt } from "../../kit";
+import type { Look } from "../../looks";
+import { surfaces, type KitAt } from "../common";
+import { ARCADE_RECIPES } from "./arcade";
+import type { HeroRecipe } from "./common";
+import { LIVING_RECIPES } from "./living";
+import { OPTICS_RECIPES } from "./optics";
+import { WORKSHOP_RECIPES } from "./workshop";
+
+/** Every hero kind's recipe, whatever its batch. */
+const RECIPES = {
+  ...OPTICS_RECIPES,
+  ...LIVING_RECIPES,
+  ...WORKSHOP_RECIPES,
+  ...ARCADE_RECIPES,
+} satisfies Record<HeroKind, HeroRecipe>;
+
+/**
+ * Builds variant `variant` of a hero kind into the kits `kitAt` makes, in
+ * `frameAt([0, 0, 0], 0)`: at the origin, facing north, as a hero on a
+ * south wall looks into the room. Throws on a variant the catalogue does
+ * not give the kind, as `heroFootprint` does: a generator bug should not
+ * pass silently.
+ */
+export function buildHero(
+  kitAt: KitAt,
+  kind: HeroKind,
+  variant: number,
+  look: Look,
+): void {
+  const variants = HERO_CATALOGUE[kind].variants;
+  if (!Number.isInteger(variant) || variant < 0 || variant >= variants) {
+    throw new Error(`buildHero: ${kind} has no variant ${String(variant)}`);
+  }
+  RECIPES[kind]({
+    k: kitAt(frameAt([0, 0, 0], 0)),
+    kitAt,
+    s: surfaces(look),
+    look,
+    variant,
+    kind,
+  });
+}
+
+/**
+ * One hero kind's variant as its own mesh, in the look's colours, ready to
+ * be drawn instanced: the renderer builds one per kind, variant and look
+ * and places each instance by its turn and anchor.
+ */
+export function buildHeroMesh(
+  kind: HeroKind,
+  variant: number,
+  look: Look,
+): MeshData {
+  const b = createBuilder();
+  buildHero((f) => createKit(b, f), kind, variant, look);
+  return b.build();
+}

@@ -17,8 +17,10 @@
  * A null result means the part is not drawn this frame.
  *
  * `restDraw` is the identity every other draw uses: the static room and
- * the prop instances are drawn with it, so the scene shader's pivot,
- * scale, gain and offset change nothing for them.
+ * the prop and hero instances are drawn with it, so the scene shader's
+ * pivot, scale, gain and offset change nothing for them. A hero's lights
+ * blink through its blink channel (`uBlink`, H11), never through `uGain`,
+ * which stays 1 for every instance.
  *
  * Only the fault frame's type is read from `world/malfunction.ts`: the
  * renderer takes the frames the session hands it and never runs the clock.
@@ -55,7 +57,9 @@ export interface MoverDraw {
 /**
  * The uniforms that leave a draw as it is: no offset, scale 1 about the
  * origin, gain 1, and the frame's own swirl time. The renderer sets them
- * before the static room and again after the movers, before the props.
+ * before the static room, again after the movers, before the props and
+ * heroes, and once more after those, so every draw pass ends at the
+ * identity.
  */
 export function restDraw(seconds: number): MoverDraw {
   return {

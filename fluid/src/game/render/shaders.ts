@@ -13,9 +13,18 @@
  * screen-space derivatives; they are added above 1.0 so the bloom picks them
  * up. The portal surface scrolls its swirl layer and brightens towards its
  * rim.
+ *
+ * Self-lit lights take their own path: the ceiling panels (`FLAG.lamp`)
+ * follow their cell's light, but a signal light (`FLAG.signal`: a door's
+ * warning lamp, a hero's steady light) and a blinking one (the blink flags)
+ * shine by themselves, as bright in a dark room as in a lit one (H12). A
+ * blinking light's gain comes from `uBlink`, the blink banks' gains
+ * (`blink.ts`), at the channel its instance slot and its flag name (H11).
  */
 
 import { CELL } from "../world/units";
+import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
+import { FLAG } from "./geometry";
 import { turnMat2Columns } from "./kit";
 
 /**
@@ -28,6 +37,13 @@ import { turnMat2Columns } from "./kit";
 export const LIGHT_NUDGE = 0.05;
 
 /**
+ * The scale of the signal and blink branches: a signal light's colour is
+ * its tint times this (times its blink gain and `uGain`), so it reads as
+ * bright as a screen (the emissive branch's 1.4) whatever the room's light.
+ */
+export const SIGNAL_GAIN = 1.4;
+
+/**
  * The attribute location of an instance's anchor offset, a `vec3` in world
  * metres. Only a prop's instanced vertex array enables it, with a divisor
  * of one; everything else reads the generic value, which the renderer sets
@@ -37,9 +53,11 @@ export const INSTANCE_OFFSET_LOCATION = 6;
 
 /**
  * The attribute location of an instance's turn and slot, a `vec2`: x the
- * quarter turns, y a reserved slot that is 0 for now. It is kept apart from
- * the offset, never packed into one `vec4`, so a disabled attribute's
- * generic (0, 0, 0, 1) cannot leak a 1 into the turn.
+ * quarter turns, y the slot, the instance's blink bank (H11, `bankSlot` in
+ * `blink.ts`): a hero's kind's bank, 0 (the steady bank) for the static
+ * room, the movers and the props. It is kept apart from the offset, never
+ * packed into one `vec4`, so a disabled attribute's generic (0, 0, 0, 1)
+ * cannot leak a 1 into the turn.
  */
 export const INSTANCE_TURN_LOCATION = 7;
 
@@ -63,12 +81,14 @@ const TURN_TABLE = [0, 1, 2, 3]
  * writes, at the attribute locations `gl/mesh.ts` binds (position 0, normal
  * 1, uv 2, layer 3, tint 4, flag 5), plus two instance attributes: the
  * anchor offset at location 6 (`INSTANCE_OFFSET_LOCATION`) and the turn
- * and reserved slot at location 7 (`INSTANCE_TURN_LOCATION`). A prop's
+ * and slot at location 7 (`INSTANCE_TURN_LOCATION`). A prop's or a hero's
  * instanced vertex array feeds those once per instance; the static room
  * and the movers leave them disabled, so they read the generic attribute
- * value, which the renderer sets to zero once: offset 0 and turn 0, the
- * identity. The slot of attribute 7 stays reserved and unused: a way's
- * malfunction is drawn with per-draw uniforms, not instance data. The
+ * value, which the renderer sets to zero once: offset 0, turn 0 and slot
+ * 0, the identity and the steady bank. The slot is the instance's blink
+ * bank (H11), passed on flat as `vSlot` for the fragment shader's blink
+ * branch; a way's malfunction is drawn with per-draw uniforms, not
+ * instance data. The
  * vertex is turned by `TURNS` (emitted from `turnMat2Columns`) and moved
  * by the instance offset; then comes a mover's scale about its pivot
  * (`uModelScale` about `uModelPivot`: a portal disc collapsing; 1 about
@@ -93,7 +113,7 @@ layout(location = 3) in float aLayer;
 layout(location = 4) in vec3 aTint;
 layout(location = 5) in float aFlag;
 layout(location = 6) in vec3 aInstanceOffset;
-layout(location = 7) in vec2 aInstanceTurn; // x: quarter turns, y: slot (reserved, 0)
+layout(location = 7) in vec2 aInstanceTurn; // x: quarter turns, y: slot, the blink bank (H11); 0 for the room, the movers and the props
 uniform mat4 uViewProjection;
 uniform vec3 uModelOffset;
 uniform vec3 uModelPivot;
@@ -104,6 +124,7 @@ out vec2 vUv;
 flat out float vLayer;
 flat out vec3 vTint;
 flat out int vFlag;
+flat out float vSlot;
 const mat2 TURNS[4] = mat2[4](${TURN_TABLE});
 void main() {
   mat2 turn = TURNS[int(aInstanceTurn.x + 0.5) & 3];
@@ -117,6 +138,7 @@ void main() {
   vLayer = aLayer;
   vTint = aTint;
   vFlag = int(aFlag + 0.5);
+  vSlot = aInstanceTurn.y;
   gl_Position = uViewProjection * vec4(world, 1.0);
 }
 `;
@@ -124,13 +146,18 @@ void main() {
 /**
  * The surface fragment shader, one for everything in the room. The flag
  * from `FLAG` in `geometry.ts` picks the path: emissive text and screens
- * ignore the light, a lamp glows with its cell's level, the portal scrolls
- * its swirl and brightens at the rim, and lit surfaces (with frames among
- * them) get the banded, distance-dimmed cell light, optional grime and the
- * neon edge lines. On an RGBA8 target (`uLdr` 1) the edge lines are toned
- * down, since nothing above 1.0 survives there and the bloom threshold is
- * lower. `uGain` scales every exit: 1 for the room and the props, a
- * fault's flicker, blink or spark for a mover.
+ * ignore the light; a lamp (the ceiling panel's flag) glows with its
+ * cell's level and so follows its zone's light; a signal light shines by
+ * itself at `SIGNAL_GAIN`, with no room light in it (H12); a blink-flagged
+ * light does the same times its channel's gain in `uBlink`, the channel
+ * being `vSlot * BLINK_GROUPS + (flag - FLAG.blink)` (H11); the portal
+ * scrolls its swirl and brightens at the rim; and lit surfaces (with
+ * frames among them) get the banded, distance-dimmed cell light, optional
+ * grime and the neon edge lines. On an RGBA8 target (`uLdr` 1) the edge
+ * lines are toned down, since nothing above 1.0 survives there and the
+ * bloom threshold is lower. `uGain` scales every exit: 1 for the room,
+ * the props and the heroes, a fault's flicker, blink or spark for a
+ * mover. The blink gain only multiplies it, never replaces it.
  *
  * The light grid (`uLightGrid`, R8 with NEAREST filtering, `uGridSize`
  * cells wide and deep, row 0 the grid's north row) is read at the centre of
@@ -158,6 +185,7 @@ in vec2 vUv;
 flat in float vLayer;
 flat in vec3 vTint;
 flat in int vFlag;
+flat in float vSlot;
 uniform sampler2DArray uTextures;
 uniform vec3 uEye;
 uniform float uTime;
@@ -176,10 +204,13 @@ uniform float uEdgeWidth;
 uniform bool uEdgeEverywhere;
 uniform float uGrimeLayer;
 uniform float uLdr;
+uniform float uBlink[${String(BLINK_CHANNELS)}];
 out vec4 outColour;
 
 const float CELL = ${CELL.toFixed(1)};
 const float LIGHT_NUDGE = ${LIGHT_NUDGE.toFixed(2)};
+const float SIGNAL = ${SIGNAL_GAIN.toFixed(2)};
+const int BLINK_GROUPS = ${String(BLINK_GROUPS)};
 
 float cellLevel(vec3 p, vec3 n) {
   vec2 at = p.xz + normalize(n).xz * LIGHT_NUDGE;
@@ -208,6 +239,15 @@ void main() {
   }
   if (vFlag == 4) {
     outColour = vec4(vTint * (0.3 + level * 2.2 * uLightScale) * uGain, 1.0);
+    return;
+  }
+  if (vFlag == ${String(FLAG.signal)}) {
+    outColour = vec4(vTint * SIGNAL * uGain, 1.0);
+    return;
+  }
+  if (vFlag >= ${String(FLAG.blink)}) {
+    int channel = int(vSlot + 0.5) * BLINK_GROUPS + (vFlag - ${String(FLAG.blink)});
+    outColour = vec4(vTint * SIGNAL * uBlink[channel] * uGain, 1.0);
     return;
   }
   if (vFlag == 2) {

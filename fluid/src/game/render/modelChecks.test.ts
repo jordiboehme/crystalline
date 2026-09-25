@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 
+import { BLINK_GROUPS } from "./blink";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
+  blinkFlag,
   createBuilder,
   type MeshData,
   type Surface,
 } from "./geometry";
 import { createKit, frameForSlot } from "./kit";
 import {
+  GLOWING,
   floatingGlow,
   recordingKitAt,
   worstWinding,
@@ -49,6 +52,56 @@ describe("floatingGlow", () => {
     const parts = scene((k) => k.panel(1.0, 1.4, 0.01, 1.0, 1.4, GLOW));
     expect(floatingGlow(parts, WALL)).toEqual([]);
     expect(floatingGlow(parts, null)).toEqual(["1:panel"]);
+  });
+});
+
+describe("GLOWING", () => {
+  it("holds the signal flag and every blink group's flag, and not the ceiling lamp", () => {
+    expect(GLOWING).toContain(FLAG.signal);
+    for (let g = 0; g < BLINK_GROUPS; g++)
+      expect(GLOWING).toContain(blinkFlag(g));
+    expect(GLOWING).not.toContain(FLAG.lamp);
+    expect(GLOWING).not.toContain(FLAG.lit);
+  });
+
+  it("names a floating signal light and a floating blinking one", () => {
+    const signal: Surface = { ...GLOW, flag: FLAG.signal };
+    const blink: Surface = { ...GLOW, flag: blinkFlag(BLINK_GROUPS - 1) };
+    expect(
+      floatingGlow(
+        scene((k) => k.panel(-0.2, 0.2, 0.7, 0.1, 0.4, signal)),
+        null,
+      ),
+    ).toEqual(["1:panel"]);
+    expect(
+      floatingGlow(
+        scene((k) => k.panel(-0.2, 0.2, 0.7, 0.1, 0.4, blink)),
+        null,
+      ),
+    ).toEqual(["1:panel"]);
+  });
+});
+
+describe("floatingGlow on a frame", () => {
+  const FRAME: Surface = { layer: 1, tint: [1, 1, 1], flag: FLAG.frame };
+  const SIGNAL: Surface = { layer: 1, tint: [1, 1, 1], flag: FLAG.signal };
+
+  /** A frame post standing off the wall, 1 m clear of the lit box, and `place`. */
+  function framed(place: (k: ReturnType<typeof createKit>) => void): Part[] {
+    return scene((k) => {
+      k.box(1.5, 1.7, 0.2, 0.4, 0, 1, FRAME);
+      place(k);
+    });
+  }
+
+  it("lets a signal light sit on a frame", () => {
+    const parts = framed((k) => k.panel(1.55, 1.65, 0.41, 0.5, 0.6, SIGNAL));
+    expect(floatingGlow(parts, WALL)).toEqual(["1:box"]);
+  });
+
+  it("still names a frame with no lit host, and a light that floats off the frame", () => {
+    const parts = framed((k) => k.panel(1.55, 1.65, 0.6, 0.5, 0.6, SIGNAL));
+    expect(floatingGlow(parts, WALL)).toEqual(["1:box", "2:panel"]);
   });
 });
 

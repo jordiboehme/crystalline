@@ -18,6 +18,7 @@ import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { TICK_MS, type Clock } from "./core/loop";
 import { prefetchPlace } from "./data/source";
+import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
@@ -580,6 +581,38 @@ describe("a room the renderer refuses", () => {
       expect.stringContaining("APERTURE"),
     );
     expect(session.current?.permalink).toBe("manifest");
+  });
+});
+
+describe("the blink banks", () => {
+  it("hands the renderer one session-wide blink state, ticked once per tick", () => {
+    start({ client: null }).showCanned(CANNED_BRIDGE);
+    frames(1);
+    const blinkOf = (i: number): Float32Array => {
+      const call = renderer.draw.mock.calls.at(i);
+      if (call === undefined) throw new Error("nothing drawn");
+      return call[5];
+    };
+    const first = blinkOf(-1);
+    expect(first).toBeInstanceOf(Float32Array);
+    expect(first).toHaveLength(BLINK_CHANNELS);
+    // A fresh state ticked in step with the session's reads the same
+    // gains: find the session's tick count, then walk on together.
+    const reference = createBlink();
+    let ticks = 0;
+    while (
+      ticks < 50 &&
+      Array.from(reference.gains).join() !== Array.from(first).join()
+    ) {
+      reference.tick();
+      ticks++;
+    }
+    expect(ticks).toBeLessThan(50);
+    frames(40);
+    for (let i = 0; i < 40; i++) reference.tick();
+    expect(Array.from(blinkOf(-1))).toEqual(Array.from(reference.gains));
+    // The same array every frame, not a copy per room or per draw.
+    expect(blinkOf(-1)).toBe(first);
   });
 });
 

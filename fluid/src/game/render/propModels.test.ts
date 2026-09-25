@@ -12,18 +12,14 @@ import {
 import { turnForSide, wallAnchor } from "../world/sites";
 import type { PropKind, Side } from "../world/types";
 import { CELL } from "../world/units";
-import {
-  FLOATS_PER_VERTEX,
-  createBuilder,
-  type MeshData,
-  type V3,
-} from "./geometry";
-import { frameAt, frameForSlot, turnPoint, type Frame } from "./kit";
+import { createBuilder, type MeshData, type V3 } from "./geometry";
+import { frameAt, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
-  add,
   floatingGlow,
   inBox,
+  placeMesh,
+  placeParts,
   positions,
   reaches,
   recordingKitAt,
@@ -82,29 +78,6 @@ function anchorFor(kind: PropKind, t: number): V3 {
   const a = wallAnchor({ x: 3, y: 4, side: sideFor(t) });
   return [a.x * CELL, entry.anchor === "ceiling" ? CEILING : 0, a.y * CELL];
 }
-
-/**
- * A mesh turned and placed as the GPU places an instance: every position
- * turned by `turnPoint` and moved to the anchor, every normal turned.
- */
-function placeMesh(m: MeshData, t: number, at: V3): MeshData {
-  const vertices = Float32Array.from(m.vertices);
-  for (let i = 0; i < m.count; i++) {
-    const o = i * FLOATS_PER_VERTEX;
-    const v = (k: number) => vertices[o + k] ?? NaN;
-    const p = add(turnPoint([v(0), v(1), v(2)], t), at);
-    const n = turnPoint([v(3), v(4), v(5)], t);
-    vertices.set([...p, ...n], o);
-  }
-  return { vertices, count: m.count };
-}
-
-/** The recorded parts, turned and placed the same way. */
-const placeParts = (parts: readonly Part[], t: number, at: V3): Part[] =>
-  parts.map((p) => ({
-    ...p,
-    points: p.points.map((q) => add(turnPoint(q, t), at)),
-  }));
 
 describe("prop models", () => {
   for (const kind of PROP_KINDS) {
