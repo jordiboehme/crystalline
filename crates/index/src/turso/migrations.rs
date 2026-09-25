@@ -547,6 +547,11 @@ CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 // resolves differently until a canonical name or an alias is recorded. The
 // cascade is declared for the record; this connection does not enforce foreign
 // keys, so the store deletes spellings by hand where it deletes their rows.
+//
+// The two partial indexes serve the reads that ask by spelling rather than by
+// row: the references a changed spelling unbinds, the engrams a rename has to
+// respell and one domain's references by prefix for the sweep. Partial because
+// most references carry no domain prefix at all, and those rows never need it.
 const SCHEMA_V16: &str = r#"
 CREATE TABLE domain_spelling (
     spelling TEXT PRIMARY KEY,
@@ -554,6 +559,8 @@ CREATE TABLE domain_spelling (
 );
 CREATE INDEX idx_domain_spelling_domain ON domain_spelling(domain_id);
 INSERT INTO domain_spelling (spelling, domain_id) SELECT name, id FROM domain;
+CREATE INDEX idx_relation_to_domain ON relation(to_domain) WHERE to_domain IS NOT NULL;
+CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
 const SCHEMA_V9: &str = r#"

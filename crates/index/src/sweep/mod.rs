@@ -800,6 +800,22 @@ impl EngramFacts {
     }
 }
 
+/// A reference whose domain prefix is one of the spellings a caller asked
+/// about: the input of the finding that flags a link spelled with a name only
+/// this machine uses. The store fills it from
+/// [`crate::Store::spelled_references`], base rows only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpelledRef {
+    /// The engram the reference was written in.
+    pub from: EngramId,
+    /// The one-based line the reference sits on (0 when the parser had none).
+    pub line: usize,
+    /// The domain prefix as written: one of the spellings asked about.
+    pub spelling: String,
+    /// The bracket text exactly as it was written, colon and all.
+    pub raw: String,
+}
+
 /// A reference that names a target the index could not resolve: the `V102`
 /// input. The engine fills this from the store's unresolved-reference query.
 #[derive(Debug, Clone, PartialEq, Eq)]

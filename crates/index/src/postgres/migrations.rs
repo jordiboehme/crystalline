@@ -462,7 +462,8 @@ ALTER TABLE engram DROP COLUMN IF EXISTS content;
 // cleanly (`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`) because the ledger stamp
 // below is a separate statement, as v14 is. On a shared index the backfill
 // covers every instance's rows, which is right: each row is its own name
-// whichever instance registered it.
+// whichever instance registered it. The two partial `to_domain` indexes are
+// the Turso twin's too: they serve the reads that ask by spelling.
 const SCHEMA_V15: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_spelling (
     spelling TEXT PRIMARY KEY,
@@ -471,6 +472,8 @@ CREATE TABLE IF NOT EXISTS domain_spelling (
 CREATE INDEX IF NOT EXISTS idx_domain_spelling_domain ON domain_spelling(domain_id);
 INSERT INTO domain_spelling (spelling, domain_id) SELECT name, id FROM domain
 ON CONFLICT (spelling) DO NOTHING;
+CREATE INDEX IF NOT EXISTS idx_relation_to_domain ON relation(to_domain) WHERE to_domain IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
 const SCHEMA_V8: &str = r#"
