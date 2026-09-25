@@ -684,7 +684,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::rest::AuthStore;
+    use crate::AuthStore;
 
     async fn store() -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap();

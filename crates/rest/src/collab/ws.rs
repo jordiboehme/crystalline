@@ -17,12 +17,12 @@ use tokio::sync::broadcast;
 
 use super::control::{self, Control};
 use super::session::{CollabSession, CollabSessions, ConnId, Frame, JoinError, Joined};
-use crate::rest::{ApiError, ApiPath, ApiQuery, Identity, ProblemDetail, RestState};
+use crate::{ApiError, ApiPath, ApiQuery, Identity, ProblemDetail, RestState};
 
 /// One session frame can legitimately carry a whole document (SyncStep2), so
 /// the ceiling tracks the REST body limit plus protocol overhead - far below
 /// axum's 64 MiB default.
-pub const WS_MAX_MESSAGE_BYTES: usize = crate::rest::MAX_BODY_BYTES + 1024 * 1024;
+pub const WS_MAX_MESSAGE_BYTES: usize = crate::MAX_BODY_BYTES + 1024 * 1024;
 /// How often the server pings an idle socket, so a dead peer behind a proxy
 /// that keeps the connection nominally open is still noticed.
 const PING_INTERVAL_SECS: u64 = 30;
@@ -85,7 +85,7 @@ pub async fn join(
     // The same gate the save routes carry, and for the same reason: a
     // co-editing socket is a write channel. A domain this caller may not see
     // answers the 404 an unregistered one does, before the upgrade.
-    crate::rest::require_domain_write(&state, &identity, &domain).await?;
+    crate::require_domain_write(&state, &identity, &domain).await?;
     if state.engine.read_only() {
         return Err(ApiError::forbidden(
             "this instance is read-only, so collaborative editing is disabled",

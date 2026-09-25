@@ -1468,11 +1468,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "crystalline-service"
+name = "crystalline-rest"
 version = "0.20.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "axum-extra",
  "base64 0.23.1",
@@ -1483,6 +1482,41 @@ dependencies = [
  "crystalline-identity",
  "crystalline-index",
  "crystalline-remote",
+ "futures",
+ "getrandom 0.4.3",
+ "http",
+ "openidconnect",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "yrs",
+ "zip",
+]
+
+[[package]]
+name = "crystalline-service"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "crystalline-core",
+ "crystalline-engine",
+ "crystalline-identity",
+ "crystalline-index",
+ "crystalline-remote",
+ "crystalline-rest",
  "crystalline-service",
  "flate2",
  "fs4 1.1.0",
@@ -1505,17 +1539,13 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
- "thiserror 2.0.20",
  "tiktoken-rs",
- "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tower-service",
  "tracing",
  "tracing-subscriber",
  "turso",
- "url",
- "utoipa",
  "walkdir",
  "windows-sys 0.61.2",
  "yrs",

@@ -71,14 +71,16 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// nobody thought to name here fails too.
 #[test]
 fn no_cors_layer_reaches_the_http_surface() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let sources = rust_sources(&src);
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources: Vec<PathBuf> = ["src", "../rest/src", "../engine/src", "../identity/src"]
+        .iter()
+        .flat_map(|dir| rust_sources(&manifest.join(dir)))
+        .collect();
     assert!(
         sources.len() > 10,
-        "the scan found only {} files under {}, so it is not looking where it \
-         thinks it is",
-        sources.len(),
-        src.display()
+        "the scan found only {} files under crystalline-service and the crates cut out of it, \
+         so it is not looking where it thinks it is",
+        sources.len()
     );
     for file in sources {
         let text = std::fs::read_to_string(&file)
@@ -102,15 +104,22 @@ fn no_cors_layer_reaches_the_http_surface() {
 /// `CorsLayer` cannot be written without something providing it.
 #[test]
 fn the_crate_does_not_depend_on_a_cors_provider() {
-    let manifest =
-        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("the crate manifest is readable");
-    for needle in ["tower-http", "tower_http", "cors"] {
-        assert!(
-            !manifest.contains(needle),
-            "crates/service/Cargo.toml mentions `{needle}`. A CORS layer would \
-             let another origin read the CSRF token /auth/me hands back; see \
-             `check_csrf` in rest/auth.rs before adding one."
-        );
+    for path in [
+        "Cargo.toml",
+        "../rest/Cargo.toml",
+        "../engine/Cargo.toml",
+        "../identity/Cargo.toml",
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let manifest = std::fs::read_to_string(&path).expect("the crate manifest is readable");
+        for needle in ["tower-http", "tower_http", "cors"] {
+            assert!(
+                !manifest.contains(needle),
+                "{} mentions `{needle}`. A CORS layer would \
+                 let another origin read the CSRF token /auth/me hands back; see \
+                 `check_csrf` in rest/auth.rs before adding one.",
+                path.display()
+            );
+        }
     }
 }

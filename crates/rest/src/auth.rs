@@ -2336,7 +2336,7 @@ mod tests {
         );
         assert_eq!(
             cfg.proxy_role,
-            crate::rest::DEFAULT_OIDC_ROLE,
+            crate::DEFAULT_OIDC_ROLE,
             "and provisions at the least privileged role"
         );
     }

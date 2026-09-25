@@ -307,7 +307,7 @@ const MAX_PENDING_PER_CLIENT: usize = 4;
 /// bound that rounds the safe way holds through an edit to any of them instead
 /// of having to be re-derived.
 const UNSTAMPED_CLIENT_CEILING: usize = REGISTRATION_BURST
-    * (crate::rest::auth_store::OAUTH_CLIENT_UNAUTHORIZED_SECS as usize)
+    * (crate::auth_store::OAUTH_CLIENT_UNAUTHORIZED_SECS as usize)
         .div_ceil(REGISTRATION_WINDOW.as_secs() as usize);
 
 // The two bounds compose or the per-client cap buys nothing: an unauthenticated
@@ -394,7 +394,8 @@ pub struct OriginRule {
 /// `Host` the transport serves must be one the documents are willing to
 /// publish, or a client would read a resource identifier off an address that
 /// then refuses it.
-pub(crate) const ALWAYS_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+#[doc(hidden)]
+pub const ALWAYS_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 /// A host name in the one spelling both sides are compared in: lowercased,
 /// with any IPv6 brackets off, so `[::1]` from a request and `::1` from the

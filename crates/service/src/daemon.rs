@@ -4064,8 +4064,8 @@ mod tests {
     /// be noticed the day somebody fills it.
     const TOKEN_BEARING_SOURCES: [(&str, &str); 3] = [
         ("daemon.rs", include_str!("daemon.rs")),
-        ("rest/mod.rs", include_str!("rest/mod.rs")),
-        ("rest/auth.rs", include_str!("rest/auth.rs")),
+        ("rest/mod.rs", include_str!("../../rest/src/lib.rs")),
+        ("rest/auth.rs", include_str!("../../rest/src/auth.rs")),
     ];
 
     /// The output macros none of those three files may spell the token into.
@@ -4152,7 +4152,7 @@ mod tests {
     /// proves the comment blanking works at all.
     #[test]
     fn a_comment_naming_a_log_call_and_the_token_is_prose_the_guard_reads_past() {
-        let auth = include_str!("rest/auth.rs");
+        let auth = include_str!("../../rest/src/auth.rs");
         let warning = auth.lines().find(|line| {
             line.trim_start().starts_with("//")
                 && line.contains("token")

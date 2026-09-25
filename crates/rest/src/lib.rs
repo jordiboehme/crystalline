@@ -3,10 +3,28 @@
 //! the MCP tools and this API stay one source of truth, and every failure is
 //! an [`ApiError`] rendered as RFC 9457 problem detail.
 
+// The lower crates' modules under the names the moved files already use, so
+// every `crate::engine::`, `crate::scope::` (and so on) path in this crate
+// resolves exactly as it did in crystalline-service.
+pub(crate) use crystalline_engine::{
+    domain_view, engine, maintenance, origin, params, review, settings, similar, web_url,
+};
+// Named only by the unit tests.
+#[cfg(test)]
+pub(crate) use crystalline_engine::overlay;
+pub(crate) use crystalline_identity::{join, scope};
+
+/// The co-editing modules: the engine's sessions, and the WebSocket route
+/// that serves them.
+pub mod collab {
+    pub use crystalline_engine::collab::*;
+    pub mod ws;
+}
+
 mod archive;
 mod auth;
 mod schemas;
-use crate::auth_store;
+use crystalline_identity::auth_store;
 mod discovery;
 mod domains;
 mod domains_admin;
@@ -45,7 +63,8 @@ pub use error::{
 use login_throttle::LoginThrottle;
 /// The loopback names every tier answers to, shared with `daemon::http_config`
 /// so the transport's allow-list and the origin rule's cannot come apart.
-pub(crate) use oauth::ALWAYS_ALLOWED_HOSTS;
+#[doc(hidden)]
+pub use oauth::ALWAYS_ALLOWED_HOSTS;
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
     MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,

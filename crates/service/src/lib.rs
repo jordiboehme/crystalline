@@ -9,7 +9,6 @@
 //! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
-pub(crate) use crystalline_identity::auth_store;
 pub mod client;
 pub mod control;
 pub mod daemon;
@@ -17,8 +16,8 @@ pub mod instance;
 pub use crystalline_identity::join;
 pub mod mcp;
 pub mod mcp_gate;
-pub mod rest;
 pub use crystalline_identity::scope;
+pub use crystalline_rest as rest;
 pub mod stub;
 mod tool_schema;
 #[cfg(feature = "fluid-ui")]
@@ -29,17 +28,8 @@ pub use crystalline_engine::{
     subscribers, temp_store, web_url,
 };
 // Were crate-private modules of this crate; still only this crate's business.
-pub(crate) use crystalline_engine::{domain_view, origin, review, serving, toon};
-pub mod collab {
-    //! Real-time co-editing sessions: one yrs document per open engram, served
-    //! over the axum WebSocket route in [`ws`], saved through the engine's own
-    //! write path. Sessions are in-memory only - the file stays the source of
-    //! truth, and a daemon restart drops sessions by design (clients rejoin from
-    //! the saved file).
-
-    pub use crystalline_engine::collab::*;
-    pub mod ws;
-}
+pub(crate) use crystalline_engine::{domain_view, review, serving, toon};
+pub use crystalline_rest::collab;
 
 /// The name the consolidation sweep is advertised and dispatched under.
 ///

@@ -5,6 +5,7 @@ members = [
     "crates/index",
     "crates/identity",
     "crates/engine",
+    "crates/rest",
     "crates/remote",
     "crates/service",
     "crates/cli",
@@ -29,6 +30,7 @@ crystalline-identity = { path = "crates/identity" }
 # in to the embedding and Postgres features explicitly.
 crystalline-engine = { path = "crates/engine", default-features = false }
 crystalline-remote = { path = "crates/remote" }
+crystalline-rest = { path = "crates/rest" }
 crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.7", features = ["derive"] }
