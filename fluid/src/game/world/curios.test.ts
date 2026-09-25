@@ -31,6 +31,7 @@ import {
   PROP_SURFACES,
   RETRO_SHARE,
   UNDER_SHARE,
+  cornerSpots,
   curioBox,
   curioDraws,
   curioFits,
@@ -40,6 +41,7 @@ import {
   hostSurfaces,
   placeCurios,
   type CurioDraws,
+  type CurioSlot,
   type HostSurface,
 } from "./curios";
 import { dressRoom } from "./dress";
@@ -57,19 +59,29 @@ import {
   HERO_KINDS,
   HERO_POOLS,
   heroCap,
+  heroEdges,
   placeHeroes,
   type HeroDraws,
 } from "./heroes";
 import { blockersFor } from "./move";
 import { PROP_KINDS } from "./props";
 import { DEGENERATE_PLACES } from "./reachChecks";
-import { dressingSites, overlaps, wallAnchor, type CurioBase } from "./sites";
+import {
+  dressingSites,
+  edgeKey,
+  edgeOf,
+  overlaps,
+  wallAnchor,
+  type CurioBase,
+} from "./sites";
 import type {
   Archetype,
   Box,
   Condition,
   Curio,
+  CurioKind,
   PlaceInput,
+  Prop,
   RoomSpec,
   Side,
   WallSlot,
@@ -107,6 +119,11 @@ describe("curio catalogue", () => {
       }
       expect(e.classes.length, k).toBeGreaterThan(0);
       expect(e.slot === "under", k).toBe(e.classes.includes("under"));
+      if (e.variantClasses !== undefined) {
+        expect(e.variantClasses.length, k).toBe(e.variants);
+        for (const vc of e.variantClasses)
+          for (const cls of vc) expect(e.classes, k).toContain(cls);
+      }
     }
   });
 
@@ -413,6 +430,18 @@ const reseed = (r: RoomSpec, ...key: (string | number)[]): CurioBase => ({
   ...base(r),
   seed: seedFor(...key),
 });
+/** Draws that force `kind` into its own slot and take no other slot. */
+const only = (kind: CurioKind): CurioDraws => {
+  const slot = CURIO_CATALOGUE[kind].slot;
+  const draw = (mine: CurioSlot) =>
+    mine === slot ? { take: true, roll: 0, kind } : OFF;
+  return {
+    retro: draw("retro"),
+    gear: draw("gear"),
+    ball: { ...draw("ball"), floor: false },
+    under: draw("under"),
+  };
+};
 /** A count's tolerance: 4 standard deviations of `n` draws at `p`. */
 const within = (count: number, n: number, p: number) =>
   Math.abs(count - n * p) <= 4 * Math.sqrt(n * p * (1 - p));
@@ -421,9 +450,34 @@ const contains = (outer: Box, inner: Box, eps = 1e-6) =>
   inner.x1 <= outer.x1 + eps &&
   inner.z0 >= outer.z0 - eps &&
   inner.z1 <= outer.z1 + eps;
-/** The surfaces a curio may stand on: each whose box holds its box, at its height. */
+/**
+ * The surfaces a curio may stand on: each whose box holds its box, at its
+ * height.
+ */
 const hostsOf = (surfaces: readonly HostSurface[], c: Curio) =>
   surfaces.filter((s) => s.h === c.h && contains(s.box, curioBox(c)));
+
+/**
+ * The footprint of the host a surface belongs to, found by its family in
+ * the room's own lists; null for a host with none (or none found).
+ */
+function hostFootprint(room: CurioBase, s: HostSurface): Box | null {
+  const family = s.host.split(":")[0];
+  if (family === "terminal" || family === "machine") {
+    const f = room.fixtures.find((x) => x === s.anchorOf);
+    return f === undefined ? null : footprintOf(f);
+  }
+  if (family === "decor") {
+    const d = room.decor.find((x) => x === s.anchorOf);
+    return d === undefined ? null : decorFootprint(d);
+  }
+  if (family === "prop") {
+    const p = room.props.find((x) => x === s.anchorOf);
+    return p === undefined ? null : propFootprint(p);
+  }
+  const h = room.heroes.find((x) => x === s.anchorOf);
+  return h === undefined ? null : heroFootprint(h);
+}
 
 /**
  * Every invariant of one pass's output: at most one curio per slot, each
@@ -537,6 +591,23 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
         const nearZ = Math.min(z - hall.y0 * CELL, hall.y1 * CELL - z);
         expect(nearX, name).toBeLessThanOrEqual(0.2);
         expect(nearZ, name).toBeLessThanOrEqual(0.2);
+        // Neither hall wall edge of its corner carries a wall prop or a
+        // hero's edge, and both are free.
+        const cx = Math.floor(c.x);
+        const cy = Math.floor(c.y);
+        const sx = c.x - cx < 0.5 ? "w" : "e";
+        const sy = c.y - cy < 0.5 ? "n" : "s";
+        const walled = new Set([
+          ...room.props
+            .filter((p) => p.anchor === "wall")
+            .map((p) => edgeKey(edgeOf(p))),
+          ...room.heroes.flatMap((h) => heroEdges(h).map(edgeKey)),
+        ]);
+        for (const side of [sx, sy] as const) {
+          const k = edgeKey({ x: cx, y: cy, side });
+          expect(sites.free.has(k), `${name} ${k}`).toBe(true);
+          expect(walled.has(k), `${name} ${k}`).toBe(false);
+        }
         const box = curioBox(c);
         for (const lane of sites.lanes)
           expect(overlaps(box, lane), name).toBe(false);
@@ -635,14 +706,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
         expect(hosts.length, `${name} ${c.kind}`).toBeGreaterThan(0);
         expect(
           hosts.some((s) => {
-            const host = s.anchorOf;
-            const foot = room.fixtures.includes(host as never)
-              ? footprintOf(host as never)
-              : room.decor.includes(host as never)
-                ? decorFootprint(host as never)
-                : room.props.includes(host as never)
-                  ? propFootprint(host as never)
-                  : heroFootprint(host as never);
+            const foot = hostFootprint(room, s);
             return foot !== null && contains(foot, curioBox(c));
           }),
           `${name} ${c.kind}`,
@@ -729,6 +793,157 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(curioBox(c).z1).toBeCloseTo(desk.box.z1 - 0.02, 2);
     expect(() => curioOn(under, "pocket-console", 0, 0.5, 0.5, 1)).toThrow();
     expect(() => curioOn(desk, "beige-laptop", 0, 0.5, 0.5, 1)).toThrow();
+    const shelf = hostSurfaces(galleryRoom()).find(
+      (x) => x.cls === "shelf" && x.clear === OPEN_CLEAR,
+    );
+    if (shelf === undefined) throw new Error("no open shelf top");
+    expect(() => curioOn(shelf, "light-sword", 1, 0.5, 0.5, 1)).toThrow();
+    expect(curioOn(shelf, "light-sword", 0, 0.5, 0.5, 1).h).toBe(shelf.h);
+  });
+
+  it("stands an upright lit sword on no shelf class top (controller ruling)", () => {
+    // Default ceilings, archive rooms full of shelves and cabinets.
+    let upright = 0;
+    let lyingOnShelf = 0;
+    for (const place of [CANNED_HUB, CANNED_WORKSHOP]) {
+      const room = generateRoom({ ...place, type: ARCHETYPE_TYPES.archive });
+      for (let i = 0; i < 200; i++) {
+        const b = reseed(room, "sword", place.permalink, i);
+        const got = placeCurios(b, {
+          ...curioDraws(b),
+          gear: { take: true, roll: 0, kind: "light-sword" },
+        });
+        const surfaces = hostSurfaces(b);
+        for (const c of got) {
+          if (c.kind !== "light-sword") continue;
+          const shelf = hostsOf(surfaces, c).some((s) => s.cls === "shelf");
+          if (c.variant === 0) {
+            if (shelf) lyingOnShelf++;
+            continue;
+          }
+          upright++;
+          expect(shelf, `upright sword at h ${String(c.h)}`).toBe(false);
+        }
+      }
+    }
+    expect(upright).toBeGreaterThan(0);
+    expect(lyingOnShelf).toBeGreaterThan(0);
+  });
+
+  it("never turns a front curio to the wall, and faces a fixed one out from its wall host (C10)", () => {
+    const kinds = CURIO_KINDS.filter(
+      (k) => CURIO_CATALOGUE[k].facing !== "any",
+    );
+    let onWall = 0;
+    let onFree = 0;
+    for (const kind of kinds) {
+      const { facing } = CURIO_CATALOGUE[kind];
+      for (const [i, { name, room }] of ROOMS.entries())
+        for (let r = 0; r < 3; r++) {
+          const b = r === 0 ? base(room) : reseed(room, "facing", i, r);
+          const surfaces = hostSurfaces(b);
+          for (const c of placeCurios(b, only(kind))) {
+            const [s] = hostsOf(surfaces, c).filter((x) => curioFits(b, c, x));
+            if (s === undefined) throw new Error(`${name} ${kind}: no host`);
+            if (s.free) {
+              onFree++;
+              continue;
+            }
+            onWall++;
+            const rel = (((c.turn - s.turn) % 4) + 4) % 4;
+            if (facing === "front") expect(rel, `${name} ${kind}`).not.toBe(2);
+            else expect(rel, `${name} ${kind}`).toBe(0);
+          }
+        }
+    }
+    expect(onWall).toBeGreaterThan(0);
+    expect(onFree).toBeGreaterThan(0);
+  });
+
+  it("clusters the pink gadget only in a lab or an engineering room", () => {
+    let cluster = 0;
+    let alone = 0;
+    for (const [i, m] of WORKSHOPS.entries())
+      for (let r = 0; r < 10; r++) {
+        const b = reseed(m.room, "gadget", i, r);
+        for (const c of placeCurios(b, only("pink-gadget"))) {
+          if (m.archetype === "lab" || m.archetype === "engineering") {
+            if (c.variant === 1) cluster++;
+            continue;
+          }
+          alone++;
+          expect(c.variant, m.name).toBe(0);
+        }
+      }
+    expect(alone).toBeGreaterThan(0);
+    expect(cluster).toBeGreaterThan(0);
+  });
+
+  it("keeps a corner spot off a floor prop and off a wall prop (cornerSpots)", () => {
+    // The one room of the varied workshops whose south-west corner is
+    // usable as generated.
+    const b = base(
+      generateRoom({
+        ...CANNED_WORKSHOP,
+        permalink: "pipe-shop-12",
+        type: ARCHETYPE_TYPES.council,
+      }),
+    );
+    const spots = cornerSpots(b);
+    expect(spots).toEqual([{ cx: 0, cy: 11, x: 0.06, y: 11.94 }]);
+    const crate: Prop = {
+      kind: "crate",
+      variant: 0,
+      anchor: "floor",
+      x: 0.25,
+      y: 11.8,
+      turn: 0,
+      seed: 1,
+    };
+    expect(cornerSpots({ ...b, props: [...b.props, crate] })).toEqual([]);
+    const edge: WallSlot = { x: 0, y: 11, side: "w" };
+    const grille: Prop = {
+      kind: "vent-grille",
+      variant: 0,
+      anchor: "wall",
+      ...wallAnchor(edge),
+      seed: 1,
+    };
+    expect(cornerSpots({ ...b, props: [...b.props, grille] })).toEqual([]);
+  });
+
+  it("re-places the curios on the re-dressed room in the forced-hero seam", () => {
+    let moved = 0;
+    for (const type of Object.values(ARCHETYPE_TYPES))
+      for (const kind of ["mess-table", "turret", "laser-desk"] as const) {
+        const place = { ...CANNED_WORKSHOP, type };
+        const { room } = roomWithForcedHero(place, kind);
+        const b = base(room);
+        expect(room.curios, `${type} ${kind}`).toEqual(placeCurios(b));
+        expectInvariants(b, room.curios, `${type} ${kind}`);
+        if (
+          JSON.stringify(room.curios) !==
+          JSON.stringify(generateRoom(place).curios)
+        )
+          moved++;
+      }
+    // The seam matters: some forced hero moves a curio's host.
+    expect(moved).toBeGreaterThan(0);
+  });
+
+  it("draws the slots in their fixed order (a pin of curioDraws)", () => {
+    expect(curioDraws(base(generateRoom(CANNED_WORKSHOP)))).toEqual({
+      retro: { take: true, roll: 0.3097186426166445 },
+      gear: { take: false, roll: 0.7412930731661618 },
+      ball: { take: false, roll: 0.29439340252429247, floor: true },
+      under: { take: false, roll: 0.9774609189480543 },
+    });
+    expect(curioDraws(base(generateRoom(CANNED_BRIDGE)))).toEqual({
+      retro: { take: false, roll: 0.9995579079259187 },
+      gear: { take: false, roll: 0.5458925957791507 },
+      ball: { take: false, roll: 0.42699357331730425, floor: false },
+      under: { take: false, roll: 0.7664119158871472 },
+    });
   });
 
   it("pins one surfaced hero and its curios exactly (C11)", () => {

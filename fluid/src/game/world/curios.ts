@@ -58,22 +58,37 @@
  *    `BALL_POOL`, `UNDER_POOL`, or only the kind its draw forces), keeps
  *    the kinds with a candidate that fits right now, picks one by
  *    `pickByRoll` and places it. A slot with no fitting kind stays empty.
+ *    A floor ball that fits no corner falls back to the surfaces: the
+ *    slot runs again with the same roll, so the ball rate stays
+ *    `BALL_SHARE`. Nothing is drawn again.
  * 4. **Candidates of a kind.** A floor ball (the ball slot when it drew
  *    its floor chance) takes the hall's corners (`cornerSpots`); any other
- *    kind takes every host surface of one of its classes. A floor ball
- *    that fits no corner falls back to the surfaces: step 3 runs again for
- *    its slot with the same roll, so the ball rate stays `BALL_SHARE`. A candidate's
+ *    kind takes every host surface of one of its classes. A candidate's
  *    seed is `seedFor(room.seed, "curio", ...key)` of its surface, or
  *    `seedFor(room.seed, "curio", cx, cy, "floor")` for a corner (C9).
- *    They are tried in seed order, ties by their order in `hostSurfaces`.
+ *    They are tried in seed order, ties by their order in `hostSurfaces`
+ *    or among the corners.
  * 5. **A trial.** The candidate's own stream draws the variant (the pink
  *    gadget's cluster only in a lab or an engineering room), a turn roll
- *    and the fractions `u` and `v`; the facing turns the curio (C10), and
- *    `u` and `v` place its box in the surface's slack inside
- *    `CURIO_MARGIN`. The first candidate that fits its surface
- *    (`curioFits`) and clashes with no curio placed before
- *    (`curiosClash`) is the curio, with its candidate's seed.
- * 6. **The output** is sorted by `CURIO_ORDER`.
+ *    and the fractions `u` and `v`, all of them always. The facing turns
+ *    the curio (C10, `curioTurn`), and `u` and `v` place its box in the
+ *    surface's slack inside `CURIO_MARGIN`; a floor ball stands at its
+ *    corner point at the turn roll. The first candidate that fits
+ *    (step 6) and clashes with no curio placed before (step 7) is the
+ *    curio, with its candidate's seed.
+ * 6. **Fitting a surface** (`curioFits`, C12): the variant stands on the
+ *    surface's class (`curioClasses`: the upright lit swords never on a
+ *    shelf class top), its box lies inside the surface's box less
+ *    `CURIO_MARGIN`, its top is at most the surface's `clear`, and its top
+ *    stays `CURIO_CEILING_GAP` under the ceiling.
+ * 7. **Clashing** (`curiosClash`): two curios whose plan boxes, one grown
+ *    by `CURIO_GAP`, overlap and whose height ranges overlap.
+ * 8. **Corner spots** (`cornerSpots`): the hall's four corner cells, each
+ *    with the point 0.12 m in from both hall walls, where the cell is
+ *    floor, both hall wall edges are free, carry no wall prop and are no
+ *    hero's edge, and the ball's box keeps clear of every lane, taken box,
+ *    floor prop and hero. Only this step reads `dressingSites`.
+ * 9. **The output** is sorted by `CURIO_ORDER`.
  *
  * `curioOn` makes one curio on a given surface the same way, for the
  * hand-built rooms.
@@ -158,6 +173,12 @@ export interface CurioEntry {
   variants: number;
   sizes: readonly CurioSize[];
   classes: readonly SurfaceClass[];
+  /**
+   * Per variant, the classes that variant keeps of `classes`, where a
+   * variant stands on fewer: the upright lit swords never go on a shelf
+   * class top. A kind without it stands every variant on `classes`.
+   */
+  variantClasses?: readonly (readonly SurfaceClass[])[];
   facing: "fixed" | "front" | "any";
 }
 
@@ -179,6 +200,13 @@ export const CURIO_CATALOGUE: Readonly<Record<CurioKind, CurioEntry>> = {
     variants: 3,
     facing: "any",
     classes: ["desk", "bench", "table", "shelf"],
+    // Only the lying sword in its cradle goes on a shelf or a cabinet; the
+    // lit blade upright in its stand stands on a desk, a bench or a table.
+    variantClasses: [
+      ["desk", "bench", "table", "shelf"],
+      ["desk", "bench", "table"],
+      ["desk", "bench", "table"],
+    ],
     sizes: [
       { width: 0.3, depth: 0.1, top: 0.08 },
       { width: 0.14, depth: 0.14, top: 1.22 },
@@ -711,6 +739,18 @@ export function curioSize(c: Curio): CurioSize {
 }
 
 /**
+ * The surface classes curio `kind` of `variant` stands on: its
+ * `variantClasses` entry when it has one, else its kind's `classes`.
+ */
+export function curioClasses(
+  kind: CurioKind,
+  variant: number,
+): readonly SurfaceClass[] {
+  const e = CURIO_CATALOGUE[kind];
+  return e.variantClasses?.[variant] ?? e.classes;
+}
+
+/**
  * A curio's plan box, in metres: its variant's size centred on
  * `(c.x * CELL, c.y * CELL)`, width and depth swapped at an odd turn.
  */
@@ -742,7 +782,10 @@ export interface SlotDraw {
   kind?: CurioKind;
 }
 
-/** A room's four slot draws (C6); the ball slot also carries its floor chance (`BALL_FLOOR`). */
+/**
+ * A room's four slot draws (C6); the ball slot also carries its floor
+ * chance (`BALL_FLOOR`).
+ */
 export interface CurioDraws {
   retro: SlotDraw;
   gear: SlotDraw;
@@ -784,7 +827,10 @@ export function curioDraws(room: CurioBase): CurioDraws {
 
 /** How far in from both hall walls a floor ball's centre stands, in metres. */
 const CORNER_IN = 0.12;
-/** How far a floor ball's box keeps from lanes, footprints, props and heroes, in metres. */
+/**
+ * How far a floor ball's box keeps from lanes, footprints, props and
+ * heroes, in metres.
+ */
 const CORNER_CLEAR = 0.05;
 
 /**
@@ -860,7 +906,8 @@ export function cornerSpots(
 
 /**
  * True when curio `c` stands on surface `s` of `room` (the module doc's
- * step 5, C12): its box lies inside the surface's box shrunk by
+ * step 5, C12): its variant stands on the surface's class
+ * (`curioClasses`), its box lies inside the surface's box shrunk by
  * `CURIO_MARGIN` (less 2 mm, for the rounding of its centre to three
  * decimals of a cell), its top is at most the surface's `clear`, and the
  * surface's height plus its top stays `CURIO_CEILING_GAP` under the
@@ -871,6 +918,7 @@ export function curioFits(room: CurioBase, c: Curio, s: HostSurface): boolean {
   const inner = grow(s.box, -(CURIO_MARGIN - 0.002));
   const top = curioSize(c).top;
   return (
+    curioClasses(c.kind, c.variant).includes(s.cls) &&
     box.x0 >= inner.x0 &&
     box.x1 <= inner.x1 &&
     box.z0 >= inner.z0 &&
@@ -914,8 +962,9 @@ function curioTurn(
 /**
  * Curio `kind` of `variant` at `turn` on `s`'s box, its box at fractions
  * `u` and `v` of the slack the box leaves inside `CURIO_MARGIN`, or null
- * when it leaves none (a slack within `EPS` of zero counts as zero). Its centre is rounded to three decimals of a cell
- * and its height is the surface's. What a trial and `curioOn` share.
+ * when it leaves none (a slack within `EPS` of zero counts as zero). Its
+ * centre is rounded to three decimals of a cell and its height is the
+ * surface's. What a trial and `curioOn` share.
  */
 function placeOn(
   s: HostSurface,
@@ -961,7 +1010,7 @@ export function curioOn(
   turn: number = s.turn,
 ): Curio {
   const where = `curioOn: ${kind} ${String(variant)} on ${s.host}`;
-  if (!CURIO_CATALOGUE[kind].classes.includes(s.cls))
+  if (!curioClasses(kind, variant).includes(s.cls))
     throw new Error(`${where}: no ${s.cls} curio`);
   const c = placeOn(s, kind, variant, turn, u, v, seed);
   if (c === null) throw new Error(`${where}: too big for the surface`);
@@ -969,13 +1018,14 @@ export function curioOn(
   return c;
 }
 
-/** One place a curio may be tried at: its seed, its order among its fellows and the surface or corner. */
-interface CurioCandidate {
-  seed: number;
-  order: number;
-  surface: HostSurface | null;
-  spot: { x: number; y: number } | null;
-}
+/**
+ * One place a curio may be tried at: its seed, its order among its
+ * fellows, and either the surface it stands on or the corner point it
+ * stands at.
+ */
+type CurioCandidate =
+  | { seed: number; order: number; on: "surface"; surface: HostSurface }
+  | { seed: number; order: number; on: "floor"; x: number; y: number };
 
 /**
  * The candidates of `kind` in `room` (the module doc's step 4), in the
@@ -994,8 +1044,9 @@ function candidatesOf(
     ? corners().map((c, order) => ({
         seed: seedFor(room.seed, "curio", c.cx, c.cy, "floor"),
         order,
-        surface: null,
-        spot: { x: c.x, y: c.y },
+        on: "floor" as const,
+        x: c.x,
+        y: c.y,
       }))
     : surfaces.flatMap((s, order) =>
         CURIO_CATALOGUE[kind].classes.includes(s.cls)
@@ -1003,8 +1054,8 @@ function candidatesOf(
               {
                 seed: seedFor(room.seed, "curio", s.key[0], s.key[1], s.key[2]),
                 order,
+                on: "surface" as const,
                 surface: s,
-                spot: null,
               },
             ]
           : [],
@@ -1040,13 +1091,12 @@ function trial(
   const u = rng.next();
   const v = rng.next();
   let c: Curio | null;
-  if (cand.surface === null) {
-    const spot = cand.spot ?? { x: 0, y: 0 };
+  if (cand.on === "floor") {
     c = {
       kind,
       variant,
-      x: spot.x,
-      y: spot.y,
+      x: cand.x,
+      y: cand.y,
       h: 0,
       turn: turnRoll,
       seed: cand.seed,
