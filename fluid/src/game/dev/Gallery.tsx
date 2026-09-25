@@ -16,17 +16,29 @@
  * `SIGNAL LOST` and leaves the player in the gallery, and F opens nothing:
  * the gallery is no engram. `?bloom=rgba8` forces the RGBA8 bloom path as
  * in the look demo.
+ *
+ * Two more parameters are dev-only and not on the legend. `?at=<kind>:<n>`
+ * (see `spotSpawn`) puts the player in front of the n-th fixture of that
+ * kind, facing it, instead of the room's own entrance; use it to judge a
+ * malfunctioning fixture without walking across the hall. `?fault=missing`
+ * or `?fault=denied` answers every travel with that failure instead of
+ * `SIGNAL LOST`, so every open door, portal and hatch in the gallery
+ * malfunctions once the player walks into or crawls through it, and stays
+ * broken for the rest of the visit. The sealed sliding door (`door:4`) and
+ * the sealed portal (`portal:2`) malfunction from the start, with or
+ * without `?fault=`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
-import { createSession, type Session } from "../session";
+import { createSession, type PlaceLoader, type Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { galleryRoom } from "../world/canned";
+import { spotSpawn } from "./spots";
 
 /** The keys, along the top of the screen. */
 const LEGEND =
@@ -52,6 +64,14 @@ export default function Gallery() {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
     const params = new URLSearchParams(window.location.search);
+    const base = galleryRoom();
+    const at = params.get("at");
+    const spawn = at === null ? null : spotSpawn(base, at);
+    const fault = params.get("fault");
+    const load: PlaceLoader | undefined =
+      fault === "missing" || fault === "denied"
+        ? () => Promise.resolve({ kind: fault })
+        : undefined;
     const session = createSession({
       canvas,
       client: null,
@@ -59,9 +79,10 @@ export default function Gallery() {
       navigate: openNothing,
       openFluid: openNothing,
       forceRgba8: params.get("bloom") === "rgba8",
+      ...(load === undefined ? {} : { load }),
     });
     sessionRef.current = session;
-    session.showRoom(galleryRoom());
+    session.showRoom(spawn === null ? base : { ...base, spawn });
     return () => {
       sessionRef.current = null;
       session.dispose();
