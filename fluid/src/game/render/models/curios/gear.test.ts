@@ -241,6 +241,8 @@ describe("gear curio models", () => {
       .sort((p, q) => centre(p)[0] - centre(q)[0]);
     expect(left).toHaveLength(4);
     expect(right).toHaveLength(3);
+    // The jumping order itself, pinned as a literal so a change fails here.
+    expect(METER.chase).toEqual([3, 5, 7, 4, 1, 6, 2]);
     [...left, ...right].forEach((p, i) => {
       expect(p.flag - FLAG.blink).toBe(METER.chase.indexOf(i + 1));
       const wing = wings.find((w) => side(w) === side(p));
