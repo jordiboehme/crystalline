@@ -2,8 +2,9 @@
  * The living heroes' shape tests: what `heroModels.test.ts` does not check
  * for every kind. The mess table's catalogue surface lies on an upward
  * face, the drinking bird stands on the table, the robot's two faces never
- * share a quad, the sleep ring carries six pods and six lights and the
- * dome planters hold two or three domes.
+ * share a quad, the sleep ring carries six pods and six lights with each
+ * lit lid over its own pod, and the dome planters hold two or three domes
+ * with a grow lamp under each.
  */
 
 import { describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import { heroSurfaces } from "../../../world/heroes";
 import type { Hero, HeroKind } from "../../../world/types";
 import { CELL } from "../../../world/units";
 import {
+  FLAG,
   blinkFlag,
   createBuilder,
   type MeshData,
@@ -28,6 +30,7 @@ import {
   type Part,
 } from "../../modelChecks";
 import { buildHero, buildHeroMesh } from ".";
+import { BIRD_A } from "./living";
 
 /** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
 function heroAt(kind: HeroKind, variant = 0): Hero {
@@ -115,12 +118,13 @@ describe("living hero models", () => {
   });
 
   it("the bird stands on the table", () => {
-    // The bird sits at a 1.6, d 0; a window of a 1.5 to 1.7 catches only
-    // its own parts, since the pedestal under it tops out at h 0.72 and
-    // the tray and cups sit at a 1.0 to 1.3.
+    // The bird sits at a BIRD_A (1.15), d 0; a window of 0.1 either side
+    // catches only its own parts and its water glass: the table's rounded
+    // ends and skirt start at a 1.4, the spine ends at 1.5, the tray and
+    // cups sit at a 1.45 to 1.75 and the catalogue surface ends at 0.9.
     const bird = partsOf("mess-table")
       .flatMap(local)
-      .filter((p) => p[0] > 1.5 && p[0] < 1.7);
+      .filter((p) => p[0] > BIRD_A - 0.1 && p[0] < BIRD_A + 0.1);
     expect(bird.length).toBeGreaterThan(0);
     const lowest = Math.min(...bird.map((p) => p[2]));
     const highest = Math.max(...bird.map((p) => p[2]));
@@ -153,28 +157,53 @@ describe("living hero models", () => {
     }
   });
 
-  it("dome planters have two or three domes", () => {
-    // A lathe's `a`-extent alone understates its radius: with 6 sides, no
-    // facet lands exactly on the `a` axis, so the widest points are at
-    // `sin(60deg)` of it. Measure the radial distance from the shape's own
-    // bounding-box centre instead, which sits exactly on the lathe's axis.
-    const radius = (p: Part) => {
+  it("each pod's lit lid lies over its own pod, on the side of its light", () => {
+    // The plan centre of a part's points, and its heading from the hub.
+    const heading = (p: Part) => {
       const pts = local(p);
-      const as = pts.map((q) => q[0]);
-      const ds = pts.map((q) => q[1]);
-      const ca = (Math.min(...as) + Math.max(...as)) / 2;
-      const cd = (Math.min(...ds) + Math.max(...ds)) / 2;
-      return Math.max(...pts.map((q) => Math.hypot(q[0] - ca, q[1] - cd)));
+      const a = pts.reduce((t, q) => t + q[0], 0) / pts.length;
+      const d = pts.reduce((t, q) => t + q[1], 0) / pts.length;
+      return { angle: Math.atan2(d, a), reach: Math.hypot(a, d) };
     };
+    const parts = partsOf("sleep-ring");
+    const lids = parts
+      .filter((p) => p.flag === FLAG.signal && p.method === "cylinderAlong")
+      .map(heading);
+    expect(lids).toHaveLength(6);
+    for (let group = 0; group < 6; group++) {
+      const light = parts.find((p) => p.flag === blinkFlag(group));
+      if (!light) throw new Error(`no light in group ${String(group)}`);
+      const { angle } = heading(light);
+      const turn = (x: number) =>
+        Math.abs(Math.atan2(Math.sin(x - angle), Math.cos(x - angle)));
+      const over = lids.filter((l) => l.reach > 1 && turn(l.angle) < 0.05);
+      expect(over, `pod ${String(group)}`).toHaveLength(1);
+    }
+  });
+
+  it("dome planters have two or three domes, a grow lamp under each", () => {
+    // Each dome is an open lattice of twenty struts (extruded bars) and
+    // hangs one grow lamp, its own blink group, under its apex hub.
     for (const [variant, count] of [
       [0, 2],
       [1, 3],
     ] as const) {
-      const lathes = partsOf("dome-planters", variant).filter(
-        (p) => p.method === "lathe",
-      );
-      const domes = lathes.filter((p) => Math.abs(radius(p) - 0.7) < 1e-6);
-      expect(domes, `variant ${String(variant)}`).toHaveLength(count);
+      const parts = partsOf("dome-planters", variant);
+      expect(
+        parts.filter((p) => p.method === "extrude"),
+        `variant ${String(variant)}`,
+      ).toHaveLength(20 * count);
+      for (let group = 0; group < 8; group++) {
+        const lamps = parts.filter((p) => p.flag === blinkFlag(group));
+        expect(
+          lamps,
+          `variant ${String(variant)} group ${String(group)}`,
+        ).toHaveLength(group < count ? 1 : 0);
+        for (const lamp of lamps) {
+          const top = Math.max(...local(lamp).map((q) => q[2]));
+          expect(top).toBeLessThan(1.5 - 0.2);
+        }
+      }
     }
   });
 });
