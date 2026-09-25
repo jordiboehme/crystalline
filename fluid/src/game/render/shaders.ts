@@ -88,9 +88,9 @@ const TURN_TABLE = [0, 1, 2, 3]
  * 0, the identity and the steady bank. The slot is the instance's blink
  * bank (H11), passed on flat as `vSlot` for the fragment shader's blink
  * branch; a way's malfunction is drawn with per-draw uniforms, not
- * instance data. The
- * vertex is turned by `TURNS` (emitted from `turnMat2Columns`) and moved
- * by the instance offset; then comes a mover's scale about its pivot
+ * instance data. The vertex is turned by `TURNS` (emitted from
+ * `turnMat2Columns`) and moved by the instance offset; then comes a
+ * mover's scale about its pivot
  * (`uModelScale` about `uModelPivot`: a portal disc collapsing; 1 about
  * the origin for everything else) and its slide (`uModelOffset`: a door
  * leaf or hatch lid while it opens; zero for the static room and the
@@ -150,7 +150,9 @@ void main() {
  * cell's level and so follows its zone's light; a signal light shines by
  * itself at `SIGNAL_GAIN`, with no room light in it (H12); a blink-flagged
  * light does the same times its channel's gain in `uBlink`, the channel
- * being `vSlot * BLINK_GROUPS + (flag - FLAG.blink)` (H11); the portal
+ * being `vSlot * BLINK_GROUPS + (flag - FLAG.blink)` (H11), and the
+ * branch takes only the blink flags, so no flag past them reads outside
+ * `uBlink`; the portal
  * scrolls its swirl and brightens at the rim; and lit surfaces (with
  * frames among them) get the banded, distance-dimmed cell light, optional
  * grime and the neon edge lines. On an RGBA8 target (`uLdr` 1) the edge
@@ -245,7 +247,7 @@ void main() {
     outColour = vec4(vTint * SIGNAL * uGain, 1.0);
     return;
   }
-  if (vFlag >= ${String(FLAG.blink)}) {
+  if (vFlag >= ${String(FLAG.blink)} && vFlag < ${String(FLAG.blink + BLINK_GROUPS)}) {
     int channel = int(vSlot + 0.5) * BLINK_GROUPS + (vFlag - ${String(FLAG.blink)});
     outColour = vec4(vTint * SIGNAL * uBlink[channel] * uGain, 1.0);
     return;

@@ -49,6 +49,12 @@ describe("the scene shader's blink and signal paths", () => {
     );
   });
 
+  it("bounds the blink branch to the blink flags, so no flag past them reads outside uBlink", () => {
+    expect(SCENE_FS).toContain(
+      `if (vFlag >= ${String(FLAG.blink)} && vFlag < ${String(FLAG.blink + BLINK_GROUPS)}) {`,
+    );
+  });
+
   it("puts the signal and blink branches after the lamp branch and before the lit path", () => {
     const main = SCENE_FS.slice(SCENE_FS.indexOf("void main()"));
     const lamp = main.indexOf(`vFlag == ${String(FLAG.lamp)}`);

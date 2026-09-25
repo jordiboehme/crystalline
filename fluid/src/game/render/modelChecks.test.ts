@@ -94,9 +94,19 @@ describe("floatingGlow on a frame", () => {
     });
   }
 
-  it("lets a signal light sit on a frame", () => {
-    const parts = framed((k) => k.panel(1.55, 1.65, 0.41, 0.5, 0.6, SIGNAL));
-    expect(floatingGlow(parts, WALL)).toEqual(["1:box"]);
+  it("lets a signal light and a blinking one sit on a frame, which alone is named", () => {
+    // The frame post stands off the wall with no lit host, so the frame
+    // itself floats and is named ("1:box"); the light on it is not.
+    const signal = framed((k) => k.panel(1.55, 1.65, 0.41, 0.5, 0.6, SIGNAL));
+    expect(floatingGlow(signal, WALL)).toEqual(["1:box"]);
+    const blink: Surface = { ...SIGNAL, flag: blinkFlag(3) };
+    const blinking = framed((k) => k.panel(1.55, 1.65, 0.41, 0.5, 0.6, blink));
+    expect(floatingGlow(blinking, WALL)).toEqual(["1:box"]);
+  });
+
+  it("does not let a screen sit on a frame: only signal and blink lights may", () => {
+    const parts = framed((k) => k.panel(1.55, 1.65, 0.41, 0.5, 0.6, GLOW));
+    expect(floatingGlow(parts, WALL)).toEqual(["1:box", "2:panel"]);
   });
 
   it("still names a frame with no lit host, and a light that floats off the frame", () => {

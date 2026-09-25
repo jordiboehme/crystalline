@@ -12,9 +12,13 @@
  *
  * - `steady` (slot 0): every group at 1. The static room, the movers and
  *   the props all read slot 0, so they are unchanged.
- * - `breathe`, `status` and `twinkle`: DOOM's glow, strobe and flicker
- *   specials, one light zone of level 255 per group, each group with its
- *   own seed so the groups of a bank are out of step.
+ * - `breathe`: DOOM's glow special at level 255, one cycle recorded once
+ *   from `createLights` (`GLOW_CYCLE`); each group reads it at its own
+ *   seeded phase, since the glow itself draws no random numbers and would
+ *   otherwise run every group in step.
+ * - `status` and `twinkle`: DOOM's strobe and flicker specials, one light
+ *   zone of level 255 per group, each group with its own seed, so the
+ *   groups of a bank are out of step.
  * - `swap`: groups 0 to 3 lit while 4 to 7 are low, the other way round
  *   every `SWAP_TICS`: a face or a screen that flips between two pictures.
  * - `chase`: one group lit at a time, the next every `CHASE_TICS`: a light
@@ -57,12 +61,40 @@ export const SWAP_TICS = 105;
 /** Ticks the chase bank holds each group lit. */
 export const CHASE_TICS = 5;
 
-/** The DOOM special behind each bank that has one. */
+/**
+ * The DOOM special behind each bank run as light zones: the strobe and the
+ * flicker draw from each zone's seed, so their groups fall out of step by
+ * themselves. The breathe bank's glow draws nothing and is phased by hand
+ * (`GLOW_CYCLE`).
+ */
 const SPECIAL: Partial<Record<BlinkBank, LightSpecial>> = {
-  breathe: "glow",
   status: "strobe",
   twinkle: "flicker",
 };
+
+/** The longest glow cycle `GLOW_CYCLE` will record before it gives up, in ticks. */
+const GLOW_CYCLE_MAX = 1000;
+
+/**
+ * One whole cycle of DOOM's glow at level 255, tick by tick from its start
+ * (255, heading down, through its low level and back up): recorded once
+ * from `createLights` with a single glow zone, so the breathe bank moves
+ * exactly as a glowing light zone does. It ends on the tick before the
+ * glow is back at 255.
+ */
+const GLOW_CYCLE: readonly number[] = (() => {
+  const glow = createLights([
+    { x0: 0, y0: 0, x1: 1, y1: 1, level: 255, special: "glow", seed: 0 },
+  ]);
+  const cycle = [glow.levels[0] ?? 255];
+  for (let t = 0; t < GLOW_CYCLE_MAX; t++) {
+    glow.tick();
+    const level = glow.levels[0] ?? 255;
+    if (level === 255) return cycle;
+    cycle.push(level);
+  }
+  throw new Error("blink: the glow never came back to its level");
+})();
 
 /** A bank's slot: its index in `BLINK_BANKS`. */
 export function bankSlot(bank: BlinkBank): number {
@@ -76,15 +108,26 @@ export interface BlinkState {
 }
 
 /**
- * The blink state: the DOOM banks as light zones of level 255, one per
- * group, each with its own seed (so the groups of a bank are out of step),
- * run by `createLights`; the swap and chase banks counted from the ticks.
+ * The blink state: the breathe bank read from `GLOW_CYCLE`, each group at
+ * the phase `seedFor("blink", "breathe", group)` gives it; the status and
+ * twinkle banks as light zones of level 255, one per group, each with its
+ * own seed (so the groups of a bank are out of step), run by
+ * `createLights`; the swap and chase banks counted from the ticks.
  */
 export function createBlink(): BlinkState {
   const gains = new Float32Array(BLINK_CHANNELS).fill(1);
+  // Each bank's first channel, looked up once rather than on every tick.
+  const base = (bank: BlinkBank) => bankSlot(bank) * BLINK_GROUPS;
+  const breathe = base("breathe");
+  const swap = base("swap");
+  const chase = base("chase");
+  const phases = Array.from(
+    { length: BLINK_GROUPS },
+    (_, g) => seedFor("blink", "breathe", g) % GLOW_CYCLE.length,
+  );
   const doom = BLINK_BANKS.flatMap((bank) => {
     const special = SPECIAL[bank];
-    return special === undefined ? [] : [{ bank, special }];
+    return special === undefined ? [] : [{ at: base(bank), bank, special }];
   });
   const zones: LightZone[] = doom.flatMap(({ bank, special }) =>
     Array.from({ length: BLINK_GROUPS }, (_, g) => ({
@@ -100,12 +143,13 @@ export function createBlink(): BlinkState {
   const lights = createLights(zones);
   let ticks = 0;
   const fill = () => {
-    doom.forEach(({ bank }, k) => {
+    // DOOM's flicker and strobe low level is round(0.15 * 255) = 38, and
+    // 38 / 255 is 0.149, a hair under BLINK_LOW: every DOOM gain is
+    // clamped, so no group of any bank is ever darker than a swap or chase
+    // group. The glow's low level (0.4) is above it anyway.
+    doom.forEach(({ at }, k) => {
       for (let g = 0; g < BLINK_GROUPS; g++)
-        // DOOM's flicker and strobe low level is round(0.15 * 255) = 38,
-        // and 38 / 255 is 0.149, a hair under BLINK_LOW: clamp, so no
-        // group of any bank is ever darker than a swap or chase group.
-        gains[bankSlot(bank) * BLINK_GROUPS + g] = Math.max(
+        gains[at + g] = Math.max(
           BLINK_LOW,
           (lights.levels[k * BLINK_GROUPS + g] ?? 255) / 255,
         );
@@ -113,9 +157,11 @@ export function createBlink(): BlinkState {
     const first = Math.floor(ticks / SWAP_TICS) % 2 === 0;
     const lit = Math.floor(ticks / CHASE_TICS) % BLINK_GROUPS;
     for (let g = 0; g < BLINK_GROUPS; g++) {
-      gains[bankSlot("swap") * BLINK_GROUPS + g] =
-        g < BLINK_GROUPS / 2 === first ? 1 : BLINK_LOW;
-      gains[bankSlot("chase") * BLINK_GROUPS + g] = g === lit ? 1 : BLINK_LOW;
+      const glow =
+        GLOW_CYCLE[(ticks + (phases[g] ?? 0)) % GLOW_CYCLE.length] ?? 255;
+      gains[breathe + g] = Math.max(BLINK_LOW, glow / 255);
+      gains[swap + g] = g < BLINK_GROUPS / 2 === first ? 1 : BLINK_LOW;
+      gains[chase + g] = g === lit ? 1 : BLINK_LOW;
     }
   };
   fill();

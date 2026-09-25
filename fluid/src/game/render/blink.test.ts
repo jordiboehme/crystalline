@@ -82,6 +82,39 @@ describe("blink banks", () => {
   });
 });
 
+describe("the DOOM banks out of step", () => {
+  it("has every DOOM bank's groups differ on at least one tick in 700", () => {
+    for (const bank of ["breathe", "status", "twinkle"] as const) {
+      const b = createBlink();
+      let differ = 0;
+      for (let t = 0; t < 700; t++, b.tick()) {
+        const first = at(b.gains, bank, 0);
+        for (let g = 1; g < BLINK_GROUPS; g++)
+          if (at(b.gains, bank, g) !== first) {
+            differ++;
+            break;
+          }
+      }
+      expect(differ, bank).toBeGreaterThan(0);
+    }
+  });
+
+  it("breathes every group through the same glow, each at its own phase", () => {
+    // Each breathe group runs DOOM's glow: the same set of levels, only
+    // shifted in time, so a group's run over one long stretch holds the
+    // same values as group 0's.
+    const b = createBlink();
+    const seen = Array.from({ length: BLINK_GROUPS }, () => new Set<number>());
+    for (let t = 0; t < 700; t++, b.tick())
+      for (let g = 0; g < BLINK_GROUPS; g++)
+        seen[g]?.add(at(b.gains, "breathe", g));
+    const ref = [...(seen[0] ?? [])].sort().join();
+    for (let g = 1; g < BLINK_GROUPS; g++)
+      expect([...(seen[g] ?? [])].sort().join(), String(g)).toBe(ref);
+    expect(seen[0]?.size).toBeGreaterThan(10);
+  });
+});
+
 describe("blinkFlag", () => {
   it("maps groups 0 to 7 onto FLAG.blink onwards and refuses any other group", () => {
     for (let g = 0; g < BLINK_GROUPS; g++)

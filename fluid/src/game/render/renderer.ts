@@ -156,15 +156,16 @@ type GroupMesh =
   | { key: string; family: "hero"; kind: HeroKind; variant: number };
 
 /**
- * One prop or hero kind and variant of the room on the GPU: its instance
- * buffer, kept while the room stays the same, and the vertex array that
- * binds it to the cached mesh of the current look, remade on every
- * `setRoom`.
+ * One prop or hero kind and variant of the room on the GPU: which mesh it
+ * draws (`id`), its instance buffer, kept while the room stays the same,
+ * and the vertex array that binds it to the cached mesh of the current
+ * look, remade on every `setRoom`.
  */
-type GpuGroup = GroupMesh & {
+interface GpuGroup {
+  id: GroupMesh;
   instances: InstanceBuffer;
   mesh: InstancedMesh | null;
-};
+}
 
 /**
  * The room's light on the GPU: an R8 texture of one texel per grid cell,
@@ -366,7 +367,8 @@ export function createRenderer(
       const sameRoom = nextRoom === room;
       const lookChanged = nextLook.id !== meshLook;
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
-      const needed: readonly GroupMesh[] = nextGroups ?? groups;
+      const needed: readonly GroupMesh[] =
+        nextGroups ?? groups.map((g) => g.id);
       // The prop and hero meshes this room lacks in this look are built on
       // the CPU before the old room is let go, like the room mesh, so one
       // that cannot be built leaves the old room drawn too.
@@ -388,39 +390,29 @@ export function createRenderer(
       }
       if (nextGroups !== null) {
         releaseGroups();
-        groups = nextGroups.map((g): GpuGroup =>
-          g.family === "prop"
-            ? {
-                key: g.key,
-                family: g.family,
-                kind: g.kind,
-                variant: g.variant,
-                instances: createInstanceBuffer(gl, g.data),
-                mesh: null,
-              }
-            : {
-                key: g.key,
-                family: g.family,
-                kind: g.kind,
-                variant: g.variant,
-                instances: createInstanceBuffer(gl, g.data),
-                mesh: null,
-              },
-        );
+        // An instance group is a `GroupMesh` as it stands (its count and
+        // data ride along, a few floats each), so one map serves both
+        // families.
+        groups = nextGroups.map((g) => ({
+          id: g,
+          instances: createInstanceBuffer(gl, g.data),
+          mesh: null,
+        }));
       }
       for (const g of groups) {
-        let vertices = groupMeshes.get(g.key);
+        const { key, family } = g.id;
+        let vertices = groupMeshes.get(key);
         if (vertices === undefined) {
           // Every mesh the cache lacks was built above, before the release;
           // building one here would break the old-room guarantee.
-          const data = fresh.get(g.key);
+          const data = fresh.get(key);
           if (data === undefined) {
             throw new Error(
-              `renderer: ${g.family} mesh ${g.key} was not built before the release`,
+              `renderer: ${family} mesh ${key} was not built before the release`,
             );
           }
           vertices = createVertexBuffer(gl, data);
-          groupMeshes.set(g.key, vertices);
+          groupMeshes.set(key, vertices);
         }
         g.mesh = createInstancedMesh(gl, vertices, g.instances);
       }

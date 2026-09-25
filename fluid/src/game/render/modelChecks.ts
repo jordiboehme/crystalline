@@ -9,9 +9,10 @@
  * box, and whether every glowing part (a screen, a frame, a portal, a
  * signal light or a blinking one) touches a lit host or its wall. A prop
  * or hero mesh, built once at the origin, is turned and placed the way the
- * GPU places an instance (`placeMesh`, `placeParts`) before it is measured. The glow check works on a list of recorded kit
- * calls (`Part`), which `recordingKitAt` records for a model built through
- * a kit factory, and which the fixture tests record for the movers too.
+ * GPU places an instance (`placeMesh`, `placeParts`) before it is
+ * measured. The glow check works on a list of recorded kit calls (`Part`),
+ * which `recordingKitAt` records for a model built through a kit factory,
+ * and which the fixture tests record for the movers too.
  */
 
 import type { Box } from "../world/types";
@@ -213,6 +214,11 @@ export const GLOWING: readonly number[] = [
   ...Array.from({ length: BLINK_GROUPS }, (_, g) => FLAG.blink + g),
 ];
 
+/** Whether a flag is a signal light's or a blinking light's: what a frame may host. */
+const isLight = (flag: number) =>
+  flag === FLAG.signal ||
+  (flag >= FLAG.blink && flag < FLAG.blink + BLINK_GROUPS);
+
 /**
  * Every glowing part that floats: a part with a flag in `GLOWING` that is
  * in contact with no lit host part (a vertex of one within
@@ -223,9 +229,10 @@ export const GLOWING: readonly number[] = [
  * included, since mover parts count as hosts too.
  *
  * A frame is a lit body whose edges glow (the shader lights it like any lit
- * surface and adds its edge lines), so a frame part hosts every other
- * glowing part: a door's warning lamp, a signal light, sits on the frame
- * of its jamb. A frame itself still needs a lit host or the wall.
+ * surface and adds its edge lines), so a frame part hosts a signal or a
+ * blinking light: a door's warning lamp sits on the frame of its jamb. It
+ * hosts nothing else (a screen or a portal on a frame is still named), and
+ * a frame itself still needs a lit host or the wall.
  */
 export function floatingGlow(
   parts: readonly Part[],
@@ -245,7 +252,7 @@ export function floatingGlow(
       if (wall && p.points.some((q) => toLocal(wall, q)[1] <= CONTACT))
         return false;
       const glow = shape(p.points);
-      const own = p.flag === FLAG.frame ? hosts : [...hosts, ...frames];
+      const own = isLight(p.flag) ? [...hosts, ...frames] : hosts;
       return !own.some((h) => reaches(glow, h) || reaches(h, glow));
     })
     .map(({ p, i }) => `${String(i)}:${p.method}`);

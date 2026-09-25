@@ -27,11 +27,11 @@
  *
  * Every door also gets two more movers, which a malfunction drives
  * (`render/parts.ts` turns a fault frame into their draw): a hazard lamp
- * lens (`lamp:<index>`), a flush amber panel near the top of the right
- * jamb or housing that glows dimly at `LAMP_IDLE` and blinks while a fault
- * runs, a signal light (`FLAG.signal`, H12) that shines by itself and no
- * longer follows the room's light, so it is as vivid in a dark room as in
- * a lit one; and a spark cluster (`spark:<index>`), six tiny glowing boxes on
+ * lens (`lamp:<index>`), a flush amber signal light (`FLAG.signal`, H12)
+ * near the top of the right jamb or housing, which shines by itself and
+ * no longer follows the room's light, so it glows dimly at `LAMP_IDLE`
+ * and blinks while a fault runs as vividly in a dark room as in a lit
+ * one; and a spark cluster (`spark:<index>`), six tiny glowing boxes on
  * the recess at the leaves' meeting line, drawn only while a fault lights
  * them and hidden by the closed leaves.
  *
