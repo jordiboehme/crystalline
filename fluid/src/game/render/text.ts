@@ -220,19 +220,43 @@ export interface PictogramRect {
 }
 
 /**
- * The pictogram set, a 2 by 2 sheet of square tiles in the one pictogram
- * layer, so a square plate shows its sign undistorted: the service hatch
- * top left, the portal top right, the door bottom left, and the bottom
- * right tile left dark for a later sign. This is the single source of the
+ * The pictogram set, a 4 by 4 sheet of square tiles in the one pictogram
+ * layer, so a square plate shows its sign undistorted: `service`, `portal`
+ * and `door` keep their milestone 1 tiles across the top two rows, the six
+ * sign-plate pictograms (`SIGN_PICTOGRAMS`) fill the row after them, and
+ * seven tiles stay dark for later signs. This is the single source of the
  * layout: `drawPictogramLayer` draws each sign into the tile named here, and
  * a model maps its plate to the same rectangle (`SERVICE_PICTOGRAM` in
- * `models/hatch.ts` is `PICTOGRAM.service`), so the two cannot drift.
+ * `models/hatch.ts` is `PICTOGRAM.service`, a sign plate's is
+ * `PICTOGRAM[SIGN_PICTOGRAMS[variant]]`), so the two cannot drift.
  */
 export const PICTOGRAM = {
-  service: { u0: 0, v0: 0.5, uw: 0.5, vh: 0.5 },
-  portal: { u0: 0.5, v0: 0.5, uw: 0.5, vh: 0.5 },
-  door: { u0: 0, v0: 0, uw: 0.5, vh: 0.5 },
+  service: { u0: 0, v0: 0.75, uw: 0.25, vh: 0.25 },
+  portal: { u0: 0.25, v0: 0.75, uw: 0.25, vh: 0.25 },
+  door: { u0: 0.5, v0: 0.75, uw: 0.25, vh: 0.25 },
+  exit: { u0: 0.75, v0: 0.75, uw: 0.25, vh: 0.25 },
+  fire: { u0: 0, v0: 0.5, uw: 0.25, vh: 0.25 },
+  medic: { u0: 0.25, v0: 0.5, uw: 0.25, vh: 0.25 },
+  voltage: { u0: 0.5, v0: 0.5, uw: 0.25, vh: 0.25 },
+  air: { u0: 0.75, v0: 0.5, uw: 0.25, vh: 0.25 },
+  caution: { u0: 0, v0: 0.25, uw: 0.25, vh: 0.25 },
 } as const satisfies Record<string, PictogramRect>;
+
+/**
+ * The six generic signs a sign-plate prop may show, one per variant
+ * (`PROP_CATALOGUE["sign-plate"].variants` in `world/props.ts`), in variant
+ * order: variant `v` shows `PICTOGRAM[SIGN_PICTOGRAMS[v]]`. Every name here
+ * is also a key of `PICTOGRAM`, apart from `service`, `portal` and `door`,
+ * which stay reserved for the hatch and the milestone 1 signs.
+ */
+export const SIGN_PICTOGRAMS = [
+  "exit",
+  "fire",
+  "medic",
+  "voltage",
+  "air",
+  "caution",
+] as const;
 
 /** The pictograms of the set, each drawn into a unit tile (0 to 16). */
 const SIGNS: Record<
@@ -289,14 +313,82 @@ const SIGNS: Record<
     ctx.closePath();
     ctx.fill();
   },
+  // An open doorway with a pair of running chevrons through it: the way out.
+  exit(ctx) {
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(2.5, 3.5, 4, 10);
+    const chevron = (cx: number) => {
+      ctx.beginPath();
+      ctx.moveTo(cx, 5);
+      ctx.lineTo(cx + 3, 8.5);
+      ctx.lineTo(cx, 12);
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    };
+    chevron(8);
+    chevron(11);
+  },
+  // A rising flame.
+  fire(ctx) {
+    ctx.beginPath();
+    ctx.moveTo(8, 2.2);
+    ctx.bezierCurveTo(11.5, 6, 7.5, 7.5, 9.5, 10.5);
+    ctx.bezierCurveTo(10.5, 9, 11.5, 9.5, 11.5, 11);
+    ctx.bezierCurveTo(11.5, 13, 9.5, 14, 8, 14);
+    ctx.bezierCurveTo(5, 14, 3.5, 11.5, 4.5, 9);
+    ctx.bezierCurveTo(5, 7.5, 6, 7.5, 6, 6);
+    ctx.bezierCurveTo(6, 4.5, 7, 3, 8, 2.2);
+    ctx.closePath();
+    ctx.fill();
+  },
+  // A plain cross: the way to help.
+  medic(ctx) {
+    ctx.fillRect(6.5, 2.5, 3, 11);
+    ctx.fillRect(2.5, 6.5, 11, 3);
+  },
+  // A zigzag bolt: live power.
+  voltage(ctx) {
+    ctx.beginPath();
+    ctx.moveTo(9.5, 2.5);
+    ctx.lineTo(5, 8.5);
+    ctx.lineTo(7.7, 8.5);
+    ctx.lineTo(6.5, 13.5);
+    ctx.lineTo(11.5, 7);
+    ctx.lineTo(8.7, 7);
+    ctx.closePath();
+    ctx.fill();
+  },
+  // Three curved lines: moving air.
+  air(ctx) {
+    ctx.lineWidth = 1.1;
+    for (const y of [4.5, 8, 11.5]) {
+      ctx.beginPath();
+      ctx.moveTo(3, y);
+      ctx.quadraticCurveTo(8, y - 2.2, 13, y);
+      ctx.stroke();
+    }
+  },
+  // An exclamation mark in a triangle: mind your step.
+  caution(ctx) {
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(8, 2.5);
+    ctx.lineTo(14, 13);
+    ctx.lineTo(2, 13);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fillRect(7.3, 6, 1.4, 4.2);
+    ctx.beginPath();
+    ctx.arc(8, 11.3, 0.9, 0, Math.PI * 2);
+    ctx.fill();
+  },
 };
 
 /**
- * The pictogram layer: the `PICTOGRAM` set of Semiotic Standard style
- * signs, each a square frame around its symbol, drawn as vector paths in
- * white on black so the shader can tint them. Each tile keeps a dark margin
- * on every side, so the coarser mip levels do not bleed one sign into its
- * neighbour.
+ * The pictogram layer: the `PICTOGRAM` set of signs, each a square frame
+ * around its symbol, drawn as vector paths in white on black so the shader
+ * can tint them. Each tile keeps a dark margin on every side, so the coarser
+ * mip levels do not bleed one sign into its neighbour.
  */
 export function drawPictogramLayer(size: number): Uint8Array {
   const ctx = canvas2d(size);
