@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import { decorFootprint, footprint, footprintOf } from "../world/footprints";
 import { MACHINE_KINDS } from "../world/generate";
 import type {
-  Box,
   Decor,
   DecorKind,
   DoorStyle,
@@ -14,7 +13,6 @@ import type {
 } from "../world/types";
 import { CELL } from "../world/units";
 import {
-  FLAG,
   FLOATS_PER_VERTEX,
   createBuilder,
   type MeshData,
@@ -29,6 +27,19 @@ import {
   type Frame,
 } from "./kit";
 import { LOOKS } from "./looks";
+import {
+  add,
+  cross,
+  dot,
+  floatingGlow,
+  inBox,
+  positions,
+  scale,
+  sub,
+  toLocal,
+  worstWinding,
+  type Part,
+} from "./modelChecks";
 import {
   BLAST_DOWN_TRAVEL,
   BLAST_UP_TRAVEL,
@@ -45,16 +56,6 @@ import {
   type ModelContext,
   type Mover,
 } from "./models";
-
-/** One kit call, as the recording kit saw it. */
-interface Part {
-  /** The builder it emitted into: the room's, or a mover's own. */
-  builder: object;
-  method: string;
-  layer: number;
-  flag: number;
-  points: V3[];
-}
 
 /**
  * Every kit made while a model builds, the models' own mover kits
@@ -226,61 +227,6 @@ const DECOR_KINDS: readonly DecorKind[] = [
   "specimen-tank",
 ];
 
-function positions(m: MeshData): V3[] {
-  return Array.from({ length: m.count }, (_, i) => {
-    const o = i * FLOATS_PER_VERTEX;
-    const v = (k: number) => m.vertices[o + k] ?? NaN;
-    return [v(0), v(1), v(2)];
-  });
-}
-
-function normals(m: MeshData): V3[] {
-  return Array.from({ length: m.count }, (_, i) => {
-    const o = i * FLOATS_PER_VERTEX + 3;
-    const v = (k: number) => m.vertices[o + k] ?? NaN;
-    return [v(0), v(1), v(2)];
-  });
-}
-
-const add = (p: V3, q: V3): V3 => [p[0] + q[0], p[1] + q[1], p[2] + q[2]];
-const sub = (p: V3, q: V3): V3 => [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-const scale = (p: V3, k: number): V3 => [p[0] * k, p[1] * k, p[2] * k];
-const cross = (p: V3, q: V3): V3 => [
-  p[1] * q[2] - p[2] * q[1],
-  p[2] * q[0] - p[0] * q[2],
-  p[0] * q[1] - p[1] * q[0],
-];
-const dot = (p: V3, q: V3) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
-
-/** The smallest agreement between a triangle's winding and its stored normal. */
-function worstWinding(m: MeshData): number {
-  const ps = positions(m);
-  const ns = normals(m);
-  let worst = Infinity;
-  for (let t = 0; t + 2 < ps.length; t += 3) {
-    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
-    const n = ns[t];
-    if (!a || !b || !c || !n) throw new Error("short triangle");
-    const g = cross(sub(b, a), sub(c, a));
-    const len = Math.hypot(...g);
-    if (len < 1e-9) continue;
-    worst = Math.min(worst, dot(g, n) / len);
-  }
-  return worst;
-}
-
-/** A world point in a frame's local `[a, d, h]`. */
-function toLocal(f: Frame, p: V3): V3 {
-  const o = sub(p, f.origin);
-  return [dot(o, f.along), dot(o, f.inward), o[1]];
-}
-
-const inBox = (b: Box, p: V3) =>
-  p[0] >= b.x0 - EPS &&
-  p[0] <= b.x1 + EPS &&
-  p[2] >= b.z0 - EPS &&
-  p[2] <= b.z1 + EPS;
-
 interface Built {
   static: MeshData;
   movers: Mover[];
@@ -351,102 +297,8 @@ function opened(b: Built): { mover: Mover; points: V3[] }[] {
   }));
 }
 
-/** The closest point on triangle `a b c` to `p` (Ericson's method). */
-function closestOnTriangle(p: V3, a: V3, b: V3, c: V3): V3 {
-  const ab = sub(b, a);
-  const ac = sub(c, a);
-  const ap = sub(p, a);
-  const d1 = dot(ab, ap);
-  const d2 = dot(ac, ap);
-  if (d1 <= 0 && d2 <= 0) return a;
-  const bp = sub(p, b);
-  const d3 = dot(ab, bp);
-  const d4 = dot(ac, bp);
-  if (d3 >= 0 && d4 <= d3) return b;
-  const vc = d1 * d4 - d3 * d2;
-  if (vc <= 0 && d1 >= 0 && d3 <= 0) return add(a, scale(ab, d1 / (d1 - d3)));
-  const cp = sub(p, c);
-  const d5 = dot(ab, cp);
-  const d6 = dot(ac, cp);
-  if (d6 >= 0 && d5 <= d6) return c;
-  const vb = d5 * d2 - d1 * d6;
-  if (vb <= 0 && d2 >= 0 && d6 <= 0) return add(a, scale(ac, d2 / (d2 - d6)));
-  const va = d3 * d6 - d5 * d4;
-  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
-    return add(b, scale(sub(c, b), (d4 - d3) / (d4 - d3 + (d5 - d6))));
-  }
-  const denom = 1 / (va + vb + vc);
-  return add(a, add(scale(ab, vb * denom), scale(ac, vc * denom)));
-}
-
-/** How close two parts must come to count as touching, in metres. */
-const CONTACT = 0.03;
-
-/** A part's points with their bounds, measured once. */
-interface Shape {
-  points: readonly V3[];
-  lo: V3;
-  hi: V3;
-}
-
-function shape(points: readonly V3[]): Shape {
-  const lo: V3 = [Infinity, Infinity, Infinity];
-  const hi: V3 = [-Infinity, -Infinity, -Infinity];
-  for (const p of points) {
-    for (const k of [0, 1, 2] as const) {
-      lo[k] = Math.min(lo[k], p[k]);
-      hi[k] = Math.max(hi[k], p[k]);
-    }
-  }
-  return { points, lo, hi };
-}
-
-/** Whether a point lies within `CONTACT` of a shape's bounds. */
-const nearBounds = (p: V3, s: Shape) =>
-  ([0, 1, 2] as const).every(
-    (k) => p[k] >= s.lo[k] - CONTACT && p[k] <= s.hi[k] + CONTACT,
-  );
-
-/** Whether any vertex of `from` lies within `CONTACT` of a triangle of `to`. */
-function reaches(from: Shape, to: Shape): boolean {
-  const near = from.points.filter((p) => nearBounds(p, to));
-  if (near.length === 0) return false;
-  const pts = to.points;
-  for (let t = 0; t + 2 < pts.length; t += 3) {
-    const [a, b, c] = [pts[t], pts[t + 1], pts[t + 2]];
-    if (!a || !b || !c) continue;
-    for (const p of near) {
-      const q = closestOnTriangle(p, a, b, c);
-      if (Math.hypot(...sub(p, q)) <= CONTACT) return true;
-    }
-  }
-  return false;
-}
-
-const GLOWING: readonly number[] = [FLAG.emissive, FLAG.frame, FLAG.portal];
-
-/**
- * Every glowing part is in contact with a lit host part (a vertex of one
- * within `CONTACT` of a triangle of the other, either way round) or, for a
- * wall fixture, with the wall plane. Mover parts count as hosts. Nothing
- * glows in mid-air.
- */
-function floatingGlow(b: Built, wall: Frame | null): string[] {
-  const every = [...b.parts, ...b.moverParts.flat()];
-  const hosts = every
-    .filter((p) => !GLOWING.includes(p.flag) && p.points.length > 0)
-    .map((p) => shape(p.points));
-  return every
-    .map((p, i) => ({ p, i }))
-    .filter(({ p }) => GLOWING.includes(p.flag) && p.points.length > 0)
-    .filter(({ p }) => {
-      if (wall && p.points.some((q) => toLocal(wall, q)[1] <= CONTACT))
-        return false;
-      const glow = shape(p.points);
-      return !hosts.some((h) => reaches(glow, h) || reaches(h, glow));
-    })
-    .map(({ p, i }) => `${i}:${p.method}`);
-}
+/** Every part of a built model: the static ones, then each mover's. */
+const allParts = (b: Built): Part[] => [...b.parts, ...b.moverParts.flat()];
 
 /** A unit vector along `p`. */
 const unit = (p: V3): V3 => scale(p, 1 / Math.hypot(...p));
@@ -468,7 +320,7 @@ const OVERLAP = 1e-4;
  * measured where the door is closed.
  */
 function sunkDecals(b: Built, wall: Frame | null): string[] {
-  const every = [...b.parts, ...b.moverParts.flat()];
+  const every = allParts(b);
   const out: string[] = [];
   every.forEach((decal, i) => {
     if (decal.method !== "panel") return;
@@ -549,7 +401,7 @@ describe("fixture models", () => {
         });
 
         it("glows only on or in its body", () => {
-          expect(floatingGlow(built, wall)).toEqual([]);
+          expect(floatingGlow(allParts(built), wall)).toEqual([]);
         });
 
         it("lifts every decal DECAL_LIFT off what it covers", () => {
@@ -684,7 +536,7 @@ describe("decor models", () => {
         });
 
         it("glows only on or in its body", () => {
-          expect(floatingGlow(built, null)).toEqual([]);
+          expect(floatingGlow(allParts(built), null)).toEqual([]);
         });
 
         it("lifts every decal DECAL_LIFT off what it covers", () => {

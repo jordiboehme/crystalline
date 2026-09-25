@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { wallAnchor } from "../world/sites";
 import { CELL } from "../world/units";
 import type { Decor } from "../world/types";
 import {
@@ -15,6 +16,8 @@ import {
   frameAt,
   frameForDecor,
   frameForSlot,
+  turnMat2Columns,
+  turnPoint,
   type Frame,
   type Kit,
 } from "./kit";
@@ -632,5 +635,53 @@ describe("the modelling kit", () => {
     }
     const f = frameForDecor(DECOR);
     expect(f.origin).toEqual([DECOR.x * CELL, 0, DECOR.y * CELL]);
+  });
+});
+
+describe("the turn table", () => {
+  it("turns points exactly as frameAt's turn table does", () => {
+    const local: V3[] = [
+      [0.3, 1.1, -0.7],
+      [-1.2, 0, 0.4],
+      [0.5, 2, 0.9],
+    ];
+    for (let t = 0; t < 4; t++) {
+      for (const [a, h, d] of local) {
+        const f = frameAt([0, 0, 0], t);
+        const f0 = frameAt([0, 0, 0], 0);
+        const at = (fr: Frame): V3 => [
+          fr.along[0] * a + fr.inward[0] * d,
+          h,
+          fr.along[2] * a + fr.inward[2] * d,
+        ];
+        const turned = turnPoint(at(f0), t);
+        const want = at(f);
+        for (const k of [0, 1, 2] as const)
+          expect(turned[k]).toBeCloseTo(want[k], 12);
+      }
+    }
+  });
+
+  it("emits column-major mat2 numbers that multiply like turnPoint", () => {
+    for (let t = 0; t < 4; t++) {
+      const [c0x, c0y, c1x, c1y] = turnMat2Columns(t);
+      const [x, z] = [0.7, -1.9];
+      const glsl = [c0x * x + c1x * z, c0y * x + c1y * z]; // M * v, column-major
+      const ts = turnPoint([x, 0, z], t);
+      expect(glsl[0]).toBeCloseTo(ts[0], 12);
+      expect(glsl[1]).toBeCloseTo(ts[2], 12);
+    }
+  });
+
+  it("anchors a wall edge where frameForSlot stands and turns it the same way", () => {
+    for (const side of ["n", "e", "s", "w"] as const) {
+      const e = { x: 3, y: 4, side };
+      const a = wallAnchor(e);
+      const slot = frameForSlot(e);
+      const f = frameAt([a.x * CELL, 0, a.y * CELL], a.turn);
+      expect(f.origin).toEqual(slot.origin);
+      expect(f.along).toEqual(slot.along);
+      expect(f.inward).toEqual(slot.inward);
+    }
   });
 });

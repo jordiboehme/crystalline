@@ -839,6 +839,49 @@ export function frameAt(origin: V3, turn: number): Frame {
 }
 
 /**
+ * The quarter turns as 2x2 maps of (x, z), clockwise seen from above:
+ * turn q sends (x, z) to (m[0] * x + m[1] * z, m[2] * x + m[3] * z).
+ * This is the one rotation both the tests and the scene shader use (the
+ * shader's table is emitted from it by `turnMat2Columns`); the kit test
+ * pins it against `frameAt`'s TURNS table.
+ *
+ * A prop mesh is built once, in `frameAt([0, 0, 0], 0)`, and every
+ * instance is placed by turning it with this table and adding its anchor.
+ * Turn q of a point built at turn 0 lands exactly where `frameAt` at turn q
+ * would have built it, so a recipe never needs to know how it is turned.
+ */
+export const TURN_XZ: readonly (readonly [number, number, number, number])[] = [
+  [1, 0, 0, 1],
+  [0, -1, 1, 0],
+  [-1, 0, 0, -1],
+  [0, 1, -1, 0],
+];
+
+/**
+ * A point or direction turned by whole quarter turns about the vertical,
+ * by `TURN_XZ`. The turn is rounded to whole quarters and taken modulo
+ * four, as `frameAt` takes it; the height is left alone.
+ */
+export function turnPoint(p: V3, turn: number): V3 {
+  const q = ((Math.round(turn) % 4) + 4) % 4;
+  const m = TURN_XZ[q] ?? [1, 0, 0, 1];
+  return [m[0] * p[0] + m[1] * p[2], p[1], m[2] * p[0] + m[3] * p[2]];
+}
+
+/**
+ * A turn as the four numbers of a GLSL `mat2` constructor, which takes its
+ * columns first: `mat2(c0.x, c0.y, c1.x, c1.y)`, so that `M * vec2(x, z)`
+ * equals `turnPoint`.
+ */
+export function turnMat2Columns(
+  turn: number,
+): [number, number, number, number] {
+  const q = ((Math.round(turn) % 4) + 4) % 4;
+  const m = TURN_XZ[q] ?? [1, 0, 0, 1];
+  return [m[0], m[2], m[1], m[3]];
+}
+
+/**
  * The frame for a piece of decor: origin at its centre on the floor
  * (`x` and `y` are continuous cell units), turned by its quarter turns. A
  * decor recipe is written centred on `a = 0, d = 0` with its front
