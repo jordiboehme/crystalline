@@ -21,14 +21,24 @@
  * golden room.
  *
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
- * model gallery: one of every model the station draws, so each can be
- * walked up to and judged without an engram that happens to need it.
+ * model gallery: one of every model the station draws, machines in bays 1
+ * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
+ * judged without an engram that happens to need it.
  */
 
 import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
+import { PROP_ORDER } from "./dress";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
-import { createSlotPool, planLayout, wallSlots, type SlotPref } from "./layout";
+import {
+  createSlotPool,
+  planLayout,
+  wallRuns,
+  wallSlots,
+  type SlotPref,
+} from "./layout";
+import { PROP_CATALOGUE, PROP_KINDS } from "./props";
+import { wallAnchor } from "./sites";
 import type {
   Decor,
   DecorKind,
@@ -36,7 +46,11 @@ import type {
   LightZone,
   PlaceAddress,
   PlaceInput,
+  Prop,
+  PropKind,
+  Rect,
   RoomSpec,
+  Side,
   WallSlot,
 } from "./types";
 
@@ -261,14 +275,15 @@ const GALLERY: PlaceAddress = { domain: "station", permalink: "gallery" };
  * carries: eight on the north wall make the hall seventeen cells wide, seven
  * on the west make it sixteen deep, which leaves a band wide enough for all
  * nine pieces of furniture with an aisle up the middle, and the inflated
- * `any` asks for exactly two bays, where the twelve machines stand.
+ * `any` asks for exactly four bays: the first two hold the twelve machines,
+ * the last two the one-of-everything set dressing.
  */
 const GALLERY_NEED = {
   north: 8,
   west: 7,
   east: 0,
   south: 3,
-  any: 30,
+  any: 55,
   hatches: 2,
 };
 
@@ -307,9 +322,11 @@ const GALLERY_LIGHT = 210;
  *   domain and one sealed; two terminals on the west wall; two posters on
  *   the east wall; two hatches beside the entrance and the placard on the
  *   south wall; and every kind of furniture in the middle (`GALLERY_DECOR`).
- * - **Bays.** Two, east of the hall, holding the twelve machines, one of
- *   each kind in `MACHINE_KINDS` order, six to a bay, labelled with their
- *   kind.
+ * - **Bays.** Four, east of the hall. Bays 1 and 2 hold the twelve machines,
+ *   one of each kind in `MACHINE_KINDS` order, six to a bay, labelled with
+ *   their kind. Bays 3 and 4 hold one of every prop kind and variant
+ *   (`galleryProps`): wall and ceiling kinds on their walls, floor kinds on
+ *   their floor, a run kind's variant as a 2-segment run.
  * - **Light.** One steady zone per block of four by four cells, so every
  *   floor cell is lit and nothing flickers while a model is looked at.
  *
@@ -341,7 +358,8 @@ export function galleryRoom(): RoomSpec {
         "Model Gallery",
         "EVERY MODEL THE",
         "STATION DRAWS",
-        "MACHINES IN THE BAYS",
+        "MACHINES IN BAYS 1 2",
+        "PROPS IN BAYS 3 4",
       ],
     },
   ];
@@ -430,16 +448,18 @@ export function galleryRoom(): RoomSpec {
     });
   }
 
-  // The machines stand in the bays' own slots, which the pool would only
-  // hand out once the hall's were gone.
+  // The machines stand in the first two bays' own slots, which the pool
+  // would only hand out once the hall's were gone; the last two bays are
+  // the set dressing's, below.
+  const machineBays = layout.bays.slice(0, 2);
   const baySlots = wallSlots(layout.grid).filter((s) =>
-    layout.bays.some(
+    machineBays.some(
       (b) => s.x >= b.x0 && s.x < b.x1 && s.y >= b.y0 && s.y < b.y1,
     ),
   );
-  const perBay = MACHINE_KINDS.length / layout.bays.length;
+  const perBay = MACHINE_KINDS.length / machineBays.length;
   MACHINE_KINDS.forEach((machine, i) => {
-    const bay = layout.bays[Math.floor(i / perBay)];
+    const bay = machineBays[Math.floor(i / perBay)];
     const own = baySlots.filter(
       (s) => bay !== undefined && s.x >= bay.x0 && s.x < bay.x1,
     );
@@ -463,6 +483,14 @@ export function galleryRoom(): RoomSpec {
     turn,
     seed: seedFor(seed, "decor", kind, 0),
   }));
+
+  const propBays = layout.bays.slice(2, 4);
+  const bay3 = propBays[0];
+  const bay4 = propBays[1];
+  if (bay3 === undefined || bay4 === undefined) {
+    throw new Error("gallery: needs four bays for the props");
+  }
+  const props = galleryProps(seed, layout.grid, bay3, bay4);
 
   const lights: LightZone[] = [];
   for (let y0 = 0; y0 < layout.depth; y0 += 4) {
@@ -505,9 +533,198 @@ export function galleryRoom(): RoomSpec {
     fixtures,
     decor,
     scaffold: scaffoldFor(condition, layout.hall, decor, seed),
-    props: [],
+    props,
     lights,
     dropped: 0,
     inboundMore: 0,
   };
+}
+
+/**
+ * Filters the runs `wallRuns` returns to the ones entirely inside `bay`, on
+ * one of `sides`: a bay's own straight wall run, never a neighbour's.
+ */
+function bayRuns(
+  grid: readonly string[],
+  bay: Rect,
+  sides: readonly Side[],
+): WallSlot[][] {
+  return wallRuns(grid).filter((run) => {
+    const first = run[0];
+    return (
+      first !== undefined &&
+      sides.includes(first.side) &&
+      run.every(
+        (e) => e.x >= bay.x0 && e.x < bay.x1 && e.y >= bay.y0 && e.y < bay.y1,
+      )
+    );
+  });
+}
+
+/**
+ * A queue over a list of wall runs: `take` hands out one edge at a time and
+ * `takePair` two consecutive edges of the same run (a run kind's segments),
+ * skipping a run once it cannot serve what is asked. Both throw once the
+ * queue is spent, which a bug in the gallery's own bookkeeping is the only
+ * way to reach.
+ */
+function edgeQueue(runsIn: readonly WallSlot[][]): {
+  take(): WallSlot;
+  takePair(): [WallSlot, WallSlot];
+} {
+  const runs = runsIn.map((r) => [...r]);
+  let cursor = 0;
+  const advance = (need: number) => {
+    while (cursor < runs.length && (runs[cursor]?.length ?? 0) < need) {
+      cursor++;
+    }
+  };
+  return {
+    take(): WallSlot {
+      advance(1);
+      const e = runs[cursor]?.shift();
+      if (e === undefined) throw new Error("gallery: ran out of wall edges");
+      return e;
+    },
+    takePair(): [WallSlot, WallSlot] {
+      advance(2);
+      const pair = runs[cursor]?.splice(0, 2);
+      const a = pair?.[0];
+      const b = pair?.[1];
+      if (a === undefined || b === undefined) {
+        throw new Error("gallery: ran out of wall run space");
+      }
+      return [a, b];
+    },
+  };
+}
+
+/**
+ * One of every prop kind and variant (ruling 13's six sign-plate pictograms
+ * included), hand-placed in bays 3 and 4 rather than drawn from a palette:
+ *
+ * - wall kinds on the north, south and east walls of both bays, a run kind
+ *   (`cable-tray`, `pipe-bundle`) as a 2-segment run per variant, taken from
+ *   two consecutive edges of one straight run so a run never turns a corner
+ *   or crosses a bay's doorway;
+ * - ceiling kinds along both bays' north wall edges, runs (`duct`,
+ *   `ceiling-tray`) the same way; a ceiling prop may share an edge with a
+ *   wall prop, since the two hang at different heights, exactly as the
+ *   dressing pass allows;
+ * - floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
+ *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0. The outer columns are left
+ *   out because they sit next to a bay's doorway, which the real dressing
+ *   pass always keeps floor props off; rows 0, 2, 4, 6 and 7 stay walkable.
+ *
+ * Every seed follows ruling 2, `seedFor(roomSeed, "prop", cx, cy, token)`:
+ * the token is the edge's side for a single wall or ceiling prop, `run-` or
+ * `ceiling-` plus the side for a run's segments, and `"floor"` for a floor
+ * prop, the same tokens `dress.ts` uses. The output is sorted by
+ * `PROP_ORDER`, as a dressed room's `props` always are.
+ */
+function galleryProps(
+  roomSeed: number,
+  grid: readonly string[],
+  bay3: Rect,
+  bay4: Rect,
+): Prop[] {
+  const atEdge = (
+    kind: PropKind,
+    e: WallSlot,
+    variant: number,
+    token: string,
+  ): Prop => {
+    const a = wallAnchor(e);
+    return {
+      kind,
+      variant,
+      anchor: PROP_CATALOGUE[kind].anchor,
+      x: a.x,
+      y: a.y,
+      turn: a.turn,
+      seed: seedFor(roomSeed, "prop", e.x, e.y, token),
+    };
+  };
+  const kindsOf = (anchor: "wall" | "floor" | "ceiling") =>
+    PROP_KINDS.filter((k) => PROP_CATALOGUE[k].anchor === anchor);
+
+  // Wall kinds: the north, south and east walls of both bays.
+  const wallEdges = edgeQueue([
+    ...bayRuns(grid, bay3, ["n", "s", "e"]),
+    ...bayRuns(grid, bay4, ["n", "s", "e"]),
+  ]);
+  const wall: Prop[] = [];
+  for (const kind of kindsOf("wall")) {
+    const entry = PROP_CATALOGUE[kind];
+    if (!entry.run) continue;
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const [a, b] = wallEdges.takePair();
+      wall.push(
+        atEdge(kind, a, variant, `run-${a.side}`),
+        atEdge(kind, b, variant, `run-${b.side}`),
+      );
+    }
+  }
+  for (const kind of kindsOf("wall")) {
+    const entry = PROP_CATALOGUE[kind];
+    if (entry.run) continue;
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const e = wallEdges.take();
+      wall.push(atEdge(kind, e, variant, e.side));
+    }
+  }
+
+  // Ceiling kinds: both bays' north wall edges only.
+  const ceilingEdges = edgeQueue([
+    ...bayRuns(grid, bay3, ["n"]),
+    ...bayRuns(grid, bay4, ["n"]),
+  ]);
+  const ceiling: Prop[] = [];
+  for (const kind of kindsOf("ceiling")) {
+    const entry = PROP_CATALOGUE[kind];
+    if (!entry.run) continue;
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const [a, b] = ceilingEdges.takePair();
+      ceiling.push(
+        atEdge(kind, a, variant, `ceiling-${a.side}`),
+        atEdge(kind, b, variant, `ceiling-${b.side}`),
+      );
+    }
+  }
+  for (const kind of kindsOf("ceiling")) {
+    const entry = PROP_CATALOGUE[kind];
+    if (entry.run) continue;
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const e = ceilingEdges.take();
+      ceiling.push(atEdge(kind, e, variant, e.side));
+    }
+  }
+
+  // Floor kinds: rows 1, 3 and 5 of the six inner columns of each bay.
+  const cells: { x: number; y: number }[] = [];
+  for (const bay of [bay3, bay4])
+    for (const y of [1, 3, 5])
+      for (let x = bay.x0 + 1; x <= bay.x1 - 2; x++) cells.push({ x, y });
+  let ci = 0;
+  const floor: Prop[] = [];
+  for (const kind of kindsOf("floor")) {
+    const entry = PROP_CATALOGUE[kind];
+    for (let variant = 0; variant < entry.variants; variant++) {
+      const cell = cells[ci++];
+      if (cell === undefined) {
+        throw new Error("gallery: ran out of floor cells for props");
+      }
+      floor.push({
+        kind,
+        variant,
+        anchor: "floor",
+        x: cell.x + 0.5,
+        y: cell.y + 0.5,
+        turn: 0,
+        seed: seedFor(roomSeed, "prop", cell.x, cell.y, "floor"),
+      });
+    }
+  }
+
+  return [...wall, ...floor, ...ceiling].sort(PROP_ORDER);
 }

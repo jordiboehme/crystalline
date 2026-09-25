@@ -90,7 +90,9 @@ export interface ReaderState {
  * - `prompt`: the line for what the player faces (`E READ Scope`), null
  *   when nothing.
  * - `status`: the room, the look, its condition and the mouse hint.
- * - `frame`: the frame time and the render targets' colour format.
+ * - `frame`: the frame time and the render targets' colour format, with
+ *   `BUILD <ms> MS` appended once a room has been built: the time the last
+ *   `renderer.setRoom` call took.
  * - `notice`: a centred message over the canvas (`ACCESS DENIED`), null to
  *   hide it.
  * - `connector`: the travel overlay, shown while a place loads, with the
@@ -284,6 +286,8 @@ export function createSession(opts: SessionOptions): Session {
   let frameCount = 0;
   let lastReport = now();
   const started = now();
+  /** The last `renderer.setRoom` call's time, in ms; null before the first. */
+  let lastBuildMs: number | null = null;
 
   const input = createInput(canvas);
   const onClick = () => {
@@ -361,8 +365,10 @@ export function createSession(opts: SessionOptions): Session {
    */
   const present = (next: RoomSpec, id: LookId): boolean => {
     if (renderer === null) return true;
+    const t0 = now();
     try {
       renderer.setRoom(next, LOOKS[id]);
+      lastBuildMs = now() - t0;
       return true;
     } catch {
       return false;
@@ -590,7 +596,11 @@ export function createSession(opts: SessionOptions): Session {
       made = factory(canvas, { forceRgba8: opts.forceRgba8 });
       if (made !== null) {
         renderer = made.renderer;
-        if (room !== null) renderer.setRoom(room, LOOKS[lookId]);
+        if (room !== null) {
+          const t0 = now();
+          renderer.setRoom(room, LOOKS[lookId]);
+          lastBuildMs = now() - t0;
+        }
         sizeCanvas();
         renderer.resize(canvas.width, canvas.height);
       }
@@ -720,8 +730,10 @@ export function createSession(opts: SessionOptions): Session {
         const t = now();
         if (t - lastReport > 250) {
           const ms = frameSum / frameCount;
+          const build =
+            lastBuildMs === null ? "" : `  BUILD ${lastBuildMs.toFixed(1)} MS`;
           hud.frame(
-            `${colorFormat}  ${ms.toFixed(1)} MS  ${Math.round(1000 / ms)} FPS`,
+            `${colorFormat}  ${ms.toFixed(1)} MS  ${Math.round(1000 / ms)} FPS${build}`,
           );
           frameSum = 0;
           frameCount = 0;

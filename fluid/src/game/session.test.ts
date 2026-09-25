@@ -661,6 +661,19 @@ describe("showRoom", () => {
   });
 });
 
+describe("build timing", () => {
+  it("times the last renderer.setRoom and appends BUILD <ms> MS to the frame line", () => {
+    renderer.setRoom.mockImplementation(() => {
+      now += 7;
+    });
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(12);
+    const last = hud.frame.mock.calls.at(-1)?.[0];
+    expect(last).toContain("BUILD 7.0 MS");
+  });
+});
+
 /** The eye's floor position in the last frame drawn. */
 function eyeAt(): [number, number] {
   const eye = lastCamera().eye;

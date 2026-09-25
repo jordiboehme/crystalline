@@ -1179,10 +1179,14 @@ describe("degenerate rooms (Review Focus 5)", () => {
     }
   });
 
-  it("leaves the gallery undressed", () => {
+  it("dresses the gallery by hand, keeping every invariant", () => {
     const gallery = galleryRoom();
-    expect(gallery.props).toEqual([]);
-    expect(blockersFor(gallery)).toHaveLength(takenBoxes(gallery).length);
+    expect(gallery.props.length).toBeGreaterThan(0);
+    expectWallInvariants("gallery", gallery);
+    expectFloorInvariants("gallery", gallery);
+    expect(blockersFor(gallery)).toHaveLength(
+      takenBoxes(gallery).length + floorProps(gallery).length,
+    );
   });
 });
 
