@@ -12,7 +12,7 @@
  */
 
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { useEffect } from "react";
+import { StrictMode, useEffect } from "react";
 import {
   MemoryRouter,
   useLocation,
@@ -65,6 +65,7 @@ const made = vi.hoisted(() => ({
     dispose: ReturnType<typeof vi.fn>;
   }[],
   navigations: [] as string[],
+  sessions: [] as { disposed: boolean }[],
 }));
 
 vi.mock("./render/renderer", () => ({
@@ -85,14 +86,23 @@ vi.mock("./session", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./session")>();
   return {
     ...actual,
-    createSession: (opts: Parameters<typeof actual.createSession>[0]) =>
-      actual.createSession({
+    createSession: (opts: Parameters<typeof actual.createSession>[0]) => {
+      const session = actual.createSession({
         ...opts,
         navigate: (path: string) => {
           made.navigations.push(path);
           opts.navigate(path);
         },
-      }),
+      });
+      const entry = { disposed: false };
+      made.sessions.push(entry);
+      const dispose = session.dispose.bind(session);
+      session.dispose = () => {
+        entry.disposed = true;
+        dispose();
+      };
+      return session;
+    },
   };
 });
 
@@ -191,14 +201,15 @@ const keepNavigate = (n: NavigateFunction) => {
   navigate = n;
 };
 
-function renderAt(path: string) {
-  return render(
+function renderAt(path: string, strict = false) {
+  const tree = (
     <MemoryRouter initialEntries={[path]}>
       <App />
       <NavProbe onNavigate={keepNavigate} />
       <LocationProbe />
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(strict ? <StrictMode>{tree}</StrictMode> : tree);
 }
 
 /** Changes the URL under the app, as a link or the history buttons would. */
@@ -248,6 +259,7 @@ beforeEach(() => {
   location = "";
   made.renderers.length = 0;
   made.navigations.length = 0;
+  made.sessions.length = 0;
   gl.available = false;
   // jsdom has no `matchMedia`; the device check and the session's
   // pixel-ratio watch both ask it. A fine pointer and no coarse one: a
@@ -411,5 +423,42 @@ describe("GameRoute", () => {
     });
     await settle(500);
     view.unmount();
+  });
+  it("runs exactly one live session under StrictMode's double mount", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/game/d/eng/e/alpha", true);
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+
+    // StrictMode mounts, unmounts and mounts again: two sessions, each with
+    // its own renderer, and only the second one still running.
+    expect(made.sessions.length).toBeGreaterThanOrEqual(2);
+    expect(made.renderers).toHaveLength(made.sessions.length);
+    const live = made.sessions.filter((s) => !s.disposed);
+    expect(live).toHaveLength(1);
+    expect(made.sessions.at(-1)?.disposed).toBe(false);
+    made.sessions.forEach((s, i) => {
+      const renderer = made.renderers[i];
+      if (s.disposed) {
+        expect(renderer?.dispose).toHaveBeenCalled();
+        expect(renderer?.setRoom).not.toHaveBeenCalled();
+      } else {
+        expect(renderer?.dispose).not.toHaveBeenCalled();
+      }
+    });
+    // One room, entered once, and the URL replaced once.
+    expect(made.renderers.at(-1)?.setRoom).toHaveBeenCalledTimes(1);
+    expect(made.navigations).toEqual(["/game/d/eng/e/alpha"]);
+    expect(location).toBe("/game/d/eng/e/alpha");
+
+    view.unmount();
+    expect(made.sessions.every((s) => s.disposed)).toBe(true);
+    for (const renderer of made.renderers) {
+      expect(renderer.dispose).toHaveBeenCalled();
+    }
+    expect(actWarnings()).toEqual([]);
   });
 });

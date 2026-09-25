@@ -170,14 +170,25 @@ function frames(n: number) {
   }
 }
 
-/** A new session on a fresh canvas, with the stubs of this test. */
-function start(options: { client?: QueryClient | null } = {}): Session {
-  const factory: RendererFactory = () => ({
-    renderer,
-    color: "rgba8",
-  });
+/**
+ * A new session with the stubs of this test, on a fresh canvas unless one
+ * is given, and with a factory that hands out `renderer` unless one is.
+ */
+function start(
+  options: {
+    client?: QueryClient | null;
+    canvas?: HTMLCanvasElement;
+    factory?: RendererFactory;
+  } = {},
+): Session {
+  const factory: RendererFactory =
+    options.factory ??
+    (() => ({
+      renderer,
+      color: "rgba8",
+    }));
   const session = createSession({
-    canvas: document.createElement("canvas"),
+    canvas: options.canvas ?? document.createElement("canvas"),
     client: options.client === undefined ? client : options.client,
     hud,
     navigate,
@@ -562,6 +573,52 @@ describe("a room the renderer refuses", () => {
     expect(hud.status).toHaveBeenLastCalledWith(
       expect.stringContaining("APERTURE"),
     );
+    expect(session.current?.permalink).toBe("manifest");
+  });
+});
+
+describe("the GPU context", () => {
+  it("pauses on a lost context and rebuilds the renderer on restore", () => {
+    const canvas = document.createElement("canvas");
+    const factory = vi.fn<RendererFactory>(() => ({
+      renderer,
+      color: "rgba8",
+    }));
+    const session = start({ client: null, canvas, factory });
+    session.showCanned(CANNED_BRIDGE);
+    frames(2);
+    expect(renderer.draw).toHaveBeenCalled();
+    expect(factory).toHaveBeenCalledTimes(1);
+
+    // Lost: the default is prevented (or the browser never restores it),
+    // the loop stops and the notice says why the screen froze.
+    const lost = new Event("webglcontextlost", { cancelable: true });
+    canvas.dispatchEvent(lost);
+    expect(lost.defaultPrevented).toBe(true);
+    // The loop cancelled its next frame: nothing is waiting on the clock.
+    expect(pending).toBeNull();
+    expect(hud.notice).toHaveBeenLastCalledWith(
+      "SIGNAL LOST - WAITING FOR THE GPU",
+    );
+    renderer.draw.mockClear();
+    frames(5);
+    expect(renderer.draw).not.toHaveBeenCalled();
+
+    // Restored: a fresh renderer, handed the room the player is in, sized,
+    // and drawing again; the old one is not touched.
+    const first = renderer;
+    const second = stubRenderer();
+    factory.mockImplementation(() => ({ renderer: second, color: "rgba8" }));
+    canvas.dispatchEvent(new Event("webglcontextrestored"));
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(second.setRoom).toHaveBeenCalledTimes(1);
+    expect(second.setRoom.mock.calls[0]?.[0].permalink).toBe("manifest");
+    expect(second.resize).toHaveBeenCalledTimes(1);
+    expect(hud.notice).toHaveBeenLastCalledWith(null);
+    expect(pending).not.toBeNull();
+    frames(2);
+    expect(second.draw).toHaveBeenCalled();
+    expect(first.draw).not.toHaveBeenCalled();
     expect(session.current?.permalink).toBe("manifest");
   });
 });
