@@ -755,6 +755,7 @@ export function createSession(opts: SessionOptions): Session {
           lights.levels,
           (t - started) / 1000,
           doorOpen,
+          new Map(),
         );
       },
     },

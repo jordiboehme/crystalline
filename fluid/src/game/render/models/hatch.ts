@@ -7,11 +7,18 @@
  * glass) and a lever handle. Above it a stencil plate carries the
  * "SERVICE" pictogram and the label row with the title of the engram the
  * hatch leads to.
+ *
+ * The door itself, with its hinges, porthole and lever, is the hatch's lid:
+ * a mover (`lid:<index>`) built on its own, which a malfunction pops open
+ * `LID_CRACK` along the wall's inward and rattles (`render/parts.ts` turns
+ * the fault frame into its offset). A dark recess panel behind it shows as
+ * the crack. The frame, the stencil plate, the pictogram and the label
+ * stay in the room's static mesh.
  */
 
 import type { Fixture } from "../../world/types";
-import { FLAG } from "../geometry";
-import { DECAL_LIFT, frameForSlot } from "../kit";
+import { FLAG, createBuilder } from "../geometry";
+import { DECAL_LIFT, createKit, frameForSlot } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import { PICTOGRAM } from "../text";
 import {
@@ -20,7 +27,9 @@ import {
   textPanel,
   type KitAt,
   type ModelContext,
+  type Mover,
 } from "./common";
+import { RECESS } from "./doors";
 
 type Hatch = Extract<Fixture, { kind: "hatch" }>;
 
@@ -30,6 +39,12 @@ type Hatch = Extract<Fixture, { kind: "hatch" }>;
  * `render/text.ts` lays out and draws, so the plate and the sheet agree.
  */
 export const SERVICE_PICTOGRAM = PICTOGRAM.service;
+
+/**
+ * How far a broken hatch's lid pops out from the wall, in metres: a crack,
+ * which leaves the lever at most 0.233 m out, inside `FLUSH_DEPTH`.
+ */
+export const LID_CRACK = 0.05;
 
 /** The hatch door: half width, bottom and top. */
 const HALF = 0.5;
@@ -48,14 +63,18 @@ const PLATE_H0 = TOP + FRAME + 0.08;
 const PLATE_HALF = 0.9;
 const PLATE_D = 0.03;
 
-/** Builds a service hatch against its wall slot. */
+/**
+ * Builds a service hatch against its wall slot: its static parts into the
+ * kits `kitAt` makes, and its lid returned as the one mover `lid:<index>`.
+ */
 export function buildHatch(
   kitAt: KitAt,
   fx: Hatch,
   index: number,
   ctx: ModelContext,
-): void {
-  const k = kitAt(frameForSlot(fx.slot));
+): Mover[] {
+  const f = frameForSlot(fx.slot);
+  const k = kitAt(f);
   const s = surfaces(ctx.look);
   const p = ctx.look.palette;
 
@@ -82,9 +101,27 @@ export function buildHatch(
   );
   k.bevelBox(-HALF, HALF, 0, FRAME_D, TOP, TOP + FRAME, 0.015, s.hazard);
   k.bevelBox(-HALF, HALF, 0, FRAME_D, BOTTOM - FRAME, BOTTOM, 0.015, s.hazard);
-  k.bevelBox(-HALF, HALF, 0.02, DOOR_D, BOTTOM, TOP, 0.02, s.body);
+  // The dark recess behind the lid, which shows as the crack.
+  k.panel(-HALF, HALF, DECAL_LIFT, BOTTOM, TOP, {
+    layer: LAYER.panel,
+    tint: RECESS,
+    flag: FLAG.lit,
+  });
+
+  // The lid: the door, its hinges, the porthole and the lever, one mover.
+  const b = createBuilder();
+  const lid = createKit(b, f);
+  lid.bevelBox(-HALF, HALF, 0.02, DOOR_D, BOTTOM, TOP, 0.02, s.body);
   for (const h of [BOTTOM + 0.15, TOP - 0.25]) {
-    k.box(-HALF - 0.04, -HALF + 0.1, DOOR_D, DOOR_D + 0.02, h, h + 0.1, s.dark);
+    lid.box(
+      -HALF - 0.04,
+      -HALF + 0.1,
+      DOOR_D,
+      DOOR_D + 0.02,
+      h,
+      h + 0.1,
+      s.dark,
+    );
   }
 
   // The porthole: dark glass inside a dimly glowing rim.
@@ -92,8 +129,8 @@ export function buildHatch(
     const t = (2 * Math.PI * i) / 12;
     return [Math.sin(t) * PORT_R, PORT_H + Math.cos(t) * PORT_R];
   });
-  k.extrude(glass, DOOR_D, DOOR_D + 0.005, s.tinted(p.screen));
-  k.ring(
+  lid.extrude(glass, DOOR_D, DOOR_D + 0.005, s.tinted(p.screen));
+  lid.ring(
     0,
     DOOR_D + 0.01,
     PORT_H,
@@ -106,8 +143,8 @@ export function buildHatch(
   );
 
   // The lever handle on its mount.
-  k.bevelBox(0.22, 0.3, DOOR_D, DOOR_D + 0.06, 0.52, 0.62, 0.01, s.dark);
-  k.cylinderAlong(0.26, 0.44, DOOR_D + 0.045, 0.57, 0.018, 6, s.metal);
+  lid.bevelBox(0.22, 0.3, DOOR_D, DOOR_D + 0.06, 0.52, 0.62, 0.01, s.dark);
+  lid.cylinderAlong(0.26, 0.44, DOOR_D + 0.045, 0.57, 0.018, 6, s.metal);
 
   // The stencil plate: the pictogram, then the label row.
   const pictogram = PLATE_HALF * 0.4;
@@ -152,4 +189,16 @@ export function buildHatch(
       flag: FLAG.emissive,
     },
   );
+  return [
+    {
+      key: `lid:${index}`,
+      part: "lid",
+      fixture: index,
+      mesh: b.build(),
+      axis: [...f.inward],
+      travel: LID_CRACK,
+      pivot: null,
+      rest: 1,
+    },
+  ];
 }

@@ -5,14 +5,20 @@
  * base plinth and joined by a header bar that carries the label. Inside
  * the ring the portal surface shimmers in the portal colour (the cross
  * domain colour for a link into another domain) in front of a dark back
- * plate, and the ring glows with
- * a frame edge in the same colour. A sealed portal has a hazard plate
- * where the surface would be and a padlock-shaped block across it.
+ * plate, and the ring glows with a frame edge in the same colour.
+ *
+ * The surface is a disc of its own, a mover (`disc:<index>`) that a
+ * malfunction flickers, stutters and collapses to a point about its centre
+ * (`render/parts.ts` turns the fault frame into its scale, gain and swirl
+ * time). The back plate stays in the static mesh, so a collapsed disc
+ * leaves a dead, dark ring. A sealed portal keeps the same swirl behind a
+ * padlock-shaped block, dimmed to `DISC_SEALED_GAIN`, and carries a hazard
+ * band on the plinth's front face.
  */
 
 import type { Fixture } from "../../world/types";
-import { FLAG, type Surface } from "../geometry";
-import { frameForSlot } from "../kit";
+import { FLAG, createBuilder, type Surface } from "../geometry";
+import { DECAL_LIFT, createKit, frameForSlot } from "../kit";
 import { LAYER } from "../layers";
 import {
   label,
@@ -20,9 +26,16 @@ import {
   surfaces,
   type KitAt,
   type ModelContext,
+  type Mover,
 } from "./common";
 
 type Portal = Extract<Fixture, { kind: "portal" }>;
+
+/**
+ * A sealed portal's swirl gain at rest: half as bright as an open one's,
+ * a dim surface behind the padlock.
+ */
+export const DISC_SEALED_GAIN = 0.5;
 
 /** The ring: centre height and depth, radius to the tube, tube radius. */
 const RING_H = 1.35;
@@ -40,14 +53,19 @@ const PYLON_TOP = 2.4;
 const PLINTH = 0.3;
 const HEADER = 0.1;
 
-/** Builds a portal against its wall slot. */
+/**
+ * Builds a portal against its wall slot: its static parts into the kits
+ * `kitAt` makes, and its swirl surface returned as the one mover
+ * `disc:<index>`, pivoting on the disc's centre.
+ */
 export function buildPortal(
   kitAt: KitAt,
   fx: Portal,
   index: number,
   ctx: ModelContext,
-): void {
-  const k = kitAt(frameForSlot(fx.slot));
+): Mover[] {
+  const f = frameForSlot(fx.slot);
+  const k = kitAt(f);
   const s = surfaces(ctx.look);
   const p = ctx.look.palette;
   const colour = fx.crossDomain ? p.portalAlt : p.portal;
@@ -105,15 +123,16 @@ export function buildPortal(
   );
   // The emitter's dark back plate, which holds the surface in the ring.
   k.extrude(disc, 0.02, RING_D - 0.01, s.tinted(shade(p.metal, 0.2)));
-  if (fx.sealedLabel === null) {
-    k.extrude(disc, RING_D - 0.01, RING_D + 0.01, {
-      layer: LAYER.portal,
-      tint: colour,
-      flag: FLAG.portal,
-    });
-  } else {
-    k.extrude(disc, RING_D - 0.01, RING_D + 0.01, s.hazard);
-    // The padlock: a body and its shackle.
+  // The swirl surface, its own mover, open or sealed.
+  const b = createBuilder();
+  createKit(b, f).extrude(disc, RING_D - 0.01, RING_D + 0.01, {
+    layer: LAYER.portal,
+    tint: colour,
+    flag: FLAG.portal,
+  });
+  const sealed = fx.sealedLabel !== null;
+  if (sealed) {
+    // The padlock in front of the disc: a body and its shackle.
     k.bevelBox(
       -0.18,
       0.18,
@@ -125,6 +144,24 @@ export function buildPortal(
       s.metal,
     );
     k.ring(0, 0.21, RING_H + 0.05, 0.11, 0.03, 6, 12, s.metal, "inward");
+    // A hazard band across the plinth's front face.
+    k.panel(-0.6, 0.6, 0.28 + DECAL_LIFT, 0.08, 0.22, s.hazard, 1.2, 0.14);
   }
   label(k, ctx, `portal:${index}`, -0.9, 0.9, PYLON_TOP + HEADER + 0.04, 0.08);
+  return [
+    {
+      key: `disc:${index}`,
+      part: "disc",
+      fixture: index,
+      mesh: b.build(),
+      axis: [...f.inward],
+      travel: 0,
+      pivot: [
+        f.origin[0] + f.inward[0] * RING_D,
+        f.origin[1] + f.inward[1] * RING_D + RING_H,
+        f.origin[2] + f.inward[2] * RING_D,
+      ],
+      rest: sealed ? DISC_SEALED_GAIN : 1,
+    },
+  ];
 }

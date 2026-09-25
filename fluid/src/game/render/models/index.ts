@@ -11,8 +11,10 @@
  * and for any sub-frame a part needs, so a sloped deck, a slanted table,
  * an arch or the angled wings of a console are built with the same
  * primitives as everything square. Everything static lands in the room's
- * one vertex array; door panels come back as movers, each its own small
- * mesh, for the renderer to slide open.
+ * one vertex array; the moving parts of every way (door leaves, a door's
+ * hazard lamp and sparks, a hatch's lid, a portal's swirl disc) come back
+ * as movers, each its own small mesh, for the renderer to slide, blink or
+ * scale (`render/parts.ts`).
  *
  * Every model stays inside its footprint (`FOOTPRINTS` in
  * `world/footprints.ts`) or, for what is mounted on the wall, inside the
@@ -38,6 +40,7 @@ export {
   type KitAt,
   type ModelContext,
   type Mover,
+  type MoverPart,
   type TextSlot,
 } from "./common";
 export { PIPE_DROP, buildDecor, pipeLength } from "./decor";
@@ -46,17 +49,22 @@ export {
   BLAST_UP_TRAVEL,
   BULKHEAD_TRAVEL,
   HOUSING_DEPTH,
+  LAMP_IDLE,
   OPENING,
   SLIDE_TRAVEL,
 } from "./doors";
+export { LID_CRACK } from "./hatch";
+export { DISC_SEALED_GAIN } from "./portal";
 
 /**
  * Builds one fixture of a room: its static parts into the kits `kitAt`
- * makes, and its moving parts (the panels of a door that opens) returned
- * as movers keyed `door:<index>`. `index` is the fixture's position in
- * `room.fixtures`, which names its text layer key (`terminal:<index>`,
- * `tag:<index>` and so on) and its movers. Every kind but an open door
- * returns no movers.
+ * makes, and its moving parts returned as movers, keyed as in `Mover`:
+ * every door returns its two leaves (`door:<index>`, sealed or not), its
+ * lamp (`lamp:<index>`) and its sparks (`spark:<index>`), every hatch its
+ * lid (`lid:<index>`) and every portal its disc (`disc:<index>`). `index`
+ * is the fixture's position in `room.fixtures`, which names its text
+ * layer key (`terminal:<index>`, `tag:<index>` and so on) and its movers.
+ * Every other kind returns no movers.
  */
 export function buildFixture(
   kitAt: KitAt,
@@ -71,11 +79,9 @@ export function buildFixture(
     case "door":
       return buildDoor(kitAt, fixture, index, ctx);
     case "portal":
-      buildPortal(kitAt, fixture, index, ctx);
-      return [];
+      return buildPortal(kitAt, fixture, index, ctx);
     case "hatch":
-      buildHatch(kitAt, fixture, index, ctx);
-      return [];
+      return buildHatch(kitAt, fixture, index, ctx);
     case "machine":
       buildMachine(kitAt, fixture, index, ctx);
       return [];

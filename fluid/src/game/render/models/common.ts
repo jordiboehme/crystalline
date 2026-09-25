@@ -48,18 +48,43 @@ export interface ModelContext {
 }
 
 /**
- * A part that moves: a door panel, as its own mesh in world space at its
- * closed position. `key` is `door:<fixtureIndex>` (both panels of a door
- * share it, as they open together), `axis` the world unit direction the
- * panel slides as the door opens and `travel` how many metres it slides
- * when fully open. The renderer draws it offset by
- * `axis * travel * openFraction`.
+ * The five kinds of moving part a way has: a door `leaf`, a door's
+ * `spark` cluster and hazard `lamp` lens, a hatch's `lid` and a portal's
+ * swirl `disc`.
+ */
+export type MoverPart = "leaf" | "spark" | "lamp" | "lid" | "disc";
+
+/**
+ * A part that moves, blinks or collapses: its own mesh in world space at
+ * rest (a leaf or lid shut, a disc whole), drawn with per-draw uniforms
+ * (`moverDraw` in `render/parts.ts`).
+ *
+ * - `key` names the part and its fixture: `door:<i>` for a leaf (both
+ *   leaves of a door share it, as they open together, and it is the key
+ *   the door's open fraction comes under), `spark:<i>`, `lamp:<i>`,
+ *   `lid:<i>` and `disc:<i>`.
+ * - `part` says which of the five it is, `fixture` the index `i` in
+ *   `room.fixtures` (the key the fault frames come under).
+ * - A leaf or lid is drawn offset by `axis * travel * open`: `axis` the
+ *   world unit direction it slides, `travel` how many metres it slides
+ *   when fully open. A spark, lamp or disc has travel 0 and axis the
+ *   wall's `inward`.
+ * - A disc is drawn scaled about `pivot`, its centre in world metres;
+ *   every other part has pivot null and is never scaled.
+ * - A spark, lamp or disc is drawn with a gain: `rest` is that gain while
+ *   no fault frame names the fixture (1 for a leaf, lid or open disc, the
+ *   lamp's idle glow, 0 for sparks, which are then not drawn at all, and
+ *   the dim glow of a sealed disc).
  */
 export interface Mover {
   key: string;
+  part: MoverPart;
+  fixture: number;
   mesh: MeshData;
   axis: V3;
   travel: number;
+  pivot: V3 | null;
+  rest: number;
 }
 
 /**

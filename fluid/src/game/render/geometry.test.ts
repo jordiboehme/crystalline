@@ -145,13 +145,21 @@ for (const [name, place] of ROOMS) {
       expect(walls).toBeGreaterThan(0);
     });
 
-    it("gives every unsealed door a mover and nothing else one", () => {
-      const doors = room.fixtures
-        .map((f, i) => ({ f, i }))
-        .filter(({ f }) => f.kind === "door" && f.address !== null)
-        .map(({ i }) => `door:${i}`);
-      expect(doors.length).toBeGreaterThan(0);
-      expect(new Set(built.movers.map((m) => m.key))).toEqual(new Set(doors));
+    it("gives every way its movers", () => {
+      const keys = room.fixtures.flatMap((f, i) => {
+        switch (f.kind) {
+          case "door":
+            return [`door:${i}`, `lamp:${i}`, `spark:${i}`];
+          case "hatch":
+            return [`lid:${i}`];
+          case "portal":
+            return [`disc:${i}`];
+          default:
+            return [];
+        }
+      });
+      expect(keys.length).toBeGreaterThan(0);
+      expect(new Set(built.movers.map((m) => m.key))).toEqual(new Set(keys));
     });
 
     it("hangs one lamp panel per light zone", () => {
@@ -183,9 +191,11 @@ describe("buildRoomMesh details", () => {
   });
 
   it("has a portal surface, door frames and lamps", () => {
+    // The portal surface is a mover (its disc), so the movers count too.
+    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day);
     const flags = new Set(
-      all(buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day).static).map(
-        (v) => v.flag,
+      [built.static, ...built.movers.map((m) => m.mesh)].flatMap((m) =>
+        all(m).map((v) => v.flag),
       ),
     );
     expect(flags.has(FLAG.portal)).toBe(true);
@@ -306,9 +316,12 @@ describe("buildRoomMesh details", () => {
 
   it("tints the cross-domain portal in the look's other portal colour", () => {
     const alt = LOOKS.day.palette.portalAlt;
-    const portal = all(
-      buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day).static,
-    ).filter((v) => v.flag === FLAG.portal);
+    // The portal surface is its disc, a mover.
+    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day);
+    const portal = built.movers
+      .filter((m) => m.part === "disc")
+      .flatMap((m) => all(m.mesh))
+      .filter((v) => v.flag === FLAG.portal);
     expect(portal.length).toBeGreaterThan(0);
     for (const v of portal) {
       v.tint.forEach((c, i) => expect(c).toBeCloseTo(alt[i] ?? NaN, 5));

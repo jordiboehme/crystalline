@@ -13,12 +13,25 @@
  *
  * The frame, sill, housing and label go into the room's static mesh, and
  * a dark recess behind the leaves shows as the passage when the door
- * stands open. The leaves of an open way come back as movers
- * (`door:<index>`) for the renderer to slide; wherever a leaf parks it is
- * hidden inside a jamb, a housing or the floor, never above the ceiling
- * and never over the door's own label. A sealed door (no address) keeps
- * its leaves in the static mesh, returns no movers and carries a hazard
- * plate or a locking bar across them.
+ * stands open. Every door's leaves come back as movers (`door:<index>`),
+ * sealed or not, for the renderer to slide: an open way slides them by
+ * its `DoorState`, a broken one by a fault's frames. Wherever a leaf parks
+ * it is hidden inside a jamb, a housing or the floor, never above the
+ * ceiling and never over the door's own label.
+ *
+ * A sealed door (no address) carries its marks on the leaves: the sliding
+ * door's and the bulkhead's hazard plate is split into one half per leaf
+ * and rides with it, so a leaf that jerks open takes its half along. The
+ * blast door's locking bar belongs to the frame and stays static across
+ * the split, so its halves strain against it.
+ *
+ * Every door also gets two more movers, which a malfunction drives
+ * (`render/parts.ts` turns a fault frame into their draw): a hazard lamp
+ * lens (`lamp:<index>`), a flush amber panel near the top of the right
+ * jamb or housing that glows dimly at `LAMP_IDLE` and blinks while a fault
+ * runs, and a spark cluster (`spark:<index>`), six tiny glowing boxes on
+ * the recess at the leaves' meeting line, drawn only while a fault lights
+ * them and hidden by the closed leaves.
  */
 
 import type { DoorStyle, Fixture } from "../../world/types";
@@ -77,8 +90,49 @@ const UP: V3 = [0, 1, 0];
 const DOWN: V3 = [0, -1, 0];
 const neg = (v: V3): V3 => [-v[0], -v[1], -v[2]];
 
-/** The colour of the dark passage behind an open door. */
-const RECESS: V3 = [0.02, 0.02, 0.025];
+/**
+ * The colour of the dark passage behind an open door, and of the dark
+ * crack behind a hatch lid that pops open.
+ */
+export const RECESS: V3 = [0.02, 0.02, 0.025];
+
+/**
+ * The hazard lamp lens's gain while no fault runs: a dim amber glow, so a
+ * blink to `LAMP_ON` (in `world/malfunction.ts`) reads as the lamp
+ * lighting up.
+ */
+export const LAMP_IDLE = 0.3;
+
+/**
+ * The hazard lamp lens's colour: amber, a warning light of its own that
+ * no look's palette carries, so it reads the same in every look.
+ */
+export const LAMP_TINT: V3 = [1.0, 0.55, 0.1];
+
+/** The lens's side, in metres: a small square light. */
+const LAMP_SIZE = 0.12;
+
+/**
+ * The sparks' colour: a hot white-yellow, the colour of welding sparks
+ * rather than of any look, drawn emissive so it ignores the room's light.
+ */
+export const SPARK_TINT: V3 = [1.0, 0.85, 0.55];
+
+/** Each spark box's side, in metres. */
+const SPARK_SIZE = 0.02;
+
+/**
+ * Where the six sparks sit around the gap, as `[a, dh]`: along the wall
+ * from the door's centre line, and up or down from the gap height.
+ */
+const SPARK_POINTS: readonly (readonly [number, number])[] = [
+  [-0.03, 0.05],
+  [0.02, -0.04],
+  [0.06, 0.1],
+  [-0.07, -0.08],
+  [0.01, 0.16],
+  [-0.02, -0.15],
+];
 
 /**
  * How far a rising leaf whose top stands at `top` may travel, up to
@@ -89,28 +143,34 @@ function riseUnder(ctx: ModelContext, top: number, travel: number): number {
   return Math.max(0, Math.min(travel, ctx.ceiling - HEADROOM - top));
 }
 
-/**
- * Where a door's leaves go: into movers of their own for an open way, or
- * into the static mesh for a sealed one.
- */
+/** Where a door's leaves go: each into a mover of its own. */
 interface Leaves {
-  /** Builds one leaf into a kit; for an open door, a mover along `axis`. */
+  /** Builds one leaf into a kit of its own, a mover along `axis`. */
   add(axis: V3, travel: number, build: (k: Kit) => void): void;
   movers: Mover[];
 }
 
-function leaves(kit: Kit, f: Frame, key: string, sealed: boolean): Leaves {
+/**
+ * The leaves of door `index`, keyed `key`: each one a `leaf` mover built
+ * in a fresh builder with a kit on the door's frame, at rest gain 1.
+ */
+function leaves(f: Frame, key: string, index: number): Leaves {
   const movers: Mover[] = [];
   return {
     movers,
     add(axis, travel, build) {
-      if (sealed) {
-        build(kit);
-        return;
-      }
       const b = createBuilder();
       build(createKit(b, f));
-      movers.push({ key, mesh: b.build(), axis, travel });
+      movers.push({
+        key,
+        part: "leaf",
+        fixture: index,
+        mesh: b.build(),
+        axis,
+        travel,
+        pivot: null,
+        rest: 1,
+      });
     },
   };
 }
@@ -124,6 +184,7 @@ interface Style {
   ctx: ModelContext;
   sealed: boolean;
   key: string;
+  index: number;
 }
 
 /** Builds a door against its wall slot and returns its movers. */
@@ -137,10 +198,86 @@ export function buildDoor(
   const k = kitAt(f);
   const key = `door:${index}`;
   const sealed = fx.address === null;
-  const out = leaves(k, f, key, sealed);
+  const out = leaves(f, key, index);
   const style = { sliding, bulkhead, blast }[fx.style];
-  style({ k, f, out, s: surfaces(ctx.look), ctx, sealed, key });
-  return out.movers;
+  const st = { k, f, out, s: surfaces(ctx.look), ctx, sealed, key, index };
+  const [lampAt, sparkH] = style(st);
+  // Built after the leaves, so the movers come back in the order their
+  // kits were first used: leaves, lamp, sparks.
+  const lens = lamp(st, ...lampAt);
+  return [...out.movers, lens, sparks(st, sparkH)];
+}
+
+/**
+ * Where a style puts its lamp lens (`[a, h, faceD]`: along, height, and
+ * the depth of the face it sits on) and its sparks (the gap height).
+ */
+type Parts = [lamp: [a: number, h: number, faceD: number], sparkH: number];
+
+/**
+ * The hazard lamp lens, mover `lamp:<index>`: a flush `LAMP_SIZE` square
+ * amber panel centred at `a` along and height `h`, `DECAL_LIFT` in front of
+ * the face at depth `faceD`, glowing at `LAMP_IDLE` while no fault runs.
+ */
+function lamp(st: Style, a: number, h: number, faceD: number): Mover {
+  const b = createBuilder();
+  const half = LAMP_SIZE / 2;
+  createKit(b, st.f).panel(
+    a - half,
+    a + half,
+    faceD + DECAL_LIFT,
+    h - half,
+    h + half,
+    { layer: LAYER.panel, tint: LAMP_TINT, flag: FLAG.lamp },
+  );
+  return {
+    key: `lamp:${st.index}`,
+    part: "lamp",
+    fixture: st.index,
+    mesh: b.build(),
+    axis: [...st.f.inward],
+    travel: 0,
+    pivot: null,
+    rest: LAMP_IDLE,
+  };
+}
+
+/**
+ * The spark cluster, mover `spark:<index>`: six `SPARK_SIZE` boxes at
+ * `SPARK_POINTS` around the door's centre line at gap height `h`, standing
+ * on the recess (from `DECAL_LIFT` out), so they touch a lit host and the
+ * closed leaves hide them. Drawn only while a fault lights them.
+ */
+function sparks(st: Style, h: number): Mover {
+  const b = createBuilder();
+  const m = createKit(b, st.f);
+  const hot: Surface = {
+    layer: LAYER.panel,
+    tint: SPARK_TINT,
+    flag: FLAG.emissive,
+  };
+  const half = SPARK_SIZE / 2;
+  for (const [a, dh] of SPARK_POINTS) {
+    m.box(
+      a - half,
+      a + half,
+      DECAL_LIFT,
+      DECAL_LIFT + SPARK_SIZE,
+      h + dh - half,
+      h + dh + half,
+      hot,
+    );
+  }
+  return {
+    key: `spark:${st.index}`,
+    part: "spark",
+    fixture: st.index,
+    mesh: b.build(),
+    axis: [...st.f.inward],
+    travel: 0,
+    pivot: null,
+    rest: 0,
+  };
 }
 
 /** The dark passage behind the leaves, just in front of the wall. */
@@ -219,7 +356,7 @@ const SLIDE_LABEL_D = 0.1;
  * opening, a track runs along the floor and the label sits on a plate
  * over the lintel.
  */
-function sliding(st: Style) {
+function sliding(st: Style): Parts {
   const { k, f, out, s, ctx, sealed, key } = st;
   const p = ctx.look.palette;
   const seam: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
@@ -275,12 +412,15 @@ function sliding(st: Style) {
       );
       const edge = dir < 0 ? a1 - 0.08 : a0 + 0.04;
       m.box(edge, edge + 0.04, SLIDE_D1, SLIDE_D1 + 0.015, 0.95, 1.25, s.dark);
+      if (sealed) {
+        // This leaf's half of the hazard plate, over the pull recesses,
+        // the frontmost faces of the leaves; the right half's stripes go
+        // on from where the left half's end.
+        const d = SLIDE_D1 + 0.015 + DECAL_LIFT;
+        const [h0, h1] = dir < 0 ? [-0.4, -LEAF_GAP] : [LEAF_GAP, 0.4];
+        m.panel(h0, h1, d, 0.9, 1.3, s.hazard, 0.4, 0.4, dir < 0 ? 0 : 0.4);
+      }
     });
-  }
-  if (sealed) {
-    // Over the pull recesses, the frontmost faces of the leaves.
-    const d = SLIDE_D1 + 0.015 + DECAL_LIFT;
-    k.panel(-0.4, 0.4, d, 0.9, 1.3, s.hazard, 0.8, 0.4);
   }
   label(
     k,
@@ -291,6 +431,7 @@ function sliding(st: Style) {
     SLIDE_LABEL_BOTTOM,
     SLIDE_LABEL_D,
   );
+  return [[0.75, 2.35, SLIDE_FRAME_D], 1.2];
 }
 
 /** The bulkhead's opening: half width, sill height and top. */
@@ -325,7 +466,7 @@ const BULK_LABEL_MARGIN = 0.05;
  * side housings glow at their edges in the door colour; the lintel is
  * plain, so the label reads on it.
  */
-function bulkhead(st: Style) {
+function bulkhead(st: Style): Parts {
   const { k, f, out, s, ctx, sealed, key } = st;
   const p = ctx.look.palette;
   const frame: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
@@ -358,6 +499,22 @@ function bulkhead(st: Style) {
     out.add(dir < 0 ? neg(f.along) : [...f.along], BULKHEAD_TRAVEL, (m) => {
       m.bevelBox(a0, a1, BULK_D0, BULK_D1, BULK_SILL, BULK_TOP, 0.02, plate);
       m.box(e0, e1, BULK_D1, BULK_D1 + EDGE_D, BULK_SILL, BULK_TOP, s.hazard);
+      if (sealed) {
+        // This leaf's half of the hazard plate; the stripes run on across
+        // the seam.
+        const [p0, p1] = dir < 0 ? [-0.4, -LEAF_GAP] : [LEAF_GAP, 0.4];
+        m.panel(
+          p0,
+          p1,
+          BULK_D1 + EDGE_D + DECAL_LIFT,
+          0.62,
+          0.98,
+          s.hazard,
+          0.4,
+          0.36,
+          dir < 0 ? 0 : 0.4,
+        );
+      }
       // Two stiffening ribs across the leaf.
       const [r0, r1] = dir < 0 ? [a0 + 0.04, e0] : [e1, a1 - 0.04];
       for (const h of [0.45, 1.8]) {
@@ -397,18 +554,8 @@ function bulkhead(st: Style) {
       m.ring(wa, WHEEL_D, wh, wr, 0.02, 6, 20, s.metal, "inward");
     });
   }
-  if (sealed) {
-    k.panel(
-      -0.4,
-      0.4,
-      BULK_D1 + EDGE_D + DECAL_LIFT,
-      0.62,
-      0.98,
-      s.hazard,
-      0.8,
-      0.36,
-    );
-  }
+  // The lens lands at 0.30 m, the depth of the lintel's label.
+  return [[0.75, 2.0, HOUSING_DEPTH], 1.2];
 }
 
 /** The blast door's opening: half width, top, and where the halves meet. */
@@ -463,7 +610,7 @@ function chevron(h: number, dir: 1 | -1): [number, number][] {
  * opening clears under the lowest ceiling. A massive bolted frame lined
  * with a neon border holds them; a sealed one is barred across the split.
  */
-function blast(st: Style) {
+function blast(st: Style): Parts {
   const { k, out, s, ctx, sealed } = st;
   const p = ctx.look.palette;
   const neon: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
@@ -519,4 +666,6 @@ function blast(st: Style) {
       s.metal,
     );
   }
+  // The lens on the right jamb above the bolts; the sparks at the split.
+  return [[0.9, 2.0, BLAST_FRAME_D], BLAST_SPLIT];
 }

@@ -32,6 +32,7 @@ import {
   frameForSlot,
   type Frame,
 } from "./kit";
+import { LAYER } from "./layers";
 import { LOOKS } from "./looks";
 import {
   add,
@@ -50,9 +51,12 @@ import {
   BLAST_DOWN_TRAVEL,
   BLAST_UP_TRAVEL,
   BULKHEAD_TRAVEL,
+  DISC_SEALED_GAIN,
   FLUSH_DEPTH,
   HEADROOM,
   HOUSING_DEPTH,
+  LAMP_IDLE,
+  LID_CRACK,
   OPENING,
   PIPE_DROP,
   SLIDE_TRAVEL,
@@ -242,7 +246,12 @@ interface Built {
   keys: string[];
 }
 
-/** Splits the recorded parts into the room's and each mover's. */
+/**
+ * Splits the recorded parts into the room's and each mover's. A mover's
+ * builder is known by the order its kit was first used, which is the
+ * order the recipes return their movers in (leaves, lamp, sparks for a
+ * door); the vertex count of each checks the pairing.
+ */
 function collect(builder: object, movers: readonly Mover[]) {
   const parts = rec.parts.filter((p) => p.builder === builder);
   const others: object[] = [];
@@ -293,7 +302,7 @@ const all = (b: Built): MeshData[] => [
 ];
 const triangleCount = (b: Built) => all(b).reduce((n, m) => n + m.count / 3, 0);
 
-/** Every mover's parts moved to where the door is fully open. */
+/** Every mover's parts moved to where it is fully open. */
 function opened(b: Built): { mover: Mover; points: V3[] }[] {
   return b.movers.map((mover, i) => ({
     mover,
@@ -302,6 +311,10 @@ function opened(b: Built): { mover: Mover; points: V3[] }[] {
     ),
   }));
 }
+
+/** The parts of the movers of one kind. */
+const partsOf = (b: Built, part: Mover["part"]): Part[] =>
+  b.movers.flatMap((m, i) => (m.part === part ? (b.moverParts[i] ?? []) : []));
 
 /** Every part of a built model: the static ones, then each mover's. */
 const allParts = (b: Built): Part[] => [...b.parts, ...b.moverParts.flat()];
@@ -418,51 +431,97 @@ describe("fixture models", () => {
           expect(built.keys).toEqual([KEY_OF[fx.kind]]);
         });
 
-        it("returns movers only for an open door", () => {
+        it("returns the movers of its kind", () => {
           const { movers } = built;
           for (const m of movers) {
-            expect(m.key).toBe(`door:${INDEX}`);
+            expect(m.fixture).toBe(INDEX);
             expect(Math.hypot(...m.axis)).toBeCloseTo(1, 9);
           }
-          if (fx.kind !== "door" || fx.address === null) {
-            expect(movers).toEqual([]);
-            return;
-          }
-          const axes = movers.map((m) => m.axis);
-          switch (fx.style) {
-            case "sliding":
-              expect(movers).toHaveLength(2);
-              expect(movers.map((m) => m.travel)).toEqual([
-                SLIDE_TRAVEL,
-                SLIDE_TRAVEL,
+          const of = (part: Mover["part"]) =>
+            movers.filter((m) => m.part === part);
+          switch (fx.kind) {
+            case "door": {
+              const leaves = of("leaf");
+              expect(leaves).toHaveLength(2);
+              for (const m of leaves) {
+                expect(m.key).toBe(`door:${INDEX}`);
+                expect(m.pivot).toBeNull();
+                expect(m.rest).toBe(1);
+              }
+              const axes = leaves.map((m) => m.axis);
+              switch (fx.style) {
+                case "sliding":
+                  expect(leaves.map((m) => m.travel)).toEqual([
+                    SLIDE_TRAVEL,
+                    SLIDE_TRAVEL,
+                  ]);
+                  expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
+                    -1, 1,
+                  ]);
+                  break;
+                case "bulkhead":
+                  expect(leaves.map((m) => m.travel)).toEqual([
+                    BULKHEAD_TRAVEL,
+                    BULKHEAD_TRAVEL,
+                  ]);
+                  expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
+                    -1, 1,
+                  ]);
+                  break;
+                case "blast":
+                  expect(axes.map((a) => a[1])).toEqual([1, -1]);
+                  expect(leaves.map((m) => m.travel)).toEqual([
+                    BLAST_UP_TRAVEL,
+                    BLAST_DOWN_TRAVEL,
+                  ]);
+                  break;
+              }
+              const [lamp, spark] = [of("lamp"), of("spark")];
+              expect(lamp.map((m) => [m.key, m.travel, m.rest])).toEqual([
+                [`lamp:${INDEX}`, 0, LAMP_IDLE],
               ]);
-              expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
-                -1, 1,
+              expect(spark.map((m) => [m.key, m.travel, m.rest])).toEqual([
+                [`spark:${INDEX}`, 0, 0],
               ]);
+              expect(movers).toHaveLength(4);
               break;
-            case "bulkhead":
-              expect(movers).toHaveLength(2);
-              expect(movers.map((m) => m.travel)).toEqual([
-                BULKHEAD_TRAVEL,
-                BULKHEAD_TRAVEL,
-              ]);
-              expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
-                -1, 1,
-              ]);
+            }
+            case "hatch":
+              expect(movers).toHaveLength(1);
+              expect(movers[0]?.key).toBe(`lid:${INDEX}`);
+              expect(movers[0]?.part).toBe("lid");
+              expect(movers[0]?.travel).toBe(LID_CRACK);
+              expect(
+                dot(movers[0]?.axis ?? [0, 0, 0], wall.inward),
+              ).toBeCloseTo(1, 9);
+              expect(movers[0]?.rest).toBe(1);
               break;
-            case "blast":
-              expect(movers).toHaveLength(2);
-              expect(axes.map((a) => a[1])).toEqual([1, -1]);
-              expect(movers.map((m) => m.travel)).toEqual([
-                BLAST_UP_TRAVEL,
-                BLAST_DOWN_TRAVEL,
-              ]);
+            case "portal": {
+              expect(movers).toHaveLength(1);
+              const disc = movers[0];
+              if (!disc) throw new Error("no disc");
+              expect(disc.key).toBe(`disc:${INDEX}`);
+              expect(disc.part).toBe("disc");
+              expect(disc.travel).toBe(0);
+              const pivot = toLocal(wall, disc.pivot ?? [NaN, NaN, NaN]);
+              expect(pivot[0]).toBeCloseTo(0, 9);
+              expect(pivot[1]).toBeCloseTo(0.15, 9);
+              expect(pivot[2]).toBeCloseTo(1.35, 9);
+              expect(disc.rest).toBe(
+                fx.sealedLabel === null ? 1 : DISC_SEALED_GAIN,
+              );
               break;
+            }
+            default:
+              expect(movers).toEqual([]);
           }
         });
 
-        if (fx.kind === "door" && fx.address !== null) {
+        if (fx.kind === "door") {
           for (const ceiling of [CEILING, HIGH_CEILING]) {
+            // The leaves only: the lamp and the sparks never move. The
+            // envelope is convex and a leaf travels in a straight line, so
+            // the fully open pose bounds every fraction a fault opens to.
             it(`opens fully and cleanly under a ${ceiling} m ceiling`, () => {
               const b = ceiling === CEILING ? built : buildOne(fx, ceiling);
               const label = b.parts.find((p) => p.layer === LABEL_LAYER);
@@ -477,7 +536,9 @@ describe("fixture models", () => {
                 Math.max(...lab.map((q) => q[2])),
               ];
               const labelD = Math.min(...lab.map((q) => q[1]));
-              for (const { mover, points } of opened(b)) {
+              const leaves = opened(b).filter((o) => o.mover.part === "leaf");
+              expect(leaves).toHaveLength(2);
+              for (const { mover, points } of leaves) {
                 for (const p of points) {
                   expect(inside(p)).toBe(true);
                   expect(p[1]).toBeLessThanOrEqual(ceiling - HEADROOM + EPS);
@@ -501,6 +562,62 @@ describe("fixture models", () => {
               }
             });
           }
+        }
+
+        if (fx.kind === "door" && fx.address === null) {
+          it("rides a sealed door's hazard marks on its leaves", () => {
+            const o = OPENING[fx.style];
+            const inOpening = (p: Part) =>
+              p.points.every((q) => {
+                const [a, , h] = toLocal(wall, q);
+                return (
+                  Math.abs(a) <= o.half + EPS &&
+                  h >= o.h0 - EPS &&
+                  h <= o.h1 + EPS
+                );
+              });
+            const leafParts = partsOf(built, "leaf");
+            if (fx.style === "blast") {
+              // The locking bar belongs to the frame: a bevelled box across
+              // the split, left static.
+              const bar = built.parts.filter((p) => {
+                if (p.method !== "bevelBox") return false;
+                const as = p.points.map((q) => toLocal(wall, q)[0]);
+                const hs = p.points.map((q) => toLocal(wall, q)[2]);
+                return (
+                  Math.min(...as) < -o.half &&
+                  Math.max(...as) > o.half &&
+                  Math.min(...hs) < 1.47 &&
+                  Math.max(...hs) > 1.47
+                );
+              });
+              expect(bar).toHaveLength(1);
+              return;
+            }
+            const plates = (ps: Part[]) =>
+              ps.filter(
+                (p) =>
+                  p.method === "panel" &&
+                  p.layer === LAYER.hazard &&
+                  inOpening(p),
+              );
+            expect(plates(leafParts)).toHaveLength(2);
+            expect(plates(built.parts)).toEqual([]);
+          });
+        }
+
+        if (fx.kind === "hatch") {
+          it("pops the hatch lid inside the wall band", () => {
+            const lid = built.movers[0];
+            if (!lid) throw new Error("no lid");
+            const points = partsOf(built, "lid").flatMap((p) => p.points);
+            expect(points.length).toBeGreaterThan(0);
+            for (const q of points) {
+              expect(inBox(band, add(q, scale(lid.axis, LID_CRACK)))).toBe(
+                true,
+              );
+            }
+          });
         }
       });
     }

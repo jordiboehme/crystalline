@@ -65,13 +65,19 @@ const TURN_TABLE = [0, 1, 2, 3]
  * anchor offset at location 6 (`INSTANCE_OFFSET_LOCATION`) and the turn
  * and reserved slot at location 7 (`INSTANCE_TURN_LOCATION`). A prop's
  * instanced vertex array feeds those once per instance; the static room
- * and the door movers leave them disabled, so they read the generic
- * attribute value, which the renderer sets to zero once: offset 0 and turn
- * 0, the identity. The vertex is turned by `TURNS` (emitted from
- * `turnMat2Columns`), moved by the instance offset and by `uModelOffset`
- * (a door panel's slide while it opens; zero for the static room and the
- * props), and its normal turns with it, so a prop is lit and nudged into
- * the light grid the way it faces. The moved world position goes on for
+ * and the movers leave them disabled, so they read the generic attribute
+ * value, which the renderer sets to zero once: offset 0 and turn 0, the
+ * identity. The slot of attribute 7 stays reserved and unused: a way's
+ * malfunction is drawn with per-draw uniforms, not instance data. The
+ * vertex is turned by `TURNS` (emitted from `turnMat2Columns`) and moved
+ * by the instance offset; then comes a mover's scale about its pivot
+ * (`uModelScale` about `uModelPivot`: a portal disc collapsing; 1 about
+ * the origin for everything else) and its slide (`uModelOffset`: a door
+ * leaf or hatch lid while it opens; zero for the static room and the
+ * props). At those rest values the placement is exact, so the room and
+ * the props land where they always did. The normal turns with the
+ * vertex, so a prop is lit and nudged into the light grid the way it
+ * faces; a uniform scale does not change a normal's direction. The moved world position goes on for
  * the distance and light-grid lookups, and layer, tint and flag go through
  * flat so a triangle never blends between two surfaces. The flag is
  * rounded to an int once here, so the fragment shader compares whole
@@ -90,6 +96,8 @@ layout(location = 6) in vec3 aInstanceOffset;
 layout(location = 7) in vec2 aInstanceTurn; // x: quarter turns, y: slot (reserved, 0)
 uniform mat4 uViewProjection;
 uniform vec3 uModelOffset;
+uniform vec3 uModelPivot;
+uniform float uModelScale;
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;
@@ -100,7 +108,8 @@ const mat2 TURNS[4] = mat2[4](${TURN_TABLE});
 void main() {
   mat2 turn = TURNS[int(aInstanceTurn.x + 0.5) & 3];
   vec2 xz = turn * aPosition.xz;
-  vec3 world = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset + uModelOffset;
+  vec3 placed = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset;
+  vec3 world = uModelPivot + (placed - uModelPivot) * uModelScale + uModelOffset;
   vec2 nxz = turn * aNormal.xz;
   vWorld = world;
   vNormal = vec3(nxz.x, aNormal.y, nxz.y);
@@ -120,7 +129,8 @@ void main() {
  * them) get the banded, distance-dimmed cell light, optional grime and the
  * neon edge lines. On an RGBA8 target (`uLdr` 1) the edge lines are toned
  * down, since nothing above 1.0 survives there and the bloom threshold is
- * lower.
+ * lower. `uGain` scales every exit: 1 for the room and the props, a
+ * fault's flicker, blink or spark for a mover.
  *
  * The light grid (`uLightGrid`, R8 with NEAREST filtering, `uGridSize`
  * cells wide and deep, row 0 the grid's north row) is read at the centre of
@@ -151,6 +161,7 @@ flat in int vFlag;
 uniform sampler2DArray uTextures;
 uniform vec3 uEye;
 uniform float uTime;
+uniform float uGain;
 uniform sampler2D uLightGrid;
 uniform vec2 uGridSize;
 uniform float uLightScale;
@@ -192,17 +203,17 @@ void main() {
   float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
 
   if (vFlag == 1) {
-    outColour = vec4(vTint * texel * 1.4, 1.0);
+    outColour = vec4(vTint * texel * 1.4 * uGain, 1.0);
     return;
   }
   if (vFlag == 4) {
-    outColour = vec4(vTint * (0.3 + level * 2.2 * uLightScale), 1.0);
+    outColour = vec4(vTint * (0.3 + level * 2.2 * uLightScale) * uGain, 1.0);
     return;
   }
   if (vFlag == 2) {
     vec2 centred = vUv / vec2(1.7, 2.45) - 0.5;
     float rim = smoothstep(0.25, 0.5, max(abs(centred.x), abs(centred.y)));
-    outColour = vec4(vTint * (0.6 + swirl * 0.9 + rim * 1.6), 1.0);
+    outColour = vec4(vTint * (0.6 + swirl * 0.9 + rim * 1.6) * uGain, 1.0);
     return;
   }
 
@@ -225,7 +236,7 @@ void main() {
     vec3 edgeColour = vFlag == 3 ? vTint : uEdgeColour;
     colour += edgeColour * e * uEdgeStrength * mix(1.0, 0.45, uLdr);
   }
-  outColour = vec4(colour, 1.0);
+  outColour = vec4(colour * uGain, 1.0);
 }
 `;
 

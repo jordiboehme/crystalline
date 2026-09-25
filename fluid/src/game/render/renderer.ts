@@ -2,13 +2,14 @@
  * Frames from a room: the scene pass, the bloom and the final composite.
  *
  * `setRoom` does the expensive work once per room or look - it builds the
- * static room mesh and one small mesh per moving door panel, fills the
+ * static room mesh and one small mesh per moving part of a way, fills the
  * texture array (procedural layers, the pictogram set, and the text layers
  * of `layerPlan`: one per screen, poster and placard, one per six labels),
  * makes the room's light grid texture, uploads the set dressing and keeps
  * the look's numbers - and `draw` is then a handful of uniform uploads, one
- * small light upload, the room and its door panels, one instanced draw per
- * prop kind and variant, and six full-screen passes. The scene is rendered
+ * small light upload, the room and its moving parts (each mover drawn
+ * with the uniforms `moverDraw` in `parts.ts` gives it), one instanced
+ * draw per prop kind and variant, and six full-screen passes. The scene is rendered
  * at the canvas size handed to `resize`, the bloom at half of that and
  * below.
  *
@@ -45,13 +46,16 @@ import {
 import { createProgram, type Program } from "../gl/program";
 import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
+import type { FaultFrame } from "../world/malfunction";
 import type { PropKind, RoomSpec } from "../world/types";
 import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
 import { propInstances } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
 import { C64_PALETTE, applyCondition, type Look, type LookId } from "./looks";
+import type { MoverPart } from "./models";
 import { buildPropMesh } from "./models/props";
+import { moverDraw, restDraw, type MoverDraw } from "./parts";
 import {
   BRIGHT_FS,
   COMPOSITE_FS,
@@ -94,10 +98,14 @@ export interface Camera {
  *   pixels.
  * - `draw` renders one frame: `levels` holds the zones' current light
  *   levels (DOOM's 0 to 255 scale, in `room.lights` order), `seconds` the
- *   time for the portal's swirl, and `doors` each moving door's open
- *   fraction by its mover key (`door:<fixtureIndex>`), 0 closed to 1 open;
- *   a key that is missing is a closed door, and a fraction outside 0..1 is
- *   clamped.
+ *   time for the portal's swirl, `doors` each door's open fraction by its
+ *   leaves' mover key (`door:<fixtureIndex>`), 0 closed to 1 open (a key
+ *   that is missing is a closed door, and a fraction outside 0..1 is
+ *   clamped), and `faults` the frames of running malfunctions by fixture
+ *   index (from `faultFrames` in `world/malfunction.ts`). A fixture with
+ *   no entry draws its parts at rest: leaves by `doors`, the lamp at its
+ *   idle glow, no sparks, a shut lid and a whole disc. A frame drives the
+ *   leaves in place of `doors`; `doors` itself never sees it.
  * - `dispose` frees every GPU object and may be called more than once.
  *
  * `draw` before `setRoom` or after `dispose` draws nothing.
@@ -110,15 +118,23 @@ export interface Renderer {
     levels: Float32Array,
     seconds: number,
     doors: ReadonlyMap<string, number>,
+    faults: ReadonlyMap<number, FaultFrame>,
   ): void;
   dispose(): void;
 }
 
-/** A door panel on the GPU: its mesh, key and slide (`axis * travel`). */
+/**
+ * A moving part on the GPU: its key, part and fixture index, its mesh,
+ * its slide (`axis * travel`), its pivot and its rest gain.
+ */
 interface GpuMover {
   key: string;
+  part: MoverPart;
+  fixture: number;
   mesh: Mesh;
   slide: V3;
+  pivot: V3 | null;
+  rest: number;
 }
 
 /**
@@ -379,12 +395,16 @@ export function createRenderer(
       mesh = createMesh(gl, built.static);
       movers = built.movers.map((m) => ({
         key: m.key,
+        part: m.part,
+        fixture: m.fixture,
         mesh: createMesh(gl, m.mesh),
         slide: [
           m.axis[0] * m.travel,
           m.axis[1] * m.travel,
           m.axis[2] * m.travel,
         ],
+        pivot: m.pivot,
+        rest: m.rest,
       }));
       const array = createTextureArray(gl, LAYER_SIZE, plan.count);
       textures = array;
@@ -414,7 +434,7 @@ export function createRenderer(
       buildTargets();
     },
 
-    draw(camera, levels, seconds, doors) {
+    draw(camera, levels, seconds, doors, faults) {
       if (
         disposed ||
         mesh === null ||
@@ -475,7 +495,6 @@ export function createRenderer(
         camera.eye[1],
         camera.eye[2],
       );
-      gl.uniform1f(scene.uniform("uTime"), seconds);
       gl.uniform1i(scene.uniform("uTextures"), 0);
       gl.uniform1i(scene.uniform("uLightGrid"), 1);
       gl.uniform2f(
@@ -499,19 +518,33 @@ export function createRenderer(
       );
       gl.uniform1f(scene.uniform("uLdr"), caps.color === "rgba8" ? 1 : 0);
       const offset = scene.uniform("uModelOffset");
-      gl.uniform3f(offset, 0, 0, 0);
+      const pivot = scene.uniform("uModelPivot");
+      const scaleU = scene.uniform("uModelScale");
+      const gain = scene.uniform("uGain");
+      const time = scene.uniform("uTime");
+      const set = (d: MoverDraw) => {
+        gl.uniform3f(offset, ...d.offset);
+        gl.uniform3f(pivot, ...d.pivot);
+        gl.uniform1f(scaleU, d.scale);
+        gl.uniform1f(gain, d.gain);
+        gl.uniform1f(time, d.time);
+      };
+      // The static room at the identity: offset 0, pivot 0, scale 1, gain 1.
+      set(restDraw(seconds));
       mesh.draw();
       for (const m of movers) {
-        const open = Math.min(1, Math.max(0, doors.get(m.key) ?? 0));
-        gl.uniform3f(
-          offset,
-          m.slide[0] * open,
-          m.slide[1] * open,
-          m.slide[2] * open,
+        const d = moverDraw(
+          m,
+          doors.get(m.key) ?? 0,
+          faults.get(m.fixture),
+          seconds,
         );
+        if (d === null) continue;
+        set(d);
         m.mesh.draw();
       }
-      gl.uniform3f(offset, 0, 0, 0);
+      // Back to the identity before the props.
+      set(restDraw(seconds));
       for (const g of groups) g.mesh?.draw();
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);

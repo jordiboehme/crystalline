@@ -4,9 +4,9 @@
  * furniture, the lamps, and the scaffolding of a room under construction.
  *
  * Everything static is emitted into one interleaved, non-indexed vertex
- * array in world space, so the whole room is one draw call; the panels of
- * the doors that open come back as movers, each its own small mesh, for the
- * renderer to slide. Per vertex: position, normal, a uv in metres (so panel
+ * array in world space, so the whole room is one draw call; the moving
+ * parts of every way come back as movers, each its own small mesh, for the
+ * renderer to slide, blink or scale. Per vertex: position, normal, a uv in metres (so panel
  * seams fall on whole numbers and the shader can draw edge lines there), the
  * texture array layer, a tint from the look, and a flag that tells the
  * shader how the surface is lit:
@@ -269,8 +269,9 @@ const TOP_RAIL = 2.2;
 /**
  * The static room and its moving parts: `static` is the one vertex array
  * of shell, lamps, scaffolding and every model's fixed parts; `movers` are
- * the panels of every door that opens, at their closed position, keyed
- * `door:<fixtureIndex>`.
+ * the moving parts of every way at rest, by `Mover.key`: each door's
+ * leaves (`door:<i>`), lamp (`lamp:<i>`) and sparks (`spark:<i>`), each
+ * hatch's lid (`lid:<i>`) and each portal's disc (`disc:<i>`).
  */
 export interface RoomMesh {
   static: MeshData;
