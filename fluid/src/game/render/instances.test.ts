@@ -7,6 +7,7 @@ import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
 import {
   INSTANCE_FLOATS,
+  curioInstances,
   heroInstances,
   heroKey,
   instanceGroups,
@@ -171,6 +172,54 @@ describe("instanceGroups", () => {
       3,
       bankSlot("swap"),
     ]);
+  });
+});
+
+describe("curioInstances", () => {
+  // Review Focus 3's key-space pin for the third family: a curio key
+  // never collides with a prop or hero key, and each curio keeps its
+  // height and its kind's bank slot.
+  it("gives curio groups their own key space, their height and their bank slot", () => {
+    const room = {
+      ...galleryRoom(),
+      curios: [
+        {
+          kind: "wing-meter" as const,
+          variant: 0,
+          x: 4.5,
+          y: 3.25,
+          h: 0.78,
+          turn: 1,
+          seed: 1,
+        },
+        {
+          kind: "star-ball" as const,
+          variant: 0,
+          x: 6,
+          y: 2,
+          h: 1.08,
+          turn: 0,
+          seed: 2,
+        },
+      ],
+    };
+    const groups = curioInstances(room);
+    expect(groups.map((g) => g.key)).toEqual([
+      "curio:star-ball:0",
+      "curio:wing-meter:0",
+    ]);
+    const meter = groups.find((g) => g.kind === "wing-meter");
+    expect(Array.from(meter?.data ?? [])).toEqual([
+      Math.fround(4.5 * CELL),
+      Math.fround(0.78),
+      Math.fround(3.25 * CELL),
+      1,
+      bankSlot("chase"),
+    ]);
+    const keys = instanceGroups(room).map((g) => g.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(instanceGroups(room).at(-1)?.family).toBe("curio");
+    expect(curioInstances(room)).toEqual(curioInstances(room));
   });
 });
 

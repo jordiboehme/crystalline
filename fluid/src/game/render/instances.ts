@@ -1,35 +1,43 @@
 /**
- * The set dressing and the heroes as instance data: one group per prop
- * kind and variant and one per hero kind and variant, each holding one
- * short record per instance for the GPU.
+ * The set dressing, the heroes and the curios as instance data: one group
+ * per prop kind and variant, one per hero kind and variant and one per
+ * curio kind and variant, each holding one short record per instance for
+ * the GPU.
  *
  * Every prop model is built once at the origin (`buildPropMesh` in
  * `models/props/index.ts`), and so is every hero model (`buildHeroMesh` in
- * `models/heroes/index.ts`); the scene vertex shader turns each instance
+ * `models/heroes/index.ts`) and every curio model (`buildCurioMesh` in
+ * `models/curios/index.ts`); the scene vertex shader turns each instance
  * by its quarter turns and moves it to its anchor. This module is the pure
- * half of that: it reads `room.props` and `room.heroes` and writes the
- * per-instance floats, so what the renderer uploads is tested without a GL
- * context. The renderer uploads one instance buffer per group and draws
- * the group's mesh once with `drawArraysInstanced`.
+ * half of that: it reads `room.props`, `room.heroes` and `room.curios` and
+ * writes the per-instance floats, so what the renderer uploads is tested
+ * without a GL context. The renderer uploads one instance buffer per group
+ * and draws the group's mesh once with `drawArraysInstanced`.
  *
  * Heroes are instanced like props, in their own key space (`heroKey`,
  * `hero:<kind>:<variant>`), so a hero's mesh never shares a cache entry
  * with a prop's. Their slot is their kind's blink bank (`HERO_BANK`,
  * `bankSlot`, H11), which the fragment shader reads for their blinking
  * lights; a prop's slot is 0, the steady bank.
+ *
+ * Curios are the third family (C1), in a key space of their own
+ * (`curioKey`, `curio:<kind>:<variant>`). An instance's height is the
+ * surface the curio stands on (`Curio.h`), not the floor, and its slot is
+ * its kind's blink bank (`CURIO_BANK`, C16).
  */
 
-import type { HeroKind, PropKind, RoomSpec } from "../world/types";
+import type { CurioKind, HeroKind, PropKind, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
+import { CURIO_BANK } from "./models/curios/common";
 import { HERO_BANK } from "./models/heroes/common";
 
 /**
  * Floats per instance: the anchor in world metres (x, y, z), the quarter
  * turns and the slot. The first three feed the shader's `aInstanceOffset`
  * (location 6), the last two its `aInstanceTurn` (location 7). The slot is
- * the instance's blink bank (`bankSlot`, H11): a hero's kind's bank, and 0,
- * the steady bank, for every prop.
+ * the instance's blink bank (`bankSlot`, H11): a hero's or a curio's
+ * kind's bank, and 0, the steady bank, for every prop.
  */
 export const INSTANCE_FLOATS = 5;
 
@@ -49,6 +57,16 @@ export function propKey(kind: PropKind, variant: number): string {
  */
 export function heroKey(kind: HeroKind, variant: number): string {
   return `hero:${kind}:${String(variant)}`;
+}
+
+/**
+ * The key a curio's mesh is cached and grouped under:
+ * `curio:<kind>:<variant>`. The prefix keeps it apart from every `propKey`
+ * and every `heroKey`, so the renderer's one mesh cache holds all three
+ * families without a collision.
+ */
+export function curioKey(kind: CurioKind, variant: number): string {
+  return `curio:${kind}:${String(variant)}`;
 }
 
 /**
@@ -79,8 +97,22 @@ export interface HeroGroup {
   data: Float32Array;
 }
 
-/** One instance group of either family; `family` tells them apart. */
-export type InstanceGroup = PropGroup | HeroGroup;
+/**
+ * All instances of one curio kind and variant: `count` records of
+ * `INSTANCE_FLOATS` floats in `data`, in the order the curios appear in
+ * `room.curios`.
+ */
+export interface CurioGroup {
+  key: string;
+  family: "curio";
+  kind: CurioKind;
+  variant: number;
+  count: number;
+  data: Float32Array;
+}
+
+/** One instance group of any of the three families; `family` tells them apart. */
+export type InstanceGroup = PropGroup | HeroGroup | CurioGroup;
 
 /**
  * Groups records by key and sorts the groups by key, so the draw order is
@@ -172,9 +204,37 @@ export function heroInstances(room: RoomSpec): HeroGroup[] {
 }
 
 /**
+ * The room's curios as instance groups, one per distinct kind and variant,
+ * sorted by key. Each instance is `x * CELL`, the height of the surface it
+ * stands on (`c.h`), `y * CELL`, the turn and its kind's blink bank slot
+ * (`bankSlot(CURIO_BANK[kind])`). A room without curios gives no groups. A
+ * pure function: the same room gives equal arrays.
+ */
+export function curioInstances(room: RoomSpec): CurioGroup[] {
+  return grouped(
+    room.curios.map((c) => ({
+      key: curioKey(c.kind, c.variant),
+      kind: c.kind,
+      variant: c.variant,
+      floats: [
+        c.x * CELL,
+        c.h,
+        c.y * CELL,
+        c.turn,
+        bankSlot(CURIO_BANK[c.kind]),
+      ],
+    })),
+  ).map((g) => ({ ...g, family: "curio" as const }));
+}
+
+/**
  * Every instance group the renderer draws: the props' groups, then the
- * heroes', each family sorted by key.
+ * heroes', then the curios', each family sorted by key.
  */
 export function instanceGroups(room: RoomSpec): InstanceGroup[] {
-  return [...propInstances(room), ...heroInstances(room)];
+  return [
+    ...propInstances(room),
+    ...heroInstances(room),
+    ...curioInstances(room),
+  ];
 }

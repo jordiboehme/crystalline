@@ -8,7 +8,8 @@
  * same ways: the winding of every triangle against its stored normal,
  * points in a frame's local terms, points inside a floor box, whether a
  * catalogue surface sits on a real upward face and stays clear above it
- * (`upwardFaceAt`, `clearAbove`), whether every part traces a path back to
+ * (`upwardFaceAt`, `clearAbove` at a point, `clearAboveBox` over a whole
+ * curio host surface), whether every part traces a path back to
  * the floor or its wall through the parts it touches (`touching`,
  * `looseParts`), and whether every glowing part (a screen, a frame, a
  * portal, a signal light or a blinking one) touches a lit host or its
@@ -386,6 +387,42 @@ export function clearAbove(
     const lo = Math.min(a[1], b[1], c[1]);
     const hi = Math.max(a[1], b[1], c[1]);
     if (hi > h + 0.005 && lo < h + headroom) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the box `clear` metres tall standing on a surface at height `h`
+ * over the plan box `box` is free of mesh: no triangle whose plan bounding
+ * box overlaps `box` (strictly, so one that only meets its edge does not
+ * count) has its top above `h + 0.003` while its bottom lies below
+ * `h + clear`. The surface's own top face, at `h` within 3 mm, does not
+ * count. It is the curio host test's check (C3): whatever stands on the
+ * surface up to `clear` tall meets nothing of its host. It uses the
+ * triangles' plan bounds rather than their exact outlines, so it errs
+ * strict: a slanted triangle whose bounds reach over the box is counted
+ * even where the triangle itself would miss it. Pass the surface box
+ * shrunk a little, so a wall or rail that only bounds it is not counted.
+ * `clearAbove` is the same question asked at one point.
+ */
+export function clearAboveBox(
+  mesh: MeshData,
+  box: Box,
+  h: number,
+  clear: number,
+): boolean {
+  const ps = positions(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!a || !b || !c) continue;
+    const x0 = Math.min(a[0], b[0], c[0]);
+    const x1 = Math.max(a[0], b[0], c[0]);
+    const z0 = Math.min(a[2], b[2], c[2]);
+    const z1 = Math.max(a[2], b[2], c[2]);
+    if (x1 <= box.x0 || x0 >= box.x1 || z1 <= box.z0 || z0 >= box.z1) continue;
+    const lo = Math.min(a[1], b[1], c[1]);
+    const hi = Math.max(a[1], b[1], c[1]);
+    if (hi > h + 0.003 && lo < h + clear) return false;
   }
   return true;
 }

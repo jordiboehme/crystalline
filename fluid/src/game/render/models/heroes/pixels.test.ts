@@ -14,7 +14,7 @@ const TITLES = ["TILEFALL", "ROCK RAIN", "MAZE HUNT", "VOID WING"];
 describe("block-pixel font", () => {
   it("draws every glyph as 5 rows of 3 lit or dark cells", () => {
     const keys = Object.keys(PIXEL_FONT);
-    for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .")
+    for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .<=>")
       expect(keys, c).toContain(c);
     for (const [c, rows] of Object.entries(PIXEL_FONT)) {
       expect(rows, c).toHaveLength(5);
@@ -58,6 +58,17 @@ describe("block-pixel font", () => {
       expect(r[3]).toBe(".");
       expect(r.slice(4)).toBe(PIXEL_FONT.B?.[y]);
     });
+  });
+
+  it("sets the laptop's mark from its three glyphs", () => {
+    const rows = textRows("<=>");
+    expect(rows).toHaveLength(5);
+    for (const r of rows) expect(r).toHaveLength(11);
+    for (const c of "<=>") {
+      const g = PIXEL_FONT[c];
+      expect(g, c).toHaveLength(5);
+      for (const r of g ?? []) expect(r, c).toMatch(/^[#.]{3}$/);
+    }
   });
 
   it("draws the period as a single lit cell at the bottom middle", () => {
