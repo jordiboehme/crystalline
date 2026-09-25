@@ -109,8 +109,12 @@ export const LAMP_IDLE = 0.3;
  */
 export const LAMP_TINT: V3 = [1.0, 0.55, 0.1];
 
-/** The lens's side, in metres: a small square light. */
+/**
+ * The lens's side, in metres: a small square light. On a blast door it is
+ * `BLAST_LAMP_SIZE`, so it stays on the narrow flat face of its jamb.
+ */
 const LAMP_SIZE = 0.12;
+const BLAST_LAMP_SIZE = 0.09;
 
 /**
  * The sparks' colour: a hot white-yellow, the colour of welding sparks
@@ -212,16 +216,26 @@ export function buildDoor(
  * Where a style puts its lamp lens (`[a, h, faceD]`: along, height, and
  * the depth of the face it sits on) and its sparks (the gap height).
  */
-type Parts = [lamp: [a: number, h: number, faceD: number], sparkH: number];
+type Parts = [
+  lamp: [a: number, h: number, faceD: number, size: number],
+  sparkH: number,
+];
 
 /**
- * The hazard lamp lens, mover `lamp:<index>`: a flush `LAMP_SIZE` square
- * amber panel centred at `a` along and height `h`, `DECAL_LIFT` in front of
- * the face at depth `faceD`, glowing at `LAMP_IDLE` while no fault runs.
+ * The hazard lamp lens, mover `lamp:<index>`: a flush amber panel `size`
+ * metres square, centred at `a` along and height `h`, `DECAL_LIFT` in
+ * front of the face at depth `faceD`, glowing at `LAMP_IDLE` while no
+ * fault runs.
  */
-function lamp(st: Style, a: number, h: number, faceD: number): Mover {
+function lamp(
+  st: Style,
+  a: number,
+  h: number,
+  faceD: number,
+  size: number,
+): Mover {
   const b = createBuilder();
-  const half = LAMP_SIZE / 2;
+  const half = size / 2;
   createKit(b, st.f).panel(
     a - half,
     a + half,
@@ -417,8 +431,8 @@ function sliding(st: Style): Parts {
         // the frontmost faces of the leaves; the right half's stripes go
         // on from where the left half's end.
         const d = SLIDE_D1 + 0.015 + DECAL_LIFT;
-        const [h0, h1] = dir < 0 ? [-0.4, -LEAF_GAP] : [LEAF_GAP, 0.4];
-        m.panel(h0, h1, d, 0.9, 1.3, s.hazard, 0.4, 0.4, dir < 0 ? 0 : 0.4);
+        const [p0, p1] = dir < 0 ? [-0.4, -LEAF_GAP] : [LEAF_GAP, 0.4];
+        m.panel(p0, p1, d, 0.9, 1.3, s.hazard, 0.4, 0.4, dir < 0 ? 0 : 0.4);
       }
     });
   }
@@ -431,7 +445,7 @@ function sliding(st: Style): Parts {
     SLIDE_LABEL_BOTTOM,
     SLIDE_LABEL_D,
   );
-  return [[0.75, 2.35, SLIDE_FRAME_D], 1.2];
+  return [[0.75, 2.35, SLIDE_FRAME_D, LAMP_SIZE], 1.2];
 }
 
 /** The bulkhead's opening: half width, sill height and top. */
@@ -555,13 +569,14 @@ function bulkhead(st: Style): Parts {
     });
   }
   // The lens lands at 0.30 m, the depth of the lintel's label.
-  return [[0.75, 2.0, HOUSING_DEPTH], 1.2];
+  return [[0.75, 2.0, HOUSING_DEPTH, LAMP_SIZE], 1.2];
 }
 
 /** The blast door's opening: half width, top, and where the halves meet. */
 export const BLAST_HALF = 0.8;
 const BLAST_TOP = 2.2;
-const BLAST_SPLIT = 1.47;
+/** The height where the blast door's two halves meet, in metres. */
+export const BLAST_SPLIT = 1.47;
 /** The massive frame's outer half width and depth. */
 const BLAST_JAMB = 1.0;
 const BLAST_FRAME_D = 0.28;
@@ -667,5 +682,5 @@ function blast(st: Style): Parts {
     );
   }
   // The lens on the right jamb above the bolts; the sparks at the split.
-  return [[0.9, 2.0, BLAST_FRAME_D], BLAST_SPLIT];
+  return [[0.9, 2.0, BLAST_FRAME_D, BLAST_LAMP_SIZE], BLAST_SPLIT];
 }

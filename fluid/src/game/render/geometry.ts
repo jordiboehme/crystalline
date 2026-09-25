@@ -6,10 +6,10 @@
  * Everything static is emitted into one interleaved, non-indexed vertex
  * array in world space, so the whole room is one draw call; the moving
  * parts of every way come back as movers, each its own small mesh, for the
- * renderer to slide, blink or scale. Per vertex: position, normal, a uv in metres (so panel
- * seams fall on whole numbers and the shader can draw edge lines there), the
- * texture array layer, a tint from the look, and a flag that tells the
- * shader how the surface is lit:
+ * renderer to slide, blink or scale. Per vertex: position, normal, a uv in
+ * metres (so panel seams fall on whole numbers and the shader can draw
+ * edge lines there), the texture array layer, a tint from the look, and a
+ * flag that tells the shader how the surface is lit:
  *
  * - `lit`: ordinary surface under the zone's light.
  * - `emissive`: screens and tag strips, full brightness whatever the light.

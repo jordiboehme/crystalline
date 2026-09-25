@@ -12,6 +12,8 @@
  * Sparks are drawn only while a frame lights them. The lamp glows at its
  * rest gain and blinks brighter while a frame lights it. A disc scales,
  * flickers and shifts its swirl with the frame, and is skipped at scale 0.
+ * A disc's frame gain is scaled by its rest gain, so a sealed disc's run
+ * flickers about its dim rest glow and starts and ends with no jump.
  * A null result means the part is not drawn this frame.
  *
  * `restDraw` is the identity every other draw uses: the static room and
@@ -114,7 +116,7 @@ export function moverDraw(
         offset: [0, 0, 0],
         pivot: m.pivot ?? [0, 0, 0],
         scale: f.scale,
-        gain: f.gain,
+        gain: frame === undefined ? m.rest : f.gain * m.rest,
         time: seconds + f.shift,
       };
     }

@@ -108,6 +108,16 @@ describe("moverDraw", () => {
       expect(d?.time).toBeCloseTo(T + 0.2, 12);
     });
 
+    it("scales a sealed disc's run gains by its rest gain, with no jump", () => {
+      const sealed = info("disc", DISC_SEALED_GAIN, pivot);
+      const flicker = moverDraw(sealed, 0, frame({ gain: 1.6 }), T);
+      expect(flicker?.gain).toBeCloseTo(1.6 * DISC_SEALED_GAIN, 12);
+      // A run's calm frame (gain 1) draws the disc at its rest glow, so a
+      // run starts and ends where the rest leaves off.
+      const calm = moverDraw(sealed, 0, frame({ gain: 1 }), T);
+      expect(calm?.gain).toBe(moverDraw(sealed, 0, undefined, T)?.gain);
+    });
+
     it("is not drawn at scale 0", () => {
       const d = moverDraw(info("disc", 1, pivot), 0, frame({ scale: 0 }), T);
       expect(d).toBeNull();

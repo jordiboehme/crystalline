@@ -46,6 +46,7 @@ export {
 export { PIPE_DROP, buildDecor, pipeLength } from "./decor";
 export {
   BLAST_DOWN_TRAVEL,
+  BLAST_SPLIT,
   BLAST_UP_TRAVEL,
   BULKHEAD_TRAVEL,
   HOUSING_DEPTH,

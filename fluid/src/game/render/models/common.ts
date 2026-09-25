@@ -71,10 +71,12 @@ export type MoverPart = "leaf" | "spark" | "lamp" | "lid" | "disc";
  *   wall's `inward`.
  * - A disc is drawn scaled about `pivot`, its centre in world metres;
  *   every other part has pivot null and is never scaled.
- * - A spark, lamp or disc is drawn with a gain: `rest` is that gain while
- *   no fault frame names the fixture (1 for a leaf, lid or open disc, the
- *   lamp's idle glow, 0 for sparks, which are then not drawn at all, and
- *   the dim glow of a sealed disc).
+ * - Every part has a rest gain, `rest`: the gain it is drawn with while no
+ *   fault frame names the fixture. It is 1 for a leaf, a lid or an open
+ *   disc, the lamp's idle glow, 0 for sparks (which are then not drawn at
+ *   all) and the dim glow of a sealed disc. A fault frame blinks the lamp,
+ *   lights the sparks and flickers a disc, whose frame gain is scaled by
+ *   its rest gain.
  */
 export interface Mover {
   key: string;

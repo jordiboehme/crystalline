@@ -77,9 +77,10 @@ const TURN_TABLE = [0, 1, 2, 3]
  * props). At those rest values the placement is exact, so the room and
  * the props land where they always did. The normal turns with the
  * vertex, so a prop is lit and nudged into the light grid the way it
- * faces; a uniform scale does not change a normal's direction. The moved world position goes on for
- * the distance and light-grid lookups, and layer, tint and flag go through
- * flat so a triangle never blends between two surfaces. The flag is
+ * faces; a uniform scale does not change a normal's direction. The moved
+ * world position goes on for the distance and light-grid lookups, and
+ * layer, tint and flag go through flat so a triangle never blends between
+ * two surfaces. The flag is
  * rounded to an int once here, so the fragment shader compares whole
  * numbers. The fragment shader is unchanged by instancing, so the light
  * grid, the bands, the grime, the edge lines and the dither apply to props

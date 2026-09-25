@@ -49,6 +49,7 @@ import {
 } from "./modelChecks";
 import {
   BLAST_DOWN_TRAVEL,
+  BLAST_SPLIT,
   BLAST_UP_TRAVEL,
   BULKHEAD_TRAVEL,
   DISC_SEALED_GAIN,
@@ -587,8 +588,8 @@ describe("fixture models", () => {
                 return (
                   Math.min(...as) < -o.half &&
                   Math.max(...as) > o.half &&
-                  Math.min(...hs) < 1.47 &&
-                  Math.max(...hs) > 1.47
+                  Math.min(...hs) < BLAST_SPLIT &&
+                  Math.max(...hs) > BLAST_SPLIT
                 );
               });
               expect(bar).toHaveLength(1);
@@ -606,7 +607,84 @@ describe("fixture models", () => {
           });
         }
 
+        if (fx.kind === "door") {
+          it("sets its lamp lens on a flat face of its host", () => {
+            // The lens is a FLAG.lamp panel, which the glow check does not
+            // look at, so it is held here: every corner lies on a static
+            // triangle that faces into the room DECAL_LIFT behind it.
+            const lens = partsOf(built, "lamp").flatMap((p) => p.points);
+            expect(lens.length).toBe(6);
+            const local = lens.map((q) => toLocal(wall, q));
+            const faceD = (local[0]?.[1] ?? NaN) - DECAL_LIFT;
+            const faces: V3[][] = [];
+            for (const p of built.parts) {
+              for (let t = 0; t + 2 < p.points.length; t += 3) {
+                const tri = p.points.slice(t, t + 3);
+                const [a, b, c] = tri;
+                if (!a || !b || !c) continue;
+                const n = cross(sub(b, a), sub(c, a));
+                if (Math.hypot(...n) < 1e-12) continue;
+                if (dot(unit(n), wall.inward) < 0.999) continue;
+                const l = tri.map((q) => toLocal(wall, q));
+                if (l.every((q) => Math.abs(q[1] - faceD) < 1e-6))
+                  faces.push(l);
+              }
+            }
+            const onTri = (p: V3, [a, b, c]: V3[]) => {
+              if (!a || !b || !c) return false;
+              const side = (u: V3, v: V3) =>
+                (v[0] - u[0]) * (p[2] - u[2]) - (v[2] - u[2]) * (p[0] - u[0]);
+              const s = [side(a, b), side(b, c), side(c, a)];
+              return s.every((x) => x >= -1e-9) || s.every((x) => x <= 1e-9);
+            };
+            for (const q of local) {
+              expect(faces.some((f) => onTri(q, f))).toBe(true);
+            }
+          });
+
+          it("stands its sparks on the recess, back faces in its plane", () => {
+            const sparks = partsOf(built, "spark").flatMap((p) => p.points);
+            const recess = built.parts.filter(
+              (p) =>
+                p.method === "panel" &&
+                p.layer === LAYER.panel &&
+                p.points.every(
+                  (q) => Math.abs(toLocal(wall, q)[1] - DECAL_LIFT) < 1e-6,
+                ),
+            );
+            expect(recess).toHaveLength(1);
+            const r = (recess[0]?.points ?? []).map((q) => toLocal(wall, q));
+            const [a0, a1] = [
+              Math.min(...r.map((q) => q[0])),
+              Math.max(...r.map((q) => q[0])),
+            ];
+            const [h0, h1] = [
+              Math.min(...r.map((q) => q[2])),
+              Math.max(...r.map((q) => q[2])),
+            ];
+            const s = sparks.map((q) => toLocal(wall, q));
+            expect(Math.min(...s.map((q) => q[1]))).toBeCloseTo(DECAL_LIFT, 9);
+            for (const [a, , h] of s) {
+              expect(a).toBeGreaterThanOrEqual(a0 - EPS);
+              expect(a).toBeLessThanOrEqual(a1 + EPS);
+              expect(h).toBeGreaterThanOrEqual(h0 - EPS);
+              expect(h).toBeLessThanOrEqual(h1 + EPS);
+            }
+          });
+        }
+
         if (fx.kind === "hatch") {
+          it("pops the lid clear of the frame, inside the wall band", () => {
+            // The lid's back clears the frame's front (0.08 m) by 2 cm at
+            // full crack, so the crack shows past the frame.
+            const back = Math.min(
+              ...partsOf(built, "lid").flatMap((p) =>
+                p.points.map((q) => toLocal(wall, q)[1]),
+              ),
+            );
+            expect(back + LID_CRACK).toBeCloseTo(0.08 + 0.02, 9);
+          });
+
           it("pops the hatch lid inside the wall band", () => {
             const lid = built.movers[0];
             if (!lid) throw new Error("no lid");

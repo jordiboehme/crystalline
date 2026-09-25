@@ -41,10 +41,12 @@ type Hatch = Extract<Fixture, { kind: "hatch" }>;
 export const SERVICE_PICTOGRAM = PICTOGRAM.service;
 
 /**
- * How far a broken hatch's lid pops out from the wall, in metres: a crack,
- * which leaves the lever at most 0.233 m out, inside `FLUSH_DEPTH`.
+ * How far a broken hatch's lid pops out from the wall, in metres: enough
+ * that the lid's back (0.02 m out at rest) clears the frame's front
+ * (0.08 m) by 2 cm, so the crack shows past the frame, while the lever
+ * stands at most 0.263 m out, inside `FLUSH_DEPTH`.
  */
-export const LID_CRACK = 0.05;
+export const LID_CRACK = 0.08;
 
 /** The hatch door: half width, bottom and top. */
 const HALF = 0.5;

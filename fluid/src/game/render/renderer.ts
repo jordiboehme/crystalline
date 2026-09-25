@@ -9,9 +9,9 @@
  * the look's numbers - and `draw` is then a handful of uniform uploads, one
  * small light upload, the room and its moving parts (each mover drawn
  * with the uniforms `moverDraw` in `parts.ts` gives it), one instanced
- * draw per prop kind and variant, and six full-screen passes. The scene is rendered
- * at the canvas size handed to `resize`, the bloom at half of that and
- * below.
+ * draw per prop kind and variant, and six full-screen passes. The scene
+ * is rendered at the canvas size handed to `resize`, the bloom at half of
+ * that and below.
  *
  * The set dressing is drawn instanced (see `instances.ts`). Each prop kind
  * and variant the room needs is built once as its own mesh in the look's
