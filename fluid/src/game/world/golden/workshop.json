@@ -488,7 +488,7 @@
       "seed": 935787132597451
     },
     {
-      "kind": "locker-bank",
+      "kind": "tool-board",
       "variant": 0,
       "anchor": "wall",
       "x": 0,
@@ -506,7 +506,7 @@
       "seed": 5828345860956950
     },
     {
-      "kind": "locker-bank",
+      "kind": "tool-board",
       "variant": 1,
       "anchor": "wall",
       "x": 0,
@@ -533,7 +533,7 @@
       "seed": 273206598517309
     },
     {
-      "kind": "locker-bank",
+      "kind": "pipe-riser",
       "variant": 1,
       "anchor": "wall",
       "x": 13,
@@ -551,7 +551,7 @@
       "seed": 3455044626190804
     },
     {
-      "kind": "locker-bank",
+      "kind": "tool-board",
       "variant": 1,
       "anchor": "wall",
       "x": 0,
@@ -560,7 +560,7 @@
       "seed": 1317430818500153
     },
     {
-      "kind": "breaker-box",
+      "kind": "locker-bank",
       "variant": 1,
       "anchor": "wall",
       "x": 0.5,
@@ -578,15 +578,6 @@
       "seed": 8447299978821473
     },
     {
-      "kind": "light-strip",
-      "variant": 1,
-      "anchor": "wall",
-      "x": 1.5,
-      "y": 10,
-      "turn": 0,
-      "seed": 2156168744542737
-    },
-    {
       "kind": "pipe-bundle",
       "variant": 0,
       "anchor": "wall",
@@ -594,6 +585,15 @@
       "y": 10,
       "turn": 0,
       "seed": 3562977813536724
+    },
+    {
+      "kind": "pipe-riser",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 1.5,
+      "y": 10,
+      "turn": 0,
+      "seed": 2156168744542737
     },
     {
       "kind": "extinguisher",
@@ -659,15 +659,6 @@
       "seed": 361364235832011
     },
     {
-      "kind": "locker-bank",
-      "variant": 0,
-      "anchor": "wall",
-      "x": 12.5,
-      "y": 10,
-      "turn": 0,
-      "seed": 8331754079411472
-    },
-    {
       "kind": "pipe-bundle",
       "variant": 0,
       "anchor": "wall",
@@ -677,7 +668,16 @@
       "seed": 4161799227616381
     },
     {
-      "kind": "traffic-cone",
+      "kind": "pipe-riser",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 12.5,
+      "y": 10,
+      "turn": 0,
+      "seed": 8331754079411472
+    },
+    {
+      "kind": "tool-cart",
       "variant": 1,
       "anchor": "floor",
       "x": 0.5,
@@ -686,12 +686,12 @@
       "seed": 2453311243386724
     },
     {
-      "kind": "tool-cart",
+      "kind": "crate",
       "variant": 0,
       "anchor": "floor",
       "x": 12.5,
       "y": 0.5,
-      "turn": 1,
+      "turn": 3,
       "seed": 5442230551554003
     },
     {
@@ -702,6 +702,15 @@
       "y": 1.5,
       "turn": 0,
       "seed": 431454712763185
+    },
+    {
+      "kind": "traffic-cone",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 0.275,
+      "y": 2.5,
+      "turn": 1,
+      "seed": 324921811911760
     },
     {
       "kind": "traffic-cone",

@@ -17,6 +17,8 @@ import {
   dressingSites,
   edgeKey,
   fitsFloor,
+  interiorBand,
+  isLargeHall,
   overlaps,
   turnForSide,
   wallAnchor,
@@ -519,6 +521,33 @@ describe("fitsFloor", () => {
 
   it("refuses an empty box", () => {
     expect(fitsFloor(hub, { x0: 1, x1: 1, z0: 1, z1: 2 })).toBe(false);
+  });
+});
+
+describe("the interior band and large halls", () => {
+  const hall = (w: number, d: number) => ({ x0: 0, y0: 0, x1: w, y1: d });
+  it("shrinks the hall by BAND_MARGIN on every side, or gives null", () => {
+    expect(interiorBand(hall(13, 10))).toEqual({ x0: 2, y0: 2, x1: 11, y1: 8 });
+    expect(interiorBand(hall(4, 10))).toBeNull();
+    expect(interiorBand({ x0: 26, y0: 0, x1: 50, y1: 24 })).toEqual({
+      x0: 28,
+      y0: 2,
+      x1: 48,
+      y1: 22,
+    });
+  });
+  it("calls a hall large from 9 by 8, either way round", () => {
+    expect(isLargeHall(hall(9, 8))).toBe(true);
+    expect(isLargeHall(hall(8, 9))).toBe(true);
+    expect(isLargeHall(hall(8, 8))).toBe(false);
+    expect(isLargeHall(hall(9, 7))).toBe(false);
+    expect(isLargeHall(hall(13, 10))).toBe(true);
+    for (const [w, d] of [
+      [7, 6],
+      [5, 6],
+      [5, 12],
+    ] as const)
+      expect(isLargeHall(hall(w, d))).toBe(false);
   });
 });
 

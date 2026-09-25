@@ -67,7 +67,7 @@
  */
 
 import { decorFootprint, footprint, footprintOf } from "./footprints";
-import { STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
+import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
   LANE_DEPTH,
   LANE_WIDTH,
@@ -336,6 +336,44 @@ export function dressingSites(room: RoomBase): DressingSites {
     wallSide,
     longWalls: [hallEdges(a), hallEdges(b)],
   };
+}
+
+/**
+ * The hall's interior band: the hall less `BAND_MARGIN` cells on every
+ * side, the band `decorFor` stands its furniture in and `scaffoldFor` draws
+ * its frames inside. Null when nothing is left, which is a hall narrower or
+ * shallower than `2 * BAND_MARGIN + 1` cells. The density measure counts
+ * the floor props in it (`density.ts`), and the mid-hall clusters (D6)
+ * are tiled across it.
+ */
+export function interiorBand(hall: Rect): Rect | null {
+  const band = {
+    x0: hall.x0 + BAND_MARGIN,
+    y0: hall.y0 + BAND_MARGIN,
+    x1: hall.x1 - BAND_MARGIN,
+    y1: hall.y1 - BAND_MARGIN,
+  };
+  return band.x1 > band.x0 && band.y1 > band.y0 ? band : null;
+}
+
+/** A large hall's shorter side, at least, in cells (D5). */
+const LARGE_SHORT = 8;
+/** A large hall's longer side, at least, in cells (D5). */
+const LARGE_LONG = 9;
+
+/**
+ * True when a hall is large (D5): its shorter side is at least 8 cells and
+ * its longer side at least 9, either way round. Its interior band is then
+ * at least 5 by 4 cells, enough for one cluster block. The workshop
+ * (13x10), the hub (24x24) and the fullest probed room qualify; the bridge
+ * (7x6), the empty hall (5x6) and the narrow hall (5x12) do not. Only a
+ * large hall gets mid-hall clusters and spans, and the density ceiling of
+ * `dress.test.ts` is held against large halls alone.
+ */
+export function isLargeHall(hall: Rect): boolean {
+  const w = hall.x1 - hall.x0;
+  const d = hall.y1 - hall.y0;
+  return Math.min(w, d) >= LARGE_SHORT && Math.max(w, d) >= LARGE_LONG;
 }
 
 /** The order a floor cell's walls are tried in for a wall-side spot. */

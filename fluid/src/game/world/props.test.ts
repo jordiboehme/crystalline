@@ -96,6 +96,18 @@ describe("the prop catalogue", () => {
       expect(PROP_CATALOGUE[k].keepClear).toBe(true);
   });
 
+  it("weights the wide kinds above the small ones in every palette", () => {
+    for (const a of ARCHETYPES) {
+      const wall = PALETTES[a].wall;
+      const wide = wall.filter(([k]) => PROP_CATALOGUE[k].wide);
+      const small = wall.filter(([k]) => !PROP_CATALOGUE[k].wide);
+      expect(wide.length, a).toBeGreaterThan(0);
+      const minWide = Math.min(...wide.map(([, w]) => w));
+      for (const [k, w] of small)
+        if (k !== "sign-plate") expect(w, `${a} ${k}`).toBeLessThan(minWide);
+    }
+  });
+
   it("makes spans ceiling kinds that are neither runs nor extras", () => {
     const spans = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].span);
     expect(spans.sort()).toEqual(["span-duct", "span-tray"]);

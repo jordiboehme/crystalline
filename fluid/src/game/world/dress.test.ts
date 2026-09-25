@@ -6,8 +6,10 @@ import {
   CANNED_WORKSHOP,
   galleryRoom,
 } from "./canned";
+import { measureDensity, type Density } from "./density";
 import {
   PROP_ORDER,
+  SCREEN_GAP,
   WALL_GAP,
   capProps,
   dressCandidates,
@@ -290,7 +292,9 @@ function expectWallInvariants(name: string, room: RoomSpec) {
  * The floor-prop invariants, for any room: every floor prop's footprint
  * fits the floor and overlaps no lane, no fixture, decor or scaffold box
  * and no other floor prop; no cell under it is a doorway cell, next to one
- * (ruling 10) or in the corridor; and no two floor props share a cell.
+ * (ruling 10) or in the corridor; no two floor props share a cell; and no
+ * floor prop on a wall-side spot stands on a cell whose wall edge carries a
+ * keep-clear wall prop (D2 as amended: corner-zone spots ignore wall props).
  * Returns how many it checked.
  */
 function expectFloorInvariants(name: string, room: RoomSpec) {
@@ -337,6 +341,24 @@ function expectFloorInvariants(name: string, room: RoomSpec) {
     (p) => `${String(Math.floor(p.x))},${String(Math.floor(p.y))}`,
   );
   expect(new Set(cells).size, name).toBe(cells.length);
+  const kinds = new Map(
+    wallProps(room).map((p) => [edgeKey(edgeOf(p)), p.kind] as const),
+  );
+  const wallSide = new Set(
+    sites.wallSide.map((s) => `${String(s.cx)},${String(s.cy)}`),
+  );
+  for (const p of floorProps(room)) {
+    const cx = Math.floor(p.x);
+    const cy = Math.floor(p.y);
+    if (!wallSide.has(`${String(cx)},${String(cy)}`)) continue;
+    for (const side of ["n", "e", "s", "w"] as const) {
+      const kind = kinds.get(edgeKey({ x: cx, y: cy, side }));
+      expect(
+        kind !== undefined && PROP_CATALOGUE[kind].keepClear,
+        `${name} ${p.kind} at ${String(cx)},${String(cy)} before ${String(kind)}`,
+      ).toBe(false);
+    }
+  }
   return boxes.length;
 }
 
@@ -476,7 +498,7 @@ describe("floor props", () => {
     expect(checked).toBeGreaterThan(100);
   });
 
-  it("backs a wall-side prop onto its wall, WALL_GAP off it and facing away, on all four walls", () => {
+  it("backs a wall-side prop WALL_GAP off a bare wall and SCREEN_GAP off a screenable wall prop, on all four walls", () => {
     const rooms = [
       ...ALL.map((d) => d.room),
       ...Array.from({ length: 40 }, (_, i) =>
@@ -490,9 +512,15 @@ describe("floor props", () => {
       ),
     ];
     const sides = new Set<Side>();
+    const screenSides = new Set<Side>();
+    let bare = 0;
+    let screening = 0;
     for (const room of rooms) {
       const spots = new Map(
         dressingSites(room).wallSide.map((s) => [`${s.cx},${s.cy}`, s]),
+      );
+      const kinds = new Map(
+        wallProps(room).map((p) => [edgeKey(edgeOf(p)), p.kind] as const),
       );
       for (const p of floorProps(room)) {
         const cx = Math.floor(p.x);
@@ -510,10 +538,23 @@ describe("floor props", () => {
           w: box.x0 - cx * CELL,
           e: (cx + 1) * CELL - box.x1,
         }[side];
-        expect(gap).toBeCloseTo(WALL_GAP, 2);
+        const kind = kinds.get(edgeKey({ x: cx, y: cy, side }));
+        if (kind !== undefined) {
+          expect(gap).toBeCloseTo(SCREEN_GAP, 2);
+          expect(PROP_CATALOGUE[kind].keepClear).toBe(false);
+          expect(PROP_CATALOGUE[p.kind].wallBacked).toBe(false);
+          screenSides.add(side);
+          screening++;
+        } else {
+          expect(gap).toBeCloseTo(WALL_GAP, 2);
+          bare++;
+        }
       }
     }
     expect([...sides].sort()).toEqual(["e", "n", "s", "w"]);
+    expect(bare).toBeGreaterThan(0);
+    expect(screening).toBeGreaterThanOrEqual(20);
+    expect([...screenSides].sort()).toEqual(["e", "n", "s", "w"]);
   });
 
   it("keeps floor props out of a reserved box", () => {
@@ -719,6 +760,8 @@ describe("density", () => {
       const kinds = palette.floor
         .map(([k]) => k)
         .filter((k) => !PROP_CATALOGUE[k].wallBacked);
+      // A zone spot ignores wall props, keep-clear ones included (D2 as
+      // amended), so only the lanes and taken boxes decide.
       // A spot is accepted when every box a zone prop could take there is.
       const accepted = (cx: number, cy: number) =>
         kinds.every((kind) =>
@@ -773,6 +816,49 @@ describe("density", () => {
         expect(sides.size, name).toBeGreaterThanOrEqual(1);
         expect(sides.size, name).toBeLessThanOrEqual(2);
       }
+    }
+  });
+});
+
+/**
+ * 60 workshop rooms in every archetype, the conditions cycling: the rooms
+ * the density measure's floors were forecast on (the plan's Baselines).
+ */
+const SEEDS: RoomSpec[] = Array.from({ length: 60 }, (_, i) => i).flatMap((i) =>
+  Object.values(ARCHETYPE_TYPES).map((type) =>
+    generateRoom({
+      ...CANNED_WORKSHOP,
+      type,
+      status: Object.values(STATUS)[i % 4] ?? "stable",
+      permalink: `w-${String(i)}`,
+    }),
+  ),
+);
+const sum = (rooms: RoomSpec[], f: (d: Density) => number) =>
+  rooms.reduce((a, r) => a + f(measureDensity(r)), 0);
+
+describe("density measure", () => {
+  it("covers at least 0.12 of free edges with wide wall props, and at most 0.6", () => {
+    // Baseline 0.016 (locker banks only), forecast 0.17.
+    const share =
+      sum(SEEDS, (d) => d.wideEdges) / sum(SEEDS, (d) => d.freeEdges);
+    expect(share).toBeGreaterThanOrEqual(0.12);
+    expect(share).toBeLessThanOrEqual(0.6);
+  });
+
+  it("puts at least 0.07 floor props per wall-side spot, and at most 0.35", () => {
+    // Baseline 0.049: 82% of the spots were dropped behind any wall prop.
+    // Forecast about 0.085: keep-clear kinds still close 0.625 of the spots.
+    const per =
+      sum(SEEDS, (d) => d.wallSideProps) / sum(SEEDS, (d) => d.wallSideSpots);
+    expect(per).toBeGreaterThanOrEqual(0.07);
+    expect(per).toBeLessThanOrEqual(0.35);
+  });
+
+  it("keeps every dressed room at or under 14 floor props per 100 floor cells", () => {
+    for (const { name, room } of [...ALL, ...BRIDGES]) {
+      const d = measureDensity(room);
+      if (d.large) expect(d.floorPer100, name).toBeLessThanOrEqual(14);
     }
   });
 });
@@ -951,7 +1037,7 @@ describe("the cap (Review Focus 4)", () => {
    * The fullest room a probe of the generator found: a manifest under
    * construction with 24 relations, 24 sections, 40 tags and 30 inbound
    * references (24 listed). A 24 by 24 hall, four bays and a corridor give
-   * it 203 candidates, three over the cap.
+   * it more candidates than the cap, and the cap drops them by its tiers.
    */
   const OVER_CAP: PlaceInput = {
     domain: "t",
@@ -987,25 +1073,22 @@ describe("the cap (Review Focus 4)", () => {
     observations: [],
   };
 
-  it("caps a room that really overflows, dropping only optional ceiling props", () => {
+  it("caps a room that really overflows by the tier rules", () => {
     const room = generateRoom(OVER_CAP);
     expect(room.hall).toEqual({ x0: 26, y0: 0, x1: 50, y1: 24 });
     expect(room.bays).toHaveLength(4);
     expect(room.corridor).not.toBeNull();
     const candidates = dressCandidates(room);
-    expect(candidates).toHaveLength(PROP_CAP + 3);
+    expect(candidates.length).toBeGreaterThan(PROP_CAP);
     expect(room.props).toHaveLength(PROP_CAP);
     const kept = capProps(candidates, PROP_CAP);
     expect(room.props).toEqual([...kept].sort(PROP_ORDER));
-    expect(expectTiers("over cap", candidates, kept)).toBe(3);
-    const left = new Set(kept.map((p) => JSON.stringify(p)));
-    const dropped = candidates.filter((c) => !left.has(JSON.stringify(c.prop)));
-    expect(dropped).toHaveLength(3);
-    for (const c of dropped) {
-      expect(c.prop.anchor).toBe("ceiling");
-      expect(c.mandatory).toBe(false);
-    }
-    expect(room.props.filter((p) => p.kind === "beacon")).toHaveLength(1);
+    expectTiers("over cap", candidates, kept);
+    // No wall candidate is dropped: the lower tiers hold enough to cover
+    // the overflow on their own.
+    expect(
+      candidates.filter((c) => c.prop.anchor !== "wall").length,
+    ).toBeGreaterThanOrEqual(candidates.length - PROP_CAP);
   });
 
   const prop = (anchor: PropAnchor, seed: number, x = 0): Prop => ({

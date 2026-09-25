@@ -44,6 +44,7 @@ import { isRetired } from "../../lifecycle";
 import { createRng, seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
 import {
+  BAND_MARGIN,
   SOUTH_HATCHES,
   createSlotPool,
   isFloor,
@@ -257,10 +258,10 @@ function round3(v: number) {
  */
 function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
   const band = {
-    x0: hall.x0 + 2,
-    x1: hall.x1 - 2,
-    y0: hall.y0 + 2,
-    y1: hall.y1 - 2,
+    x0: hall.x0 + BAND_MARGIN,
+    x1: hall.x1 - BAND_MARGIN,
+    y0: hall.y0 + BAND_MARGIN,
+    y1: hall.y1 - BAND_MARGIN,
   };
   if (band.x1 - band.x0 < 3 || band.y1 - band.y0 < 3) return [];
   const cx = (hall.x0 + hall.x1) / 2;
@@ -388,8 +389,6 @@ function lightsFor(
 const SCAFFOLD_FRAMES = 2;
 /** A scaffold frame's side, in metres. */
 export const SCAFFOLD_SIZE = 1.4;
-/** The hall's margin around its interior band, in cells, as for decor. */
-const BAND_MARGIN = 2;
 
 /**
  * The scaffold frames of a room under construction, and none for any other

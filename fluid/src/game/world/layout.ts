@@ -76,6 +76,15 @@ export const HALL_CAP = 24;
 /** How many hatches the hall's south wall takes before a corridor is built. */
 export const SOUTH_HATCHES = 8;
 
+/**
+ * The hall's margin around its interior band, in cells: the band is the
+ * hall less this many cells on every side. The decor stands in it
+ * (`decorFor`), the scaffold frames are drawn inside it (`scaffoldFor`), and
+ * the dressing reads it as `interiorBand` (`sites.ts`), so all three agree
+ * on one band.
+ */
+export const BAND_MARGIN = 2;
+
 /** The smallest hall, so even an empty engram is a room to stand in. */
 const MIN_WIDTH = 5;
 const MIN_DEPTH = 6;

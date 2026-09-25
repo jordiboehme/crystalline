@@ -62,9 +62,10 @@ export interface PropEntry {
    */
   wide: boolean;
   /**
-   * A kind a person reads or uses at standing height, so no floor prop may
-   * stand in front of it (D2): every mandatory kind is keep-clear, and some
-   * optional kinds are too.
+   * A kind a person reads or uses at standing height, so no wall-side floor
+   * prop may stand in front of it (D2 as amended: corner-zone spots ignore
+   * it): every mandatory kind is keep-clear, and some optional kinds are
+   * too.
    */
   keepClear: boolean;
   /**
@@ -563,13 +564,21 @@ export const FILLER: readonly (readonly [WallPropKind, number])[] = [
   ["breaker-box", 1],
 ];
 
-/** The five archetypes' weighted picks and density knobs. */
+/**
+ * The five archetypes' weighted picks and density knobs. Every wall palette
+ * holds at least one wide kind, weighted 4 to 6, above its small kinds at 2
+ * (D4), so a free edge draws a prop that fills it more often than one that
+ * dots it; the sign plate keeps 3 where it is the archive's and council's
+ * own pick. `FILLER` stays at 1 each.
+ */
 export const PALETTES = {
   bridge: {
     wall: [
-      ["wall-monitor", 3],
-      ["intercom", 3],
-      ["light-strip", 3],
+      ["wall-monitor", 2],
+      ["intercom", 2],
+      ["light-strip", 2],
+      ["conduit-cabinet", 5],
+      ["locker-bank", 3],
     ],
     wallRun: "cable-tray",
     floor: [
@@ -582,9 +591,11 @@ export const PALETTES = {
   },
   engineering: {
     wall: [
-      ["breaker-box", 3],
-      ["vent-grille", 3],
-      ["locker-bank", 3],
+      ["breaker-box", 2],
+      ["vent-grille", 2],
+      ["locker-bank", 4],
+      ["tool-board", 4],
+      ["pipe-riser", 4],
     ],
     wallRun: "pipe-bundle",
     floor: [
@@ -597,7 +608,11 @@ export const PALETTES = {
     wallSide: 1 / 4,
   },
   archive: {
-    wall: [["sign-plate", 3]],
+    wall: [
+      ["sign-plate", 3],
+      ["conduit-cabinet", 4],
+      ["stowage-net", 4],
+    ],
     wallRun: null,
     floor: [
       ["filing-cabinet", 3],
@@ -610,9 +625,11 @@ export const PALETTES = {
   },
   lab: {
     wall: [
-      ["first-aid", 3],
-      ["extinguisher", 3],
-      ["vent-grille", 3],
+      ["first-aid", 2],
+      ["extinguisher", 2],
+      ["vent-grille", 2],
+      ["tool-board", 4],
+      ["pipe-riser", 4],
     ],
     wallRun: null,
     floor: [
@@ -627,7 +644,7 @@ export const PALETTES = {
   },
   council: {
     wall: [
-      ["padded-panel", 3],
+      ["padded-panel", 6],
       ["sign-plate", 3],
     ],
     wallRun: null,

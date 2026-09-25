@@ -9,6 +9,7 @@
  * this order:
  *
  * 1. `sites = dressingSites(room)`, `used` (the wall edges a wall prop took),
+ *    `wallKinds` (the kind of the wall prop on each of those edges),
  *    `floorBoxes` (the boxes of the floor props placed so far) and
  *    `floorCells` (the cells that have a floor prop). `reserved` joins
  *    `sites.taken`.
@@ -18,6 +19,7 @@
  *    then the previous one; then an extinguisher on each run at along-run
  *    index `3 + 6k`, falling back to `+1` and then `-1`. Its variant is the
  *    first draw of `createRng(seed)` (a sign's variant is its pictogram).
+ *    Each is recorded in `used` and `wallKinds`.
  * 3. Wall runs, when the palette has one: `createRng(seedFor(roomSeed,
  *    "prop-runs", "wall"))` draws the count (1 or 2), with 1 the long wall,
  *    then the variant the whole run shares; one segment per long-wall edge
@@ -25,29 +27,39 @@
  * 4. Optional wall props: every free edge not in `used`, in run order,
  *    draws from `createRng(seed)` a chance of `WALL_SHARE`, then a kind
  *    weighted over the palette's wall picks plus `FILLER`, then a variant.
- * 5. Floor spots: every corner-zone spot, and every wall-side spot whose
- *    wall edge is not in `used`. A zone spot's prop is centred on its cell;
- *    a wall-side spot's is backed to its wall, its centre `WALL_GAP +
- *    depth / 2` metres off it, facing away from it (`turnForSide`). A prop
- *    is accepted when its `propFootprint` fits the floor, overlaps no lane,
- *    no taken box and no floor box placed before, and its cell has no floor
- *    prop yet. Every spot's draws come from `createRng` of its own seed,
- *    `seedFor(roomSeed, "prop", cx, cy, "floor")`: the kind when it is
- *    picked, then the variant, then the turn of a zone spot.
+ *    Each is recorded in `used` and `wallKinds`.
+ * 5. Floor spots and their backing. A spot's backing is what stands behind
+ *    it. A zone spot has no wall and is always `bare`, whatever hangs on
+ *    its cell's walls. A wall-side spot is `clear` when any of its cell's
+ *    four wall edges carries a keep-clear wall prop (`PropEntry.keepClear`),
+ *    otherwise `screen` when its own wall edge carries a wall prop,
+ *    otherwise `bare`. The floor spots are every corner-zone spot and every
+ *    wall-side spot whose backing is not `clear`. A zone spot's prop is centred on its cell; a wall-side
+ *    spot's is backed to its wall, facing away from it (`turnForSide`), its
+ *    centre `WALL_GAP + depth / 2` metres off a bare wall and `SCREEN_GAP +
+ *    depth / 2` off a screen. A prop is accepted when its `propFootprint`
+ *    fits the floor, overlaps no lane, no taken box and no floor box placed
+ *    before, and its cell has no floor prop yet. Every spot's draws come
+ *    from `createRng` of its own seed, `seedFor(roomSeed, "prop", cx, cy,
+ *    "floor")`: the kind when it is picked, then the variant, then the turn
+ *    of a zone spot.
  * 6. Condition extras (ruling 12): `createRng(seedFor(roomSeed, "extras",
  *    condition))` draws each rule's count in `EXTRAS` order. Each floor
- *    extra goes to the first spot in floor-seed order that accepts it, a
- *    wall-backed one (the ladder) only to a wall-side spot. The loose
- *    cables' count is kept for step 9.
+ *    extra goes to the first spot of step 5 in floor-seed order that
+ *    accepts it, a wall-backed one (the ladder) only to a wall-side spot
+ *    whose backing is `bare`. The loose cables' count is kept for step 9.
  * 7. Corner zones: each zone takes `1` prop on a bridge, otherwise `1 +
  *    (seedFor(roomSeed, "prop-zone", key) % 2)`. Its remaining spots are
- *    walked in seed order, each drawing a kind weighted over the palette's
- *    floor picks that are not wall-backed, a variant and a turn, until that
- *    many are placed or the spots run out, so a cramped zone gets fewer.
- * 8. Wall-side cells: every remaining wall-side spot draws a chance of the
- *    palette's `wallSide`, then a kind weighted over all its floor picks
- *    (wall-backed ones allowed), then a variant, and is placed when
- *    accepted.
+ *    walked in seed order, each drawing a kind weighted
+ *    over the palette's floor picks that are not wall-backed (`zonePicks`),
+ *    a variant and a turn, until that many are placed or the spots run
+ *    out, so a cramped zone gets fewer.
+ * 8. Wall-side cells: every remaining wall-side spot of step 5 draws a
+ *    chance of the palette's `wallSide`, then a kind, then a variant, and
+ *    is placed when accepted. The kind is weighted over all the palette's
+ *    floor picks when the backing is `bare`, and over `zonePicks` in front
+ *    of a screen, since a wall-backed kind 0.35 m off its wall would lean
+ *    on air.
  * 9. Ceiling, anchored at wall points like a wall prop: the ceiling run when
  *    the palette has one, drawn as in step 3 from `"ceiling"`, token
  *    `ceiling-<side>`; under each ceiling tray segment a cable loop when
@@ -62,6 +74,17 @@
  * 11. The output: `x` and `y` rounded to three decimals (done as each prop
  *     is made, so acceptance measures exactly the prop that is returned),
  *     sorted by `PROP_ORDER`.
+ *
+ * Keep-clear and screening (D2 as amended: wall-side spots only, D3). A
+ * wall prop a person reads or works by hand at standing height (reader,
+ * sign, extinguisher, first-aid box, intercom, wall monitor) keeps a
+ * wall-side spot on its cell free of floor props, whether the prop is
+ * mandatory or an optional palette pick. A corner-zone spot ignores wall
+ * props, keep-clear ones included: its prop stands centred in the corner
+ * cell, well off the wall, and hides nothing a person uses. Any other wall prop is a screen: a
+ * floor prop may stand in front of it, `SCREEN_GAP` (0.35 m) off the wall,
+ * so the two layers never meet; ruling 5's height bands keep them apart
+ * above the floor.
  *
  * Every seed is keyed by the integer anchor cell and a token (ruling 2),
  * never by a position in a list, and every draw comes from the rng of that
@@ -85,6 +108,7 @@ import {
   PALETTES,
   PROP_CAP,
   PROP_CATALOGUE,
+  WALL_PROP_DEPTH,
   WALL_SHARE,
 } from "./props";
 import {
@@ -166,6 +190,24 @@ export const PROP_ORDER = (a: Prop, b: Prop): number =>
 /** How far a wall-backed floor prop stands off its wall, in metres. */
 export const WALL_GAP = 0.05;
 
+/**
+ * How far a wall-side floor prop stands off its wall when a screenable wall
+ * prop hangs on that wall's edge (D3), in metres: the wall band's depth
+ * (`WALL_PROP_DEPTH`, 0.3) plus `WALL_GAP`, so 0.35. The floor prop then
+ * stands clear of the wall prop behind it; the deepest floor prop (1.4 m)
+ * still ends 1.75 m off the wall, inside the 2 m cell.
+ */
+export const SCREEN_GAP = WALL_PROP_DEPTH + WALL_GAP;
+
+/**
+ * What stands behind a floor spot: a bare wall, a screenable wall prop, or
+ * something that must stay clear. A corner-zone spot is always bare.
+ */
+type Backing = "bare" | "screen" | "clear";
+
+/** The four sides of a cell, in the order a spot's backing checks them. */
+const SIDES = ["n", "e", "s", "w"] as const;
+
 /** The along-run index of a run's first extinguisher (ruling 7). */
 const EXTINGUISHER_FIRST = 3;
 
@@ -212,6 +254,7 @@ export function dressCandidates(
   const sites = dressingSites(room);
   const palette = PALETTES[room.archetype];
   const used = new Set<string>();
+  const wallKinds = new Map<string, PropKind>();
   const floorBoxes: Box[] = [];
   const floorCells = new Set<string>();
   const blocked = [...sites.taken, ...reserved];
@@ -246,6 +289,7 @@ export function dressCandidates(
   const onWall = (kind: PropKind, e: WallSlot, mandatory: boolean) => {
     const seed = propSeed(e.x, e.y, e.side);
     used.add(edgeKey(e));
+    wallKinds.set(edgeKey(e), kind);
     out.push({
       prop: atWall(kind, e, variantOf(kind, createRng(seed)), seed),
       mandatory,
@@ -300,17 +344,26 @@ export function dressCandidates(
     if (!rng.chance(WALL_SHARE)) continue;
     const kind = weighted(rng, wallPicks);
     used.add(k);
+    wallKinds.set(k, kind);
     out.push({
       prop: atWall(kind, e, variantOf(kind, rng), seed),
       mandatory: false,
     });
   }
 
-  // Step 5: the floor spots and how a prop is accepted on one.
-  const wallSide = sites.wallSide.filter(
-    (s) =>
-      s.wall !== null && !used.has(edgeKey({ x: s.cx, y: s.cy, side: s.wall })),
-  );
+  // Step 5: the floor spots, what stands behind each, and how a prop is
+  // accepted on one.
+  const backing = (s: FloorSpot): Backing => {
+    if (s.wall === null) return "bare";
+    for (const side of SIDES) {
+      const kind = wallKinds.get(edgeKey({ x: s.cx, y: s.cy, side }));
+      if (kind !== undefined && PROP_CATALOGUE[kind].keepClear) return "clear";
+    }
+    return wallKinds.has(edgeKey({ x: s.cx, y: s.cy, side: s.wall }))
+      ? "screen"
+      : "bare";
+  };
+  const wallSide = sites.wallSide.filter((s) => backing(s) !== "clear");
   const floorSeed = (s: FloorSpot) => propSeed(s.cx, s.cy, "floor");
   const bySeed = (a: FloorSpot, b: FloorSpot) =>
     floorSeed(a) - floorSeed(b) || a.cy - b.cy || a.cx - b.cx;
@@ -325,7 +378,8 @@ export function dressCandidates(
       turn = turnForSide(s.wall);
       const size = FOOTPRINTS.prop[kind][variant];
       if (size === undefined) throw new Error(`${kind} has no variant`);
-      const off = (WALL_GAP + size.depth / 2) / CELL;
+      const gap = backing(s) === "screen" ? SCREEN_GAP : WALL_GAP;
+      const off = (gap + size.depth / 2) / CELL;
       if (s.wall === "n") y = s.cy + off;
       else if (s.wall === "s") y = s.cy + 1 - off;
       else if (s.wall === "w") x = s.cx + off;
@@ -371,7 +425,8 @@ export function dressCandidates(
     const wallBacked = PROP_CATALOGUE[kind].wallBacked;
     for (let i = 0; i < n; i++)
       for (const s of spots) {
-        if (!free(s) || (wallBacked && s.wall === null)) continue;
+        if (!free(s)) continue;
+        if (wallBacked && (s.wall === null || backing(s) !== "bare")) continue;
         if (place(onFloor(kind, s, createRng(floorSeed(s))), s)) break;
       }
   }
@@ -399,7 +454,9 @@ export function dressCandidates(
     if (!free(s)) continue;
     const rng = createRng(floorSeed(s));
     if (!rng.chance(palette.wallSide)) continue;
-    place(onFloor(weighted(rng, palette.floor), s, rng), s);
+    const picks = backing(s) === "bare" ? palette.floor : zonePicks;
+    if (picks.length === 0) continue;
+    place(onFloor(weighted(rng, picks), s, rng), s);
   }
 
   // Step 9: the ceiling.

@@ -257,7 +257,7 @@
       "seed": 6510771300869815
     },
     {
-      "kind": "light-strip",
+      "kind": "conduit-cabinet",
       "variant": 1,
       "anchor": "wall",
       "x": 7,
@@ -275,7 +275,7 @@
       "seed": 1988428737779548
     },
     {
-      "kind": "light-strip",
+      "kind": "vent-grille",
       "variant": 1,
       "anchor": "wall",
       "x": 0,
@@ -293,7 +293,7 @@
       "seed": 7238002020838373
     },
     {
-      "kind": "light-strip",
+      "kind": "conduit-cabinet",
       "variant": 1,
       "anchor": "wall",
       "x": 0,
@@ -311,7 +311,7 @@
       "seed": 669630369330755
     },
     {
-      "kind": "light-strip",
+      "kind": "locker-bank",
       "variant": 0,
       "anchor": "wall",
       "x": 0.5,
