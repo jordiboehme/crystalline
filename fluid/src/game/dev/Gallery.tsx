@@ -5,8 +5,10 @@
  * engram, and shown with `session.showRoom`: a door of every style, the
  * sealed ways, the portals, a terminal, a hatch, a poster and the placard in
  * the hall with every kind of furniture, the twelve machines in bays 1 and
- * 2, one of every prop kind and variant in bays 3 and 4, and a row of every
- * ceiling span kind and variant over row 6 of those same two bays.
+ * 2, one of every prop kind and variant in bays 3 and 4 (the floor kinds
+ * spilling from rows 1, 3 and 5 onto row 7 once the four tall kinds no
+ * longer fit), and a row of every ceiling span kind and variant over row 6
+ * of those same two bays.
  * Development only - the route that renders this exists only under
  * `import.meta.env.DEV`, and stays that way for good.
  *

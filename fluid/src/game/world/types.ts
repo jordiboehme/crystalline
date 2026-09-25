@@ -297,7 +297,12 @@ export type FloorPropKind =
   | "tool-cart"
   | "toppled-crate"
   | "debris-pile"
-  | "cable-coil";
+  | "cable-coil"
+  // tall floor kinds (E5), at least TALL_MIN tall
+  | "crate-stack"
+  | "drum-rack"
+  | "gas-rack"
+  | "potted-tree";
 
 /** The kinds of prop that hang from the ceiling, out of the player's way. */
 export type CeilingPropKind =

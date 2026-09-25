@@ -272,7 +272,7 @@ describe("galleryRoom", () => {
     }
   });
 
-  it("centres every floor prop on rows 1, 3 or 5 of bays 3 and 4, turn 0", () => {
+  it("centres every floor prop on rows 1, 3, 5 or 7 of bays 3 and 4, turn 0", () => {
     const propBays = room.bays.slice(2, 4);
     const floorProps = room.props.filter((p) => p.anchor === "floor");
     expect(floorProps.length).toBeGreaterThan(0);
@@ -282,13 +282,47 @@ describe("galleryRoom", () => {
       expect(p.y % 1).toBeCloseTo(0.5, 6);
       const cx = Math.floor(p.x);
       const cy = Math.floor(p.y);
-      expect([1, 3, 5]).toContain(cy);
+      expect([1, 3, 5, 7]).toContain(cy);
       expect(
         propBays.some(
           (b) => cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1,
         ),
       ).toBe(true);
     }
+  });
+
+  it("puts the gallery's floor props on rows 1, 3, 5 and then 7 of bays 3 and 4, never before a keep-clear wall prop", () => {
+    const propBays = room.bays.slice(2, 4);
+    const floor = room.props.filter((p) => p.anchor === "floor");
+    const kinds = new Map(
+      room.props
+        .filter((p) => p.anchor === "wall")
+        .map(
+          (p) =>
+            [
+              `${String(Math.floor(p.x))},${String(Math.floor(p.y))}`,
+              p.kind,
+            ] as const,
+        ),
+    );
+    for (const p of floor) {
+      const cx = Math.floor(p.x);
+      const cy = Math.floor(p.y);
+      expect([1, 3, 5, 7]).toContain(cy);
+      expect(propBays.some((b) => cx > b.x0 && cx < b.x1 - 1)).toBe(true);
+      if (cy === 7) {
+        // A south wall prop's anchor lies on the cell's south edge (y = 8):
+        // wallAnchor's "s" case returns { x: e.x + 0.5, y: e.y + 1 }, and a
+        // row-7 cell's south edge is the cell y = 7's "s" slot, so e.y + 1 =
+        // 8 is exactly the key a row-7 cell's south neighbour is stored
+        // under.
+        const k = kinds.get(`${String(cx)},8`);
+        expect(k === undefined || !PROP_CATALOGUE[k].keepClear).toBe(true);
+      }
+    }
+    expect(floor.filter((p) => Math.floor(p.y) === 7).length).toBeGreaterThan(
+      0,
+    );
   });
 
   it("is the same room every time", () => {

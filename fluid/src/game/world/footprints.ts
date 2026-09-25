@@ -179,6 +179,22 @@ export const FOOTPRINTS: Footprints = {
       { width: 0.8, depth: 0.8 },
       { width: 1.0, depth: 0.7 },
     ],
+    "crate-stack": [
+      { width: 1.2, depth: 1.2 },
+      { width: 1.3, depth: 1.1 },
+    ],
+    "drum-rack": [
+      { width: 1.35, depth: 0.9 },
+      { width: 1.3, depth: 1.0 },
+    ],
+    "gas-rack": [
+      { width: 1.0, depth: 0.5 },
+      { width: 1.2, depth: 0.6 },
+    ],
+    "potted-tree": [
+      { width: 0.9, depth: 0.9 },
+      { width: 1.0, depth: 1.0 },
+    ],
   },
 };
 

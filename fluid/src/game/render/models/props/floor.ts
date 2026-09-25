@@ -36,6 +36,13 @@ const CLAY: Rgb = [0.62, 0.4, 0.3];
 const GLASS: Rgb = [0.85, 0.9, 0.86];
 
 /**
+ * An amber cap tint: the gas rack's cylinder caps, the standard colour a
+ * pressurised gas cylinder's cap carries regardless of the room's own
+ * colours.
+ */
+const GAS_CAP: Rgb = [0.85, 0.55, 0.08];
+
+/**
  * A straight rail leaning from `(d0, h0)` to `(d1, h1)`, `thick` wide along
  * `a` and centred there: a tilted bar drawn in the `(d, h)` side view and
  * extruded along the wall by `profileAlong`, which owns the side frame's
@@ -141,8 +148,9 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
 const BARREL = { ribTube: 0.015, lidLift: 0.02 };
 
 /**
- * One upright barrel at `(a, d)`: a metal cylinder with two ribs and a lid,
- * `sides` facets round.
+ * One upright barrel at `(a, d)`, its base at `base` (0 by default so
+ * `barrel`'s own floor-level barrels need not pass it): a metal cylinder
+ * with two ribs and a lid, `sides` facets round.
  */
 function oneBarrel(
   k: Kit,
@@ -152,13 +160,14 @@ function oneBarrel(
   radius: number,
   height: number,
   sides: number,
+  base = 0,
 ): void {
-  k.cylinder(a, d, 0, height, radius, sides, s.metal);
+  k.cylinder(a, d, base, base + height, radius, sides, s.metal);
   for (const h of [height * 0.3, height * 0.7]) {
     k.ring(
       a,
       d,
-      h,
+      base + h,
       radius - BARREL.ribTube,
       BARREL.ribTube,
       6,
@@ -170,8 +179,8 @@ function oneBarrel(
   k.cylinder(
     a,
     d,
-    height,
-    height + BARREL.lidLift,
+    base + height,
+    base + height + BARREL.lidLift,
     radius * 0.97,
     sides,
     s.dark,
@@ -902,6 +911,241 @@ function cableCoil({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   }
 }
 
+/**
+ * Crate stack: variant 0 a large bevelled crate, a medium one stacked on it
+ * and offset along `a` (not rotated), then a small one on that, each a
+ * little inside the one below; variant 1 a slatted pallet, two crates side
+ * by side on it, one crate across both of them, and a small hazard-taped
+ * crate on top.
+ */
+function crateStack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("crate-stack", variant);
+  const bevel = 0.03;
+  if (variant === 0) {
+    const H0 = 0.8;
+    const H1 = 1.4;
+    const H2 = 1.8;
+    k.bevelBox(
+      -hw + 0.02,
+      hw - 0.02,
+      -hd + 0.02,
+      hd - 0.02,
+      0,
+      H0,
+      bevel,
+      s.body,
+    );
+    const mw = (hw - 0.02) * 0.78;
+    const md = (hd - 0.02) * 0.78;
+    const offA = (hw - 0.02 - mw) * 0.5;
+    k.bevelBox(offA - mw, offA + mw, -md, md, H0, H1, bevel * 0.85, s.body);
+    const sw = mw * 0.62;
+    const sd = md * 0.62;
+    k.bevelBox(offA - sw, offA + sw, -sd, sd, H1, H2, bevel * 0.7, s.body);
+    return;
+  }
+  const slats = 4;
+  const slatW = 0.14;
+  const innerHw = hw - 0.03;
+  const spacing = (2 * innerHw - slatW) / (slats - 1);
+  for (let i = 0; i < slats; i++) {
+    const a = -innerHw + slatW / 2 + i * spacing;
+    k.box(
+      a - slatW / 2,
+      a + slatW / 2,
+      -hd + 0.03,
+      hd - 0.03,
+      0,
+      0.12,
+      s.metal,
+    );
+  }
+  const gap = 0.05;
+  for (const side of [-1, 1] as const) {
+    const a0 = side > 0 ? gap / 2 : -hw + 0.03;
+    const a1 = side > 0 ? hw - 0.03 : -gap / 2;
+    k.bevelBox(a0, a1, -hd + 0.04, hd - 0.04, 0.12, 0.8, bevel, s.body);
+  }
+  k.bevelBox(
+    -hw + 0.02,
+    hw - 0.02,
+    -hd + 0.02,
+    hd - 0.02,
+    0.8,
+    1.45,
+    bevel,
+    s.body,
+  );
+  const sw = hw * 0.45;
+  const sd = hd * 0.45;
+  k.bevelBox(-sw, sw, -sd, sd, 1.45, 1.95, bevel * 0.8, s.body);
+  k.box(-sw + 0.02, sw - 0.02, -sd - 0.005, sd + 0.005, 1.68, 1.76, s.hazard);
+}
+
+/**
+ * Drum rack: variant 0 a two-tier steel rack (four corner posts, deck
+ * plates near the bottom and the middle), two upright drums (`oneBarrel`)
+ * on each deck; variant 1 drums lying along `a` in cradles
+ * (`cylinderAlong`), three tiers of two, two and one, in a frame of four
+ * posts.
+ */
+function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("drum-rack", variant);
+  const postA = hw - 0.03;
+  const postD = hd - 0.03;
+  if (variant === 0) {
+    const top = 1.8;
+    for (const a of [-postA, postA]) {
+      for (const d of [-postD, postD]) {
+        k.box(a - 0.025, a + 0.025, d - 0.025, d + 0.025, 0, top, s.metal);
+      }
+    }
+    const decks = [0.05, 0.95];
+    for (const h0 of decks) {
+      k.box(
+        -hw + 0.02,
+        hw - 0.02,
+        -hd + 0.02,
+        hd - 0.02,
+        h0,
+        h0 + 0.04,
+        s.dark,
+      );
+    }
+    const dr = Math.min(hw, hd) * 0.42;
+    for (const h0 of decks) {
+      for (const a of [-hw * 0.4, hw * 0.4]) {
+        oneBarrel(k, s, a, 0, dr, 0.8, 6, h0 + 0.04);
+      }
+    }
+    return;
+  }
+  const top = 1.75;
+  for (const a of [-postA, postA]) {
+    for (const d of [-postD, postD]) {
+      k.box(a - 0.025, a + 0.025, d - 0.025, d + 0.025, 0, top, s.metal);
+    }
+  }
+  const r = 0.15;
+  const a0 = -hw + 0.06;
+  const a1 = hw - 0.06;
+  const tiers: readonly (readonly [number, readonly number[]])[] = [
+    [0.3, [-hd * 0.42, hd * 0.42]],
+    [0.85, [-hd * 0.42, hd * 0.42]],
+    [1.4, [0]],
+  ];
+  for (const [h, ds] of tiers) {
+    for (const d of ds) k.cylinderAlong(a0, a1, d, h, r, 10, s.metal);
+  }
+}
+
+/**
+ * Gas rack: a base plate and a back frame (two posts, rails near the
+ * bottom and the top) hold upright gas cylinders, each a plain body, a
+ * short dome and a smaller cap under a coloured collar (`GAS_CAP`).
+ * Variant 0 three cylinders at one height with a chain bar across the
+ * front; variant 1 five cylinders at two alternating heights with a top
+ * guard rail instead.
+ */
+function gasRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("gas-rack", variant);
+  const cap = s.tinted(GAS_CAP);
+  const postA = hw - 0.05;
+  const backD = -hd + 0.03;
+  const frameTop = 1.7;
+  k.box(-hw + 0.02, hw - 0.02, -hd + 0.02, hd - 0.02, 0, 0.05, s.metal);
+  for (const a of [-postA, postA]) {
+    k.box(
+      a - 0.02,
+      a + 0.02,
+      backD - 0.02,
+      backD + 0.02,
+      0.05,
+      frameTop,
+      s.dark,
+    );
+  }
+  for (const h of [0.3, 1.7]) {
+    k.box(
+      -postA,
+      postA,
+      backD - 0.015,
+      backD + 0.015,
+      h - 0.02,
+      h + 0.02,
+      s.dark,
+    );
+  }
+  const positions =
+    variant === 0
+      ? [-hw * 0.6, 0, hw * 0.6]
+      : [-hw * 0.72, -hw * 0.36, 0, hw * 0.36, hw * 0.72];
+  const heights = positions.map((_, i) =>
+    variant === 0 ? 1.55 : i % 2 === 0 ? 1.45 : 1.65,
+  );
+  const r = 0.11;
+  positions.forEach((a, i) => {
+    const top = heights[i] ?? 1.55;
+    k.cylinder(a, 0, 0.05, top, r, 10, s.metal);
+    k.cylinder(a, 0, top, top + 0.08, r * 0.75, 10, s.metal);
+    k.cylinder(a, 0, top + 0.08, top + 0.14, r * 0.4, 8, s.metal);
+    k.cylinder(a, 0, top - 0.06, top + 0.01, r * 1.05, 8, cap);
+  });
+  if (variant === 0) {
+    k.cylinderAlong(-postA, postA, 0, 1.2, 0.012, 6, s.dark);
+    return;
+  }
+  k.cylinderAlong(-postA, postA, backD, 1.75, 0.015, 6, s.metal);
+}
+
+/**
+ * Potted tree: variant 0 a square tub, a thin trunk and a canopy of three
+ * stacked bevelled boxes shrinking upwards; variant 1 a round tub and a
+ * bundle of six thin stalks of different heights, each topped with a small
+ * leaf box, in `PLANT`.
+ */
+function pottedTree({ k, s, variant }: Parameters<PropRecipe>[0]): void {
+  const { hw, hd } = halfSize("potted-tree", variant);
+  const tub = s.tinted(CLAY);
+  const plant = s.tinted(PLANT);
+  if (variant === 0) {
+    const tubH = 0.5;
+    k.bevelBox(
+      -hw + 0.02,
+      hw - 0.02,
+      -hd + 0.02,
+      hd - 0.02,
+      0,
+      tubH,
+      0.02,
+      tub,
+    );
+    k.cylinder(0, 0, tubH - 0.04, 1.1, 0.05, 8, s.dark);
+    const tiers = [
+      { h0: 1.1, h1: 1.45, half: hw * 0.62 },
+      { h0: 1.45, h1: 1.7, half: hw * 0.42 },
+      { h0: 1.7, h1: 1.9, half: hw * 0.24 },
+    ];
+    for (const t of tiers) {
+      k.bevelBox(-t.half, t.half, -t.half, t.half, t.h0, t.h1, 0.02, plant);
+    }
+    return;
+  }
+  const r = Math.min(hw, hd) - 0.04;
+  k.cylinder(0, 0, 0, 0.45, r, 12, tub);
+  k.cylinder(0, 0, 0.41, 0.45, r * 0.85, 12, s.dark);
+  const sr = r * 0.55;
+  const heights = [1.62, 1.74, 1.86, 1.93, 1.79, 1.67];
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2;
+    const a = Math.cos(angle) * sr;
+    const d = Math.sin(angle) * sr;
+    const top = heights[i] ?? 1.7;
+    k.cylinder(a, d, 0.4, top, 0.02, 6, s.dark);
+    k.box(a - 0.045, a + 0.045, d - 0.045, d + 0.045, top, top + 0.04, plant);
+  }
+}
+
 /** The recipe of every floor prop kind, the condition extras included. */
 export const FLOOR_RECIPES = {
   crate,
@@ -920,4 +1164,8 @@ export const FLOOR_RECIPES = {
   "toppled-crate": toppledCrate,
   "debris-pile": debrisPile,
   "cable-coil": cableCoil,
+  "crate-stack": crateStack,
+  "drum-rack": drumRack,
+  "gas-rack": gasRack,
+  "potted-tree": pottedTree,
 } satisfies Record<FloorPropKind, PropRecipe>;

@@ -613,9 +613,15 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
  *   with a wall prop, since the two hang at different heights, exactly as
  *   the dressing pass allows;
  * - floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
- *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0. The outer columns are left
- *   out because they sit next to a bay's doorway, which the real dressing
- *   pass always keeps floor props off; rows 0, 2, 4, 6 and 7 stay walkable.
+ *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0, then row 7 of bay 3 and of
+ *   bay 4 in the same columns: the four tall kinds Task 1 adds push the
+ *   count past what rows 1, 3 and 5 hold. A row-7 cell is left out when its
+ *   south wall edge carries a keep-clear wall prop, since the prop lies
+ *   before it in the `wall` list built above and keep-clear holds there as
+ *   it does in the real dressing pass. The outer columns are left out
+ *   because they sit next to a bay's doorway, which the real dressing pass
+ *   always keeps floor props off; rows 0, 2, 4 and 6 stay walkable, row 6
+ *   running the length of each bay beside rows 5 and 7.
  * - span kinds (`span-duct`, `span-tray`) over row 6: each kind and variant
  *   takes the next of four fixed first cells, `bay3.x0 + 1`, `bay3.x0 + 4`,
  *   `bay4.x0 + 1` and `bay4.x0 + 4`, anchored at `(x + 1, 6.5)`, turn 0.
@@ -728,11 +734,26 @@ function galleryProps(
     }
   }
 
-  // Floor kinds: rows 1, 3 and 5 of the six inner columns of each bay.
+  // Floor kinds: rows 1, 3 and 5 of the six inner columns of each bay, then
+  // row 7 of bay 3 and of bay 4, in the same columns, rows 0, 2, 4 and 6
+  // stay walkable, row 6 running the length of each bay beside rows 5 and 7.
   const cells: { x: number; y: number }[] = [];
   for (const bay of [bay3, bay4])
     for (const y of [1, 3, 5])
       for (let x = bay.x0 + 1; x <= bay.x1 - 2; x++) cells.push({ x, y });
+  // A row-7 cell's south wall edge is the same edge a south-facing wall
+  // slot at y = row would anchor on (wallAnchor's "s" case: y: e.y + 1), so
+  // it is left out when that edge carries a keep-clear wall prop: the prop
+  // lies before it in `wall`, and keep-clear holds as in the real dressing
+  // pass.
+  const southKeepClear = new Set(
+    wall
+      .filter((p) => PROP_CATALOGUE[p.kind].keepClear)
+      .map((p) => `${String(Math.floor(p.x))},${String(Math.floor(p.y))}`),
+  );
+  for (const bay of [bay3, bay4])
+    for (let x = bay.x0 + 1; x <= bay.x1 - 2; x++)
+      if (!southKeepClear.has(`${String(x)},8`)) cells.push({ x, y: 7 });
   let ci = 0;
   const floor: Prop[] = [];
   for (const kind of kindsOf("floor")) {

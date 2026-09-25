@@ -5,6 +5,7 @@ import {
   PROP_CATALOGUE,
   PROP_KINDS,
   SPAN_HALF,
+  TALL_MIN,
   WALL_PROP_DEPTH,
   WIDE_REACH,
 } from "../world/props";
@@ -275,6 +276,26 @@ describe("prop models", () => {
           rungCenters.some((b) => Math.abs(b + a) < EPS),
           `a = ${String(a)} has no mirror, variant ${String(variant)}`,
         ).toBe(true);
+      }
+    }
+  });
+
+  it("makes every tall kind stand at least TALL_MIN in every variant, under FLOOR_TOP", () => {
+    for (const kind of PROP_KINDS) {
+      if (!PROP_CATALOGUE[kind].tall) continue;
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
+        const placed = placeMesh(
+          buildRecorded(kind, v).mesh,
+          0,
+          anchorFor(kind, 0),
+        );
+        const top = Math.max(...positions(placed).map((p) => p[1]));
+        expect(top, `${kind} ${String(v)}`).toBeGreaterThanOrEqual(
+          TALL_MIN - EPS,
+        );
+        expect(top, `${kind} ${String(v)}`).toBeLessThanOrEqual(
+          FLOOR_TOP + EPS,
+        );
       }
     }
   });

@@ -27,7 +27,31 @@ describe("the prop catalogue", () => {
   it("lists every kind once, as PROP_CATALOGUE does", () => {
     expect(new Set(PROP_KINDS).size).toBe(PROP_KINDS.length);
     expect([...PROP_KINDS].sort()).toEqual(Object.keys(PROP_CATALOGUE).sort());
-    expect(PROP_KINDS).toHaveLength(40);
+    expect(PROP_KINDS).toHaveLength(44);
+  });
+
+  it("marks tall only the floor kinds whose every variant stands TALL_MIN or more", () => {
+    const tall = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].tall);
+    expect(tall.sort()).toEqual([
+      "crate-stack",
+      "drum-rack",
+      "fume-cabinet",
+      "gas-rack",
+      "potted-tree",
+      "specimen-shelf",
+      "storage-shelf",
+    ]);
+    for (const k of tall) {
+      expect(PROP_CATALOGUE[k].anchor).toBe("floor");
+      expect(PROP_CATALOGUE[k].extra).toBe(false);
+    }
+    for (const k of [
+      "crate-stack",
+      "drum-rack",
+      "gas-rack",
+      "potted-tree",
+    ] as const)
+      expect(PROP_CATALOGUE[k].wallBacked).toBe(false);
   });
 
   it("gives every kind 2 or 3 variants, the sign plate 6", () => {

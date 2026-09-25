@@ -10,8 +10,9 @@
  *   only against a free wall, whether it is a condition extra a palette
  *   never picks, whether it is a wide wall kind that reaches `WIDE_REACH` on
  *   both sides of its anchor, whether it keeps clear (a person reads or uses
- *   it, so nothing may stand in front of it) and whether it is a ceiling
- *   span that crosses the hall rather than hugging a wall;
+ *   it, so nothing may stand in front of it), whether it is a ceiling span
+ *   that crosses the hall rather than hugging a wall, and whether it is a
+ *   tall floor kind (`TALL_MIN` or more in every variant, E5);
  * - `PALETTES`, the weighted picks each archetype draws free wall edges,
  *   floor spots, mid-hall clusters and runs from, plus `FILLER`, a low
  *   weight given to a few utility kinds in every archetype's wall palette
@@ -26,10 +27,10 @@
  *   the fume cabinet still sits in a regular palette;
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
- *   `LANE_WIDTH`, `LANE_DEPTH`, the cluster constants (`CLUSTER_BLOCK`,
- *   `CLUSTER_INNER`, `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and
- *   `CLUSTER_CLEAR`) and the span constants (`SPAN_CELLS`, `SPAN_HALF` and
- *   `SPAN_SHARE`).
+ *   `LANE_WIDTH`, `LANE_DEPTH`, `TALL_MIN`, the cluster constants
+ *   (`CLUSTER_BLOCK`, `CLUSTER_INNER`, `CLUSTER_SHARE`, `CLUSTER_MIN`,
+ *   `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants (`SPAN_CELLS`,
+ *   `SPAN_HALF` and `SPAN_SHARE`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
  * pictograms (ruling 13).
@@ -77,6 +78,12 @@ export interface PropEntry {
    * `run` or `extra`.
    */
   span: boolean;
+  /**
+   * A floor kind whose every variant stands at least `TALL_MIN` tall; the
+   * density measure counts them, `propModels.test.ts` pins it against
+   * geometry.
+   */
+  tall: boolean;
 }
 
 /** An archetype's weighted picks and density knobs. */
@@ -153,6 +160,10 @@ export const PROP_KINDS: readonly PropKind[] = [
   "toppled-crate",
   "debris-pile",
   "cable-coil",
+  "crate-stack",
+  "drum-rack",
+  "gas-rack",
+  "potted-tree",
   // ceiling
   "duct",
   "ceiling-tray",
@@ -177,6 +188,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   extinguisher: {
     anchor: "wall",
@@ -187,6 +199,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   "first-aid": {
     anchor: "wall",
@@ -197,6 +210,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   intercom: {
     anchor: "wall",
@@ -207,6 +221,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   "keycard-reader": {
     anchor: "wall",
@@ -217,6 +232,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   "vent-grille": {
     anchor: "wall",
@@ -227,6 +243,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "sign-plate": {
     anchor: "wall",
@@ -237,6 +254,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   "breaker-box": {
     anchor: "wall",
@@ -247,6 +265,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "wall-monitor": {
     anchor: "wall",
@@ -257,6 +276,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: true,
     span: false,
+    tall: false,
   },
   "padded-panel": {
     anchor: "wall",
@@ -267,6 +287,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "light-strip": {
     anchor: "wall",
@@ -277,6 +298,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "cable-tray": {
     anchor: "wall",
@@ -287,6 +309,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "pipe-bundle": {
     anchor: "wall",
@@ -297,6 +320,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "tool-board": {
     anchor: "wall",
@@ -307,6 +331,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "conduit-cabinet": {
     anchor: "wall",
@@ -317,6 +342,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "stowage-net": {
     anchor: "wall",
@@ -327,6 +353,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "pipe-riser": {
     anchor: "wall",
@@ -337,6 +364,7 @@ export const PROP_CATALOGUE = {
     wide: true,
     keepClear: false,
     span: false,
+    tall: false,
   },
   crate: {
     anchor: "floor",
@@ -347,6 +375,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   barrel: {
     anchor: "floor",
@@ -357,6 +386,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   trolley: {
     anchor: "floor",
@@ -367,6 +397,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   stool: {
     anchor: "floor",
@@ -377,6 +408,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "filing-cabinet": {
     anchor: "floor",
@@ -387,6 +419,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "storage-shelf": {
     anchor: "floor",
@@ -397,6 +430,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: true,
   },
   planter: {
     anchor: "floor",
@@ -407,6 +441,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   bench: {
     anchor: "floor",
@@ -417,6 +452,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "specimen-shelf": {
     anchor: "floor",
@@ -427,6 +463,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: true,
   },
   "fume-cabinet": {
     anchor: "floor",
@@ -437,6 +474,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: true,
   },
   "traffic-cone": {
     anchor: "floor",
@@ -447,6 +485,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   ladder: {
     anchor: "floor",
@@ -457,6 +496,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "tool-cart": {
     anchor: "floor",
@@ -467,6 +507,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "toppled-crate": {
     anchor: "floor",
@@ -477,6 +518,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "debris-pile": {
     anchor: "floor",
@@ -487,6 +529,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "cable-coil": {
     anchor: "floor",
@@ -497,6 +540,51 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
+  },
+  "crate-stack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+  },
+  "drum-rack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+  },
+  "gas-rack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+  },
+  "potted-tree": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
   },
   duct: {
     anchor: "ceiling",
@@ -507,6 +595,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "ceiling-tray": {
     anchor: "ceiling",
@@ -517,6 +606,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "cable-loop": {
     anchor: "ceiling",
@@ -527,6 +617,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   beacon: {
     anchor: "ceiling",
@@ -537,6 +628,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "loose-cable": {
     anchor: "ceiling",
@@ -547,6 +639,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: false,
+    tall: false,
   },
   "span-duct": {
     anchor: "ceiling",
@@ -557,6 +650,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: true,
+    tall: false,
   },
   "span-tray": {
     anchor: "ceiling",
@@ -567,6 +661,7 @@ export const PROP_CATALOGUE = {
     wide: false,
     keepClear: false,
     span: true,
+    tall: false,
   },
 } satisfies Record<PropKind, PropEntry>;
 
@@ -755,6 +850,13 @@ export const WIDE_REACH = 0.8;
  * read from the models.
  */
 export const WALL_PROP_DEPTH = 0.3;
+/**
+ * The least a tall floor kind's model stands, in metres (E5): every variant
+ * of a kind marked `tall` in `PROP_CATALOGUE` reaches at least this height,
+ * under `FLOOR_TOP` (2.2), so it reads over a cluster of ordinary props in a
+ * large hall. `propModels.test.ts` pins it against the built geometry.
+ */
+export const TALL_MIN = 1.6;
 /**
  * The side of a mid-hall cluster block, in cells (D6). The hall's interior
  * band is tiled from its north-west corner into blocks this size, partial
