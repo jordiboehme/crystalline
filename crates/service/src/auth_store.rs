@@ -4685,7 +4685,7 @@ pub(crate) fn normalize_resource(resource: &str) -> String {
 /// unreachable; this is the last line before attacker-chosen text lands in a
 /// field a person reads as the address they are being asked to recognize.
 pub(crate) fn redirect_host(uri: &str) -> String {
-    let Ok(parsed) = openidconnect::url::Url::parse(uri) else {
+    let Ok(parsed) = url::Url::parse(uri) else {
         return NO_REDIRECT_HOST.to_string();
     };
     match (parsed.host_str(), parsed.port()) {

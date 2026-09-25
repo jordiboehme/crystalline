@@ -979,6 +979,24 @@ use crate::scope::member_level_word;
 use crate::scope::{DomainRight, Scope};
 use crate::similar::SimilarProbe;
 
+/// rmcp's `subscriptions/listen` sink as the engine's registry sees it.
+#[derive(Debug)]
+struct RmcpListSink(rmcp::service::SubscriptionSink);
+
+#[async_trait::async_trait]
+impl crate::subscribers::ToolListSink for RmcpListSink {
+    async fn notify_tool_list_changed(&self) -> crate::subscribers::SinkDelivery {
+        use crate::subscribers::SinkDelivery;
+        use rmcp::service::SubscriptionSendError;
+        match self.0.notify_tool_list_changed().await {
+            Ok(()) => SinkDelivery::Delivered,
+            Err(SubscriptionSendError::SubscriptionClosed) => SinkDelivery::Closed,
+            Err(SubscriptionSendError::NotificationNotAccepted(_)) => SinkDelivery::NotAccepted,
+            Err(e) => SinkDelivery::Failed(e.to_string()),
+        }
+    }
+}
+
 /// The connected client's identity in the OKF agent form `name/version`, read
 /// from the initialize handshake rmcp keeps on the peer.
 ///
@@ -4031,7 +4049,7 @@ impl ServerHandler for McpServer {
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         let _registered = crate::subscribers::ListSubscribers::register(
             self.engine.list_subscribers(),
-            context.sink().clone(),
+            Arc::new(RmcpListSink(context.sink().clone())),
         );
         tracing::debug!(
             accepted = ?context.accepted(),

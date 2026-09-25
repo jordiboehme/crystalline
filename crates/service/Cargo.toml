@@ -97,6 +97,8 @@ zip = { workspace = true }
 # features (see the workspace pin), so its HTTP calls go through the client
 # below rather than through a reqwest of its own.
 openidconnect = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }
 # The one HTTP client this crate makes outbound calls with: discovery, the
 # JWKS fetch and the OIDC token exchange, wired into openidconnect through
 # `rest::oidc`'s `AsyncHttpClient` implementation. Was a dev-dependency only

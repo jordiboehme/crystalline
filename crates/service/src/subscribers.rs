@@ -17,7 +17,7 @@
 //! even always an MCP call: the control socket and the REST API write the same
 //! setting, which is why `Engine::configure` is what sends on these sinks.
 //!
-//! [`SubscriptionSink`] is `Clone`, every field is `Send + Sync + 'static`
+//! `SubscriptionSink` is `Clone`, every field is `Send + Sync + 'static`
 //! (`service/server.rs:139-144`), and it holds a `Peer` plus a child
 //! cancellation token - so an entry left behind after its stream ended would
 //! pin a dead peer. [`Subscriber`] is the RAII guard that prevents that:
@@ -27,7 +27,27 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rmcp::service::{SubscriptionSendError, SubscriptionSink};
+/// One place a `notifications/tools/list_changed` can be sent: in the daemon,
+/// a `subscriptions/listen` stream (`crate::mcp` wraps rmcp's sink in it).
+/// A trait so the engine, which owns the registry, never names the MCP crate.
+#[async_trait::async_trait]
+pub trait ToolListSink: Send + Sync + std::fmt::Debug {
+    /// Announce that the tool list moved, and say how it went.
+    async fn notify_tool_list_changed(&self) -> SinkDelivery;
+}
+
+/// How one announcement went, in the terms the registry acts on.
+#[derive(Debug)]
+pub enum SinkDelivery {
+    /// Sent.
+    Delivered,
+    /// The stream has ended: the registry drops the sink.
+    Closed,
+    /// The subscriber did not ask for the tools category.
+    NotAccepted,
+    /// Anything else, with the error's own text for the log line.
+    Failed(String),
+}
 
 /// Every open `subscriptions/listen` stream, keyed by a registration id this
 /// type hands out.
@@ -43,7 +63,7 @@ use rmcp::service::{SubscriptionSendError, SubscriptionSink};
 /// subscriber's notification.
 #[derive(Debug, Default)]
 pub struct ListSubscribers {
-    sinks: std::sync::Mutex<Vec<(u64, SubscriptionSink)>>,
+    sinks: std::sync::Mutex<Vec<(u64, Arc<dyn ToolListSink>)>>,
     next_id: AtomicU64,
 }
 
@@ -53,7 +73,7 @@ impl ListSubscribers {
     ///
     /// An associated function rather than a method because the guard has to
     /// own a handle on the registry, and the engine is what holds the `Arc`.
-    pub fn register(registry: &Arc<Self>, sink: SubscriptionSink) -> Subscriber {
+    pub fn register(registry: &Arc<Self>, sink: Arc<dyn ToolListSink>) -> Subscriber {
         let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
         registry.sinks.lock().unwrap().push((id, sink));
         Subscriber {
@@ -78,10 +98,10 @@ impl ListSubscribers {
     ///
     /// A peer that has gone away since it subscribed is dropped rather than
     /// retried: `SubscriptionSink::send` reports a cancelled stream as
-    /// [`SubscriptionSendError::SubscriptionClosed`], and the guard normally
+    /// `SubscriptionSendError::SubscriptionClosed`, and the guard normally
     /// removes such an entry already, so this is the belt to that braces.
     ///
-    /// [`SubscriptionSendError::NotificationNotAccepted`] is not a failure at
+    /// `SubscriptionSendError::NotificationNotAccepted` is not a failure at
     /// all: it is what a live stream that subscribed to other categories
     /// answers, which is the ordinary outcome for every sink here that did not
     /// ask for tools. It stays registered - its other categories are still
@@ -89,19 +109,19 @@ impl ListSubscribers {
     /// transport trouble and is logged, also without unregistering, so the
     /// next flip tries again.
     pub async fn notify_tool_list_changed(&self) {
-        let current: Vec<(u64, SubscriptionSink)> = self.sinks.lock().unwrap().clone();
+        let current: Vec<(u64, Arc<dyn ToolListSink>)> = self.sinks.lock().unwrap().clone();
         let mut closed: Vec<u64> = Vec::new();
         for (id, sink) in current {
             match sink.notify_tool_list_changed().await {
-                Ok(()) => {}
-                Err(SubscriptionSendError::SubscriptionClosed) => closed.push(id),
-                Err(SubscriptionSendError::NotificationNotAccepted(_)) => {
+                SinkDelivery::Delivered => {}
+                SinkDelivery::Closed => closed.push(id),
+                SinkDelivery::NotAccepted => {
                     tracing::debug!(
                         subscription = id,
                         "subscriber did not ask for the tools category"
                     );
                 }
-                Err(e) => {
+                SinkDelivery::Failed(e) => {
                     tracing::debug!(error = %e, "tools/list_changed could not be delivered");
                 }
             }

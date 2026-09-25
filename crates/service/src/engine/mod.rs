@@ -1809,7 +1809,7 @@ impl Engine {
 
     /// Where this instance's pages are, for the HTTP caller these headers came
     /// from.
-    pub fn request_web_base(&self, headers: &axum::http::HeaderMap) -> crate::web_url::WebBase {
+    pub fn request_web_base(&self, headers: &http::HeaderMap) -> crate::web_url::WebBase {
         let ui_enabled = self.config.read().unwrap().ui_enabled();
         match self.web_origin.get() {
             Some(rule) => rule.request_base(headers, ui_enabled),

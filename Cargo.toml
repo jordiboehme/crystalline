@@ -195,6 +195,15 @@ openidconnect = { version = "4.0.1", default-features = false, features = [
     "accept-string-booleans",
     "accept-rfc3339-timestamps",
 ] }
+# The URL type openidconnect re-exports as `openidconnect::url`, named
+# directly by the crates that parse addresses without speaking OpenID
+# Connect (crystalline-identity, crystalline-engine). Same crate, same
+# version as the re-export, so nothing new is built.
+url = "2.5.8"
+# The request types axum re-exports as `axum::http`, named directly by the
+# engine, which reads a request's headers but never serves one. Same crate,
+# same version as the re-export.
+http = "1.5.0"
 
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"

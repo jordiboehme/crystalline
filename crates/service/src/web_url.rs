@@ -23,7 +23,7 @@
 //! into a value another caller then reads would be wrong for whoever asked
 //! second.
 
-use axum::http::HeaderMap;
+use http::HeaderMap;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 

@@ -1204,7 +1204,7 @@ pub const PUBLIC_URL_KEY: &str = "service.public_url";
 /// the environment overlay - so the two cannot drift.
 pub fn service_public_url_problem(value: &str) -> Option<String> {
     let key = PUBLIC_URL_KEY;
-    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+    let Ok(url) = url::Url::parse(value.trim()) else {
         return Some(format!(
             "{key} must be an absolute url, for example https://knowledge.example.com, got '{value}'"
         ));
@@ -1220,9 +1220,9 @@ pub fn service_public_url_problem(value: &str) -> Option<String> {
         ));
     };
     let unspecified = match host {
-        openidconnect::url::Host::Ipv4(ip) => ip.is_unspecified(),
-        openidconnect::url::Host::Ipv6(ip) => ip.is_unspecified(),
-        openidconnect::url::Host::Domain(_) => false,
+        url::Host::Ipv4(ip) => ip.is_unspecified(),
+        url::Host::Ipv6(ip) => ip.is_unspecified(),
+        url::Host::Domain(_) => false,
     };
     if unspecified {
         return Some(format!(
@@ -1275,7 +1275,7 @@ pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
     match service_public_url_problem(&value) {
         Some(_) => clear_service_public_url(config),
         None => {
-            let origin = openidconnect::url::Url::parse(value.trim())
+            let origin = url::Url::parse(value.trim())
                 .expect("validated above")
                 .origin()
                 .ascii_serialization();
@@ -1294,7 +1294,7 @@ fn set_service_public_url(config: &mut GlobalConfig, value: &str) -> Result<(), 
     // Stored as its origin: the trailing slash gone, the host in its ascii
     // spelling, a default port dropped - the one spelling every reader of the
     // key compares, the same way the OAuth identifier is stored.
-    let origin = openidconnect::url::Url::parse(value.trim())
+    let origin = url::Url::parse(value.trim())
         .expect("validated above")
         .origin()
         .ascii_serialization();
@@ -1711,7 +1711,7 @@ fn set_trusted_header(config: &mut GlobalConfig, value: &str) -> Result<(), Sett
     // refusing to come up. Parsing here means a typo is refused at the moment
     // it is typed, rather than accepted now and discovered as a dead endpoint
     // at the next daemon start. The parse over there stays as the second layer.
-    if axum::http::HeaderName::try_from(trimmed.to_ascii_lowercase()).is_err() {
+    if http::HeaderName::try_from(trimmed.to_ascii_lowercase()).is_err() {
         return Err(SettingsError(format!(
             "auth.trusted_header must be a valid HTTP header name - letters, digits or any of \
              !#$%&'*+-.^_`|~, and nothing else - got '{value}'"
@@ -2188,16 +2188,16 @@ pub const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
 /// an address the browser never reaches).
 pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
     let key = "auth.oidc.redirect_uri";
-    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+    let Ok(url) = url::Url::parse(value.trim()) else {
         return Some(format!(
             "{key} must be an absolute url, for example \
              https://knowledge.example.com{OIDC_CALLBACK_PATH}, got '{value}'"
         ));
     };
     let loopback = match url.host() {
-        Some(openidconnect::url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        Some(openidconnect::url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(openidconnect::url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
     };
     match url.scheme() {
