@@ -19,10 +19,10 @@ use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
 };
-use crate::DiscardTarget;
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
+use crystalline_remote::ops::DiscardTarget;
 
 /// The caller, when they may drive this instance's share surfaces - the status
 /// report, the preview, the share, a withdrawal, and reading or resolving a

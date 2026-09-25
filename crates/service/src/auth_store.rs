@@ -189,13 +189,13 @@ pub fn normalize_account_name(name: &str) -> Result<String> {
 /// the machine owner its own work.
 pub fn normalize_new_account_name(name: &str) -> Result<String> {
     let folded = normalize_account_name(name)?;
-    if folded == crate::engine::OWNER_IDENTITY_NAME {
+    if folded == crate::scope::OWNER_IDENTITY_NAME {
         return Err(refuse(
             RefusalKind::InvalidName,
             format!(
                 "'{}' is the name this machine's own work is filed under, so it is not a login \
                  anybody can hold: pick another name for this account",
-                crate::engine::OWNER_IDENTITY_NAME
+                crate::scope::OWNER_IDENTITY_NAME
             ),
         ));
     }

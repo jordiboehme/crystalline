@@ -1178,18 +1178,7 @@ pub enum PreviewCredential {
     ReadScopeFallback,
 }
 
-/// The fixed identity name the machine owner's personal credential is stored
-/// under - the CLI and stdio MCP have no account to be, so they share one local
-/// name rather than inventing one per machine. `crystalline connect github
-/// --personal` with no `--as` writes exactly this slot.
-///
-/// It is also the actor key the machine owner's private drafts carry in a
-/// domain that reviews changes: the overlay rows, the journal folder, the files
-/// overlay inside it. So it is a reserved login, refused case-folded by
-/// [`crate::rest::auth_store::normalize_new_account_name`], because an account
-/// holding this name would be acting in the machine owner's own unshared work
-/// everywhere at once.
-pub const OWNER_IDENTITY_NAME: &str = "owner";
+pub use crate::scope::OWNER_IDENTITY_NAME;
 
 /// What a write is told when it reaches a domain that reviews changes before
 /// they land and nobody can say whose draft it would join.
@@ -1813,7 +1802,7 @@ impl Engine {
         };
         crate::web_url::local_base(
             public_url.as_deref(),
-            crate::instance::serve_intent().map(|intent| &intent.http),
+            crate::serving::serve_intent().map(|intent| &intent.http),
             config.ui_enabled(),
         )
     }

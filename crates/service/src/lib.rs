@@ -9,6 +9,7 @@
 //! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
+pub(crate) mod auth_store;
 pub mod client;
 pub mod collab;
 pub mod control;
@@ -36,6 +37,7 @@ pub mod rest;
 // `pub mod` made every one of them a broken link for a reader of the docs.
 pub(crate) mod review;
 pub mod scope;
+mod serving;
 pub mod settings;
 pub(crate) mod share_staging;
 pub mod similar;

@@ -1200,7 +1200,7 @@ impl Engine {
                  '{domain}' is {}, and editing somebody's draft needs the same editor access \
                  that writing anything else here needs. Suggest changes to whoever shared it, \
                  or ask for editor access on the domain.",
-                crate::rest::member_level_word(right)
+                crate::scope::member_level_word(right)
             )));
         }
         let join = crate::join::Join {

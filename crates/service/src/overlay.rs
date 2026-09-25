@@ -97,6 +97,13 @@ const REVIEW_OVERLAY_VALUE: &str = "overlay";
 /// and the `crystalline_remote::token` module docs).
 pub const GITHUB_TOKEN_ENV: &str = "CRYSTALLINE_GITHUB_TOKEN";
 
+/// The install-channel marker env var. The mcpb manifest sets it to "mcpb".
+pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
+
+/// The test-only variable that parks a blocking task in a daemon; see
+/// `parked_blocking_task`.
+pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
+
 /// Variables that live outside the settings registry and are read elsewhere.
 /// They are skipped silently rather than warned about, so a legitimate
 /// deployment does not get a spurious warning for a variable Crystalline
@@ -127,13 +134,13 @@ const RESERVED_VARS: &[&str] = &[
     // which the shutdown test uses to hold a `spawn_blocking` open while the
     // daemon is asked to stop. Read straight from the environment in
     // `run_serve`, so reserved for the same reason as the two above.
-    crate::daemon::PARK_BLOCKING_ENV,
-    // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
+    PARK_BLOCKING_ENV,
+    // The install-channel marker (see [`CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the
     // environment in `crate::stub`, never through the settings registry, so
     // reserve it here or every mcpb session logs a spurious warning.
-    crate::stub::CHANNEL_ENV,
+    CHANNEL_ENV,
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -1009,7 +1016,7 @@ mod tests {
             ("CRYSTALLINE_HEARTBEAT_SECS", "5"),
             ("CRYSTALLINE_STALE_SECS", "15"),
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
-            (crate::stub::CHANNEL_ENV, "mcpb"),
+            (CHANNEL_ENV, "mcpb"),
         ])
         .unwrap();
         assert!(

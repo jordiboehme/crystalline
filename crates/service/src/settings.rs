@@ -17,8 +17,8 @@ use crystalline_core::config::{
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
 
+use crate::auth_store::Role;
 use crate::overlay::EnvOverlay;
-use crate::rest::Role;
 
 /// What a credential-carrying setting renders as instead of its value:
 /// whether one is configured, and nothing more. The core marker, re-exported
@@ -35,6 +35,13 @@ pub use crystalline_core::config::SECRET_DISPLAY;
 pub fn is_secret_key(key: &str) -> bool {
     registry().iter().any(|s| s.key == key && s.secret)
 }
+
+/// The default HTTP bind address: where the endpoint comes up when nothing asks
+/// for another one, which since the default flip is the plain `crystalline serve`
+/// case too. `crate::settings` reports it as the effective `service.http` value
+/// so `config show` and the daemon cannot drift apart.
+#[doc(hidden)]
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
 /// An error applying, resetting or looking up a setting. The message is
 /// actionable and safe to show an agent or a terminal as-is.
@@ -1076,10 +1083,10 @@ fn clear_http(config: &mut GlobalConfig) {
 /// word back would leave a reader guessing which address it means.
 fn http_effective(config: &GlobalConfig) -> (String, bool) {
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
-        Some(HttpSetting::Enabled(true)) => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), false),
+        Some(HttpSetting::Enabled(true)) => (DEFAULT_HTTP_ADDR.to_string(), false),
         Some(HttpSetting::Enabled(false)) => ("false".to_string(), false),
         Some(HttpSetting::Address(a)) => (a.clone(), false),
-        None => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), true),
+        None => (DEFAULT_HTTP_ADDR.to_string(), true),
     }
 }
 
@@ -1797,7 +1804,8 @@ fn clear_oauth(config: &mut GlobalConfig) {
     drop_auth_if_empty(config);
 }
 
-fn oauth_effective(config: &GlobalConfig) -> (String, bool) {
+#[doc(hidden)]
+pub fn oauth_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.auth.as_ref().and_then(|a| a.oauth).is_none();
     (config.auth_oauth().to_string(), is_default)
 }
@@ -2149,7 +2157,10 @@ fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
         Some(role) => (role.clone(), false),
         // The same constant the relying party provisions at, so what this key
         // says it does when unset and what a sign-in then does cannot drift.
-        None => (crate::rest::DEFAULT_OIDC_ROLE.as_str().to_string(), true),
+        None => (
+            crate::auth_store::DEFAULT_OIDC_ROLE.as_str().to_string(),
+            true,
+        ),
     }
 }
 
@@ -3769,66 +3780,6 @@ mod tests {
     }
 
     // --- auth.oauth -----------------------------------------------------------
-
-    #[test]
-    fn auth_oauth_round_trips_and_needs_auth_mcp() {
-        let mut config = GlobalConfig::default();
-        assert!(!config.auth_oauth());
-        apply(&mut config, "auth.oauth", "true").unwrap();
-        assert!(config.auth_oauth());
-        assert_eq!(oauth_effective(&config), ("true".to_string(), false));
-
-        let no_env = EnvOverlay::default();
-        assert!(change_note("auth.oauth", &no_env).is_some());
-
-        let err = crate::rest::AuthCfg::resolve(&config)
-            .expect_err("auth.oauth without auth.mcp must refuse to resolve");
-        assert!(err.to_string().contains("auth.mcp"), "{err}");
-
-        unset(&mut config, "auth.oauth").unwrap();
-        assert!(!config.auth_oauth());
-        assert!(
-            config.auth.is_none(),
-            "the block this key created goes with it"
-        );
-    }
-
-    #[test]
-    fn auth_oauth_follows_auth_mcp_when_unset() {
-        let mut config = GlobalConfig::default();
-        assert!(!config.auth_oauth());
-
-        apply(&mut config, "auth.mcp", "true").unwrap();
-        assert!(
-            config.auth_oauth(),
-            "auth.mcp on with the UI served turns OAuth on unasked"
-        );
-        assert_eq!(oauth_effective(&config), ("true".to_string(), true));
-
-        apply(&mut config, "auth.oauth", "false").unwrap();
-        let (value, is_default) = oauth_effective(&config);
-        assert_eq!(value, "false");
-        assert!(!is_default, "an explicit false is no longer derived");
-
-        unset(&mut config, "auth.oauth").unwrap();
-        assert!(
-            config.auth_oauth(),
-            "unset returns to following auth.mcp, still true"
-        );
-
-        apply(&mut config, "service.ui", "false").unwrap();
-        assert!(
-            !config.auth_oauth(),
-            "a derived value never turns on where it cannot be served"
-        );
-        crate::rest::AuthCfg::resolve(&config)
-            .expect("a derived oauth value must never trip the auth.mcp guard");
-        // The daemon guards in `http_base` (`service.api`, `service.ui`) are
-        // private to `daemon.rs` and not reachable from here;
-        // `a_derived_oauth_value_never_trips_the_daemon_guards` in
-        // `tests/rest_api.rs` pins the property this config algebra implies -
-        // an instance that only ever set `auth.mcp` true keeps starting.
-    }
 
     // --- auth.proxy_headers ---------------------------------------------------
 

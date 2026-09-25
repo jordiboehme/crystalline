@@ -975,7 +975,7 @@ use crate::engine::{
     OVERLAY_NEEDS_IDENTITY, PreviewCredential, ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
-use crate::rest::member_level_word;
+use crate::scope::member_level_word;
 use crate::scope::{DomainRight, Scope};
 use crate::similar::SimilarProbe;
 

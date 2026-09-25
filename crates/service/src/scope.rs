@@ -21,7 +21,20 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::rest::{AuthStore, DomainAcl, MemberLevel, Role};
+use crate::auth_store::{AuthStore, DomainAcl, MemberLevel, Role};
+
+/// The fixed identity name the machine owner's personal credential is stored
+/// under - the CLI and stdio MCP have no account to be, so they share one local
+/// name rather than inventing one per machine. `crystalline connect github
+/// --personal` with no `--as` writes exactly this slot.
+///
+/// It is also the actor key the machine owner's private drafts carry in a
+/// domain that reviews changes: the overlay rows, the journal folder, the files
+/// overlay inside it. So it is a reserved login, refused case-folded by
+/// [`crate::rest::auth_store::normalize_new_account_name`], because an account
+/// holding this name would be acting in the machine owner's own unshared work
+/// everywhere at once.
+pub const OWNER_IDENTITY_NAME: &str = "owner";
 
 /// Who a request is acting as.
 ///
@@ -54,7 +67,7 @@ pub enum Scope {
 /// One function, so every write verb and every read verb asks the same
 /// question the same way. The mapping is the whole of the policy:
 ///
-/// * the machine owner drafts as [`crate::engine::OWNER_IDENTITY_NAME`]. Whoever runs
+/// * the machine owner drafts as [`OWNER_IDENTITY_NAME`]. Whoever runs
 ///   the CLI, the control socket or a local stdio session is one actor with
 ///   one name, and naming them makes the owner's own work reviewable beside
 ///   everybody else's rather than a special case that bypasses review;
@@ -67,7 +80,7 @@ pub enum Scope {
 ///   refusal that teaches how to connect rather than into a silent write.
 pub fn overlay_actor(scope: &Scope) -> Option<String> {
     match scope {
-        Scope::Unrestricted => Some(crate::engine::OWNER_IDENTITY_NAME.to_string()),
+        Scope::Unrestricted => Some(OWNER_IDENTITY_NAME.to_string()),
         Scope::User { account, .. } => Some(account.clone()),
         Scope::Anonymous => None,
     }
@@ -112,6 +125,20 @@ pub enum DomainRight {
     Manage,
     /// Everything, including making the domain shared again and handing it on.
     Own,
+}
+
+/// What a caller holding this right is called on the domain, for a refusal
+/// that has to name it. Only [`DomainRight::Read`] reaches a message today;
+/// the rest are spelled out so the mapping is complete rather than a default
+/// arm that would print "viewer" for something else one day.
+pub fn member_level_word(right: DomainRight) -> &'static str {
+    match right {
+        DomainRight::None => "none",
+        DomainRight::Read => "viewer",
+        DomainRight::Write => "editor",
+        DomainRight::Manage => "manager",
+        DomainRight::Own => "owner",
+    }
 }
 
 /// The scope resolved against the accounts table: what [`decide`] actually
@@ -917,7 +944,7 @@ mod tests {
     fn overlay_actor_names_the_owner_the_account_and_nobody() {
         assert_eq!(
             overlay_actor(&Scope::Unrestricted).as_deref(),
-            Some(crate::engine::OWNER_IDENTITY_NAME)
+            Some(OWNER_IDENTITY_NAME)
         );
         assert_eq!(
             overlay_actor(&Scope::User {

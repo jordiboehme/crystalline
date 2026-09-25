@@ -2140,6 +2140,8 @@ mod tests {
 
     use super::super::auth_store;
     use super::*;
+    use crate::overlay::EnvOverlay;
+    use crate::settings::{apply, change_note, oauth_effective, unset};
 
     async fn store() -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -2775,5 +2777,65 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "the anonymous viewer is told to log in: anonymous identities never write"
         );
+    }
+
+    #[test]
+    fn auth_oauth_round_trips_and_needs_auth_mcp() {
+        let mut config = GlobalConfig::default();
+        assert!(!config.auth_oauth());
+        apply(&mut config, "auth.oauth", "true").unwrap();
+        assert!(config.auth_oauth());
+        assert_eq!(oauth_effective(&config), ("true".to_string(), false));
+
+        let no_env = EnvOverlay::default();
+        assert!(change_note("auth.oauth", &no_env).is_some());
+
+        let err = AuthCfg::resolve(&config)
+            .expect_err("auth.oauth without auth.mcp must refuse to resolve");
+        assert!(err.to_string().contains("auth.mcp"), "{err}");
+
+        unset(&mut config, "auth.oauth").unwrap();
+        assert!(!config.auth_oauth());
+        assert!(
+            config.auth.is_none(),
+            "the block this key created goes with it"
+        );
+    }
+
+    #[test]
+    fn auth_oauth_follows_auth_mcp_when_unset() {
+        let mut config = GlobalConfig::default();
+        assert!(!config.auth_oauth());
+
+        apply(&mut config, "auth.mcp", "true").unwrap();
+        assert!(
+            config.auth_oauth(),
+            "auth.mcp on with the UI served turns OAuth on unasked"
+        );
+        assert_eq!(oauth_effective(&config), ("true".to_string(), true));
+
+        apply(&mut config, "auth.oauth", "false").unwrap();
+        let (value, is_default) = oauth_effective(&config);
+        assert_eq!(value, "false");
+        assert!(!is_default, "an explicit false is no longer derived");
+
+        unset(&mut config, "auth.oauth").unwrap();
+        assert!(
+            config.auth_oauth(),
+            "unset returns to following auth.mcp, still true"
+        );
+
+        apply(&mut config, "service.ui", "false").unwrap();
+        assert!(
+            !config.auth_oauth(),
+            "a derived value never turns on where it cannot be served"
+        );
+        AuthCfg::resolve(&config)
+            .expect("a derived oauth value must never trip the auth.mcp guard");
+        // The daemon guards in `http_base` (`service.api`, `service.ui`) are
+        // private to `daemon.rs` and not reachable from here;
+        // `a_derived_oauth_value_never_trips_the_daemon_guards` in
+        // `tests/rest_api.rs` pins the property this config algebra implies -
+        // an instance that only ever set `auth.mcp` true keeps starting.
     }
 }

@@ -27,8 +27,8 @@ use axum::http::HeaderMap;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 
-use crate::instance::{HttpBinding, loopback_connect_addr};
 use crate::rest::OriginRule;
+use crate::serving::{HttpBinding, loopback_connect_addr};
 
 /// The one sentence an unresolved outcome carries, naming the setting that
 /// answers it. Said once per response, never per row.

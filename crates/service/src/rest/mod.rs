@@ -5,7 +5,7 @@
 
 mod archive;
 mod auth;
-mod auth_store;
+use crate::auth_store;
 mod discovery;
 mod domains;
 mod domains_admin;
@@ -415,7 +415,7 @@ impl RestState {
     /// [`auth::setup`] alone, and never rendered into a response: see the
     /// handler for what it is compared with and why the comparison is
     /// constant-time.
-    pub(super) fn setup_token(&self) -> Option<&str> {
+    pub(crate) fn setup_token(&self) -> Option<&str> {
         self.setup_token.as_deref()
     }
 
@@ -435,7 +435,7 @@ impl RestState {
     /// minutes, and fencing co-editing joins for that long would hang every
     /// editor on the instance over a registration that closes no rooms. A
     /// create never sweeps anything, so it has no join window to close.
-    pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub(crate) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.engine.domain_admin().await
     }
 
@@ -455,7 +455,7 @@ impl RestState {
     /// rather than reach for the field. See [`auth::with_login_slot`] for what
     /// the cap is for and why the admin routes share the login one instead of
     /// getting a second.
-    pub(super) async fn with_login_slot<F: std::future::Future>(
+    pub(crate) async fn with_login_slot<F: std::future::Future>(
         &self,
         work: F,
     ) -> Result<F::Output, ApiError> {
@@ -463,7 +463,7 @@ impl RestState {
     }
 
     /// The login throttle, for the one handler that consults it.
-    pub(super) fn login_throttle(&self) -> &LoginThrottle {
+    pub(crate) fn login_throttle(&self) -> &LoginThrottle {
         &self.login_throttle
     }
 }
@@ -972,7 +972,7 @@ async fn wrong_method() -> ApiError {
 /// asked. The `crystalline` CLI on the server that holds the data is the
 /// recovery path - there is no flag that reopens this surface, on purpose
 /// (resolved ambiguity 7 in the plan).
-pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
+pub(crate) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
     if state.engine.read_only() {
         return Err(ApiError::forbidden(
             "this instance is read-only; changes are disabled here - use the \
@@ -996,7 +996,7 @@ pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
 /// with this: the MANIFEST read, the attachment listing and bytes, the inbound
 /// list's siblings. A resolver that cannot answer propagates as a 500 through
 /// the engine's `EngineError::Internal`, so this fails closed.
-pub(super) async fn require_domain_read(
+pub(crate) async fn require_domain_read(
     state: &RestState,
     identity: &Identity,
     domain: &str,
@@ -1040,7 +1040,7 @@ pub(super) async fn require_domain_read(
 /// the engine's rather than absent. The share surfaces beside them are NOT in that set: their gate
 /// moves with `github.share_identity`, so an instance editor reaches them in
 /// personal mode, and they carry a domain gate of their own.
-pub(super) async fn require_domain_write(
+pub(crate) async fn require_domain_write(
     state: &RestState,
     identity: &Identity,
     domain: &str,
@@ -1071,19 +1071,7 @@ pub(super) async fn require_domain_write(
     Ok(caller)
 }
 
-/// What a caller holding this right is called on the domain, for a refusal
-/// that has to name it. Only [`DomainRight::Read`] reaches a message today;
-/// the rest are spelled out so the mapping is complete rather than a default
-/// arm that would print "viewer" for something else one day.
-pub(crate) fn member_level_word(right: DomainRight) -> &'static str {
-    match right {
-        DomainRight::None => "none",
-        DomainRight::Read => "viewer",
-        DomainRight::Write => "editor",
-        DomainRight::Manage => "manager",
-        DomainRight::Own => "owner",
-    }
-}
+pub(crate) use crate::scope::member_level_word;
 
 /// Refuse an empty password before it is hashed into an account nobody can log
 /// in as. The store would accept it; `crystalline users` refuses it, and this
@@ -1094,7 +1082,7 @@ pub(crate) fn member_level_word(right: DomainRight) -> &'static str {
 /// the same rule is how the two surfaces would drift: an installation whose
 /// very first admin was allowed a password no later account could have is
 /// exactly the wrong place to discover that.
-pub(super) fn check_password(password: &str) -> Result<(), ApiError> {
+pub(crate) fn check_password(password: &str) -> Result<(), ApiError> {
     if password.is_empty() {
         return Err(ApiError::unprocessable(
             "the password is empty; pick one with at least one character",

@@ -23,12 +23,7 @@ use crate::engine::{Engine, WatchEvent};
 use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
-
-/// The default HTTP bind address: where the endpoint comes up when nothing asks
-/// for another one, which since the default flip is the plain `crystalline serve`
-/// case too. `crate::settings` reports it as the effective `service.http` value
-/// so `config show` and the daemon cannot drift apart.
-pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+use crate::settings::DEFAULT_HTTP_ADDR;
 
 /// How long a daemon asked to `--exit-when-idle` waits after its last socket
 /// session ends before it leaves. Long enough for Claude Desktop to restart its
@@ -90,9 +85,7 @@ const COPYRIGHT_LINE: &str = concat!(
 /// does, so the two spellings cannot drift apart unnoticed.
 pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
-/// The test-only variable that parks a blocking task in a daemon; see
-/// [`parked_blocking_task`].
-pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
+pub use crate::overlay::PARK_BLOCKING_ENV;
 
 /// How long a daemon parks one `spawn_blocking` task at startup, from
 /// [`PARK_BLOCKING_ENV`], or `None`.
