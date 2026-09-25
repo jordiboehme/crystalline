@@ -465,6 +465,47 @@ describe("heroHallRoom", () => {
 
     expect([...hall.curios].sort(CURIO_ORDER)).toEqual(hall.curios);
   });
+
+  it("lays every row along its host's local a axis: a curio row's centres differ only there, never along d", () => {
+    // Post-breaker ("rows along the wall"): `row` lays a surface's curios
+    // along the host's own wall-parallel `a` axis (world x at an even
+    // turn, world z at an odd one, `turnedPoint` in `footprints.ts`), never
+    // along `d`, the axis running from the wall into the room. Grouped by
+    // the surface's own token (`key[2]`), since `hostOf` recomputes
+    // `hostSurfaces` per call and never returns the same object twice.
+    const groups = new Map<
+      string,
+      { turn: number; along: number; cross: number }[]
+    >();
+    for (const c of hall.curios) {
+      const s = hostOf(hall, c);
+      if (s === undefined) continue;
+      const box = curioBox(c);
+      const cx = (box.x0 + box.x1) / 2;
+      const cz = (box.z0 + box.z1) / 2;
+      const aIsX = (((Math.round(s.turn) % 4) + 4) % 4) % 2 === 0;
+      const point = {
+        turn: s.turn,
+        along: aIsX ? cx : cz,
+        cross: aIsX ? cz : cx,
+      };
+      const list = groups.get(s.key[2]) ?? [];
+      list.push(point);
+      groups.set(s.key[2], list);
+    }
+    let rowsChecked = 0;
+    for (const [host, points] of groups) {
+      if (points.length < 2) continue;
+      rowsChecked++;
+      const cross = new Set(points.map((p) => Math.round(p.cross * 1e6)));
+      expect(cross.size, `${host}: cross-axis centres`).toBe(1);
+      const along = new Set(points.map((p) => Math.round(p.along * 1e6)));
+      expect(along.size, `${host}: along-axis centres`).toBe(points.length);
+    }
+    // The mess table, the tube bench and the laser desk each carry more
+    // than one curio; a row of one (the gun bench) has nothing to compare.
+    expect(rowsChecked).toBe(3);
+  });
 });
 
 describe("galleryRoom curios", () => {

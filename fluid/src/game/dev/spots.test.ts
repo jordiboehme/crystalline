@@ -28,13 +28,7 @@ import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
 import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
-import {
-  blockersFor,
-  EYE_HEIGHT,
-  MAX_PITCH,
-  PLAYER_RADIUS,
-  spawnPlayer,
-} from "../world/move";
+import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
 import { PROP_KINDS } from "../world/props";
 import { wallAnchor } from "../world/sites";
 import type { Box, Curio, Fixture, Hero, RoomSpec } from "../world/types";
@@ -43,8 +37,6 @@ import { GAME_VERSION } from "../version";
 import { roomWithForcedCurio } from "./demo";
 import {
   CURIO_FAR,
-  CURIO_NEAR,
-  CURIO_STEP,
   SPOT_KINDS,
   circleOverlapsBox,
   curioSightClear,
@@ -474,52 +466,16 @@ describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)
   });
 
   /**
-   * True when some candidate `frameCurio` tries for `c` (four sides, from
-   * `CURIO_NEAR` by `CURIO_STEP` out to `far`) stands the player and sees
-   * `c` (`curioSightClear`, the other curios included).
+   * Post-breaker, "rows along the wall": `row` (`world/canned.ts`) now lays
+   * a hero surface's curios along the host's local `a` axis rather than
+   * whichever world axis its box happened to span more, and the hall's
+   * rows were regrouped to fit that budget. The two curios round 5 pinned
+   * as hidden (light-sword 0 behind pink-gadget 0 on the gun bench,
+   * light-sword 1 behind light-sword 2 on the tube bench, both standing
+   * one behind the other on the only line a player could stand) no longer
+   * stand behind anything: every curio in the hall now has a clear spot.
    */
-  function anyClearSpot(room: RoomSpec, c: Curio, far: number): boolean {
-    const blockers = blockersFor(room);
-    const box = curioBox(c);
-    const cx = (box.x0 + box.x1) / 2;
-    const cz = (box.z0 + box.z1) / 2;
-    const f = HERO_FRONT[c.turn] ?? [0, -1];
-    const sides = [f, [-f[1], f[0]], [f[1], -f[0]], [-f[0], -f[1]]] as const;
-    const steps = Math.round((far - CURIO_NEAR) / CURIO_STEP);
-    for (const [dx, dz] of sides) {
-      for (let k = 0; k <= steps; k++) {
-        const dist = CURIO_NEAR + k * CURIO_STEP;
-        const x = cx + dx * dist;
-        const z = cz + dz * dist;
-        const onFloor = [x - PLAYER_RADIUS, x + PLAYER_RADIUS].every((px) =>
-          [z - PLAYER_RADIUS, z + PLAYER_RADIUS].every((pz) =>
-            isFloor(room.grid, Math.floor(px / CELL), Math.floor(pz / CELL)),
-          ),
-        );
-        if (!onFloor || blockers.some((b) => circleOverlapsBox(x, z, b)))
-          continue;
-        if (curioSightClear(room, { x, z }, c)) return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * The hero hall's two curios that no spot of the search can see (fix
-   * round 5): each stands against the bench's back wall with another curio
-   * in front of it on the same line (light-sword 1 behind light-sword 2 on
-   * the tube bench, light-sword 0 behind pink-gadget 0 on the gun bench).
-   * Right and left of them are not standable (the wall is closer than the
-   * player's radius), behind them is the wall, and every front spot looks
-   * through the curio in front, whose top the line cannot pass over. The
-   * ruling keeps `canned.ts` as it is, so this is pinned as a limit.
-   */
-  const HIDDEN = new Set([
-    "hero-hall prop:light-sword:0",
-    "hero-hall prop:light-sword:1",
-  ]);
-
-  it("frames every curio of both rooms from a spot with a clear sight line, other curios included, but the two pinned as hidden", () => {
+  it("frames every curio of both rooms from a spot with a clear sight line, other curios included", () => {
     for (const room of [heroHallRoom(), galleryRoom()]) {
       for (const { c, spot } of withOrdinals(room)) {
         const name = `${room.permalink} ${spot}`;
@@ -530,17 +486,8 @@ describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)
         expect(
           curioSightClear(room, { x: player.x, z: player.z }, c),
           name,
-        ).toBe(!HIDDEN.has(name));
+        ).toBe(true);
       }
-    }
-  });
-
-  it("finds no clear spot at all, out to 15 m, for the two hidden hall curios", () => {
-    const hall = heroHallRoom();
-    for (const { c, spot } of withOrdinals(hall)) {
-      const name = `${hall.permalink} ${spot}`;
-      if (!HIDDEN.has(name)) continue;
-      expect(anyClearSpot(hall, c, 15), name).toBe(false);
     }
   });
 
