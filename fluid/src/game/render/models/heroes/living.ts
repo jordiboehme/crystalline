@@ -36,13 +36,13 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import { heroHalf, type HeroRecipe } from "./common";
+import { ALUMINIUM, heroHalf, type HeroRecipe } from "./common";
 
 /** The mess table, its benches and the sleep pods' shells: a clean warm off-white. */
 const TABLE_WHITE: Rgb = [0.9, 0.9, 0.88];
 
 /** The mess table's grey trim: the skirt under its top, its foot and the tray. A soft gunmetal. */
-const TRIM_GREY: Rgb = [0.55, 0.55, 0.57];
+const TRIM_GREY: Rgb = ALUMINIUM;
 
 /** The drinking bird's red liquid, in its body bulb and the foot of its neck. */
 const RED_LIQUID: Rgb = [0.75, 0.1, 0.1];

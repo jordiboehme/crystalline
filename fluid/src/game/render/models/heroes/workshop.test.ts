@@ -3,7 +3,8 @@
  * check for every kind. The gun bench's and the tube bench's catalogue
  * tops lie on an upward face of their mesh; the core wall's lamps cover
  * all eight twinkle groups and never overlap; the big gun, taken from the
- * built rack and bench, is the same parts only moved; the tube bench's
+ * built rack and bench, is the same parts only moved, and nothing else
+ * meets its grip; the tube bench's
  * three tubes meet at one round hub, two arms up and the stem down; the
  * field pack's chase climbs its cell one light per group and runs round
  * its cyclotron in ring order; and no part of any workshop hero floats:
@@ -117,16 +118,30 @@ function upwardFaceAt(mesh: MeshData, x: number, z: number, h: number) {
 const TOUCH = 0.012;
 
 /**
- * Whether two parts touch: their bounds overlap with some volume (a sleeve
- * round a barrel, a part sunk into another), or a vertex of one lies
- * within `TOUCH` of a triangle of the other.
+ * Whether one shape is a sleeve round the other: their bounds overlap on
+ * every axis, and on at least two axes one's range holds the other's
+ * whole (a collar round a barrel, a ring round a tube). No vertex of
+ * either lies near a triangle of the other, so the vertex test alone
+ * would call it loose.
+ */
+function sleeve(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (!axes.every((k) => p.lo[k] < q.hi[k] && q.lo[k] < p.hi[k])) return false;
+  const holds = (o: Shape, i: Shape) =>
+    axes.filter((k) => o.lo[k] <= i.lo[k] + 1e-6 && i.hi[k] <= o.hi[k] + 1e-6)
+      .length >= 2;
+  return holds(p, q) || holds(q, p);
+}
+
+/**
+ * Whether two parts touch: one is a sleeve round the other (`sleeve`), or
+ * a vertex of one lies within `TOUCH` of a triangle of the other.
  */
 function touching(p: Shape, q: Shape): boolean {
   const axes = [0, 1, 2] as const;
   if (axes.some((k) => p.lo[k] > q.hi[k] + TOUCH || q.lo[k] > p.hi[k] + TOUCH))
     return false;
-  if (axes.every((k) => p.lo[k] < q.hi[k] - 1e-6 && q.lo[k] < p.hi[k] - 1e-6))
-    return true;
+  if (sleeve(p, q)) return true;
   const near = (from: Shape, to: Shape) => {
     for (let t = 0; t + 2 < to.points.length; t += 3) {
       const [a, b, c] = [to.points[t], to.points[t + 1], to.points[t + 2]];
@@ -137,6 +152,33 @@ function touching(p: Shape, q: Shape): boolean {
     return false;
   };
   return near(p, q) || near(q, p);
+}
+
+/**
+ * The big gun inside the built gun rack and gun bench: the longest run of
+ * parts, in build order, that the bench repeats from the rack, each moved
+ * by one and the same offset. Returns both part lists, where the run
+ * starts in each and its length.
+ */
+function gunRun() {
+  const rack = partsOf("gun-rack");
+  const bench = partsOf("gun-bench");
+  let best = { i: 0, j: 0, n: 0 };
+  for (let i = 0; i < rack.length; i++)
+    for (let j = 0; j < bench.length; j++) {
+      const [r0, b0] = [rack[i], bench[j]];
+      if (!r0 || !b0 || !sameMoved(r0, b0)) continue;
+      const shift = offsetOf(r0, b0);
+      let n = 0;
+      for (;;) {
+        const [r, b] = [rack[i + n], bench[j + n]];
+        if (!r || !b || !sameMoved(r, b)) break;
+        if (gap(offsetOf(r, b), shift) > 1e-6) break;
+        n++;
+      }
+      if (n > best.n) best = { i, j, n };
+    }
+  return { rack, bench, ...best };
 }
 
 /** The workshop kinds, each tested in every variant. */
@@ -210,35 +252,37 @@ describe("workshop hero models", () => {
   });
 
   it("the big gun is the same on the rack and the bench", () => {
-    // The longest run of parts, in build order, that the bench repeats from
-    // the rack, each moved by one and the same offset: that run is the gun.
-    const rack = partsOf("gun-rack");
-    const bench = partsOf("gun-bench");
-    let best = { i: 0, j: 0, n: 0 };
-    for (let i = 0; i < rack.length; i++)
-      for (let j = 0; j < bench.length; j++) {
-        const [r0, b0] = [rack[i], bench[j]];
-        if (!r0 || !b0 || !sameMoved(r0, b0)) continue;
-        const shift = offsetOf(r0, b0);
-        let n = 0;
-        for (;;) {
-          const [r, b] = [rack[i + n], bench[j + n]];
-          if (!r || !b || !sameMoved(r, b)) break;
-          if (gap(offsetOf(r, b), shift) > 1e-6) break;
-          n++;
-        }
-        if (n > best.n) best = { i, j, n };
-      }
+    const { rack, bench, i, j, n } = gunRun();
     // Stock, body, spine, bezel, window, barrel, three collars, four vent
     // slots, the muzzle and the grip.
-    expect(best.n).toBe(15);
+    expect(n).toBe(15);
     // Every light of either model is the gun's core, all inside the run.
     const lights = rack.filter(blinks);
     expect(lights.length).toBeGreaterThan(0);
-    expect(rack.slice(best.i, best.i + best.n).filter(blinks)).toEqual(lights);
-    expect(bench.slice(best.j, best.j + best.n).filter(blinks)).toEqual(
-      bench.filter(blinks),
-    );
+    expect(rack.slice(i, i + n).filter(blinks)).toEqual(lights);
+    expect(bench.slice(j, j + n).filter(blinks)).toEqual(bench.filter(blinks));
+  });
+
+  it("keeps every other part clear of the big gun's grip, on the rack and the bench", () => {
+    const { rack, bench, i, j, n } = gunRun();
+    for (const [name, parts, at] of [
+      ["rack", rack, i],
+      ["bench", bench, j],
+    ] as const) {
+      const gun = parts.slice(at, at + n);
+      const grip = gun.find((p) => p.method === "extrude");
+      if (!grip) throw new Error(`${name}: no grip in the gun`);
+      const g = shape(grip.points);
+      const others = parts.filter((p) => !gun.includes(p));
+      expect(others.length, name).toBeGreaterThan(0);
+      for (const other of others) {
+        const o = shape(other.points);
+        const overlaps = ([0, 1, 2] as const).every(
+          (k) => o.lo[k] < g.hi[k] - 1e-6 && g.lo[k] < o.hi[k] - 1e-6,
+        );
+        expect(overlaps, `${name} ${other.method}`).toBe(false);
+      }
+    }
   });
 
   it("the tube bench's three tubes meet at one round hub, two arms up and the stem down", () => {

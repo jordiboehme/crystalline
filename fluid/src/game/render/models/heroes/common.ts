@@ -34,6 +34,9 @@ import type { Kit } from "../../kit";
 import type { Look, Rgb } from "../../looks";
 import type { KitAt, Surfaces } from "../common";
 
+/** Bare aluminium: frames, grilles and trims, shared by every batch. */
+export const ALUMINIUM: Rgb = [0.55, 0.55, 0.57];
+
 /** A status light that says all is well, shared by every hero that shows one. */
 export const STATUS_GREEN: Rgb = [0.25, 1.0, 0.35];
 

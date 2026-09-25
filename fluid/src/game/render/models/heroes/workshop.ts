@@ -37,6 +37,7 @@ import {
   type Surfaces,
 } from "../common";
 import {
+  ALUMINIUM,
   cornerPosts,
   heroHalf,
   STATUS_AMBER,
@@ -77,7 +78,7 @@ const PAD_RUBBER: Rgb = [0.35, 0.31, 0.27];
 /** The big gun's overall length, stock to muzzle, in metres. */
 const GUN_LENGTH = 1.3;
 /** The body's depth (back to front) and height, in metres. */
-const GUN_DEPTH = 0.2;
+const GUN_DEPTH = 0.22;
 const GUN_HEIGHT = 0.3;
 /** The stock's length at the rear, its height band above `h0` and its depth. */
 const STOCK_LEN = 0.2;
@@ -87,8 +88,8 @@ const STOCK_DEPTH = 0.14;
 /** The body's length after the stock; the square barrel takes the rest. */
 const BODY_LEN = 0.6;
 /** The square barrel's side and its vent collars' side, in metres. */
-const BARREL_SIDE = 0.16;
-const COLLAR_SIDE = 0.19;
+const BARREL_SIDE = 0.22;
+const COLLAR_SIDE = 0.25;
 /** The core window on the body's front: its span along the body and its margins. */
 const WINDOW_A0 = 0.1;
 const WINDOW_A1 = 0.52;
@@ -218,13 +219,13 @@ export function bigGun(
         a - 0.008,
         a + 0.008,
         dc + b + DECAL_LIFT,
-        hc - 0.05,
-        hc + 0.05,
+        hc - 0.07,
+        hc + 0.07,
         s.dark,
       );
     }
   }
-  k.box(aEnd - 0.03, aEnd, dc - 0.05, dc + 0.05, hc - 0.05, hc + 0.05, core);
+  k.box(aEnd - 0.03, aEnd, dc - 0.07, dc + 0.07, hc - 0.07, hc + 0.07, core);
 
   const gripTopA = aBody + GRIP_AT;
   const gripFootA = gripTopA - 0.06;
@@ -277,8 +278,8 @@ function benchSurface(kind: HeroKind): HeroSurfaceSpec {
  * A heavy workbench, backed against its wall: a top slab from
  * `top - SLAB_THICK` to `top` over the whole footprint, four square legs
  * (`cornerPosts`) standing `LEG_IN_A` in from its ends and `LEG_IN_D` in
- * from its back and front, a lower shelf spanning leg centre to leg centre
- * so it rests in all four, and a blank pegboard panel standing at the wall
+ * from its back and front, a lower shelf out to the legs' outer faces so
+ * it rests in all four, and a blank pegboard panel standing at the wall
  * from `top` up to `top + PEGBOARD_RISE`. `hw` is the bench's half width
  * and `depth` its footprint depth (`heroHalf`'s `d1`); every recipe that
  * calls it adds its own gear on the slab and the board.
@@ -294,7 +295,9 @@ export function workbench(
   const legA = hw - LEG_IN_A;
   const legD = [LEG_IN_D, depth - LEG_IN_D];
   cornerPosts(k, [-legA, legA], legD, LEG_HALF, 0, top - SLAB_THICK, s.metal);
-  k.box(-legA, legA, LEG_IN_D, depth - LEG_IN_D, SHELF_H0, SHELF_H1, s.metal);
+  const shelfA = legA + LEG_HALF;
+  const [shelfD0, shelfD1] = [LEG_IN_D - LEG_HALF, depth - LEG_IN_D + LEG_HALF];
+  k.box(-shelfA, shelfA, shelfD0, shelfD1, SHELF_H0, SHELF_H1, s.metal);
   k.box(-hw + 0.05, hw - 0.05, 0, 0.03, top, top + PEGBOARD_RISE, s.panel);
 }
 
@@ -505,8 +508,8 @@ const RACK_BACK_D = 0.04;
 /** The gun's placement on the rack: its span along the wall, its back and front, its base. */
 const RACK_GUN_A0 = -0.8;
 const RACK_GUN_A1 = 0.85;
-const RACK_GUN_D0 = 0.06;
-const RACK_GUN_D1 = 0.28;
+const RACK_GUN_D0 = 0.055;
+const RACK_GUN_D1 = 0.275;
 const RACK_GUN_H0 = 1.15;
 
 /** How deep a cradle bracket reaches under the gun, and how tall it is. */
@@ -558,16 +561,20 @@ const BENCH_GUN_D1 = 0.54;
 /** How far the gun's belly sits above the bench top: the grip's drop and a little air. */
 const BENCH_GUN_LIFT = GRIP_DROP + 0.02;
 
-/** The pegboard's tool silhouettes: their a-centres, heights and head widths. */
+/**
+ * The pegboard's tool silhouettes, all on the free left part behind the
+ * catalogue surface, clear of the gun: their a-centres, heights and head
+ * widths.
+ */
 const BENCH_TOOLS: readonly {
   a: number;
   h0: number;
   h1: number;
   head: number;
 }[] = [
-  { a: -0.7, h0: 1.0, h1: 1.32, head: 0.05 },
-  { a: -0.3, h0: 1.05, h1: 1.28, head: 0.035 },
-  { a: 0.6, h0: 1.05, h1: 1.3, head: 0.06 },
+  { a: -0.82, h0: 1.0, h1: 1.32, head: 0.05 },
+  { a: -0.69, h0: 1.05, h1: 1.28, head: 0.035 },
+  { a: -0.56, h0: 1.02, h1: 1.3, head: 0.05 },
 ];
 
 /**
@@ -629,18 +636,18 @@ const BOX_D1 = 0.7;
 const BOX_H1 = 1.4;
 /** The box's wall thickness, and the front window frame's rail and stile widths. */
 const BOX_WALL = 0.02;
-const FRAME_RAIL = 0.06;
+const FRAME_RAIL = 0.04;
 const FRAME_TOP_RAIL = 0.04;
 const FRAME_STILE = 0.04;
 
 /** The Y of tubes: its hub's centre in `(a, h)`, the hub's depth band and radius. */
 const HUB_A = 0.4;
-const HUB_H = 1.15;
+const HUB_H = 1.197;
 const HUB_D0 = 0.58;
 const HUB_D1 = 0.64;
-const HUB_RADIUS = 0.045;
+const HUB_RADIUS = 0.055;
 /** A tube's length from the hub's centre, its width and its depth band (inside the hub's). */
-const TUBE_LEN = 0.19;
+const TUBE_LEN = 0.25;
 const TUBE_WIDTH = 0.028;
 const TUBE_D0 = 0.6;
 const TUBE_D1 = 0.62;
@@ -648,9 +655,13 @@ const TUBE_D1 = 0.62;
 /** The Y's three arm directions in degrees: two arms up and out, the stem straight down. */
 const TUBE_ANGLES_DEG: readonly number[] = [30, 150, 270];
 
-/** The side door: its hinge at the box's back right corner, its width and how far it stands open. */
+/**
+ * The side door: its hinge at the box's back right corner, its width, and
+ * how far it stands open from shut. A shut door runs along `d`, so its
+ * frame is yawed a quarter turn less this.
+ */
 const DOOR_WIDTH = BOX_D1 - BOX_D0;
-const DOOR_OPEN = (55 * Math.PI) / 180;
+const DOOR_OPEN = (35 * Math.PI) / 180;
 
 /** The soldering lamp: its base, its two jointed arms and the shade hanging from the second. */
 const LAMP_A = -0.15;
@@ -678,7 +689,7 @@ const COIL_RADIUS = 0.07;
  * and three tiny sparks flicker on the hub's face.
  */
 function tubeY(k: Kit, s: Surfaces): void {
-  k.extrude(discOutline(HUB_A, HUB_H, HUB_RADIUS, 10), HUB_D0, HUB_D1, s.dark);
+  k.extrude(discOutline(HUB_A, HUB_H, HUB_RADIUS, 12), HUB_D0, HUB_D1, s.dark);
   const mount = (a: number, h: number) =>
     k.box(
       a - 0.01,
@@ -758,8 +769,8 @@ function tubeBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
     am - 0.09,
     am + 0.09,
     BOX_D1 + DECAL_LIFT,
-    h0 + 0.015,
-    h0 + 0.045,
+    h0 + 0.01,
+    h0 + 0.03,
     s.tinted(LABEL_CREAM),
   );
   STATUS_TINTS.forEach((tint, i) => {
@@ -776,7 +787,7 @@ function tubeBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
   });
   tubeY(k, s);
 
-  const door = kitAt(yawed(ORIGIN, BOX_A1, BOX_D0, DOOR_OPEN));
+  const door = kitAt(yawed(ORIGIN, BOX_A1, BOX_D0, Math.PI / 2 - DOOR_OPEN));
   door.box(0, DOOR_WIDTH, -BOX_WALL, 0, h0 + 0.01, BOX_H1 - 0.01, s.metal);
   door.box(0.05, DOOR_WIDTH - 0.05, 0, 0.006, h0 + 0.08, BOX_H1 - 0.08, s.dark);
   for (const h of [h0 + 0.08, BOX_H1 - 0.12])
@@ -904,8 +915,8 @@ const tubeBench: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
 /** The pack's shell: a matte black. */
 const PACK_BLACK: Rgb = [0.06, 0.06, 0.07];
 
-/** The pack's frame, the cyclotron and the wand's barrel: a bare aluminium grey. */
-const FRAME_GREY: Rgb = [0.55, 0.55, 0.57];
+/** The pack's frame, the cyclotron and the wand's barrel: bare aluminium. */
+const FRAME_GREY: Rgb = ALUMINIUM;
 
 /** The wand's body: a mid grey. */
 const WAND_GREY: Rgb = [0.42, 0.43, 0.45];
@@ -938,12 +949,6 @@ const FRAME_OVER = 0.02;
 /** How far v0's body top leans back of its bottom, in metres. */
 const PACK_LEAN = 0.08;
 
-/**
- * v1's frame plate's bottom: the pack stands on its rack so that the
- * frame's top reaches the catalogue top, 1.6.
- */
-const V1_PLATE_H0 = 1.6 - FRAME_OVER - PACK_H - PLATE_H;
-
 /** The rack's deck and its posts (v1). */
 const RACK_DECK_T = 0.03;
 const RACK_HALF_A = 0.3;
@@ -952,13 +957,15 @@ const RACK_POST_A = 0.28;
 const RACK_POST_D = 0.2;
 const RACK_RAIL_H = 0.25;
 
+/** v0's easel: its front legs' feet along `a`, and its back struts' feet in `d`. */
+const EASEL_FOOT_A = 0.32;
+const EASEL_FOOT_D = -0.32;
+
 /** The wand's length, gunbox to tip, and where its axis stands off the body's left side. */
 const WAND_LEN = 0.5;
 const WAND_OFF = 0.065;
-/** v0's wand stand: the wand's bottom height, its axis's depth and the base disc's radius. */
-const V0_WAND_BASE = 1.1;
-const V0_WAND_D = 0.05;
-const V0_STAND_RADIUS = 0.09;
+/** How far above the body's bottom the stowed wand's gunbox starts. */
+const WAND_RISE = 0.1;
 
 /** The ribbed hose's radius, its ribs' radius and their spacing along the hose. */
 const HOSE_RADIUS = 0.02;
@@ -980,9 +987,13 @@ interface PackPose {
   back(h: number): number;
 }
 
-/** The pose of variant `variant`: v0 on the floor leaning back, v1 upright on its rack. */
-function packPose(variant: number): PackPose {
-  const plate = variant === 0 ? 0 : V1_PLATE_H0;
+/**
+ * The pose of variant `variant` under the catalogue top `top`: in both the
+ * frame's plate sits so the frame's top reaches `top`; v0 leans back on its
+ * easel, v1 stands upright on its rack.
+ */
+function packPose(variant: number, top: number): PackPose {
+  const plate = top - FRAME_OVER - PACK_H - PLATE_H;
   const bottom = plate + PLATE_H;
   const lean = (h: number) =>
     variant === 0 ? (PACK_LEAN * (h - bottom)) / PACK_H : 0;
@@ -1284,57 +1295,99 @@ function ribbedHose(
 }
 
 /**
- * v0's stand: two struts from the frame's uprights, low on its back, down
- * behind it to the floor, a foot pad each, so the leaning pack is propped;
- * and the wand's own floor stand beside the pack (a base disc and a thin
- * post up to the wand).
+ * v0's easel: two front legs splayed out along `a` from under the frame's
+ * plate down to the floor, with a crossbar between them, and two struts
+ * from the frame's uprights, low on its back, down behind it, a foot pad
+ * under every leg, so the leaning pack is propped at full height.
  */
-function packV0Stands(
-  k: Kit,
-  kitAt: KitAt,
-  s: Surfaces,
-  p: PackPose,
-  aWand: number,
-): void {
+function packV0Easel(k: Kit, kitAt: KitAt, s: Surfaces, p: PackPose): void {
+  const grey = s.tinted(FRAME_GREY);
   const footH = 0.03;
-  const footD = p.back(0) - FRAME_T - 0.16;
+  const legD1 = p.front(p.bottom) - 0.03;
+  const legD0 = legD1 - FRAME_T;
+  const topA = FRAME_A - 0.03;
+  const legA = (h: number) =>
+    topA + ((EASEL_FOOT_A - topA) * (p.plate - h)) / (p.plate - footH);
+  for (const side of [-1, 1]) {
+    const [a0, h0, a1, h1] = [side * topA, p.plate, side * EASEL_FOOT_A, footH];
+    k.extrude(
+      tiltedBar(
+        (a0 + a1) / 2,
+        (h0 + h1) / 2,
+        Math.atan2(h1 - h0, a1 - a0),
+        Math.hypot(a1 - a0, h1 - h0),
+        0.025,
+      ),
+      legD0,
+      legD1,
+      grey,
+    );
+    k.cylinder(a1, (legD0 + legD1) / 2, 0, footH, 0.025, 8, s.dark);
+  }
+  const barH = p.plate * 0.4;
+  k.cylinderAlong(
+    -legA(barH),
+    legA(barH),
+    (legD0 + legD1) / 2,
+    barH,
+    0.012,
+    6,
+    grey,
+  );
   const joinH = p.bottom + 0.35;
   const joinD = p.back(joinH) - FRAME_T;
-  const ua = FRAME_A;
-  for (const a of [-ua, ua]) {
+  for (const a of [-FRAME_A, FRAME_A]) {
     profileAlong(
       kitAt,
       ORIGIN,
       tiltedBar(
-        (joinD + footD) / 2,
+        (joinD + EASEL_FOOT_D) / 2,
         (joinH + footH) / 2,
-        Math.atan2(joinH - footH, joinD - footD),
-        Math.hypot(joinH - footH, joinD - footD),
+        Math.atan2(joinH - footH, joinD - EASEL_FOOT_D),
+        Math.hypot(joinH - footH, joinD - EASEL_FOOT_D),
         0.025,
       ),
       a - FRAME_T / 2,
       a + FRAME_T / 2,
-      s.tinted(FRAME_GREY),
+      grey,
     );
-    k.cylinder(a, footD, 0, footH, 0.025, 8, s.dark);
+    k.cylinder(a, EASEL_FOOT_D, 0, footH, 0.025, 8, s.dark);
   }
-  k.cylinder(aWand, V0_WAND_D, 0, 0.02, V0_STAND_RADIUS, 8, s.dark);
-  k.cylinder(aWand, V0_WAND_D, 0.02, V0_WAND_BASE - 0.04, 0.012, 6, s.metal);
+}
+
+/**
+ * The wand's mount: a ribbed grey clip on the body's left side, centred
+ * on depth `d`, that the stowed wand (its axis at `aWand`, its bottom at
+ * `base`) hangs in.
+ */
+function wandMount(
+  k: Kit,
+  s: Surfaces,
+  aWand: number,
+  d: number,
+  base: number,
+): void {
+  const mount0 = -PACK_W / 2;
+  const mount1 = aWand + 0.035;
+  k.box(
+    mount1,
+    mount0,
+    d - 0.06,
+    d + 0.06,
+    base + 0.02,
+    base + 0.16,
+    s.tinted(FRAME_GREY),
+  );
+  for (const h of [base + 0.04, base + 0.085, base + 0.13])
+    k.box(mount1 - 0.006, mount0, d - 0.065, d + 0.065, h, h + 0.012, s.dark);
 }
 
 /**
  * v1's rack: a deck the frame's plate stands on, four corner posts
  * (`cornerPosts`) down to the floor and two low rails joining them along
- * `a`; and the gun mount, a ribbed grey clip on the body's left side that
- * the wand hangs in.
+ * `a`.
  */
-function packV1Rack(
-  k: Kit,
-  s: Surfaces,
-  p: PackPose,
-  aWand: number,
-  wandBase: number,
-): void {
+function packV1Rack(k: Kit, s: Surfaces, p: PackPose): void {
   const deck0 = p.plate - RACK_DECK_T;
   k.box(
     -RACK_HALF_A,
@@ -1364,12 +1417,6 @@ function packV1Rack(
       RACK_RAIL_H + 0.03,
       s.metal,
     );
-  const mount0 = -PACK_W / 2;
-  const mount1 = aWand + 0.035;
-  const grey = s.tinted(FRAME_GREY);
-  k.box(mount1, mount0, -0.06, 0.06, wandBase + 0.02, wandBase + 0.16, grey);
-  for (const h of [wandBase + 0.04, wandBase + 0.085, wandBase + 0.13])
-    k.box(mount1 - 0.006, mount0, -0.065, 0.065, h, h + 0.012, s.dark);
 }
 
 /**
@@ -1379,13 +1426,11 @@ function packV1Rack(
  * grey wand with a black grip and an orange tip (`wand`) joined to the
  * pack's left side by a ribbed black hose (`ribbedHose`).
  *
- * v0: the frame's plate on the floor, the body leaning back `PACK_LEAN`
- * on two struts, the wand standing upright on its own floor stand beside
- * the pack, its tip at the catalogue top (1.6), the hose climbing from
- * the pack to it. v1: upright on a four-post rack (`packV1Rack`), the
- * frame's top at the catalogue top, the wand clipped into a ribbed mount
- * on the body's side, the hose dropping from high on the side to its
- * socket.
+ * Both variants stand the frame's top at the catalogue top (`heroHalf`),
+ * with the wand stowed tip up in a ribbed mount on the body's left side
+ * (`wandMount`) and the hose dropping from high on that side to the
+ * wand's socket. v0 leans back `PACK_LEAN` on an A-frame easel
+ * (`packV0Easel`); v1 stands upright on a four-post rack (`packV1Rack`).
  *
  * The kind's bank is chase, which lights one group of eight at a time in
  * order: one dot climbs the power cell's whole column each cycle (light i
@@ -1393,31 +1438,18 @@ function packV1Rack(
  * ring once (groups 0, 2, 4 and 6, a dark step between lenses), and the
  * wand's tip flashes with the column's top step (group 7).
  */
-const fieldPack: HeroRecipe = ({ k, kitAt, s, variant }) => {
-  const p = packPose(variant);
+const fieldPack: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+  const p = packPose(variant, heroHalf(kind, variant).top);
   const aWand = -PACK_W / 2 - WAND_OFF - 0.035;
+  const base = p.bottom + WAND_RISE;
+  const dWand = -p.lean(base + WAND_LEN / 2);
   packBody(k, kitAt, s, p);
   packFace(k, kitAt, s, p);
-  if (variant === 0) {
-    const base = V0_WAND_BASE;
-    packV0Stands(k, kitAt, s, p, aWand);
-    wand(k, s, aWand, V0_WAND_D, base);
-    ribbedHose(
-      k,
-      kitAt,
-      s,
-      aWand,
-      V0_WAND_D,
-      V0_WAND_D - 0.08,
-      p.bottom + 0.4,
-      base - 0.04,
-    );
-  } else {
-    const base = p.bottom + 0.1;
-    packV1Rack(k, s, p, aWand, base);
-    wand(k, s, aWand, 0, base);
-    ribbedHose(k, kitAt, s, aWand, 0, -0.1, p.top - 0.08, base - 0.04);
-  }
+  if (variant === 0) packV0Easel(k, kitAt, s, p);
+  else packV1Rack(k, s, p);
+  wandMount(k, s, aWand, dWand, base);
+  wand(k, s, aWand, dWand, base);
+  ribbedHose(k, kitAt, s, aWand, dWand, dWand - 0.1, p.top - 0.08, base - 0.04);
 };
 
 /** The workshop kinds' recipes. */

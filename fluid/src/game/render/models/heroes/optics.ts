@@ -39,6 +39,7 @@ import {
   type Surfaces,
 } from "../common";
 import {
+  ALUMINIUM,
   heroHalf,
   STATUS_AMBER,
   STATUS_GREEN,
@@ -73,7 +74,7 @@ const FACEPLATE_CHAMPAGNE: Rgb = [0.75, 0.7, 0.6];
 const BEZEL_BLACK: Rgb = [0.05, 0.05, 0.055];
 
 /** The eye panel's grille slats: a plain brushed aluminium. */
-const GRILLE_GREY: Rgb = [0.55, 0.55, 0.57];
+const GRILLE_GREY: Rgb = ALUMINIUM;
 
 /** The small bright dot in the middle of the eye panel's lens. */
 const LENS_YELLOW: Rgb = [1.0, 0.85, 0.25];
