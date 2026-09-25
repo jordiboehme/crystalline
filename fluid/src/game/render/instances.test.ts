@@ -74,12 +74,15 @@ describe("propInstances", () => {
 
 describe("SCENE_VS", () => {
   it("carries the turn table built from turnMat2Columns", () => {
-    for (const t of [0, 1, 2, 3]) {
-      const literal = `mat2(${turnMat2Columns(t)
-        .map((n) => n.toFixed(1))
-        .join(", ")})`;
-      expect(SCENE_VS).toContain(literal);
-    }
+    // The whole array in turn order, so a table with two turns swapped
+    // fails as well as one with a wrong matrix.
+    const literals = [0, 1, 2, 3].map(
+      (t) =>
+        `mat2(${turnMat2Columns(t)
+          .map((n) => n.toFixed(1))
+          .join(", ")})`,
+    );
+    expect(SCENE_VS).toContain(`mat2[4](${literals.join(", ")})`);
     expect(SCENE_VS).toContain("layout(location = 6) in vec3 aInstanceOffset;");
     expect(SCENE_VS).toContain("layout(location = 7) in vec2 aInstanceTurn;");
   });

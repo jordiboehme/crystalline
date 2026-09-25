@@ -9,6 +9,7 @@ import {
   lookForKey,
   type Rgb,
 } from "./looks";
+import type { Condition } from "../world/types";
 
 function allColours(look: (typeof LOOKS)["day"]): Rgb[] {
   return [...Object.values(look.palette), look.edge.colour];
@@ -88,6 +89,20 @@ describe("applyCondition", () => {
     applyCondition(LOOKS.aperture, "derelict");
     expect(JSON.stringify(LOOKS.aperture)).toBe(before);
   });
+
+  it("leaves the palette alone in every condition, so prop meshes are cached by look", () => {
+    const conditions = [
+      "clean",
+      "construction",
+      "dim",
+      "derelict",
+    ] satisfies readonly Condition[];
+    for (const id of LOOK_ORDER) {
+      for (const c of conditions) {
+        expect(applyCondition(LOOKS[id], c).palette).toBe(LOOKS[id].palette);
+      }
+    }
+  });
 });
 
 describe("hueToRgb", () => {
@@ -96,14 +111,5 @@ describe("hueToRgb", () => {
     expect(r).toBeCloseTo(1);
     expect(g).toBeCloseTo(0);
     expect(b).toBeCloseTo(0);
-  });
-
-  it("leave the palette alone under every condition, so prop meshes cache by look", () => {
-    const conditions = ["clean", "construction", "dim", "derelict"] as const;
-    for (const id of LOOK_ORDER) {
-      for (const c of conditions) {
-        expect(applyCondition(LOOKS[id], c).palette).toBe(LOOKS[id].palette);
-      }
-    }
   });
 });

@@ -363,8 +363,14 @@ export function createRenderer(
       for (const g of groups) {
         let vertices = propMeshes.get(g.key);
         if (vertices === undefined) {
-          const data =
-            fresh.get(g.key) ?? buildPropMesh(g.kind, g.variant, nextLook);
+          // Every mesh the cache lacks was built above, before the release;
+          // building one here would break the old-room guarantee.
+          const data = fresh.get(g.key);
+          if (data === undefined) {
+            throw new Error(
+              `renderer: prop mesh ${g.key} was not built before the release`,
+            );
+          }
           vertices = createVertexBuffer(gl, data);
           propMeshes.set(g.key, vertices);
         }
