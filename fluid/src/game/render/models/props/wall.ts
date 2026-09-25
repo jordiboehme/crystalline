@@ -766,7 +766,8 @@ const RISER = { depth: 0.12, strapH: 2.05 };
  * `h = 1.2`; variant 1 two thicker pipes with a crossover pipe between them
  * at `h = 0.9` and a glowing gauge disc on the left pipe at `h = 1.5`. A
  * mounting strap ties the pipes to the wall at `RISER.strapH`, wide enough
- * to reach `WIDE_REACH` on both sides (D4).
+ * to reach `WIDE_REACH` on both sides (D4), grounded to the wall by a small
+ * bracket at each end.
  */
 function pipeRiser({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const R = RISER;
@@ -779,6 +780,17 @@ function pipeRiser({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     R.strapH + 0.04,
     s.dark,
   );
+  for (const a of [-0.85, 0.85]) {
+    k.box(
+      a - 0.03,
+      a + 0.03,
+      0,
+      R.depth - 0.02,
+      R.strapH,
+      R.strapH + 0.04,
+      s.dark,
+    );
+  }
   if (variant === 0) {
     for (const a of [-0.7, 0, 0.7]) {
       k.cylinder(a, R.depth, 0, 2.2, 0.05, 10, s.metal);

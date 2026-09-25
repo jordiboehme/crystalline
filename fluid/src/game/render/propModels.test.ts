@@ -236,6 +236,42 @@ describe("prop models", () => {
     }
   });
 
+  it("keeps the span tray's rungs symmetric about a = 0", () => {
+    // A rung is a short box across the tray (small along `a`, wide across
+    // `d`); a rail is wide along `a` and a hanger rod is narrow across `d`,
+    // so this shape tells rungs apart from both without naming positions.
+    const f = frameAt([0, 0, 0], 0);
+    for (
+      let variant = 0;
+      variant < PROP_CATALOGUE["span-tray"].variants;
+      variant++
+    ) {
+      const { parts } = buildRecorded("span-tray", variant);
+      const rungCenters = parts
+        .filter((p) => p.method === "box")
+        .map((p) => {
+          const as = p.points.map((q) => toLocal(f, q)[0]);
+          const ds = p.points.map((q) => toLocal(f, q)[1]);
+          return {
+            aWidth: Math.max(...as) - Math.min(...as),
+            dWidth: Math.max(...ds) - Math.min(...ds),
+            centerA: (Math.max(...as) + Math.min(...as)) / 2,
+          };
+        })
+        .filter((p) => p.aWidth < 0.1 && p.dWidth > 0.3)
+        .map((p) => p.centerA);
+      expect(rungCenters.length, `variant ${String(variant)}`).toBeGreaterThan(
+        0,
+      );
+      for (const a of rungCenters) {
+        expect(
+          rungCenters.some((b) => Math.abs(b + a) < EPS),
+          `a = ${String(a)} has no mirror, variant ${String(variant)}`,
+        ).toBe(true);
+      }
+    }
+  });
+
   it("lays every ladder rung across both rails, on both variants", () => {
     // The rails lean in the (d, h) side view and the rungs follow the same
     // line; a side frame with the wrong sign mirrors the rails in depth, so

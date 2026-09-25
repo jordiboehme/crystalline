@@ -54,8 +54,8 @@ export const RUN_REACH = 1.0;
 /**
  * How far along its line a span segment reaches either side of its anchor,
  * in metres: half of `SPAN_CELLS` cells (2.0 m), the segment's full length,
- * so the segments of neighbouring lines meet, exactly as `RUN_REACH` does
- * for a wall or ceiling run (D9).
+ * so neighbouring segments meet, exactly as `RUN_REACH` does for a wall or
+ * ceiling run (D9).
  */
 export const SPAN_REACH = (SPAN_CELLS * CELL) / 2;
 

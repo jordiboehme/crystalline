@@ -42,6 +42,17 @@ const RED: Rgb = [0.8, 0.08, 0.06];
  */
 const D_MID = (CEILING_SETBACK + CEILING_OUT) / 2;
 
+/**
+ * Evenly spaced positions from `start` to `end`, `step` apart, both ends
+ * included: an integer count times `step`, never a repeated float
+ * addition, which drifts and can silently drop the last position (as it
+ * did for the span tray's rungs, leaving a bare end).
+ */
+function evenlySpaced(start: number, end: number, step: number): number[] {
+  const count = Math.round((end - start) / step) + 1;
+  return Array.from({ length: count }, (_, i) => start + i * step);
+}
+
 /** A hanger strap from its host's nearest-to-ceiling surface up to exactly `-HEADROOM`. */
 function hanger(
   k: Kit,
@@ -261,7 +272,7 @@ function looseCable({ k, s, variant }: Parameters<PropRecipe>[0]): void {
 
 /** The round duct's height, radius and flange half-width along `a`. */
 const SPAN_DUCT_ROUND = { h: -0.45, radius: 0.2, flange: 0.03 };
-/** The square duct's height and half-size across it (D9's `SPAN_HALF` less its rail). */
+/** The square duct's height and half-size across it, kept inside D9's `SPAN_HALF`. */
 const SPAN_DUCT_SQUARE = { h: -0.45, halfW: SPAN_HALF - 0.05, halfH: 0.15 };
 
 /**
@@ -287,7 +298,7 @@ function spanDuct({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       D.h + D.halfH,
       s.metal,
     );
-    for (let a = -SPAN_REACH + 0.3; a <= SPAN_REACH - 0.15; a += 0.5) {
+    for (const a of evenlySpaced(-SPAN_REACH + 0.3, SPAN_REACH - 0.15, 0.5)) {
       k.box(
         a - 0.006,
         a + 0.006,
@@ -319,7 +330,7 @@ function trayTier(k: Kit, s: Surfaces, h: number): void {
       s.metal,
     );
   }
-  for (let a = -SPAN_REACH + 0.2; a <= SPAN_REACH - 0.2; a += 0.4) {
+  for (const a of evenlySpaced(-SPAN_REACH + 0.2, SPAN_REACH - 0.2, 0.4)) {
     k.box(a - 0.008, a + 0.008, -half, half, h - 0.01, h + 0.01, s.dark);
   }
   for (const d of [-0.15, 0, 0.15]) {

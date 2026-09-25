@@ -307,7 +307,7 @@ export type CeilingPropKind =
   | "beacon"
   // condition extra
   | "loose-cable"
-  // spans the hall wall to wall
+  // spans a line across the hall's interior, stopping one cell short of every wall
   | "span-duct"
   | "span-tray";
 
