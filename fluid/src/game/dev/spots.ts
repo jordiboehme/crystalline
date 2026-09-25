@@ -282,6 +282,12 @@ function surfaceOf(
  * tops, so the rule alone leaves the terminal empty, while the pedestals,
  * the keyboard deck, the CRT and the chair are drawn there and hide a
  * curio on a desk end from the far side.
+ *
+ * Every other curio in the room occludes too (fix round 5): its own plan
+ * box (`curioBox`) from its surface height `h` up to its top (`h +
+ * curioSize(o).top`), so a sword standing in front of another on the same
+ * bench, or a gadget in front of a cradle, moves the search on to a spot
+ * that sees the framed curio itself. Only `c` is left out.
  */
 function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const own = surfaceOf(hostSurfaces(room), c);
@@ -313,6 +319,10 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   for (const p of room.props) add(p, propFootprint(p), EYE_HEIGHT);
   for (const h of room.heroes)
     add(h, heroFootprint(h), HERO_CATALOGUE[h.kind].top);
+  for (const o of room.curios) {
+    if (o === c) continue;
+    out.push({ ...curioBox(o), y0: o.h, y1: o.h + curioSize(o).top });
+  }
   return out;
 }
 
