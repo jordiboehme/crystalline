@@ -64,7 +64,9 @@
  * 9. Mid-hall clusters (D6, D7), in a large hall only: every block of
  *    `sites.clusterBlocks` draws from `createRng(seedFor(roomSeed, "prop",
  *    bx, by, "cluster-block"))`, keyed by its north-west cell, a chance of
- *    `CLUSTER_SHARE` and then a size from `CLUSTER_MIN` to `CLUSTER_MAX`.
+ *    `CLUSTER_SHARE` (1, so every block holds a cluster; the draw is kept
+ *    for tuning) and then a size from `CLUSTER_MIN` to `CLUSTER_MAX` (3 to
+ *    5, E4).
  *    Its inner cells are walked in the order of their own seeds,
  *    `seedFor(roomSeed, "prop", cx, cy, "cluster")`, each drawing a kind
  *    weighted over the palette's `cluster` picks, a variant and a turn,
@@ -76,11 +78,12 @@
  *    cluster may stand side by side, never overlapping. The floor props
  *    the ring is held against are a snapshot of the floor boxes taken
  *    before the block's first member, so a cluster's own members are left
- *    out. Today that check never binds: the other clusters' inner cells,
- *    and the cells of the zone and wall-side props outside the band, all
- *    lie at least 2 cells away. It is a future-proofing guard, kept so that a
- *    later step or a smaller block cannot bring a floor prop within 1.0 m
- *    of a cluster unnoticed.
+ *    out. Between clusters that check never binds: neighbouring blocks'
+ *    inner cells are one empty cell apart and a member stays 0.3 m inside
+ *    its cell, so two clusters stand at least 2.6 m apart (E4). Against the
+ *    props outside the band it can bind: an inner cell on the band's south
+ *    or east edge touches a corner-zone cell diagonally, and a member there
+ *    is dropped when a corner-zone prop stands within 1.0 m of it.
  * 10. Ceiling, anchored at wall points like a wall prop: the ceiling run
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
  *     `ceiling-<side>`; under each ceiling tray segment a cable loop when
@@ -531,8 +534,9 @@ export function dressCandidates(
     if (!rng.chance(CLUSTER_SHARE)) continue;
     const size = rng.int(CLUSTER_MIN, CLUSTER_MAX);
     // Every floor prop not in this cluster: its members are placed after.
-    // A future-proofing guard; today no floor prop outside the cluster comes
-    // within the ring (see step 9 of the module doc).
+    // Another cluster never comes within the ring (E4), but a corner-zone
+    // prop diagonal to the band's south or east edge can (see step 9 of the
+    // module doc).
     const outside = [...floorBoxes];
     const clusterSeed = (s: FloorSpot) => propSeed(s.cx, s.cy, "cluster");
     let placed = 0;

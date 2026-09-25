@@ -134,8 +134,8 @@ export interface FloorSpot {
  * `key` is `"x,y"`, which also keys the block's seed. A cluster stands only
  * on `cells`, the block's inner `CLUSTER_INNER` by `CLUSTER_INNER` cells
  * that are floor, one in from its north-west corner, row by row, as spots
- * with no wall and no zone; the ring of cells around them keeps two
- * clusters at least 2 cells apart.
+ * with no wall and no zone; the block's empty first row and column keep
+ * two clusters' inner cells at least one cell apart (E4).
  */
 export interface ClusterBlock {
   key: string;

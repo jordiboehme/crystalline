@@ -551,7 +551,9 @@ describe("walking on the grid", () => {
         }
       }
     }
-  });
+    // The dressed hub carries about 240 props since every cluster block
+    // fills, so the walk takes longer under a loaded test run.
+  }, 20_000);
 });
 
 describe("sliding around corners", () => {

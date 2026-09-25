@@ -7,6 +7,8 @@ import {
   CLUSTER_BLOCK,
   CLUSTER_INNER,
   CLUSTER_MAX,
+  CLUSTER_MIN,
+  CLUSTER_SHARE,
   EXTRAS,
   FILLER,
   LANE_DEPTH,
@@ -206,6 +208,19 @@ describe("the prop catalogue", () => {
         PALETTES[a].floor.some(([k]) => PROP_CATALOGUE[k].tall),
         a,
       ).toBe(true);
+  });
+
+  it("gives every palette a tall cluster pick", () => {
+    for (const a of ARCHETYPES)
+      expect(
+        PALETTES[a].cluster.some(([k]) => PROP_CATALOGUE[k].tall),
+        a,
+      ).toBe(true);
+  });
+
+  it("fills every block with 3 to 5 members in a 3 by 3 inner square", () => {
+    expect(CLUSTER_SHARE).toBe(1);
+    expect([CLUSTER_MIN, CLUSTER_MAX, CLUSTER_INNER]).toEqual([3, 5, 3]);
   });
 
   it("fits CLUSTER_MAX members into a block's inner square, one cell in from its corner", () => {

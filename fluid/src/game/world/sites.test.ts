@@ -571,6 +571,7 @@ describe("the interior band and large halls", () => {
       y1: 22,
     });
   });
+
   it("calls a hall large from 9 by 8, either way round", () => {
     expect(isLargeHall(hall(9, 8))).toBe(true);
     expect(isLargeHall(hall(8, 9))).toBe(true);
@@ -587,7 +588,7 @@ describe("the interior band and large halls", () => {
 });
 
 describe("cluster blocks", () => {
-  it("tiles the workshop band into four blocks with 2 by 2 inner cells", () => {
+  it("tiles the workshop band into four blocks with 3 by 3 inner cells", () => {
     const blocks = dressingSites(generateRoom(CANNED_WORKSHOP)).clusterBlocks;
     expect(blocks.map((b) => b.key)).toEqual(["2,2", "6,2", "2,6", "6,6"]);
     expect(blocks.map((b) => [b.x, b.y])).toEqual([
@@ -599,8 +600,13 @@ describe("cluster blocks", () => {
     expect(blocks[0]?.cells.map((c) => [c.cx, c.cy])).toEqual([
       [3, 3],
       [4, 3],
+      [5, 3],
       [3, 4],
       [4, 4],
+      [5, 4],
+      [3, 5],
+      [4, 5],
+      [5, 5],
     ]);
     for (const b of blocks)
       for (const c of b.cells) {
@@ -608,11 +614,13 @@ describe("cluster blocks", () => {
         expect(c.zone).toBeNull();
       }
   });
+
   it("tiles the hub band into 25 blocks", () => {
     expect(dressingSites(generateRoom(CANNED_HUB)).clusterBlocks).toHaveLength(
       25,
     );
   });
+
   it("gives a small hall none", () => {
     expect(dressingSites(generateRoom(CANNED_BRIDGE)).clusterBlocks).toEqual(
       [],

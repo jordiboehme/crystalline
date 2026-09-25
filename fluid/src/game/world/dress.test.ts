@@ -20,6 +20,7 @@ import {
 import dressSource from "./dress.ts?raw";
 import {
   FOOTPRINTS,
+  MAX_FLOOR_PROP,
   decorFootprint,
   footprint,
   footprintOf,
@@ -35,6 +36,7 @@ import {
   CLUSTER_BLOCK,
   CLUSTER_CLEAR,
   CLUSTER_MAX,
+  CLUSTER_MIN,
   EXTRAS,
   LANE_DEPTH,
   LANE_WIDTH,
@@ -119,24 +121,25 @@ const workshop = generateRoom(CANNED_WORKSHOP);
 
 /**
  * The fullest room a probe of the generator found: a manifest under
- * construction with 24 relations, 24 sections, 40 tags and 30 inbound
- * references (24 listed). A 24 by 24 hall, four bays and a corridor give
- * it more candidates than the cap, and the cap drops them by its tiers.
+ * construction with 30 relations, 30 sections, 60 tags and 30 inbound
+ * references (24 listed). A 24 by 24 hall, four bays and a corridor. Halls
+ * stop growing there, so no generated room has many more candidates; this
+ * one has about 317 against the cap of 280.
  */
 const OVER_CAP: PlaceInput = {
   domain: "t",
-  permalink: "p24-24-40-30",
+  permalink: "p30-30-60-30",
   title: "R",
   type: "manifest",
   status: "draft",
   salience: null,
   validFrom: null,
   validTo: null,
-  tags: Array.from({ length: 40 }, (_, k) => `t${String(k)}`),
-  content: Array.from({ length: 24 }, (_, i) => `## P${String(i)}\nx`).join(
+  tags: Array.from({ length: 60 }, (_, k) => `t${String(k)}`),
+  content: Array.from({ length: 30 }, (_, i) => `## P${String(i)}\nx`).join(
     "\n",
   ),
-  relations: Array.from({ length: 24 }, (_, k) => {
+  relations: Array.from({ length: 30 }, (_, k) => {
     const t = `r${String(k).padStart(2, "0")}`;
     return {
       relType: "r",
@@ -513,7 +516,7 @@ describe("floor props", () => {
     let n = 0;
     for (const { name, room } of ALL) n += expectFloorInvariants(name, room);
     expect(n).toBeGreaterThan(100);
-  });
+  }, 20_000);
 
   it("leave the player's circle at every arrival point clear", () => {
     let checked = 0;
@@ -549,7 +552,7 @@ describe("floor props", () => {
 
   it("leave the player's circle at every terminal and machine use point clear", () => {
     let checked = 0;
-    for (const { name, room } of [...ALL, ...REACH_EXTRA]) {
+    for (const { name, room } of [...ALL, ...BRIDGES, ...REACH_EXTRA]) {
       const boxes = floorProps(room).map(boxOf);
       for (const f of room.fixtures) {
         if (f.kind !== "terminal" && f.kind !== "machine") continue;
@@ -827,10 +830,12 @@ describe("reachability (Review Focus 1)", () => {
     for (const t of without)
       expect(withProps.has(t), `${name} ${t}`).toBe(true);
   };
-  for (const { name, room } of ALL)
+
+  for (const { name, room } of [...ALL, ...BRIDGES])
     it(`reaches with props every target ${name} reaches without them`, () => {
       expectSameTargets(name, room);
     }, 20_000);
+
   // The fullest room and the seeds, where the mid-hall clusters stand among
   // the most fixtures and decor: a cluster narrows a way but never seals it.
   for (const { name, room } of REACH_EXTRA)
@@ -972,17 +977,17 @@ describe("density measure", () => {
     expect(per).toBeLessThanOrEqual(0.35);
   });
 
-  it("makes at least 0.14 of the floor props tall", () => {
-    // 0.060 on the 13x12 seeds before Task 2, forecast 0.188 (E9).
+  it("makes at least 0.25 of the floor props tall", () => {
+    // 0.060 on the 13x12 seeds before Task 2, 0.188 after it; forecast 0.327
+    // once the clusters draw tall stacks (E9).
     expect(
       sum(SEEDS, (d) => d.tallProps) / sum(SEEDS, (d) => d.floorProps),
-    ).toBeGreaterThanOrEqual(0.14);
+    ).toBeGreaterThanOrEqual(0.25);
   });
 
-  it("keeps every large dressed room at or under 16 floor props per 100 floor cells", () => {
-    // The densest room measured is a seed at 14.74 (w-15, engineering, on
-    // the 13x12 workshop); the ceiling of 16 leaves room until the clusters
-    // grow.
+  it("keeps every large dressed room at or under 22 floor props per 100 floor cells", () => {
+    // The densest room forecast with a cluster in every block is at 19.23
+    // (E9); the ceiling was 16 before the clusters grew.
     const rooms = [
       ...ALL,
       ...BRIDGES,
@@ -993,26 +998,28 @@ describe("density measure", () => {
     for (const { name, room } of rooms) {
       const d = measureDensity(room);
       if (!d.large) continue;
-      expect(d.floorPer100, name).toBeLessThanOrEqual(16);
+      expect(d.floorPer100, name).toBeLessThanOrEqual(22);
       large++;
     }
     // Every workshop, hub, seed and the over-cap room is large; no bridge is.
     expect(large).toBe(ALL.length + SEEDS.length + REACH_EXTRA.length);
   });
 
-  it("raises large workshops to at least 8 floor props per 100 floor cells", () => {
-    // Baseline 4.70 before iteration 1, 7.39 after it; forecast 8.81 (E9).
+  it("raises large workshops to at least 13 floor props per 100 floor cells", () => {
+    // Baseline 4.70 before iteration 1, 7.39 after it, 8.81 with the 13x12
+    // workshop; forecast 15.97 with a cluster in every block (E9).
     const per100 =
       (sum(SEEDS, (d) => d.floorProps) * 100) / sum(SEEDS, (d) => d.floorCells);
-    expect(per100).toBeGreaterThanOrEqual(8);
+    expect(per100).toBeGreaterThanOrEqual(13);
   });
 
-  it("raises the canned hub to at least 5 floor props per 100 floor cells in every archetype", () => {
-    // Baseline 2.1 to 2.4.
+  it("raises the canned hub to at least 13 floor props per 100 floor cells in every archetype", () => {
+    // Baseline 2.1 to 2.4, 7.7 to 8.9 before the clusters grew; forecast
+    // 15.8 to 17.2 (E9).
     for (const { name, condition, room } of HUBS)
       if (condition === "clean")
         expect(measureDensity(room).floorPer100, name).toBeGreaterThanOrEqual(
-          5,
+          13,
         );
   });
 });
@@ -1059,15 +1066,17 @@ describe("mid-hall clusters", () => {
           b.cells.map((c) => `${String(c.cx)},${String(c.cy)}`),
         ),
       );
+      const taken = takenBoxes(room);
+      const floor = floorProps(room);
       for (const p of inBand) {
         expect(
           inner.has(`${String(Math.floor(p.x))},${String(Math.floor(p.y))}`),
           name,
         ).toBe(true);
         const ring = grow(boxOf(p), CLUSTER_CLEAR - 1e-9);
-        for (const t of takenBoxes(room))
+        for (const t of taken)
           expect(overlaps(ring, t), `${name} ${p.kind}`).toBe(false);
-        for (const q of floorProps(room))
+        for (const q of floor)
           if (q !== p && blockOf(q) !== blockOf(p))
             expect(overlaps(ring, boxOf(q)), `${name} ${p.kind}`).toBe(false);
         members++;
@@ -1076,9 +1085,20 @@ describe("mid-hall clusters", () => {
       for (const p of inBand)
         sizes.set(blockOf(p), (sizes.get(blockOf(p)) ?? 0) + 1);
       for (const n of sizes.values())
-        expect(n).toBeLessThanOrEqual(CLUSTER_MAX);
+        expect(n, name).toBeLessThanOrEqual(CLUSTER_MAX);
+      expect(
+        sizes.size === 0 ? 0 : Math.max(...sizes.values()),
+        name,
+      ).toBeGreaterThanOrEqual(CLUSTER_MIN);
     }
-    expect(members).toBeGreaterThan(50);
+    expect(members).toBeGreaterThan(300);
+  }, 20_000);
+
+  it("keeps two clusters at least 2 m + twice the widest footprint's inset apart", () => {
+    // E4: inner cells of neighbouring blocks are one empty cell apart, and a
+    // member stays (CELL - MAX_FLOOR_PROP) / 2 inside its cell.
+    const gap = CELL + (CELL - MAX_FLOOR_PROP);
+    expect(gap).toBeGreaterThan(2 * CLUSTER_CLEAR);
   });
 
   it("uses only the palette's cluster kinds in the band", () => {
@@ -1349,11 +1369,15 @@ describe("the cap (Review Focus 4)", () => {
       (c) => PROP_CATALOGUE[c.prop.kind].span,
     ).length;
     expect(room.props.length).toBeLessThanOrEqual(PROP_CAP);
-    // At this commit OVER_CAP's span stream misses (SPAN_SHARE), so line is
-    // 0 and this bound pins the length at exactly PROP_CAP; Math.max(line, 1)
-    // keeps the bound meaningful once a later task's larger fixture draws
-    // one (E10: dropping the whole line can cost up to line - 1 props).
-    expect(room.props.length).toBeGreaterThan(PROP_CAP - Math.max(line, 1));
+    // OVER_CAP draws a span line (11 segments), and the cap keeps it whole
+    // or drops it whole (E10); dropping the whole line can cost up to
+    // line - 1 props, so the length is pinned within that of PROP_CAP.
+    expect(line).toBeGreaterThan(1);
+    const spansKept = room.props.filter(
+      (p) => PROP_CATALOGUE[p.kind].span,
+    ).length;
+    expect([0, line]).toContain(spansKept);
+    expect(room.props.length).toBeGreaterThan(PROP_CAP - line);
     const kept = capProps(candidates, PROP_CAP);
     expect(room.props).toEqual([...kept].sort(PROP_ORDER));
     expectTiers("over cap", candidates, kept);

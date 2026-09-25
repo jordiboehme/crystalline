@@ -9,18 +9,18 @@
  * archetype unless a line says otherwise):
  *
  * - `floorPer100`, floor props per 100 floor cells of the hall and the
- *   bays: at most 16 in every large dressed room, checked on the canned
+ *   bays: at most 22 in every large dressed room, checked on the canned
  *   workshop and hub in every archetype and condition, the canned bridge
  *   (never large), all 300 seed rooms and the over-cap room ("keeps every
- *   large dressed room at or under 16 floor props per 100 floor cells").
- *   The same measure has floors: at least 8 summed over the seeds, and at
- *   least 5 in the clean canned hub of every archetype.
+ *   large dressed room at or under 22 floor props per 100 floor cells").
+ *   The same measure has floors: at least 13 summed over the seeds, and at
+ *   least 13 in the clean canned hub of every archetype (E9).
  * - `wallSideProps / wallSideSpots`, the floor props standing in a
  *   wall-side spot per spot, summed over the seeds: at least 0.15 and at
  *   most 0.35 ("puts at least 0.15 floor props per wall-side spot").
  * - `tallProps / floorProps`, the share of floor props whose kind is
- *   `tall` (E5), summed over the seeds: at least 0.14 ("makes at least
- *   0.14 of the floor props tall").
+ *   `tall` (E5), summed over the seeds: at least 0.25 ("makes at least
+ *   0.25 of the floor props tall").
  * - `wideEdges / freeEdges`, the free wall edges carrying a wide wall prop,
  *   summed over the seeds: at least 0.12 and at most 0.6 ("covers at least
  *   0.12 of free edges with wide wall props").

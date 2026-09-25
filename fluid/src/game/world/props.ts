@@ -28,9 +28,8 @@
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
  *   `LANE_WIDTH`, `LANE_DEPTH`, `USE_LANE_DEPTH`, `TALL_MIN`, the cluster
- *   constants
- *   (`CLUSTER_BLOCK`, `CLUSTER_INNER`, `CLUSTER_SHARE`, `CLUSTER_MIN`,
- *   `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants
+ *   constants (`CLUSTER_BLOCK`, `CLUSTER_INNER`, `CLUSTER_SHARE`,
+ *   `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants
  *   (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
@@ -95,8 +94,8 @@ export interface Palette {
   wallRun: "cable-tray" | "pipe-bundle" | null;
   /**
    * Weighted picks for floor spots. Every palette holds at least one tall
-   * kind (E5), weighted 2 beside its plain kinds at 3, so a large hall
-   * shows some height along its walls and in its corners.
+   * kind (E5), so a large hall shows some height along its walls and in its
+   * corners.
    */
   floor: readonly (readonly [FloorPropKind, number])[];
   /** The ceiling run kind, or null. */
@@ -120,7 +119,9 @@ export interface Palette {
   /**
    * Weighted picks for the members of a mid-hall cluster (D6): plain floor
    * kinds, never an extra and never a wall-backed kind, since a cluster
-   * stands in the open, away from every wall.
+   * stands in the open, away from every wall. Every palette holds at least
+   * one tall kind (E5), so a cluster reads over the ordinary props around
+   * it.
    */
   cluster: readonly (readonly [FloorPropKind, number])[];
 }
@@ -714,6 +715,7 @@ export const PALETTES = {
     cluster: [
       ["crate", 3],
       ["trolley", 2],
+      ["crate-stack", 3],
     ],
   },
   engineering: {
@@ -740,6 +742,8 @@ export const PALETTES = {
       ["crate", 3],
       ["barrel", 3],
       ["trolley", 2],
+      ["crate-stack", 3],
+      ["drum-rack", 2],
     ],
   },
   archive: {
@@ -763,6 +767,7 @@ export const PALETTES = {
       ["crate", 3],
       ["trolley", 2],
       ["filing-cabinet", 1],
+      ["crate-stack", 3],
     ],
   },
   lab: {
@@ -788,6 +793,7 @@ export const PALETTES = {
     cluster: [
       ["trolley", 3],
       ["crate", 2],
+      ["gas-rack", 3],
     ],
   },
   council: {
@@ -808,6 +814,7 @@ export const PALETTES = {
     cluster: [
       ["planter", 3],
       ["crate", 1],
+      ["potted-tree", 3],
     ],
   },
 } satisfies Record<Archetype, Palette>;
@@ -832,8 +839,14 @@ export const EXTRAS = {
   ],
 } satisfies Record<Condition, readonly ExtraRule[]>;
 
-/** At most this many props in one room; beyond it the cap drops the rest. */
-export const PROP_CAP = 200;
+/**
+ * At most this many props in one room; beyond it the cap drops the rest
+ * (E8). The canned hub stays under it in every archetype and condition, so
+ * the cap never drops its ceiling, and the fullest room the generator can
+ * make (a 24 by 24 hall with four bays, about 317 candidates) still
+ * overflows it.
+ */
+export const PROP_CAP = 280;
 /** About this share of free wall cells gets a prop. */
 export const WALL_SHARE = 2 / 3;
 /** Chance a free wall-side cell gets a floor prop, unless the palette says otherwise. */
@@ -888,24 +901,32 @@ export const TALL_MIN = 1.6;
 /**
  * The side of a mid-hall cluster block, in cells (D6). The hall's interior
  * band is tiled from its north-west corner into blocks this size, partial
- * blocks dropped, and a cluster uses only a block's inner 2 by 2 cells, so
- * two clusters always stand at least 2 cells (4 m) apart.
+ * blocks dropped, and a cluster uses only a block's inner `CLUSTER_INNER`
+ * by `CLUSTER_INNER` cells, so two clusters always stand at least one cell
+ * (2 m) apart (E4).
  */
 export const CLUSTER_BLOCK = 4;
 /**
- * The side of a cluster block's inner square, in cells: the block's spots
- * are its cells `bx + 1` to `bx + CLUSTER_INNER` in both axes, one cell in
- * from its north-west corner, so a partial last row or column of the block
- * (when `CLUSTER_INNER` falls short of `CLUSTER_BLOCK - 1`) stays outside
- * the square and keeps two clusters' inner cells at least one cell apart.
+ * The side of a cluster block's inner square, in cells (E4): the block's
+ * spots are its cells `bx + 1` to `bx + CLUSTER_INNER` in both axes, one
+ * cell in from its north-west corner. At 3 in a block of 4 the square
+ * reaches the block's last row and column, and the block's first row and
+ * column stay empty, so two neighbouring clusters' inner cells are one
+ * empty cell apart. Every floor footprint is at most `MAX_FLOOR_PROP`
+ * (1.4 m), so a member stays 0.3 m inside its cell, and two clusters' boxes
+ * are at least 2 + 0.3 + 0.3 = 2.6 m apart, more than `CLUSTER_CLEAR`.
  */
-export const CLUSTER_INNER = 2;
-/** Chance a cluster block holds a cluster (D6, D8). */
-export const CLUSTER_SHARE = 1 / 2;
-/** The fewest members a cluster is drawn with (D6). */
-export const CLUSTER_MIN = 2;
-/** The most members a cluster is drawn with (D6). */
-export const CLUSTER_MAX = 3;
+export const CLUSTER_INNER = 3;
+/**
+ * Chance a cluster block holds a cluster (D6, E4): every block does. The
+ * draw stays in each block's stream, so tuning it is a one-constant change
+ * that moves no other draw.
+ */
+export const CLUSTER_SHARE = 1;
+/** The fewest members a cluster is drawn with (D6, E4). */
+export const CLUSTER_MIN = 3;
+/** The most members a cluster is drawn with (D6, E4). */
+export const CLUSTER_MAX = 5;
 /**
  * How far a cluster member keeps clear of everything solid outside its own
  * cluster, in metres (D7): its box grown by this much overlaps no taken box

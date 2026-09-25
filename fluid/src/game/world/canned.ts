@@ -146,9 +146,9 @@ export const CANNED_BRIDGE: PlaceInput = {
  * - **Posters.** Two observations in two categories.
  * - **Dressing.** `runbook` is the engineering archetype (pipe bundles on the
  *   walls, ducts on the ceiling, barrels, crates, trolleys, crate stacks
- *   and drum racks) and `draft`
- *   puts it under construction: two scaffold frames and the construction
- *   extras (traffic cones, a ladder, a tool cart).
+ *   and drum racks) and `draft` puts it under construction: two scaffold
+ *   frames and the construction extras (traffic cones, a ladder, a tool
+ *   cart).
  * - **Permalink.** It seeds the room, and is chosen so its span stream
  *   draws a line in every archetype that hangs one (E2).
  */

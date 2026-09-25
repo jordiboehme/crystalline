@@ -682,13 +682,31 @@
       "seed": 3706877606749112
     },
     {
-      "kind": "barrel",
+      "kind": "trolley",
       "variant": 0,
       "anchor": "floor",
       "x": 4.5,
       "y": 3.5,
       "turn": 1,
       "seed": 2666659318902538
+    },
+    {
+      "kind": "trolley",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 5.5,
+      "y": 3.5,
+      "turn": 0,
+      "seed": 2781833970118906
+    },
+    {
+      "kind": "crate",
+      "variant": 2,
+      "anchor": "floor",
+      "x": 9.5,
+      "y": 3.5,
+      "turn": 1,
+      "seed": 1983939423968796
     },
     {
       "kind": "barrel",
@@ -709,13 +727,22 @@
       "seed": 2916180305326663
     },
     {
-      "kind": "barrel",
+      "kind": "crate-stack",
       "variant": 1,
       "anchor": "floor",
-      "x": 4.5,
+      "x": 5.5,
+      "y": 4.5,
+      "turn": 3,
+      "seed": 5779406324665304
+    },
+    {
+      "kind": "trolley",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 9.5,
       "y": 4.5,
       "turn": 1,
-      "seed": 6619480273103084
+      "seed": 4830142154457217
     },
     {
       "kind": "traffic-cone",
@@ -725,6 +752,24 @@
       "y": 5.5,
       "turn": 1,
       "seed": 150616531967614
+    },
+    {
+      "kind": "crate-stack",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 3.5,
+      "y": 5.5,
+      "turn": 0,
+      "seed": 2684470689422599
+    },
+    {
+      "kind": "trolley",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 9.5,
+      "y": 5.5,
+      "turn": 2,
+      "seed": 2331508782570572
     },
     {
       "kind": "trolley",
@@ -748,19 +793,19 @@
       "kind": "crate",
       "variant": 1,
       "anchor": "floor",
-      "x": 4.5,
+      "x": 5.5,
       "y": 7.5,
-      "turn": 1,
-      "seed": 7554166841878963
+      "turn": 0,
+      "seed": 254746912752376
     },
     {
-      "kind": "crate",
-      "variant": 1,
+      "kind": "trolley",
+      "variant": 0,
       "anchor": "floor",
-      "x": 3.5,
-      "y": 8.5,
+      "x": 7.5,
+      "y": 7.5,
       "turn": 2,
-      "seed": 6631754886330797
+      "seed": 1758542748150682
     },
     {
       "kind": "ladder",
@@ -779,6 +824,60 @@
       "y": 9.5,
       "turn": 1,
       "seed": 3802026275378677
+    },
+    {
+      "kind": "barrel",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 3.5,
+      "y": 9.5,
+      "turn": 0,
+      "seed": 2591646911493658
+    },
+    {
+      "kind": "crate-stack",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 4.5,
+      "y": 9.5,
+      "turn": 1,
+      "seed": 2585140044142125
+    },
+    {
+      "kind": "crate",
+      "variant": 2,
+      "anchor": "floor",
+      "x": 5.5,
+      "y": 9.5,
+      "turn": 3,
+      "seed": 6549289440701669
+    },
+    {
+      "kind": "drum-rack",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 7.5,
+      "y": 9.5,
+      "turn": 2,
+      "seed": 2180463798953798
+    },
+    {
+      "kind": "trolley",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 8.5,
+      "y": 9.5,
+      "turn": 0,
+      "seed": 518360766134460
+    },
+    {
+      "kind": "crate",
+      "variant": 2,
+      "anchor": "floor",
+      "x": 9.5,
+      "y": 9.5,
+      "turn": 1,
+      "seed": 2081132349747553
     },
     {
       "kind": "traffic-cone",
