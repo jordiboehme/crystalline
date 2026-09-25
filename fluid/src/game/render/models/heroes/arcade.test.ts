@@ -3,19 +3,34 @@
  * for every kind. Three games with their own titles and colours, attract
  * screens whose title card and demo never share a quad, a recruitment
  * cabinet that is bigger than the arcade cabinet and glows along its
- * sides, and nothing that reaches out into the use point in front.
+ * sides, nothing that reaches out into the use point in front, and no
+ * two faces stacked closer than the decal spacing.
  */
 
 import { describe, expect, it } from "vitest";
 
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import type { HeroKind } from "../../../world/types";
-import { FLAG, blinkFlag, createBuilder, type V3 } from "../../geometry";
-import { frameAt } from "../../kit";
+import {
+  FLAG,
+  blinkFlag,
+  createBuilder,
+  type MeshData,
+  type V3,
+} from "../../geometry";
+import { DECAL_LIFT, frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
-import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
-import { buildHero } from ".";
-import { ARCADE_GAMES, RECRUIT_TITLE } from "./arcade";
+import {
+  cross,
+  dot,
+  positions,
+  recordingKitAt,
+  sub,
+  toLocal,
+  type Part,
+} from "../../modelChecks";
+import { buildHero, buildHeroMesh } from ".";
+import { ARCADE_GAMES, RECRUIT_DEMO, RECRUIT_TITLE } from "./arcade";
 import { heroHalf } from "./common";
 import { textRows } from "./pixels";
 
@@ -56,20 +71,69 @@ function overlap(
   );
 }
 
+/** A mesh's triangles: corners, unit normal and the plane's offset along it. */
+function triangles(m: MeshData): { pts: V3[]; n: V3; off: number }[] {
+  const ps = positions(m);
+  const out: { pts: V3[]; n: V3; off: number }[] = [];
+  for (let i = 0; i + 2 < ps.length; i += 3) {
+    const [a, b, c] = [ps[i], ps[i + 1], ps[i + 2]];
+    if (!a || !b || !c) continue;
+    const x = cross(sub(b, a), sub(c, a));
+    const l = Math.hypot(...x);
+    if (l < 1e-10) continue;
+    const n: V3 = [x[0] / l, x[1] / l, x[2] / l];
+    out.push({ pts: [a, b, c], n, off: dot(n, a) });
+  }
+  return out;
+}
+
+/**
+ * Whether two triangles in parallel planes of normal `n` overlap when seen
+ * along `n` (a separating-axis test on their projections; sharing only an
+ * edge or a corner does not count).
+ */
+function overlapAlong(n: V3, p: readonly V3[], q: readonly V3[]): boolean {
+  const t: V3 = Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const u = cross(n, t);
+  const lu = Math.hypot(...u);
+  const e1: V3 = [u[0] / lu, u[1] / lu, u[2] / lu];
+  const e2 = cross(n, e1);
+  const flat = (xs: readonly V3[]) => xs.map((x) => [dot(x, e1), dot(x, e2)]);
+  const [a, b] = [flat(p), flat(q)];
+  for (const poly of [a, b])
+    for (let i = 0; i < 3; i++) {
+      const [p0, p1] = [poly[i], poly[(i + 1) % 3]];
+      if (!p0 || !p1) continue;
+      const ax = [(p1[1] ?? 0) - (p0[1] ?? 0), (p0[0] ?? 0) - (p1[0] ?? 0)];
+      const pr = (xs: number[][]) =>
+        xs.map((x) => (x[0] ?? 0) * (ax[0] ?? 0) + (x[1] ?? 0) * (ax[1] ?? 0));
+      const [pa, pb] = [pr(a), pr(b)];
+      if (
+        Math.max(...pa) <= Math.min(...pb) + 1e-6 ||
+        Math.max(...pb) <= Math.min(...pa) + 1e-6
+      )
+        return false;
+    }
+  return true;
+}
+
 describe("arcade hero models", () => {
   it("three games with distinct titles and colours", () => {
     expect(ARCADE_GAMES).toHaveLength(3);
     expect(ARCADE_GAMES).toHaveLength(
       HERO_CATALOGUE["arcade-cabinet"].variants,
     );
-    const titles = new Set(ARCADE_GAMES.map((g) => g.title));
+    const titles = new Set<string>(ARCADE_GAMES.map((g) => g.title));
     expect(titles.size).toBe(3);
     expect(titles.has(RECRUIT_TITLE)).toBe(false);
     const colours = ARCADE_GAMES.flatMap((g) => [g.body, g.side, g.accent]);
     expect(new Set(colours.map((c) => c.join(","))).size).toBe(colours.length);
     for (const g of [...ARCADE_GAMES.map((x) => x.title), RECRUIT_TITLE])
       expect(() => textRows(g), g).not.toThrow();
-    for (const g of ARCADE_GAMES) {
+    for (const g of [
+      ...ARCADE_GAMES,
+      { title: RECRUIT_TITLE, demo: RECRUIT_DEMO },
+    ]) {
       expect(g.demo.length, g.title).toBeGreaterThan(0);
       const width = g.demo[0]?.length ?? 0;
       expect(width, g.title).toBeGreaterThan(0);
@@ -114,10 +178,16 @@ describe("arcade hero models", () => {
   });
 
   it("the recruitment cabinet is wider and deeper than the arcade cabinet and its side panels glow", () => {
-    const arcade = heroHalf("arcade-cabinet", 0);
-    const recruit = heroHalf("recruit-cabinet", 0);
-    expect(recruit.hw).toBeGreaterThan(arcade.hw);
-    expect(recruit.d1).toBeGreaterThan(arcade.d1);
+    const extents = (kind: HeroKind) => {
+      const ps = positions(buildHeroMesh(kind, 0, LOOKS.aperture));
+      const span = (i: 0 | 2) =>
+        Math.max(...ps.map((p) => p[i])) - Math.min(...ps.map((p) => p[i]));
+      return { width: span(0), depth: span(2) };
+    };
+    const arcade = extents("arcade-cabinet");
+    const recruit = extents("recruit-cabinet");
+    expect(recruit.width).toBeGreaterThan(arcade.width + 0.1);
+    expect(recruit.depth).toBeGreaterThan(arcade.depth + 0.1);
     const parts = partsOf("recruit-cabinet", 0);
     for (const side of [1, -1]) {
       const panels = parts.filter((p) => {
@@ -147,6 +217,24 @@ describe("arcade hero models", () => {
             .map((q) => q[1]),
         );
         expect(deepest, `${kind} ${String(v)}`).toBeLessThanOrEqual(d1 + 1e-9);
+      }
+  });
+
+  it("stacks no two same-facing overlapping faces closer than the decal spacing", () => {
+    for (const kind of CABINETS)
+      for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++) {
+        const ts = triangles(buildHeroMesh(kind, v, LOOKS.aperture));
+        const close: string[] = [];
+        for (let i = 0; i < ts.length; i++)
+          for (let j = i + 1; j < ts.length; j++) {
+            const [p, q] = [ts[i], ts[j]];
+            if (!p || !q || dot(p.n, q.n) < 1 - 1e-6) continue;
+            const gap = Math.abs(p.off - q.off);
+            if (gap >= DECAL_LIFT - 1e-6) continue;
+            if (overlapAlong(p.n, p.pts, q.pts))
+              close.push(`${gap.toFixed(4)} at ${p.pts[0]?.join(",") ?? ""}`);
+          }
+        expect(close, `${kind} ${String(v)}`).toEqual([]);
       }
   });
 });

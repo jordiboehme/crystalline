@@ -71,9 +71,10 @@ export interface PixelRun {
 /**
  * Every horizontal run of characters equal to each other in `rows`, row by
  * row from the top and left to right, with the character each run is made
- * of: the one scan both `pixelRuns` and `pixelPanel` share.
+ * of: the one scan `pixelRuns`, `pixelPanel` and any other picture made of
+ * rows of characters (a cabinet's block side art) share.
  */
-function runsOf(rows: readonly string[]): (PixelRun & { ch: string })[] {
+export function runsOf(rows: readonly string[]): (PixelRun & { ch: string })[] {
   const runs: (PixelRun & { ch: string })[] = [];
   rows.forEach((line, row) => {
     let col = 0;
