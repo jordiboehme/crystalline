@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { seedFor } from "../core/seed";
+import { frameAt, turnPoint } from "../render/kit";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import { dressCandidates, dressRoom } from "./dress";
 import {
@@ -33,6 +34,7 @@ import {
   heroCap,
   heroDraws,
   heroEdges,
+  heroPoint,
   heroReserve,
   heroSurfaces,
   heroUsePoint,
@@ -192,6 +194,100 @@ describe("the hero catalogue", () => {
     expect(heroesSource).not.toMatch(
       /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|generate|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
     );
+  });
+});
+
+/** A point in the kit's terms: x, height, z. */
+type V3 = [number, number, number];
+
+describe("hero local terms against the kit's frame", () => {
+  /**
+   * Where the kit puts local point `(a, d)` of a hero: `a` along the
+   * frame's `along` and `d` along its `inward`, at the hero's anchor and
+   * turn, worked out twice, by `frameAt` and by `turnPoint` of the point
+   * as built at turn 0 (the way instancing places a mesh).
+   */
+  function kitPoints(h: Hero, a: number, d: number) {
+    const origin: V3 = [h.x * CELL, 0, h.y * CELL];
+    const f = frameAt(origin, h.turn);
+    const byFrame = [
+      origin[0] + f.along[0] * a + f.inward[0] * d,
+      origin[2] + f.along[2] * a + f.inward[2] * d,
+    ];
+    const base = frameAt([0, 0, 0], 0);
+    const local: V3 = [
+      base.along[0] * a + base.inward[0] * d,
+      0,
+      base.along[2] * a + base.inward[2] * d,
+    ];
+    const turned = turnPoint(local, h.turn);
+    const byTurn = [origin[0] + turned[0], origin[2] + turned[2]];
+    return [byFrame, byTurn];
+  }
+
+  /** A hero of `kind` at each of the four turns: on each wall, or turned in place. */
+  const atEveryTurn = (kind: HeroKind): Hero[] =>
+    HERO_FOOTING[kind] === "free"
+      ? [0, 1, 2, 3].map((turn) => ({ ...heroAt(kind, 0), turn }))
+      : SIDES.map((side) => heroAt(kind, 0, side));
+
+  it("puts every surface where the kit's frame puts the catalogue's local top, at every turn", () => {
+    // The laser desk, mess table and both benches have tops that are not
+    // centred on their `a` axis, so a mirrored along axis shows.
+    let checked = 0;
+    for (const kind of HERO_KINDS)
+      for (const h of atEveryTurn(kind)) {
+        const specs = HERO_CATALOGUE[kind].surfaces;
+        const got = heroSurfaces(h);
+        for (const [i, s] of specs.entries()) {
+          for (const pts of [0, 1]) {
+            const xs: number[] = [];
+            const zs: number[] = [];
+            for (const a of [s.a0, s.a1])
+              for (const d of [s.d0, s.d1]) {
+                const p = kitPoints(h, a, d)[pts];
+                if (p === undefined) throw new Error("no point");
+                xs.push(p[0] ?? NaN);
+                zs.push(p[1] ?? NaN);
+              }
+            const box = got[i]?.box;
+            if (box === undefined)
+              throw new Error(`${kind} surface ${String(i)}`);
+            const label = `${kind} turn ${String(h.turn)} surface ${String(i)}`;
+            expect(box.x0, label).toBeCloseTo(Math.min(...xs), 9);
+            expect(box.x1, label).toBeCloseTo(Math.max(...xs), 9);
+            expect(box.z0, label).toBeCloseTo(Math.min(...zs), 9);
+            expect(box.z1, label).toBeCloseTo(Math.max(...zs), 9);
+          }
+          checked++;
+        }
+      }
+    // Four kinds with one top each, at four turns.
+    expect(checked).toBe(16);
+  });
+
+  it("puts every use point where the kit's frame puts the catalogue's local one, at every turn", () => {
+    let checked = 0;
+    for (const kind of HERO_KINDS) {
+      const use = HERO_CATALOGUE[kind].use;
+      if (use === null) continue;
+      for (const h of atEveryTurn(kind)) {
+        const p = heroUsePoint(h);
+        if (p === null) throw new Error(kind);
+        for (const q of kitPoints(h, use.a, use.d)) {
+          expect(p.x, `${kind} ${String(h.turn)}`).toBeCloseTo(q[0] ?? NaN, 9);
+          expect(p.z, `${kind} ${String(h.turn)}`).toBeCloseTo(q[1] ?? NaN, 9);
+        }
+        // An off-centre point at the same depth, so a mirrored axis shows
+        // even though every cabinet's own point is on its centre line.
+        const moved = heroPoint(h, 0.3, use.d);
+        const [q] = kitPoints(h, 0.3, use.d);
+        expect(moved.x).toBeCloseTo(q?.[0] ?? NaN, 9);
+        expect(moved.z).toBeCloseTo(q?.[1] ?? NaN, 9);
+        checked++;
+      }
+    }
+    expect(checked).toBe(8);
   });
 });
 
@@ -689,14 +785,53 @@ describe("the hero pass", () => {
     }, 30_000);
 
   it("gives the same heroes whatever order the lists come in", () => {
-    for (const { base } of HUB_BASES) {
-      const shuffled = {
-        ...base,
-        fixtures: [...base.fixtures].reverse(),
-        decor: [...base.decor].reverse(),
-      };
-      expect(placeHeroes(shuffled)).toEqual(placeHeroes(base));
+    // The canned hub and workshop draw no hero at their own seeds, so the
+    // lists are reversed on reseeds, and some of those must carry heroes.
+    let placed = 0;
+    for (const { base } of [...HUB_BASES, ...WORKSHOP_BASES])
+      for (const r of reseeded(base, 20)) {
+        const heroes = place(base, r);
+        const shuffled = {
+          ...r,
+          fixtures: [...r.fixtures].reverse(),
+          decor: [...r.decor].reverse(),
+        };
+        // The shuffled room works out its own sites from its own lists.
+        expect(placeHeroes(shuffled)).toEqual(heroes);
+        if (heroes.length > 0) placed++;
+      }
+    expect(placed).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("draws the slab before the turret, so a one-hero hall that draws both stands the slab", () => {
+    for (const { archetype, base } of BRIDGE_BASES) {
+      expect(heroCap(base.hall), archetype).toBe(1);
+      expect(
+        placeHeroes(base, { slab: true, turret: true, picks: [] }).map(
+          (h) => h.kind,
+        ),
+        archetype,
+      ).toEqual(["black-slab"]);
     }
+  });
+
+  it("pins the empty place's own hero exactly, so a change to the candidate order shows", () => {
+    // A 5 by 6 lab hall at its own seed draws the turret. It stands in the
+    // south-west corner cell (0, 5), turned north towards the hall's
+    // centre (2.5, 3), on the seed of that corner candidate.
+    const room = generateRoom(DEGENERATE_PLACES.empty);
+    expect(room.hall).toEqual({ x0: 0, y0: 0, x1: 5, y1: 6 });
+    expect(room.heroes).toEqual([
+      {
+        kind: "turret",
+        variant: 0,
+        x: 0.5,
+        y: 5.5,
+        turn: 0,
+        seed: seedFor(room.seed, "hero", 0, 5, "corner"),
+      },
+    ]);
+    expect(room.heroes[0]?.seed).toBe(184992945357087);
   });
 
   it("places heroes in degenerate rooms without breaking an invariant (Review Focus 1)", () => {

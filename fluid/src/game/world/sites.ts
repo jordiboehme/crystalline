@@ -90,6 +90,9 @@
  * Coordinates follow `Decor` (ruling 1): cells for spots and anchors,
  * metres for boxes. Pure and deterministic.
  *
+ * It also holds the small helpers the dressing and the hero pass share, so
+ * neither keeps a copy: `EPS`, `round3`, `grow`, `pickByRoll` and `inside`.
+ *
  * `Reserved` (`{ boxes, edges }`), `NO_RESERVE` and `mergeReserved` are
  * what a pass that runs before the dressing, such as the hero pass, hands
  * `dress.ts` to keep its own boxes and wall edges out of the set dressing;
@@ -288,9 +291,46 @@ export function mergeReserved(a: Reserved, b: Reserved): Reserved {
 
 /**
  * Slack for a box edge that lies on a cell border but came out of float
- * arithmetic a hair past it, so the box does not claim the next cell.
+ * arithmetic a hair past it, so the box does not claim the next cell (and,
+ * in the hero pass, a band hero's box does not count as leaving the band).
  */
-const EPS = 1e-9;
+export const EPS = 1e-9;
+
+/**
+ * Rounds a coordinate to three decimals, so the goldens are the same on
+ * every engine. The dressing and the hero pass round each anchor as the
+ * thing is made, so acceptance measures exactly what is returned.
+ */
+export function round3(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
+/** A box grown by `m` metres on every side: a cluster's ring, a hero's moat. */
+export function grow(b: Box, m: number): Box {
+  return { x0: b.x0 - m, x1: b.x1 + m, z0: b.z0 - m, z1: b.z1 + m };
+}
+
+/**
+ * One pick of a weighted list by a roll in [0, 1): the first entry whose
+ * running weight passes `roll` times the total weight, the last one when
+ * float rounding runs past the end, and null for an empty list. The
+ * dressing feeds it a fresh draw (`weighted` in `dress.ts`), the hero pass
+ * a pool slot's own roll.
+ */
+export function pickByRoll<K>(
+  roll: number,
+  picks: readonly (readonly [K, number])[],
+): K | null {
+  let total = 0;
+  for (const [, w] of picks) total += w;
+  let r = roll * total;
+  for (const [k, w] of picks) {
+    r -= w;
+    if (r < 0) return k;
+  }
+  const last = picks.at(-1);
+  return last === undefined ? null : last[0];
+}
 
 /**
  * True when a floor prop's box stands on the room's floor: every cell under
@@ -585,7 +625,8 @@ function cellKey(x: number, y: number) {
   return `${x},${y}`;
 }
 
-function inside(r: Rect, x: number, y: number) {
+/** True when cell `(x, y)` lies in rectangle `r` (`x1` and `y1` exclusive). */
+export function inside(r: Rect, x: number, y: number): boolean {
   return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
 }
 

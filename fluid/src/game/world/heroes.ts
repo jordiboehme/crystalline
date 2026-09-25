@@ -82,11 +82,16 @@ import {
   pipeRunBox,
 } from "./footprints";
 import {
+  EPS,
   dressingSites,
   edgeKey,
   fitsFloor,
+  grow,
+  inside,
   interiorBand,
   overlaps,
+  pickByRoll,
+  round3,
   wallAnchor,
   type DressingSites,
   type Reserved,
@@ -443,26 +448,42 @@ export function heroReserve(heroes: readonly Hero[]): Reserved {
 }
 
 /**
- * The hero's tops (H21) in world metres, each with its height `h`. A local
- * point `(a, d)` lies at `anchor * CELL + along * a + front * d`, with
- * `front = HERO_FRONT[turn]` and `along = [-front[1], front[0]]` (`[1, 0]`
- * at turn 0, turning clockwise with the hero); each top's box spans the
- * extremes of its four corners.
+ * Where a hero's local point `(a, d)` lies in world metres: `a` along the
+ * hero's width and `d` along its depth, in the terms the models are built
+ * in (`frameAt` in `render/kit.ts`). The point is `anchor * CELL + along *
+ * a + front * d`, with `front = HERO_FRONT[turn]` (the frame's `inward`)
+ * and `along = [front[1], -front[0]]`, the frame's `along`: `[-1, 0]` at
+ * turn 0, since a piece facing north has its `along` running west. Every
+ * helper that turns a catalogue point into the world goes through here,
+ * so they all mirror the kit alike (`heroes.test.ts` pins it against
+ * `frameAt` and `turnPoint` at every turn).
+ */
+export function heroPoint(
+  h: Hero,
+  a: number,
+  d: number,
+): { x: number; z: number } {
+  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
+  const ax = fz;
+  const az = -fx;
+  return { x: h.x * CELL + ax * a + fx * d, z: h.y * CELL + az * a + fz * d };
+}
+
+/**
+ * The hero's tops (H21) in world metres, each with its height `h`: each
+ * top's four corners through `heroPoint`, and its box spanning their
+ * extremes.
  */
 export function heroSurfaces(h: Hero): { box: Box; h: number }[] {
-  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
-  const ax = -fz;
-  const az = fx;
-  const ox = h.x * CELL;
-  const oz = h.y * CELL;
   const specs: readonly HeroSurfaceSpec[] = HERO_CATALOGUE[h.kind].surfaces;
   return specs.map((s) => {
     const xs: number[] = [];
     const zs: number[] = [];
     for (const a of [s.a0, s.a1])
       for (const d of [s.d0, s.d1]) {
-        xs.push(ox + ax * a + fx * d);
-        zs.push(oz + az * a + fz * d);
+        const p = heroPoint(h, a, d);
+        xs.push(p.x);
+        zs.push(p.z);
       }
     return {
       box: {
@@ -482,18 +503,14 @@ export const HERO_ORDER = (a: Hero, b: Hero): number =>
 
 /**
  * Where a player would stand to use a hero, in world metres, or null for a
- * kind with no use point: the catalogue's `use` turned and moved like
- * `heroSurfaces`, `anchor * CELL + along * a + front * d`. For a cabinet it
- * is `HERO_USE_OUT` in front of its face, on its centre line.
+ * kind with no use point: the catalogue's `use` through `heroPoint`, as
+ * `heroSurfaces` turns its tops. For a cabinet it is `HERO_USE_OUT` in
+ * front of its face, on its centre line.
  */
 export function heroUsePoint(h: Hero): { x: number; z: number } | null {
   const use = HERO_CATALOGUE[h.kind].use;
   if (use === null) return null;
-  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
-  return {
-    x: h.x * CELL - fz * use.a + fx * use.d,
-    z: h.y * CELL + fx * use.a + fz * use.d,
-  };
+  return heroPoint(h, use.a, use.d);
 }
 
 /** The draws of one room (H6, H7): the slab, the turret and each pool slot's chance and roll. */
@@ -520,41 +537,6 @@ export function heroDraws(room: SiteBase): HeroDraws {
   return { slab, turret, picks };
 }
 
-/**
- * Slack for a box edge that lies on the band's border but came out of
- * float arithmetic a hair past it.
- */
-const EPS = 1e-9;
-
-/** Rounds a coordinate, so the golden is the same on every engine. */
-function round3(v: number) {
-  return Math.round(v * 1000) / 1000;
-}
-
-/** A box grown by `m` metres on every side. */
-function grow(b: Box, m: number): Box {
-  return { x0: b.x0 - m, x1: b.x1 + m, z0: b.z0 - m, z1: b.z1 + m };
-}
-
-/**
- * The kind a pool slot's roll picks: the first whose running weight passes
- * `roll` times the total, as `weighted` in `dress.ts` does with a fresh
- * draw. Null for an empty pool.
- */
-function pickByRoll(
-  roll: number,
-  picks: readonly (readonly [HeroKind, number])[],
-): HeroKind | null {
-  let total = 0;
-  for (const [, w] of picks) total += w;
-  let r = roll * total;
-  for (const [k, w] of picks) {
-    r -= w;
-    if (r < 0) return k;
-  }
-  return picks.at(-1)?.[0] ?? null;
-}
-
 /** One place a hero may be tried at: its seed, its anchor and how to make the hero. */
 interface HeroCandidate {
   seed: number;
@@ -573,10 +555,6 @@ function faceCentre(hall: Rect, x: number, y: number): number {
   const dy = (hall.y0 + hall.y1) / 2 - y;
   if (Math.abs(dy) >= Math.abs(dx)) return dy < 0 ? 0 : 2;
   return dx > 0 ? 1 : 3;
-}
-
-function insideRect(r: Rect, x: number, y: number) {
-  return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
 }
 
 /**
@@ -616,7 +594,8 @@ export function placeHeroes(
         if (n !== undefined) beside.add(edgeKey(n));
     }
 
-  const fits = (kind: HeroKind, h: Hero): boolean => {
+  const fits = (h: Hero): boolean => {
+    const kind = h.kind;
     const box = heroFootprint(h);
     if (!fitsFloor(room, box)) return false;
     if (sites.lanes.some((l) => overlaps(box, l))) return false;
@@ -648,21 +627,20 @@ export function placeHeroes(
     return !solid.some((b) => overlaps(moat, b));
   };
 
+  // Every hero is made here: the candidate's first draw is the variant,
+  // then `at` gives the anchor and turn (a band hero draws its turn second,
+  // the slab's anchor reads the variant's depth), rounded to three
+  // decimals before anything measures it.
   const hero = (
     kind: HeroKind,
     rng: Rng,
-    x: number,
-    y: number,
-    turn: number,
     seed: number,
-  ): Hero => ({
-    kind,
-    variant: rng.int(0, HERO_CATALOGUE[kind].variants - 1),
-    x: round3(x),
-    y: round3(y),
-    turn,
-    seed,
-  });
+    at: (variant: number) => { x: number; y: number; turn: number },
+  ): Hero => {
+    const variant = rng.int(0, HERO_CATALOGUE[kind].variants - 1);
+    const { x, y, turn } = at(variant);
+    return { kind, variant, x: round3(x), y: round3(y), turn, seed };
+  };
 
   const candidates = (kind: HeroKind): HeroCandidate[] => {
     const entry = HERO_CATALOGUE[kind];
@@ -674,7 +652,7 @@ export function placeHeroes(
         const usable = (e: WallSlot) => {
           const k = edgeKey(e);
           return (
-            insideRect(hall, e.x, e.y) &&
+            inside(hall, e.x, e.y) &&
             sites.free.has(k) &&
             !beside.has(k) &&
             !taken.has(k)
@@ -698,7 +676,7 @@ export function placeHeroes(
               seed,
               x,
               y,
-              make: (rng) => hero(kind, rng, x, y, turn, seed),
+              make: (rng) => hero(kind, rng, seed, () => ({ x, y, turn })),
             });
           }
         break;
@@ -714,17 +692,8 @@ export function placeHeroes(
               seed,
               x,
               y,
-              make: (rng) => {
-                const variant = rng.int(0, entry.variants - 1);
-                return {
-                  kind,
-                  variant,
-                  x: round3(x),
-                  y: round3(y),
-                  turn: rng.int(0, 3),
-                  seed,
-                };
-              },
+              make: (rng) =>
+                hero(kind, rng, seed, () => ({ x, y, turn: rng.int(0, 3) })),
             });
           }
         break;
@@ -741,7 +710,7 @@ export function placeHeroes(
               seed,
               x,
               y,
-              make: (rng) => hero(kind, rng, x, y, turn, seed),
+              make: (rng) => hero(kind, rng, seed, () => ({ x, y, turn })),
             });
           }
         }
@@ -753,12 +722,14 @@ export function placeHeroes(
           seed,
           x,
           y: (hall.y0 + hall.y1) / 2,
-          make: (rng) => {
-            const variant = rng.int(0, entry.variants - 1);
-            const depth = FOOTPRINTS.hero[kind][variant]?.depth ?? 0;
-            const y = (hall.y0 + hall.y1) / 2 - depth / 2 / CELL;
-            return { kind, variant, x: round3(x), y: round3(y), turn: 2, seed };
-          },
+          make: (rng) =>
+            hero(kind, rng, seed, (variant) => ({
+              x,
+              y:
+                (hall.y0 + hall.y1) / 2 -
+                (FOOTPRINTS.hero[kind][variant]?.depth ?? 0) / 2 / CELL,
+              turn: 2,
+            })),
         });
         break;
       }
@@ -769,7 +740,7 @@ export function placeHeroes(
   const tryPlace = (kind: HeroKind) => {
     for (const c of candidates(kind)) {
       const h = c.make(createRng(c.seed));
-      if (fits(kind, h)) {
+      if (fits(h)) {
         out.push(h);
         return;
       }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { seedFor } from "../core/seed";
 import {
   CANNED_BRIDGE,
   CANNED_HUB,
@@ -92,7 +93,6 @@ import type {
   WallSlot,
 } from "./types";
 import { CELL } from "./units";
-import { seedFor } from "../core/seed";
 
 const ARCHETYPE_TYPES = {
   bridge: "manifest",
@@ -275,10 +275,11 @@ function expectWallInvariants(name: string, room: RoomSpec) {
 /**
  * The floor-prop invariants, for any room: every floor prop's footprint
  * fits the floor and overlaps no lane, no fixture, decor or scaffold box,
- * no box its heroes reserve (`heroReserve`) and no other floor prop; no cell under it is a doorway cell, next to one
- * (ruling 10) or in the corridor; no two floor props share a cell; and no
- * floor prop on a wall-side spot stands on a cell whose wall edge carries a
- * keep-clear wall prop (D2 as amended: corner-zone spots ignore wall props).
+ * no box its heroes reserve (`heroReserve`) and no other floor prop; no
+ * cell under it is a doorway cell, next to one (ruling 10) or in the
+ * corridor; no two floor props share a cell; and no floor prop on a
+ * wall-side spot stands on a cell whose wall edge carries a keep-clear
+ * wall prop (D2 as amended: corner-zone spots ignore wall props).
  * Returns how many it checked.
  */
 function expectFloorInvariants(name: string, room: RoomSpec) {

@@ -170,8 +170,11 @@ import {
   dressingSites,
   edgeKey,
   fitsFloor,
+  grow,
   mergeReserved,
   overlaps,
+  pickByRoll,
+  round3,
   spanBox,
   turnForSide,
   wallAnchor,
@@ -288,27 +291,15 @@ const SIDES = ["n", "e", "s", "w"] as const;
 /** The along-run index of a run's first extinguisher (ruling 7). */
 const EXTINGUISHER_FIRST = 3;
 
-/** Rounds a coordinate, so the golden is the same on every engine. */
-function round3(v: number) {
-  return Math.round(v * 1000) / 1000;
-}
-
 function cellKey(x: number, y: number) {
   return `${String(x)},${String(y)}`;
 }
 
-/** One pick of a weighted list; an empty list is a palette bug. */
+/** One pick of a weighted list by a fresh draw (`pickByRoll`); an empty list is a palette bug. */
 function weighted<K>(rng: Rng, picks: readonly (readonly [K, number])[]): K {
-  let total = 0;
-  for (const [, w] of picks) total += w;
-  let r = rng.next() * total;
-  for (const [k, w] of picks) {
-    r -= w;
-    if (r < 0) return k;
-  }
-  const last = picks.at(-1);
-  if (last === undefined) throw new Error("weighted pick from an empty list");
-  return last[0];
+  const k = pickByRoll(rng.next(), picks);
+  if (k === null) throw new Error("weighted pick from an empty list");
+  return k;
 }
 
 function variantOf(kind: PropKind, rng: Rng) {
@@ -542,12 +533,6 @@ export function dressCandidates(
   }
 
   // Step 9: mid-hall clusters (D6, D7), large halls only.
-  const grow = (b: Box, m: number): Box => ({
-    x0: b.x0 - m,
-    x1: b.x1 + m,
-    z0: b.z0 - m,
-    z1: b.z1 + m,
-  });
   for (const block of sites.clusterBlocks) {
     const rng = createRng(propSeed(block.x, block.y, "cluster-block"));
     if (!rng.chance(CLUSTER_SHARE)) continue;
