@@ -3,7 +3,7 @@
 //! Every one of these that touches the derived index reaches it through
 //! [`reach_index`] and nowhere else: a running daemon owns the index file, so a
 //! verb that opens the database on its own answers a person with a lock error
-//! on exactly the machines the daemon is there to serve. `crates/cli/tests/index_access.rs`
+//! on exactly the machines the daemon is there to serve. `crates/cli/tests/knowledge/index_access.rs`
 //! guards the rule.
 
 use std::path::{Path, PathBuf};
@@ -2958,7 +2958,7 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// a human rendering and does not honor `--json`. The line printed here is the
 /// daemon's own `/health` HTTP body echoed verbatim, not a locally composed set
 /// of checks, and it is a machine-consumed contract: the container `HEALTHCHECK`
-/// captures it into `docker inspect`, and `tests/service.rs` asserts the default
+/// captures it into `docker inspect`, and `tests/daemon/service.rs` asserts the default
 /// output contains `"status":"ok"`. Reshaping it would break those consumers for
 /// no gain (the body is already the canonical machine JSON), so the behavior is
 /// left as-is deliberately.

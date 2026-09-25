@@ -16,8 +16,8 @@ path = "src/lib.rs"
 # drops candle and sqlx while the daemon still compiles and serves text search
 # over Turso.
 default = ["local-embeddings", "postgres", "fluid-ui"]
-local-embeddings = ["crystalline-index/local-embeddings"]
-postgres = ["crystalline-index/postgres"]
+local-embeddings = ["crystalline-index/local-embeddings", "crystalline-engine/local-embeddings"]
+postgres = ["crystalline-index/postgres", "crystalline-engine/postgres"]
 # The Fluid web bundle, compiled into the binary and served by every daemon on
 # its HTTP endpoint (on at 127.0.0.1:7411 unless it is turned off).
 # On by default so a plain `cargo build` produces the same code paths a release
@@ -26,28 +26,29 @@ postgres = ["crystalline-index/postgres"]
 # and tolerates its absence, so a clone without node still builds and tests
 # green with this on - the embed is then simply empty.
 fluid-ui = ["dep:rust-embed"]
-# The test seams this crate carries outside plain `cfg(test)`, and nothing
-# else: the engine's own arming method and the branch that reads it, its
-# counters (`prune_statements_issued`, `detection_walks`), plus
-# `crate::nudge`'s share-walk counter (`SHARE_WALKS`, `share_walks_for`,
-# `count_walk`), which moved out of the engine into its own module but is
-# the same shape of seam. Off by default, so a released binary carries none
-# of it; turned on for this package's own test builds by the self
-# dev-dependency below, which is how an integration test - a separate crate -
-# reaches something `cfg(test)` alone would hide from it.
-testing = []
+# The test seams outside plain `cfg(test)`, which live in crystalline-engine
+# and are forwarded to its `testing` feature, and nothing else: the engine's
+# own arming method and the branch that reads it, its counters
+# (`prune_statements_issued`, `detection_walks`), plus `crate::nudge`'s
+# share-walk counter (`SHARE_WALKS`, `share_walks_for`, `count_walk`), which
+# moved out of the engine into its own module but is the same shape of seam.
+# Off by default, so a released binary carries none of it; turned on for this
+# package's own test builds by the self dev-dependency below, which is how an
+# integration test - a separate crate - reaches something `cfg(test)` alone
+# would hide from it.
+testing = ["crystalline-engine/testing"]
 
 [dependencies]
 crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
+crystalline-identity = { workspace = true }
+crystalline-engine = { workspace = true }
+crystalline-rest = { workspace = true }
 crystalline-remote = { workspace = true }
-argon2 = { workspace = true }
 getrandom = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
-turso = { workspace = true }
-indexmap = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
@@ -69,39 +70,16 @@ interprocess = { workspace = true, features = ["tokio"] }
 fs4 = { workspace = true }
 notify = { workspace = true }
 axum = { workspace = true }
-axum-extra = { workspace = true }
 tower-service = { workspace = true }
-time = { workspace = true }
-utoipa = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-sha2 = { workspace = true }
-globset = { workspace = true }
-walkdir = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
-yrs = { workspace = true }
-similar = { workspace = true }
 bytes = { workspace = true }
-# diffy has a workspace pin already (crates/remote uses it), but this crate
-# does not inherit it automatically: plain-text merge conflict surfacing here
-# needs its own line.
-diffy = { workspace = true }
-zip = { workspace = true }
-# The OpenID Connect relying party (rest::oidc). Built with no default
-# features (see the workspace pin), so its HTTP calls go through the client
-# below rather than through a reqwest of its own.
-openidconnect = { workspace = true }
-# The one HTTP client this crate makes outbound calls with: discovery, the
-# JWKS fetch and the OIDC token exchange, wired into openidconnect through
-# `rest::oidc`'s `AsyncHttpClient` implementation. Was a dev-dependency only
-# until the relying party landed.
-reqwest = { workspace = true }
+http = { workspace = true }
 # Optional: the embedded Fluid bundle, behind the `fluid-ui` feature.
 rust-embed = { workspace = true, optional = true }
 
@@ -123,6 +101,17 @@ crystalline-service = { path = ".", default-features = false, features = [
     "testing",
 ] }
 tempfile = { workspace = true }
+# The integration tests open a Turso database and walk a tree directly.
+turso = { workspace = true }
+walkdir = { workspace = true }
+# The integration tests drive the HTTP endpoint, fake an identity provider
+# and read back archives, co-editing documents and hashes; the crates they
+# name for it are the rest crate's dependencies, not this package's.
+reqwest = { workspace = true }
+openidconnect = { workspace = true }
+sha2 = { workspace = true }
+yrs = { workspace = true }
+zip = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
 # log lines through; both are test-only additions to crates this package
@@ -134,7 +123,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-tungstenite = { workspace = true }
-# The fake identity provider in tests/oidc.rs: `jsonwebtoken` signs its ID
+# The fake identity provider in tests/auth/oidc.rs: `jsonwebtoken` signs its ID
 # tokens (RS256, from the committed PEM fixtures) and `rsa` reads the same PEM
 # back to publish the matching modulus and exponent as a JWKS, so the key set
 # the relying party validates against cannot drift from the key that signed.

@@ -1,0 +1,1490 @@
+//! Smoke tests for the GitHub-origin CLI verbs, against a temp config and a
+//! temp index, no daemon involved (the in-process path).
+//!
+//! Every scenario here is reachable without a network call: the CLI's own
+//! flag validation (`--origin` combined with `--virtual` or `--no-sync`, or
+//! `--branch` without `--origin`, or a malformed `--origin` value) runs
+//! before anything talks to `crystalline-service`, and `github.enabled`
+//! being off refuses before an engine method ever tries to build a GitHub
+//! provider. The successful connect/update/status paths against a real (or
+//! mocked) origin are covered at the engine level by
+//! `crates/service/tests/origins/origin.rs`, which injects a mock provider; there is
+//! no HTTP-mocking harness in this crate to exercise them here, and
+//! `connect github` needs a live GitHub connection to test end to end, so it
+//! is not covered by an automated test in this crate (noted as a gap; its
+//! auth building blocks are covered by `crates/remote`'s own
+//! `github_auth.rs`/`github_client.rs` tests).
+
+use std::path::{Path, PathBuf};
+
+use assert_cmd::Command;
+
+use crate::common::isolate;
+
+fn bin() -> Command {
+    Command::cargo_bin("crystalline").unwrap()
+}
+
+// --- domain add --origin: flag validation (no network) -----------------------
+
+#[test]
+fn domain_add_origin_and_virtual_conflict() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    bin()
+        .args(["domain", "add", "brand", "--origin", "acme/brand-knowledge"])
+        .args(["--virtual", "--config"])
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--virtual"));
+}
+
+#[test]
+fn domain_add_origin_and_no_sync_conflict() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    bin()
+        .args(["domain", "add", "brand", "--origin", "acme/brand-knowledge"])
+        .args(["--no-sync", "--config"])
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--no-sync"));
+}
+
+#[test]
+fn domain_add_branch_without_origin_is_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("kb");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), "# Manifest").unwrap();
+    bin()
+        .args(["domain", "add", "eng"])
+        .arg(&dir)
+        .args(["--branch", "main", "--config"])
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--origin"));
+}
+
+#[test]
+fn domain_add_origin_rejects_a_malformed_spec() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    bin()
+        .args(["domain", "add", "brand", "--origin", "not-a-repo"])
+        .args(["--config"])
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("owner/repo"));
+}
+
+// --- gating: github.enabled, reached through the real CLI plumbing -----------
+
+#[test]
+fn domain_add_origin_refuses_when_github_is_not_enabled() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    bin()
+        .args(["domain", "add", "brand", "--origin", "acme/brand-knowledge"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+}
+
+#[test]
+fn origin_update_and_status_refuse_when_github_is_not_enabled() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    bin()
+        .args(["origin", "update", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args(["origin", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+}
+
+/// `isolate` redirects `HOME`/`XDG_*` AND, load-bearingly here,
+/// `CRYSTALLINE_TEST_NO_KEYCHAIN`: `origin status`'s connection block reads
+/// this machine's GitHub credential even with zero team domains registered,
+/// and neither `--config` nor `--db` touches that read - it goes through
+/// `Engine::github_credential`, which resolves the OS keychain (a hardcoded
+/// service name, not derived from any base directory) unless this boolean
+/// seam refuses that backend first and falls back to the file store under
+/// the isolated state dir instead. Without `isolate` here this test asked
+/// the real login keychain for a `github` credential on every run -
+/// harmlessly on a machine with none stored, but a real prompt (or a
+/// contended, slow answer under a loaded parallel run) on one that has ever
+/// run `crystalline connect github` for real.
+#[test]
+fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["config", "set", "github.enabled", "true", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["--json", "origin", "update", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["domains"].as_array().unwrap().len(), 0);
+    assert_eq!(data["errors"].as_array().unwrap().len(), 0);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["--json", "origin", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["connection"]["connected"], false);
+    assert_eq!(data["domains"].as_array().unwrap().len(), 0);
+
+    // The human render mentions no domains and the disconnected state,
+    // without panicking on the empty arrays.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let human = cmd
+        .args(["origin", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("not connected"), "{human}");
+    assert!(human.contains("No team domains"), "{human}");
+}
+
+// --- origin share, withdraw, resolve: flag validation and gating ------------
+
+#[test]
+fn origin_resolve_requires_exactly_one_of_keep_or_content_file() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    // Neither given.
+    bin()
+        .args(["origin", "resolve", "brand", "notes/a.md", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--keep"))
+        .stderr(predicates::str::contains("--content-file"));
+}
+
+#[test]
+fn origin_resolve_rejects_both_keep_and_content_file() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    let content_file = work.path().join("merged.md");
+    std::fs::write(&content_file, "merged content").unwrap();
+
+    bin()
+        .args(["origin", "resolve", "brand", "notes/a.md"])
+        .args(["--keep", "mine", "--content-file"])
+        .arg(&content_file)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("exactly one"));
+}
+
+#[test]
+fn origin_share_withdraw_and_resolve_refuse_when_github_is_not_enabled() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    bin()
+        .args(["origin", "share", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args(["origin", "resolve", "brand", "notes/a.md", "--keep", "mine"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args(["origin", "diff", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args([
+            "origin", "discard", "brand", "--path", "a.md", "--yes", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+}
+
+/// Isolated the same way as
+/// `origin_update_and_status_succeed_with_no_team_domains_once_enabled`,
+/// even though every verb below fails at the domain-lookup check before
+/// `Engine::github_credential` ever runs: a future reordering of that check
+/// against the connection read must not silently regain a real keychain
+/// touch here.
+#[test]
+fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["config", "set", "github.enabled", "true", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    // No such domain is registered, so each verb reaches the engine's real
+    // domain-lookup error rather than failing at CLI flag parsing.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "share", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    // --proposal is optional now: omitting it means "the single open one",
+    // which still reaches the engine rather than tripping flag parsing.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "withdraw", "brand", "--revert", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "resolve", "brand", "notes/a.md", "--keep", "mine"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "diff", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "origin", "discard", "brand", "--path", "a.md", "--yes", "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("not registered"));
+}
+
+#[test]
+fn origin_share_help_names_the_amend_and_file_flags() {
+    bin()
+        .args(["origin", "share", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--proposal"))
+        .stdout(predicates::str::contains("Amend this open proposal"))
+        .stdout(predicates::str::contains("--file"))
+        .stdout(predicates::str::contains("Share only this changed file"));
+}
+
+#[test]
+fn origin_diff_and_discard_help_name_their_flags() {
+    bin()
+        .args(["origin", "diff", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--path"))
+        .stdout(predicates::str::contains("Show only this changed file"))
+        .stdout(predicates::str::contains("--json"));
+    bin()
+        .args(["origin", "discard", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--path"))
+        .stdout(predicates::str::contains("--yes"))
+        .stdout(predicates::str::contains("Skip the confirmation prompt"));
+    bin()
+        .args(["origin", "withdraw", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--proposal"))
+        .stdout(predicates::str::contains("--revert"));
+}
+
+// --- origin diff / origin discard --------------------------------------------
+
+/// A registered team domain whose origin state carries a base snapshot with
+/// a real base tree, written by hand where `<state_dir>/origins/<domain>/`
+/// puts it (the shape `hook.rs` seeds), so `origin diff` and `origin discard`
+/// have a team copy to compare with and restore from.
+fn write_diffable_team_domain(work: &Path, home: &Path, config: &Path) -> PathBuf {
+    let root = work.join("eng");
+    std::fs::create_dir_all(&root).unwrap();
+    let manifest = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- eng\n\n## When to Use\n\n- eng\n";
+    let team_alpha = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nthe team's line\n";
+    let my_alpha = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nmy line\n";
+    std::fs::write(root.join("MANIFEST.md"), manifest).unwrap();
+    std::fs::write(root.join("alpha.md"), my_alpha).unwrap();
+    std::fs::write(
+        root.join("new.md"),
+        team_alpha.replace("permalink: alpha", "permalink: new"),
+    )
+    .unwrap();
+    // The platform's isolated state dir, never `<home>/state/crystalline` by
+    // hand: that spelling is the unix answer and the wrong folder on Windows
+    // (see `crate::common::isolated_state_dir`).
+    let origin_dir = crate::common::isolated_state_dir(home)
+        .join("origins")
+        .join("eng");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(origin_dir.join("base").join("MANIFEST.md"), manifest).unwrap();
+    std::fs::write(origin_dir.join("base").join("alpha.md"), team_alpha).unwrap();
+    let stamp = |text: &str| {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(text.as_bytes());
+        serde_json::json!({ "sha256": crystalline_index::hex_lower(&digest), "size": text.len() })
+    };
+    std::fs::write(
+        origin_dir.join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "repo": "acme/kb", "branch": "main", "base_commit": "abc",
+            "ref_etag": null, "last_checked": null,
+            "files": { "MANIFEST.md": stamp(manifest), "alpha.md": stamp(team_alpha) },
+            "proposals": [], "history": [], "conflicts": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        config,
+        format!(
+            "github:\n  enabled: true\ndomains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn origin_diff_prints_a_unified_diff_and_json_carries_both_sides() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    write_diffable_team_domain(work.path(), &home, &config);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "diff", "eng", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--- a/alpha.md (team)"))
+        .stdout(predicates::str::contains("+++ b/alpha.md (mine)"))
+        .stdout(predicates::str::contains("-the team's line"))
+        .stdout(predicates::str::contains("+my line"))
+        .stdout(predicates::str::contains("--- a/new.md (team)"))
+        .stdout(predicates::str::contains("+++ b/new.md (mine)"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .args([
+            "--json", "origin", "diff", "eng", "--path", "alpha.md", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["mode"], "team");
+    let changes = data["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{data}");
+    assert_eq!(changes[0]["path"], "alpha.md");
+    assert_eq!(changes[0]["kind"], "modified");
+    assert!(
+        changes[0]["base"]
+            .as_str()
+            .unwrap()
+            .contains("the team's line")
+    );
+    assert!(changes[0]["current"].as_str().unwrap().contains("my line"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "diff", "eng", "--path", "nowhere.md", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "not among this domain's unshared changes",
+        ));
+}
+
+#[test]
+fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    let root = write_diffable_team_domain(work.path(), &home, &config);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "discard", "eng", "--path", "alpha.md", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("M alpha.md"))
+        .stdout(predicates::str::contains("restore the team's copy"))
+        .stderr(predicates::str::contains("not a terminal; pass --yes"));
+    assert!(
+        std::fs::read_to_string(root.join("alpha.md"))
+            .unwrap()
+            .contains("my line"),
+        "nothing moved"
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    // `alpha.md` is named twice: it is still one target, so the report
+    // names it restored exactly once, not twice.
+    cmd.args([
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "alpha.md",
+        "--path",
+        "alpha.md",
+        "--path",
+        "new.md",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .success()
+    .stdout(predicates::str::contains("A new.md"))
+    .stdout(predicates::str::contains(
+        "nowhere.md  refused: not among this domain's unshared changes",
+    ))
+    .stdout(predicates::str::contains("restored: alpha.md").count(1))
+    .stdout(predicates::str::contains("deleted: new.md"))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
+    assert!(
+        std::fs::read_to_string(root.join("alpha.md"))
+            .unwrap()
+            .contains("the team's line")
+    );
+    assert!(!root.join("new.md").exists());
+
+    // Every named path refused: a non-zero exit, and the report says why.
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args([
+        "--json",
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains("\"reason\":\"unknown_path\""));
+
+    // The same case in text mode: the engine is reached exactly as it is in
+    // JSON mode, and the refusal prints the same way it would for any other
+    // discard refusal, not as a special-cased CLI message.
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args([
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains(
+        "nowhere.md  refused: not among this domain's unshared changes",
+    ))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
+}
+
+// --- domain add --origin on an already-registered name -----------------------
+
+/// A config holding one team domain `eng`, already connected to `acme/kb` on
+/// `trunk` at `root`, with `github.enabled`. Written through the core's own
+/// serializer so the path is valid YAML on every platform.
+fn already_connected_team_config(config: &Path, root: &Path) {
+    use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig, OriginConfig};
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(std::fs::canonicalize(root).unwrap());
+    entry.origin = Some(OriginConfig {
+        repo: "acme/kb".to_string(),
+        path: None,
+        branch: Some("trunk".to_string()),
+        poll_secs: None,
+    });
+    cfg.domains.insert("eng".to_string(), entry);
+    cfg.github = Some(GitHubConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    crystalline_core::config::save_yaml(config, &cfg).unwrap();
+}
+
+/// `domain add --origin` on a name already registered must not let
+/// `--private` close it (the issue this test pins: it used to always report
+/// "not adopted" and go on to close whatever `domain add` had just touched,
+/// even an existing registration). Here the retry is exact - same repo,
+/// branch and folder as the entry already on file - so the engine answers
+/// `already_connected` lock-free, with no GitHub call: the one shape this
+/// crate can drive without a GitHub mock (see the file header).
+///
+/// The other half of the fix's `true` condition - a fresh, origin-less
+/// domain adopted in place by `--origin`, which needs a real connect to
+/// reach - is covered at the engine level by the `adopted: true` assertion
+/// in `crates/service/tests/origins/origin.rs`, against a mock provider this crate
+/// has no harness for; both conditions feed the same `already_registered ||
+/// already_connected` return in `domain_add_origin_dispatch`, and this test
+/// exercises the CLI-only half of the fix, the `--private` refusal in
+/// `run_domain`, that neither engine-level test reaches.
+#[test]
+fn domain_add_origin_on_an_already_connected_domain_refuses_private_and_does_not_close_it() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    already_connected_team_config(&config, &root);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "users",
+        "add",
+        "ada",
+        "--role",
+        "editor",
+        "--password-stdin",
+    ])
+    .write_stdin("s3cret\n")
+    .assert()
+    .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "domain",
+        "add",
+        "eng",
+        "--origin",
+        "acme/kb",
+        "--branch",
+        "trunk",
+        "--private",
+        "--owner",
+        "ada",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("domain visibility"));
+
+    // The refusal ran before any close: the domain is still shared.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["domain", "members", "eng", "list", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(listed.contains("is shared"), "{listed}");
+}
+
+// --- chain rendering, against a stand-in daemon ------------------------------
+
+/// The stacked-chain render paths, driven end to end through the real binary
+/// against a stand-in daemon: an owner record naming this alive test process
+/// plus a ctl socket that answers one command with canned JSON and hands the
+/// request back to the test. That is what makes both halves observable at
+/// once - what the CLI sends (`origin share --proposal 6` really carries the
+/// number) and what it renders from what a daemon answers.
+///
+/// Unix-only: a filesystem socket the test binds itself is the mechanism, and
+/// a short `/tmp` base keeps the path under the `sockaddr_un` limit. Neither
+/// `--config` nor `--db` may be passed here, since either override sends the
+/// verb down the in-process path instead of to the socket.
+#[cfg(unix)]
+mod chain {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use assert_cmd::Command;
+    use serde_json::{Value, json};
+
+    /// A stand-in daemon answering exactly one ctl command.
+    struct Daemon {
+        dir: PathBuf,
+        requests: Receiver<Value>,
+    }
+
+    impl Daemon {
+        /// Bind the socket, write the owner record and serve one command with
+        /// `data` as its payload.
+        fn answering(tag: &str, data: Value) -> Daemon {
+            Daemon::serving(tag, json!({ "v": 1, "ok": true, "data": data }))
+        }
+
+        /// The same, refusing the one command it serves with `message` - the
+        /// shape the engine's teaching refusals arrive in.
+        fn refusing(tag: &str, message: &str) -> Daemon {
+            Daemon::serving(tag, json!({ "v": 1, "ok": false, "error": message }))
+        }
+
+        /// Bind the socket, write the owner record and answer one command with
+        /// `envelope` exactly as given.
+        fn serving(tag: &str, envelope: Value) -> Daemon {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
+            let state = dir.join("state/crystalline");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+
+            let sock = state.join("service.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let record = json!({
+                "pid": std::process::id(),
+                "socket_path": sock.display().to_string(),
+                // This binary's own version: an older one would be displaced
+                // rather than attached to.
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": "2026-08-27T00:00:00Z",
+            });
+            std::fs::write(state.join("service.json"), record.to_string()).unwrap();
+
+            let (tx, requests) = channel();
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // The mode line ("ctl") comes first, then the command.
+                let mut mode = String::new();
+                let mut line = String::new();
+                if reader.read_line(&mut mode).is_err() || reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                    let _ = tx.send(request);
+                }
+                let mut write = stream;
+                let _ = writeln!(write, "{envelope}");
+                let _ = write.flush();
+            });
+            Daemon { dir, requests }
+        }
+
+        /// Bind the socket, write the owner record and answer each of
+        /// `envelopes` in order, one per connection: for a verb that opens
+        /// more than one ctl round trip, like `origin discard`'s preview
+        /// (`origin_changes`) followed by the discard itself
+        /// (`origin_discard`), where each call is its own `try_attach`.
+        /// Requests are recorded in the same order the envelopes answer them,
+        /// so `request()` called once per envelope reads them back in order.
+        fn serving_sequence(tag: &str, envelopes: Vec<Value>) -> Daemon {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
+            let state = dir.join("state/crystalline");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+
+            let sock = state.join("service.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let record = json!({
+                "pid": std::process::id(),
+                "socket_path": sock.display().to_string(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": "2026-08-27T00:00:00Z",
+            });
+            std::fs::write(state.join("service.json"), record.to_string()).unwrap();
+
+            let (tx, requests) = channel();
+            std::thread::spawn(move || {
+                for envelope in envelopes {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut mode = String::new();
+                    let mut line = String::new();
+                    if reader.read_line(&mut mode).is_err() || reader.read_line(&mut line).is_err()
+                    {
+                        return;
+                    }
+                    if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                        let _ = tx.send(request);
+                    }
+                    let mut write = stream;
+                    let _ = writeln!(write, "{envelope}");
+                    let _ = write.flush();
+                }
+            });
+            Daemon { dir, requests }
+        }
+
+        /// Run the real binary against this daemon and return its stdout.
+        fn run(&self, args: &[&str]) -> String {
+            let out = self.invoke(args);
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        /// The same, for a command this daemon refuses: returns its stderr.
+        fn run_failing(&self, args: &[&str]) -> String {
+            let out = self.invoke(args);
+            assert!(!out.status.success(), "{out:?}");
+            String::from_utf8(out.stderr).unwrap()
+        }
+
+        fn invoke(&self, args: &[&str]) -> std::process::Output {
+            let mut cmd = Command::cargo_bin("crystalline").unwrap();
+            cmd.env("HOME", &self.dir)
+                .env("XDG_CONFIG_HOME", self.dir.join("config"))
+                .env("XDG_STATE_HOME", self.dir.join("state"))
+                .env("XDG_CACHE_HOME", self.dir.join("cache"))
+                .env("CRYSTALLINE_SERVICE_HTTP", "false")
+                // Belt and suspenders: every command this mock daemon serves
+                // answers over the ctl socket before the CLI ever opens an
+                // engine, so nothing here should reach a credential store at
+                // all - but a future command that fell through to the
+                // standalone path must not silently regain a real keychain
+                // touch.
+                .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+                .args(args);
+            cmd.output().unwrap()
+        }
+
+        /// The single ctl command the CLI sent.
+        fn request(&self) -> Value {
+            self.requests
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the CLI sent a ctl command")
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn share_with_a_proposal_number_amends_that_layer_and_names_the_chain() {
+        let daemon = Daemon::answering(
+            "amend",
+            json!({
+                "outcome": "updated",
+                "proposal": {
+                    "number": 6,
+                    "url": "https://github.test/acme/brand/pull/6",
+                    "summary": "3 engrams refined",
+                    "added": [], "updated": ["notes/a.md"], "deleted": [],
+                    "skipped_large": [],
+                    "stack_number": 42,
+                    "stack_position": [2, 3],
+                },
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand", "--proposal", "6"]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_share");
+        assert_eq!(request["proposal"], 6);
+        assert!(out.contains("Updated proposal #6"), "{out}");
+        assert!(
+            out.contains("proposal #6, layer 2 of 3 on stack #42"),
+            "{out}"
+        );
+    }
+
+    /// `--file` is repeatable and every path reaches the daemon in order: a
+    /// share of some of the delta is the caller's list, not a flag the CLI
+    /// interprets. A share with no `--file` sends no list at all, which is a
+    /// different answer from an empty one - the whole delta rather than
+    /// nothing - and both halves are pinned here because the CLI is where
+    /// they could be conflated.
+    #[test]
+    fn share_with_files_carries_each_one_and_without_them_carries_none() {
+        let outcome = || {
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/8",
+                "number": 8,
+                "branch": "crystalline/brand-8",
+                "summary": "2 engrams added",
+                "added": ["notes/a.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+            })
+        };
+        let daemon = Daemon::answering("files", outcome());
+        daemon.run(&[
+            "origin",
+            "share",
+            "brand",
+            "--file",
+            "notes/a.md",
+            "--file",
+            "guides/g.md",
+        ]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_share");
+        assert_eq!(request["files"], json!(["notes/a.md", "guides/g.md"]));
+
+        let plain = Daemon::answering("nofiles", outcome());
+        plain.run(&["origin", "share", "brand"]);
+        assert!(
+            plain.request()["files"].is_null(),
+            "no --file is the whole delta, never a selection of nothing"
+        );
+    }
+
+    #[test]
+    fn a_plain_share_stacks_a_new_layer_and_says_the_link_is_pending() {
+        let daemon = Daemon::answering(
+            "stack",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/8",
+                "number": 8,
+                "branch": "crystalline/brand-8",
+                "summary": "2 engrams added",
+                "added": ["notes/b.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+                // The chain exists; the call that groups it on the forge did
+                // not land, so there is no stack number to name.
+                "stack_number": Value::Null,
+                "stack_position": [2, 2],
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        let request = daemon.request();
+        assert!(request["proposal"].is_null(), "{request}");
+        assert!(
+            out.contains("proposal #8, layer 2 of 2 (stack link pending)"),
+            "{out}"
+        );
+        assert!(!out.contains("stack #"), "{out}");
+    }
+
+    #[test]
+    fn a_lone_open_proposal_is_rendered_without_any_layer_framing() {
+        let daemon = Daemon::answering(
+            "lone",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/8",
+                "number": 8,
+                "branch": "crystalline/brand-8",
+                "summary": "2 engrams added",
+                "added": ["notes/b.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+                "stack_number": 42,
+                "stack_position": [1, 1],
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        assert!(out.contains("Opened proposal:"), "{out}");
+        assert!(!out.contains("layer"), "{out}");
+        assert!(!out.contains("stack"), "{out}");
+    }
+
+    #[test]
+    fn refreshed_folder_indexes_get_one_line_and_stay_out_of_the_counts() {
+        let daemon = Daemon::answering(
+            "indexes",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/9",
+                "number": 9,
+                "branch": "crystalline/brand-9",
+                "summary": "Shares 1 new engram.",
+                "added": ["notes/b.md", "index.md"],
+                "updated": ["notes/index.md"],
+                "deleted": [],
+                "skipped_large": [],
+                "stack_number": Value::Null,
+                "stack_position": Value::Null,
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        // The counts are about the engram; the listings that rode along with
+        // it say so once, underneath, and never inflate the numbers a reader
+        // recognizes their own work in.
+        assert!(out.contains("1 added, 0 updated, 0 deleted"), "{out}");
+        assert!(out.contains("also refreshes 2 folder indexes"), "{out}");
+    }
+
+    #[test]
+    fn a_share_with_no_refreshed_indexes_says_nothing_about_them() {
+        let daemon = Daemon::answering(
+            "plain",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/9",
+                "number": 9,
+                "branch": "crystalline/brand-9",
+                "summary": "Shares 1 new engram.",
+                "added": ["notes/b.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+                "stack_number": Value::Null,
+                "stack_position": Value::Null,
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        assert!(out.contains("1 added, 0 updated, 0 deleted"), "{out}");
+        assert!(!out.contains("folder index"), "{out}");
+    }
+
+    #[test]
+    fn withdraw_names_the_repaired_chain_and_what_it_could_not_restore() {
+        let daemon = Daemon::answering(
+            "repaired",
+            json!({
+                "number": 7,
+                "closed": true,
+                "status": "withdrawn",
+                "restored": ["notes/a.md"],
+                "deleted": [],
+                "skipped_diverged": [],
+                "skipped_reverts": ["notes/d.md"],
+                "repaired": true,
+                "restacked": 43,
+            }),
+        );
+        let out = daemon.run(&["origin", "withdraw", "brand", "--proposal", "7", "--revert"]);
+        assert!(out.contains("Withdrew proposal #7"), "{out}");
+        assert!(out.contains("stack repaired; now stack #43"), "{out}");
+        assert!(
+            out.contains("could not restore (no reachable copy): notes/d.md"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn withdrawing_down_to_one_survivor_says_the_stack_dissolved() {
+        let daemon = Daemon::answering(
+            "dissolved",
+            json!({
+                "number": 7,
+                "closed": true,
+                "status": "withdrawn",
+                "restored": [], "deleted": [], "skipped_diverged": [],
+                "skipped_reverts": [],
+                "repaired": true,
+                "restacked": Value::Null,
+            }),
+        );
+        let out = daemon.run(&["origin", "withdraw", "brand", "--proposal", "7"]);
+        assert!(out.contains("stack dissolved"), "{out}");
+        assert!(!out.contains("now stack"), "{out}");
+    }
+
+    /// `origin diff` is one ctl round trip: `origin_changes` with no `path`
+    /// and `sides: true` (a diff always wants both texts), and `--json`
+    /// prints exactly what the daemon answered.
+    #[test]
+    fn diff_over_the_daemon_sends_domain_and_sides_and_prints_the_answer() {
+        let daemon = Daemon::answering(
+            "diff",
+            json!({
+                "domain": "brand",
+                "mode": "team",
+                "changes": [
+                    {
+                        "path": "notes/a.md",
+                        "kind": "modified",
+                        "sha": "deadbeef",
+                        "size_before": 10,
+                        "size_after": 12,
+                        "binary": false,
+                        "engram": true,
+                        "base": "old text\n",
+                        "current": "new text\n",
+                        "too_large": false,
+                    }
+                ],
+                "skipped_large": [],
+            }),
+        );
+        let out = daemon.run(&["--json", "origin", "diff", "brand"]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_changes");
+        assert_eq!(request["domain"], "brand");
+        assert!(request["path"].is_null(), "{request}");
+        assert_eq!(request["sides"], true);
+        assert!(out.contains("\"mode\":\"team\""), "{out}");
+        assert!(out.contains("\"path\":\"notes/a.md\""), "{out}");
+        assert!(out.contains("\"current\":\"new text\\n\""), "{out}");
+    }
+
+    /// `origin discard` is two ctl round trips over two separate
+    /// connections: the preview (`origin_changes`, no `path`, `sides:
+    /// false`) and then the discard itself (`origin_discard`, carrying the
+    /// digest the preview answered for the named path). `--json` prints
+    /// exactly the daemon's discard report.
+    #[test]
+    fn discard_over_the_daemon_previews_then_posts_the_previewed_digest() {
+        let daemon = Daemon::serving_sequence(
+            "discard",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        let out = daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--yes",
+        ]);
+        let preview_request = daemon.request();
+        assert_eq!(preview_request["cmd"], "origin_changes");
+        assert_eq!(preview_request["domain"], "brand");
+        assert!(preview_request["path"].is_null(), "{preview_request}");
+        assert_eq!(preview_request["sides"], false);
+
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(discard_request["domain"], "brand");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }])
+        );
+        assert!(out.contains("\"restored\":[\"a.md\"]"), "{out}");
+    }
+
+    /// A path named twice on the command line is one target, pinned where
+    /// the duplicate would otherwise be visible: the request the stand-in
+    /// daemon records. A stdout assertion cannot pin this reliably (the
+    /// engine's changed-since guard refuses a second, now-stale copy of the
+    /// same target after the first one restores the file, so `restored:
+    /// alpha.md` prints once either way); the posted `targets` array is the
+    /// only place the duplicate would actually show up before the dedupe.
+    #[test]
+    fn discard_over_the_daemon_posts_one_target_for_a_path_named_twice() {
+        let daemon = Daemon::serving_sequence(
+            "discard-dup",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--path", "a.md", "--yes",
+        ]);
+        // The preview.
+        daemon.request();
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }]),
+            "a.md named twice must still post as one target"
+        );
+    }
+
+    /// The status payload for a domain: `open` open proposals in chain order
+    /// plus whatever chain state the test is about.
+    fn status_payload(open: Vec<Value>, wedged: Vec<u64>, repair: bool, link: bool) -> Value {
+        json!({
+            "connection": { "connected": true, "user": "octocat", "token_store": "keychain" },
+            "domains": [{
+                "domain": "brand",
+                "repo": "acme/brand-knowledge",
+                "branch": "main",
+                "base_commit": "abc123",
+                "behind": false,
+                "local_changes": 2,
+                "skipped_large": [],
+                "open_proposals": open,
+                "declined_proposals": [{
+                    "number": 7, "title": "Declined work",
+                    "url": "https://github.test/acme/brand/pull/7",
+                }],
+                "conflicts": [],
+                "last_checked": Value::Null,
+                "probe_error": Value::Null,
+                "stack_number": 42,
+                "stack_wedged": wedged,
+                "repair_pending": repair,
+                "stack_link_pending": link,
+            }],
+            "errors": [],
+        })
+    }
+
+    fn open_proposal(number: u64, title: &str) -> Value {
+        json!({
+            "number": number,
+            "title": title,
+            "url": format!("https://github.test/acme/brand/pull/{number}"),
+            "status": "open",
+        })
+    }
+
+    #[test]
+    fn status_renders_the_chain_bottom_up_with_its_debts() {
+        let daemon = Daemon::answering(
+            "status-chain",
+            status_payload(
+                vec![
+                    open_proposal(3, "Bottom layer"),
+                    open_proposal(8, "Middle layer"),
+                    open_proposal(9, "Top layer"),
+                ],
+                vec![7],
+                true,
+                true,
+            ),
+        );
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("stack #42: 3 layers"), "{out}");
+        assert!(out.contains("layer 1: open proposal #3"), "{out}");
+        assert!(out.contains("layer 3: open proposal #9"), "{out}");
+        assert!(
+            out.contains("stack wedged by #7 - withdraw it or share to repair"),
+            "{out}"
+        );
+        assert!(
+            out.contains("repair pending - the next share or withdraw finishes it"),
+            "{out}"
+        );
+        assert!(
+            out.contains("stack link pending - a share or status with connection retries it"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_names_no_stack_for_a_chain_the_forge_holds_none_of() {
+        let mut payload = status_payload(
+            vec![
+                open_proposal(3, "Bottom layer"),
+                open_proposal(8, "Top layer"),
+            ],
+            vec![],
+            false,
+            true,
+        );
+        payload["domains"][0]["stack_number"] = Value::Null;
+        let daemon = Daemon::answering("status-unlinked", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("layer 2: open proposal #8"), "{out}");
+        assert!(!out.contains("stack #"), "{out}");
+    }
+
+    #[test]
+    fn status_leaves_a_single_open_proposal_unframed_and_quiet() {
+        let daemon = Daemon::answering(
+            "status-lone",
+            status_payload(vec![open_proposal(3, "Only work")], vec![], false, false),
+        );
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("open proposal #3: Only work"), "{out}");
+        assert!(!out.contains("layer"), "{out}");
+        assert!(!out.contains("wedged"), "{out}");
+        assert!(!out.contains("pending"), "{out}");
+        assert!(
+            !out.contains("personal"),
+            "an instance-mode status says nothing about a personal identity: {out}"
+        );
+    }
+
+    /// In personal mode the connection line only names the credential that
+    /// READS; the line under it names the identity this caller's own share
+    /// would go out as.
+    #[test]
+    fn status_names_the_personal_identity_a_share_would_go_out_as() {
+        let mut payload = status_payload(vec![open_proposal(3, "Only work")], vec![], false, false);
+        payload["connection"]["share_identity"] = json!("personal");
+        payload["connection"]["owner_identity"] =
+            json!({ "account": "owner", "connected": true, "user": "alice-gh" });
+        let daemon = Daemon::answering("status-personal", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("GitHub: connected as octocat"), "{out}");
+        assert!(out.contains("sharing as @alice-gh (personal)"), "{out}");
+    }
+
+    /// The same instance, with nothing connected for this caller: the refusal
+    /// their next share would get, said before they hit it, with the command
+    /// that fixes it.
+    #[test]
+    fn status_teaches_the_connect_command_when_no_personal_identity_is_connected() {
+        let mut payload = status_payload(vec![], vec![], false, false);
+        payload["connection"]["share_identity"] = json!("personal");
+        payload["connection"]["owner_identity"] =
+            json!({ "account": "owner", "connected": false, "user": Value::Null });
+        let daemon = Daemon::answering("status-unconnected", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(
+            out.contains(
+                "no personal GitHub identity connected - run: crystalline connect github --personal"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A chain whose layers belong to different people says so, layer by
+    /// layer; a proposal that recorded no author reads exactly as it always
+    /// did.
+    #[test]
+    fn status_names_each_layers_author_where_one_was_recorded() {
+        let mut alice = open_proposal(3, "Bottom layer");
+        alice["author_login"] = json!("alice-gh");
+        let mut payload = status_payload(
+            vec![alice, open_proposal(8, "Top layer")],
+            vec![],
+            false,
+            false,
+        );
+        payload["domains"][0]["declined_proposals"] = json!([{
+            "number": 7, "title": "Declined work",
+            "url": "https://github.test/acme/brand/pull/7",
+            "author_login": "carol-gh",
+        }]);
+        let daemon = Daemon::answering("status-authors", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(
+            out.contains("layer 1: open proposal #3 by @alice-gh: Bottom layer"),
+            "{out}"
+        );
+        assert!(
+            out.contains("layer 2: open proposal #8: Top layer"),
+            "a layer with no recorded author reads as it always did: {out}"
+        );
+        assert!(
+            out.contains("declined proposal #7 by @carol-gh: Declined work"),
+            "{out}"
+        );
+    }
+
+    /// The engine's teaching refusals reach the caller word for word: the CLI
+    /// renders a ctl error as plain text, so the text the engine chose is the
+    /// text a person reads. Pinned here in full, because these words are the
+    /// whole feature for someone whose share just stopped working.
+    #[test]
+    fn a_refused_share_reaches_the_caller_word_for_word() {
+        let refusal = "This instance shares with personal GitHub identities. Connect yours in \
+                       Fluid (profile > GitHub identity) or run 'crystalline connect github \
+                       --personal', then share again.";
+        let daemon = Daemon::refusing("share-refused", refusal);
+        let err = daemon.run_failing(&["origin", "share", "brand"]);
+        assert!(err.contains(refusal), "{err}");
+    }
+}

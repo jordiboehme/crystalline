@@ -340,7 +340,7 @@ async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
 /// declaration mid-call - so `provision` is listed always and refuses its
 /// mutating actions. `github.enabled` is one shared setting, so hiding on it
 /// keeps every client's answer identical at any given instant; what a flip
-/// owes is an announcement, and `tests/mcp_subscriptions.rs` is where that is
+/// owes is an announcement, and `tests/mcp/mcp_subscriptions.rs` is where that is
 /// pinned. `read_only` gates the listing as it always did: fixed at engine
 /// construction (`Engine::with_read_only` takes `self` by value), no request
 /// can move it.
@@ -381,7 +381,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     // it are withheld rather than listed-and-refusing. Calling one by name
     // still reaches the handler and says how to turn it on
     // (`hidden_collab_tools_refuse_at_call_time_when_github_is_disabled` in
-    // tests/mcp_collab.rs).
+    // tests/collab/mcp_collab.rs).
     for hidden in [
         "share_changes",
         "update_domain",
@@ -450,7 +450,7 @@ async fn no_tool_administers_a_domains_membership() {
 /// behind it: the prohibition is on two clients getting different answers at
 /// the same moment, not on a shared setting changing what everybody is served
 /// from the next call on. The obligation the "MAY change over time" clause
-/// carries is the announcement, and `tests/mcp_subscriptions.rs` pins who
+/// carries is the announcement, and `tests/mcp/mcp_subscriptions.rs` pins who
 /// receives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_six() {
@@ -1083,7 +1083,7 @@ async fn read_only_hides_the_write_gated_tools() {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
     // Read-only hides the five write-shaped collaboration tools and
-    // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
+    // `provision` (the full gating matrix lives in tests/collab/mcp_collab.rs).
     // `evolve_engrams` is hidden on its own gate: it is a read, but every
     // finding it returns prescribes a mutation, so the queue is noise where
     // mutation is impossible.
@@ -4578,7 +4578,7 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`, mirroring
-/// `tests/mcp_collab.rs`'s `NotifyClient` for the `configure` flip.
+/// `tests/collab/mcp_collab.rs`'s `NotifyClient` for the `configure` flip.
 #[derive(Clone, Default)]
 struct ProvisionNotifyClient {
     got_list_changed: Arc<tokio::sync::Notify>,
@@ -4606,7 +4606,7 @@ impl rmcp::ClientHandler for ProvisionNotifyClient {
 /// time, so the notification described a change that had not happened; and from
 /// MCP 2026-07-28 an unsolicited notification has no channel at all
 /// (`/basic/patterns/subscriptions`: a server "MUST NOT send notification types
-/// the client has not explicitly requested"). `tests/mcp_subscriptions.rs`
+/// the client has not explicitly requested"). `tests/mcp/mcp_subscriptions.rs`
 /// carries the same inversion for `configure` and the subscription path that
 /// replaces it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

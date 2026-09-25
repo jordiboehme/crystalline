@@ -23,12 +23,7 @@ use crate::engine::{Engine, WatchEvent};
 use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
-
-/// The default HTTP bind address: where the endpoint comes up when nothing asks
-/// for another one, which since the default flip is the plain `crystalline serve`
-/// case too. `crate::settings` reports it as the effective `service.http` value
-/// so `config show` and the daemon cannot drift apart.
-pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+use crate::settings::DEFAULT_HTTP_ADDR;
 
 /// How long a daemon asked to `--exit-when-idle` waits after its last socket
 /// session ends before it leaves. Long enough for Claude Desktop to restart its
@@ -90,9 +85,7 @@ const COPYRIGHT_LINE: &str = concat!(
 /// does, so the two spellings cannot drift apart unnoticed.
 pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
-/// The test-only variable that parks a blocking task in a daemon; see
-/// [`parked_blocking_task`].
-pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
+pub use crate::overlay::PARK_BLOCKING_ENV;
 
 /// How long a daemon parks one `spawn_blocking` task at startup, from
 /// [`PARK_BLOCKING_ENV`], or `None`.
@@ -1343,7 +1336,7 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// `tools/call` naming 2026-07-28 reaches the schema cache whatever we
 /// advertise - it did so while that call was still being refused, and it does
 /// so now that the call is served.
-/// `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
+/// `tests/mcp/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
 /// is the guard.
 ///
 /// # What the number means
@@ -1548,7 +1541,7 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
 /// without the `fluid-ui` feature) the fallback is the transport alone, exactly
 /// as it was before the UI existed.
 ///
-/// There is no CORS layer here and there must never be one (`tests/no_cors.rs`
+/// There is no CORS layer here and there must never be one (`tests/rest/no_cors.rs`
 /// fails the build over it): `GET /api/v1/auth/me` hands the caller their CSRF
 /// token, which is safe only because no other origin can read the answer. The
 /// UI adds no CORS surface at all - it is served from the same origin as the
@@ -2996,7 +2989,7 @@ mod tests {
     /// Every path rmcp ends a session on runs through `close_session`, so
     /// releasing the identity claim there is what keeps the gate's map in step
     /// with rmcp's own sessions. A client `DELETE` is one of those paths and is
-    /// covered end to end in `tests/mcp_auth.rs`; the other two - the 300 second
+    /// covered end to end in `tests/auth/mcp_auth.rs`; the other two - the 300 second
     /// idle keep-alive and a worker error - are reached from inside
     /// `spawn_session_worker`, with no seam a test can drive without standing up
     /// a real session and waiting out a timer that is not on a pausable clock
@@ -3029,7 +3022,7 @@ mod tests {
     /// A legacy session's draft join ends WITH THE SESSION, on every path rmcp
     /// ends one.
     ///
-    /// `tests/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
+    /// `tests/mcp/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
     /// that path the service object dies with the connection, so the join would
     /// also go through `SessionJoins`' own drop. The other two endings - the 300
     /// second idle keep-alive and a worker error - reach `close_session` from
@@ -4071,8 +4064,8 @@ mod tests {
     /// be noticed the day somebody fills it.
     const TOKEN_BEARING_SOURCES: [(&str, &str); 3] = [
         ("daemon.rs", include_str!("daemon.rs")),
-        ("rest/mod.rs", include_str!("rest/mod.rs")),
-        ("rest/auth.rs", include_str!("rest/auth.rs")),
+        ("rest/mod.rs", include_str!("../../rest/src/lib.rs")),
+        ("rest/auth.rs", include_str!("../../rest/src/auth.rs")),
     ];
 
     /// The output macros none of those three files may spell the token into.
@@ -4159,7 +4152,7 @@ mod tests {
     /// proves the comment blanking works at all.
     #[test]
     fn a_comment_naming_a_log_call_and_the_token_is_prose_the_guard_reads_past() {
-        let auth = include_str!("rest/auth.rs");
+        let auth = include_str!("../../rest/src/auth.rs");
         let warning = auth.lines().find(|line| {
             line.trim_start().starts_with("//")
                 && line.contains("token")

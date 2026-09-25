@@ -1,5 +1,5 @@
 //! A minimal in-memory forge implementing `crystalline_remote::Provider`, for
-//! the engine-level origin tests in `tests/origin.rs`.
+//! the engine-level origin tests in `tests/origins/origin.rs`.
 //!
 //! Lifted from `crystalline_remote`'s own `tests/mock/mod.rs` (a test-only
 //! module of that crate, not reachable from here) and trimmed to what the
@@ -1187,7 +1187,7 @@ impl Provider for MockProvider {
 }
 
 /// An embedding provider that returns fixed small vectors and counts calls,
-/// for the background embed worker tests in `tests/origin.rs`.
+/// for the background embed worker tests in `tests/origins/origin.rs`.
 pub struct CountingEmbedder {
     pub calls: std::sync::atomic::AtomicUsize,
 }
@@ -1409,8 +1409,8 @@ pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
 
 /// A fake [`ConnectAuth`] for the `configure` tool's connect actions and the
 /// engine-level GitHub status/ready/disconnect verbs. Lifted out of
-/// `tests/mcp_collab.rs` (formerly `FakeConnectAuth`) so both that suite and
-/// `tests/domain_admin.rs` share one double instead of keeping two: the
+/// `tests/collab/mcp_collab.rs` (formerly `FakeConnectAuth`) so both that suite and
+/// `tests/domains/domain_admin.rs` share one double instead of keeping two: the
 /// general one-shot constructor [`fake_auth`] sets all three outcomes once,
 /// each consumed exactly once by its matching method, with
 /// `run_device_flow` blockable on `run_gate` so a test can observe the
@@ -1799,7 +1799,7 @@ pub fn initialize_body_as(client: &str) -> String {
 /// `tools/call` POSTs a test drives afterwards.
 ///
 /// Raw HTTP/1.1 over a fresh connection per request, modelled on
-/// `tests/http_stream.rs`: a `tools/call` answer is a chunked SSE stream the
+/// `tests/mcp/http_stream.rs`: a `tools/call` answer is a chunked SSE stream the
 /// transport leaves open for the session's own use, so there is no
 /// end-of-message a buffering client could wait for. Reading for a bounded
 /// window and asserting on substrings is what that shape allows.

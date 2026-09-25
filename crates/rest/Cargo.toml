@@ -1,0 +1,54 @@
+[package]
+name = "crystalline-rest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The JSON API Crystalline's HTTP endpoint mounts at /api/v1, the sign-in surface (passwords, OAuth, OpenID Connect, trusted proxies) and the co-editing WebSocket."
+
+[lib]
+name = "crystalline_rest"
+path = "src/lib.rs"
+
+[dependencies]
+crystalline-core = { workspace = true }
+crystalline-index = { workspace = true }
+crystalline-remote = { workspace = true }
+crystalline-identity = { workspace = true }
+crystalline-engine = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+getrandom = { workspace = true }
+http = { workspace = true }
+# The OpenID Connect relying party (oidc). Built with no default features
+# (see the workspace pin), so its HTTP calls go through the client below
+# rather than through a reqwest of its own.
+openidconnect = { workspace = true }
+percent-encoding = { workspace = true }
+# The one HTTP client this crate makes outbound calls with: discovery, the
+# JWKS fetch and the OIDC token exchange, wired into openidconnect through
+# `oidc`'s `AsyncHttpClient` implementation.
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+yrs = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+# The argon2 verification counter the `auth` unit test reads across the
+# crate boundary (see crystalline-identity's `testing` feature).
+crystalline-identity = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

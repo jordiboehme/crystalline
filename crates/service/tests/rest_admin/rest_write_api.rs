@@ -1,0 +1,3427 @@
+//! Endpoint tests for the Group A write surface: engram create/save/retire/
+//! move/delete, manifest save, the validation dry-run, user admin, and the
+//! auth/CSRF and If-Match matrices over all of them.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+
+use crystalline_core::config::{
+    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig,
+};
+use crystalline_index::TursoStore;
+use crystalline_service::Engine;
+use crystalline_service::daemon::http_router;
+use crystalline_service::rest::{AuthStore, Role};
+use tokio::sync::Mutex;
+
+const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
+
+/// What a write-test server varies.
+#[derive(Default)]
+struct Options {
+    anonymous: bool,
+    read_only: bool,
+    trusted_header: Option<&'static str>,
+}
+
+struct Fixture {
+    addr: std::net::SocketAddr,
+    auth: Arc<AuthStore>,
+    /// The engine the router serves, so a test can seed a second domain, drain
+    /// the embedding backlog or otherwise set up a state no route reaches.
+    engine: Arc<Engine>,
+    /// Every successful write on this surface marks its domain pending in the
+    /// maintenance state file under the state directory, so every fixture here
+    /// redirects that directory into a scratch home for the test's duration.
+    /// Held rather than dropped: the redirection lasts exactly as long as this
+    /// value, and the requests that write happen while a test holds it.
+    state: crate::support::ScratchStateDir,
+    _tmp: tempfile::TempDir,
+}
+
+async fn serve(opts: Options) -> Fixture {
+    let state = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        // Defense in depth: the matrix's domain-create row is mode `virtual`
+        // and touches no disk, but a pin costs nothing and a later row that
+        // creates a local domain would otherwise scaffold folders into the
+        // developer's real `~/Documents/Crystalline`.
+        domains_root: Some(root.join("domains-root")),
+        auth: Some(AuthConfig {
+            trusted_header: opts.trusted_header.map(str::to_string),
+            proxy_headers: None,
+            anonymous: Some(opts.anonymous),
+            mcp: None,
+            oauth: None,
+            max_users: None,
+            oidc: None,
+            login: None,
+        }),
+        ..GlobalConfig::default()
+    };
+    let dir = root.join("eng");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::file(dir));
+    // A second file domain whose only job is being unregistered by the
+    // matrix's DELETE row: a MANIFEST is all a domain needs, and nothing else
+    // in this suite reads it, so its disappearance disturbs no other row.
+    let scrap = root.join("scrap");
+    std::fs::create_dir_all(&scrap).unwrap();
+    std::fs::write(
+        scrap.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: scrap\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# scrap\n\n## Scope\n\n- Scratch knowledge\n\n## When to Use\n\n- Route here for scrap questions\n",
+    )
+    .unwrap();
+    cfg.domains
+        .insert("scrap".to_string(), DomainEntry::file(scrap));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        read_only: Some(opts.read_only),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    // `service.read_only` is resolved by the daemon rather than by the engine's
+    // constructor, so the fixture applies it the way `serve` does.
+    // Both GitHub overrides are load-bearing rather than tidiness, because the
+    // matrix drives the settings routes for real once it reaches their allowed
+    // leg: without the stub `ConnectAuth` a connect would dial github.com, and
+    // without the token-store dir the `DELETE /settings/github` row would
+    // resolve to `TokenStore::Keyring` and delete the developer's REAL keychain
+    // GitHub token. The override confines the whole matrix to the temp dir.
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_read_only(opts.read_only)
+            .with_token_store_dir(root.join("tokens"))
+            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo"))),
+    );
+    engine.sync(None).await.unwrap();
+    // A deterministic embedder, so the neighbours advisory on create and save
+    // is assertable at all: without a provider the probe returns empty before
+    // it does any work, and every write here would look quiet for the wrong
+    // reason. No embed worker is wired, so nothing is embedded until a test
+    // asks for it with `embed_pending`.
+    engine.set_provider(Arc::new(crate::support::TopicEmbedder));
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    // One account per role, so every matrix row has a caller.
+    auth.add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    auth.add_user("eddy", "Eddy", None, Role::Editor, "eddypw")
+        .await
+        .unwrap();
+    auth.add_user("vera", "Vera", None, Role::Viewer, "verapw")
+        .await
+        .unwrap();
+    // Two accounts nobody logs in as: the user-admin matrix mutates THESE, so
+    // a password reset or deletion never revokes a session the matrix's own
+    // callers are still using.
+    auth.add_user("mark", "Mark", None, Role::Editor, "markpw")
+        .await
+        .unwrap();
+    auth.add_user("tina", "Tina", None, Role::Viewer, "tinapw")
+        .await
+        .unwrap();
+    // One more nobody logs in as, and one this matrix keeps to itself: the
+    // two membership rows name it as the `{principal}` path segment, and
+    // `canonicalize` maps it back. It cannot be `mark` or `tina`, which
+    // canonicalize already maps to the user-admin routes' `{name}`.
+    auth.add_user("pat", "Pat", None, Role::Editor, "patpw")
+        .await
+        .unwrap();
+
+    let router = http_router(
+        engine.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        // Served the way `run_http` serves it, connect info included: the peer
+        // address the first-run setup route reads lives in the extensions this
+        // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    Fixture {
+        addr,
+        auth,
+        engine,
+        state,
+        _tmp: tmp,
+    }
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Log in, returning (session cookie value, csrf token).
+async fn login(addr: std::net::SocketAddr, name: &str, password: &str) -> (String, String) {
+    let resp = client()
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({"name": name, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "login as {name} must succeed");
+    let cookie = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("fluid_session="))
+        .and_then(|v| v.split(';').next())
+        .and_then(|v| v.strip_prefix("fluid_session="))
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    (cookie, body["csrf"].as_str().unwrap().to_string())
+}
+
+/// A request carrying a session and its token, the browser shape.
+fn as_session(
+    addr: std::net::SocketAddr,
+    method: reqwest::Method,
+    path: &str,
+    session: &(String, String),
+) -> reqwest::RequestBuilder {
+    client()
+        .request(method, format!("http://{addr}{path}"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1)
+}
+
+/// The alpha detail read: (etag token unquoted, full content).
+async fn read_alpha(addr: std::net::SocketAddr, session: &(String, String)) -> (String, String) {
+    let resp = as_session(
+        addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/engrams/alpha",
+        session,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let etag = resp.headers()["etag"]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    (etag, body["content"].as_str().unwrap().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Beta",
+        "folder": "notes",
+        "type": "guide",
+        "tags": ["eng"],
+        "content": "# Beta\n\nThe next rule.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert!(
+        resp.headers().contains_key("etag"),
+        "the created detail carries its ETag"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["permalink"], "notes/beta");
+    assert_eq!(body["type"], "guide");
+    // The file landed with provenance naming the account.
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/notes/beta.md")).unwrap();
+    assert!(on_disk.contains("human:eddy"), "{on_disk}");
+
+    // A second create at the same permalink is a 409.
+    let dup = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Beta", "folder": "notes", "content": "again"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(dup.status(), 409);
+}
+
+/// A title holding a `/` lands nested, and the detail the create answers with
+/// carries the notice that says so. The editor is where a person writing by
+/// hand finds out, so the receipt's extra key has to survive the hop from the
+/// engine onto the detail read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_created_title_that_will_not_read_back_carries_its_notice() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Q3/Q4 planning",
+        "content": "# Q3\n\nWhat the quarter holds.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["permalink"], "q3/q4-planning");
+    let notices = body["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the notice rode across onto the detail: {body}"));
+    assert!(
+        notices[0].as_str().unwrap().contains("folder"),
+        "and it names the parameter that places an engram on purpose: {body}"
+    );
+
+    // A plain title leaves the detail exactly as a read would answer it.
+    let plain = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Gamma", "content": "# Gamma\n\nPlain.\n"}))
+    .send()
+    .await
+    .unwrap();
+    let plain: serde_json::Value = plain.json().await.unwrap();
+    assert!(plain.get("notices").is_none(), "{plain}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_walks_the_if_match_contract() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    // 428: the header is missing.
+    let missing = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .json(&serde_json::json!({"content": content}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), 428);
+    assert_eq!(
+        missing.headers()["content-type"],
+        "application/problem+json",
+        "even the precondition answers are problem details"
+    );
+
+    // Happy path: the edit lands and the answer carries the new ETag.
+    let edited = content.replace("A rule about alpha.", "A sharper rule.");
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"content": edited}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let new_etag = saved.headers()["etag"].to_str().unwrap().to_string();
+    assert_ne!(new_etag, format!("\"{etag}\""));
+
+    // 412: the old token is stale, and the payload carries the current truth.
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"content": "---\ntitle: X\n---\nwhatever"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    assert_eq!(stale.headers()["content-type"], "application/problem+json");
+    let conflict: serde_json::Value = stale.json().await.unwrap();
+    assert_eq!(conflict["current_etag"].as_str().unwrap(), new_etag);
+    assert!(
+        conflict["current_content"]
+            .as_str()
+            .unwrap()
+            .contains("A sharper rule.")
+    );
+    // And the stale body never landed.
+    let (_final_etag, final_content) = read_alpha(fx.addr, &editor).await;
+    assert!(final_content.contains("A sharper rule."));
+}
+
+/// `If-Match` accepts three shapes of the same checksum: the bare form Fluid
+/// sends from the detail read's `checksum` field, the current versioned tag
+/// the `ETag` header carries, and a tag written by an older version of this
+/// binary - the checksum is what the guard protects, so a client that copied
+/// the header from a stale build still saves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_accepts_a_bare_or_a_versioned_if_match() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // The bare checksum.
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let checksum = etag.rsplit_once('-').map_or(etag.as_str(), |(c, _)| c);
+    let bare = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{checksum}\""))
+    .json(&serde_json::json!({
+        "content": content.replace("A rule about alpha.", "A rule, v1.")
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bare.status(), 200, "the bare checksum is accepted");
+
+    // The current versioned tag, straight off the response the bare save just
+    // answered with.
+    let etag = bare.headers()["etag"].to_str().unwrap().to_string();
+    let (_etag, content) = read_alpha(fx.addr, &editor).await;
+    let versioned = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", etag)
+    .json(&serde_json::json!({ "content": content.replace("v1", "v2") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        versioned.status(),
+        200,
+        "the current versioned tag is accepted"
+    );
+
+    // The same checksum under an older version's tag - not what this binary
+    // would have written, but still a valid precondition.
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let checksum = etag.rsplit_once('-').map_or(etag.as_str(), |(c, _)| c);
+    let older = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{checksum}-0.18.1\""))
+    .json(&serde_json::json!({ "content": content.replace("v2", "v3") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        older.status(),
+        200,
+        "an older version's tag is still a valid precondition when the \
+         checksum matches"
+    );
+}
+
+/// Two tabs saving the same engram from the same read. Exactly one lands and
+/// the other is told it is stale, and the file on disk holds one writer's bytes
+/// whole rather than a blend of both.
+///
+/// End to end, this is the contract; it is not what pins the ordering. Measured
+/// against a build with the per-file lock removed, two saves sent together over
+/// HTTP still serialize on their own - the round trip is longer than the window
+/// between one save's comparison and its write - so this passed there too. What
+/// pins it is `engine::lock_tests::a_save_compares_inside_the_file_lock`, which
+/// holds the lock from outside and rewrites the file underneath a blocked save.
+/// Both are worth keeping: that one proves the order, this one proves the
+/// order is what a client actually gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    let first = content.replace("A rule about alpha.", "The first writer got there.");
+    let second = content.replace("A rule about alpha.", "The second writer got there.");
+    let put = |body: String| {
+        as_session(
+            fx.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/eng/engrams/alpha",
+            &editor,
+        )
+        .header("if-match", format!("\"{etag}\""))
+        .json(&serde_json::json!({ "content": body }))
+        .send()
+    };
+    let (a, b) = tokio::join!(put(first.clone()), put(second.clone()));
+    let mut codes = [a.unwrap().status().as_u16(), b.unwrap().status().as_u16()];
+    codes.sort_unstable();
+    assert_eq!(
+        codes,
+        [200, 412],
+        "one save lands and the other is told to re-read"
+    );
+
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        on_disk == first || on_disk == second,
+        "one writer's bytes, whole: {on_disk}"
+    );
+}
+
+/// The save writes exactly the bytes it was given, frontmatter included, even
+/// when that frontmatter's `permalink` no longer matches the URL the save came
+/// in on - and then follows the engram to where it moved.
+///
+/// Rewriting the caller's document to keep the URL and the file in step is not
+/// this layer's call to make: an editor that saved something other than what
+/// its author typed would be worse than an engram whose address moved. So the
+/// answer follows instead, and a rename that also changes the title - the case
+/// with no name left in common - still answers 200 at the new address rather
+/// than 404 over a write that landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    let diverged = content
+        .replace("permalink: alpha", "permalink: renamed")
+        .replace("title: Alpha", "title: Renamed");
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": diverged }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let new_etag = saved.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        body["permalink"], "renamed",
+        "the answer is the read at the address the engram now has"
+    );
+
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, diverged, "byte for byte what was sent");
+
+    // And the token that came back is the one the next save of it carries.
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/renamed",
+        &editor,
+    )
+    .header("if-match", &new_etag)
+    .json(&serde_json::json!({ "content": diverged.replace("A rule", "Another rule") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 200);
+}
+
+/// A human write marks its domain pending in the maintenance state file, which
+/// is how the Stop hook learns this machine owes a consolidation sweep.
+///
+/// The save route stands for all three authoring routes here: create and
+/// retire mark the same way at the same seam. A refused write must not mark,
+/// which is what the failing leg pins - a 412 leaves nothing behind, so a
+/// conflict an author never resolved cannot put a domain on the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    // The scratch state directory is one per process, so an earlier test's
+    // write outlives that test: start from no state at all, which makes
+    // "nothing is pending yet" a claim about this test rather than about the
+    // order the binary happened to run in. Done after the fixture, never
+    // before: the redirection has to be in place, or the removal would reach
+    // the developer's own state directory.
+    std::fs::remove_file(fx.state.maintenance_path()).ok();
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let before = crystalline_service::maintenance::load();
+    assert!(
+        !before.pending_domains.contains(&"eng".to_string()),
+        "nothing is pending before the first write: {:?} at {}",
+        before.pending_domains,
+        fx.state.maintenance_path().display()
+    );
+
+    // A stale token: refused, and nothing recorded.
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", "\"not-the-current-checksum\"")
+    .json(&serde_json::json!({ "content": content.clone() }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    assert_eq!(
+        crystalline_service::maintenance::load(),
+        before,
+        "a refused write owes the sweep nothing"
+    );
+
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": content.replace("A rule", "A revised rule") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"eng".to_string()),
+        "the written domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+    assert!(
+        state.pending_since.is_some(),
+        "the backlog carries the moment it started"
+    );
+    assert!(state.last_run_at.is_none(), "no sweep has run here");
+    assert!(
+        fx.state.maintenance_path().starts_with(fx.state.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
+}
+
+/// A human create marks its domain pending, the same seam the save marks at.
+///
+/// It writes into `scrap` rather than `eng` so the three marker tests here
+/// never depend on each other's backlog: under a plain `cargo test` run the
+/// tests of one binary share a scratch state directory, and a test that
+/// asserted "nothing is pending yet" for a domain another test had just marked
+/// would fail on the order they happened to run in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Fresh",
+        "content": "# Fresh\n\nSomething a person just wrote down.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"scrap".to_string()),
+        "the created-into domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+    assert!(
+        state.pending_since.is_some(),
+        "the backlog carries the moment it started"
+    );
+    assert!(
+        fx.state.maintenance_path().starts_with(fx.state.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
+}
+
+/// A human retirement marks its domain pending too: closing an engram out is
+/// authoring, and the sweep wants to see what the retirement left dangling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // Authored into `scrap` first, for the isolation the create test explains,
+    // then retired: the create's own mark and this one land on the same domain,
+    // so what this test pins is that the retirement route reaches the recorder
+    // at all rather than which write put the name there.
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Retiree",
+        "content": "# Retiree\n\nOn its way out.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "retiree", "status": "deprecated"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"scrap".to_string()),
+        "the retired-from domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+}
+
+/// Restoring an archive is administration rather than authoring, so it marks
+/// nothing: an import that put a whole domain on the queue would ask an agent
+/// to consolidate work nobody did, and the one write that most looks like a
+/// flood of human edits is exactly the one that is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_import_does_not_mark_its_domain_pending() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let before = crystalline_service::maintenance::load();
+
+    let mut zipped = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(&mut zipped);
+        writer
+            .start_file("imported.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(ALPHA.replace("Alpha", "Imported").as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let resp = client()
+        .post(format!(
+            "http://{}/api/v1/domains/scrap/archive/import",
+            fx.addr
+        ))
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .header("x-csrf-token", &admin.1)
+        .header("content-type", "application/zip")
+        .body(zipped.into_inner())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(report["written"], 1, "the import really landed: {report}");
+
+    assert_eq!(
+        crystalline_service::maintenance::load(),
+        before,
+        "a restore owes the sweep nothing at all"
+    );
+}
+
+/// A body past the API's limit is refused with 413 rather than truncated or
+/// hung on, and the refusal is a problem detail like every other one.
+///
+/// The limit is set explicitly (`rest::MAX_BODY_BYTES`) because axum's 2 MiB
+/// default would leave an engram past that size readable but unsavable, which
+/// is a trap an author only finds after making their edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_past_the_limit_is_refused_with_413() {
+    // The second leg of this test saves successfully, which marks `eng`
+    // pending, so it belongs to the serialized set even though it is not a
+    // maintenance test. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    // Comfortably past the limit, and past axum's default several times over.
+    let huge = format!(
+        "{content}{}",
+        "x".repeat(crystalline_service::rest::MAX_BODY_BYTES)
+    );
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": huge }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 413);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+
+    // A document that is merely large still saves: the limit is generous on
+    // purpose, and this is the size that broke under axum's default.
+    let big = format!("{}\n{}\n", content.trim_end(), "padding ".repeat(400_000));
+    let ok = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": big }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ok.status(), 200, "a 3 MiB engram is an engram");
+}
+
+/// The reserved OKF names are not documents: `index.md` is generated from the
+/// folder and `log.md` is reserved beside it, so neither may be created nor
+/// saved through this surface whatever the caller's role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reserved_index_and_log_names_are_refused() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    for (title, folder) in [("Index", None), ("Log", Some("notes"))] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::POST,
+            "/api/v1/domains/eng/engrams",
+            &editor,
+        )
+        .json(&serde_json::json!({
+            "title": title,
+            "folder": folder,
+            "content": "# Nope\n"
+        }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "creating '{title}' is refused");
+    }
+
+    for permalink in ["index", "notes/log"] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::PUT,
+            &format!("/api/v1/domains/eng/engrams/{permalink}"),
+            &editor,
+        )
+        .header("if-match", "\"deadbeef\"")
+        .json(&serde_json::json!({"content": "---\ntitle: X\n---\n\nnope\n"}))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "saving '{permalink}' is refused");
+    }
+}
+
+/// Who may not write, in every identity mode the surface has: a viewer
+/// account, the anonymous viewer, and a session that does not echo its CSRF
+/// token. None of them reaches the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
+    let fx = serve(Options {
+        anonymous: true,
+        ..Options::default()
+    })
+    .await;
+    let viewer = login(fx.addr, "vera", "verapw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    // A viewer is forbidden: logging in again would not help.
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &viewer,
+    )
+    .json(&serde_json::json!({"title": "Gamma", "content": "no"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 403);
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &viewer,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"content": content}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 403);
+    let retired = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &viewer,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "status": "deprecated"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(retired.status(), 403);
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &viewer,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "destination": "moved"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 403);
+    let deleted = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &viewer,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(deleted.status(), 403);
+    let manifest_saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &viewer,
+    )
+    .header("if-match", "\"deadbeef\"")
+    .json(&serde_json::json!({"markdown": "no"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(manifest_saved.status(), 403);
+    // /validate writes nothing, but it is held to the same editor-only rule
+    // as every other write on this surface: see the standing lesson at the
+    // top of this matrix - a dry run that bypassed the gate would let a
+    // viewer run the rule engine over arbitrary content this route does not
+    // mean to open.
+    let validated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &viewer)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(validated.status(), 403);
+
+    // Each route's own valid body, so a schema mismatch never masks the
+    // identity check: `ApiJson` extraction runs ahead of the handler and
+    // would otherwise answer 422 before `require_editor` is ever reached.
+    let bodies = || {
+        [
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/engrams",
+                serde_json::json!({"title": "Gamma", "content": "no"}),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/v1/domains/eng/engrams/alpha",
+                serde_json::json!({"content": "no"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/retire",
+                serde_json::json!({"permalink": "alpha", "status": "deprecated"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/move",
+                serde_json::json!({"permalink": "alpha", "destination": "moved"}),
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/domains/eng/engrams/alpha",
+                serde_json::json!({}),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/v1/domains/eng/manifest",
+                serde_json::json!({"markdown": "no"}),
+            ),
+            (
+                reqwest::Method::PATCH,
+                "/api/v1/domains/eng/manifest",
+                serde_json::json!({"generated_indexes": "local"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/validate",
+                serde_json::json!({"content": ALPHA}),
+            ),
+        ]
+    };
+
+    // The anonymous viewer is told to log in: an anonymous identity never
+    // writes, whatever the deployment mode allows it to read.
+    for (method, path, body) in bodies() {
+        let resp = client()
+            .request(method.clone(), format!("http://{}{path}", fx.addr))
+            .header("if-match", "\"deadbeef\"")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{method} {path} anonymously");
+    }
+
+    // A real editor session that does not echo its token is refused ahead of
+    // the handler, so the CSRF rule covers the content routes like every other
+    // unsafe method.
+    for (method, path, body) in bodies() {
+        let resp = client()
+            .request(method.clone(), format!("http://{}{path}", fx.addr))
+            .header("cookie", format!("fluid_session={}", editor.0))
+            .header("if-match", format!("\"{etag}\""))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{method} {path} without the token");
+    }
+
+    // Nothing above touched the domain.
+    let (_still, unchanged) = read_alpha(fx.addr, &editor).await;
+    assert!(unchanged.contains("A rule about alpha."));
+}
+
+/// A read-only instance refuses a content write before it looks at the write's
+/// preconditions: the answer is 403, never the 428 a missing `If-Match` would
+/// otherwise earn. An instance that refuses writes refuses them whatever
+/// headers arrive, and a client that fetched an ETag first would otherwise be
+/// sent round a loop that cannot end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_before_the_precondition_check() {
+    let fx = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    // The manifest route now requires admin (spec section 5: MANIFEST editing
+    // is a domain-management, admin-only screen), so its own probe below
+    // needs a caller that clears that gate - an editor would 403 there
+    // regardless of read_only, which would not exercise the ordering this
+    // test is actually about.
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let no_if_match = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .json(&serde_json::json!({"content": ALPHA}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        no_if_match.status(),
+        403,
+        "read-only answers 403, not the 428 a missing If-Match would earn"
+    );
+    assert_eq!(
+        no_if_match.headers()["content-type"],
+        "application/problem+json"
+    );
+
+    // The manifest route holds its own read-only check ahead of `if_match`
+    // too (see `save_manifest`'s comment on why it is not shared), so it gets
+    // the same probe.
+    let manifest_no_if_match = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        manifest_no_if_match.status(),
+        403,
+        "read-only answers 403 on the manifest route too, not the 428 a \
+         missing If-Match would earn"
+    );
+    assert_eq!(
+        manifest_no_if_match.headers()["content-type"],
+        "application/problem+json"
+    );
+
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Gamma", "content": "no"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 403);
+
+    // /validate refuses too, even though it writes nothing: it checks
+    // `read_only` itself, since no engine verb runs underneath it to answer
+    // that for free.
+    let validated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(validated.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_move_and_delete_run_through_their_endpoints() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // Seed a successor through the create endpoint.
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Beta", "content": "# Beta\n\nSharper.\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // Retire alpha in favor of beta.
+    let retired = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "permalink": "alpha",
+        "status": "superseded",
+        "successor": "beta"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(retired.status(), 200);
+    let alpha = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: superseded"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[beta]]"), "{alpha}");
+
+    // An invalid retirement status is a 422 with the engine's words.
+    let bad = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "status": "stable"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bad.status(), 422);
+
+    // Move beta into a folder.
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "beta", "destination": "guides/beta"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 200);
+    assert!(fx._tmp.path().join("eng/guides/beta.md").exists());
+    assert!(!fx._tmp.path().join("eng/beta.md").exists());
+
+    // Hard delete demands If-Match, then honors it.
+    let bare = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bare.status(), 428);
+    let (etag, _) = read_alpha(fx.addr, &editor).await;
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header(
+        "if-match",
+        "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    let gone = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(gone.status(), 204);
+    assert!(!fx._tmp.path().join("eng/alpha.md").exists());
+}
+
+/// **The move receipt names the address the engram answers to afterwards.**
+///
+/// A path-derived permalink follows the file, so a receipt that echoed the
+/// permalink the caller sent would hand a browser client an address that stops
+/// resolving on exactly the calls that changed it - and Fluid navigates to the
+/// moved engram off this body. The GET at the end is the point rather than
+/// belt-and-braces: it proves the receipt names something reachable, not merely
+/// something plausible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_move_receipt_names_the_permalink_the_engram_landed_at() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "destination": "guides/alpha"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 200);
+    let receipt: serde_json::Value = moved.json().await.unwrap();
+
+    assert_eq!(
+        receipt["from"],
+        serde_json::json!({ "domain": "eng", "permalink": "alpha", "path": "alpha.md" }),
+        "the receipt says where it came from: {receipt}"
+    );
+    assert_eq!(
+        receipt["to"],
+        serde_json::json!({
+            "domain": "eng",
+            "permalink": "guides/alpha",
+            "path": "guides/alpha.md",
+        }),
+        "and where it landed, permalink included: {receipt}"
+    );
+    assert_eq!(receipt["cross_domain"], false, "{receipt}");
+    assert_eq!(
+        receipt["attachment_warnings"],
+        serde_json::json!([]),
+        "a same-domain move carries nothing and so warns about nothing: {receipt}"
+    );
+
+    // The address the receipt names is one that resolves, and resolves to the
+    // engram that moved rather than to whatever else the string might match.
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/engrams/guides/alpha",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        read.status(),
+        200,
+        "the permalink in the receipt is reachable"
+    );
+    let detail: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(detail["permalink"], "guides/alpha", "{detail}");
+    assert_eq!(detail["path"], "guides/alpha.md", "{detail}");
+    assert!(fx._tmp.path().join("eng/guides/alpha.md").exists());
+    assert!(!fx._tmp.path().join("eng/alpha.md").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    // Manifest saves are admin, not editor (spec section 5: MANIFEST editing
+    // is a domain-management screen); reads stay open to any account, so the
+    // GET below still goes through the editor session.
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    let etag = read.headers()["etag"]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    let checksum = body["checksum"].as_str().unwrap().to_string();
+    assert_eq!(
+        etag,
+        format!("{checksum}-{}", crystalline_core::VERSION),
+        "header and body agree, versioned for the shape `sections` carries"
+    );
+    let markdown = body["markdown"].as_str().unwrap().to_string();
+
+    // An editor clears every other precondition here but not the role gate:
+    // refused before the If-Match check ever runs, which is why this carries
+    // no header at all.
+    let editor_refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .json(&serde_json::json!({"markdown": markdown}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        editor_refused.status(),
+        403,
+        "an editor is not enough to save the MANIFEST"
+    );
+
+    // No header: 428. Stale: 412 with the current manifest. Fresh: 200.
+    let missing = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"markdown": markdown}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), 428);
+
+    let edited = markdown.replace(
+        "Route here for eng questions",
+        "Route here for all things eng",
+    );
+    // The bare checksum, the way Fluid sends it from the body's own
+    // `checksum` field rather than the versioned header: still a valid
+    // precondition, since the checksum is what the guard protects.
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .header("if-match", format!("\"{checksum}\""))
+    .json(&serde_json::json!({"markdown": edited}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_body: serde_json::Value = saved.json().await.unwrap();
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), checksum);
+    assert_eq!(
+        std::fs::read_to_string(fx._tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        edited
+    );
+
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    let conflict: serde_json::Value = stale.json().await.unwrap();
+    assert!(
+        conflict["current_content"]
+            .as_str()
+            .unwrap()
+            .contains("all things eng")
+    );
+}
+
+/// A server fixture with one virtual domain (`docs`), its `MANIFEST.md`
+/// scaffolded straight into the database rather than onto disk - the virtual
+/// counterpart of `serve`'s file-domain manifest, so the round trip below
+/// pins the same GET-etag-to-PUT byte consistency for the virtual kind that
+/// `the_manifest_reads_with_an_etag_and_saves_under_if_match` already pins
+/// for a file domain.
+async fn serve_with_a_virtual_domain() -> Fixture {
+    let state = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            trusted_header: None,
+            proxy_headers: None,
+            anonymous: Some(false),
+            mcp: None,
+            oauth: None,
+            max_users: None,
+            oidc: None,
+            login: None,
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("docs".to_string(), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        read_only: Some(false),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    // No embedding provider, deliberately: this fixture exists for the virtual
+    // domain's write and manifest routes, and none of them probe. A neighbours
+    // test written against it would come back quiet for that reason rather
+    // than for the one it was asserting, so install a provider here first (as
+    // `serve` does) before writing one.
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine
+        .scaffold_virtual_manifest(
+            "docs",
+            "---\ntype: manifest\ntitle: docs\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# docs\n\n## Scope\n\n- Everything about docs\n\n## When to Use\n\n- Route here for docs questions\n",
+        )
+        .await
+        .unwrap();
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("eddy", "Eddy", None, Role::Editor, "eddypw")
+        .await
+        .unwrap();
+    // The manifest save below needs admin (spec section 5): domain
+    // management, MANIFEST editing included, is held to that role.
+    auth.add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+
+    let router = http_router(
+        engine.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        // Served the way `run_http` serves it, connect info included: the peer
+        // address the first-run setup route reads lives in the extensions this
+        // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    Fixture {
+        addr,
+        auth,
+        engine,
+        state,
+        _tmp: tmp,
+    }
+}
+
+/// The virtual-domain counterpart of
+/// `the_manifest_reads_with_an_etag_and_saves_under_if_match`: a GET's ETag
+/// carries straight into a PUT's `If-Match` and lands, proving the manifest
+/// round trip is byte-consistent for a database-backed MANIFEST too, not only
+/// one on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve_with_a_virtual_domain().await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    // Reads stay open to any account; the save below is admin-only.
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/docs/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    let etag = read.headers()["etag"]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    let checksum = body["checksum"].as_str().unwrap().to_string();
+    assert_eq!(
+        etag,
+        format!("{checksum}-{}", crystalline_core::VERSION),
+        "header and body agree, versioned for the shape `sections` carries"
+    );
+    let markdown = body["markdown"].as_str().unwrap().to_string();
+
+    let edited = markdown.replace(
+        "Route here for docs questions",
+        "Route here for all things docs",
+    );
+    // The versioned header tag round-trips into `If-Match` too, not only the
+    // bare checksum the other half of this pair proves.
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/docs/manifest",
+        &admin,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"markdown": edited}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_body: serde_json::Value = saved.json().await.unwrap();
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), checksum);
+    assert_eq!(saved_body["markdown"].as_str().unwrap(), edited);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_reports_findings_without_writing() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // A superseded engram without a successor trips T005.
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({
+            "domain": "eng",
+            "path": "alpha.md",
+            "content": ALPHA.replace("status: stable", "status: superseded")
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rules: Vec<&str> = body["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert!(rules.contains(&"T005"), "expected T005 in {rules:?}");
+
+    // A clean document has no findings, and nothing was ever written.
+    let clean = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clean.status(), 200);
+    let clean: serde_json::Value = clean.json().await.unwrap();
+    assert_eq!(clean["errors"], 0);
+    assert_eq!(
+        std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "a dry run writes nothing"
+    );
+}
+
+/// The trusted-header mode, end to end on a write: a proxy identity is
+/// provisioned at viewer and so cannot write, the CSRF token it needs comes
+/// from `/auth/me` and is required here like anywhere else, and promoting the
+/// account through the store the `crystalline users` CLI shares is what opens
+/// the route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_identity_writes_once_it_is_an_editor_carrying_its_token() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options {
+        trusted_header: Some("remote-user"),
+        ..Options::default()
+    })
+    .await;
+    let probe = client()
+        .get(format!("http://{}/api/v1/auth/me", fx.addr))
+        .header("remote-user", "dana")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+    let me: serde_json::Value = probe.json().await.unwrap();
+    assert_eq!(me["user"]["role"], "viewer", "provisioned at viewer");
+    let csrf = me["csrf"].as_str().unwrap().to_string();
+
+    let create = |csrf: Option<&str>| {
+        let mut req = client()
+            .post(format!("http://{}/api/v1/domains/eng/engrams", fx.addr))
+            .header("remote-user", "dana");
+        if let Some(csrf) = csrf {
+            req = req.header("x-csrf-token", csrf);
+        }
+        req.json(&serde_json::json!({"title": "Delta", "content": "# Delta\n"}))
+            .send()
+    };
+
+    assert_eq!(
+        create(Some(&csrf)).await.unwrap().status(),
+        403,
+        "a viewer the proxy names is still a viewer"
+    );
+    fx.auth.set_role("dana", Role::Editor).await.unwrap();
+    assert_eq!(
+        create(None).await.unwrap().status(),
+        403,
+        "and the CSRF rule has no trusted-header exemption"
+    );
+    let created = create(Some(&csrf)).await.unwrap();
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(body["permalink"], "delta");
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/delta.md")).unwrap();
+    assert!(on_disk.contains("human:dana"), "{on_disk}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_edits_display_names_and_resets_passwords() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    // Display name set and cleared.
+    let patched = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": "Eddy the Editor"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 200);
+    let body: serde_json::Value = patched.json().await.unwrap();
+    assert_eq!(body["user"]["display"], "Eddy the Editor");
+    let cleared = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": ""}))
+    .send()
+    .await
+    .unwrap();
+    let cleared: serde_json::Value = cleared.json().await.unwrap();
+    assert_eq!(
+        cleared["user"]["display"], "eddy",
+        "clear resets to the login name"
+    );
+
+    // Password now travels its own route, and PATCH refuses it.
+    let old_shape = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        old_shape.status(),
+        422,
+        "password is no longer a PATCH field"
+    );
+
+    let reset = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    // The reset revoked eddy's sessions: the old login is dead, the new works.
+    let editor = login(fx.addr, "eddy", "newpw").await;
+    let probe = as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &editor)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+}
+
+/// Session revocation through the API, both triggers (spec section 10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deactivation_and_reset_revoke_live_sessions_through_the_api() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // Deactivate: eddy's live session stops resolving mid-flight.
+    let off = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"disabled": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(off.status(), 200);
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401, "the revoked session no longer resolves");
+
+    // Reactivate, log in again, then reset the password: same eviction.
+    as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"disabled": false}))
+    .send()
+    .await
+    .unwrap();
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "rotated"}))
+    .send()
+    .await
+    .unwrap();
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401);
+}
+
+/// NOT_LAST_ADMIN through the API: absolute, server-side, 409 with the
+/// store's own explanation (spec section 10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_admin_is_protected_through_the_api() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for (method, path, body) in [
+        (
+            reqwest::Method::PATCH,
+            "/api/v1/users/root",
+            Some(serde_json::json!({"role": "viewer"})),
+        ),
+        (reqwest::Method::DELETE, "/api/v1/users/root", None),
+    ] {
+        let mut req = as_session(fx.addr, method, path, &admin);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 409);
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("last admin") || detail.contains("your own account"),
+            "a refusal in words, never a raw error: {detail}"
+        );
+    }
+}
+
+/// Every mutating user-admin route is refused on a read-only instance, ahead
+/// of the checks each one would otherwise run: an unknown account is never
+/// probed, and a change that would otherwise be well-formed is refused before
+/// it reaches the store. `crystalline users` on the server is the recovery
+/// path (spec section 10, resolved ambiguity 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_user_mutations() {
+    let fx = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users", &admin)
+        .json(&serde_json::json!({"name": "gina", "role": "viewer", "password": "hunter2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 403);
+    assert_eq!(
+        created.headers()["content-type"],
+        "application/problem+json"
+    );
+
+    let patched = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": "Nope"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 403);
+
+    let reset = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 403);
+
+    let removed = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(removed.status(), 403);
+
+    // `GET /users` stays served: read-only refuses writes, not reads.
+    let listed = as_session(fx.addr, reqwest::Method::GET, "/api/v1/users", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+
+    assert_eq!(
+        fx.auth.list_users().await.unwrap().len(),
+        6,
+        "nothing above changed anything"
+    );
+}
+
+/// One write operation as the matrix drives it.
+struct WriteOp {
+    method: reqwest::Method,
+    path: &'static str,
+    /// A body that passes validation when the caller is allowed.
+    body: Option<serde_json::Value>,
+    /// The least privileged role the route serves. Everything below it is
+    /// 403; the row's own role and everything above it must get past
+    /// authorization. `Role::Viewer` is a route every signed-in account may
+    /// drive - the self-service MCP token surface is the first of those, and
+    /// this field is a role rather than the two-valued flag it started as
+    /// because two values could not say that.
+    min_role: Role,
+    /// Whether a read-only instance still serves this route. False for every
+    /// route that touches knowledge, which is nearly all of them; true only
+    /// for the self-service MCP token surface, whose writes land in the
+    /// accounts database rather than in a domain (see the rows below).
+    read_only_exempt: bool,
+}
+
+/// Every mutating route the `/api/v1` surface mounts, spec section 10's write
+/// matrix as data. A route added to the router without a row here fails
+/// `write_ops_covers_every_mutating_route_mounted` below, by name, rather
+/// than depending on a reviewer noticing anything.
+fn write_ops() -> Vec<WriteOp> {
+    use reqwest::Method;
+    vec![
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/engrams",
+            body: Some(serde_json::json!({"title": "Fresh", "content": "# Fresh\n"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/engrams/alpha",
+            body: Some(serde_json::json!({"content": "x"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/retire",
+            body: Some(serde_json::json!({"permalink": "alpha", "status": "deprecated"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/move",
+            body: Some(serde_json::json!({"permalink": "alpha", "destination": "moved/alpha"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/engrams/alpha",
+            body: None,
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/manifest",
+            body: Some(serde_json::json!({"markdown": "x"})),
+            // Domain management, not content editing (spec section 5:
+            // MANIFEST editing sits among the admin-only domain screens,
+            // alongside creating and unregistering a domain).
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/domains/eng/manifest",
+            body: Some(serde_json::json!({"generated_indexes": "local"})),
+            // Domain write plus the owner right: on the shared `eng` there is
+            // no owner, so only an admin gets past authorization.
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains",
+            body: Some(serde_json::json!({"mode": "virtual", "name": "matrix-made"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // Visibility, in the direction that changes nothing on a domain that
+        // is already shared: the allowed leg answers 204 and the domain stays
+        // reachable for every row below it.
+        //
+        // What this row measures is the RE-SHARE direction against a SHARED
+        // domain, where the answer coincides with admin-only for a reason that
+        // is not the role gate: re-sharing needs `DomainRight::Own`, and on a
+        // shared domain nobody holds that but an instance admin, so an
+        // instance viewer and an instance editor are both refused by the right
+        // rather than by a role. The real two-direction policy - privatizing
+        // is admin only, re-sharing is the owner's or an admin's, a manager
+        // does neither - is pinned in `rest_visibility.rs`
+        // (`the_owner_re_shares_and_only_an_admin_closes_a_domain`), which is
+        // where a fixture with an owner exists. Refused on a read-only
+        // instance like every other mutation here: the membership records are
+        // not knowledge, but what they decide is who may read it.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/visibility",
+            body: Some(serde_json::json!({"private": false})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // Review mode, in the direction that needs no answers: `eng` has no
+        // GitHub origin, so the allowed leg is a 409 - exactly the "anything
+        // but 401/403" this matrix asserts, while changing nothing at all.
+        //
+        // Admin rather than editor, and for the same reason the visibility and
+        // unregister rows above are: the route is gated by
+        // `Engine::require_domain_owner`, which needs `DomainRight::Own`, and
+        // on a SHARED domain nobody holds that but an instance admin. Deciding
+        // whether a whole domain reviews its changes is a domain-management
+        // verb, not content editing.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/review",
+            body: Some(serde_json::json!({"mode": "overlay"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The three membership mutations. `eng` is SHARED in this fixture, so
+        // the gate they are being measured for is the domain right rather
+        // than a membership row: an instance viewer resolves to `Read` there
+        // and an instance editor to `Write`, both below the `Manage` these
+        // need, so both are refused; an admin resolves to `Own` and gets
+        // through to the store, which answers 409 because a shared domain has
+        // no membership - "anything but 401/403", which is what the allowed
+        // leg asserts. Refused on a read-only instance like every other
+        // mutation here: the membership records are not knowledge, but what
+        // they decide is who may read it.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/members/pat",
+            body: Some(serde_json::json!({"level": "editor"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/members/pat",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/owner",
+            body: Some(serde_json::json!({"owner": "pat"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // `eng` has no origin, so the allowed leg answers 409 - which is
+        // exactly the "anything but 401/403" this matrix asserts, and it needs
+        // no team fixture to prove the gate. The endpoint's own semantics are
+        // tested against a mock forge in `rest_admin_api.rs`.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The three share-surface writes, for the same reason and with the
+        // same answer: `eng` has no origin, so every allowed leg is a 409.
+        // Each carries a body, because these three parse one before the
+        // handler's own gates run - a bodyless row would answer 415 on the
+        // read-only leg instead of the 403 that leg is asserting.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/share",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/proposals/1/withdraw",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/conflicts/abc12345/resolve",
+            body: Some(serde_json::json!({"resolution": "mine"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // `eng` has no origin either, so the allowed leg is a 409 the same
+        // way the sync/withdraw/resolve rows above are: "anything but
+        // 401/403", proving the gate without a team fixture.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/changes/discard",
+            body: Some(serde_json::json!({"paths": [{"path": "alpha.md", "sha": null}]})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // Both archive uploads: admin-only writes, and their allowed legs
+        // answer 422 (an empty body is not a zip), which passes this matrix's
+        // "anything but 401/403" contract while mutating nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/archive/preview",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/archive/import",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The attachment bytes, in this order so the delete row has something
+        // to remove. Editor writes rather than admin ones: attaching a file to
+        // an engram is content editing, and the same role that writes the
+        // markdown referencing it writes the file.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: Some(serde_json::json!("bytes")),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: None,
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // The acknowledgment pair: editor writes, because ruling a finding
+        // intentional is a judgment about content rather than about the
+        // deployment. Their allowed legs answer 404 by the time this matrix
+        // runs (an earlier row moved `alpha` out from under them), which is
+        // exactly the "anything but 401/403" this asserts while changing
+        // nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // Last among the domain rows, and no later row targets `scrap`: this
+        // one unregisters it.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/scrap",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/validate",
+            body: Some(serde_json::json!({"content": "x"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users",
+            body: Some(serde_json::json!({"name": "new", "role": "viewer", "password": "pw"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/users/mark",
+            body: Some(serde_json::json!({"display": "M"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users/mark/password",
+            body: Some(serde_json::json!({"password": "pw2"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/users/tina",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/connect",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // Before the disconnect row, so the disconnect's allowed leg has
+        // something to forget; both legs are state-tolerant either way.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/token",
+            body: Some(serde_json::json!({"token": "matrix-pat"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/settings/github",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The self-service identity surface: the one settings-shaped write
+        // group an editor may drive, because the credential it manages is the
+        // caller's own rather than the instance's. A viewer is still refused
+        // by the matrix's viewer leg, as everywhere else.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/me/github-identity/token",
+            body: Some(serde_json::json!({"token": "matrix-personal-pat"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/github-identity/connect",
+            body: None,
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // Last of the three, so the delete has something to forget on its
+        // allowed leg; every leg is state-tolerant either way.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/github-identity",
+            body: None,
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // Starting a single sign-on that links its identity to the caller's
+        // account. Viewer-level like the two surfaces below (how somebody
+        // signs in is not a privilege) and read-only exempt for the same
+        // reason: an identity link is account state in the accounts database.
+        // The fixture instance has no provider configured, so every allowed
+        // leg answers 404 - past authorization, which is what this matrix
+        // asserts, and starting nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/auth/oidc/login",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // The self-service MCP token surface: the first viewer-level writes
+        // on this API, because an agent acts as the account that issued its
+        // token, so a viewer's agent is read-only by construction. Every
+        // other leg of the matrix applies unchanged - the anonymous viewer
+        // never writes and a cookie session echoes its CSRF token - except the
+        // read-only one, which is what `read_only_exempt` on these rows says:
+        // a read-only instance with `auth.mcp` on is exactly where an agent
+        // cannot connect at all until somebody issues it a token, and a token
+        // is account state in the accounts database rather than knowledge.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/mcp-tokens",
+            body: Some(serde_json::json!({"label": "the write matrix"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // An id no account holds, so both rows answer 404 on their allowed
+        // legs - past authorization, which is what this matrix asserts, while
+        // revoking nothing the issuing row above just minted. Well clear of
+        // the ids in play rather than one past them: the issuing row mints a
+        // token per allowed leg per fixture, so a leg added to the loop below
+        // would silently walk a small id into a real row.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/mcp-tokens/999999/rotate",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/mcp-tokens/999999",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // Deciding what an MCP client may do: every signed-in account may
+        // answer a consent request of its own, because a client acts as the
+        // person who consented and there is no account at the moment the
+        // client starts one. Read-only exempt on the settlement the two
+        // surfaces below share - a grant is account state in the accounts
+        // database rather than knowledge, and a read-only team server with
+        // `auth.oauth` on is exactly where a client cannot connect without
+        // one. The id names no pending request (the fixture instance serves
+        // no OAuth at all), so every allowed leg answers 404 - past
+        // authorization, which is what this matrix asserts - and `deny`
+        // rather than `allow` so that a leg could grant nothing even if it
+        // did name one.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/oauth/authorizations/9",
+            body: Some(serde_json::json!({"decision": "deny"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // Revoking a connected client: the profile-card counterpart of the
+        // MCP token surface above, on the exact same settlement - every
+        // account may revoke its own, viewers included, and a read-only
+        // instance still serves it because a grant is account state in the
+        // accounts database rather than knowledge. Unlike the MCP token rows,
+        // nothing in this matrix mints a real oauth grant, so there is no
+        // small id to collide with; `10` is the next free literal after the
+        // consent row's `9` (see `write_ops`'s oauth/authorizations row). No
+        // fixture account holds an oauth grant, so every allowed leg answers
+        // 404 - past authorization, which is what this matrix asserts -
+        // revoking nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/oauth-grants/10",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // The self-service identity-link surface, on the same settlement as
+        // the tokens above: every account may give up its own link, and an
+        // identity link is account state rather than knowledge, so a
+        // read-only instance serves it. The issuer is one no fixture account
+        // holds a link at, so every allowed leg answers 404 - past
+        // authorization, which is what this matrix asserts, and removing
+        // nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/identity-links/https%3A%2F%2Fnobody.example",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // The five mutating halves of the draft share-link surface, all on the
+        // same settlement as the tokens above: a grant is a row in the
+        // accounts database and a join is a record in this process's memory,
+        // so neither is knowledge and a read-only instance serves both. What
+        // read-only still refuses is the write a join enables, in the engine,
+        // where it always did.
+        //
+        // Minting is editor-level, because only somebody who may write on a
+        // domain can be holding a draft there to share. `eng` takes changes
+        // directly in this fixture, so nobody is holding one and every allowed
+        // leg answers 404 - past authorization, which is what this matrix
+        // asserts, and sharing nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/draft-links",
+            body: Some(serde_json::json!({"path": "alpha.md"})),
+            min_role: Role::Editor,
+            read_only_exempt: true,
+        },
+        // Revoking is viewer-level, and deliberately: it only ever ends a
+        // credential the caller minted, and the right to take one back must
+        // never be harder to hold than the right to have handed it out was -
+        // an author demoted since would otherwise leave a live link on her
+        // unfolded work that nobody alive could close. Whose link it is, is
+        // the whole of the authorization, and an admin may close any.
+        //
+        // Id 11: the next free literal after the oauth consent row's `9` and
+        // the oauth-grant row's `10`. Nothing in this matrix mints a real
+        // grant, so there is no small id to collide with, and no fixture
+        // account holds one - so every allowed leg answers 404, revoking
+        // nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/draft-links/11",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        // Redeeming, joining and leaving are viewer-level: a link binds to
+        // whichever account presents it whatever its role, and a viewer opens
+        // the draft read-only with the server's reason. The token is one
+        // nobody minted, so the first two answer 404 on every allowed leg;
+        // leaving a join nobody is holding is a success, which is what the
+        // route says it is.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/accept",
+            body: Some(serde_json::json!({"token": "dl_nobodyminted"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/join",
+            body: Some(serde_json::json!({"token": "dl_nobodyminted"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/leave",
+            body: Some(serde_json::json!({"key": "nobody is holding this"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+    ]
+}
+
+/// Every route of the share-link surface is in the router's own operation list
+/// and, for the mutating ones, in the write matrix beside it.
+///
+/// The check that keeps a route from shipping ungated: the enumeration test
+/// below fails by name for a mutating route with no matrix row, and this one
+/// fails first, naming the surface rather than a path. It also pins the two
+/// settlements that are this surface's own and cannot be read off a path -
+/// that redeeming and joining serve a viewer, and that a read-only instance
+/// serves all five - because both are decisions rather than consequences.
+#[test]
+fn draft_link_routes_are_in_the_write_matrix() {
+    for op in [
+        "POST /api/v1/domains/{domain}/draft-links",
+        "GET /api/v1/domains/{domain}/draft-links",
+        "DELETE /api/v1/draft-links/{id}",
+        "POST /api/v1/draft-links/accept",
+        "POST /api/v1/draft-links/join",
+        "POST /api/v1/draft-links/leave",
+    ] {
+        assert!(
+            crate::support::MOUNTED_OPERATIONS.contains(&op),
+            "the router's own operation list carries {op}"
+        );
+    }
+    let rows: Vec<WriteOp> = write_ops()
+        .into_iter()
+        .filter(|op| op.path.contains("draft-links"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "every mutating half of the surface has a row: mint, revoke, accept, join, leave"
+    );
+    assert!(
+        rows.iter().all(|op| op.read_only_exempt),
+        "a grant is account state and a join is session state; neither is knowledge"
+    );
+    let viewer: Vec<&str> = rows
+        .iter()
+        .filter(|op| op.min_role == Role::Viewer)
+        .map(|op| op.path)
+        .collect();
+    assert_eq!(
+        viewer,
+        vec![
+            "/api/v1/draft-links/11",
+            "/api/v1/draft-links/accept",
+            "/api/v1/draft-links/join",
+            "/api/v1/draft-links/leave",
+        ],
+        "a link binds whatever the role, a viewer opens the draft read-only, \
+         and an author ends her own link whatever her role has become"
+    );
+}
+
+fn request_for(
+    addr: std::net::SocketAddr,
+    op: &WriteOp,
+    session: Option<&(String, String)>,
+    csrf: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client().request(op.method.clone(), format!("http://{addr}{}", op.path));
+    if let Some((cookie, own_csrf)) = session {
+        req = req.header("cookie", format!("fluid_session={cookie}"));
+        req = req.header("x-csrf-token", csrf.unwrap_or(own_csrf));
+    }
+    if let Some(body) = &op.body {
+        req = req.json(body);
+    } else {
+        // A bodyless op still needs to not trip 415 on anything; DELETE sends none.
+        req = req.header("content-type", "application/json");
+    }
+    req
+}
+
+/// The spec's matrix: anonymous never writes, viewer 403, admin-only routes
+/// 403 for an editor, missing/wrong CSRF 403, read_only refuses all. "Allowed"
+/// is asserted as "gets past authorization", i.e. anything but 401/403 - the
+/// per-endpoint tests own the happy-path semantics (ETags, bodies, 4xx
+/// preconditions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_matrix_holds_on_every_route() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    // Plain instance: role and CSRF rows.
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let viewer = login(fx.addr, "vera", "verapw").await;
+
+    for op in write_ops() {
+        let label = format!("{} {}", op.method, op.path);
+
+        // No identity at all: 401 ahead of everything.
+        let resp = request_for(fx.addr, &op, None, None).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "{label} with no identity");
+
+        // A viewer session: authenticated, and refused unless the route is
+        // one every signed-in account may drive.
+        let resp = request_for(fx.addr, &op, Some(&viewer), None)
+            .send()
+            .await
+            .unwrap();
+        if op.min_role == Role::Viewer {
+            assert!(
+                resp.status() != 401 && resp.status() != 403,
+                "{label} is a viewer-level route and must serve a viewer, got {}",
+                resp.status()
+            );
+        } else {
+            assert_eq!(resp.status(), 403, "{label} as viewer");
+        }
+
+        // Missing and wrong CSRF: refused before any handler logic. The
+        // editor session drives the viewer-level rows too - an editor is
+        // above a viewer, and these legs are about the token, not the role.
+        let session = if op.min_role == Role::Admin {
+            &admin
+        } else {
+            &editor
+        };
+        let no_token = client()
+            .request(op.method.clone(), format!("http://{}{}", fx.addr, op.path))
+            .header("cookie", format!("fluid_session={}", session.0));
+        let no_token = match &op.body {
+            Some(body) => no_token.json(body),
+            None => no_token,
+        };
+        assert_eq!(
+            no_token.send().await.unwrap().status(),
+            403,
+            "{label} without csrf"
+        );
+        let resp = request_for(fx.addr, &op, Some(session), Some("wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{label} with wrong csrf");
+
+        // Admin-only routes refuse an editor.
+        if op.min_role == Role::Admin {
+            let resp = request_for(fx.addr, &op, Some(&editor), None)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{label} as editor on an admin route");
+        }
+
+        // The allowed caller gets past authorization: whatever the endpoint
+        // answers (2xx, or a 4xx precondition like 428), it is not 401/403.
+        let resp = request_for(fx.addr, &op, Some(session), None)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() != 401 && resp.status() != 403,
+            "{label} as its minimum role must pass authorization, got {}",
+            resp.status()
+        );
+    }
+
+    // Anonymous instance: the anonymous viewer never writes.
+    let anon = serve(Options {
+        anonymous: true,
+        ..Options::default()
+    })
+    .await;
+    for op in write_ops() {
+        let resp = request_for(anon.addr, &op, None, None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "{} {} as the anonymous viewer: told to log in, never served",
+            op.method,
+            op.path
+        );
+    }
+
+    // Read-only instance: every write refuses for the strongest caller.
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    for op in write_ops() {
+        let resp = request_for(ro.addr, &op, Some(&admin), None)
+            .send()
+            .await
+            .unwrap();
+        if op.read_only_exempt {
+            // The self-service account-state surfaces, and only those:
+            // `read_only` protects the knowledge, and neither an MCP token
+            // nor a single sign-on identity is knowledge - both live in the
+            // accounts database, beside the password that logs the same
+            // person in. A read-only team server with `auth.mcp` on is
+            // where an agent most needs one - it cannot connect at all
+            // without it - so issuing answers 200 here and the two id-bearing
+            // rows answer 404, both past authorization. This assertion IS the
+            // test for that rule.
+            assert!(
+                resp.status() != 401 && resp.status() != 403,
+                "{} {} must still be served under read_only, got {}",
+                op.method,
+                op.path,
+                resp.status()
+            );
+        } else {
+            assert_eq!(
+                resp.status(),
+                403,
+                "{} {} under read_only",
+                op.method,
+                op.path
+            );
+        }
+    }
+}
+
+/// Maps a matrix fixture's concrete path to the template form
+/// `crate::support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
+/// `/api/v1/domains/eng/engrams/alpha` becomes
+/// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has a fixed
+/// handful of fixture names in play - `eng` the one domain and `scrap` the
+/// throwaway one the unregister row deletes, `alpha` the one engram,
+/// `mark`/`tina` the two user-admin targets, and the share surface's `1` and
+/// `abc12345` - so a fixed per-segment substitution is enough; nothing here
+/// needs to be a general router.
+fn canonicalize(path: &str) -> String {
+    // The attachment routes take a wildcard rather than a segment: everything
+    // after `files/` is the one `{path}` parameter, however many slashes it
+    // holds, so it collapses before the per-segment pass runs over the head.
+    if let Some((head, _)) = path.split_once("/files/") {
+        return format!("{}/files/{{path}}", canonicalize(head));
+    }
+    // The MCP token routes take a numeric id, which the per-segment pass
+    // below cannot tell apart from the share surface's proposal number, so
+    // they are named here instead.
+    if let Some(rest) = path.strip_prefix("/api/v1/me/mcp-tokens/") {
+        let tail = match rest.split_once('/') {
+            Some((_, action)) => format!("/{action}"),
+            None => String::new(),
+        };
+        return format!("/api/v1/me/mcp-tokens/{{id}}{tail}");
+    }
+    // The consent route's id is 32 random bytes of hex, which the per-segment
+    // pass below could not name either: spelled out here for the same reason
+    // the token ids above are.
+    if path.starts_with("/api/v1/oauth/authorizations/") {
+        return "/api/v1/oauth/authorizations/{id}".to_string();
+    }
+    // The connected-clients route's id is a numeric grant row id, which the
+    // per-segment pass below cannot tell apart from the share surface's
+    // proposal number either: named here for the same reason the token ids
+    // above are.
+    if path.starts_with("/api/v1/me/oauth-grants/") {
+        return "/api/v1/me/oauth-grants/{id}".to_string();
+    }
+    // The share-link revoke route's id is a numeric grant row id, which the
+    // per-segment pass below cannot tell apart from the share surface's
+    // proposal number: named here for the same reason the token ids above are.
+    // The three bodyless `/draft-links/*` verbs beside it are ordinary
+    // segments and need no help.
+    if let Some(rest) = path.strip_prefix("/api/v1/draft-links/")
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return "/api/v1/draft-links/{id}".to_string();
+    }
+    // The identity-link route takes an issuer url percent-encoded into one
+    // segment, which no per-segment name could match: it is spelled out here
+    // for the same reason the token ids above are.
+    if path.starts_with("/api/v1/me/identity-links/") {
+        return "/api/v1/me/identity-links/{issuer}".to_string();
+    }
+    path.split('/')
+        .map(|segment| match segment {
+            "eng" | "scrap" => "{domain}",
+            "alpha" => "{permalink}",
+            "mark" | "tina" => "{name}",
+            // The membership rows' target account. Kept apart from the two
+            // above because it collapses to a different template.
+            "pat" => "{principal}",
+            // The share-surface rows: one proposal number and one conflict id.
+            "1" => "{number}",
+            "abc12345" => "{id}",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Deciding whether a domain reviews its changes is the domain owner's, and
+/// leaving review mode is the answer somebody has to give per actor before
+/// anybody's unshared drafts end.
+///
+/// The gate is `Engine::require_domain_owner`, the one every surface that ends
+/// something about a whole domain goes through, so an instance editor on a
+/// shared domain is refused where an admin gets past authorization. The matrix
+/// row beside this test drives the same route through every role and both CSRF
+/// legs; what this one adds is the two directions' own answers, which a matrix
+/// asserting "anything but 401/403" cannot see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_mode_route_is_owner_only_and_in_the_matrix() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // The route is in the matrix at all, which is what keeps it from shipping
+    // ungated: the enumeration test below fails by name otherwise.
+    assert!(
+        crate::support::MOUNTED_OPERATIONS.contains(&"PUT /api/v1/domains/{domain}/review"),
+        "the router's own operation list carries the route"
+    );
+
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &editor,
+    )
+    .json(&serde_json::json!({"mode": "overlay"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "an editor does not decide whether a whole domain reviews its changes"
+    );
+
+    // The admin gets past the gate and meets the domain's own answer: `eng` has
+    // no GitHub origin, so there is nowhere for a reviewed change to be
+    // proposed.
+    let conflict = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "overlay"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(conflict.status(), 409);
+    let problem: serde_json::Value = conflict.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("connect it to a GitHub repository"),
+        "and the refusal teaches the way in: {problem}"
+    );
+
+    // A `folds` key on the way IN is refused, empty or not: folds are a question
+    // about leaving, and a domain on its way in holds no drafts.
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "overlay", "folds": {}}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+
+    // An explicit null is the absent key, not an empty answer: a client that
+    // holds `folds` as nullable and sends what it holds is asking the question.
+    let plan = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct", "folds": null}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(plan.status(), 200);
+    assert_eq!(
+        plan.json::<serde_json::Value>().await.unwrap()["applied"],
+        serde_json::json!(false),
+        "a null folds key asks rather than answers"
+    );
+
+    // The other direction with no `folds` key is the question rather than the
+    // change: the plan comes back and nothing moves.
+    let plan = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(plan.status(), 200);
+    let plan: serde_json::Value = plan.json().await.unwrap();
+    assert_eq!(plan["applied"], serde_json::json!(false));
+    assert_eq!(plan["actors"], serde_json::json!([]), "{plan}");
+
+    // And with one, it is the change - on a domain where nobody is drafting,
+    // which is every domain that was never in review mode.
+    let applied = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct", "folds": {}}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(applied.status(), 200);
+    let applied: serde_json::Value = applied.json().await.unwrap();
+    assert_eq!(applied["applied"], serde_json::json!(true));
+    assert_eq!(applied["review"], serde_json::Value::Null, "{applied}");
+}
+
+/// The enumeration property: `write_ops()` covers every mutating route this
+/// surface mounts, and nothing else.
+///
+/// Built from `crate::support::MOUNTED_OPERATIONS` - the same list
+/// `openapi_snapshot.rs`'s `the_document_covers_every_mounted_path` already
+/// checks against the served document - rather than a second hand-kept copy.
+/// A route added to the router is forced into that list by the OpenAPI
+/// coverage check already; this test then forces it into `write_ops()` too,
+/// so a write route that lands without a matrix row fails here by name
+/// instead of relying on a reviewer noticing a pointer comment (this is
+/// exactly how Task 13 shipped three routes uncovered by the matrix).
+///
+/// Four mounted mutating routes are named exemptions rather than matrix rows.
+/// Three of them rest on `check_csrf` in `rest/auth.rs`; the fourth rests on
+/// something else entirely and is described after them:
+/// - `POST /auth/login` is CSRF-exempt by design: `check_csrf` waves through
+///   any request whose path is `LOGIN_PATH` unconditionally, because login is
+///   what mints the token a later request would echo - there is no session
+///   yet to carry one.
+/// - `POST /auth/logout` is a safe no-op for a tokenless caller: `check_csrf`
+///   only demands a token when `identity.user.is_some()`; an identity with no
+///   resolved account (no cookie, or a cookie the server has forgotten)
+///   passes with no token at all, and logout has nothing to revoke for it
+///   either way. A *real* session's logout still enforces the same token
+///   match as every other unsafe request - only the account-less case is
+///   exempt, which is why this is a logout-specific carve-out and not a
+///   second CSRF-exempt path in `check_csrf` itself.
+/// - `POST /auth/setup` is pre-session for the same reason login is - it
+///   creates the first account, before which no session and so no CSRF token
+///   can exist - and `check_csrf` exempts it by path exactly as it exempts
+///   login. It cannot be driven from this matrix either: every fixture here
+///   has six accounts, so every leg of every row would see the same 410 and
+///   assert nothing about roles or CSRF. Its auth story - the 410 once any
+///   account exists, the loopback-or-token gate, the CSRF exemption and the
+///   read-only carve-out - is pinned by `tests/rest/rest_setup_api.rs` instead,
+///   which serves a deliberately account-less instance.
+///
+/// The fourth and fifth are `POST /api/v1/oauth/register` and
+/// `POST /api/v1/oauth/token`, and they are exempt for a
+/// different reason from all three: both are CSRF-protected exactly like every
+/// matrix row (a browser holding a session must echo its token, or the
+/// registration is refused 403), but neither has a ROLE dimension for the
+/// matrix to drive. Every leg here signs in as one of six accounts, and
+/// registration answers 201 to all six and to the anonymous caller alike - a client
+/// registers before anybody has signed in anywhere, which is what being in
+/// `PUBLIC_PATHS` means. What actually bounds it is not an identity but a burst
+/// limit, a stored-registration ceiling and a thirty-day prune, and those,
+/// together with its CSRF behaviour and its refusal on an instance with
+/// `auth.oauth` off, are pinned by `tests/auth/oauth.rs`.
+///
+/// The token endpoint is the same case one leg later: it answers a program
+/// holding an authorization code, which every fixture account here would be
+/// answered identically for, because the account a grant is issued to comes off
+/// the code rather than off the caller. What bounds it is the PKCE verifier
+/// behind the challenge the authorization was started with, and that, the RFC
+/// 6749 refusals and the rotation rules are pinned by `tests/auth/oauth.rs`.
+#[test]
+fn write_ops_covers_every_mutating_route_mounted() {
+    use std::collections::BTreeSet;
+
+    const EXEMPT: &[&str] = &[
+        "POST /api/v1/auth/login",
+        "POST /api/v1/auth/logout",
+        "POST /api/v1/auth/setup",
+        "POST /api/v1/oauth/register",
+        "POST /api/v1/oauth/token",
+    ];
+
+    let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS
+        .iter()
+        .filter(|op| {
+            op.starts_with("POST ")
+                || op.starts_with("PUT ")
+                || op.starts_with("PATCH ")
+                || op.starts_with("DELETE ")
+        })
+        .filter(|op| !EXEMPT.contains(op))
+        .map(|op| op.to_string())
+        .collect();
+
+    let covered: BTreeSet<String> = write_ops()
+        .iter()
+        .map(|op| format!("{} {}", op.method, canonicalize(op.path)))
+        .collect();
+
+    let missing: Vec<&String> = mutating.difference(&covered).collect();
+    assert!(
+        missing.is_empty(),
+        "these mounted write routes have no write_ops() row in the auth/CSRF \
+         matrix: {missing:?}"
+    );
+    let extra: Vec<&String> = covered.difference(&mutating).collect();
+    assert!(
+        extra.is_empty(),
+        "these write_ops() rows match no mounted route: {extra:?}"
+    );
+}
+
+// --- the neighbours advisory on the create and save answers ------------------
+
+/// Two documents about one topic, close in meaning and different in wording.
+/// Under `crate::support::TopicEmbedder` both land on the retry axis, so one is a
+/// neighbour of the other and a manifest or the alpha fixture is not.
+const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
+const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
+
+/// The permalinks the advisory of `body` names, in the order it names them.
+fn similar_permalinks(body: &serde_json::Value) -> Vec<&str> {
+    body["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["permalink"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_save_answer_with_the_neighbours_advisory() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // Nothing is embedded yet, so the first capture has nothing to be near.
+    let first = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry queue gotcha", "content": RETRY, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), 201);
+    let first: serde_json::Value = first.json().await.unwrap();
+    assert!(
+        first.get("similar").is_none(),
+        "nothing near the first capture: {first}"
+    );
+    fx.engine.embed_pending().await.unwrap();
+
+    // Fluid's create dialog sends an empty body, so the probe text is the bare
+    // title: under the 80-character floor, and therefore no probe at all. The
+    // title carries the `retry` marker deliberately - were the floor not doing
+    // the work here, this would match the engram above at cosine 1.0 and name
+    // it, so do not "simplify" the title to something off-topic.
+    let scratch = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({ "title": "Retry scratch", "content": "" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(scratch.status(), 201);
+    let scratch: serde_json::Value = scratch.json().await.unwrap();
+    assert_eq!(
+        scratch["permalink"], "retry-scratch",
+        "the empty-body create landed: {scratch}"
+    );
+    assert!(
+        scratch.get("similar").is_none(),
+        "an empty body is under the probe floor: {scratch}"
+    );
+
+    let second = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), 201);
+    let created_etag = second.headers()["etag"].to_str().unwrap().to_string();
+    let second: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(
+        second["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{second}"
+    );
+    assert_eq!(second["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert_eq!(
+        second["permalink"], "retry-backoff-lesson",
+        "the detail keys are still there"
+    );
+    // The advisory rides beside the detail read, and the ETag is still the
+    // version of the engram: it is taken from the payload's `checksum` rather
+    // than hashed over the body the advisory was attached to, so a client that
+    // saves what it read is still holding the right token.
+    assert_eq!(
+        created_etag,
+        format!(
+            "\"{}-{}\"",
+            second["checksum"].as_str().unwrap(),
+            crystalline_core::VERSION
+        ),
+        "the advisory did not move the ETag off the engram's checksum"
+    );
+
+    let (etag, content) = read_alpha(fx.addr, &eddy).await;
+    let edited = content.replace("A rule about alpha.", RETRY);
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &eddy,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": edited }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_etag = saved.headers()["etag"].to_str().unwrap().to_string();
+    let saved: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        saved["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{saved}"
+    );
+    assert_eq!(saved["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert_eq!(
+        saved["permalink"], "alpha",
+        "the detail keys are still there"
+    );
+    assert_eq!(
+        saved_etag,
+        format!(
+            "\"{}-{}\"",
+            saved["checksum"].as_str().unwrap(),
+            crystalline_core::VERSION
+        ),
+        "the saved ETag is the new version, advisory or not"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    // `scrap` gets one retry engram and is then closed under `root`. Eddy is an
+    // instance editor and no member of it, so it is not his to see; root is an
+    // admin, and an admin sees every domain. The advisory has to answer both
+    // the way a search would.
+    fx.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scrap".to_string(),
+            title: "Retry secrets".to_string(),
+            content: RETRY.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["t".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+    fx.engine.embed_pending().await.unwrap();
+    fx.auth
+        .set_domain_visibility("scrap", true, "root")
+        .await
+        .unwrap();
+
+    // The stranger writes first, while `eng` still holds no retry engram of its
+    // own: an empty advisory here means "nothing visible", not "nothing near".
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // The save leg of the same rule, taken here rather than in its own test
+    // because this is the only fixture that holds a neighbour a caller may not
+    // see. `eng` has no retry engram yet, so the one engram close to what eddy
+    // is saving is the closed domain's - and an absent advisory covers both
+    // legs the create proves: quiet when nothing visible is near.
+    let (etag, content) = read_alpha(fx.addr, &eddy).await;
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &eddy,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({
+        "content": content.replace("A rule about alpha.", RETRY_AGAIN)
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        saved["permalink"], "alpha",
+        "the save landed, so an absent advisory is a scoped one: {saved}"
+    );
+    assert!(
+        saved.get("similar").is_none(),
+        "a closed domain's engram is nobody else's neighbour on a save either: {saved}"
+    );
+    let stranger = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stranger.status(), 201);
+    let stranger: serde_json::Value = stranger.json().await.unwrap();
+    assert_eq!(
+        stranger["permalink"], "retry-backoff-lesson",
+        "the create landed, so an absent advisory is a scoped one: {stranger}"
+    );
+    assert!(
+        stranger.get("similar").is_none(),
+        "a closed domain's engram is nobody else's neighbour: {stranger}"
+    );
+
+    let root = login(fx.addr, "root", "rootpw").await;
+    let owner = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &root,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry ledger", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(owner.status(), 201);
+    let owner: serde_json::Value = owner.json().await.unwrap();
+    assert!(
+        similar_permalinks(&owner).contains(&"retry-secrets"),
+        "the same engram is a neighbour to a caller who may see it: {owner}"
+    );
+}
+
+/// Creating a domain whose name already carries a private-domain record owned
+/// by somebody else is a conflict, not a fault: the request was understood, the
+/// caller is allowed to make it, and nothing about the request can be corrected
+/// - the record has to change first, which is what `PUT /domains/{domain}/owner`
+/// does. It used to answer 500 alongside the genuine store failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_domain_a_stranger_holds_privately_is_a_conflict() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    // `set_domain_visibility` requires a live account behind the owner it
+    // records, so the stranger needs an account before it can hold one.
+    fx.auth
+        .add_user("stranger", "Stranger", None, Role::Viewer, "strangerpw")
+        .await
+        .unwrap();
+    // The record with no domain behind it: exactly the state the arm detects.
+    fx.auth
+        .set_domain_visibility("orphaned", true, "stranger")
+        .await
+        .unwrap();
+
+    let response = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "orphaned", "private": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["title"], "conflict");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("orphaned"), "{detail}");
+    assert!(
+        detail.contains("stranger"),
+        "the owner on file is named for the admin reading it: {detail}"
+    );
+    assert!(
+        detail.contains("PUT /domains/{domain}/owner"),
+        "and the route that changes it is named: {detail}"
+    );
+    assert!(
+        detail.contains("rolled back"),
+        "the registration did not survive the refusal: {detail}"
+    );
+    assert!(
+        detail.contains("Register it again"),
+        "rolled back, so the remedy has to register the name again before the \
+         owner route can reach it: {detail}"
+    );
+    // Rolled back, so nothing is left registered and shared.
+    assert!(
+        !fx.engine.config().domains.contains_key("orphaned"),
+        "nothing was left registered"
+    );
+
+    // The remedy the 409 names, pasted: register the name again (without
+    // asking for private, which would only hit the same conflict again),
+    // hand the surviving record over, then close it. Each call has to
+    // succeed for the remedy to be real rather than aspirational.
+    let recreated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "orphaned" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated.status(),
+        201,
+        "the plain create the remedy names must actually register the name again"
+    );
+    let handed_over = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/orphaned/owner",
+        &root,
+    )
+    .json(&serde_json::json!({ "owner": "root" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        handed_over.status(),
+        204,
+        "the owner route the remedy names must work once the name is registered again"
+    );
+    let closed = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/orphaned/visibility",
+        &root,
+    )
+    .json(&serde_json::json!({ "private": true }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        closed.status(),
+        204,
+        "closing it again is a no-op once the hand-over already made it the caller's"
+    );
+}
+
+/// The sibling of the test above, for the branch its 409 cannot reach through
+/// the public API: a rollback that fails leaves the domain REGISTERED with
+/// the foreign private-domain record still standing, which is exactly the
+/// state built here directly (register plainly, then plant the record
+/// underneath it rather than going through `create`'s own conflict). The
+/// message for that branch must not claim the domain is shared, and its
+/// remedy - the owner route, with no re-registration first - has to work
+/// against this exact state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_hand_over_works_on_a_registered_domain_a_stranger_holds_privately() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    fx.auth
+        .add_user(
+            "stranger2",
+            "Stranger Two",
+            None,
+            Role::Viewer,
+            "strangerpw",
+        )
+        .await
+        .unwrap();
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "keptregistered" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    // Planted directly, standing in for the record a failed rollback would
+    // have left standing underneath an already-registered domain.
+    fx.auth
+        .set_domain_visibility("keptregistered", true, "stranger2")
+        .await
+        .unwrap();
+    assert!(
+        fx.engine.config().domains.contains_key("keptregistered"),
+        "registered throughout, unlike the rolled-back branch"
+    );
+
+    let handed_over = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/keptregistered/owner",
+        &root,
+    )
+    .json(&serde_json::json!({ "owner": "root" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        handed_over.status(),
+        204,
+        "the direct hand-over the not-rolled-back message names must work with no \
+         re-registration first"
+    );
+}

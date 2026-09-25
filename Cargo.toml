@@ -3,13 +3,16 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/index",
+    "crates/identity",
+    "crates/engine",
+    "crates/rest",
     "crates/remote",
     "crates/service",
     "crates/cli",
 ]
 
 [workspace.package]
-version = "0.19.5"
+version = "0.20.0"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
@@ -22,7 +25,12 @@ crystalline-core = { path = "crates/core" }
 # explicitly; `cargo build --workspace --no-default-features` then drops candle
 # from the whole build rather than pulling it back in through a dependency edge.
 crystalline-index = { path = "crates/index", default-features = false }
+crystalline-identity = { path = "crates/identity" }
+# default-features off for the same reason as the index: every dependent opts
+# in to the embedding and Postgres features explicitly.
+crystalline-engine = { path = "crates/engine", default-features = false }
 crystalline-remote = { path = "crates/remote" }
+crystalline-rest = { path = "crates/rest" }
 crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.7", features = ["derive"] }
@@ -72,9 +80,9 @@ fs4 = "1.1.0"
 axum = { version = "0.8.9", features = ["ws"] }
 # The yrs `sync` feature makes observer callbacks Send + Sync for the
 # multi-threaded server; the `yrs::sync` protocol module itself is
-# unconditional. Wire format pinned in crates/service/tests/collab_wire.rs.
+# unconditional. Wire format pinned in crates/service/tests/collab/collab_wire.rs.
 yrs = { version = "0.28.0", features = ["sync"] }
-# Text diffing for collaborative merge conflict surfacing (crates/service).
+# Text diffing for collaborative merge conflict surfacing (crates/engine).
 similar = "3.2.0"
 # Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
 # axum's WebSocket binary frames take, so a frame crosses the seam without a
@@ -133,7 +141,7 @@ base64 = "0.23.1"
 # in the graph through axum and url; named directly because the MCP surface
 # decodes an attachment uri itself, with no extractor doing it on the way in.
 percent-encoding = "2.3.2"
-# Password hashing for the REST auth store (crates/service). 0.6's default
+# Password hashing for the account store (crates/identity). 0.6's default
 # set is `alloc`, `getrandom` and `password-hash` - `std` is gone and `simple`
 # became `password-hash` - and `rand_core` is no longer pulled in by default,
 # so `hash_password` draws its salt through `PasswordHasher::hash_password`
@@ -143,15 +151,16 @@ percent-encoding = "2.3.2"
 # feature is optional and rand_core 0.10.1 exports no `OsRng` at all, so
 # `argon2::password_hash::rand_core::OsRng` cannot be reached any more.
 argon2 = { version = "0.6.0", features = ["alloc", "password-hash"] }
-# The direct entropy source for every raw random-bytes site in
-# crates/service (crates/service/src/daemon.rs, join.rs, rest/auth_store.rs,
-# rest/oauth.rs): already in the lock through argon2's own `getrandom`
-# feature by way of password-hash, so naming it directly adds no new version
-# to the graph, only a name every one of those sites can import instead of
-# reaching through argon2's re-export.
+# The direct entropy source for every raw random-bytes site across the
+# identity, rest and service crates (crates/service/src/daemon.rs,
+# crates/identity/src/join.rs, crates/identity/src/auth_store.rs,
+# crates/rest/src/oauth.rs): already in the lock through argon2's own
+# `getrandom` feature by way of password-hash, so naming it directly adds no
+# new version to the graph, only a name every one of those sites can import
+# instead of reaching through argon2's re-export.
 getrandom = "0.4.3"
 
-# Zip archives for the domain archive download and import (crates/service).
+# Zip archives for the domain archive download and import (crates/rest).
 # Default features drag aes, bzip2, lzma, ppmd, zstd and xz in; the archives
 # this reads and writes are deflate only, and flate2 is already in the graph
 # through crates/remote, so the lean deflate backend is the whole need.
@@ -172,17 +181,17 @@ rust-embed = { version = "8.12", features = [
     "include-exclude",
 ] }
 
-# The OpenAPI document for the REST surface (crates/service). Default features
+# The OpenAPI document for the REST surface (crates/rest). Default features
 # are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and
 # `IntoParams` attributes need; `preserve_order` stays off, so nothing here can
 # switch serde_json's map type on the whole workspace.
 utoipa = "5.5.0"
 
-# The OpenID Connect relying party (crates/service). `default-features = false`
+# The OpenID Connect relying party (crates/rest). `default-features = false`
 # is load bearing: the defaults are `reqwest` + `rustls-tls`, which reach
 # reqwest through oauth2's `^0.12` requirement and would put a SECOND reqwest
 # and a second TLS stack in the graph beside the workspace's 0.13. The crate
-# has an `AsyncHttpClient` trait for exactly this, so `rest::oidc` implements
+# has an `AsyncHttpClient` trait for exactly this, so `oidc` implements
 # it over the one reqwest this workspace already builds.
 #
 # `accept-string-booleans` and `accept-rfc3339-timestamps` are tolerance for
@@ -195,6 +204,15 @@ openidconnect = { version = "4.0.1", default-features = false, features = [
     "accept-string-booleans",
     "accept-rfc3339-timestamps",
 ] }
+# The URL type openidconnect re-exports as `openidconnect::url`, named
+# directly by the crates that parse addresses without speaking OpenID
+# Connect (crystalline-identity, crystalline-engine). Same crate, same
+# version as the re-export, so nothing new is built.
+url = "2.5.8"
+# The request types axum re-exports as `axum::http`, named directly by the
+# engine, which reads a request's headers but never serves one. Same crate,
+# same version as the re-export.
+http = "1.5.0"
 
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"

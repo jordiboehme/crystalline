@@ -1,0 +1,2853 @@
+//! MCP-layer tests for the seven GitHub collaboration tools: the runtime
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the six
+//! GitHub-gated ones still give when called while withheld from the listing,
+//! the `configure` tool's snapshot, set
+//! flow and GitHub connect state machine, and wiring smoke tests for the
+//! origin tools against the engine with an injected `MockProvider`. Also the
+//! non-GitHub `add_domain` modes (local and virtual), which are not
+//! collaboration-gated and work on a fresh instance with GitHub off.
+//!
+//! Every test that touches a GitHub connection injects either
+//! `crate::support::MockProvider` (via `Engine::with_origin_provider`) or
+//! `crate::support::StubConnectAuth` (via `Engine::with_connect_auth`), and points
+//! token and origin state at a tempdir (`Engine::with_token_store_dir`,
+//! `Engine::with_origins_dir`), so nothing here reaches a network, a real
+//! GitHub repository, or the developer's actual OS keychain.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Arc;
+
+use crate::support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
+use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_index::TursoStore;
+use crystalline_remote::{RemoteError, StoredToken, TokenStore};
+use crystalline_service::Engine;
+use crystalline_service::EnvOverlay;
+use crystalline_service::engine::EngineError;
+use crystalline_service::mcp::McpServer;
+use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
+use rmcp::service::{NotificationContext, Peer, RunningService};
+use rmcp::{ClientHandler, RoleClient, RoleServer};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+
+// --- shared fixtures ---------------------------------------------------------
+
+fn config(github_enabled: bool) -> GlobalConfig {
+    let mut cfg = GlobalConfig::default();
+    if github_enabled {
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        });
+    }
+    // The collab tools origin_status and update_domain are list-shaped and so
+    // default to TOON; pin json so these tests assert on data semantics over
+    // byte-identical JSON.
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    cfg
+}
+
+/// A bare engine (no origin provider, no connect auth) for gating and
+/// refusal tests that never reach `resolve_origin_provider` or a real
+/// connect action. `config_path` points `configure`'s `set`/`unset` at a
+/// tempdir file instead of the real machine global config, and the token
+/// store is pointed at the same tempdir: a test that turns github.enabled on
+/// mid-call gets an ungated snapshot afterwards, and without the override
+/// that snapshot would read the developer's real OS keychain.
+async fn engine(config_path: &std::path::Path, github_enabled: bool, read_only: bool) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(github_enabled),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_token_store_dir(config_path.parent().unwrap().to_path_buf())
+    .with_read_only(read_only)
+}
+
+fn manifest() -> Vec<u8> {
+    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
+/// The same MANIFEST, declaring the policy that commits straight to the
+/// branch. Copied from `tests/origins/origin.rs`, which pins the engine side of it.
+fn manifest_sharing_direct() -> Vec<u8> {
+    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
+fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
+    )
+    .into_bytes()
+}
+
+fn commit_files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+    pairs
+        .iter()
+        .map(|(p, c)| (p.to_string(), c.clone()))
+        .collect()
+}
+
+async fn connect(
+    engine: Arc<Engine>,
+) -> (
+    RunningService<RoleClient, ()>,
+    RunningService<RoleServer, McpServer>,
+) {
+    connect_with(engine, ()).await
+}
+
+/// `connect` with a caller-supplied client handler, so a test can observe the
+/// server-to-client notifications (progress, tool list changes) it emits.
+async fn connect_with<H: ClientHandler>(
+    engine: Arc<Engine>,
+    handler: H,
+) -> (
+    RunningService<RoleClient, H>,
+    RunningService<RoleServer, McpServer>,
+) {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task =
+        tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
+    let client = rmcp::serve_client(handler, client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    (client, server)
+}
+
+/// `connect`, served as the streamable-HTTP transport serves it
+/// (`McpServer::new_http`, the constructor the daemon's router mounts) rather
+/// than as stdio does.
+///
+/// The transport is the only difference, and it is exactly the difference the
+/// write verbs read: a stdio session acts as the machine owner, an HTTP one as
+/// the account `github.agent_identity` names.
+async fn connect_http(
+    engine: Arc<Engine>,
+) -> (
+    RunningService<RoleClient, ()>,
+    RunningService<RoleServer, McpServer>,
+) {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task =
+        tokio::spawn(
+            async move { rmcp::serve_server(McpServer::new_http(engine), server_io).await },
+        );
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    (client, server)
+}
+
+/// Call a tool, returning its JSON body on success or the error message on
+/// failure.
+async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value, String> {
+    let mut params = CallToolRequestParams::new(tool.to_string());
+    if let Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    match peer.call_tool(params).await {
+        Ok(result) => {
+            let v = serde_json::to_value(&result).unwrap();
+            let text = v
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // A write receipt may carry a ride-along ask after its payload
+            // (`crystalline_service::nudge`), set off by a rule on its own
+            // line. The payload is the compact JSON in front of it - which can
+            // hold no raw newline of its own - so cutting at the rule is what
+            // keeps a receipt parseable for a caller that reads its keys.
+            let payload = text.split_once("\n\n---\n").map_or(text, |(head, _)| head);
+            Ok(serde_json::from_str(payload).unwrap_or(Value::String(payload.to_string())))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Polls `f` until it returns `Some`, up to two seconds, panicking otherwise.
+/// Used to wait for the connect background task to land its outcome.
+async fn wait_until<F, Fut, T>(mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    for _ in 0..200 {
+        if let Some(v) = f().await {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("condition was not met within two seconds");
+}
+
+/// The seven collaboration tool names. `add_domain` is deliberately not here:
+/// it is write-gated, not collaboration-gated (see `add_domain_*` tests below).
+const ALL_SEVEN: [&str; 7] = [
+    "configure",
+    "share_changes",
+    "update_domain",
+    "origin_status",
+    "resolve_conflict",
+    "withdraw_proposal",
+    "discard_changes",
+];
+
+// --- gating matrix -----------------------------------------------------------
+
+/// The locked matrix, on both gates, which compose rather than override.
+///
+/// `github.enabled` off withholds the six tools that need it and never
+/// withholds `configure`, whatever the mode - so a default install lists the
+/// enable path and nothing else of the seven. On top of that, read-only hides
+/// the write-shaped ones, leaving `update_domain` and `origin_status` on an
+/// enabled read-only instance and `configure` alone on a disabled writable
+/// one.
+///
+/// Reading `github.enabled` live is what makes this a listing gate at all.
+/// SEP-2567 forbids a list varying per connection or as a side effect of
+/// another request; the setting is one shared value on the engine, so every
+/// client listing at the same instant is served the same list, and the flip
+/// announces itself to subscribers (see `tests/mcp/mcp_subscriptions.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gating_matrix_over_list_tools() {
+    let cases: [(bool, bool, &[&str]); 4] = [
+        (false, false, &["configure"]),
+        (false, true, &[]),
+        (true, false, &ALL_SEVEN),
+        (true, true, &["update_domain", "origin_status"]),
+    ];
+    for (github_enabled, read_only, visible) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let eng =
+            Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
+        let (client, _server) = connect(eng).await;
+        let tools = client.peer().list_tools(Default::default()).await.unwrap();
+        let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+        for name in ALL_SEVEN {
+            let should_be_visible = visible.contains(&name);
+            assert_eq!(
+                names.contains(&name.to_string()),
+                should_be_visible,
+                "github_enabled={github_enabled} read_only={read_only} name={name} names={names:?}"
+            );
+        }
+    }
+}
+
+/// `get_tool` agrees with `list_tools`, on the same matrix, so the two
+/// enforcement points cannot drift apart.
+#[tokio::test]
+async fn gating_matrix_over_get_tool() {
+    use rmcp::ServerHandler;
+
+    let cases: [(bool, bool, &[&str]); 4] = [
+        (false, false, &["configure"]),
+        (false, true, &[]),
+        (true, false, &ALL_SEVEN),
+        (true, true, &["update_domain", "origin_status"]),
+    ];
+    for (github_enabled, read_only, visible) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let eng =
+            Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
+        let server = McpServer::new(eng);
+        for name in ALL_SEVEN {
+            let should_be_visible = visible.contains(&name);
+            assert_eq!(
+                server.get_tool(name).is_some(),
+                should_be_visible,
+                "github_enabled={github_enabled} read_only={read_only} name={name}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
+    use rmcp::ServerHandler;
+    // add_domain is write-gated, not collaboration-gated: visible with GitHub
+    // off, visible with GitHub on, and hidden only in read-only mode.
+    for (github_enabled, read_only, visible) in [
+        (false, false, true),
+        (true, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let eng =
+            Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
+        let server = McpServer::new(eng);
+        assert_eq!(
+            server.get_tool("add_domain").is_some(),
+            visible,
+            "github_enabled={github_enabled} read_only={read_only}"
+        );
+    }
+}
+
+/// Flipping `github.enabled` mid-session moves the listing **and** the
+/// refusal, in step: the six appear on the next list, and the same call that
+/// was refused a moment ago now reaches the engine.
+///
+/// The refusal is not made redundant by the hiding. A client that cached the
+/// list, or one that guessed a name out of a skill, still calls a tool it
+/// cannot see, and being told which setting to turn on is what lets it
+/// recover; "no such tool" would not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flipping_github_enabled_mid_session_moves_both_the_listing_and_the_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+
+    let before: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !before.contains(&"share_changes".to_string()),
+        "the collaboration surface is withheld while the setting is off: {before:?}"
+    );
+    assert!(
+        before.contains(&"configure".to_string()),
+        "but the enable path is not: {before:?}"
+    );
+
+    // A tool it cannot see still answers, and the refusal is what the caller
+    // reads.
+    let refused = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_eq!(refused.is_error, Some(true));
+    // The text as well as the flag: in rmcp 3.1.2 a parameter-deserialization
+    // failure is itself a tool-level error, so `is_error` alone can be
+    // satisfied by a call that never reached the gate under test.
+    let text = serde_json::to_value(&refused).unwrap();
+    let text = text
+        .pointer("/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("github.enabled"),
+        "the refusal names the setting to change: {text}"
+    );
+
+    call(
+        peer,
+        "configure",
+        json!({"set": {"github.enabled": "true"}}),
+    )
+    .await
+    .unwrap();
+
+    let after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for name in ALL_SEVEN {
+        assert!(
+            after.contains(&name.to_string()),
+            "{name} is listed once collaboration is on: {after:?}"
+        );
+    }
+    assert_eq!(
+        after.len(),
+        before.len() + 6,
+        "exactly the six gated tools arrived: {before:?} -> {after:?}"
+    );
+
+    // And now the same call reaches the engine instead of the gate.
+    let served = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_ne!(
+        served.is_error,
+        Some(true),
+        "origin_status runs once collaboration is on"
+    );
+}
+
+// --- hidden tools still refuse at call time ----------------------------------
+
+/// Hidden is not disabled: the six GitHub-gated tools keep their routes while
+/// they are withheld from the listing, and each refuses with the message that
+/// names the setting.
+///
+/// The refusal is a tool-level error rather than a JSON-RPC one, because the
+/// caller is a model working from a stale list or a skill's vocabulary, and
+/// what it needs is a sentence it can act on rather than `-32601`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_collab_tools_refuse_at_call_time_when_github_is_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let cases: [(&str, Value); 6] = [
+        ("share_changes", json!({"domain": "eng"})),
+        ("update_domain", json!({})),
+        ("origin_status", json!({})),
+        (
+            "resolve_conflict",
+            json!({"domain": "eng", "path": "a.md", "resolution": "mine"}),
+        ),
+        ("withdraw_proposal", json!({"domain": "eng"})),
+        (
+            "discard_changes",
+            json!({"domain": "eng", "paths": ["a.md"]}),
+        ),
+    ];
+    for (tool, args) in cases {
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        if let Value::Object(map) = args {
+            params = params.with_arguments(map);
+        }
+        let result = peer
+            .call_tool(params)
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must answer rather than fail at the protocol: {e}"));
+        assert_eq!(result.is_error, Some(true), "{tool} should refuse");
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("not enabled") && text.contains("github.enabled"),
+            "{tool} should refuse with the not-enabled message, got: {text}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_team_mode_routes_to_not_enabled_when_github_is_disabled() {
+    // add_domain itself is visible with GitHub off, but its team-domain branch
+    // (repo present) still refuses cleanly until collaboration is enabled.
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({"repo": "acme/brand-knowledge"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("not enabled"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), true, true).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    // Even a bare configure: a read-only instance shows its settings to
+    // nobody it serves, and the refusal says who reads them and how.
+    let err = call(peer, "configure", json!({})).await.unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+    assert!(
+        err.contains("does not show its configuration to connected agents"),
+        "{err}"
+    );
+    assert!(err.contains("crystalline config show"), "{err}");
+
+    // add_domain refuses read-only in every mode: team (repo), local and virtual.
+    let err = call(peer, "add_domain", json!({"repo": "acme/brand-knowledge"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(peer, "add_domain", json!({"domain": "scratch"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "local add_domain: {err}");
+
+    let err = call(
+        peer,
+        "add_domain",
+        json!({"domain": "mem", "virtual": true}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "virtual add_domain: {err}");
+
+    let err = call(peer, "share_changes", json!({"domain": "eng"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(
+        peer,
+        "resolve_conflict",
+        json!({"domain": "eng", "path": "a.md", "resolution": "mine"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(peer, "withdraw_proposal", json!({"domain": "eng"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(
+        peer,
+        "discard_changes",
+        json!({"domain": "eng", "paths": ["a.md"]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+}
+
+// --- configure: snapshot shape and set flow ---------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(peer, "configure", json!({})).await.unwrap();
+    let settings = out["settings"].as_array().unwrap();
+    assert_eq!(settings.len(), 41, "{settings:?}");
+    assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
+    assert!(settings.iter().any(|s| s["key"] == "github.stacks"));
+    assert!(settings.iter().any(|s| s["key"] == "domains_root"));
+    // github.enabled is off here, so the github block states enablement and
+    // says nothing about a credential the call deliberately never read.
+    assert_eq!(out["github"]["github_enabled"], json!(false));
+    assert!(
+        out["github"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("configure")
+    );
+    let github = out["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "a disabled instance reports no connection facts, not false ones: {github:?}"
+        );
+    }
+}
+
+/// The gate is about the credential store, not only about the JSON: a token
+/// sitting in the engine's token directory would make an ungated snapshot
+/// report `connected: true`, so the disabled shape here is proof the block
+/// never reached the store. On a real machine that store is the OS keychain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_never_reads_the_credential_while_github_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), false, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        snap["github"]["note"],
+        json!(
+            "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection."
+        )
+    );
+    let github = snap["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "the seeded token must not surface in any shape: {github:?}"
+        );
+    }
+}
+
+/// The counterweight: with github.enabled on, the same seeded token is read
+/// and reported exactly as before, so the gate cannot be over-applied into a
+/// snapshot that never reports a connection at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_still_reports_the_connection_while_github_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), true, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+    assert_eq!(snap["github"]["token_store"], json!("file"));
+    assert!(snap["github"]["pending_connect"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_set_multiple_keys_applies_in_order_and_returns_the_fresh_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "configure",
+        json!({"set": {"github.enabled": "true", "github.poll_secs": "120"}}),
+    )
+    .await
+    .unwrap();
+    let settings = out["settings"].as_array().unwrap();
+    let enabled = settings
+        .iter()
+        .find(|s| s["key"] == "github.enabled")
+        .unwrap();
+    assert_eq!(enabled["value"], json!("true"));
+    let poll = settings
+        .iter()
+        .find(|s| s["key"] == "github.poll_secs")
+        .unwrap();
+    assert_eq!(poll["value"], json!("120"));
+
+    let out = call(peer, "configure", json!({"unset": ["github.poll_secs"]}))
+        .await
+        .unwrap();
+    let settings = out["settings"].as_array().unwrap();
+    let poll = settings
+        .iter()
+        .find(|s| s["key"] == "github.poll_secs")
+        .unwrap();
+    assert_eq!(poll["source"], json!("default"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_set_stops_at_the_first_bad_key_and_reports_what_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+
+    // `set` is a map, applied in ascending key order: "github.enabled"
+    // sorts before "zzz.bogus", so the valid key lands before the invalid
+    // one is reached.
+    let err = call(
+        peer,
+        "configure",
+        json!({"set": {"github.enabled": "true", "zzz.bogus": "x"}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("zzz.bogus"), "{err}");
+    assert!(err.contains("applied"), "{err}");
+    assert!(err.contains("github.enabled"), "{err}");
+    // The valid key before the bad one was already applied.
+    assert!(eng.config().github_enabled());
+}
+
+// --- configure: the flip announces itself, to subscribers only ---------------
+
+/// A client handler that records whether it ever received
+/// `notifications/tools/list_changed`.
+#[derive(Clone, Default)]
+struct NotifyClient {
+    got_list_changed: Arc<tokio::sync::Notify>,
+}
+
+impl ClientHandler for NotifyClient {
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let notify = self.got_list_changed.clone();
+        async move {
+            notify.notify_one();
+        }
+    }
+}
+
+/// The flip really does move this client's list, and it is still told nothing
+/// unasked.
+///
+/// A legacy peer is the strictest case: it has no `subscriptions/listen` to
+/// open, so the only way it could hear about the change is a push it never
+/// requested, and MCP 2026-07-28 removed that channel outright. It re-reads
+/// `tools/list` at its own discretion instead, which is the contract it always
+/// had. `tests/mcp/mcp_subscriptions.rs` carries the other half - a modern peer
+/// that did subscribe is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_flipping_github_enabled_never_pushes_at_an_unsubscribed_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task =
+        tokio::spawn(async move { rmcp::serve_server(McpServer::new(eng), server_io).await });
+    let handler = NotifyClient::default();
+    let client = rmcp::serve_client(handler.clone(), client_io)
+        .await
+        .unwrap();
+    let _server = server_task.await.unwrap().unwrap();
+    let peer = client.peer();
+
+    let snapshot = call(
+        peer,
+        "configure",
+        json!({"set": {"github.enabled": "true"}}),
+    )
+    .await
+    .unwrap();
+    // Prove the write landed: a malformed `configure` comes back as a
+    // tool-level error in rmcp 3.1.2, so a silence test could otherwise pass
+    // because nothing happened at all.
+    assert_ne!(
+        snapshot["github"]["github_enabled"],
+        json!(false),
+        "the setting must actually be on: {snapshot}"
+    );
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            handler.got_list_changed.notified(),
+        )
+        .await
+        .is_err(),
+        "nothing may be pushed at a client that asked for nothing, however much moved"
+    );
+
+    // And the silence is not because nothing happened: this peer's own list
+    // did move, it simply has to ask again to see it.
+    let names: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        names.contains(&"share_changes".to_string()),
+        "the flip moved this connection's list: {names:?}"
+    );
+}
+
+// --- configure: GitHub connect state machine (engine-level) -----------------
+//
+// The `ConnectAuth` fake (`StubConnectAuth`, `fake_auth`, `device_flow_start`)
+// lives in `support` now, shared with `tests/domains/domain_admin.rs`'s GitHub
+// status/ready/disconnect tests.
+
+async fn engine_for_connect(auth: Arc<StubConnectAuth>, dir: &std::path::Path) -> Engine {
+    engine_for_connect_with(false, auth, dir).await
+}
+
+/// Same wiring as [`engine_for_connect`], with `github_enabled` set on the
+/// engine's config instead of always off - so a test can prove a connect
+/// response's `github_enabled`/`note` reflect the live config in both
+/// states, not just the disabled default the other connect fixtures use.
+///
+/// Every test below about the credential cache or the device-flow lifecycle
+/// builds its engine with `true` here. Those tests are about the token cache
+/// and the pending slot, not about enablement, and they read their result
+/// out of `configure_snapshot`, which reports connection facts only while
+/// github.enabled is on. The tests that ARE about enablement (the connect
+/// responses' `github_enabled`/`note`) keep the disabled fixture.
+async fn engine_for_connect_with(
+    github_enabled: bool,
+    auth: Arc<StubConnectAuth>,
+    dir: &std::path::Path,
+) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(github_enabled),
+        None,
+        Some(dir.join("config.yaml").to_path_buf()),
+    )
+    .with_connect_auth(auth)
+    .with_token_store_dir(dir.to_path_buf())
+}
+
+/// The same wiring as [`engine_for_connect_with`], plus
+/// `CRYSTALLINE_GITHUB_TOKEN` in the environment overlay: the token store
+/// directory stays wired up too, so a test built this way can prove the
+/// environment wins over it rather than merely being the only option
+/// available. `github_enabled` is a parameter for the same reason it is one
+/// on `engine_for_connect_with`: the snapshot test needs it on, the two
+/// refusal tests are about a refusal that happens with it off.
+async fn engine_for_connect_with_env_token(
+    github_enabled: bool,
+    auth: Arc<StubConnectAuth>,
+    dir: &std::path::Path,
+    token: &str,
+) -> Engine {
+    let overlay = EnvOverlay::from_vars(vec![(
+        "CRYSTALLINE_GITHUB_TOKEN".to_string(),
+        token.to_string(),
+    )])
+    .unwrap();
+    engine_for_connect_with(github_enabled, auth, dir)
+        .await
+        .with_env_overlay(overlay)
+}
+
+#[tokio::test]
+async fn token_connect_validates_saves_and_reports_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["connected"], json!(true));
+    assert_eq!(result["github"]["user"], json!("octocat"));
+    assert_eq!(result["github"]["token_store"], json!("file"));
+
+    // A later snapshot reflects the saved token.
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn token_connect_reports_github_enabled_and_a_note_when_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    // github.enabled is off on this engine (the default fixture): the
+    // response states that explicitly rather than leaving an agent to infer
+    // it from tool wording.
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "Connected with github.enabled off; set it to true with configure when you want team domains."
+        )
+    );
+}
+
+#[tokio::test]
+async fn token_connect_reports_github_enabled_and_a_note_when_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(true));
+    assert_eq!(
+        result["github"]["note"],
+        json!("GitHub collaboration is enabled; team domains are ready to add.")
+    );
+}
+
+#[tokio::test]
+async fn token_connect_refuses_on_a_read_only_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let eng = Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(false),
+        None,
+        Some(tmp.path().join("config.yaml").to_path_buf()),
+    )
+    .with_connect_auth(auth)
+    .with_token_store_dir(tmp.path().to_path_buf())
+    .with_read_only(true);
+
+    let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
+    assert!(matches!(err, EngineError::ReadOnly));
+}
+
+#[tokio::test]
+async fn token_connect_refuses_when_the_environment_owns_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
+    assert!(matches!(err, EngineError::EnvTokenConnect));
+    assert!(
+        err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn device_flow_refuses_when_the_environment_owns_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let err = eng.start_device_connect(None, false).await.unwrap_err();
+    assert!(matches!(err, EngineError::EnvTokenConnect));
+    assert!(
+        err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn env_token_wins_over_the_test_token_dir_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Every StubConnectAuth outcome is set to fail: if the engine somehow
+    // fell through to the test token directory (which has no saved token
+    // either), reading the snapshot would still not need any of these, so a
+    // wrong resolution would only be caught by the token_store assertion
+    // below, not by a spurious success or failure here.
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+    );
+    let eng = engine_for_connect_with_env_token(true, auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(
+        snap["github"]["user"],
+        Value::Null,
+        "the env store's unknown login renders as null, not an empty string"
+    );
+    assert_eq!(snap["github"]["token_store"], json!("environment"));
+}
+
+#[tokio::test]
+async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(first["github"]["connected"], json!(false));
+    assert_eq!(first["github"]["pending_connect"]["pending"], json!(true));
+    assert_eq!(
+        first["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234")
+    );
+
+    // A second connect call while the flow is still waiting on the user
+    // reports the same pending code rather than starting a second flow.
+    let second = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        second["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234")
+    );
+
+    // Let the background task's run_device_flow complete.
+    auth.run_gate.notify_one();
+
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert!(landed["github"]["pending_connect"].is_null());
+
+    // The slot cleared: the connection stays reported without a stale
+    // pending block.
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(true));
+    assert!(after["github"]["pending_connect"].is_null());
+}
+
+#[tokio::test]
+async fn device_flow_start_reports_github_enabled_and_a_note_when_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    // github.enabled is off on this engine (the default fixture): starting a
+    // device flow works anyway, and the response states enablement
+    // explicitly rather than leaving an agent to infer it from tool wording.
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "Connecting works with github.enabled off; set it to true with configure when you want team domains."
+        )
+    );
+}
+
+#[tokio::test]
+async fn device_flow_start_reports_github_enabled_and_a_note_when_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(true));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "GitHub collaboration is enabled; once the code is confirmed team domains are ready to add."
+        )
+    );
+}
+
+/// The pending view tells the caller what to do after the code is entered
+/// and where to check it landed - not just where to type the code - so a
+/// model relaying the result has the whole story, not half of it.
+#[tokio::test]
+async fn device_flow_pending_view_carries_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None, false).await.unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
+    assert!(
+        next_steps.contains("https://github.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+/// A second `configure` call while the same flow is still pending reports
+/// the same code (see the double-click behavior above) and, with it, the
+/// same guidance - it is stored once at flow start, not recomputed.
+#[tokio::test]
+async fn a_second_call_while_pending_carries_the_same_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    let second = eng.configure_snapshot().await.unwrap();
+    let first_next_steps = first["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    // Pinned on substance, not just equal to the second call's value: two
+    // absent keys would also be equal, and would still pass a bare
+    // `assert_eq!` between the two views.
+    assert!(first_next_steps.contains("Authorize"), "{first_next_steps}");
+    assert!(
+        first_next_steps.contains("https://github.com/settings/connections/applications"),
+        "{first_next_steps}"
+    );
+    assert_eq!(
+        first["github"]["pending_connect"]["next_steps"],
+        second["github"]["pending_connect"]["next_steps"]
+    );
+}
+
+/// A GitHub Enterprise Server host derives its own applications url, not
+/// github.com's - the device flow talks to the GHES host directly.
+#[tokio::test]
+async fn a_ghes_host_yields_the_ghes_applications_url_in_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng
+        .start_device_connect(Some("github.example.com"), false)
+        .await
+        .unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(
+        next_steps.contains("https://github.example.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+/// A pending view reports what is LEFT of the code's life, not the expiry
+/// the flow started with. The frozen number was the bug: a colleague's live
+/// sign-in read `900` on every poll and so looked frozen, which is what sent
+/// five rounds of trace gathering after a flow that was fine.
+///
+/// Driven on the runtime's paused clock, which is why `started_at` is a
+/// `tokio::time::Instant`: nothing here sleeps through two real minutes.
+#[tokio::test]
+async fn a_pending_view_counts_down_instead_of_repeating_the_original_expiry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    tokio::time::pause();
+    let started = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        started["github"]["pending_connect"]["expires_in_secs"],
+        json!(900),
+        "a code issued this instant has its whole life left"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+
+    let later = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        later["github"]["pending_connect"]["expires_in_secs"],
+        json!(780),
+        "two minutes on, two minutes fewer: a caller that polls watches it fall"
+    );
+
+    // Past the code's whole life the countdown saturates rather than wrapping
+    // around a `u64` subtraction.
+    tokio::time::advance(std::time::Duration::from_secs(5_000)).await;
+    let expired = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        expired["github"]["pending_connect"]["expires_in_secs"],
+        json!(0),
+        "a run-out code reports nothing left, never a wrapped number"
+    );
+}
+
+/// A second connect while one is pending still reports the outstanding code -
+/// the double-click behavior - and now also says how to give up on it. The
+/// way out used to exist nowhere: the slot answered with the same unusable
+/// code forever.
+#[tokio::test]
+async fn a_second_connect_while_pending_names_restart_as_the_way_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    let first_next_steps = first["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !first_next_steps.contains("restart"),
+        "a first connect does not advertise abandoning a code nobody has tried: {first_next_steps}"
+    );
+
+    let second = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        second["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234"),
+        "the outstanding code, not a second one"
+    );
+    let second_next_steps = second["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(
+        second_next_steps.starts_with(&first_next_steps),
+        "the guidance is extended, not replaced: {second_next_steps}"
+    );
+    assert!(
+        second_next_steps.contains("restart"),
+        "the second call names the way out: {second_next_steps}"
+    );
+}
+
+/// `restart` abandons the pending flow and issues a fresh code: the response
+/// carries the NEW code, the old background task is dropped rather than left
+/// to land on top of the new sign-in, and the flow that finally lands is the
+/// second one.
+#[tokio::test]
+async fn a_restart_abandons_the_pending_flow_and_issues_a_fresh_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+        device_code: "devcode-two".to_string(),
+        user_code: "WXYZ-9876".to_string(),
+        verification_url: "https://github.com/login/device".to_string(),
+        interval_secs: 0,
+        expires_in_secs: 900,
+    }));
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        first["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234")
+    );
+    // Abandoning a task that has never been polled would prove nothing, so
+    // wait until the flow is actually running before restarting it.
+    wait_until(|| async { auth.run_was_entered().then_some(()) }).await;
+
+    let restarted = eng.start_device_connect(None, true).await.unwrap();
+    assert_eq!(
+        restarted["github"]["pending_connect"]["user_code"],
+        json!("WXYZ-9876"),
+        "a restart issues a fresh code rather than repeating the old one"
+    );
+
+    // The abort takes effect at the task's next poll, so this is polled.
+    wait_until(|| async { auth.run_was_abandoned().then_some(()) }).await;
+
+    // The gate releases exactly one flow, and the one still standing is the
+    // second: the abandoned task can neither consume the outcome nor write
+    // into the slot the fresh flow now owns.
+    auth.run_gate.notify_one();
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert!(landed["github"]["pending_connect"].is_null());
+}
+
+/// A `restart` against a sign-in that has already LANDED reports the outcome
+/// rather than throwing it away.
+///
+/// The restart arm used to be matched first, so `restart: true` on a flow that
+/// had finished dropped its one-shot report and answered with a fresh code
+/// beside `connected: true` - a code for a sign-in nobody needed any more. The
+/// landed outcome is drained and reported first now, and the slot is clear
+/// afterwards, so a caller who really does want a new sign-in asks again.
+#[tokio::test]
+async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    // Spare codes, because the loop below may ask for one: a restart that
+    // arrives before the outcome has landed is the ordinary abandon-and-start
+    // case, and the double must have a code left to answer it with.
+    for n in 2..=6 {
+        auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+            device_code: format!("devcode-{n}"),
+            user_code: format!("WXYZ-000{n}"),
+            verification_url: "https://github.com/login/device".to_string(),
+            interval_secs: 0,
+            expires_in_secs: 900,
+        }));
+    }
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    // The state under test is "landed in the slot and not read yet", and every
+    // read that would confirm it also DRAINS it - so the restart call is the
+    // observation. Asking again is safe and is what keeps this deterministic
+    // under load: a restart that lands first abandons the flow and starts a
+    // fresh one, which is released here and asked about on the next turn.
+    let landed = wait_until(|| async {
+        let snap = eng.start_device_connect(None, true).await.unwrap();
+        if snap["github"]["connected"] == json!(true) {
+            return Some(snap);
+        }
+        auth.run_gate.notify_one();
+        auth.rearm(Ok("device-token".to_string()), Ok("octocat".to_string()));
+        None
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["user"],
+        json!("octocat"),
+        "the restart reports the sign-in that landed"
+    );
+    assert!(
+        landed["github"]["pending_connect"].is_null(),
+        "and issues no code for a sign-in that is already done: {landed}"
+    );
+}
+
+/// A sign-in that lands narrates itself: one line per step, so the next
+/// "it looks stuck" report is answered from one daemon log rather than five
+/// rounds of trace gathering. And nothing secret is in any of them - the
+/// short code the user is being told to type is deliberate, the device code
+/// and the access token never appear.
+#[tokio::test]
+async fn a_landed_device_sign_in_logs_every_step_and_no_secret() {
+    let (logs, _guard) = crate::support::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+
+    for expected in [
+        // started, with the identity, the code and the code's life
+        "github device sign-in started",
+        "user_code=ABCD-1234",
+        "expires_in_secs=900",
+        "identity=instance",
+        // the three that follow it
+        "access token received from GitHub",
+        "token validated",
+        "login=octocat",
+        // and where the token came to rest
+        "github token saved",
+        "store=\"file\"",
+    ] {
+        assert!(
+            logs.any_contains(expected),
+            "the success path never logged {expected}: {:#?}",
+            logs.lines()
+        );
+    }
+
+    for secret in ["device-token", "devcode"] {
+        assert!(
+            !logs.any_contains(secret),
+            "a secret reached the log: {secret} in {:#?}",
+            logs.lines()
+        );
+    }
+}
+
+/// A flow that ends badly says so once, naming the step it died at and the
+/// error - the other half of answering "it looks stuck" from the log.
+#[tokio::test]
+async fn a_failed_device_sign_in_logs_the_step_it_failed_at() {
+    let (logs, _guard) = crate::support::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    wait_until(|| async {
+        logs.any_contains("github device sign-in failed")
+            .then_some(())
+    })
+    .await;
+
+    assert!(
+        logs.any_contains("step=\"poll\""),
+        "the warn names the step: {:#?}",
+        logs.lines()
+    );
+    assert!(
+        logs.any_contains("WARN"),
+        "a failed flow is a warning, not an info line: {:#?}",
+        logs.lines()
+    );
+}
+
+#[tokio::test]
+async fn device_flow_failure_is_reported_once_with_next_steps_then_the_slot_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+
+    // A landed failure is a report, not a bare error: the real credential
+    // state (here, never connected, so connected: false) with both the
+    // reason and actionable next_steps beside it, so a model relaying the
+    // result has something to tell the person rather than a dead end. See
+    // the sibling test below for the already-connected case.
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["connected"], json!(false));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("expired"), "{next_steps}");
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
+    assert!(
+        next_steps.contains("settings/connections/applications"),
+        "{next_steps}"
+    );
+
+    // Reported once: the slot is now clear and a plain snapshot no longer
+    // carries an error, reporting the ordinary (never-connected) state.
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(false));
+    assert!(after["github"]["pending_connect"].is_null());
+    assert!(after["github"]["error"].is_null());
+}
+
+/// A landed failure is built from the same credential read as a successful
+/// one - the working token is not thrown away just because a re-connect
+/// attempt on top of it expired. Without this, an instance that is already
+/// connected would see `connected: false` for one call (a lie) and then
+/// `connected: true` again on the next, purely because the slot cleared.
+#[tokio::test]
+async fn a_landed_failure_reports_the_real_credential_state_beside_the_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    // A working credential is already on file...
+    let connected = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(connected["github"]["connected"], json!(true));
+
+    // ...then a re-connect's device flow expires.
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["connected"],
+        json!(true),
+        "the stored credential must not be reported lost: {landed}"
+    );
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert_eq!(landed["github"]["token_store"], json!("file"));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    assert!(landed["github"]["pending_connect"].is_null());
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
+}
+
+/// The gate sits ABOVE the pending drain, so on a disabled instance a bare
+/// `configure` neither reports a landed device-flow outcome nor destroys it:
+/// the outcome stays in the slot for the settings surface, which still
+/// reports it exactly once.
+#[tokio::test]
+async fn a_disabled_snapshot_leaves_a_landed_outcome_for_the_settings_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+
+    // The snapshot call sits INSIDE the poll loop deliberately. Nothing can
+    // observe the background task landing its outcome without draining it
+    // (the pending view is private and github_connection drains), so a
+    // single snapshot before the poll would prove nothing: it would usually
+    // run before the outcome landed and pass with or without the gate. Here
+    // it runs on every iteration, including the one where the outcome is
+    // sitting in the slot. An ungated snapshot would drain the failure and
+    // return it as an error, github_connection would never see it, and this
+    // loop would run out and panic.
+    let reported = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        let github = snap["github"].as_object().unwrap();
+        assert_eq!(github["github_enabled"], json!(false));
+        assert!(
+            !github.contains_key("connected") && !github.contains_key("pending_connect"),
+            "a disabled snapshot reports no connection facts, landed outcome or not: {github:?}"
+        );
+        eng.github_connection().await.unwrap().error
+    })
+    .await;
+    assert_eq!(
+        reported,
+        "The GitHub connection has expired or was revoked. Use configure to sign in again."
+    );
+
+    // Still exactly once: the drain that reported it also cleared the slot.
+    assert!(eng.github_connection().await.unwrap().error.is_none());
+}
+
+// --- process-lifetime token cache -------------------------------------------
+
+/// Writes a token file into `dir` exactly where the engine's test override
+/// reads it, simulating a credential already on disk (from an earlier connect
+/// or a standalone CLI), with no keychain and no network.
+fn seed_token_file(dir: &std::path::Path, user: &str) {
+    TokenStore::File {
+        path: dir.join("github-token.json"),
+    }
+    .save(&StoredToken {
+        access_token: "seeded-token".to_string(),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configure_snapshot_serves_the_cached_token_after_the_backing_file_is_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    // Connect writes the token once and refreshes the cache.
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["connected"], json!(true));
+
+    // The backing file is deleted: the cached credential still answers, so the
+    // snapshot stays connected without re-reading (and, in production, without
+    // re-prompting) the credential store.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        snap["github"]["connected"],
+        json!(true),
+        "the cache must serve the token after the backing file is gone"
+    );
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn connect_with_token_refreshes_the_cached_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A stale identity is already cached from an earlier read.
+    seed_token_file(tmp.path(), "olduser");
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    // Populate the cache with the stale identity.
+    let before = eng.configure_snapshot().await.unwrap();
+    assert_eq!(before["github"]["user"], json!("olduser"));
+
+    // Connecting a new token must refresh the cache, not leave the old
+    // identity behind: the connect's own report already shows the new login.
+    let result = eng.connect_with_token("pat-new", None).await.unwrap();
+    assert_eq!(
+        result["github"]["user"],
+        json!("octocat"),
+        "connect must refresh the cache, so its own report is the new identity"
+    );
+
+    // With the backing file removed, only a refreshed cache can still serve
+    // the new identity; a stale cache would answer with the old login.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(true));
+    assert_eq!(after["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn a_landed_device_flow_refreshes_the_cached_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A stale identity is already cached before the flow starts.
+    seed_token_file(tmp.path(), "olduser");
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    // Populate the cache with the stale identity, then start the flow.
+    let before = eng.configure_snapshot().await.unwrap();
+    assert_eq!(before["github"]["user"], json!("olduser"));
+    eng.start_device_connect(None, false).await.unwrap();
+
+    // Let the background task run to completion; its save (moved into the
+    // task as a TokenSavePlan) must refresh the cache with the new identity.
+    auth.run_gate.notify_one();
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["pending_connect"].is_null() && snap["github"]["connected"] == json!(true))
+            .then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+
+    // With the backing file gone, only the refreshed cache can still serve the
+    // device-flow identity; a task that saved but never refreshed the cache
+    // would leave the stale login behind here.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(true));
+    assert_eq!(after["github"]["user"], json!("octocat"));
+}
+
+// --- origin tool wiring (happy path, via the injected MockProvider) ---------
+
+async fn engine_with_provider(
+    config_path: &std::path::Path,
+    origins_dir: &std::path::Path,
+    provider: Arc<MockProvider>,
+) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(true),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_origin_provider(provider)
+    .with_origins_dir(origins_dir.to_path_buf())
+    // Beside the origins directory and for the same reason: a write into a
+    // reviewing domain mirrors its draft into the state directory, and a test
+    // build refuses to guess at one rather than reach the developer's own.
+    .with_state_dir(
+        config_path
+            .parent()
+            .expect("the config path has a directory")
+            .join("state"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_tool_wires_through_to_origin_add() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "turbine notes")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "repo": "acme/brand-knowledge", "folder": root.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["domain"], json!("brand-knowledge"));
+    assert_eq!(out["engrams"], json!(2));
+    assert_eq!(out["base_commit"], json!(commit));
+    assert!(root.join("MANIFEST.md").exists());
+}
+
+/// A client handler that records every progress notification it receives.
+#[derive(Clone, Default)]
+struct ProgressSink(Arc<std::sync::Mutex<Vec<ProgressNotificationParam>>>);
+
+impl ClientHandler for ProgressSink {
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        self.0.lock().unwrap().push(params);
+        std::future::ready(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_streams_progress_when_the_client_sends_a_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "turbine notes")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+
+    let sink = ProgressSink::default();
+    let (client, _server) = connect_with(eng, sink.clone()).await;
+    let peer = client.peer();
+
+    // rmcp's client attaches a fresh progress token to every request, so the
+    // server streams the connect's stage boundaries back over the same
+    // connection without the test having to set one by hand.
+    let args = json!({ "repo": "acme/brand-knowledge", "folder": root.to_str().unwrap() });
+    let params =
+        CallToolRequestParams::new("add_domain").with_arguments(args.as_object().unwrap().clone());
+    peer.call_tool(params).await.unwrap();
+
+    // Wait until all four stage notifications land. rmcp dispatches every
+    // incoming notification on its own task, so they can be recorded out of
+    // order even though the server emits them in sequence; assert on the
+    // delivered set, not the arrival order.
+    let seen = wait_until(|| {
+        let got = sink.0.lock().unwrap().clone();
+        async move { (got.len() >= 4).then_some(got) }
+    })
+    .await;
+
+    // Every stage notification echoes the one progress token the request
+    // carried, and reports the same total.
+    let token = seen[0].progress_token.clone();
+    assert!(
+        seen.iter().all(|p| p.progress_token == token),
+        "every notification carries the request's progress token: {:?}",
+        seen.iter().map(|p| &p.progress_token).collect::<Vec<_>>()
+    );
+    assert!(seen.iter().all(|p| p.total == Some(4.0)));
+    let mut progresses: Vec<f64> = seen.iter().map(|p| p.progress).collect();
+    progresses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        progresses,
+        vec![1.0, 2.0, 3.0, 4.0],
+        "all four stages arrive, ending at the total"
+    );
+}
+
+// --- add_domain: local and virtual modes (no GitHub) ------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_creates_and_scaffolds_with_github_disabled() {
+    // GitHub is off (the engine helper's default): creating a local domain must
+    // still work, which is the whole point - an agent can start from zero.
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let folder = tmp.path().join("scratch");
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "scratch", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["domain"], json!("scratch"));
+    assert_eq!(out["kind"], json!("file"));
+    assert_eq!(out["manifest_created"], json!(true));
+    assert_eq!(out["adopted"], json!(false));
+    assert!(folder.join("MANIFEST.md").exists());
+
+    // It is registered and routable now: a second read tool sees it.
+    let domains = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        serde_json::to_string(&domains).unwrap().contains("scratch"),
+        "{domains:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_adopts_an_existing_folder_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    // A folder that already holds a MANIFEST and an engram is adopted in place:
+    // its MANIFEST is not overwritten and its engram is synced.
+    let folder = tmp.path().join("existing");
+    std::fs::create_dir_all(folder.join("notes")).unwrap();
+    std::fs::write(folder.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        folder.join("notes/alpha.md"),
+        engram("Alpha", "alpha", "turbine notes"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "existing", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["manifest_created"], json!(false));
+    assert_eq!(out["adopted"], json!(false));
+
+    // Re-adding the same folder is idempotent: already registered, so adopted.
+    let again = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "existing", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again["adopted"], json!(true));
+    assert_eq!(again["manifest_created"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_virtual_registers_and_scaffolds_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mem", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["domain"], json!("mem"));
+    assert_eq!(out["kind"], json!("virtual"));
+    assert_eq!(out["manifest_created"], json!(true));
+    assert_eq!(out["registered"], json!(true));
+
+    let again = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mem", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again["registered"], json!(false));
+    assert_eq!(again["manifest_created"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_rejects_repo_and_virtual_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), true, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(
+        peer,
+        "add_domain",
+        json!({ "repo": "acme/brand-knowledge", "virtual": true }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("mutually exclusive"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_virtual_requires_a_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({ "virtual": true }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("requires a domain name"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_honors_the_configured_domains_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let cfg = GlobalConfig {
+        domains_root: Some(tmp.path().join("root")),
+        ..GlobalConfig::default()
+    };
+    let eng = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(tmp.path().join("config.yaml")),
+    ));
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    // No folder given: the domain lands under the configured root at <root>/<name>.
+    let out = call(peer, "add_domain", json!({ "domain": "notes" }))
+        .await
+        .unwrap();
+    assert_eq!(out["kind"], json!("file"));
+    // Normalise separators so the suffix check holds on Windows, where the
+    // configured root is joined to the domain name with a backslash.
+    let root = out["root"].as_str().unwrap().replace('\\', "/");
+    assert!(root.ends_with("root/notes"), "{root}");
+    assert!(tmp.path().join("root/notes/MANIFEST.md").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_tool_wires_through_to_origin_share() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let out = call(peer, "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"));
+    // The engram alone: the domain declares nothing, so the regenerated
+    // folder listing stays on this machine.
+    assert_eq!(out["added"], json!(["notes/new.md"]));
+    assert!(out["url"].as_str().unwrap().starts_with("https://"));
+}
+
+/// The same tool on a domain whose MANIFEST declares `sharing: direct`: the
+/// share is a commit on the branch, `origin_status` says so and names it, and
+/// a proposal somebody left open stands in the way of the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_commits_on_a_direct_domain_and_refuses_under_an_open_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock.clone()).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+    let out = call(peer, "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("committed"), "{out}");
+    let sha = out["sha"].as_str().unwrap().to_string();
+    assert_eq!(
+        out["url"],
+        json!(format!(
+            "https://forge.test/acme/brand-knowledge/commit/{sha}"
+        ))
+    );
+    assert_eq!(out["added"], json!(["notes/new.md"]));
+    let status = call(peer, "origin_status", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["sharing"], json!("direct"), "{status}");
+    assert_eq!(
+        status["domains"][0]["direct_shares"][0]["sha"],
+        json!(sha),
+        "{status}"
+    );
+
+    let state_dir = origins_dir.join("brand");
+    let mut state = crystalline_remote::state::OriginState::load(&state_dir)
+        .unwrap()
+        .unwrap();
+    state.proposals.push(crystalline_remote::state::Proposal {
+        number: 2,
+        url: "https://github.test/pull/2".to_string(),
+        branch: "crystalline/share-brand-x".to_string(),
+        title: "Old".to_string(),
+        created_at: chrono::Utc::now(),
+        status: crystalline_remote::state::ProposalStatus::Open,
+        files: vec![],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: vec![],
+        updated_at: None,
+        author_login: None,
+    });
+    state.save(&state_dir).unwrap();
+    // The forge knows it too, so the share's own pull refreshes it rather than
+    // asking after a proposal that exists on this machine alone.
+    mock.set_proposal_state(2, crystalline_remote::ProposalState::Open);
+    std::fs::write(root.join("notes/more.md"), engram("More", "more", "more")).unwrap();
+    let out = call(peer, "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("proposal_open"), "{out}");
+    assert_eq!(out["proposal"]["number"], json!(2));
+    assert!(
+        out["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("merge or withdraw proposal #2 first")
+    );
+}
+
+/// A team-domain engine with one engram edited beside the base copy and one
+/// new file, ready for a discard: returns the engine, the domain root and the
+/// base bytes of the edited engram.
+async fn edited_team_engine(tmp: &tempfile::TempDir) -> (Arc<Engine>, std::path::PathBuf, Vec<u8>) {
+    let mock = Arc::new(MockProvider::new());
+    let base = engram("Alpha", "notes/a", "alpha as the team has it");
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", base.clone()),
+    ]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha, edited"),
+    )
+    .unwrap();
+    std::fs::write(root.join("notes/new.md"), engram("New", "notes/new", "new")).unwrap();
+    eng.sync(Some("brand")).await.unwrap();
+    (eng, root, base)
+}
+
+/// The tool reaches the engine's discard, and `expected` is the guard it
+/// says it is: a stale digest refuses the path and leaves the file alone,
+/// the digest the status reports unlocks it, and a path nobody's change list
+/// carries is refused by name rather than acted on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_changes_wires_through_and_honours_the_expected_digests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, root, base) = edited_team_engine(&tmp).await;
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    // Without `expected` a path is discarded as it stands.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": ["notes/new.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["deleted"], json!(["notes/new.md"]), "{out}");
+    assert!(!root.join("notes/new.md").exists());
+
+    // With `expected` a stale digest is refused and the file left alone.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({
+            "domain": "brand",
+            "paths": ["notes/a.md"],
+            "expected": { "notes/a.md": "0".repeat(64) },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["refused"],
+        json!([{ "path": "notes/a.md", "reason": "changed_since" }]),
+        "{out}"
+    );
+    assert_eq!(out["restored"], json!([]));
+
+    // The digest the status reports is the one that unlocks it.
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "detail": true, "diff": true }),
+    )
+    .await
+    .unwrap();
+    let entry = &status["domains"][0]["detail"]["diff"][0];
+    assert_eq!(entry["path"], "notes/a.md", "{status}");
+    assert_eq!(entry["kind"], "modified");
+    assert_eq!(entry["base"].as_str().unwrap().as_bytes(), base.as_slice());
+    assert!(entry["current"].as_str().unwrap().contains("alpha, edited"));
+    let sha = entry["sha"].as_str().unwrap().to_string();
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({
+            "domain": "brand",
+            "paths": ["notes/a.md"],
+            "expected": { "notes/a.md": sha },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["restored"], json!(["notes/a.md"]), "{out}");
+    assert_eq!(out["reindexed"], 1);
+    assert_eq!(std::fs::read(root.join("notes/a.md")).unwrap(), base);
+
+    // An unknown path refuses by name, and a listing is unknown too.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": ["nowhere.md", "index.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["refused"],
+        json!([
+            { "path": "nowhere.md", "reason": "unknown_path" },
+            { "path": "index.md", "reason": "unknown_path" },
+        ]),
+        "{out}"
+    );
+}
+
+/// `diff` needs a domain, implies `detail`, and carries both sides of every
+/// unshared file - a deletion, a binary addition and a text addition
+/// included - with no cap on this surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_diff_needs_a_domain_and_carries_every_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, root, _) = edited_team_engine(&tmp).await;
+    std::fs::write(root.join("logo.png"), b"\x89PNG\r\n\x1a\n\x00").unwrap();
+    std::fs::remove_file(root.join("MANIFEST.md")).unwrap();
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "origin_status", json!({ "diff": true }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("diff needs a domain"), "{err}");
+
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let detail = &status["domains"][0]["detail"];
+    assert_eq!(
+        detail["added"],
+        json!(["logo.png", "notes/new.md"]),
+        "diff implies detail: {status}"
+    );
+    let diff = detail["diff"].as_array().unwrap();
+    let paths: Vec<&str> = diff.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        vec!["MANIFEST.md", "logo.png", "notes/a.md", "notes/new.md"],
+        "path order: {status}"
+    );
+    assert!(
+        diff[0]["current"].is_null() && diff[0]["base"].as_str().is_some(),
+        "a deletion: {status}"
+    );
+    assert_eq!(diff[1]["binary"], true);
+    assert!(diff[1]["current"].is_null() && diff[1]["base"].is_null());
+    assert_eq!(diff[1]["size_after"], 9);
+    assert!(diff[3]["base"].is_null(), "an addition: {status}");
+    assert_eq!(diff[3]["too_large"], false);
+
+    // No cap on this surface: a side above a megabyte still arrives.
+    std::fs::write(
+        root.join("notes/big.md"),
+        format!(
+            "---\ntitle: Big\npermalink: notes/big\n---\n\n{}\n",
+            "x".repeat(1024 * 1024 + 10)
+        ),
+    )
+    .unwrap();
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let big = status["domains"][0]["detail"]["diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["path"] == "notes/big.md")
+        .cloned()
+        .unwrap();
+    assert_eq!(big["too_large"], false, "{}", big["path"]);
+    assert!(big["current"].as_str().unwrap().len() > 1024 * 1024);
+}
+
+/// In a reviewing domain the tool clears exactly the caller's own draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_changes_clears_only_the_callers_draft_in_a_reviewing_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &crystalline_service::Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+    let written = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "brand",
+            "title": "Colour rules",
+            "content": "- [decision] the accent is used once per page #brand",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written["draft"], json!(true), "{written}");
+    let path = written["path"].as_str().unwrap().to_string();
+
+    // Another actor's draft, written the way the overlay tests write one: the
+    // full markdown in the row's own content column, because a draft nobody
+    // put on disk lives nowhere else.
+    let store = eng.store();
+    let id = {
+        let s = store.lock().await;
+        s.domain_id("brand").await.unwrap().unwrap()
+    };
+    let text = "---\ntype: engram\ntitle: Bob\npermalink: bob\ntags:\n  - brand\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\nbob\n";
+    let mut rec = crystalline_index::EngramRecord::from_engram(
+        &crystalline_core::parse_engram(text).unwrap(),
+        "bob.md",
+        crystalline_index::FileStamp {
+            mtime: 0,
+            size: text.len() as u64,
+            sha256: "0".repeat(64),
+        },
+    );
+    rec.content = text.to_string();
+    {
+        let s = store.lock().await;
+        s.upsert_overlay(id, "bob", &rec).await.unwrap();
+    }
+
+    let listed = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let diff = listed["domains"][0]["detail"]["diff"].as_array().unwrap();
+    assert_eq!(diff.len(), 1, "the owner's own draft alone: {listed}");
+    assert_eq!(diff[0]["path"], path);
+
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": [path.clone(), "bob.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["cleared"],
+        json!([{ "path": path, "kind": "added" }]),
+        "{out}"
+    );
+    assert_eq!(
+        out["refused"],
+        json!([{ "path": "bob.md", "reason": "unknown_path" }]),
+        "bob's row is nobody's business here: {out}"
+    );
+    let s = store.lock().await;
+    assert!(
+        s.overlay_entry(id, "bob", "bob.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "bob's draft stands"
+    );
+    assert!(
+        s.overlay_entry(id, crystalline_service::engine::OWNER_IDENTITY_NAME, &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Share one new engram of a fresh team domain and return the tool's answer,
+/// over the transport asked for. Everything about the two fixtures is the
+/// same except the transport, so the answers are comparable.
+async fn share_one_engram_over(transport_is_http: bool) -> Value {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = if transport_is_http {
+        connect_http(eng).await
+    } else {
+        connect(eng).await
+    };
+    call(client.peer(), "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap()
+}
+
+/// **The transport decides the identity, and in instance mode there is only
+/// one identity to decide.** `github.share_identity` defaults to `instance`,
+/// where every share goes out on the one instance credential whoever asked -
+/// so a stdio share and an HTTP one answer the same thing, which is the
+/// byte-for-byte promise a default install rides on.
+///
+/// Only the branch is allowed to differ, and the review URL that carries it:
+/// a share branch is named for the wall-clock second it was cut plus a random
+/// suffix, so two fixtures never agree on one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_mode_answers_a_share_the_same_over_stdio_and_over_http() {
+    let mut over_stdio = share_one_engram_over(false).await;
+    let mut over_http = share_one_engram_over(true).await;
+    assert_eq!(over_stdio["outcome"], json!("proposed"), "{over_stdio}");
+    for answer in [&mut over_stdio, &mut over_http] {
+        let branch = answer["branch"].as_str().unwrap_or_default().to_string();
+        assert!(branch.starts_with("crystalline/share-brand-"), "{branch}");
+        let url = answer["url"].as_str().unwrap_or_default().to_string();
+        assert!(url.contains(&branch) && url.ends_with("/pull/1"), "{url}");
+        let object = answer.as_object_mut().unwrap();
+        object.remove("branch");
+        object.remove("url");
+    }
+    assert_eq!(over_stdio, over_http);
+}
+
+/// Write a personal token file into `dir` exactly where the engine's test
+/// override reads one for `identity`, so a share in personal mode finds a
+/// credential without a keychain, a network or a connect flow.
+fn seed_personal_token_file(dir: &std::path::Path, identity: &str, user: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    TokenStore::File {
+        path: dir.join(format!("github-token-personal-{identity}.json")),
+    }
+    .save(&StoredToken {
+        access_token: "seeded-personal-token".to_string(),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+    })
+    .unwrap();
+}
+
+/// **An HTTP share runs as the configured agent identity, and with one
+/// configured it goes through.** The refusals are the loud half of this
+/// feature; this is the quiet half, and it is the one a deployment depends on:
+/// an admin names a bot account in `github.agent_identity`, connects its
+/// GitHub identity once, and remote agents share again.
+///
+/// The injected provider short-circuits credential resolution (see
+/// `Engine::resolve_share_provider`), so what this pins is the plumbing - an
+/// `HttpAgent` actor reaching the share verb and the share completing on it.
+/// The credential half is pinned where a real resolution runs: the engine's
+/// own unit tests, and the refusal wire tests in `mcp_modern_era.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_http_share_proceeds_on_the_configured_agent_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let token_dir = tmp.path().join("tokens");
+    let root = tmp.path().join("brand-knowledge");
+    seed_personal_token_file(&token_dir, "bot", "kb-bot");
+    let mut cfg = config(true);
+    cfg.github = Some(GitHubConfig {
+        enabled: Some(true),
+        share_identity: Some("personal".to_string()),
+        agent_identity: Some("bot".to_string()),
+        ..GitHubConfig::default()
+    });
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            None,
+            Some(config_path.clone()),
+        )
+        .with_origin_provider(mock)
+        .with_origins_dir(origins_dir)
+        .with_token_store_dir(token_dir),
+    );
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect_http(eng).await;
+    let out = call(client.peer(), "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"), "{out}");
+    assert_eq!(out["added"], json!(["notes/new.md"]), "{out}");
+}
+
+/// The `proposal` argument reaches the engine rather than being decoration on
+/// the schema.
+///
+/// A number that names no open layer is the cheapest proof there is: the
+/// refusal it earns can only be produced by code that read the argument, and
+/// it is the teaching refusal itself - a caller's mistake, so `invalid_params`
+/// with the way out in the text, never a server error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_forwards_the_proposal_number_to_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let err = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "proposal": 999 }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("#999"), "the number the caller named: {err}");
+    assert!(
+        err.contains("no open layers"),
+        "and what is open instead: {err}"
+    );
+}
+
+/// The `files` argument reaches the engine too: a share naming one of two new
+/// engrams carries that one, and the other stays a local change.
+///
+/// The refusal half rides along for the same reason the amend's does: a path
+/// that is not among the unshared changes is a caller's mistake, and being
+/// told which one is the difference between fixing a typo and guessing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_forwards_the_file_selection_to_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/one.md"),
+        engram("One", "one", "the first thing"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("notes/two.md"),
+        engram("Two", "two", "the second thing"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let err = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "files": ["notes/nowhere.md"] }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("notes/nowhere.md"),
+        "the path the caller named: {err}"
+    );
+
+    let out = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "files": ["notes/one.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"), "{out}");
+    assert_eq!(out["added"], json!(["notes/one.md"]), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_domain_tool_wires_through_to_origin_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let out = call(peer, "update_domain", json!({})).await.unwrap();
+    let domains = out["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain"], json!("brand"));
+    assert_eq!(domains[0]["up_to_date"], json!(true));
+    assert!(out["errors"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_tool_wires_through_to_origin_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::write(root.join("gone.md"), engram("Gone", "gone", "local only")).unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let out = call(peer, "origin_status", json!({})).await.unwrap();
+    assert_eq!(out["connection"]["connected"], json!(true));
+    let domains = out["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain"], json!("brand"));
+    assert_eq!(domains[0]["local_changes"], json!(1));
+    assert!(
+        domains[0].get("detail").is_none(),
+        "nobody asked for detail: {}",
+        domains[0]
+    );
+
+    // The parameter an agent has to be able to reach, all the way through the
+    // tool and back out past the lean trim.
+    let named = call(peer, "origin_status", json!({ "detail": true }))
+        .await
+        .unwrap();
+    assert_eq!(
+        named["domains"][0]["detail"]["added"],
+        json!(["gone.md"]),
+        "detail: true must reach the engine and survive the trim: {named}"
+    );
+}
+
+/// An agent asking after a reviewing domain is told what it is holding there.
+///
+/// In review mode the agent's own writes never reach the folder the team
+/// shares, so without this the one surface it uses to decide what to share next
+/// would say "nothing unshared" over a pile of its own unshared drafts. The key
+/// rides on the untyped JSON the status already answers with, so nothing about
+/// the tool's shape moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_names_the_drafts_a_reviewing_domain_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &crystalline_service::Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let written = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "brand",
+            "title": "Colour rules",
+            "content": "- [decision] the accent is used once per page #brand",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        written["draft"],
+        json!(true),
+        "the write joined a draft: {written}"
+    );
+
+    let out = call(peer, "origin_status", json!({})).await.unwrap();
+    let entry = &out["domains"][0];
+    assert_eq!(
+        entry["my_drafts"],
+        json!(1),
+        "the status says what this session is holding here: {entry}"
+    );
+    assert_eq!(
+        entry["drafts"],
+        json!([{ "actor": "owner", "entries": 1 }]),
+        "and a local session, which is the machine owner, sees the whole domain: {entry}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_conflict_tool_wires_through_to_origin_resolve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock.clone()).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // A genuine same-line conflict, from a real pull.
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "line one LOCAL")).unwrap();
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
+    ]));
+    mock.set_branch("main", &c2);
+    eng.origin_update(Some("brand"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let out = call(
+        peer,
+        "resolve_conflict",
+        json!({ "domain": "brand", "path": "notes/a.md", "resolution": "theirs" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["remaining"], json!(0));
+
+    let content = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
+    assert!(content.contains("line one UPSTREAM"), "{content}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_conflict_merged_without_content_is_a_clean_invalid_params_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), true, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(
+        peer,
+        "resolve_conflict",
+        json!({ "domain": "eng", "path": "a.md", "resolution": "merged" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("content"), "{err}");
+    assert!(err.contains("merged"), "{err}");
+}

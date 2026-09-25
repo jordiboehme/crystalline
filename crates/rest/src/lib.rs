@@ -1,0 +1,1219 @@
+//! The JSON API the HTTP endpoint nests at `/api/v1`, the surface the Fluid UI
+//! talks to. Handlers pass the engine's own JSON values through unchanged, so
+//! the MCP tools and this API stay one source of truth, and every failure is
+//! an [`ApiError`] rendered as RFC 9457 problem detail.
+
+// The lower crates' modules under the names the moved files already use, so
+// every `crate::engine::`, `crate::scope::` (and so on) path in this crate
+// resolves exactly as it did in crystalline-service.
+pub(crate) use crystalline_engine::{
+    domain_view, engine, maintenance, origin, params, review, settings, similar, web_url,
+};
+// Named only by the unit tests.
+#[cfg(test)]
+pub(crate) use crystalline_engine::overlay;
+pub(crate) use crystalline_identity::{join, scope};
+
+pub mod collab {
+    //! Real-time co-editing sessions: one yrs document per open engram, served
+    //! over the axum WebSocket route in [`crate::collab::ws`], saved through
+    //! the engine's own write path. Sessions are in-memory only - the file
+    //! stays the source of truth, and a daemon restart drops sessions by
+    //! design (clients rejoin from the saved file).
+
+    pub use crystalline_engine::collab::*;
+    pub mod ws;
+}
+
+mod archive;
+mod auth;
+mod schemas;
+use crystalline_identity::auth_store;
+mod discovery;
+mod domains;
+mod domains_admin;
+mod draft_links;
+mod engrams;
+mod error;
+mod evolve;
+mod files;
+mod github_identity;
+mod github_settings;
+mod graph;
+mod identity_links;
+mod login_throttle;
+mod mcp_tokens;
+mod members;
+mod oauth;
+mod oauth_grants;
+mod oidc;
+mod users_api;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{delete, get, patch, post, put};
+use tokio::sync::Semaphore;
+
+pub use auth::{
+    AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
+};
+pub use auth_store::*;
+pub use error::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
+    if_none_match_matches, precondition_failed, versioned_etag,
+};
+use login_throttle::LoginThrottle;
+/// The loopback names every tier answers to, shared with `daemon::http_config`
+/// so the transport's allow-list and the origin rule's cannot come apart.
+#[doc(hidden)]
+pub use oauth::ALWAYS_ALLOWED_HOSTS;
+pub use oauth::{
+    AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
+    MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
+    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
+    well_known_routes,
+};
+pub use oidc::{OidcClaims, OidcClient, OidcSettings};
+
+use crate::engine::Engine;
+use crate::scope::{DomainAccess, DomainRight};
+
+/// The OpenAPI 3.1 document for this surface, assembled from the
+/// `#[utoipa::path]` annotation on every handler.
+///
+/// `info.version` is the *API* version, pinned to `v1` to match the `/api/v1`
+/// mount, rather than the crate version utoipa would otherwise take from
+/// `Cargo.toml`. That is what makes the committed snapshot survive a release:
+/// bumping the workspace version must not rewrite an artifact the UI's client
+/// generator is compiled against, and the crate version is already reported by
+/// `GET /auth/me` for the client that wants it.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Crystalline Fluid API",
+        version = "v1",
+        description = "The JSON API the Crystalline daemon mounts at `/api/v1` \
+                       on its HTTP endpoint (127.0.0.1:7411 by default), the \
+                       surface the Fluid UI talks to. Reading is \
+                       open to any signed-in viewer; writing content needs an \
+                       editor account and the `If-Match` token of the version \
+                       being replaced, and account management needs an \
+                       admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
+                       `/auth/me`, `/auth/setup`, `/auth/providers`, \
+                       `/oauth/register`, `/oauth/authorize`, \
+                       `/oauth/token` and the \
+                       two `/auth/oidc/*` routes is closed by default: a \
+                       request that \
+                       carries no identity is answered 401 ahead of routing, so \
+                       an unauthenticated caller never learns which paths \
+                       exist. Every failure is an RFC 9457 problem detail sent \
+                       as `application/problem+json`.\n\nThe payloads marked as \
+                       generic objects are the engine's own JSON, passed \
+                       through unchanged so this API and the MCP tools stay one \
+                       source of truth; each carries an example of the shape it \
+                       answers with.",
+        license(name = "AGPL-3.0-or-later"),
+    ),
+    tags(
+        (name = "meta", description = "The API's description of itself."),
+        (name = "auth", description = "Sessions and the capability probe."),
+        (name = "domains", description = "Which domains this instance serves and what each holds."),
+        (name = "engrams", description = "Listing, reading and writing engrams."),
+        (name = "discovery", description = "Search, vocabulary, context and recent activity."),
+        (name = "graph", description = "The neighborhood graph around an anchor."),
+        (name = "attachments", description = "The files an engram carries: bytes in, bytes out, and what a domain holds."),
+        (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
+        (name = "users", description = "Account management. Admin only."),
+        (name = "settings", description = "Instance settings. Admin only."),
+        (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
+    ),
+    paths(
+        openapi_json,
+        auth::login,
+        auth::logout,
+        auth::me,
+        auth::setup,
+        oidc::login,
+        oidc::callback,
+        oidc::providers,
+        domains::list,
+        domains_admin::create,
+        domains_admin::remove,
+        domains_admin::set_review_mode,
+        domains_admin::drafts,
+        domains_admin::set_visibility,
+        members::list,
+        members::set_member,
+        members::remove_member,
+        members::set_owner,
+        domains_admin::sync_status,
+        domains_admin::sync_now,
+        domains_admin::sync_summary,
+        domains_admin::share_changes_preview,
+        domains_admin::share_now,
+        domains_admin::withdraw_proposal,
+        domains_admin::conflict_detail,
+        domains_admin::resolve_conflict,
+        domains_admin::list_domain_changes,
+        domains_admin::get_domain_change,
+        domains_admin::discard_domain_changes,
+        archive::download,
+        archive::preview,
+        archive::import,
+        files::list,
+        files::read,
+        files::write,
+        files::remove,
+        domains::tree,
+        domains::manifest,
+        domains::save_manifest,
+        domains::set_domain_policies,
+        engrams::list,
+        engrams::detail,
+        engrams::inbound,
+        engrams::create,
+        engrams::save,
+        engrams::retire,
+        engrams::move_action,
+        engrams::remove,
+        engrams::validate,
+        crate::collab::ws::join,
+        discovery::search,
+        discovery::vocabulary,
+        discovery::context,
+        discovery::activity,
+        graph::graph,
+        evolve::queue,
+        evolve::acknowledge,
+        evolve::unacknowledge,
+        users_api::list,
+        users_api::create,
+        users_api::update,
+        users_api::reset_password,
+        users_api::remove,
+        github_settings::status,
+        github_settings::connect,
+        github_settings::token,
+        github_settings::disconnect,
+        github_identity::status,
+        github_identity::connect,
+        github_identity::token,
+        github_identity::disconnect,
+        mcp_tokens::list,
+        mcp_tokens::issue,
+        mcp_tokens::rotate,
+        mcp_tokens::revoke,
+        oidc::start_link,
+        oauth::register,
+        oauth::authorize,
+        oauth::authorization,
+        oauth::decide,
+        oauth_grants::list,
+        oauth_grants::revoke,
+        oauth::token,
+        identity_links::list,
+        identity_links::unlink,
+        draft_links::mint,
+        draft_links::list,
+        draft_links::revoke,
+        draft_links::accept,
+        draft_links::join,
+        draft_links::leave,
+    ),
+    components(schemas(
+        ProblemDetail,
+        ConflictDetail,
+        schemas::User,
+        schemas::Role,
+        domains::SaveManifestBody,
+        domains::ManifestResponse,
+        domains::ManifestSections,
+        domains::RoutingSource,
+        domains::ProvisioningView,
+        domains::ProvisioningDeclView,
+        domains::ManifestProblem,
+        domains::TagAliasesView,
+        domains::TagAliasDeclView,
+        domains::PolicyView,
+        domains::SetPoliciesBody,
+        domains_admin::CreateDomainBody,
+        domains_admin::FoldArg,
+        domains_admin::ReviewBody,
+        domains_admin::ReviewModeArg,
+        domains_admin::VisibilityBody,
+        schemas::MemberLevel,
+        schemas::DomainMember,
+        members::MembersResponse,
+        members::MemberBody,
+        members::OwnerBody,
+        domains_admin::ShareBody,
+        domains_admin::WithdrawBody,
+        domains_admin::ResolveBody,
+        archive::ArchiveEntryReport,
+        archive::ArchiveReport,
+        files::AttachmentView,
+        files::AttachmentsResponse,
+        files::UploadedAttachment,
+        engrams::CreateEngramBody,
+        engrams::SaveEngramBody,
+        engrams::RetireBody,
+        engrams::MoveBody,
+        engrams::ValidateBody,
+        engrams::ValidateFinding,
+        engrams::ValidateResponse,
+        auth::LoginBody,
+        auth::LoginResponse,
+        auth::LogoutResponse,
+        auth::MeResponse,
+        auth::SetupBody,
+        oidc::StartLinkResponse,
+        oidc::ProvidersResponse,
+        oidc::OidcProviderView,
+        schemas::IdentityLink,
+        identity_links::IdentityLinksResponse,
+        schemas::OverlayGrant,
+        draft_links::MintBody,
+        draft_links::MintedLinkResponse,
+        draft_links::TokenBody,
+        draft_links::LeaveBody,
+        draft_links::AcceptedDraft,
+        users_api::CreateBody,
+        users_api::PatchBody,
+        users_api::PasswordBody,
+        users_api::UserResponse,
+        users_api::UsersResponse,
+        github_settings::TokenBody,
+        github_settings::GithubStatusResponse,
+        github_settings::GithubPendingView,
+        github_identity::GithubIdentityResponse,
+        schemas::McpTokenInfo,
+        mcp_tokens::IssueBody,
+        mcp_tokens::IssuedTokenResponse,
+        oauth::RegisterBody,
+        oauth::RegisteredClient,
+        oauth::OauthErrorBody,
+        oauth::AuthorizationView,
+        oauth::DecisionBody,
+        oauth::Decision,
+        oauth::DecisionResponse,
+        schemas::OauthGrantInfo,
+        oauth::TokenForm,
+        oauth::TokenResponse,
+    )),
+)]
+struct ApiDoc;
+
+/// This surface's OpenAPI document.
+///
+/// One definition with two consumers: the [`openapi_json`] route serves it, and
+/// `crates/service/tests/rest/openapi_snapshot.rs` compares it against the committed
+/// `openapi/fluid-v1.json` the UI generates its client types from. Neither can
+/// drift from the annotations without the other noticing.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+}
+
+/// What every REST handler is given: the one shared engine the daemon owns,
+/// the one auth store this process holds open, and the auth settings resolved
+/// at startup. Cheap to clone; axum clones it per request.
+#[derive(Clone)]
+pub struct RestState {
+    /// The engine backing every request, shared with the MCP router.
+    pub engine: Arc<Engine>,
+    /// The one users-and-sessions store this process holds open. Shared rather
+    /// than opened per request: it serializes its own database access, so a
+    /// second store would only add handles on one small file.
+    pub auth: Arc<AuthStore>,
+    /// The private-domain resolver this surface asks before it serves anything
+    /// a domain name addresses. Over the same store as `auth` above, and the
+    /// same resolver the engine holds, so a membership change takes effect on
+    /// the next request rather than at the next restart and both layers cannot
+    /// answer differently.
+    pub access: Arc<DomainAccess>,
+    /// The auth settings as of startup. See [`AuthCfg`].
+    pub auth_cfg: AuthCfg,
+    /// The OAuth surface, when `auth.oauth` is on. `None` is every instance
+    /// that has not turned it on, and the routes read this option rather than
+    /// the setting, so a running daemon serves the tier it came up in. See
+    /// [`oauth`].
+    pub oauth: Option<Arc<OauthServer>>,
+    /// The single sign-on relying party, when `auth.oidc` names a usable
+    /// provider. `None` is an instance with local accounts only, which is
+    /// every instance until someone configures one. Resolved at startup with
+    /// the rest of `auth.*`, so a running daemon serves the provider it came
+    /// up with. See [`oidc`].
+    pub oidc: Option<Arc<OidcClient>>,
+    /// The open co-editing sessions, one registry for this process: the
+    /// collab upgrade route joins rooms in it, and every save it makes goes
+    /// back through the engine above.
+    pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The one-time token that lets a non-local caller reach
+    /// `POST /auth/setup`, generated once per `serve` process and only for a
+    /// non-loopback bind. `None` means the token path is closed: there is no
+    /// token, so no non-local caller can create the first admin and the
+    /// refusal says so rather than pointing at a secret that does not exist.
+    /// Set through [`RestState::with_setup_token`].
+    setup_token: Option<String>,
+    /// Caps how many password verifications run at once. See
+    /// [`LOGIN_SLOTS`].
+    login_slots: Arc<Semaphore>,
+    /// The bound on password guessing at `POST /auth/login`, resolved at
+    /// startup from `auth.login.*` like the rest of the auth settings. See
+    /// [`login_throttle`].
+    login_throttle: Arc<LoginThrottle>,
+}
+
+impl RestState {
+    /// Assemble the state, resolving and validating the auth settings out of
+    /// the engine's config. Fails when `auth.trusted_header` is not a usable
+    /// HTTP header name, and when both header modes are configured at once:
+    /// the HTTP surface then refuses to come up, naming the settings, rather
+    /// than serving with a header that silently never matches or with two
+    /// answers to one question. The daemon itself keeps running and keeps
+    /// serving MCP over its socket; see `daemon::run`.
+    pub fn new(
+        engine: Arc<Engine>,
+        auth: Arc<AuthStore>,
+        allowed_hosts: &[String],
+    ) -> anyhow::Result<RestState> {
+        let config = engine.config();
+        let auth_cfg = AuthCfg::resolve(&config)?;
+        // Read here with the rest of `auth.*`, so the throttle a running
+        // daemon applies is the one it came up with.
+        let login_free_attempts = config.auth_login_free_attempts();
+        let login_max_delay = config.auth_login_max_delay();
+        let oidc = OidcClient::new(&config)?;
+        let oauth = OauthServer::new(&config, allowed_hosts);
+        if oauth.is_some() {
+            // The registrations nobody used, collected once at startup as well
+            // as at every registration: an instance nobody connects to again
+            // would otherwise keep its abandoned rows forever. Detached; see
+            // [`oauth::prune_at_start`].
+            oauth::prune_at_start(auth.clone());
+        }
+        let collab = crate::collab::session::CollabSessions::new(engine.clone());
+        // The engine closes co-editing rooms itself when it unregisters a
+        // domain, whichever surface asked for the removal, so it needs the
+        // registry this state has just built. A `Weak` handle: see
+        // `Engine::set_collab_sessions`.
+        engine.set_collab_sessions(&collab);
+        Ok(RestState {
+            collab,
+            engine,
+            oauth,
+            oidc,
+            access: Arc::new(DomainAccess::new(auth.clone())),
+            auth,
+            auth_cfg,
+            setup_token: None,
+            login_slots: auth::login_slots(),
+            login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+        })
+    }
+
+    /// Hand this state the process's one-time setup token, or `None` to leave
+    /// the token path closed.
+    ///
+    /// A builder rather than a parameter on [`RestState::new`] so the call
+    /// sites that have no token to offer - every test state, and any future
+    /// caller - stay as they are, and so the token is visibly opt-in at the one
+    /// place that has it: `run_serve`, which generates it once, for a
+    /// non-loopback bind on an instance that has no account yet, and prints it
+    /// once.
+    ///
+    /// A blank token is stored as no token. Nothing generates one today, but a
+    /// token nobody could type is not a token, and the handler that compares it
+    /// would otherwise be handed a value that matches a caller who sends
+    /// nothing at all - see `auth::authorize_setup`, which fails closed on it a
+    /// second time rather than trusting this to be the only way the field is
+    /// ever set.
+    pub fn with_setup_token(mut self, token: Option<String>) -> RestState {
+        self.setup_token = token.filter(|token| !token.trim().is_empty());
+        self
+    }
+
+    /// The process's one-time setup token, if it has one. Read by
+    /// [`auth::setup`] alone, and never rendered into a response: see the
+    /// handler for what it is compared with and why the comparison is
+    /// constant-time.
+    pub(crate) fn setup_token(&self) -> Option<&str> {
+        self.setup_token.as_deref()
+    }
+
+    /// Hold the domain-admin lock for the whole of a create or an unregister.
+    ///
+    /// The lock itself lives on the engine ([`Engine::domain_admin`]), which is
+    /// what makes this serialization real rather than surface-local: an
+    /// unregistration over MCP takes the same lock, so a REST create and an
+    /// agent's removal of the same name can no longer interleave. What it does
+    /// NOT close is a bare `domain_add_local`/`domain_add_virtual`/`origin_add`
+    /// racing a removal: those verbs take no lock of their own, and closing
+    /// that needs a per-name lock inside the engine (see
+    /// `Engine::domain_remove`'s known race).
+    ///
+    /// Deliberately NOT the join fence below. A team-domain create downloads
+    /// and indexes a repository inside the request, which can run for
+    /// minutes, and fencing co-editing joins for that long would hang every
+    /// editor on the instance over a registration that closes no rooms. A
+    /// create never sweeps anything, so it has no join window to close.
+    pub(crate) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.engine.domain_admin().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and an
+    /// unregistration of the same domain cannot interleave. The fence's other
+    /// half is raised inside [`Engine::unregister_domain`]; see
+    /// [`Engine::fence_joins`] for the argument. The guard is dropped as soon
+    /// as the join returns, never held across the socket's life.
+    pub(crate) async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.engine.join_pass().await
+    }
+
+    /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
+    ///
+    /// The semaphore is deliberately not exposed itself: password work is the
+    /// only thing it may gate, and a handler that hashes has to go through here
+    /// rather than reach for the field. See [`auth::with_login_slot`] for what
+    /// the cap is for and why the admin routes share the login one instead of
+    /// getting a second.
+    pub(crate) async fn with_login_slot<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> Result<F::Output, ApiError> {
+        auth::with_login_slot(&self.login_slots, work).await
+    }
+
+    /// The login throttle, for the one handler that consults it.
+    pub(crate) fn login_throttle(&self) -> &LoginThrottle {
+        &self.login_throttle
+    }
+}
+
+/// The largest request body this API accepts, in bytes.
+///
+/// Set explicitly rather than left to axum's 2 MiB default, and set generously,
+/// because the body that matters here is one engram's markdown: a domain in the
+/// wild holds documents far past a megabyte (the semantic-search spill this
+/// project chased was provoked by exactly those), and a default that let such
+/// an engram be read but not saved back would fail at the worst moment - after
+/// its author had edited it. Ten mebibytes is comfortably past the largest
+/// document anyone writes by hand and still small enough that a hostile body
+/// cannot make this process reserve serious memory.
+///
+/// A body over the limit is refused with 413 before a handler runs, in
+/// problem+json like every other failure here: `ApiJson` re-renders axum's
+/// rejection and keeps the status it chose.
+///
+/// **Three other surfaces read this number, so it is not local to the REST
+/// API any more.** `daemon::http_config` hands it to rmcp as the
+/// streamable-HTTP transport's `max_request_body_bytes`, so an engram written
+/// through an MCP tool call meets the same boundary as one saved through
+/// `/api/v1` (rmcp refuses in its own words there, `413 Payload Too Large:
+/// request body exceeds {max} bytes`, rather than in problem+json).
+/// `collab::ws::WS_MAX_MESSAGE_BYTES` sits a megabyte above it, so a
+/// collaborative edit that can be saved can also be transmitted. And
+/// `fluid/nginx.conf.template` sets `client_max_body_size` to match, guarded
+/// by `crates/service/tests/rest/nginx_body_cap.rs` because nginx cannot read a Rust constant.
+/// Changing this value moves the first two by construction; the third is the
+/// one that needs the template edited with it.
+///
+/// Two routes are deliberately exempt, and only two: the archive preview and
+/// import carry a whole domain rather than one document. See
+/// [`ARCHIVE_BODY_BYTES`].
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// The largest request body the archive preview and import accept, 64 MiB.
+///
+/// A separate number because those two routes carry a different kind of body:
+/// not one person's document but a whole domain, MANIFEST, engrams and
+/// `assets/` attachments together, as one zip. Under [`MAX_BODY_BYTES`] the
+/// archive was a one-way door - a single incompressible attachment at the
+/// attachment ceiling (10 MiB, `crystalline_core::MAX_ATTACHMENT_BYTES`)
+/// exports to a zip just past 10 MiB and could then never be imported again,
+/// which is exactly the round trip the attachment feature promises.
+///
+/// Applied per route with `DefaultBodyLimit` rather than by raising the number
+/// above: axum takes the innermost limit, so every other route, the MCP
+/// streamable-HTTP transport and the collab socket keep the general ceiling
+/// untouched. The route is admin-only and CSRF-guarded, the decompression it
+/// feeds is metered against the archive module's own `MAX_TOTAL_BYTES` and
+/// runs on the blocking pool, so the cost of the larger body is bounded memory
+/// on a route nobody anonymous can reach.
+///
+/// `fluid/nginx.conf.template` gives the same two paths their own
+/// `client_max_body_size`, guarded by `crates/service/tests/rest/nginx_body_cap.rs`.
+pub const ARCHIVE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
+/// here are relative to that prefix and the fallback below only ever answers
+/// for unknown paths under it.
+///
+/// [`auth::guard`] is layered over the whole thing, fallback included, so
+/// identity resolution, the CSRF check and the closed-by-default rule apply to
+/// every path under the mount - including the ones later tasks add, which are
+/// guarded the moment they are registered. Every route therefore belongs
+/// *above* the `.layer` call: axum only wraps what was declared before it, so a
+/// route added below would serve unguarded.
+pub fn router(state: RestState) -> Router {
+    Router::new()
+        .route("/openapi.json", get(openapi_json))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
+        // The first-run path: public, CSRF-exempt by path like login, and 410
+        // for good once any account exists. See [`auth::setup`].
+        .route("/auth/setup", post(auth::setup))
+        // Single sign-on: three public GETs, for the reason the four routes
+        // above are public. The callback's protection is the single-use state
+        // it generated and the cookie it bound to this browser, not a session
+        // that does not exist yet. See [`oidc`].
+        // One path, two verbs, and the difference is the whole security
+        // story: the GET starts an ordinary sign-in and is public, the POST
+        // starts a link and is an unsafe request by a signed-in account, so
+        // the CSRF gate covers it and no other origin can start one.
+        .route(oidc::LOGIN_PATH, get(oidc::login).post(oidc::start_link))
+        .route(oidc::CALLBACK_PATH, get(oidc::callback))
+        .route(oidc::PROVIDERS_PATH, get(oidc::providers))
+        // Dynamic client registration, public by path for the reason the four
+        // routes above are public: a client registers before anybody has
+        // signed in anywhere, so there is no session it could carry. It is
+        // NOT CSRF-exempt - a browser that happens to hold one still echoes
+        // its token - and it is bounded four ways rather than by an identity
+        // it cannot have. See [`oauth::register`].
+        //
+        // The body limit is its own, far below the mount's, and it is the
+        // route's first bound rather than a refinement: axum resolves
+        // extractors before a handler runs, so the burst limiter inside the
+        // handler cannot decline to have buffered and parsed what arrived.
+        // This can. The largest legal registration is ten 2048-character uris
+        // beside a 100-character name, so 64 KiB is room to spare, and this is
+        // the one write on the surface an anonymous caller can make.
+        .route(
+            oauth::REGISTER_PATH,
+            post(oauth::register).route_layer(DefaultBodyLimit::max(oauth::MAX_REGISTER_BYTES)),
+        )
+        // The authorization endpoint, public by path for the reason
+        // registration is: the browser a client sends here may have no session
+        // yet, and Fluid carries it to the login page and back. Nothing is
+        // granted by it - it answers a redirect to the consent screen, which
+        // is where an account appears. See [`oauth::authorize`].
+        .route(oauth::AUTHORIZE_PATH, get(oauth::authorize))
+        // The consent pair, and NOT public: the whole point is that a person
+        // decides, so both verbs need an account (any role), and the POST is
+        // an unsafe request that the guard's CSRF rule covers like every
+        // other.
+        .route(
+            oauth::AUTHORIZATIONS_PATH,
+            get(oauth::authorization).post(oauth::decide),
+        )
+        // The token endpoint, public by path for the reason the two routes
+        // above it are: the caller is a program that has never signed in here
+        // and never will - what it takes away from this route is what it
+        // authenticates with afterwards. It is NOT CSRF-exempt either, so a
+        // page on another origin cannot drive an exchange from a signed-in
+        // visitor's browser. Its own body limit, for the reason registration
+        // has one: an anonymous caller decides how much of it arrives, and the
+        // extractor has parsed the body before any rule in the handler runs.
+        .route(
+            oauth::TOKEN_PATH,
+            post(oauth::token).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
+        )
+        .route("/domains", get(domains::list).post(domains_admin::create))
+        // Admin only, enforced in the handler like every other admin route
+        // here. Registered before the domain sub-paths for readability only;
+        // axum's router is order-independent.
+        .route("/domains/{domain}", delete(domains_admin::remove))
+        // Whether a domain is private, and the two directions are gated
+        // differently. PRIVATIZING is admin only: it hands the domain to the
+        // caller, so a shared domain would otherwise be seized by whoever
+        // asked first. RE-SHARING is served to the domain's own OWNER as well
+        // as to an admin - they already see everything in it. A manager does
+        // neither: it invites people and changes their levels, and deciding
+        // who holds a domain is not one domain's administration to settle.
+        // The split is documented in full on
+        // [`domains_admin::set_visibility`].
+        .route(
+            "/domains/{domain}/visibility",
+            put(domains_admin::set_visibility),
+        )
+        // Whether the domain reviews changes before they land. The same gate
+        // unregistering it goes through - an instance admin, or a private
+        // domain's owner - because both decide something about the whole
+        // domain rather than about one engram in it, and taking review mode
+        // off ends every actor's unshared drafts. See
+        // [`domains_admin::set_review_mode`].
+        .route(
+            "/domains/{domain}/review",
+            put(domains_admin::set_review_mode),
+        )
+        // Who is drafting in the domain, for whoever holds it: the read half of
+        // the same card. Gated with the switch above rather than with the
+        // domain reads below it, because a count of somebody else's unshared
+        // work is the coordination view of the person answerable for the
+        // domain. A pure read, so a read-only instance serves it. See
+        // [`domains_admin::drafts`].
+        .route("/domains/{domain}/drafts", get(domains_admin::drafts))
+        // Who may reach a private domain. The listing is open to anyone who
+        // may see the domain at all (a viewer-level member sees who else is
+        // here); inviting, re-levelling and evicting need `Manage`, with the
+        // one exception that a member may always remove ITSELF; and handing
+        // the domain on needs `Own`. Every one of them answers 404 for a
+        // domain the caller may not see, exactly as an unregistered name
+        // does. See [`members`].
+        .route("/domains/{domain}/members", get(members::list))
+        .route(
+            "/domains/{domain}/members/{principal}",
+            put(members::set_member).delete(members::remove_member),
+        )
+        .route("/domains/{domain}/owner", put(members::set_owner))
+        // Admin only as well. The GET is a pure read and stays served on a
+        // read-only instance; the POST is a pull that writes, and does not.
+        .route(
+            "/domains/{domain}/sync",
+            get(domains_admin::sync_status).post(domains_admin::sync_now),
+        )
+        // The instance-wide read behind the top bar's share action: one call
+        // that says whether any team domain has something to share. A pure
+        // read like the per-domain GET above, and served the same way on a
+        // read-only instance.
+        .route("/sync", get(domains_admin::sync_summary))
+        // The share half of the same card. The preview is a GET that pulls,
+        // so it is refused on a read-only instance like the writes below it;
+        // the two conflict routes are offline verbs and need no connection.
+        .route(
+            "/domains/{domain}/sync/changes",
+            get(domains_admin::share_changes_preview),
+        )
+        .route(
+            "/domains/{domain}/sync/share",
+            post(domains_admin::share_now),
+        )
+        .route(
+            "/domains/{domain}/sync/proposals/{number}/withdraw",
+            post(domains_admin::withdraw_proposal),
+        )
+        .route(
+            "/domains/{domain}/sync/conflicts/{id}",
+            get(domains_admin::conflict_detail),
+        )
+        .route(
+            "/domains/{domain}/sync/conflicts/{id}/resolve",
+            post(domains_admin::resolve_conflict),
+        )
+        // The offline change surface: the list and the detail need domain
+        // read alone and never pull, so they are served read-only; the
+        // discard writes the working tree and is not. The literal `discard`
+        // segment is registered first so it wins over the catch-all.
+        .route(
+            "/domains/{domain}/changes",
+            get(domains_admin::list_domain_changes),
+        )
+        .route(
+            "/domains/{domain}/changes/discard",
+            post(domains_admin::discard_domain_changes),
+        )
+        .route(
+            "/domains/{domain}/changes/{*path}",
+            get(domains_admin::get_domain_change),
+        )
+        // Admin only as well, and a pure read: the archive download is the
+        // backup story of a read-only mirror, so it stays served there.
+        .route("/domains/{domain}/archive", get(archive::download))
+        // The upload half, and the exception to the line above: both are
+        // writes (a preview is the first half of one), so both are admin-only
+        // AND refused on a read-only instance.
+        //
+        // Their own body limit, and the only two routes that have one: an
+        // archive is a whole domain rather than one document, so the general
+        // ceiling would refuse an export this same instance produced. Layered
+        // on the method router, which puts it INSIDE the router-wide limit
+        // below, and axum reads the innermost - so nothing else moves. See
+        // [`ARCHIVE_BODY_BYTES`].
+        .route(
+            "/domains/{domain}/archive/preview",
+            post(archive::preview).layer(DefaultBodyLimit::max(ARCHIVE_BODY_BYTES)),
+        )
+        .route(
+            "/domains/{domain}/archive/import",
+            post(archive::import).layer(DefaultBodyLimit::max(ARCHIVE_BODY_BYTES)),
+        )
+        // The attachment surface, beside the archive because both move bytes
+        // rather than knowledge. The listing is a plain read; the bytes route
+        // is a wildcard, because an attachment path is a path and carries its
+        // own slashes, and its wildcard is terminal like every other one here.
+        // The PUT and DELETE are editor writes refused on a read-only
+        // instance; the GET is a read and stays served there.
+        .route("/domains/{domain}/attachments", get(files::list))
+        .route(
+            "/domains/{domain}/files/{*path}",
+            get(files::read).put(files::write).delete(files::remove),
+        )
+        .route("/domains/{domain}/tree", get(domains::tree))
+        // The PATCH is the owner's: see `set_domain_policies`.
+        .route(
+            "/domains/{domain}/manifest",
+            get(domains::manifest)
+                .put(domains::save_manifest)
+                .patch(domains::set_domain_policies),
+        )
+        .route(
+            "/domains/{domain}/engrams",
+            get(engrams::list).post(engrams::create),
+        )
+        // A wildcard, not a segment: a permalink is a path, so an engram in a
+        // subfolder carries the slashes with it.
+        .route(
+            "/domains/{domain}/engrams/{*permalink}",
+            get(engrams::detail)
+                .put(engrams::save)
+                .delete(engrams::remove),
+        )
+        // What points at one engram: a read, so it sits beside the detail
+        // route rather than among the actions below. The permalink rides last
+        // because a wildcard is terminal - the same shape, for the same
+        // reason, as the collab upgrade further down.
+        .route(
+            "/domains/{domain}/inbound/{*permalink}",
+            get(engrams::inbound),
+        )
+        // Actions rather than sub-paths of `/engrams/{*permalink}`, whose
+        // wildcard cannot be followed by another segment: the permalink of
+        // the engram being retired or moved rides in the body instead.
+        // The collab upgrade: a GET, so the guard's CSRF exemption applies by
+        // method; role, read_only and Origin are enforced in the handler,
+        // before upgrade. The wildcard is terminal, so nested permalinks ride
+        // the path exactly as the engram detail route takes them.
+        .route(
+            "/collab/{domain}/{*permalink}",
+            get(crate::collab::ws::join),
+        )
+        .route("/domains/{domain}/retire", post(engrams::retire))
+        .route("/domains/{domain}/move", post(engrams::move_action))
+        // Not domain-scoped like the routes above it: the document being
+        // validated may not exist yet, so there is no path segment to name a
+        // domain with. It lives here rather than beside `/search` and its
+        // siblings because what it checks is engram markdown.
+        .route("/validate", post(engrams::validate))
+        .route("/search", get(discovery::search))
+        .route("/vocabulary", get(discovery::vocabulary))
+        .route("/context", get(discovery::context))
+        .route("/activity", get(discovery::activity))
+        .route("/graph", get(graph::graph))
+        // The consolidation queue, read-only: detection runs, nothing is
+        // recorded, so opening the maintenance page never counts as the sweep
+        // it is asking about. See [`evolve::queue`].
+        .route("/evolve", get(evolve::queue))
+        // The acknowledgment pair, editor-only and CSRF-guarded like every
+        // other mutation here. Domain-scoped in the path, engram in the body:
+        // a permalink is a path of its own, so it cannot ride a segment before
+        // an action name.
+        .route(
+            "/domains/{domain}/evolve/ack",
+            post(evolve::acknowledge).delete(evolve::unacknowledge),
+        )
+        // Admin only, enforced inside the handlers: the guard below stops at
+        // viewer. See [`users_api`] for the three rules these first mutating
+        // routes are held to.
+        .route("/users", get(users_api::list).post(users_api::create))
+        .route(
+            "/users/{name}",
+            patch(users_api::update).delete(users_api::remove),
+        )
+        .route("/users/{name}/password", post(users_api::reset_password))
+        // Admin only as well, and enforced the same way. The GET is a pure
+        // read and is served on a read-only instance; the three mutations
+        // are refused there, like every other write on this surface.
+        .route(
+            "/settings/github",
+            get(github_settings::status).delete(github_settings::disconnect),
+        )
+        .route("/settings/github/connect", post(github_settings::connect))
+        .route("/settings/github/token", post(github_settings::token))
+        // The self-service half of the same surface, and the one settings
+        // path that is not admin-only: an account's OWN GitHub identity, the
+        // credential its shares go out on when this instance shares
+        // personally. No name in the path - the session already names the
+        // account - so a caller can only ever manage their own. The GET is a
+        // pure read and stays served on a read-only instance; the three
+        // mutations are refused there like every other write here.
+        .route(
+            "/me/github-identity",
+            get(github_identity::status).delete(github_identity::disconnect),
+        )
+        .route(
+            "/me/github-identity/connect",
+            post(github_identity::connect),
+        )
+        .route("/me/github-identity/token", put(github_identity::token))
+        // The other half of the same self-service idea: the tokens this
+        // account's AGENTS authenticate with when `auth.mcp` is on. Open to
+        // every signed-in account, viewers included - an agent acts as the
+        // account that issued its token, so a viewer's agent is read-only by
+        // construction - and to no anonymous caller, which has no account to
+        // issue for. No name in the path, for the reason the identity routes
+        // above carry none: the session already names the account, so a
+        // caller can only ever reach its own. All four are served on a
+        // read-only instance, which is this surface's one departure from the
+        // rule that read-only refuses every unsafe method: that setting
+        // protects the knowledge, a token is account state in the accounts
+        // database rather than knowledge, and a read-only team server with
+        // `auth.mcp` on is exactly where an agent cannot connect at all
+        // without one.
+        .route(
+            "/me/mcp-tokens",
+            get(mcp_tokens::list).post(mcp_tokens::issue),
+        )
+        .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
+        .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
+        // The caller's own OAuth grants - the clients connected through
+        // `/oauth/authorize` - on the exact settlement the token routes above
+        // carry: self-service, every account included, served on a
+        // read-only instance because a grant is account state rather than
+        // knowledge. Revoking deletes the row outright, so both of its
+        // tokens stop resolving at the MCP gate on the very next request.
+        .route("/me/oauth-grants", get(oauth_grants::list))
+        .route("/me/oauth-grants/{id}", delete(oauth_grants::revoke))
+        // The caller's own single sign-on identities, on the same settlement
+        // as the tokens above: self-service, every account included, and
+        // served on a read-only instance because a link is account state
+        // rather than knowledge. Making one is not here - that is the sign-on
+        // itself, which is the only thing that can prove the identity is the
+        // caller's.
+        .route("/me/identity-links", get(identity_links::list))
+        .route(
+            "/me/identity-links/{issuer}",
+            delete(identity_links::unlink),
+        )
+        // Share-links on a draft: the one seam through which a person sees,
+        // and then edits, a page somebody else has not shared with the team
+        // yet. The minting and listing halves are domain-addressed and
+        // author-only; redeeming, joining and leaving carry no domain in the
+        // path, because the link itself names the draft and asking the caller
+        // to repeat it would only make a second thing that could disagree.
+        // Every one of them is served on a read-only instance, on the
+        // settlement the token routes above carry: a grant is account state in
+        // the accounts database and a join is a record in this process's
+        // memory, and neither is knowledge. The write they enable is refused
+        // by read-only in the engine, exactly as it always was.
+        .route(
+            "/domains/{domain}/draft-links",
+            get(draft_links::list).post(draft_links::mint),
+        )
+        .route("/draft-links/{id}", delete(draft_links::revoke))
+        .route("/draft-links/accept", post(draft_links::accept))
+        .route("/draft-links/join", post(draft_links::join))
+        .route("/draft-links/leave", post(draft_links::leave))
+        .fallback(unknown_path)
+        // Applies to every method router registered above it, so it stays
+        // below the routes and above the guard.
+        .method_not_allowed_fallback(wrong_method)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::guard,
+        ))
+        // Outermost, so an oversized body is refused before the guard reads a
+        // cookie or the store is touched. See [`MAX_BODY_BYTES`].
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state)
+}
+
+/// `GET /openapi.json` - this API's own OpenAPI 3.1 document.
+///
+/// Served *behind* the viewer guard, with no [`auth`] `PUBLIC_PATHS` exception:
+/// the description of a closed API is part of what being closed by default
+/// protects, and an unauthenticated caller learning every path and parameter
+/// would undo what the guard's answering 401 ahead of routing is for. Nothing
+/// is lost by that. The document is a committed artifact at
+/// `crates/service/openapi/fluid-v1.json`, and the UI's client generator reads
+/// the file rather than this route, so tooling never needs a running server -
+/// let alone an unauthenticated one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    tag = "meta",
+    operation_id = "get_openapi_document",
+    summary = "This API's own OpenAPI 3.1 document.",
+    description = "Served behind the viewer guard like every other data route: \
+                   the description of a closed API is part of what being closed \
+                   by default protects. Tooling does not need this route, since \
+                   the document is a committed artifact in the repository at \
+                   `crates/service/openapi/fluid-v1.json`.",
+    responses(
+        (
+            status = 200,
+            description = "This document. Behind the viewer guard like every \
+                           other data route.",
+            body = Object,
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(openapi_document())
+}
+
+/// Answer an unknown `/api/v1` path in problem+json rather than letting it
+/// fall through to the MCP transport, which would reply in its own shape.
+async fn unknown_path() -> ApiError {
+    ApiError::not_found("unknown API path")
+}
+
+/// Answer a known path asked for with a method it does not serve, in
+/// problem+json rather than axum's empty 405.
+async fn wrong_method() -> ApiError {
+    ApiError::method_not_allowed()
+}
+
+/// Refuse a mutation on a read-only instance, ahead of every check that reads
+/// the config, a credential or the domain's content.
+///
+/// The one thing that may run before it is the domain gate below, and on four
+/// routes it does ([`files::write`], [`files::remove`] and the two evolve
+/// acknowledgments): a domain the caller may not see must answer the 404 an
+/// unregistered name answers, on a read-only instance exactly as on a writable
+/// one, and it cannot do that from behind a 403 that names the instance's
+/// mode. It costs two membership reads on a request that was going to be
+/// refused; it buys an answer that does not vary with a setting the caller can
+/// observe. The routes that kept the old order are the ones where both checks
+/// answer 403 anyway, so nothing there is worth reordering.
+///
+/// One spelling for every admin module rather than one per module, so a
+/// read-only instance answers the same way whichever settings surface was
+/// asked. The `crystalline` CLI on the server that holds the data is the
+/// recovery path - there is no flag that reopens this surface, on purpose
+/// (resolved ambiguity 7 in the plan).
+pub(crate) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; changes are disabled here - use the \
+             `crystalline` CLI on the server that holds the data",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a request that names a domain this caller may not see, in the words
+/// a domain nobody registered is refused with.
+///
+/// The equality is the point, so it is one call rather than two messages kept
+/// in step: `Engine::require_domain` raises its `UnknownDomain` for a hidden
+/// name and for an unregistered one alike, and the registered set that error
+/// lists already has the caller's hidden domains taken out of it. A hidden
+/// domain therefore answers 404 and never 403 - being told "forbidden" would
+/// confirm the existence the privacy is for.
+///
+/// Every domain-addressed route whose engine verb is not itself scoped opens
+/// with this: the MANIFEST read, the attachment listing and bytes, the inbound
+/// list's siblings. A resolver that cannot answer propagates as a 500 through
+/// the engine's `EngineError::Internal`, so this fails closed.
+pub(crate) async fn require_domain_read(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<(), ApiError> {
+    state
+        .engine
+        .require_domain(domain, &identity.scope())
+        .await?;
+    Ok(())
+}
+
+/// The caller, when the request may mutate content in `domain`.
+///
+/// Three refusals in the order they have to happen:
+///
+/// 1. a domain this caller may not see is the 404 above, decided before
+///    anything else, so a stranger writing to a private domain learns exactly
+///    what a stranger writing to a domain nobody registered learns;
+/// 2. then the instance role, unchanged: a domain invitation widens what an
+///    account may *reach*, never what its instance role lets it *do*, so a
+///    domain editor who is an instance viewer is still refused here;
+/// 3. then the membership level, which is what a private domain adds. The
+///    message names the level the caller holds, because "forbidden" on a
+///    domain they can see and read is otherwise indistinguishable from a bug.
+///
+/// Step 3 can only fire on a private domain. On a shared one the right is the
+/// instance role's own (the policy in `crate::scope`), so a caller past step 2
+/// holds `Write` or better by construction.
+///
+/// Two routes carry no domain gate of any kind, deliberately: saving a domain's
+/// MANIFEST and the origin pull. Both are `require_admin`, and an instance
+/// admin resolves to [`DomainRight::Own`] on every domain, private ones
+/// included, so a gate there is a store round trip that cannot refuse. If that
+/// early return is ever narrowed, those two are what has to be revisited -
+/// which is why this sentence sits here rather than nowhere.
+///
+/// `DELETE /domains/{domain}` used to be the third. It is not admin-only any
+/// more: it runs `Identity::require_account` and hands the decision to
+/// `Engine::unregister_domain`, whose `require_domain_owner` is owner-or-admin
+/// and is the same rule the MCP verb and the CLI remove through. So its gate is
+/// the engine's rather than absent. The share surfaces beside them are NOT in that set: their gate
+/// moves with `github.share_identity`, so an instance editor reaches them in
+/// personal mode, and they carry a domain gate of their own.
+pub(crate) async fn require_domain_write(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Caller, ApiError> {
+    let scope = identity.scope();
+    state.engine.require_domain(domain, &scope).await?;
+    let caller = identity.require_editor()?;
+    // The capped right rather than the bare domain answer, so this gate and the
+    // MCP one are one rule with one spelling (`DomainAccess::write_right`).
+    // `require_editor` above already refuses every account the cap would catch,
+    // so nothing here changes what this route answers; what it buys is that the
+    // rule cannot drift apart from the other surface's copy of it again.
+    let right = state
+        .access
+        .write_right(&scope, domain)
+        .await
+        // Never a fallback: a write that cannot learn what its caller may do
+        // refuses rather than proceeding on an assumption.
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Write {
+        return Err(ApiError::forbidden(format!(
+            "your membership on this domain is {}, and editor access is required",
+            member_level_word(right)
+        )));
+    }
+    Ok(caller)
+}
+
+pub(crate) use crate::scope::member_level_word;
+
+/// Refuse an empty password before it is hashed into an account nobody can log
+/// in as. The store would accept it; `crystalline users` refuses it, and this
+/// surface matches.
+///
+/// Here rather than in [`users_api`], which is where it started, because the
+/// first-run [`auth::setup`] creates an account too and a second spelling of
+/// the same rule is how the two surfaces would drift: an installation whose
+/// very first admin was allowed a password no later account could have is
+/// exactly the wrong place to discover that.
+pub(crate) fn check_password(password: &str) -> Result<(), ApiError> {
+    if password.is_empty() {
+        return Err(ApiError::unprocessable(
+            "the password is empty; pick one with at least one character",
+        ));
+    }
+    Ok(())
+}
+
+/// Split a comma-separated query parameter into the `Vec<String>` the engine's
+/// params take, dropping the whitespace and the empties a hand-written URL
+/// brings with it: `?tags=a,%20b,` asks for `a` and `b` rather than for a tag
+/// that is one space long, and an absent parameter asks for nothing at all.
+///
+/// Every list-valued parameter on this surface arrives this way rather than as a
+/// repeated key: one spelling for a caller to learn, and the same one the engine
+/// then sees whichever endpoint it came through.
+fn csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A [`RestState`] over an empty in-memory engine and a fresh auth
+    /// database: enough to exercise the state's own machinery without a domain
+    /// on disk behind it.
+    async fn test_state() -> (tempfile::TempDir, RestState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let auth = Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        (dir, RestState::new(engine, auth, &[]).unwrap())
+    }
+
+    /// The cap the admin routes borrow: whatever calls
+    /// [`RestState::with_login_slot`] - a login, an account being created, a
+    /// password being reset - only [`LOGIN_SLOTS`] of them hold argon2's
+    /// working memory at a time. Asserted on the mechanism, by counting how
+    /// many bodies are inside at once, rather than on how long anything took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_login_limiter_caps_every_caller_that_hashes() {
+        let (_dir, state) = test_state().await;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let (state, live, peak) = (state.clone(), live.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                state
+                    .with_login_slot(async {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0, "every permit came back");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= LOGIN_SLOTS,
+            "at most {LOGIN_SLOTS} may hash at once, saw {peak}"
+        );
+        assert!(peak > 1, "and the limiter must not serialize them either");
+    }
+
+    #[test]
+    fn a_comma_list_splits_and_drops_the_empties() {
+        assert_eq!(csv(Some("a,b")), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            csv(Some(" a , b ")),
+            vec!["a".to_string(), "b".to_string()],
+            "a hand-written list is not punished for its spaces"
+        );
+        assert_eq!(csv(Some("a,,")), vec!["a".to_string()]);
+        assert!(
+            csv(Some("")).is_empty(),
+            "no values rather than one empty one"
+        );
+        assert!(csv(Some(" , ")).is_empty());
+        assert!(csv(None).is_empty(), "an absent parameter asks for nothing");
+    }
+}

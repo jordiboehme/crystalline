@@ -1,0 +1,39 @@
+[package]
+name = "crystalline-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Who a caller is and what they may touch in Crystalline: the account store, roles, domain access, grants, joins and scope."
+
+[lib]
+name = "crystalline_identity"
+path = "src/lib.rs"
+
+[features]
+# The test seam another crate's tests read (the argon2 verification counter
+# in auth_store), and nothing else. Off in every released binary.
+testing = []
+
+[dependencies]
+# hex_lower (ruled: identity depends on the index for it).
+crystalline-index = { workspace = true }
+anyhow = { workspace = true }
+argon2 = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true }
+# URL parsing for the OAuth redirect and resource checks (named directly
+# since Task 7b; the same crate openidconnect re-exports).
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

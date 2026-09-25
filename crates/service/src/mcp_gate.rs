@@ -25,7 +25,7 @@
 //! status, headers and body. Distinguishing them would hand an attacker an
 //! oracle telling them which half of a guess landed, and the honest cases (an
 //! expired token, a disabled colleague) are better served by the teaching text,
-//! which names where a working credential comes from. `tests/mcp_auth.rs`
+//! which names where a working credential comes from. `tests/auth/mcp_auth.rs`
 //! asserts the refusals are byte-identical.
 //!
 //! The refusal is a function of this instance's configuration and of the
