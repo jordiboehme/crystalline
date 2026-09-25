@@ -993,13 +993,13 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("drum-rack", variant);
   const postA = hw - 0.03;
   const postD = hd - 0.03;
-  if (variant === 0) {
-    const top = 1.8;
-    for (const a of [-postA, postA]) {
-      for (const d of [-postD, postD]) {
-        k.box(a - 0.025, a + 0.025, d - 0.025, d + 0.025, 0, top, s.metal);
-      }
+  const top = variant === 0 ? 1.8 : 1.75;
+  for (const a of [-postA, postA]) {
+    for (const d of [-postD, postD]) {
+      k.box(a - 0.025, a + 0.025, d - 0.025, d + 0.025, 0, top, s.metal);
     }
+  }
+  if (variant === 0) {
     const decks = [0.05, 0.95];
     for (const h0 of decks) {
       k.box(
@@ -1015,16 +1015,10 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     const dr = Math.min(hw, hd) * 0.42;
     for (const h0 of decks) {
       for (const a of [-hw * 0.4, hw * 0.4]) {
-        oneBarrel(k, s, a, 0, dr, 0.8, 6, h0 + 0.04);
+        oneBarrel(k, s, a, 0, dr, 0.8, 8, h0 + 0.04);
       }
     }
     return;
-  }
-  const top = 1.75;
-  for (const a of [-postA, postA]) {
-    for (const d of [-postD, postD]) {
-      k.box(a - 0.025, a + 0.025, d - 0.025, d + 0.025, 0, top, s.metal);
-    }
   }
   const r = 0.15;
   const a0 = -hw + 0.06;
