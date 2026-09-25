@@ -59,7 +59,7 @@ describe("propFootprint", () => {
     });
   });
 
-  it("swaps width and depth at a quarter turn, for a bench", () => {
+  it("swaps width and depth at a quarter or three-quarter turn, for a bench", () => {
     const facingNorth: Prop = {
       kind: "bench",
       variant: 0,
@@ -69,12 +69,15 @@ describe("propFootprint", () => {
       turn: 0,
       seed: 0,
     };
-    const turned: Prop = { ...facingNorth, turn: 1 };
     const box0 = propFootprint(facingNorth);
-    const box1 = propFootprint(turned);
-    if (box0 === null || box1 === null) throw new Error("expected a footprint");
-    expect(box1.x1 - box1.x0).toBeCloseTo(box0.z1 - box0.z0);
-    expect(box1.z1 - box1.z0).toBeCloseTo(box0.x1 - box0.x0);
+    if (box0 === null) throw new Error("expected a footprint");
+    for (const turn of [1, 3]) {
+      const turned: Prop = { ...facingNorth, turn };
+      const box = propFootprint(turned);
+      if (box === null) throw new Error("expected a footprint");
+      expect(box.x1 - box.x0).toBeCloseTo(box0.z1 - box0.z0);
+      expect(box.z1 - box.z0).toBeCloseTo(box0.x1 - box0.x0);
+    }
   });
 
   it("gives null for a wall or ceiling prop", () => {
@@ -110,6 +113,6 @@ describe("propFootprint", () => {
       turn: 0,
       seed: 0,
     };
-    expect(() => propFootprint(outOfRange)).toThrow();
+    expect(() => propFootprint(outOfRange)).toThrow(/no variant 5/);
   });
 });

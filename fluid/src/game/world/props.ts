@@ -16,9 +16,11 @@
  *   (ruling 8);
  * - `EXTRAS`, the condition-only kinds and their counts (ruling 12): they
  *   are placed before the regular floor props, on the same floor spots, and
- *   a regular palette never draws one of them, which is why `wallBacked`
- *   kinds like the ladder and `extra` kinds like the toppled crate are kept
- *   apart in `PROP_CATALOGUE` rather than folded into a palette (ruling 9);
+ *   a regular palette never draws one of them, which is why the `extra`
+ *   kinds, like the toppled crate, are marked apart in `PROP_CATALOGUE`
+ *   rather than folded into a palette. `wallBacked` (ruling 9) is a
+ *   separate constraint, only against a free wall: a wall-backed kind like
+ *   the fume cabinet still sits in a regular palette;
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
  *   `LANE_WIDTH` and `LANE_DEPTH`.
@@ -121,7 +123,7 @@ export const PROP_KINDS: readonly PropKind[] = [
  * The catalogue: what each kind is and how it may be placed. `PROP_KINDS`
  * lists exactly the same kinds, once each.
  */
-export const PROP_CATALOGUE: Record<PropKind, PropEntry> = {
+export const PROP_CATALOGUE = {
   "locker-bank": {
     anchor: "wall",
     variants: 2,
@@ -360,7 +362,7 @@ export const PROP_CATALOGUE: Record<PropKind, PropEntry> = {
     wallBacked: false,
     extra: true,
   },
-};
+} satisfies Record<PropKind, PropEntry>;
 
 /**
  * The low-weight wall filler every archetype's palette gets on top of its
@@ -374,7 +376,7 @@ export const FILLER: readonly (readonly [WallPropKind, number])[] = [
 ];
 
 /** The five archetypes' weighted picks and density knobs. */
-export const PALETTES: Record<Archetype, Palette> = {
+export const PALETTES = {
   bridge: {
     wall: [
       ["wall-monitor", 3],
@@ -449,14 +451,14 @@ export const PALETTES: Record<Archetype, Palette> = {
     cornerMax: 2,
     wallSide: 1 / 4,
   },
-};
+} satisfies Record<Archetype, Palette>;
 
 /**
  * The condition extras (ruling 12): kinds a regular palette never draws,
  * placed only under their condition, before the regular floor props, on
  * the same floor spots. `clean` gets none.
  */
-export const EXTRAS: Record<Condition, readonly ExtraRule[]> = {
+export const EXTRAS = {
   clean: [],
   construction: [
     { kind: "traffic-cone", min: 2, max: 4 },
@@ -469,7 +471,7 @@ export const EXTRAS: Record<Condition, readonly ExtraRule[]> = {
     { kind: "debris-pile", min: 1, max: 1 },
     { kind: "cable-coil", min: 1, max: 3 },
   ],
-};
+} satisfies Record<Condition, readonly ExtraRule[]>;
 
 /** At most this many props in one room; beyond it the cap drops the rest. */
 export const PROP_CAP = 200;
