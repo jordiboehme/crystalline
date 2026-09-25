@@ -21,6 +21,7 @@ import {
   type Frame,
   type Kit,
 } from "./kit";
+import { worstWinding } from "./modelChecks";
 
 const S: Surface = { layer: 1, tint: [0.5, 0.6, 0.7], flag: FLAG.lit };
 
@@ -80,20 +81,6 @@ const dot = (p: readonly number[], q: readonly number[]) =>
   (p[0] ?? 0) * (q[0] ?? 0) +
   (p[1] ?? 0) * (q[1] ?? 0) +
   (p[2] ?? 0) * (q[2] ?? 0);
-
-/**
- * The same check as geometry.test.ts: every triangle's geometric normal
- * (the cross product of its edges, counter-clockwise seen from the front)
- * against its stored normal. Returns the smallest dot product.
- */
-function worstWinding(m: MeshData): number {
-  let worst = Infinity;
-  for (const [a, b, c] of triangles(m)) {
-    const n = cross(sub(b.pos, a.pos), sub(c.pos, a.pos));
-    worst = Math.min(worst, dot(n, a.normal) / Math.hypot(...n));
-  }
-  return worst;
-}
 
 /**
  * The signed volume enclosed by the triangles, measured from the frame's

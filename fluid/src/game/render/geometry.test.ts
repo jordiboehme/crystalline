@@ -14,6 +14,7 @@ import {
 } from "./geometry";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS } from "./looks";
+import { worstWinding } from "./modelChecks";
 
 const EPS = 1e-4;
 
@@ -44,35 +45,6 @@ function triangles(m: MeshData): [Vertex, Vertex, Vertex][] {
     out.push([a, b, c]);
   }
   return out;
-}
-
-/**
- * For every triangle, the geometric normal of its winding (counter-clockwise
- * seen from the front) against the normal stored on its vertices: the two
- * must point the same way, or back-face culling would drop a face that
- * should be seen. Returns the smallest dot product of the two unit normals.
- */
-function worstWinding(m: MeshData): number {
-  let worst = Infinity;
-  for (const [a, b, c] of triangles(m)) {
-    const e1 = [b.pos[0] - a.pos[0], b.pos[1] - a.pos[1], b.pos[2] - a.pos[2]];
-    const e2 = [c.pos[0] - a.pos[0], c.pos[1] - a.pos[1], c.pos[2] - a.pos[2]];
-    const [e1x = 0, e1y = 0, e1z = 0] = e1;
-    const [e2x = 0, e2y = 0, e2z = 0] = e2;
-    const n = [
-      e1y * e2z - e1z * e2y,
-      e1z * e2x - e1x * e2z,
-      e1x * e2y - e1y * e2x,
-    ];
-    const len = Math.hypot(...n);
-    const dot =
-      ((n[0] ?? 0) * a.normal[0] +
-        (n[1] ?? 0) * a.normal[1] +
-        (n[2] ?? 0) * a.normal[2]) /
-      len;
-    worst = Math.min(worst, dot);
-  }
-  return worst;
 }
 
 const ROOMS: [string, PlaceInput][] = [

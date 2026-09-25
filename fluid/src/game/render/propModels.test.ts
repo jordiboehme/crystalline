@@ -14,6 +14,7 @@ import {
 import { frameForSlot, turnPoint, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
+  add,
   floatingGlow,
   inBox,
   positions,
@@ -69,8 +70,6 @@ function anchorFor(kind: PropKind, t: number): V3 {
   const a = wallAnchor({ x: 3, y: 4, side: sideFor(t) });
   return [a.x * CELL, anchor === "ceiling" ? CEILING : 0, a.y * CELL];
 }
-
-const add = (p: V3, q: V3): V3 => [p[0] + q[0], p[1] + q[1], p[2] + q[2]];
 
 /**
  * A mesh turned and placed as the GPU places an instance: every position
@@ -170,7 +169,10 @@ describe("prop models", () => {
           });
 
           it("glows only on or in its body", () => {
-            expect(floatingGlow(placeParts(parts, t, at), wall)).toEqual([]);
+            const glowWall = entry.anchor === "wall" ? wall : null;
+            expect(floatingGlow(placeParts(parts, t, at), glowWall)).toEqual(
+              [],
+            );
           });
         });
       }

@@ -9,59 +9,51 @@
  */
 
 import { FOOTPRINTS } from "../../../world/footprints";
-import type { FloorPropKind, PropKind } from "../../../world/types";
+import type { FloorPropKind } from "../../../world/types";
 import { blockout, type PropRecipe } from "./common";
 
 /** A floor blockout's height, in metres. */
 const BLOCKOUT_HEIGHT = 0.6;
 
 /**
- * The size of a floor prop's variant, as it stands at turn 0. Throws on a
- * kind that is not a floor prop or a variant it does not have.
+ * A floor prop's blockout: a box filling the footprint of the variant it
+ * is built as, read from `FOOTPRINTS.prop` for `kind`. Throws on a variant
+ * the kind does not have.
  */
-export function floorSize(
-  kind: PropKind,
-  variant: number,
-): { width: number; depth: number } {
-  const sizes = (
-    FOOTPRINTS.prop as Partial<
-      Record<PropKind, readonly { width: number; depth: number }[]>
-    >
-  )[kind];
-  const size = sizes?.[variant];
-  if (!size)
-    throw new Error(`floorSize: ${kind} has no variant ${String(variant)}`);
-  return size;
+function floorBlockout(kind: FloorPropKind): PropRecipe {
+  return ({ k, s, variant }) => {
+    const size = FOOTPRINTS.prop[kind][variant];
+    if (!size)
+      throw new Error(
+        `floor blockout: ${kind} has no variant ${String(variant)}`,
+      );
+    const { width, depth } = size;
+    blockout(
+      k,
+      s,
+      [-width / 2, width / 2],
+      [-depth / 2, depth / 2],
+      [0, BLOCKOUT_HEIGHT],
+    );
+  };
 }
-
-/** A floor prop's blockout: a box filling its variant's footprint. */
-const floorBlockout: PropRecipe = ({ k, s, kind, variant }) => {
-  const { width, depth } = floorSize(kind, variant);
-  blockout(
-    k,
-    s,
-    [-width / 2, width / 2],
-    [-depth / 2, depth / 2],
-    [0, BLOCKOUT_HEIGHT],
-  );
-};
 
 /** The recipe of every floor prop kind, the condition extras included. */
 export const FLOOR_RECIPES = {
-  crate: floorBlockout,
-  barrel: floorBlockout,
-  trolley: floorBlockout,
-  stool: floorBlockout,
-  "filing-cabinet": floorBlockout,
-  "storage-shelf": floorBlockout,
-  planter: floorBlockout,
-  bench: floorBlockout,
-  "specimen-shelf": floorBlockout,
-  "fume-cabinet": floorBlockout,
-  "traffic-cone": floorBlockout,
-  ladder: floorBlockout,
-  "tool-cart": floorBlockout,
-  "toppled-crate": floorBlockout,
-  "debris-pile": floorBlockout,
-  "cable-coil": floorBlockout,
+  crate: floorBlockout("crate"),
+  barrel: floorBlockout("barrel"),
+  trolley: floorBlockout("trolley"),
+  stool: floorBlockout("stool"),
+  "filing-cabinet": floorBlockout("filing-cabinet"),
+  "storage-shelf": floorBlockout("storage-shelf"),
+  planter: floorBlockout("planter"),
+  bench: floorBlockout("bench"),
+  "specimen-shelf": floorBlockout("specimen-shelf"),
+  "fume-cabinet": floorBlockout("fume-cabinet"),
+  "traffic-cone": floorBlockout("traffic-cone"),
+  ladder: floorBlockout("ladder"),
+  "tool-cart": floorBlockout("tool-cart"),
+  "toppled-crate": floorBlockout("toppled-crate"),
+  "debris-pile": floorBlockout("debris-pile"),
+  "cable-coil": floorBlockout("cable-coil"),
 } satisfies Record<FloorPropKind, PropRecipe>;
