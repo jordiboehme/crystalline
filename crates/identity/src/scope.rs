@@ -462,7 +462,8 @@ impl DomainAccess {
     /// Answers whether the domain had an acl row at all, so a caller can tell
     /// "a private domain's records were retired" from "a shared domain had
     /// none".
-    pub(crate) async fn forget_domain(&self, domain: &str) -> Result<bool> {
+    #[doc(hidden)]
+    pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
         self.auth.forget_domain(domain).await
     }
 

@@ -4652,7 +4652,8 @@ fn random_id_hex() -> String {
 ///
 /// `pub(crate)` so the request-origin side compares the same spelling this one
 /// stores; a second implementation of this rule is a bug waiting to happen.
-pub(crate) fn normalize_resource(resource: &str) -> String {
+#[doc(hidden)]
+pub fn normalize_resource(resource: &str) -> String {
     let trimmed = resource.trim();
     trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
 }
@@ -4669,7 +4670,8 @@ pub(crate) fn normalize_resource(resource: &str) -> String {
 /// rather than being echoed. Registration validation should make both
 /// unreachable; this is the last line before attacker-chosen text lands in a
 /// field a person reads as the address they are being asked to recognize.
-pub(crate) fn redirect_host(uri: &str) -> String {
+#[doc(hidden)]
+pub fn redirect_host(uri: &str) -> String {
     let Ok(parsed) = url::Url::parse(uri) else {
         return NO_REDIRECT_HOST.to_string();
     };
@@ -4726,7 +4728,7 @@ async fn hash_password(password: &str) -> Result<String> {
     .context("the password hashing task failed")?
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 tokio::task_local! {
     /// Counts the argon2 verifications run inside one test's task, real or
     /// dummy.
@@ -4745,7 +4747,8 @@ tokio::task_local! {
     /// so a scope around a test body counts exactly that test's own work. A
     /// verification outside any scope (every other test, and the served binary)
     /// simply counts nowhere.
-    pub(crate) static VERIFICATIONS: std::cell::Cell<u64>;
+    #[doc(hidden)]
+    pub static VERIFICATIONS: std::cell::Cell<u64>;
 }
 
 /// Verify `password` against a hash no account has, and throw the answer away.
@@ -4762,7 +4765,8 @@ tokio::task_local! {
 /// The hash is derived once per process from random bytes, so it is a real
 /// hash at the crate's current cost parameters (a frozen constant here would
 /// drift from them) and no password can match it.
-pub(crate) async fn dummy_verify(password: &str) -> Result<bool> {
+#[doc(hidden)]
+pub async fn dummy_verify(password: &str) -> Result<bool> {
     static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
     let hash = DUMMY
         .get_or_try_init(|| async { hash_password(&random_hex()).await })
@@ -4774,7 +4778,7 @@ pub(crate) async fn dummy_verify(password: &str) -> Result<bool> {
 /// same reason as [`hash_password`]. A hash this cannot parse verifies as
 /// false rather than erroring: a corrupt row must fail closed.
 async fn verify_hash(hash: String, password: String) -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     let _ = VERIFICATIONS.try_with(|count| count.set(count.get() + 1));
     tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
         Ok(parsed) => Argon2::default()

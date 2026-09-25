@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/index",
+    "crates/identity",
     "crates/remote",
     "crates/service",
     "crates/cli",
@@ -22,6 +23,7 @@ crystalline-core = { path = "crates/core" }
 # explicitly; `cargo build --workspace --no-default-features` then drops candle
 # from the whole build rather than pulling it back in through a dependency edge.
 crystalline-index = { path = "crates/index", default-features = false }
+crystalline-identity = { path = "crates/identity" }
 crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 

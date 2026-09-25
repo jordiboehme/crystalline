@@ -9,7 +9,7 @@
 //! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
-pub(crate) mod auth_store;
+pub(crate) use crystalline_identity::auth_store;
 pub mod client;
 pub mod collab;
 pub mod control;
@@ -19,7 +19,7 @@ pub mod engine;
 pub mod harness_cli;
 mod index_files;
 pub mod instance;
-pub mod join;
+pub use crystalline_identity::join;
 pub mod maintenance;
 pub mod mcp;
 pub mod mcp_gate;
@@ -36,7 +36,7 @@ pub mod rest;
 // own `pub(crate)` functions are consistent with what rustdoc publishes -
 // `pub mod` made every one of them a broken link for a reader of the docs.
 pub(crate) mod review;
-pub mod scope;
+pub use crystalline_identity::scope;
 mod serving;
 pub mod settings;
 pub(crate) mod share_staging;

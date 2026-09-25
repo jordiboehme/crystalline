@@ -1361,6 +1361,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "crystalline-identity"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "chrono",
+ "crystalline-index",
+ "futures",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turso",
+ "url",
+]
+
+[[package]]
 name = "crystalline-index"
 version = "0.20.0"
 dependencies = [
@@ -1426,6 +1446,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crystalline-core",
+ "crystalline-identity",
  "crystalline-index",
  "crystalline-remote",
  "crystalline-service",

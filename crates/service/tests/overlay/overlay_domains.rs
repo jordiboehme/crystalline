@@ -6487,7 +6487,8 @@ async fn a_write_with_no_identity_still_refuses_and_a_read_still_answers_the_bas
 /// lives in `engine.rs` too: a file-level allow-list would let `read_engram`
 /// reach another actor's drafts and stay green.
 fn call_sites(needle: &str) -> Vec<(String, String)> {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let roots = ["src", "../identity/src"].map(|dir| manifest.join(dir));
     /// The name a line declares a function under, if it declares one.
     fn declared_fn(line: &str) -> Option<&str> {
         let rest = line.trim_start();
@@ -6502,7 +6503,10 @@ fn call_sites(needle: &str) -> Vec<(String, String)> {
         Some(&rest[..end])
     }
     let mut found: Vec<(String, String)> = Vec::new();
-    for entry in walkdir::WalkDir::new(&src).into_iter().flatten() {
+    for entry in roots
+        .iter()
+        .flat_map(|src| walkdir::WalkDir::new(src).into_iter().flatten())
+    {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
@@ -6701,10 +6705,11 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
 ///
 /// A source scan for the reason the two guards above are one - the failure it
 /// pins is a call site added later in the wrong place, which no request can be
-/// written to provoke in advance. It walks `crates/service/src` alone, which is
-/// the frame that matters: the index crate holds the two backend
-/// implementations of the clearing statement, and a caller that took a row away
-/// without ending its grants would be added here, above them.
+/// written to provoke in advance. It walks every crate cut out of
+/// crystalline-service, which is the frame that matters: the index crate holds
+/// the two backend implementations of the clearing statement, and a caller
+/// that took a row away without ending its grants would be added here, above
+/// them.
 ///
 /// **Each needle is attributed to the nearest preceding `fn`, not to the file
 /// it is in and not to the call's true dynamic caller.** That is why every

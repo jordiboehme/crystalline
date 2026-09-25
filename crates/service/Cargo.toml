@@ -40,6 +40,7 @@ testing = []
 [dependencies]
 crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
+crystalline-identity = { workspace = true }
 crystalline-remote = { workspace = true }
 argon2 = { workspace = true }
 getrandom = { workspace = true }
@@ -124,6 +125,9 @@ windows-sys = { workspace = true }
 crystalline-service = { path = ".", default-features = false, features = [
     "testing",
 ] }
+# The argon2 verification counter the `rest::auth` unit test reads across the
+# crate boundary (see crystalline-identity's `testing` feature).
+crystalline-identity = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
