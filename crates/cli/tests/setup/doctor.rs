@@ -6,8 +6,6 @@
 //! directory, so that scenario isolates `HOME`/`XDG_*` the same way the
 //! service integration tests do.
 
-mod common;
-
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -45,7 +43,7 @@ fn engram(title: &str, permalink: &str) -> String {
 /// `Command` call, since dropping it removes the directory.
 fn shield_ambient_home(cmd: &mut Command) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    for (name, value) in common::isolation_env(home.path()) {
+    for (name, value) in crate::common::isolation_env(home.path()) {
         cmd.env(name, value);
     }
     home
@@ -361,7 +359,7 @@ fn without_a_daemon_the_index_is_read_directly() {
     let home = tempfile::tempdir().unwrap();
     let domain_dir = home.path().join("kb-eng");
     let mut init = bin();
-    common::isolate(&mut init, home.path());
+    crate::common::isolate(&mut init, home.path());
     init.args(["domain", "init"])
         .arg(&domain_dir)
         .args(["--name", "eng"])
@@ -371,14 +369,14 @@ fn without_a_daemon_the_index_is_read_directly() {
     // No --config and no --db: the default paths inside the isolated home,
     // which is what makes this the socket-first branch with no socket to find.
     let mut add = bin();
-    common::isolate(&mut add, home.path());
+    crate::common::isolate(&mut add, home.path());
     add.args(["domain", "add", "eng"])
         .arg(&domain_dir)
         .assert()
         .success();
 
     let mut cmd = bin();
-    common::isolate(&mut cmd, home.path());
+    crate::common::isolate(&mut cmd, home.path());
     let out = cmd
         .args(["--json", "doctor"])
         .assert()

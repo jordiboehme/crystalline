@@ -1,14 +1,12 @@
 //! Integration tests for `crystalline prompt system` against a fixture
 //! config and workspace, snapshotted with `insta`.
 
-mod common;
-
 use std::time::Instant;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-use common::fixtures_dir;
+use crate::common::fixtures_dir;
 
 #[test]
 fn prompt_text_matches_snapshot() {

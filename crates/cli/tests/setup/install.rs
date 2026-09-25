@@ -17,7 +17,6 @@
 //! Unix-only: `etcetera`'s base-directory resolution on Windows does not
 //! honor these variables the way the XDG strategy the isolation relies on
 //! does, and the shims are shell scripts.
-#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1509,8 +1508,8 @@ fn tamper_receipt(home: &Path, mutate: impl FnOnce(&mut Value)) {
 }
 
 /// The embedded routing skill, byte-identical to what install writes.
-const ROUTING_SKILL: &str = include_str!("../../../skills/crystalline-routing/SKILL.md");
-const CAPTURE_SKILL: &str = include_str!("../../../skills/crystalline-capture/SKILL.md");
+const ROUTING_SKILL: &str = include_str!("../../../../skills/crystalline-routing/SKILL.md");
+const CAPTURE_SKILL: &str = include_str!("../../../../skills/crystalline-capture/SKILL.md");
 
 #[test]
 fn prompt_system_reconciles_an_install_from_another_version() {

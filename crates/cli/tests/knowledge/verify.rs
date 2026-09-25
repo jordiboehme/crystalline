@@ -1,14 +1,12 @@
 //! Integration tests for `crystalline verify` against the golden
 //! `domain-good`/`domain-bad` fixture corpora.
 
-mod common;
-
 use std::collections::BTreeSet;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-use common::fixtures_dir;
+use crate::common::fixtures_dir;
 
 type IssueKey = (String, String, String);
 

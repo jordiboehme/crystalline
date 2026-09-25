@@ -5,7 +5,6 @@
 //! on Linux and macOS, so setting the XDG_*_HOME variables redirects the state,
 //! config and cache directories. These tests are unix-only: they use unix domain
 //! sockets and `kill -9` for the stale-lock scenario.
-#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;

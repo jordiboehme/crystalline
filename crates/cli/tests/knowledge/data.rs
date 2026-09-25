@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 
-mod common;
-
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
@@ -1232,14 +1230,14 @@ fn a_wipe_takes_the_drafts_back_from_the_overlay_journal() {
     // and on Windows the binary reads `APPDATA` instead, so the draft would be
     // mirrored in a folder nothing ever walks and the restore would find an
     // empty journal.
-    let mirror = common::isolated_state_dir(&home)
+    let mirror = crate::common::isolated_state_dir(&home)
         .join("overlays/eng/alice")
         .join("gamma.md");
     std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
     std::fs::write(&mirror, draft).unwrap();
 
     let mut cmd = bin();
-    common::isolate(&mut cmd, &home);
+    crate::common::isolate(&mut cmd, &home);
     let out = cmd
         .args(["--json", "reindex", "--wipe", "--config"])
         .arg(&config)
@@ -1256,7 +1254,7 @@ fn a_wipe_takes_the_drafts_back_from_the_overlay_journal() {
     );
 
     let mut cmd = bin();
-    common::isolate(&mut cmd, &home);
+    crate::common::isolate(&mut cmd, &home);
     let out = cmd
         .args(["--json", "reindex", "--config"])
         .arg(&config)
@@ -1288,11 +1286,11 @@ fn an_isolated_run_keeps_its_state_under_this_platform_s_own_base_directory() {
     // Pure path arithmetic: nothing here is created, read or removed.
     let home = std::env::temp_dir().join("cq-isolated-home");
     let home = home.as_path();
-    let state = common::isolated_state_dir(home);
+    let state = crate::common::isolated_state_dir(home);
 
-    let governing = common::isolation_env(home)
+    let governing = crate::common::isolation_env(home)
         .into_iter()
-        .find(|(name, _)| *name == common::STATE_HOME_VAR)
+        .find(|(name, _)| *name == crate::common::STATE_HOME_VAR)
         .map(|(_, dir)| dir)
         .expect("the isolation environment sets this platform's state-home variable");
     assert_eq!(

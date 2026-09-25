@@ -5,11 +5,10 @@
 
 use assert_cmd::Command;
 
-mod common;
-use common::isolate;
+use crate::common::isolate;
 // Used only by the cross-process test below, which is unix-only (see there).
 #[cfg(unix)]
-use common::isolation_env;
+use crate::common::isolation_env;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
@@ -704,7 +703,7 @@ fn users_add_works_while_another_process_holds_the_auth_db() {
 
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["holds_the_auth_db", "--exact", "--nocapture"])
+        .args(["users::holds_the_auth_db", "--exact", "--nocapture"])
         .env(HOLD_ENV, home.path());
     for (name, value) in isolation_env(home.path()) {
         command.env(name, value);

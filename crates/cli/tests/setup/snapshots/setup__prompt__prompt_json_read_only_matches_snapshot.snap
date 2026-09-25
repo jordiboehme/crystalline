@@ -1,11 +1,11 @@
 ---
-source: crates/cli/tests/prompt.rs
+source: crates/cli/tests/setup/prompt.rs
 expression: json
 ---
 {
   "version": 1,
   "kind": "system",
-  "read_only": false,
+  "read_only": true,
   "workspace": "workspace",
   "domains": [
     {

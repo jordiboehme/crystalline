@@ -11,7 +11,6 @@
 //! running a real `crystalline install`.
 //!
 //! Unix-only: the isolation and the shim are the same as `install.rs`'s.
-#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

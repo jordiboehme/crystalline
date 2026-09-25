@@ -5,12 +5,10 @@
 //! file that must stay untouched, a non-markdown asset and a permalink
 //! collision.
 
-mod common;
-
 use std::path::Path;
 
+use crate::common::fixtures_dir;
 use assert_cmd::Command;
-use common::fixtures_dir;
 use predicates::prelude::*;
 use serde_json::Value;
 

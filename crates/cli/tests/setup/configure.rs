@@ -6,8 +6,7 @@
 
 use assert_cmd::Command;
 
-mod common;
-use common::isolate;
+use crate::common::isolate;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()

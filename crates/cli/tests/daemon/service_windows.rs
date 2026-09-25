@@ -5,7 +5,6 @@
 //! (USERPROFILE, APPDATA, LOCALAPPDATA, which etcetera's Windows strategy
 //! reads). It compiles to an empty test binary on every other platform, so the
 //! coverage rides the windows-latest CI leg without touching local runs.
-#![cfg(windows)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;

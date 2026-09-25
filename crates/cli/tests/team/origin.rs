@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 
-mod common;
-use common::isolate;
+use crate::common::isolate;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
@@ -439,8 +438,10 @@ fn write_diffable_team_domain(work: &Path, home: &Path, config: &Path) -> PathBu
     .unwrap();
     // The platform's isolated state dir, never `<home>/state/crystalline` by
     // hand: that spelling is the unix answer and the wrong folder on Windows
-    // (see `common::isolated_state_dir`).
-    let origin_dir = common::isolated_state_dir(home).join("origins").join("eng");
+    // (see `crate::common::isolated_state_dir`).
+    let origin_dir = crate::common::isolated_state_dir(home)
+        .join("origins")
+        .join("eng");
     std::fs::create_dir_all(origin_dir.join("base")).unwrap();
     std::fs::write(origin_dir.join("base").join("MANIFEST.md"), manifest).unwrap();
     std::fs::write(origin_dir.join("base").join("alpha.md"), team_alpha).unwrap();

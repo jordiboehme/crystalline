@@ -1,5 +1,5 @@
 ---
-source: crates/cli/tests/prompt.rs
+source: crates/cli/tests/setup/prompt.rs
 expression: text
 ---
 CRYSTALLINE KNOWLEDGE ROUTING

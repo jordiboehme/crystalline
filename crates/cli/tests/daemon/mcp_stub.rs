@@ -9,7 +9,6 @@
 //! skew, this binary's own version as a plain conflict, an unreadable record as
 //! generic. Unix-only: an exclusive advisory lock across two processes and a
 //! short `/tmp` HOME are the mechanism.
-#![cfg(unix)]
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

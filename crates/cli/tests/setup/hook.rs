@@ -9,7 +9,6 @@
 //! Unix-only: `etcetera`'s base-directory resolution on Windows does not
 //! honor these variables the way the XDG strategy the isolation relies on
 //! does.
-#![cfg(unix)]
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
