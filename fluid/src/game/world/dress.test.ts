@@ -24,14 +24,16 @@ import {
   decorFootprint,
   footprint,
   footprintOf,
+  heroBlocker,
+  heroFootprint,
   pipeRunBox,
   propFootprint,
 } from "./footprints";
 import { generateRoom } from "./generate";
 import generateSource from "./generate.ts?raw";
-import { heroReserve } from "./heroes";
+import { HERO_CLEAR, heroReserve, placeHeroes } from "./heroes";
 import heroesSource from "./heroes.ts?raw";
-import { ARRIVAL_DISTANCE, REACH, wallPoint } from "./interact";
+import { REACH, wallPoint } from "./interact";
 import { lampBoxes } from "./lamps";
 import { doorwayColumns, isFloor, wallSlots } from "./layout";
 import { PLAYER_RADIUS, blockersFor } from "./move";
@@ -51,6 +53,17 @@ import {
   USE_LANE_DEPTH,
 } from "./props";
 import {
+  DEGENERATE_PLACES,
+  OVER_CAP,
+  arrivalPoint,
+  distanceTo,
+  inbound,
+  place,
+  reachedTargets,
+  rel,
+  sections,
+} from "./reachChecks";
+import {
   NO_RESERVE,
   dressingSites,
   edgeKey,
@@ -69,9 +82,9 @@ import type {
   Archetype,
   Box,
   Condition,
+  Fixture,
   Hero,
   PlaceInput,
-  PlaceReference,
   Prop,
   PropAnchor,
   RoomSpec,
@@ -79,6 +92,7 @@ import type {
   WallSlot,
 } from "./types";
 import { CELL } from "./units";
+import { seedFor } from "../core/seed";
 
 const ARCHETYPE_TYPES = {
   bridge: "manifest",
@@ -126,95 +140,7 @@ const ALL = [...WORKSHOPS, ...HUBS];
 const BRIDGES = matrix(CANNED_BRIDGE);
 const workshop = generateRoom(CANNED_WORKSHOP);
 
-/**
- * The fullest room a probe of the generator found: a manifest under
- * construction with 30 relations, 30 sections, 60 tags and 30 inbound
- * references (24 listed). A 24 by 24 hall, four bays and a corridor. Halls
- * stop growing there, so no generated room has many more candidates; this
- * one has about 317 against the cap of 280.
- */
-const OVER_CAP: PlaceInput = {
-  domain: "t",
-  permalink: "p30-30-60-30",
-  title: "R",
-  type: "manifest",
-  status: "draft",
-  salience: null,
-  validFrom: null,
-  validTo: null,
-  tags: Array.from({ length: 60 }, (_, k) => `t${String(k)}`),
-  content: Array.from({ length: 30 }, (_, i) => `## P${String(i)}\nx`).join(
-    "\n",
-  ),
-  relations: Array.from({ length: 30 }, (_, k) => {
-    const t = `r${String(k).padStart(2, "0")}`;
-    return {
-      relType: "r",
-      target: { domain: null, target: t },
-      resolved: true,
-      address: { domain: "t", permalink: t },
-      targetTitle: t,
-      targetSalience: 3,
-    };
-  }),
-  links: [],
-  inbound: Array.from({ length: 24 }, (_, i) => ({
-    address: { domain: "t", permalink: `i${String(i)}` },
-    title: `i${String(i)}`,
-    relType: "l",
-  })),
-  inboundTotal: 30,
-  observations: [],
-};
 const overCap = generateRoom(OVER_CAP);
-
-/** A place with nothing in it, to be filled by `over`. */
-function place(over: Partial<PlaceInput>): PlaceInput {
-  return {
-    domain: "test",
-    permalink: "room",
-    title: "Room",
-    type: null,
-    status: null,
-    salience: null,
-    validFrom: null,
-    validTo: null,
-    tags: [],
-    content: "",
-    relations: [],
-    links: [],
-    inbound: [],
-    inboundTotal: 0,
-    observations: [],
-    ...over,
-  };
-}
-
-/** A located relation to `target`. */
-function rel(target: string): PlaceReference {
-  return {
-    relType: "relates_to",
-    target: { domain: null, target },
-    resolved: true,
-    address: { domain: "test", permalink: target },
-    targetTitle: target,
-    targetSalience: 3,
-  };
-}
-
-function sections(n: number) {
-  return Array.from({ length: n }, (_, i) => `## Part ${String(i)}\nline`).join(
-    "\n",
-  );
-}
-
-function inbound(n: number) {
-  return Array.from({ length: n }, (_, i) => ({
-    address: { domain: "test", permalink: `in-${String(i)}` },
-    title: `In ${String(i)}`,
-    relType: "links_to",
-  }));
-}
 
 const SIDE_OF_TURN: readonly Side[] = ["s", "w", "n", "e"];
 
@@ -244,21 +170,11 @@ const boxOf = (p: Prop): Box => {
   return box;
 };
 
-/** The distance from a point to a box, 0 inside it. */
-function distanceTo(x: number, z: number, b: Box) {
-  const nx = Math.max(b.x0, Math.min(x, b.x1));
-  const nz = Math.max(b.z0, Math.min(z, b.z1));
-  return Math.hypot(x - nx, z - nz);
-}
-
-/** The point in front of a door, hatch or portal the player arrives at. */
-function arrivalPoint(slot: WallSlot) {
-  const w = wallPoint(slot);
-  return {
-    x: w.x + w.inward[0] * ARRIVAL_DISTANCE,
-    z: w.z + w.inward[1] * ARRIVAL_DISTANCE,
-  };
-}
+/** The floor props' boxes and the blocking heroes' boxes of a room. */
+const solidsOf = (r: RoomSpec): Box[] => [
+  ...floorProps(r).map(boxOf),
+  ...r.heroes.map(heroBlocker).filter((b) => b !== null),
+];
 
 /** Every box a floor prop must stay out of: fixtures, decor, scaffolding. */
 function takenBoxes(room: RoomBase): Box[] {
@@ -358,8 +274,8 @@ function expectWallInvariants(name: string, room: RoomSpec) {
 
 /**
  * The floor-prop invariants, for any room: every floor prop's footprint
- * fits the floor and overlaps no lane, no fixture, decor or scaffold box
- * and no other floor prop; no cell under it is a doorway cell, next to one
+ * fits the floor and overlaps no lane, no fixture, decor or scaffold box,
+ * no box its heroes reserve (`heroReserve`) and no other floor prop; no cell under it is a doorway cell, next to one
  * (ruling 10) or in the corridor; no two floor props share a cell; and no
  * floor prop on a wall-side spot stands on a cell whose wall edge carries a
  * keep-clear wall prop (D2 as amended: corner-zone spots ignore wall props).
@@ -378,9 +294,11 @@ function expectFloorInvariants(name: string, room: RoomSpec) {
     doorway(x, y + 1) ||
     doorway(x, y - 1);
   const boxes = floorProps(room).map(boxOf);
+  const reserved = heroReserve(room.heroes).boxes;
   for (const [i, box] of boxes.entries()) {
     const label = `${name} ${JSON.stringify(box)}`;
     expect(fitsFloor(room, box), label).toBe(true);
+    for (const r of reserved) expect(overlaps(box, r), label).toBe(false);
     for (const lane of sites.lanes)
       expect(overlaps(box, lane), label).toBe(false);
     for (const t of taken) expect(overlaps(box, t), label).toBe(false);
@@ -528,7 +446,7 @@ describe("floor props", () => {
   it("leave the player's circle at every arrival point clear", () => {
     let checked = 0;
     for (const { name, room } of [...ALL, ...REACH_EXTRA]) {
-      const boxes = floorProps(room).map(boxOf);
+      const boxes = solidsOf(room);
       for (const f of room.fixtures) {
         if (f.kind !== "door" && f.kind !== "hatch" && f.kind !== "portal")
           continue;
@@ -560,7 +478,7 @@ describe("floor props", () => {
   it("leave the player's circle at every terminal and machine use point clear", () => {
     let checked = 0;
     for (const { name, room } of [...ALL, ...BRIDGES, ...REACH_EXTRA]) {
-      const boxes = floorProps(room).map(boxOf);
+      const boxes = solidsOf(room);
       for (const f of room.fixtures) {
         if (f.kind !== "terminal" && f.kind !== "machine") continue;
         const size =
@@ -805,117 +723,11 @@ const REACH_SEEDS = SEEDS.flatMap((room, k) =>
 );
 const REACH_EXTRA = [{ name: "over cap", room: overCap }, ...REACH_SEEDS];
 
-/** The flood-fill grid step, in metres. */
-const FILL = 0.2;
-
-/**
- * The points of a 0.2 m grid the player can reach from the spawn: a point
- * is free when the player's circle there overlaps no void cell (anything
- * outside the grid is void) and no blocker. Each solid is rasterised once,
- * inflated by the player's radius, rather than tested per point.
- */
-function reach(room: RoomSpec, blockers: readonly Box[]) {
-  const nx = Math.round((room.width * CELL) / FILL) + 1;
-  const nz = Math.round((room.depth * CELL) / FILL) + 1;
-  const solid = new Uint8Array(nx * nz);
-  const mark = (b: Box) => {
-    const i0 = Math.max(0, Math.floor((b.x0 - PLAYER_RADIUS) / FILL));
-    const i1 = Math.min(nx - 1, Math.ceil((b.x1 + PLAYER_RADIUS) / FILL));
-    const j0 = Math.max(0, Math.floor((b.z0 - PLAYER_RADIUS) / FILL));
-    const j1 = Math.min(nz - 1, Math.ceil((b.z1 + PLAYER_RADIUS) / FILL));
-    for (let j = j0; j <= j1; j++)
-      for (let i = i0; i <= i1; i++)
-        if (distanceTo(i * FILL, j * FILL, b) < PLAYER_RADIUS)
-          solid[j * nx + i] = 1;
-  };
-  for (let y = -1; y <= room.depth; y++)
-    for (let x = -1; x <= room.width; x++)
-      if (!isFloor(room.grid, x, y))
-        mark({
-          x0: x * CELL,
-          x1: (x + 1) * CELL,
-          z0: y * CELL,
-          z1: (y + 1) * CELL,
-        });
-  for (const b of blockers) mark(b);
-  const reached = new Uint8Array(nx * nz);
-  const si = Math.round(((room.spawn.x + 0.5) * CELL) / FILL);
-  const sj = Math.round(((room.spawn.y + 0.5) * CELL) / FILL);
-  const start = sj * nx + si;
-  if (solid[start] === 1) throw new Error("the spawn point is not free");
-  const queue = [start];
-  reached[start] = 1;
-  while (queue.length > 0) {
-    const k = queue.pop() as number;
-    const i = k % nx;
-    const j = (k - i) / nx;
-    for (const [di, dj] of [
-      [1, 0],
-      [-1, 0],
-      [0, 1],
-      [0, -1],
-    ] as const) {
-      const a = i + di;
-      const b = j + dj;
-      if (a < 0 || b < 0 || a >= nx || b >= nz) continue;
-      const m = b * nx + a;
-      if (reached[m] === 1 || solid[m] === 1) continue;
-      reached[m] = 1;
-      queue.push(m);
-    }
-  }
-  return (x: number, z: number) => {
-    const ci = Math.round(x / FILL);
-    const cj = Math.round(z / FILL);
-    for (let j = cj - 2; j <= cj + 2; j++)
-      for (let i = ci - 2; i <= ci + 2; i++) {
-        if (i < 0 || j < 0 || i >= nx || j >= nz) continue;
-        if (reached[j * nx + i] !== 1) continue;
-        if (Math.hypot(i * FILL - x, j * FILL - z) <= FILL + 1e-9) return true;
-      }
-    return false;
-  };
-}
-
-/** Where the player stands to use each way and wall fixture. */
-function targetsOf(room: RoomSpec) {
-  const out: { label: string; x: number; z: number }[] = [];
-  for (const f of room.fixtures) {
-    const label = `${f.kind} ${edgeKey(f.slot)}`;
-    if (f.kind === "door" || f.kind === "hatch" || f.kind === "portal") {
-      out.push({ label, ...arrivalPoint(f.slot) });
-    } else if (f.kind === "terminal" || f.kind === "machine") {
-      const size =
-        f.kind === "terminal"
-          ? FOOTPRINTS.terminal
-          : FOOTPRINTS.machine[f.machine];
-      const w = wallPoint(f.slot);
-      const d = size.out + PLAYER_RADIUS + 0.1;
-      out.push({
-        label,
-        x: w.x + w.inward[0] * d,
-        z: w.z + w.inward[1] * d,
-      });
-    }
-  }
-  return out;
-}
-
-/** The targets reached from the spawn with `blockers`. */
-function reachedTargets(room: RoomSpec, blockers: readonly Box[]) {
-  const can = reach(room, blockers);
-  return new Set(
-    targetsOf(room)
-      .filter((t) => can(t.x, t.z))
-      .map((t) => t.label),
-  );
-}
-
 describe("reachability (Review Focus 1)", () => {
   it("loses a target when a bay doorway is blocked by hand", () => {
     const hub = HUBS[0]?.room;
     if (hub === undefined) throw new Error("no hub");
-    const bare = { ...hub, props: [] };
+    const bare = { ...hub, props: [], heroes: [] };
     const open = reachedTargets(bare, blockersFor(bare));
     const c = hub.hall.x1;
     const wall: Box = {
@@ -929,7 +741,7 @@ describe("reachability (Review Focus 1)", () => {
   }, 20_000);
 
   const expectSameTargets = (name: string, room: RoomSpec) => {
-    const bare = { ...room, props: [] };
+    const bare = { ...room, props: [], heroes: [] };
     const without = reachedTargets(bare, blockersFor(bare));
     expect(without.size, name).toBeGreaterThan(0);
     const withProps = reachedTargets(room, blockersFor(room));
@@ -1114,15 +926,17 @@ describe("density measure", () => {
 
   it("raises large workshops to at least 13 floor props per 100 floor cells", () => {
     // Baseline 4.70 before iteration 1, 7.39 after it, 8.81 with the 13x12
-    // workshop; forecast 15.97 with a cluster in every block (E9).
+    // workshop; 15.97 with a cluster in every block (E9), 15.58 with the
+    // heroes the seeds draw (190 of 300 rooms carry one, 2.6a).
     const per100 =
       (sum(SEEDS, (d) => d.floorProps) * 100) / sum(SEEDS, (d) => d.floorCells);
     expect(per100).toBeGreaterThanOrEqual(13);
   });
 
   it("raises the canned hub to at least 13 floor props per 100 floor cells in every archetype", () => {
-    // Baseline 2.1 to 2.4, 7.7 to 8.9 before the clusters grew; forecast
-    // 15.8 to 17.2 (E9).
+    // Baseline 2.1 to 2.4, 7.7 to 8.9 before the clusters grew; 15.77 to
+    // 17.19 (E9). The hub's seed draws no hero; reseeded with the heroes
+    // they draw, the clean hub's lowest is 14.77 (2.6a).
     for (const { name, condition, room } of HUBS)
       if (condition === "clean")
         expect(measureDensity(room).floorPer100, name).toBeGreaterThanOrEqual(
@@ -1473,7 +1287,9 @@ describe("the cap (Review Focus 4)", () => {
   });
 
   it("keeps the canned hub's candidates at or under PROP_CAP in every archetype and condition", () => {
-    // D8: the cap never drops a hub's ceiling tier.
+    // D8: the cap never drops a hub's ceiling tier. 212 to 249; the hub's
+    // seed draws no hero, and over about 1000 reseeds that do, a hero only
+    // ever removed candidates (at most 10), never added one (2.6a).
     for (const { name, room } of HUBS)
       expect(dressCandidates(room).length, name).toBeLessThanOrEqual(PROP_CAP);
   });
@@ -1610,29 +1426,93 @@ describe("the cap (Review Focus 4)", () => {
   });
 });
 
+/** A room, the same room with one more door (a relation to "z"), and that door. */
+interface LocalityCase {
+  name: string;
+  before: RoomSpec;
+  after: RoomSpec;
+  door: Fixture;
+}
+
+function localityCase(name: string, p: PlaceInput): LocalityCase {
+  const before = generateRoom(p);
+  const after = generateRoom({ ...p, relations: [...p.relations, rel("z")] });
+  const door = after.fixtures.find(
+    (f) => f.kind === "door" && f.address?.permalink === "z",
+  );
+  if (door === undefined) throw new Error(`${name}: no new door`);
+  return { name, before, after, door };
+}
+
+/** A 13-wide hall that is not large enough to lose its door's locality to the cap. */
+const SMALL_LOCALITY = localityCase(
+  "runbook",
+  place({
+    type: "runbook",
+    status: "stable",
+    relations: [rel("a"), rel("b")],
+    inbound: inbound(5),
+    inboundTotal: 5,
+    content: sections(2),
+    tags: ["t-1", "t-2"],
+  }),
+);
+
+/** A 13 by 10 large hall in four archetypes (see the large-hall locality test). */
+const LARGE_LOCALITY = ["manifest", "runbook", "reference", "guide"].map(
+  (type) =>
+    localityCase(
+      type,
+      place({
+        type,
+        status: "stable",
+        relations: [rel("a"), rel("b")],
+        inbound: inbound(5),
+        inboundTotal: 5,
+        content: sections(4),
+        tags: ["t-1", "t-2"],
+      }),
+    ),
+);
+
+/**
+ * The locality cases under 10 room seeds each, the same seed on both
+ * sides, so some of them carry heroes: what the hero locality test walks.
+ */
+const LOCALITY_CASES: LocalityCase[] = [
+  SMALL_LOCALITY,
+  ...LARGE_LOCALITY,
+].flatMap((c) =>
+  Array.from({ length: 10 }, (_, i) => {
+    const seed = seedFor("hero-locality", i);
+    return {
+      ...c,
+      name: `${c.name} seed ${String(i)}`,
+      before: { ...c.before, seed },
+      after: { ...c.after, seed },
+    };
+  }),
+);
+
+/**
+ * A room dressed with no heroes: the dressing's locality is pinned apart
+ * from the heroes', which a new door can move when its lane crosses one.
+ */
+function withoutHeroes(room: RoomSpec): RoomSpec {
+  const bare = { ...room, heroes: [] };
+  return { ...bare, props: dressRoom(bare) };
+}
+
 describe("locality", () => {
   // Locality holds only below the cap: near PROP_CAP a new fixture can
   // change which props are dropped anywhere in the room, so both rooms here
   // are asserted to stay under it.
   it("changes only props near a new door's slot", () => {
-    const P = place({
-      type: "runbook",
-      status: "stable",
-      relations: [rel("a"), rel("b")],
-      inbound: inbound(5),
-      inboundTotal: 5,
-      content: sections(2),
-      tags: ["t-1", "t-2"],
-    });
-    const P2 = { ...P, relations: [...P.relations, rel("z")] };
-    const a = generateRoom(P);
-    const b = generateRoom(P2);
+    const a = withoutHeroes(SMALL_LOCALITY.before);
+    const b = withoutHeroes(SMALL_LOCALITY.after);
     expect(a.hall).toEqual(b.hall);
     expect(a.hall.x1 - a.hall.x0).toBe(13);
-    const door = b.fixtures.find(
-      (f) => f.kind === "door" && f.address?.permalink === "z",
-    );
-    if (door === undefined) throw new Error("no new door");
+    const door = SMALL_LOCALITY.door;
     const slot = door.slot;
     expect(a.fixtures.some((f) => edgeKey(f.slot) === edgeKey(slot))).toBe(
       false,
@@ -1683,26 +1563,14 @@ describe("locality", () => {
     // order that accepts it (ruling 12), so this case is clean.
     const RADIUS = 1;
     let members = 0;
-    for (const type of ["manifest", "runbook", "reference", "guide"]) {
-      const P = place({
-        type,
-        status: "stable",
-        relations: [rel("a"), rel("b")],
-        inbound: inbound(5),
-        inboundTotal: 5,
-        content: sections(4),
-        tags: ["t-1", "t-2"],
-      });
-      const a = generateRoom(P);
-      const b = generateRoom({ ...P, relations: [...P.relations, rel("z")] });
-      const name = `${type} (${a.archetype})`;
+    for (const c of LARGE_LOCALITY) {
+      const a = withoutHeroes(c.before);
+      const b = withoutHeroes(c.after);
+      const name = `${c.name} (${a.archetype})`;
       expect(a.hall, name).toEqual(b.hall);
       expect(a.hall, name).toEqual({ x0: 0, y0: 0, x1: 13, y1: 10 });
       expect(isLargeHall(a.hall), name).toBe(true);
-      const door = b.fixtures.find(
-        (f) => f.kind === "door" && f.address?.permalink === "z",
-      );
-      if (door === undefined) throw new Error("no new door");
+      const door = c.door;
       const slot = door.slot;
       const fk = (f: unknown) => JSON.stringify(f);
       const bf = new Set(b.fixtures.map(fk));
@@ -1774,6 +1642,30 @@ describe("locality", () => {
     }
     expect(members).toBeGreaterThan(0);
   });
+
+  it("keeps the heroes where they were when a door is added, unless the door's lane crosses one", () => {
+    let kept = 0;
+    for (const { name, before, after, door } of LOCALITY_CASES) {
+      const lane = footprint(door.slot, { along: LANE_WIDTH, out: LANE_DEPTH });
+      const heroes = placeHeroes(before);
+      const moved = heroes.some((h) => {
+        const b = heroFootprint(h);
+        return overlaps(
+          {
+            x0: b.x0 - HERO_CLEAR,
+            x1: b.x1 + HERO_CLEAR,
+            z0: b.z0 - HERO_CLEAR,
+            z1: b.z1 + HERO_CLEAR,
+          },
+          lane,
+        );
+      });
+      if (moved) continue;
+      expect(placeHeroes(after), name).toEqual(heroes);
+      if (heroes.length > 0) kept++;
+    }
+    expect(kept).toBeGreaterThan(0);
+  });
 });
 
 describe("condition extras", () => {
@@ -1797,7 +1689,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
     let walls = 0;
     for (const status of Object.values(STATUS))
       for (const type of Object.values(ARCHETYPE_TYPES)) {
-        const room = generateRoom(place({ type, status }));
+        const room = generateRoom({ ...DEGENERATE_PLACES.empty, type, status });
         expect(room.hall).toEqual({ x0: 0, y0: 0, x1: 5, y1: 6 });
         const name = `empty ${type} ${status}`;
         walls += expectWallInvariants(name, room);
@@ -1809,19 +1701,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
   });
 
   it("gives a hall full of fixtures only wall props off the slots, keeping every invariant", () => {
-    const full = place({
-      type: "runbook",
-      status: "draft",
-      relations: [rel("a"), rel("b"), rel("c")],
-      inbound: inbound(2),
-      inboundTotal: 2,
-      content: sections(2),
-      tags: ["t-1", "t-2"],
-      observations: [
-        { category: "one", content: "x" },
-        { category: "two", content: "y" },
-      ],
-    });
+    const full = DEGENERATE_PLACES.full;
     const room = generateRoom(full);
     expect(room.bays).toEqual([]);
     expect(room.dropped).toBe(0);
@@ -1840,13 +1720,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
 
   it("dresses a narrow, deep hall, keeping every invariant", () => {
     for (const status of Object.values(STATUS)) {
-      const room = generateRoom(
-        place({
-          type: "guide",
-          status,
-          tags: ["a", "b", "c", "d", "e"],
-        }),
-      );
+      const room = generateRoom({ ...DEGENERATE_PLACES.narrow, status });
       expect(room.hall.x1 - room.hall.x0).toBe(5);
       expect(room.hall.y1 - room.hall.y0).toBe(12);
       expect(expectWallInvariants(`narrow ${status}`, room)).toBeGreaterThan(0);
@@ -1862,15 +1736,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
     // The generator makes odd widths and even depths, so 8 by 9 never comes
     // out of it. Its band is 5 by 4 cells, which holds one block.
     for (const status of Object.values(STATUS)) {
-      const room = generateRoom(
-        place({
-          type: "guide",
-          status,
-          content: sections(3),
-          inbound: inbound(3),
-          inboundTotal: 3,
-        }),
-      );
+      const room = generateRoom({ ...DEGENERATE_PLACES.threshold, status });
       const name = `threshold ${status}`;
       expect(room.hall.x1 - room.hall.x0, name).toBe(9);
       expect(room.hall.y1 - room.hall.y0, name).toBe(8);

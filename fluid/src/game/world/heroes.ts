@@ -19,24 +19,79 @@
  * edges of every wall-anchored hero. The dressing reads it from the room
  * itself (`dressCandidates` in `dress.ts`, H3), so no caller can forget it.
  *
+ * The pass (`placeHeroes`) runs in `generateRoom` after the scaffold and
+ * before the dressing, on the room's sites (`dressingSites`, which read no
+ * hero and no prop). In this order:
+ *
+ * 1. The draws (`heroDraws`, H6, H7): `seedFor(room.seed, "hero", "draw")`
+ *    draws the slab's chance (`SLAB_SHARE`) and then the turret's
+ *    (`TURRET_SHARE`); each of the `heroCap(room.hall)` pool slots draws a
+ *    chance of `HERO_SHARE` and a roll from `seedFor(room.seed, "hero",
+ *    "pick", i)`.
+ * 2. The slab, when drawn: one candidate, at the hall's centre x with its
+ *    south face on the hall's centre line, facing the entrance (turn 2,
+ *    H9). It stands only where the centre is free: its box grown by
+ *    `HERO_CLEAR` also keeps off every pipe run's box.
+ * 3. The turret, when drawn and a slot is left: the cells of the hall's
+ *    corner zones that kept all four spots, centred on the cell and turned
+ *    to face the hall's centre (H10).
+ * 4. The pool slots, in order, while a slot is left: a slot that drew its
+ *    chance picks by its roll from the archetype's pool (`HERO_POOLS`) less
+ *    the kinds already placed, and tries that kind. A kind that finds no
+ *    place leaves its slot empty; nothing is drawn again.
+ * 5. Trying a kind: its candidates by placement, in the order of their
+ *    seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18; ties
+ *    by the anchor's y, then x):
+ *    - `wall` and `backed`: every free wall edge of the hall that is not
+ *      beside a door, hatch or portal on its run (H5) and not a placed
+ *      hero's edge, token `wall-<side>`, anchored at `wallAnchor`; a backed
+ *      kind never takes a run's first or last edge (H24), and the core wall
+ *      takes an edge and the next one of its run, anchored between them;
+ *    - `band`: every half-cell point of the interior band, token `band`,
+ *      its box inside the band, turned by its second draw;
+ *    - `corner`: as in step 3, token `corner`;
+ *    - `centre`: as in step 2, token `centre`.
+ *    Each candidate's first draw is the variant. The first candidate whose
+ *    hero's box fits the hall's floor and enters no lane is placed when,
+ *    for a free or backed hero, the box grown by `HERO_CLEAR` overlaps no
+ *    taken box and no placed hero (H20), and, for a flush one, the box
+ *    grown by `HERO_CLEAR` overlaps no placed free or backed hero (the
+ *    same moat, seen from the flush side). Anchors are rounded to three
+ *    decimals before they are measured.
+ * 6. The output, sorted by `HERO_ORDER`.
+ *
  * The surface hook (H21): `HERO_CATALOGUE[kind].surfaces` lists each top in
  * the hero's local terms, and `heroSurfaces` gives them in world metres, for
- * the small surface props of a later milestone.
+ * the small surface props of a later milestone. `heroUsePoint` gives a
+ * cabinet's use point the same way.
  *
  * This is the generator side: it imports `footprints.ts`, `sites.ts`,
- * `types.ts` and `units.ts` (and may import `props.ts` and the seeds), and
+ * `types.ts`, `units.ts` and the seeds (and may import `props.ts`), and
  * never `move.ts`, `generate.ts`, `interact.ts`, `malfunction.ts` or
  * anything under `render/` (ruling 20). `heroes.test.ts`, `dress.test.ts`
  * and `sites.test.ts` keep it so.
  */
 
+import { createRng, seedFor, type Rng } from "../core/seed";
 import {
+  FOOTPRINTS,
   HERO_FOOTING,
   HERO_FRONT,
   heroFootprint,
   heroTurn,
+  pipeRunBox,
 } from "./footprints";
-import { edgeKey, type Reserved } from "./sites";
+import {
+  dressingSites,
+  edgeKey,
+  fitsFloor,
+  interiorBand,
+  overlaps,
+  wallAnchor,
+  type DressingSites,
+  type Reserved,
+  type SiteBase,
+} from "./sites";
 import type {
   Archetype,
   Box,
@@ -424,3 +479,313 @@ export function heroSurfaces(h: Hero): { box: Box; h: number }[] {
 /** The heroes' order in `RoomSpec.heroes`: by `y`, then `x`, then kind by code point. */
 export const HERO_ORDER = (a: Hero, b: Hero): number =>
   a.y - b.y || a.x - b.x || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+
+/**
+ * Where a player would stand to use a hero, in world metres, or null for a
+ * kind with no use point: the catalogue's `use` turned and moved like
+ * `heroSurfaces`, `anchor * CELL + along * a + front * d`. For a cabinet it
+ * is `HERO_USE_OUT` in front of its face, on its centre line.
+ */
+export function heroUsePoint(h: Hero): { x: number; z: number } | null {
+  const use = HERO_CATALOGUE[h.kind].use;
+  if (use === null) return null;
+  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
+  return {
+    x: h.x * CELL - fz * use.a + fx * use.d,
+    z: h.y * CELL + fx * use.a + fz * use.d,
+  };
+}
+
+/** The draws of one room (H6, H7): the slab, the turret and each pool slot's chance and roll. */
+export interface HeroDraws {
+  slab: boolean;
+  turret: boolean;
+  picks: readonly { take: boolean; roll: number }[];
+}
+
+/**
+ * A room's hero draws, from its own streams: `seedFor(room.seed, "hero",
+ * "draw")` draws the slab's chance and then the turret's; pool slot `i`
+ * (one per `heroCap`) draws its chance of `HERO_SHARE` and its roll from
+ * `seedFor(room.seed, "hero", "pick", i)`.
+ */
+export function heroDraws(room: SiteBase): HeroDraws {
+  const rng = createRng(seedFor(room.seed, "hero", "draw"));
+  const slab = rng.chance(SLAB_SHARE);
+  const turret = rng.chance(TURRET_SHARE);
+  const picks = Array.from({ length: heroCap(room.hall) }, (_, i) => {
+    const r = createRng(seedFor(room.seed, "hero", "pick", i));
+    return { take: r.chance(HERO_SHARE), roll: r.next() };
+  });
+  return { slab, turret, picks };
+}
+
+/**
+ * Slack for a box edge that lies on the band's border but came out of
+ * float arithmetic a hair past it.
+ */
+const EPS = 1e-9;
+
+/** Rounds a coordinate, so the golden is the same on every engine. */
+function round3(v: number) {
+  return Math.round(v * 1000) / 1000;
+}
+
+/** A box grown by `m` metres on every side. */
+function grow(b: Box, m: number): Box {
+  return { x0: b.x0 - m, x1: b.x1 + m, z0: b.z0 - m, z1: b.z1 + m };
+}
+
+/**
+ * The kind a pool slot's roll picks: the first whose running weight passes
+ * `roll` times the total, as `weighted` in `dress.ts` does with a fresh
+ * draw. Null for an empty pool.
+ */
+function pickByRoll(
+  roll: number,
+  picks: readonly (readonly [HeroKind, number])[],
+): HeroKind | null {
+  let total = 0;
+  for (const [, w] of picks) total += w;
+  let r = roll * total;
+  for (const [k, w] of picks) {
+    r -= w;
+    if (r < 0) return k;
+  }
+  return picks.at(-1)?.[0] ?? null;
+}
+
+/** One place a hero may be tried at: its seed, its anchor and how to make the hero. */
+interface HeroCandidate {
+  seed: number;
+  x: number;
+  y: number;
+  make(rng: Rng): Hero;
+}
+
+/**
+ * The quarter turn that faces a corner hero at `(x, y)` towards the hall's
+ * centre as near as a quarter turn allows (H10): north or south when the
+ * centre lies at least as far along y as along x, else east or west.
+ */
+function faceCentre(hall: Rect, x: number, y: number): number {
+  const dx = (hall.x0 + hall.x1) / 2 - x;
+  const dy = (hall.y0 + hall.y1) / 2 - y;
+  if (Math.abs(dy) >= Math.abs(dx)) return dy < 0 ? 0 : 2;
+  return dx > 0 ? 1 : 3;
+}
+
+function insideRect(r: Rect, x: number, y: number) {
+  return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
+}
+
+/**
+ * The hero pass: the heroes of a room, at most `heroCap(room.hall)` of
+ * them, no two of a kind, sorted by `HERO_ORDER` (see the module doc's
+ * numbered pass). `draws` default to the room's own (`heroDraws`) and
+ * `sites` to `dressingSites(room)`; the tests pass forced draws, and one
+ * sites object per layout, since the sites never read the seed. The
+ * generator passes neither.
+ */
+export function placeHeroes(
+  room: SiteBase,
+  draws: HeroDraws = heroDraws(room),
+  sites: DressingSites = dressingSites(room),
+): Hero[] {
+  const hall = room.hall;
+  const cap = heroCap(hall);
+  const out: Hero[] = [];
+  const band = interiorBand(hall);
+  const pipeRuns = room.decor
+    .map((d) => pipeRunBox(d, hall))
+    .filter((b) => b !== null);
+
+  // The run neighbours of every way's edge (H5), which no hero takes.
+  const beside = new Set<string>();
+  const ways = new Set(
+    room.fixtures
+      .filter(
+        (f) => f.kind === "door" || f.kind === "hatch" || f.kind === "portal",
+      )
+      .map((f) => edgeKey(f.slot)),
+  );
+  for (const run of sites.runs)
+    for (const [i, e] of run.entries()) {
+      if (!ways.has(edgeKey(e))) continue;
+      for (const n of [run[i - 1], run[i + 1]])
+        if (n !== undefined) beside.add(edgeKey(n));
+    }
+
+  const fits = (kind: HeroKind, h: Hero): boolean => {
+    const box = heroFootprint(h);
+    if (!fitsFloor(room, box)) return false;
+    if (sites.lanes.some((l) => overlaps(box, l))) return false;
+    const placement = HERO_CATALOGUE[kind].placement;
+    if (
+      placement === "band" &&
+      (band === null ||
+        box.x0 < band.x0 * CELL - EPS ||
+        box.x1 > band.x1 * CELL + EPS ||
+        box.z0 < band.y0 * CELL - EPS ||
+        box.z1 > band.y1 * CELL + EPS)
+    )
+      return false;
+    if (HERO_FOOTING[kind] === "flush") {
+      // The moat rule run the other way: a flush hero stays out of the
+      // moat of every blocking hero placed before it.
+      const ring = grow(box, HERO_CLEAR);
+      return !out.some(
+        (o) =>
+          HERO_FOOTING[o.kind] !== "flush" && overlaps(ring, heroFootprint(o)),
+      );
+    }
+    const moat = grow(box, HERO_CLEAR);
+    const solid = [
+      ...sites.taken,
+      ...out.map((o) => heroFootprint(o)),
+      ...(placement === "centre" ? pipeRuns : []),
+    ];
+    return !solid.some((b) => overlaps(moat, b));
+  };
+
+  const hero = (
+    kind: HeroKind,
+    rng: Rng,
+    x: number,
+    y: number,
+    turn: number,
+    seed: number,
+  ): Hero => ({
+    kind,
+    variant: rng.int(0, HERO_CATALOGUE[kind].variants - 1),
+    x: round3(x),
+    y: round3(y),
+    turn,
+    seed,
+  });
+
+  const candidates = (kind: HeroKind): HeroCandidate[] => {
+    const entry = HERO_CATALOGUE[kind];
+    const list: HeroCandidate[] = [];
+    switch (entry.placement) {
+      case "wall":
+      case "backed": {
+        const taken = new Set(out.flatMap(heroEdges).map(edgeKey));
+        const usable = (e: WallSlot) => {
+          const k = edgeKey(e);
+          return (
+            insideRect(hall, e.x, e.y) &&
+            sites.free.has(k) &&
+            !beside.has(k) &&
+            !taken.has(k)
+          );
+        };
+        for (const run of sites.runs)
+          for (const [i, e] of run.entries()) {
+            if (!usable(e)) continue;
+            if (entry.placement === "backed" && !(i > 0 && i < run.length - 1))
+              continue;
+            let a = wallAnchor(e);
+            if (entry.edges === 2) {
+              const n = run[i + 1];
+              if (n === undefined || !usable(n)) continue;
+              const b = wallAnchor(n);
+              a = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, turn: a.turn };
+            }
+            const seed = seedFor(room.seed, "hero", e.x, e.y, `wall-${e.side}`);
+            const { x, y, turn } = a;
+            list.push({
+              seed,
+              x,
+              y,
+              make: (rng) => hero(kind, rng, x, y, turn, seed),
+            });
+          }
+        break;
+      }
+      case "band": {
+        if (band === null) break;
+        for (let y2 = 2 * band.y0; y2 <= 2 * band.y1; y2++)
+          for (let x2 = 2 * band.x0; x2 <= 2 * band.x1; x2++) {
+            const seed = seedFor(room.seed, "hero", x2, y2, "band");
+            const x = x2 / 2;
+            const y = y2 / 2;
+            list.push({
+              seed,
+              x,
+              y,
+              make: (rng) => {
+                const variant = rng.int(0, entry.variants - 1);
+                return {
+                  kind,
+                  variant,
+                  x: round3(x),
+                  y: round3(y),
+                  turn: rng.int(0, 3),
+                  seed,
+                };
+              },
+            });
+          }
+        break;
+      }
+      case "corner":
+        for (const zone of sites.zones.slice(0, 4)) {
+          if (zone.spots.length !== 4) continue;
+          for (const s of zone.spots) {
+            const seed = seedFor(room.seed, "hero", s.cx, s.cy, "corner");
+            const x = s.cx + 0.5;
+            const y = s.cy + 0.5;
+            const turn = faceCentre(hall, x, y);
+            list.push({
+              seed,
+              x,
+              y,
+              make: (rng) => hero(kind, rng, x, y, turn, seed),
+            });
+          }
+        }
+        break;
+      case "centre": {
+        const seed = seedFor(room.seed, "hero", "centre");
+        const x = (hall.x0 + hall.x1) / 2;
+        list.push({
+          seed,
+          x,
+          y: (hall.y0 + hall.y1) / 2,
+          make: (rng) => {
+            const variant = rng.int(0, entry.variants - 1);
+            const depth = FOOTPRINTS.hero[kind][variant]?.depth ?? 0;
+            const y = (hall.y0 + hall.y1) / 2 - depth / 2 / CELL;
+            return { kind, variant, x: round3(x), y: round3(y), turn: 2, seed };
+          },
+        });
+        break;
+      }
+    }
+    return list.sort((a, b) => a.seed - b.seed || a.y - b.y || a.x - b.x);
+  };
+
+  const tryPlace = (kind: HeroKind) => {
+    for (const c of candidates(kind)) {
+      const h = c.make(createRng(c.seed));
+      if (fits(kind, h)) {
+        out.push(h);
+        return;
+      }
+    }
+  };
+
+  if (draws.slab && out.length < cap) tryPlace("black-slab");
+  if (draws.turret && out.length < cap) tryPlace("turret");
+  const pool: readonly (readonly [HeroKind, number])[] =
+    HERO_POOLS[room.archetype];
+  for (const pick of draws.picks) {
+    if (out.length >= cap) break;
+    if (!pick.take) continue;
+    const left = pool.filter(([k]) => !out.some((h) => h.kind === k));
+    const kind = pickByRoll(pick.roll, left);
+    if (kind !== null) tryPlace(kind);
+  }
+  return out.sort(HERO_ORDER);
+}

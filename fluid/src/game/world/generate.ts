@@ -33,15 +33,14 @@
  * The hall also gets its archetype's furniture (see `decorFor`), and the
  * grid is lit in blocks of four by four cells.
  *
- * 8. Last, the set dressing: `dressRoom` (`dress.ts`) reads the finished
- *    room, fixtures, furniture, scaffolding and heroes included, and adds
- *    its props. The heroes (`RoomSpec.heroes`) come before the props, and
- *    the dressing keeps off what they reserve (`heroReserve` in
- *    `heroes.ts`); the hero pass that fills them is still to come, so every
- *    room has none for now. The dressing runs after everything else and
- *    only ever adds decoration, so a prop never moves a fixture, and the
- *    room states its entrance, bays and corridor so the dressing never has
- *    to work them out again.
+ * 8. Last, the heroes and the set dressing. The heroes (`placeHeroes`,
+ *    `heroes.ts`) stand after the scaffold and before the dressing, which
+ *    keeps off what they reserve (`heroReserve`). Then `dressRoom`
+ *    (`dress.ts`) reads the finished room, fixtures, furniture,
+ *    scaffolding and heroes included, and adds its props. The dressing runs
+ *    after everything else and only ever adds decoration, so a prop never
+ *    moves a fixture, and the room states its entrance, bays and corridor
+ *    so the dressing never has to work them out again.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -57,6 +56,7 @@ import {
 } from "./layout";
 import { dressRoom } from "./dress";
 import { decorFootprint } from "./footprints";
+import { placeHeroes } from "./heroes";
 import type { RoomBase } from "./sites";
 import { sectionsOf } from "./sections";
 import {
@@ -616,13 +616,14 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     dropped,
     inboundMore,
   };
-  // The heroes go right after the scaffold and the props right after the
-  // heroes, so the keys (and the goldens) read fixtures, decor, scaffold,
-  // heroes, props, lights.
-  const { lights, dropped: left, inboundMore: more, ...head } = base;
+  // The heroes stand before the dressing, which keeps off what they
+  // reserve. They replace the empty list in place, so the keys (and the
+  // goldens) read fixtures, decor, scaffold, heroes, props, lights.
+  const room: RoomBase = { ...base, heroes: placeHeroes(base) };
+  const { lights, dropped: left, inboundMore: more, ...head } = room;
   return {
     ...head,
-    props: dressRoom(base),
+    props: dressRoom(room),
     lights,
     dropped: left,
     inboundMore: more,

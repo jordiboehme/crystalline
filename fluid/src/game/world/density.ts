@@ -30,6 +30,11 @@
  *
  * Heroes are not counted (H23): the measure reads `room.props` only, so a
  * hero never lifts a room over its ceiling or holds it up to its floors.
+ * What a hero reserves does keep props off, so it can only lower the
+ * numbers: measured with the hero pass (2.6a), the seeds give 15.58 floor
+ * props per 100 floor cells (15.97 with every hero taken out; 190 of the
+ * 300 carry one), and the canned hub, whose seed draws no hero, 15.77 to
+ * 17.19 clean.
  *
  * This is the generator side: it imports only `props.ts`, `sites.ts`,
  * `layout.ts` and `types.ts`, and never `move.ts` or `render/`.
