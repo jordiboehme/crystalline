@@ -27,8 +27,9 @@
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
  *   `LANE_WIDTH`, `LANE_DEPTH`, the cluster constants (`CLUSTER_BLOCK`,
- *   `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`) and
- *   the span constants (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
+ *   `CLUSTER_INNER`, `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and
+ *   `CLUSTER_CLEAR`) and the span constants (`SPAN_CELLS`, `SPAN_HALF` and
+ *   `SPAN_SHARE`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
  * pictograms (ruling 13).
@@ -761,6 +762,14 @@ export const WALL_PROP_DEPTH = 0.3;
  * two clusters always stand at least 2 cells (4 m) apart.
  */
 export const CLUSTER_BLOCK = 4;
+/**
+ * The side of a cluster block's inner square, in cells: the block's spots
+ * are its cells `bx + 1` to `bx + CLUSTER_INNER` in both axes, one cell in
+ * from its north-west corner, so a partial last row or column of the block
+ * (when `CLUSTER_INNER` falls short of `CLUSTER_BLOCK - 1`) stays outside
+ * the square and keeps two clusters' inner cells at least one cell apart.
+ */
+export const CLUSTER_INNER = 2;
 /** Chance a cluster block holds a cluster (D6, D8). */
 export const CLUSTER_SHARE = 1 / 2;
 /** The fewest members a cluster is drawn with (D6). */

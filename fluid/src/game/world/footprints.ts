@@ -35,6 +35,15 @@ export const FIXTURE_DEPTH = 0.9;
 export const FIXTURE_WIDTH = 2;
 
 /**
+ * No floor prop's footprint is wider or deeper than this, in metres: a
+ * member of a 2 m corner-zone cell stands at least 0.3 m off each wall,
+ * clear of the wall band (`WALL_PROP_DEPTH` 0.3), and two mid-hall clusters
+ * one empty cell apart (`CLUSTER_INNER`) stay 2.6 m apart, past the 1.0 m
+ * ring (`CLUSTER_CLEAR`).
+ */
+export const MAX_FLOOR_PROP = 1.4;
+
+/**
  * A footprint against a wall, in metres: `along` the wall and `out` from it
  * into the room.
  */

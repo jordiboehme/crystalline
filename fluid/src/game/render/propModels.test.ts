@@ -214,6 +214,13 @@ describe("prop models", () => {
     expect(WALL_PROP_DEPTH).toBe(FLUSH_DEPTH);
   });
 
+  it("keeps every floor prop under the lowest ceiling prop of the lowest ceiling", () => {
+    // generate.ts: ceiling = 3 + salience * 0.2, so never under 3.0 m. Spans
+    // now hang over mid-hall clusters, so this gap is what keeps them apart.
+    const LOWEST_CEILING = 3.0;
+    expect(FLOOR_TOP).toBeLessThan(LOWEST_CEILING - CEILING_DROP);
+  });
+
   it("makes every wide kind reach WIDE_REACH on both sides of its anchor", () => {
     const wall = frameForSlot({ x: 3, y: 4, side: "s" });
     for (const kind of PROP_KINDS) {

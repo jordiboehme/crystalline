@@ -3,7 +3,16 @@ import { describe, expect, it } from "vitest";
 import { CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import { FOOTPRINTS } from "./footprints";
 import { generateRoom } from "./generate";
-import { EXTRAS, FILLER, PALETTES, PROP_CATALOGUE, PROP_KINDS } from "./props";
+import {
+  CLUSTER_BLOCK,
+  CLUSTER_INNER,
+  CLUSTER_MAX,
+  EXTRAS,
+  FILLER,
+  PALETTES,
+  PROP_CATALOGUE,
+  PROP_KINDS,
+} from "./props";
 import type { Archetype, Condition, PropKind } from "./types";
 
 const ARCHETYPES = Object.keys({
@@ -158,5 +167,10 @@ describe("the prop catalogue", () => {
       expect(PROP_CATALOGUE[k].run).toBe(false);
       expect(PROP_CATALOGUE[k].extra).toBe(false);
     }
+  });
+
+  it("fits CLUSTER_MAX members into a block's inner square, one cell in from its corner", () => {
+    expect(CLUSTER_MAX).toBeLessThanOrEqual(CLUSTER_INNER ** 2);
+    expect(1 + CLUSTER_INNER).toBeLessThanOrEqual(CLUSTER_BLOCK);
   });
 });

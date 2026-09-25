@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { propFootprint } from "./footprints";
+import { FOOTPRINTS, MAX_FLOOR_PROP, propFootprint } from "./footprints";
 import footprintsSource from "./footprints.ts?raw";
 import unitsSource from "./units.ts?raw";
 import type { Prop } from "./types";
@@ -37,6 +37,24 @@ describe("the leaf modules of the world", () => {
         expect(s).not.toMatch(/(^|\/)(generate|move)(\.ts)?$/);
       }
     }
+  });
+});
+
+describe("MAX_FLOOR_PROP", () => {
+  it("keeps every floor prop within MAX_FLOOR_PROP either way", () => {
+    // A prop centred in a 2 m corner cell then stands 0.3 m off each wall,
+    // clear of the wall band (FLUSH_DEPTH 0.3), and two mid-hall clusters one
+    // cell apart stay 2.6 m apart, past the 1.0 m ring (E4).
+    expect(MAX_FLOOR_PROP).toBe(1.4);
+    for (const [kind, sizes] of Object.entries(FOOTPRINTS.prop))
+      for (const [v, s] of sizes.entries()) {
+        expect(s.width, `${kind} ${String(v)}`).toBeLessThanOrEqual(
+          MAX_FLOOR_PROP,
+        );
+        expect(s.depth, `${kind} ${String(v)}`).toBeLessThanOrEqual(
+          MAX_FLOOR_PROP,
+        );
+      }
   });
 });
 

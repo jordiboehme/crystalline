@@ -41,6 +41,7 @@ import {
   PALETTES,
   PROP_CATALOGUE,
   PROP_CAP,
+  SPAN_CELLS,
 } from "./props";
 import {
   dressingSites,
@@ -1096,8 +1097,8 @@ describe("ceiling spans", () => {
         const axis = p.turn === 0 ? "x" : "y";
         const first =
           axis === "x"
-            ? { x: p.x - 1, y: p.y - 0.5 }
-            : { x: p.x - 0.5, y: p.y - 1 };
+            ? { x: p.x - SPAN_CELLS / 2, y: p.y - 0.5 }
+            : { x: p.x - 0.5, y: p.y - SPAN_CELLS / 2 };
         const b = spanBox(axis, first);
         // CEILING_OUT (1.2 m) along every wall, plus 0.5 m.
         const off = Math.min(
@@ -1297,7 +1298,15 @@ describe("the cap (Review Focus 4)", () => {
     expect(room.corridor).not.toBeNull();
     const candidates = dressCandidates(room);
     expect(candidates.length).toBeGreaterThan(PROP_CAP);
-    expect(room.props).toHaveLength(PROP_CAP);
+    const line = candidates.filter(
+      (c) => PROP_CATALOGUE[c.prop.kind].span,
+    ).length;
+    expect(room.props.length).toBeLessThanOrEqual(PROP_CAP);
+    // At this commit OVER_CAP's span stream misses (SPAN_SHARE), so line is
+    // 0 and this bound pins the length at exactly PROP_CAP; Math.max(line, 1)
+    // keeps the bound meaningful once a later task's larger fixture draws
+    // one (E10: dropping the whole line can cost up to line - 1 props).
+    expect(room.props.length).toBeGreaterThan(PROP_CAP - Math.max(line, 1));
     const kept = capProps(candidates, PROP_CAP);
     expect(room.props).toEqual([...kept].sort(PROP_ORDER));
     expectTiers("over cap", candidates, kept);
@@ -1374,6 +1383,40 @@ describe("the cap (Review Focus 4)", () => {
     expect(capProps(list, 2)).toEqual(list.map((c) => c.prop));
     expect(capProps(list, 5)).toEqual(list.map((c) => c.prop));
   });
+
+  it("keeps a span line whole or drops it whole, however tight the cap", () => {
+    let dropped = 0;
+    let checked = 0;
+    for (const { name, room } of HUBS) {
+      const candidates = dressCandidates(room);
+      const line = candidates.filter(
+        (c) => PROP_CATALOGUE[c.prop.kind].span,
+      ).length;
+      if (line === 0) continue;
+      const ceiling = candidates.filter(
+        (c) => c.prop.anchor === "ceiling",
+      ).length;
+      for (
+        let cap = candidates.length - ceiling;
+        cap < candidates.length;
+        cap++
+      ) {
+        const kept = capProps(candidates, cap);
+        expect(kept.length, `${name} cap ${String(cap)}`).toBeLessThanOrEqual(
+          cap,
+        );
+        expect(kept.length, `${name} cap ${String(cap)}`).toBeGreaterThan(
+          cap - line,
+        );
+        const spans = kept.filter((p) => PROP_CATALOGUE[p.kind].span).length;
+        expect([0, line], `${name} cap ${String(cap)}`).toContain(spans);
+        if (spans === 0) dropped++;
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+    expect(dropped).toBeGreaterThan(0);
+  });
 });
 
 describe("locality", () => {
@@ -1412,8 +1455,8 @@ describe("locality", () => {
       // A span maps to its segment's first cell, not to a wall edge.
       if (PROP_CATALOGUE[p.kind].span)
         return [
-          Math.floor(p.x - (p.turn === 0 ? 1 : 0.5)),
-          Math.floor(p.y - (p.turn === 0 ? 0.5 : 1)),
+          Math.floor(p.x - (p.turn === 0 ? SPAN_CELLS / 2 : 0.5)),
+          Math.floor(p.y - (p.turn === 0 ? 0.5 : SPAN_CELLS / 2)),
         ];
       const e = edgeOf(p);
       return [e.x, e.y];

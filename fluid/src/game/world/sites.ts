@@ -56,7 +56,8 @@
  *   hall's interior band (`interiorBand`) tiled from its north-west corner
  *   into `CLUSTER_BLOCK` by `CLUSTER_BLOCK` blocks, row by row, partial
  *   blocks dropped. Each is keyed `"x,y"` by its north-west cell, and its
- *   spots are its inner 2 by 2 cells, row by row, with `wall: null` and
+ *   spots are its inner `CLUSTER_INNER` by `CLUSTER_INNER` cells, one in
+ *   from its north-west corner, row by row, with `wall: null` and
  *   `zone: null`; an inner cell that is not floor is left out, and a block
  *   is kept even when that leaves it none. A small hall has no blocks.
  * - **Span lines** (D9), in a large hall only: first every row `y` from
@@ -93,6 +94,7 @@ import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
   CLUSTER_BLOCK,
+  CLUSTER_INNER,
   LANE_DEPTH,
   LANE_WIDTH,
   SHEET_LANE_DEPTH,
@@ -125,8 +127,9 @@ export interface FloorSpot {
  * A mid-hall cluster block (D6): a `CLUSTER_BLOCK` by `CLUSTER_BLOCK` tile
  * of the hall's interior band. `x` and `y` are its north-west cell and
  * `key` is `"x,y"`, which also keys the block's seed. A cluster stands only
- * on `cells`, the block's inner 2 by 2 cells that are floor, row by row, as
- * spots with no wall and no zone; the ring of cells around them keeps two
+ * on `cells`, the block's inner `CLUSTER_INNER` by `CLUSTER_INNER` cells
+ * that are floor, one in from its north-west corner, row by row, as spots
+ * with no wall and no zone; the ring of cells around them keeps two
  * clusters at least 2 cells apart.
  */
 export interface ClusterBlock {
@@ -393,8 +396,8 @@ export function dressingSites(room: RoomBase): DressingSites {
         bx += CLUSTER_BLOCK
       ) {
         const cells: FloorSpot[] = [];
-        for (let y = by + 1; y < by + CLUSTER_BLOCK - 1; y++)
-          for (let x = bx + 1; x < bx + CLUSTER_BLOCK - 1; x++)
+        for (let y = by + 1; y <= by + CLUSTER_INNER; y++)
+          for (let x = bx + 1; x <= bx + CLUSTER_INNER; x++)
             if (isFloor(room.grid, x, y))
               cells.push({ cx: x, cy: y, wall: null, zone: null });
         clusterBlocks.push({ key: cellKey(bx, by), x: bx, y: by, cells });

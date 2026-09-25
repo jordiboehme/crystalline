@@ -102,7 +102,9 @@
  *     own seeds (token `loose-<side>`).
  * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
- *     everything else optional.
+ *     everything else optional. A group, the span line, takes the place of
+ *     its first member in this order and is kept whole or not at all;
+ *     later candidates fill what it leaves.
  * 12. The output: `x` and `y` rounded to three decimals (done as each prop
  *     is made, so acceptance measures exactly the prop that is returned;
  *     a cluster member's cell centre needs no rounding), sorted by
@@ -179,6 +181,8 @@ import { CELL } from "./units";
 export interface Candidate {
   prop: Prop;
   mandatory: boolean;
+  /** Segments that the cap keeps or drops together: the one span line. */
+  group?: string;
 }
 
 /** The order the cap keeps tiers in: walls last to go, ceilings first. */
@@ -188,14 +192,16 @@ const TIER: Record<PropAnchor, number> = { ceiling: 0, floor: 1, wall: 2 };
  * Keeps at most `cap` props. Drops the lowest tier first (ceiling, then
  * floor, then wall); within a tier optional props before mandatory ones;
  * within those the highest seed first, with kind, x and y breaking a tie so
- * the result never depends on input order.
+ * the result never depends on input order. A group (`Candidate.group`), the
+ * span line, takes the place of its first member in this order and is kept
+ * whole or not at all; later candidates fill what it leaves.
  */
 export function capProps(
   candidates: readonly Candidate[],
   cap: number,
 ): Prop[] {
   if (candidates.length <= cap) return candidates.map((c) => c.prop);
-  const keep = [...candidates].sort(
+  const order = [...candidates].sort(
     (a, b) =>
       TIER[b.prop.anchor] - TIER[a.prop.anchor] ||
       Number(b.mandatory) - Number(a.mandatory) ||
@@ -204,7 +210,21 @@ export function capProps(
       a.prop.x - b.prop.x ||
       a.prop.y - b.prop.y,
   );
-  return keep.slice(0, cap).map((c) => c.prop);
+  const kept: Prop[] = [];
+  const decided = new Set<string>();
+  for (const c of order) {
+    if (kept.length >= cap) break;
+    if (c.group === undefined) {
+      kept.push(c.prop);
+      continue;
+    }
+    if (decided.has(c.group)) continue;
+    decided.add(c.group);
+    const members = order.filter((m) => m.group === c.group);
+    if (kept.length + members.length <= cap)
+      kept.push(...members.map((m) => m.prop));
+  }
+  return kept;
 }
 
 /** Where each anchor sorts in the output: wall, floor, ceiling. */
@@ -582,6 +602,7 @@ export function dressCandidates(
               seed: propSeed(c.x, c.y, "span"),
             },
             mandatory: false,
+            group: "span",
           });
         }
     }
