@@ -5,6 +5,7 @@
 
 mod archive;
 mod auth;
+mod schemas;
 use crate::auth_store;
 mod discovery;
 mod domains;
@@ -202,8 +203,8 @@ use crate::scope::{DomainAccess, DomainRight};
     components(schemas(
         ProblemDetail,
         ConflictDetail,
-        User,
-        Role,
+        schemas::User,
+        schemas::Role,
         domains::SaveManifestBody,
         domains::ManifestResponse,
         domains::ManifestSections,
@@ -220,8 +221,8 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::ReviewBody,
         domains_admin::ReviewModeArg,
         domains_admin::VisibilityBody,
-        MemberLevel,
-        DomainMember,
+        schemas::MemberLevel,
+        schemas::DomainMember,
         members::MembersResponse,
         members::MemberBody,
         members::OwnerBody,
@@ -248,9 +249,9 @@ use crate::scope::{DomainAccess, DomainRight};
         oidc::StartLinkResponse,
         oidc::ProvidersResponse,
         oidc::OidcProviderView,
-        IdentityLink,
+        schemas::IdentityLink,
         identity_links::IdentityLinksResponse,
-        OverlayGrant,
+        schemas::OverlayGrant,
         draft_links::MintBody,
         draft_links::MintedLinkResponse,
         draft_links::TokenBody,
@@ -265,7 +266,7 @@ use crate::scope::{DomainAccess, DomainRight};
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
         github_identity::GithubIdentityResponse,
-        McpTokenInfo,
+        schemas::McpTokenInfo,
         mcp_tokens::IssueBody,
         mcp_tokens::IssuedTokenResponse,
         oauth::RegisterBody,
@@ -275,7 +276,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::DecisionBody,
         oauth::Decision,
         oauth::DecisionResponse,
-        OauthGrantInfo,
+        schemas::OauthGrantInfo,
         oauth::TokenForm,
         oauth::TokenResponse,
     )),

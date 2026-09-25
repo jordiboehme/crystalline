@@ -62,6 +62,7 @@ use super::{
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UsersResponse {
     /// Every account, by name.
+    #[schema(value_type = Vec<super::schemas::User>)]
     users: Vec<User>,
 }
 
@@ -70,6 +71,7 @@ pub struct UsersResponse {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UserResponse {
     /// The account as it now stands.
+    #[schema(value_type = super::schemas::User)]
     user: User,
 }
 
@@ -140,6 +142,7 @@ pub struct CreateBody {
     #[schema(example = "bob@example.com")]
     email: Option<String>,
     /// What the new account may do.
+    #[schema(value_type = super::schemas::Role)]
     role: Role,
     /// The initial password. Never stored in the clear; the store hashes it.
     #[schema(example = "correct horse battery staple")]
@@ -260,6 +263,7 @@ pub async fn create(
 pub struct PatchBody {
     /// The new role.
     #[serde(default)]
+    #[schema(value_type = Option<super::schemas::Role>)]
     role: Option<Role>,
     /// Whether the account is disabled. Disabling deletes every session the
     /// account holds, so it is a revocation rather than a flag a later

@@ -72,7 +72,7 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 /// What a user may do. Ordered least to most privileged; the REST layer maps
 /// each endpoint to the minimum role it accepts.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Read only: search, read, browse.
@@ -219,17 +219,14 @@ fn identity_value(value: &str, what: &str) -> Result<String> {
 
 /// One account. Carries no password material, so it is safe to hand to a
 /// handler and serialize into a response.
-#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct User {
     /// The login name and primary key. Also the identity the trusted-header
     /// mode provisions against.
-    #[schema(example = "ada")]
     pub name: String,
     /// Human-readable name for the UI.
-    #[schema(example = "Ada Lovelace")]
     pub display: String,
     /// Optional contact address; never used for login.
-    #[schema(example = "ada@example.com")]
     pub email: Option<String>,
     /// What this account may do.
     pub role: Role,
@@ -238,7 +235,6 @@ pub struct User {
     pub disabled: bool,
     /// When this account last resolved a session or arrived through the
     /// trusted header, RFC 3339. Null for an account never seen.
-    #[schema(example = "2026-08-08T09:14:22Z")]
     pub last_seen: Option<String>,
 }
 
@@ -248,20 +244,16 @@ pub struct User {
 /// display name are all mutable presentation data, and none of them may move
 /// an account. An account may hold several links (one per issuer), and a link
 /// points at exactly one account.
-#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct IdentityLink {
     /// The provider that asserts this identity, as its ID tokens spell it.
-    #[schema(example = "https://login.microsoftonline.com/<tenant>/v2.0")]
     pub issuer: String,
     /// The provider's stable identifier for the person.
-    #[schema(example = "0f8fad5b-d9cb-469f-a165-70867728950e")]
     pub subject: String,
     /// When the link was made, RFC 3339.
-    #[schema(example = "2026-09-07T09:14:22Z")]
     pub linked_at: String,
     /// Who made it: the account that linked it, an admin's name, or `jit` for
     /// a link a first sign-in created along with its account.
-    #[schema(example = "jit")]
     pub linked_by: String,
 }
 
@@ -390,25 +382,18 @@ impl std::fmt::Debug for MintedGrant {
 /// One share-link on one draft, as the store holds it. Never carries the token:
 /// only its sha256 is written, so a listing can say who holds a link and when
 /// it was made and can never hand the link itself back out.
-#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
-#[schema(description = "One share-link on one draft: which draft it opens, \
-                        who minted it, which account redeemed it, and the two \
-                        dates that can end it.")]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OverlayGrant {
     /// The row id, which is what revokes this link.
     pub id: i64,
     /// The domain the drafted engram lives in.
-    #[schema(example = "team")]
     pub domain: String,
     /// The domain-relative path of the draft this link opens.
-    #[schema(example = "plan.md")]
     pub path: String,
     /// The account whose draft it is: the actor the overlay entry belongs to.
-    #[schema(example = "alice")]
     pub owner: String,
     /// The account this link bound itself to, or null while nobody has opened
     /// it yet. The first account to redeem it is that account for good.
-    #[schema(example = "bob")]
     pub grantee: Option<String>,
     /// RFC 3339, when the link was minted.
     pub created_at: String,
@@ -556,7 +541,7 @@ impl std::fmt::Debug for RefreshOutcome {
 /// One row of an account's OAuth grant list: which client is connected, since
 /// when, and until when it may keep refreshing. Never carries a token - only
 /// hashes are stored, so there is nothing to show back.
-#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OauthGrantInfo {
     /// The grant's id, which is what revokes it.
     pub id: i64,
@@ -580,7 +565,7 @@ pub struct OauthGrantInfo {
 /// One row of an account's MCP token list, for a management UI or CLI. Never
 /// carries the token itself - only the hash is stored, so there is nothing to
 /// show back after issuance.
-#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct McpTokenInfo {
     /// The row id, used to revoke or rotate this token.
     pub id: i64,
@@ -602,7 +587,7 @@ pub struct McpTokenInfo {
 /// may not flip the domain back to shared, and it may not hand the domain to
 /// someone else: those two stay with the owner (and with an admin), which is
 /// what keeps "who can see this at all" a decision the owner made.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberLevel {
     /// Read only: this domain is visible and searchable, nothing more.
@@ -827,7 +812,7 @@ pub enum VisibilityWrite {
 
 /// One membership row: who was invited to a private domain, at what level, by
 /// whom and when.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DomainMember {
     /// The member's login name, folded by [`normalize_account_name`].
     pub principal: String,

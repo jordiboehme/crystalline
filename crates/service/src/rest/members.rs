@@ -89,6 +89,7 @@ pub struct MembersResponse {
     #[schema(example = "private")]
     pub visibility: &'static str,
     /// Everyone invited, by name. Empty for a shared domain.
+    #[schema(value_type = Vec<super::schemas::DomainMember>)]
     pub members: Vec<DomainMember>,
 }
 
@@ -100,6 +101,7 @@ pub struct MembersResponse {
 pub struct MemberBody {
     /// viewer | editor | manager
     #[schema(example = "editor")]
+    #[schema(value_type = super::schemas::MemberLevel)]
     pub level: MemberLevel,
 }
 

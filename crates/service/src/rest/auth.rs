@@ -972,6 +972,7 @@ pub struct LoginBody {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct LoginResponse {
     /// The account that was signed in.
+    #[schema(value_type = super::schemas::User)]
     user: User,
     /// The session's CSRF token, which every later mutating request must echo
     /// in the `x-csrf-token` header (see `CSRF_HEADER`).
@@ -997,6 +998,7 @@ pub struct LogoutResponse {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct MeResponse {
     /// The account behind this request, or null when there is none.
+    #[schema(value_type = Option<super::schemas::User>)]
     user: Option<User>,
     /// The CSRF token of the session this request arrived on, or null when it
     /// arrived on no session.

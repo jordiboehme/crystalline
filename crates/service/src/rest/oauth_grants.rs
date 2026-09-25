@@ -81,7 +81,7 @@ fn store_error(e: anyhow::Error) -> ApiError {
                    this surface: a grant is account state rather than \
                    knowledge.",
     responses(
-        (status = 200, description = "This account's connected clients.", body = Vec<OauthGrantInfo>),
+        (status = 200, description = "This account's connected clients.", body = Vec<super::schemas::OauthGrantInfo>),
         (
             status = 401,
             description = "No identity, or an anonymous one: the anonymous \

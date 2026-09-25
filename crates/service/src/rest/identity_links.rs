@@ -45,6 +45,7 @@ use super::{ApiError, ApiPath, ProblemDetail, RestState};
                         because that link is its only way in.")]
 pub struct IdentityLinksResponse {
     /// Every identity this account holds, by issuer.
+    #[schema(value_type = Vec<super::schemas::IdentityLink>)]
     pub links: Vec<IdentityLink>,
     /// Whether this account can also sign in with a password. False for an
     /// account a first sign-on provisioned, which has none until

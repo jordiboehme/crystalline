@@ -153,7 +153,7 @@ const TOKEN_NOT_FOUND: &str = "no such MCP token: it may already have been revok
                    instance like the rest of this surface: a token is account \
                    state rather than knowledge.",
     responses(
-        (status = 200, description = "This account's tokens.", body = Vec<McpTokenInfo>),
+        (status = 200, description = "This account's tokens.", body = Vec<super::schemas::McpTokenInfo>),
         (
             status = 401,
             description = "No identity, or an anonymous one: the anonymous \

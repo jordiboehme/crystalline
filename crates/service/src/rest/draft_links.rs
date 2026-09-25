@@ -371,7 +371,7 @@ pub async fn mint(
                    expired links are left out - the list is what still opens \
                    the draft.",
     responses(
-        (status = 200, description = "The links on that draft.", body = Vec<OverlayGrant>),
+        (status = 200, description = "The links on that draft.", body = Vec<super::schemas::OverlayGrant>),
         (
             status = 401,
             description = "No identity, or an anonymous one.",
