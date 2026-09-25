@@ -4,8 +4,6 @@
 //! Nothing here is new behaviour: each of the three is something the code
 //! already does per model, and these are the pins that say so.
 
-mod support;
-
 use std::sync::Arc;
 
 use crystalline_core::config::{
@@ -45,7 +43,7 @@ fn old_engine(store: Arc<Mutex<dyn Store>>) -> Arc<Engine> {
     Arc::new(Engine::new(
         store,
         cfg,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
     ))
 }
@@ -57,7 +55,7 @@ fn upgraded_engine(store: Arc<Mutex<dyn Store>>) -> Arc<Engine> {
     Arc::new(Engine::new(
         store,
         cfg,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
     ))
 }

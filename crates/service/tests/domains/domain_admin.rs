@@ -1,8 +1,6 @@
 //! Engine-level tests for the Group D domain-administration verbs:
 //! unregister, GitHub status/disconnect, archive file reads and imports.
 
-mod support;
-
 use std::sync::Arc;
 
 use crystalline_core::config::{
@@ -158,7 +156,7 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
 async fn domain_files_carries_attachments_of_both_kinds() {
     // An attachment write marks its domain pending in the maintenance state
     // file, which lives under the state directory: redirect it.
-    let _state = support::ScratchStateDir::acquire();
+    let _state = crate::support::ScratchStateDir::acquire();
     let (_tmp, engine) = engine().await;
     engine.domain_add_virtual("scratch").await.unwrap();
     engine
@@ -542,7 +540,7 @@ async fn engine_with_github() -> (tempfile::TempDir, Arc<Engine>) {
     let engine = Arc::new(
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
             .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo")))
+            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
             .with_state_dir(root.join("state")),
     );
     engine.sync(None).await.unwrap();

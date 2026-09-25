@@ -7,8 +7,6 @@
 //! what makes a run reproducible: the detectors never read the clock, the
 //! engine supplies the date.
 
-mod support;
-
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -727,9 +725,9 @@ async fn the_queue_rows_stay_tabular_for_toon() {
 async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     // Both assertions here are about the whole file - its exact bytes, and the
     // exact backlog left after a scoped sweep - so this test needs the state
-    // to itself while it runs. See `support::maintenance_guard`.
-    let _serialized = support::maintenance_guard().await;
-    let scratch = support::ScratchStateDir::acquire();
+    // to itself while it runs. See `crate::support::maintenance_guard`.
+    let _serialized = crate::support::maintenance_guard().await;
+    let scratch = crate::support::ScratchStateDir::acquire();
     let (_tmp, engine) = fixture().await;
 
     // Two domains owe a sweep; the run below is scoped to one of them.
@@ -800,8 +798,8 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
 async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
     // "A full sweep leaves no ghost behind" is a claim about the whole file, so
     // it takes the same exclusivity as the test above.
-    let _serialized = support::maintenance_guard().await;
-    let _scratch = support::ScratchStateDir::acquire();
+    let _serialized = crate::support::maintenance_guard().await;
+    let _scratch = crate::support::ScratchStateDir::acquire();
     let (_tmp, engine) = fixture().await;
 
     // `eng` is the only registered domain, so `ghost` can never be swept.

@@ -6,17 +6,16 @@
 //! scheduling checks also live here, beside the harness they share; they
 //! include the non-origin `domain_add_local` one.
 //!
-//! Every test injects `support::MockProvider` via `Engine::with_origin_provider`
+//! Every test injects `crate::support::MockProvider` via `Engine::with_origin_provider`
 //! and points origin state at a tempdir via `Engine::with_origins_dir`, so
 //! nothing here reaches a network, a real GitHub repository or the real
 //! machine's state directory.
-
-mod support;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::{CountingEmbedder, MockProvider, sha256_hex};
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
@@ -30,7 +29,6 @@ use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::scope::DomainAccess;
 use crystalline_service::{Engine, EnvOverlay};
-use support::{CountingEmbedder, MockProvider, sha256_hex};
 use tokio::sync::Mutex;
 
 fn config(github_enabled: bool) -> GlobalConfig {

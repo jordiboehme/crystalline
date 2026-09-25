@@ -11,8 +11,6 @@
 //! tests; the wiring between it and the engine is pinned by
 //! `tests/domain_access.rs`. This is the third leg: the verbs.
 
-mod support;
-
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};

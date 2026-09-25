@@ -4,7 +4,7 @@
 //! tests exercise the scheduling and gating decisions the daemon wiring
 //! itself is too thin to need its own tests for.
 //!
-//! Every test injects `support::MockProvider` via `Engine::with_origin_provider`
+//! Every test injects `crate::support::MockProvider` via `Engine::with_origin_provider`
 //! and points origin state and the GitHub token store at tempdirs via
 //! `Engine::with_origins_dir` and `Engine::with_token_store_dir`, so nothing
 //! here reaches a network, a real GitHub repository or the real machine's
@@ -17,13 +17,12 @@
 //! ticks pass whatever synthetic time is needed to prove due/not-due and
 //! backoff behavior, with no real waiting at all.
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::support::MockProvider;
 use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
@@ -31,7 +30,6 @@ use crystalline_remote::state::OriginState;
 use crystalline_remote::{StoredToken, TokenStore};
 use crystalline_service::engine::ConfigureAction;
 use crystalline_service::{Engine, EnvOverlay};
-use support::MockProvider;
 use tokio::sync::Mutex;
 
 fn config(poll_secs: Option<u64>) -> GlobalConfig {

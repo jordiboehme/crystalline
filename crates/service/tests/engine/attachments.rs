@@ -2,11 +2,9 @@
 //! folder and out of a virtual domain's blob table, plus the reserved-prefix
 //! refusal on the engram write path.
 //!
-//! Every fixture holds a [`support::ScratchStateDir`]: an attachment write
+//! Every fixture holds a [`crate::support::ScratchStateDir`]: an attachment write
 //! marks its domain pending in the maintenance state file, which lives under
 //! the state directory, so a run must never reach the developer's own.
-
-mod support;
 
 use std::sync::Arc;
 
@@ -61,7 +59,7 @@ async fn engine_fixture() -> (
     tempfile::TempDir,
     Arc<Engine>,
     std::path::PathBuf,
-    support::ScratchStateDir,
+    crate::support::ScratchStateDir,
 ) {
     named_fixture("eng", "scratch").await
 }
@@ -77,9 +75,9 @@ async fn named_fixture(
     tempfile::TempDir,
     Arc<Engine>,
     std::path::PathBuf,
-    support::ScratchStateDir,
+    crate::support::ScratchStateDir,
 ) {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -116,9 +114,9 @@ async fn move_fixture() -> (
     Arc<Engine>,
     std::path::PathBuf,
     std::path::PathBuf,
-    support::ScratchStateDir,
+    crate::support::ScratchStateDir,
 ) {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -1845,7 +1843,7 @@ async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
 /// overlay has one seam to land in rather than five call sites to find.
 #[tokio::test]
 async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every_actor() {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -1961,9 +1959,9 @@ async fn review_fixture(
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
-    support::ScratchStateDir,
+    crate::support::ScratchStateDir,
 ) {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -2459,7 +2457,7 @@ async fn delete_engram_on_an_assets_path_in_review_mode_lands_as_a_draft_deletio
 /// impossible, where an absent folder would only mean nobody noticed.
 #[tokio::test]
 async fn an_engine_with_no_state_dir_reaches_no_files_overlay_in_a_test_build() {
-    let scratch = support::ScratchStateDir::acquire();
+    let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();

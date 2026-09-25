@@ -5,18 +5,16 @@
 //! engine's own pass is covered here too: it pages the backlog and skips a
 //! batch the provider rejects instead of stranding the rest.
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::support::CountingEmbedder;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::{Store, TursoStore};
 use crystalline_service::daemon::run_embed_tick;
 use crystalline_service::engine::Engine;
 use crystalline_service::params::*;
-use support::CountingEmbedder;
 use tokio::sync::Mutex;
 
 /// An engine over a config with a single virtual domain named `notes`.

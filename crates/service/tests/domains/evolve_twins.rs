@@ -3,8 +3,6 @@
 //! is invisible to the lexical `V201` and visible to `V301`; an exact copy is
 //! `V201`'s and never doubled as a twin.
 
-mod support;
-
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
@@ -40,7 +38,7 @@ async fn engine(with_provider: bool) -> (tempfile::TempDir, Arc<Engine>) {
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
     let provider: Option<Arc<dyn crystalline_index::EmbeddingProvider>> =
-        with_provider.then(|| Arc::new(support::TopicEmbedder) as Arc<_>);
+        with_provider.then(|| Arc::new(crate::support::TopicEmbedder) as Arc<_>);
     let engine = Arc::new(Engine::new(
         Arc::new(Mutex::new(store)),
         cfg,
@@ -546,7 +544,7 @@ async fn review_engine() -> (tempfile::TempDir, Arc<Engine>) {
         Engine::new(
             Arc::new(Mutex::new(store)),
             cfg,
-            Some(Arc::new(support::TopicEmbedder) as Arc<_>),
+            Some(Arc::new(crate::support::TopicEmbedder) as Arc<_>),
             Some(config_path),
         )
         .with_state_dir(tmp.path().join("state")),

@@ -1,8 +1,6 @@
 //! The neighbours advisory at the engine: what a probe finds, what it never
 //! finds, and how it fails.
 
-mod support;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +28,7 @@ async fn engine() -> (tempfile::TempDir, Arc<Engine>) {
     let engine = build(
         &tmp,
         store,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
         None,
     );
@@ -47,7 +45,7 @@ async fn engine_with_worker() -> (tempfile::TempDir, Arc<Engine>) {
     let engine = build(
         &tmp,
         store,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         Some(tx),
         None,
     );
@@ -273,7 +271,7 @@ async fn no_provider_and_no_embeddings_both_mean_no_neighbours() {
     let embedding = build(
         &tmp,
         Arc::clone(&store),
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
         None,
     );
@@ -337,7 +335,7 @@ async fn no_provider_and_no_embeddings_both_mean_no_neighbours() {
     let old_model = build(
         &tmp,
         Arc::clone(&store),
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
         Some("model-that-was"),
     );
@@ -346,7 +344,7 @@ async fn no_provider_and_no_embeddings_both_mean_no_neighbours() {
     let new_model = build(
         &tmp,
         store,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         None,
         Some("model-that-is"),
     );
@@ -477,7 +475,7 @@ async fn a_slow_provider_is_cut_at_the_timeout() {
         .await
         .unwrap();
     engine.embed_pending().await.unwrap();
-    engine.set_provider(Arc::new(support::SleepyEmbedder {
+    engine.set_provider(Arc::new(crate::support::SleepyEmbedder {
         delay: Duration::from_secs(10),
     }));
     let mut receipt = json!({ "domain": "open", "permalink": "retry-queue-gotcha" });
@@ -512,7 +510,7 @@ async fn a_completed_probe_logs_its_elapsed_time() {
     let (_tmp, engine) = engine().await;
     two_retry_engrams(&engine).await;
     engine.embed_pending().await.unwrap();
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let mut receipt = retry_receipt();
     engine
         .attach_similar(&mut receipt, retry_probe(), &Scope::Unrestricted)
@@ -534,9 +532,9 @@ async fn a_completed_probe_logs_its_elapsed_time() {
 /// completion no matter what the timeout is set to and leaves no trace
 /// unless the wall clock is checked afterward.
 ///
-/// [`support::BlockingEmbedder`] reproduces that shape at the provider
+/// [`crate::support::BlockingEmbedder`] reproduces that shape at the provider
 /// instead of the store, which is the same failure mode from the timeout's
-/// point of view: unlike [`support::SleepyEmbedder`]'s `tokio::time::sleep`
+/// point of view: unlike [`crate::support::SleepyEmbedder`]'s `tokio::time::sleep`
 /// (an async, cancellable delay - see `a_slow_provider_is_cut_at_the_timeout`
 /// above), its delay is a `std::thread::sleep` inside the poll, so nothing
 /// yields and the timeout cannot cut it.
@@ -546,8 +544,10 @@ async fn a_probe_that_blocks_the_thread_logs_an_overrun() {
     two_retry_engrams(&engine).await;
     engine.embed_pending().await.unwrap();
     let over_budget = SIMILAR_TIMEOUT + Duration::from_millis(1300);
-    engine.set_provider(Arc::new(support::BlockingEmbedder { delay: over_budget }));
-    let (logs, _guard) = support::capture_logs();
+    engine.set_provider(Arc::new(crate::support::BlockingEmbedder {
+        delay: over_budget,
+    }));
+    let (logs, _guard) = crate::support::capture_logs();
     let mut receipt = retry_receipt();
     let started = std::time::Instant::now();
     engine
@@ -580,7 +580,7 @@ async fn the_backlog_wait_is_bounded_and_only_happens_with_a_worker() {
     let worker = build(
         &tmp,
         store,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         Some(tx),
         None,
     );
@@ -754,7 +754,7 @@ async fn review_engine(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<Engine
         Engine::new(
             Arc::new(Mutex::new(store)),
             cfg,
-            Some(Arc::new(support::TopicEmbedder)),
+            Some(Arc::new(crate::support::TopicEmbedder)),
             Some(config_path),
         )
         .with_state_dir(tmp.path().join("state")),

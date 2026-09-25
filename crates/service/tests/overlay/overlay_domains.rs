@@ -12,8 +12,6 @@
 //! writes the row and its mirror by hand, exactly as the verbs will: one
 //! `upsert_overlay` beside one `overlay_journal::journal_write`.
 
-mod support;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -48,7 +46,7 @@ const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - 
 const ALICE_DRAFT: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Plan\n\n- [decision] the plan as alice would have it #team\n";
 /// Two engrams on one topic, for the capture advisory: the draft a receipt is
 /// about and the base engram the team already has beside it. The marker words
-/// are the ones `support::TopicEmbedder` reads, so "a neighbour appears" is a
+/// are the ones `crate::support::TopicEmbedder` reads, so "a neighbour appears" is a
 /// deterministic fact rather than a hash collision.
 const RETRY_BODY: &str = "- [decision] the retry queue doubles its backoff on every failure #team\n- [decision] a dead-letter ttl bounds how long a retry waits #team";
 const RETRY_NEIGHBOUR: &str = "---\ntype: engram\ntitle: Retry backoff lesson\npermalink: retry-backoff-lesson\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Retry backoff lesson\n\n- [decision] retries wait on a backoff that doubles each time #team\n- [decision] the dead-letter ttl is the bound on a stuck retry #team\n";
@@ -75,7 +73,7 @@ struct Fixture {
     /// The forge this engine shares against, on a fixture that carries an
     /// origin: the same handle `with_origin_provider` was given, so a test can
     /// arm it and read back what a share actually called.
-    forge: Option<Arc<support::MockProvider>>,
+    forge: Option<Arc<crate::support::MockProvider>>,
 }
 
 /// A file domain `team` (MANIFEST + plan.md), synced, with the state directory
@@ -131,7 +129,7 @@ async fn review_fixture_with_provider() -> Fixture {
         MANIFEST,
         true,
         true,
-        Some(Arc::new(support::TopicEmbedder)),
+        Some(Arc::new(crate::support::TopicEmbedder)),
         false,
         false,
     )
@@ -243,7 +241,7 @@ async fn build_fixture(
     let mut commit = String::new();
     let mut forge = None;
     if origin {
-        let mock = Arc::new(support::MockProvider::new());
+        let mock = Arc::new(crate::support::MockProvider::new());
         commit = mock.add_commit(std::collections::BTreeMap::from([(
             "MANIFEST.md".to_string(),
             manifest.as_bytes().to_vec(),
@@ -294,7 +292,7 @@ impl Fixture {
     }
 
     /// The forge behind this fixture's origin.
-    fn mock(&self) -> Arc<support::MockProvider> {
+    fn mock(&self) -> Arc<crate::support::MockProvider> {
         self.forge
             .clone()
             .expect("this fixture carries an origin and its forge")
@@ -453,7 +451,7 @@ impl Fixture {
             state.files.insert(
                 rel.clone(),
                 crystalline_remote::state::BaseStamp {
-                    sha256: support::sha256_hex(&bytes),
+                    sha256: crate::support::sha256_hex(&bytes),
                     size: bytes.len() as u64,
                 },
             );
@@ -3559,12 +3557,12 @@ async fn an_authenticated_search_finds_the_callers_draft_and_nobody_elses() {
             .await
             .unwrap();
     }
-    let alice = support::McpTestSession::open(
+    let alice = crate::support::McpTestSession::open(
         &addr,
         Some(&auth.issue_mcp_token("alice", "t").await.unwrap().token),
     )
     .await;
-    let bob = support::McpTestSession::open(
+    let bob = crate::support::McpTestSession::open(
         &addr,
         Some(&auth.issue_mcp_token("bob", "t").await.unwrap().token),
     )
@@ -4935,7 +4933,7 @@ async fn a_review_mode_change_list_names_exactly_the_callers_own_drafts() {
     let plan = &mine["changes"][3];
     assert_eq!(
         plan["sha"],
-        support::sha256_hex(ALICE_DRAFT.as_bytes()),
+        crate::support::sha256_hex(ALICE_DRAFT.as_bytes()),
         "{plan}"
     );
     assert_eq!(plan["size_before"], PLAN.len(), "{plan}");
@@ -5014,7 +5012,7 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
             &[
                 DiscardTarget {
                     path: "plan.md".to_string(),
-                    sha256: Some(support::sha256_hex(ALICE_DRAFT.as_bytes())),
+                    sha256: Some(crate::support::sha256_hex(ALICE_DRAFT.as_bytes())),
                 },
                 DiscardTarget {
                     path: "fresh.md".to_string(),
@@ -5026,7 +5024,7 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
                 },
                 DiscardTarget {
                     path: "assets/logo.png".to_string(),
-                    sha256: Some(support::sha256_hex(b"png")),
+                    sha256: Some(crate::support::sha256_hex(b"png")),
                 },
                 DiscardTarget {
                     path: "nowhere.md".to_string(),
@@ -5191,7 +5189,7 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
             &[
                 DiscardTarget {
                     path: "plan.md".to_string(),
-                    sha256: Some(support::sha256_hex(ALICE_DRAFT.as_bytes())),
+                    sha256: Some(crate::support::sha256_hex(ALICE_DRAFT.as_bytes())),
                 },
                 DiscardTarget {
                     path: "fresh.md".to_string(),

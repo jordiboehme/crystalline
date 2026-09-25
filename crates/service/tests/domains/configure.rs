@@ -14,8 +14,6 @@ use crystalline_service::settings::SettingSource;
 use crystalline_service::{Engine, EnvOverlay};
 use tokio::sync::Mutex;
 
-mod support;
-
 async fn engine_at(config_path: &std::path::Path, read_only: bool) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     Engine::new(
@@ -59,7 +57,7 @@ async fn an_unusable_public_url_variable_warns_and_loads_as_unset() {
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.yaml");
 
-    let (logs, _guard) = support::capture_logs();
+    let (logs, _guard) = crate::support::capture_logs();
     let engine = engine_with_overlay(
         &config_path,
         &[("CRYSTALLINE_SERVICE_PUBLIC_URL", "http://0.0.0.0:7411")],

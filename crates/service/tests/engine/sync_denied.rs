@@ -2,8 +2,6 @@
 //! domain lands in `failed`, its neighbor still syncs and a named sync of the
 //! denied domain surfaces the error rather than silently emptying its index.
 
-#![cfg(unix)]
-
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
