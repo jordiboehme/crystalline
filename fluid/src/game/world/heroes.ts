@@ -26,15 +26,15 @@
  * This is the generator side: it imports `footprints.ts`, `sites.ts`,
  * `types.ts` and `units.ts` (and may import `props.ts` and the seeds), and
  * never `move.ts`, `generate.ts`, `interact.ts`, `malfunction.ts` or
- * anything under `render/` (ruling 20). `heroes.test.ts` and
- * `dress.test.ts` keep it so.
+ * anything under `render/` (ruling 20). `heroes.test.ts`, `dress.test.ts`
+ * and `sites.test.ts` keep it so.
  */
 
 import {
-  FOOTPRINTS,
   HERO_FOOTING,
   HERO_FRONT,
   heroFootprint,
+  heroTurn,
 } from "./footprints";
 import { edgeKey, type Reserved } from "./sites";
 import type {
@@ -247,7 +247,11 @@ export const HERO_CATALOGUE = {
   },
 } satisfies Record<HeroKind, HeroEntry>;
 
-/** Each archetype's weighted pool (H7); the turret and the slab are drawn apart. */
+/**
+ * Each archetype's weighted pool (H7); the turret and the slab are drawn
+ * apart. The pools are listed in catalogue order, and that order is part
+ * of the seeded result, so do not reorder them.
+ */
 export const HERO_POOLS = {
   bridge: [
     ["eye-panel", 4],
@@ -330,7 +334,7 @@ const SIDE_FOR_TURN: readonly Side[] = ["s", "w", "n", "e"];
  */
 export function heroEdges(h: Hero): WallSlot[] {
   if (HERO_FOOTING[h.kind] === "free") return [];
-  const side = SIDE_FOR_TURN[turnOf(h)] ?? "s";
+  const side = SIDE_FOR_TURN[heroTurn(h)] ?? "s";
   const two = HERO_CATALOGUE[h.kind].edges === 2;
   const along = side === "n" || side === "s";
   // The cell just inside the wall, before the anchor's along-wall half.
@@ -359,51 +363,28 @@ export function heroEdges(h: Hero): WallSlot[] {
  * hero its box (`heroFootprint`) grown by `HERO_CLEAR` on every side, which
  * for a backed hero is also the clear use box in front of it; for a flush
  * wall hero its view box, its own width and `HERO_VIEW` deep out from its
- * wall point along `HERO_FRONT`. Every wall-anchored hero, backed or flush,
- * also reserves its wall edges (`heroEdges`).
+ * wall point along `HERO_FRONT` (`heroFootprint(h, HERO_VIEW)`). Every
+ * wall-anchored hero, backed or flush, also reserves its wall edges
+ * (`heroEdges`).
  */
 export function heroReserve(heroes: readonly Hero[]): Reserved {
   const boxes: Box[] = [];
   const edges = new Set<string>();
   for (const h of heroes) {
     const footing = HERO_FOOTING[h.kind];
-    const box = heroFootprint(h);
-    if (footing === "flush") boxes.push(viewBox(h));
-    else
+    if (footing === "flush") boxes.push(heroFootprint(h, HERO_VIEW));
+    else {
+      const box = heroFootprint(h);
       boxes.push({
         x0: box.x0 - HERO_CLEAR,
         x1: box.x1 + HERO_CLEAR,
         z0: box.z0 - HERO_CLEAR,
         z1: box.z1 + HERO_CLEAR,
       });
+    }
     if (footing !== "free") for (const e of heroEdges(h)) edges.add(edgeKey(e));
   }
   return { boxes, edges };
-}
-
-/**
- * A flush hero's view box: `heroFootprint` of the same hero with its depth
- * `HERO_VIEW`, so it runs `HERO_VIEW` out from the wall point along
- * `HERO_FRONT[turn]`, as wide as the hero, its wall face exactly on the
- * wall.
- */
-function viewBox(h: Hero): Box {
-  const size = FOOTPRINTS.hero[h.kind][h.variant];
-  if (size === undefined)
-    throw new Error(
-      `heroReserve: ${h.kind} has no variant ${String(h.variant)}`,
-    );
-  const [fx, fz] = HERO_FRONT[turnOf(h)] ?? [0, -1];
-  const half = size.width / 2;
-  const span = (a: number, f: number): [number, number] =>
-    f === 0
-      ? [a - half, a + half]
-      : f > 0
-        ? [a, a + HERO_VIEW]
-        : [a - HERO_VIEW, a];
-  const [x0, x1] = span(h.x * CELL, fx);
-  const [z0, z1] = span(h.y * CELL, fz);
-  return { x0, x1, z0, z1 };
 }
 
 /**
@@ -414,7 +395,7 @@ function viewBox(h: Hero): Box {
  * extremes of its four corners.
  */
 export function heroSurfaces(h: Hero): { box: Box; h: number }[] {
-  const [fx, fz] = HERO_FRONT[turnOf(h)] ?? [0, -1];
+  const [fx, fz] = HERO_FRONT[heroTurn(h)] ?? [0, -1];
   const ax = -fz;
   const az = fx;
   const ox = h.x * CELL;
@@ -443,8 +424,3 @@ export function heroSurfaces(h: Hero): { box: Box; h: number }[] {
 /** The heroes' order in `RoomSpec.heroes`: by `y`, then `x`, then kind by code point. */
 export const HERO_ORDER = (a: Hero, b: Hero): number =>
   a.y - b.y || a.x - b.x || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
-
-/** A hero's quarter turn, 0 to 3. */
-function turnOf(h: Hero): number {
-  return ((Math.round(h.turn) % 4) + 4) % 4;
-}

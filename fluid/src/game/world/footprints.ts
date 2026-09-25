@@ -386,26 +386,35 @@ export const HERO_FRONT: readonly (readonly [number, number])[] = [
   [-1, 0],
 ];
 
+/** A hero's quarter turn, 0 to 3, whatever whole number `turn` holds. */
+export function heroTurn(h: Hero): number {
+  return ((Math.round(h.turn) % 4) + 4) % 4;
+}
+
 /**
  * The floor a hero takes, in metres: its variant's size, width and depth
  * swapped at an odd turn, centred on the anchor for a `free` footing, and
  * for a wall-anchored one centred along the wall and running `depth` out
  * from the wall point along `HERO_FRONT`, so a backed hero's box equals
- * `footprint(edge, { along: width, out: depth })` exactly.
- * A flush hero has a box too (what its view box and the model checks
- * start from), though it does not collide. Throws on a variant the kind
- * does not have, in the words `propFootprint` uses.
+ * `footprint(edge, { along: width, out: depth })` exactly. A flush hero has
+ * a box too (what the model checks start from), though it does not collide.
+ *
+ * `depth` overrides the variant's depth, keeping its width: a flush hero's
+ * view box (`heroReserve` in `heroes.ts`) is its footprint `HERO_VIEW`
+ * deep. Throws on a variant the kind does not have, in the words
+ * `propFootprint` uses.
  */
-export function heroFootprint(h: Hero): Box {
+export function heroFootprint(h: Hero, depth?: number): Box {
   const size = FOOTPRINTS.hero[h.kind][h.variant];
   if (size === undefined)
     throw new Error(
       `heroFootprint: ${h.kind} has no variant ${String(h.variant)}`,
     );
-  const t = ((Math.round(h.turn) % 4) + 4) % 4;
+  const deep = depth ?? size.depth;
+  const t = heroTurn(h);
   const sideways = t % 2 === 1;
-  const hx = (sideways ? size.depth : size.width) / 2;
-  const hz = (sideways ? size.width : size.depth) / 2;
+  const hx = (sideways ? deep : size.width) / 2;
+  const hz = (sideways ? size.width : deep) / 2;
   const ax = h.x * CELL;
   const az = h.y * CELL;
   if (HERO_FOOTING[h.kind] === "free")
@@ -415,11 +424,7 @@ export function heroFootprint(h: Hero): Box {
   // come out exactly where `footprint` puts them.
   const [fx, fz] = HERO_FRONT[t] ?? [0, -1];
   const out = (a: number, f: number, half: number): [number, number] =>
-    f === 0
-      ? [a - half, a + half]
-      : f > 0
-        ? [a, a + size.depth]
-        : [a - size.depth, a];
+    f === 0 ? [a - half, a + half] : f > 0 ? [a, a + deep] : [a - deep, a];
   const [x0, x1] = out(ax, fx, hx);
   const [z0, z1] = out(az, fz, hz);
   return { x0, x1, z0, z1 };

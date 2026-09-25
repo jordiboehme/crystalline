@@ -115,6 +115,8 @@ describe("the hero catalogue", () => {
   });
 
   it("keeps a use point only on the cabinets, in front of the box and inside the reserve", () => {
+    // The reserve is the box grown by HERO_CLEAR, so a point HERO_USE_OUT in
+    // front of the face lies inside it; checked against heroReserve below.
     for (const kind of HERO_KINDS) {
       const use = HERO_CATALOGUE[kind].use;
       if (kind !== "arcade-cabinet" && kind !== "recruit-cabinet") {
@@ -132,6 +134,12 @@ describe("the hero catalogue", () => {
       expect(box.z0 - z, kind).toBeCloseTo(HERO_USE_OUT);
       expect(HERO_USE_OUT).toBeGreaterThan(0.35);
       expect(HERO_USE_OUT).toBeLessThan(HERO_CLEAR);
+      const reserve = heroReserve([h]).boxes[0];
+      if (reserve === undefined) throw new Error(kind);
+      expect(x, kind).toBeGreaterThan(reserve.x0);
+      expect(x, kind).toBeLessThan(reserve.x1);
+      expect(z, kind).toBeGreaterThan(reserve.z0);
+      expect(z, kind).toBeLessThan(reserve.z1);
     }
   });
 
@@ -189,6 +197,25 @@ describe("hero footprints", () => {
       expect(heroEdges(h).map(edgeKey).sort()).toEqual(
         [edgeKey(e0), edgeKey(e1)].sort(),
       );
+      // Its box covers both edges' wall stretch less 0.2 m at each end, and
+      // stands out from the wall as deep as a one-edge box would.
+      const size = FOOTPRINTS.hero["core-wall"][0];
+      if (size === undefined) throw new Error("no core wall size");
+      const wall = { along: CELL, out: size.depth };
+      const f0 = footprint(e0, wall);
+      const f1 = footprint(e1, wall);
+      const edges = {
+        x0: Math.min(f0.x0, f1.x0),
+        x1: Math.max(f0.x1, f1.x1),
+        z0: Math.min(f0.z0, f1.z0),
+        z1: Math.max(f0.z1, f1.z1),
+      };
+      const want = along
+        ? { ...edges, x0: edges.x0 + 0.2, x1: edges.x1 - 0.2 }
+        : { ...edges, z0: edges.z0 + 0.2, z1: edges.z1 - 0.2 };
+      const box = heroFootprint(h);
+      for (const k of ["x0", "x1", "z0", "z1"] as const)
+        expect(box[k], `${side} ${k}`).toBeCloseTo(want[k], 9);
     }
   });
 
@@ -256,6 +283,24 @@ describe("what a hero reserves (H19)", () => {
       const wantEdges =
         HERO_FOOTING[kind] === "free" ? [] : heroEdges(h).map(edgeKey);
       expect([...r.edges].sort(), kind).toEqual(wantEdges.sort());
+    }
+  });
+
+  it("reserves a one-edge flush hero's view box HERO_VIEW deep off its edge, on every side", () => {
+    for (const kind of HERO_KINDS) {
+      if (HERO_FOOTING[kind] !== "flush" || HERO_CATALOGUE[kind].edges !== 1)
+        continue;
+      const size = FOOTPRINTS.hero[kind][0];
+      if (size === undefined) throw new Error(kind);
+      for (const side of SIDES) {
+        const got = heroReserve([heroAt(kind, 0, side)]).boxes;
+        expect(got, `${kind} ${side}`).toEqual([
+          footprint(
+            { x: 3, y: 4, side },
+            { along: size.width, out: HERO_VIEW },
+          ),
+        ]);
+      }
     }
   });
 
