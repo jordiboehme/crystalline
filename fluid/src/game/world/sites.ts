@@ -92,6 +92,9 @@
  *
  * It also holds the small helpers the dressing and the hero pass share, so
  * neither keeps a copy: `EPS`, `round3`, `grow`, `pickByRoll` and `inside`.
+ * `edgeOf`, `wallAnchor`'s inverse, is the same kind of shared helper for
+ * `dev/` (which reads a single-edge wall or ceiling prop's edge back from
+ * its anchor point and turn) rather than for the generator side.
  *
  * `Reserved` (`{ boxes, edges }`), `NO_RESERVE` and `mergeReserved` are
  * what a pass that runs before the dressing, such as the hero pass, hands
@@ -254,6 +257,31 @@ export function wallAnchor(e: WallSlot): {
       return { x: e.x, y: e.y + 0.5, turn };
     case "e":
       return { x: e.x + 1, y: e.y + 0.5, turn };
+  }
+}
+
+/** The side a wall-anchored thing's turn stands on, the inverse of `turnForSide`. */
+const SIDE_FOR_TURN: readonly Side[] = ["s", "w", "n", "e"];
+
+/**
+ * The wall edge a single-edge wall-anchored thing is anchored on, the
+ * inverse of `wallAnchor`: recovers the edge from the anchor point `(x, y)`
+ * and the turn `wallAnchor` gave it. Only a single-edge thing (a wall or
+ * ceiling prop; a wall-anchored hero with one edge) inverts this way; a
+ * two-edge hero's combined anchor (`heroEdges`'s two-edge case in
+ * `heroes.ts`) does not.
+ */
+export function edgeOf(p: { x: number; y: number; turn: number }): WallSlot {
+  const side = SIDE_FOR_TURN[p.turn] ?? "s";
+  switch (side) {
+    case "n":
+      return { x: p.x - 0.5, y: p.y, side };
+    case "s":
+      return { x: p.x - 0.5, y: p.y - 1, side };
+    case "w":
+      return { x: p.x, y: p.y - 0.5, side };
+    case "e":
+      return { x: p.x - 1, y: p.y - 0.5, side };
   }
 }
 

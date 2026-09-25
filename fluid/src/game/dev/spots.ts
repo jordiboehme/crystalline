@@ -25,14 +25,8 @@ import { wallFacingSpawn, wallPoint } from "../world/interact";
 import { isFloor } from "../world/layout";
 import { blockersFor, PLAYER_RADIUS } from "../world/move";
 import { PROP_KINDS } from "../world/props";
-import type {
-  Box,
-  Fixture,
-  Prop,
-  RoomSpec,
-  Side,
-  WallSlot,
-} from "../world/types";
+import { edgeOf } from "../world/sites";
+import type { Box, Fixture, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
 
 /**
@@ -98,30 +92,6 @@ export function circleOverlapsBox(x: number, z: number, b: Box): boolean {
   const dx = x - nx;
   const dz = z - nz;
   return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
-}
-
-/** The wall side a thing stands on at each quarter turn, the inverse of `turnForSide`. */
-const SIDE_OF_TURN: readonly Side[] = ["s", "w", "n", "e"];
-
-/**
- * The wall edge a wall or ceiling prop is anchored on, the inverse of
- * `wallAnchor` in `sites.ts` (`canned.test.ts` and `dress.test.ts` keep
- * their own copies of this for the same reason `spots.ts` needs its own: a
- * generator-side module never imports `dev/`, so the inverse cannot live
- * next to `wallAnchor` itself and reach here).
- */
-function wallEdgeOf(p: Prop): WallSlot {
-  const side = SIDE_OF_TURN[p.turn] ?? "s";
-  switch (side) {
-    case "n":
-      return { x: p.x - 0.5, y: p.y, side };
-    case "s":
-      return { x: p.x - 0.5, y: p.y - 1, side };
-    case "w":
-      return { x: p.x, y: p.y - 0.5, side };
-    case "e":
-      return { x: p.x - 1, y: p.y - 0.5, side };
-  }
 }
 
 /** The box `frameSpot` frames a wall or ceiling prop with, which has no `propFootprint`. */
@@ -198,10 +168,14 @@ function frameSpot(
  * of that kind (in `room.props` order) when `PROP_KINDS` holds it, framed
  * from its front (`frameSpot`, `HERO_FRONT[turn]`): a wall or ceiling prop,
  * which has no `propFootprint`, is framed by the box of its own edge
- * (`EDGE_PROP_SIZE`). Null for a bad spot: an unknown kind, no such
- * ordinal, no ordinal at all, or a negative one. The gallery reads both
- * from `?at=`; the controller's browser shots start every malfunction or
- * every model there. Development only, like everything in `dev/`.
+ * (`EDGE_PROP_SIZE`). `n` is the ordinal a hero or prop of that kind holds
+ * in the room's own order (`HERO_ORDER` for a hero), not its variant: the
+ * two usually line up, but the field pack is one kind where they do not
+ * (its variant 1 sorts before variant 0 in the hero hall). Null for a bad
+ * spot: an unknown kind, no such ordinal, no ordinal at all, or a negative
+ * one. The gallery reads both from `?at=`; the controller's browser shots
+ * start every malfunction or every model there. Development only, like
+ * everything in `dev/`.
  */
 export function spotSpawn(
   room: RoomSpec,
@@ -226,7 +200,7 @@ export function spotSpawn(
   if ((PROP_KINDS as readonly string[]).includes(kind)) {
     const p = room.props.filter((x) => x.kind === kind)[i];
     if (p === undefined) return null;
-    const box = propFootprint(p) ?? footprint(wallEdgeOf(p), EDGE_PROP_SIZE);
+    const box = propFootprint(p) ?? footprint(edgeOf(p), EDGE_PROP_SIZE);
     return frameSpot(room, box, HERO_FRONT[p.turn] ?? [0, -1]);
   }
   return null;

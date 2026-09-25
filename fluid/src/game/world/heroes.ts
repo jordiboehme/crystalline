@@ -549,8 +549,11 @@ interface HeroCandidate {
  * The quarter turn that faces a corner hero at `(x, y)` towards the hall's
  * centre as near as a quarter turn allows (H10): north or south when the
  * centre lies at least as far along y as along x, else east or west.
+ * Exported so `canned.ts`'s hand-placed hero hall can turn its turret the
+ * same way a generated room's corner hero would, rather than keep its own
+ * copy.
  */
-function faceCentre(hall: Rect, x: number, y: number): number {
+export function faceCentre(hall: Rect, x: number, y: number): number {
   const dx = (hall.x0 + hall.x1) / 2 - x;
   const dy = (hall.y0 + hall.y1) / 2 - y;
   if (Math.abs(dy) >= Math.abs(dx)) return dy < 0 ? 0 : 2;

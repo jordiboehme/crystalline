@@ -35,7 +35,7 @@ import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
 import { PROP_ORDER } from "./dress";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
-import { HERO_ORDER } from "./heroes";
+import { faceCentre, HERO_ORDER } from "./heroes";
 import {
   createSlotPool,
   planLayout,
@@ -813,20 +813,6 @@ const HERO_HALL_NEED = {
 /** The hero hall's one light level, steady everywhere, as `galleryRoom`'s. */
 const HERO_HALL_LIGHT = 210;
 
-/**
- * The quarter turn that faces a corner hero towards the hall's centre, as
- * near as a quarter turn allows (H10): the same rule `placeHeroes` turns a
- * corner hero by (`faceCentre` in `heroes.ts`), copied here since the hero
- * hall is hand-built rather than generated and that helper is private to
- * `heroes.ts`.
- */
-function faceHallCentre(hall: Rect, x: number, y: number): number {
-  const dx = (hall.x0 + hall.x1) / 2 - x;
-  const dy = (hall.y0 + hall.y1) / 2 - y;
-  if (Math.abs(dy) >= Math.abs(dx)) return dy < 0 ? 0 : 2;
-  return dx > 0 ? 1 : 3;
-}
-
 /** One steady light zone per four by four block that holds any floor, as `galleryRoom`'s. */
 function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
   const lights: LightZone[] = [];
@@ -870,8 +856,8 @@ function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
  * edges, x 6 and x 7, combined the way `heroEdges`'s two-edge case combines
  * them, into the anchor `(7, 0)` at turn 2), the band, corner and centre
  * ones at fixed coordinates directly, and the turret turned to face the
- * hall's centre the way a generated room's corner hero would
- * (`faceHallCentre`, H10). Every hero's seed is `seedFor(seed, "hero",
+ * hall's centre the way a generated room's corner hero would (`faceCentre`
+ * in `heroes.ts`, H10). Every hero's seed is `seedFor(seed, "hero",
  * kind, variant)`, keyed by its kind and variant since a hand-placed room
  * has no candidate to key a seed by anchor with, and the list is sorted by
  * `HERO_ORDER`, the order a generated room's own heroes keep.
@@ -928,7 +914,7 @@ export function heroHallRoom(): RoomSpec {
     at("black-slab", 0, 11.5, 11.925, 2),
     at("sleep-ring", 0, 6.5, 19, 0),
     at("mess-table", 0, 16.5, 19, 0),
-    at("turret", 0, 21.5, 22.5, faceHallCentre(hall, 21.5, 22.5)),
+    at("turret", 0, 21.5, 22.5, faceCentre(hall, 21.5, 22.5)),
     at("field-pack", 0, 1.5, 22.5, 1),
     at("field-pack", 1, 21.5, 1.5, 2),
   ].sort(HERO_ORDER);
