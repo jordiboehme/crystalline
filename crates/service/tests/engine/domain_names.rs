@@ -689,7 +689,7 @@ async fn a_local_name_registered_by_another_process_wins_at_once() {
     );
 }
 
-// --- registration write-back (Task 11) ---------------------------------------
+// --- registration write-back ---------------------------------------
 
 /// A folder holding a MANIFEST that declares `domain_name: declared`, not yet
 /// registered in any engine's config.
@@ -823,7 +823,7 @@ async fn nameless_add_writes_the_basename_default_back_into_a_bare_manifest() {
 }
 
 /// A brand-new folder with no MANIFEST at all gets one scaffolded that
-/// already carries the derived basename as its `domain_name` (Task 3a); the
+/// already carries the derived basename as its `domain_name`; the
 /// write-back path itself has nothing left to do.
 #[tokio::test]
 async fn a_fresh_folder_scaffold_already_carries_the_derived_name() {
@@ -940,7 +940,7 @@ async fn a_numeric_looking_explicit_name_round_trips_as_a_string() {
     );
 }
 
-// --- adoption after a sync (Task 17) ------------------------------------------
+// --- adoption after a sync ------------------------------------------
 
 /// A config file on disk holding `domains`, and an engine over it with a
 /// state directory, the way a daemon reads both at startup.
@@ -1358,7 +1358,7 @@ async fn a_rename_and_its_sync_never_run_an_adoption() {
     );
 }
 
-// --- list_domains name fields (Task 21) --------------------------------------
+// --- list_domains name fields --------------------------------------
 
 async fn listed_domains(engine: &Engine) -> Value {
     engine

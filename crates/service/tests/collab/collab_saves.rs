@@ -962,7 +962,7 @@ async fn dispose_domain_sweeps_every_overlay_owners_room() {
 }
 
 // ---------------------------------------------------------------------------
-// domain name normalization (Task 18): the Fluid editor's save path is the
+// domain name normalization: the Fluid editor's save path is the
 // same funnel write_engram and edit_engram pass their final text through, not
 // a route around it.
 // ---------------------------------------------------------------------------

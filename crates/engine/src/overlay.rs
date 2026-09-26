@@ -664,6 +664,20 @@ pub struct LoadedConfig {
     pub overlay: EnvOverlay,
 }
 
+impl LoadedConfig {
+    /// The name table this configuration alone gives, for a command that
+    /// opens no index: over the effective configuration, environment domains
+    /// included, each file domain's canonical name read off its MANIFEST and
+    /// a virtual domain's local name only (its declared name lives in the
+    /// database).
+    pub fn name_table(&self) -> crystalline_core::names::NameTable {
+        crystalline_core::names::NameTable::from_config(
+            &self.effective,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+}
+
 /// The single load chokepoint every `GlobalConfig` load routes through: parse
 /// the overlay from the process environment, resolve the config path, read the
 /// file (a missing file reading as the default) and layer the overlay on top.

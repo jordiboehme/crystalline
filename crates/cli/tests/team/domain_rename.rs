@@ -34,6 +34,10 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> std::process::Output {
         let mut cmd = bin();
         isolate(&mut cmd, self.home.path());
+        // This machine's own configuration is the fixture's file: a rename
+        // runs only against this machine's own configuration, and `--config`
+        // naming that same file is what keeps the daemon out of it.
+        cmd.env("CRYSTALLINE_CONFIG", &self.config);
         cmd.args(args);
         cmd.output().unwrap()
     }
@@ -233,8 +237,7 @@ fn domain_rename_local_leaves_the_manifest_and_links_untouched() {
 /// (`control::localized_request`). The standalone path has no such pre-pass
 /// of its own, but `Engine::rename_domain` localizes its `domain` argument
 /// against the name table as the very first thing it does, so the same
-/// spellings work here too - this is the carry from Task 8 this task closes
-/// for the rename entry point specifically.
+/// spellings work here too, for the rename entry point specifically.
 #[test]
 fn domain_rename_standalone_accepts_a_canonical_name_like_the_daemon_path() {
     let fx = Fixture::new();
@@ -313,7 +316,7 @@ fn domain_remove_standalone_accepts_a_canonical_name_like_the_daemon_path() {
     assert!(listed["domains"].as_array().unwrap().is_empty(), "{listed}");
 }
 
-/// The carry from Task 8 reaches every standalone domain command whose
+/// Name resolution reaches every standalone domain command whose
 /// daemon path resolves a canonical name or alias
 /// (`control::DOMAIN_REFERENCE_COMMANDS`), not only `domain remove` and
 /// `domain rename` themselves: `domain review` is one more of them, and the
@@ -427,7 +430,7 @@ fn domain_list_marks_a_shadowed_canonical_name() {
     assert!(human.contains("shadowed"), "{human}");
 }
 
-/// Task 23b item 1: a virtual domain's declared canonical name (its
+/// A virtual domain's declared canonical name (its
 /// MANIFEST engram, in the database) shows in the NAME column too, not only
 /// a file domain's (read straight off disk). Standalone, no daemon: the
 /// index is opened read-only to read the one MANIFEST engram the virtual
@@ -477,9 +480,9 @@ fn domain_list_shows_a_virtual_domains_declared_name_without_a_daemon() {
     );
 }
 
-/// Task 23b item 2: `sync <name>` without a daemon resolves its argument
-/// through the name table like every other standalone domain command
-/// (Task 23 binding A), rather than matching it against the config's local
+/// `sync <name>` without a daemon resolves its argument
+/// through the name table like every other standalone domain command,
+/// rather than matching it against the config's local
 /// keys directly.
 #[test]
 fn sync_standalone_accepts_a_canonical_name_like_the_daemon_path() {

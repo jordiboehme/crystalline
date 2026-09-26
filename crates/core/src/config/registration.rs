@@ -164,28 +164,9 @@ pub fn derive_domain_name(raw: &str, taken: impl Fn(&str) -> bool) -> String {
     // Room for a `-NN` suffix inside the cap; a slug is ASCII, so chars and
     // bytes agree here.
     let base: String = slug.chars().take(MAX_DOMAIN_NAME_CHARS - 4).collect();
-    let base = base.trim_end_matches('-').to_string();
-    let usable = |candidate: &str| validate_domain_name(candidate).is_ok() && !taken(candidate);
-    if usable(&base) {
-        return base;
-    }
-    let mut n = 2;
-    loop {
-        // Shorten the base by the suffix's length, so a long base keeps every
-        // candidate inside the cap however far the counter climbs (a 60
-        // character base would otherwise overflow from `-1000` on and never
-        // validate again).
-        let suffix = format!("-{n}");
-        let stem: String = base
-            .chars()
-            .take(MAX_DOMAIN_NAME_CHARS.saturating_sub(suffix.len()))
-            .collect();
-        let candidate = format!("{}{suffix}", stem.trim_end_matches('-'));
-        if usable(&candidate) {
-            return candidate;
-        }
-        n += 1;
-    }
+    // A slug carries no `.`, so the stepping below trims exactly what this
+    // function always trimmed.
+    step_domain_name(base.trim_end_matches('-'), taken)
 }
 
 /// The default name for a domain rooted at GitHub repository `repo`
@@ -323,8 +304,7 @@ pub fn choose_domain_name(
 /// never for a team domain (`entry.origin` set) whatever its name's origin -
 /// explicit or derived. The owner adds the name upstream by hand; an
 /// automatic write would plant a pending local change that blocks review
-/// mode and conflicts once the owner adds the name upstream (Jordi's ruling
-/// 2026-09-26, option A). Otherwise written for every plain local file or
+/// mode and conflicts once the owner adds the name upstream. Otherwise written for every plain local file or
 /// virtual domain (no `origin`), whatever its name's origin.
 pub fn needs_manifest_write_back(entry: &DomainEntry, manifest_declares: bool) -> bool {
     !manifest_declares && entry.origin.is_none()

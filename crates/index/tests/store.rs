@@ -922,19 +922,33 @@ async fn spelling_writes_refuse_to_nest_in_a_transaction(store: &dyn Store) {
         .await
         .unwrap();
     store.begin().await.unwrap();
-    assert!(
+    // Refused because a transaction is already open, and for nothing else:
+    // each backend says so in its own words, both of them naming it.
+    let refused_for_nesting = |what: &str, result: crystalline_index::Result<()>| {
+        let err = result.expect_err(what).to_string().to_lowercase();
+        assert!(
+            err.contains("transaction"),
+            "{what} is refused for the open transaction: {err}"
+        );
+    };
+    refused_for_nesting(
+        "replace_domain_spellings",
         store
             .replace_domain_spellings(&[("x".to_string(), a)])
             .await
-            .is_err()
+            .map(|_| ()),
     );
-    assert!(
+    refused_for_nesting(
+        "reset_references_to_spellings",
         store
             .reset_references_to_spellings(&["x".to_string()])
             .await
-            .is_err()
+            .map(|_| ()),
     );
-    assert!(store.rename_domain_row("a", "b").await.is_err());
+    refused_for_nesting(
+        "rename_domain_row",
+        store.rename_domain_row("a", "b").await.map(|_| ()),
+    );
     store.rollback().await.unwrap();
     assert_eq!(
         store.domain_spellings().await.unwrap(),

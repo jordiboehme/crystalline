@@ -662,7 +662,7 @@ async fn a_declared_name_makes_a_refused_repo_name_moot() {
     assert_eq!(result["domain"], "eng", "{result}");
 }
 
-// --- adoption after a pull (Task 17) ------------------------------------------
+// --- adoption after a pull ------------------------------------------
 
 /// The owner adds `domain_name: eng` upstream: the pull lands it, and once
 /// the pull has finished the derived team domain is renamed to `eng` on this

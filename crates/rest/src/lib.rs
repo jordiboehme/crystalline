@@ -1235,6 +1235,68 @@ mod tests {
         assert!(peak > 1, "and the limiter must not serialize them either");
     }
 
+    /// How many times a request through the whole router resolved its
+    /// caller, and the status it was answered with.
+    async fn resolves_for(state: &RestState, path: &str) -> (usize, http::StatusCode) {
+        use tower_service::Service;
+        let request = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        auth::RESOLVE_COUNT
+            .scope(std::cell::Cell::new(0), async {
+                let status = router(state.clone()).call(request).await.unwrap().status();
+                (auth::RESOLVE_COUNT.with(|count| count.get()), status)
+            })
+            .await
+    }
+
+    /// A request resolves its caller once, also when its path names a domain
+    /// by an alias, where the step ahead of routing has to know the caller
+    /// to decide whether to spell the local name: the guard takes that
+    /// answer, the refusal of a caller nobody signed in included.
+    #[tokio::test]
+    async fn a_request_resolves_its_caller_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("platform");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = crystalline_core::config::GlobalConfig::default();
+        config.domains.insert(
+            "platform".to_string(),
+            crystalline_core::config::DomainEntry {
+                path: Some(root),
+                aliases: vec!["eng".to_string()],
+                ..Default::default()
+            },
+        );
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            config,
+            None,
+            None,
+        ));
+        let auth = Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        let state = RestState::new(engine, auth, &[]).unwrap();
+        assert_eq!(
+            state.engine.local_domain_name("eng").await.as_deref(),
+            Some("platform"),
+            "the alias is what the step ahead of routing rewrites"
+        );
+
+        for path in ["/domains/eng/tree", "/domains/platform/tree", "/search"] {
+            let (resolves, status) = resolves_for(&state, path).await;
+            assert_eq!(resolves, 1, "{path}");
+            assert_eq!(status, http::StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+
     #[test]
     fn a_comma_list_splits_and_drops_the_empties() {
         assert_eq!(csv(Some("a,b")), vec!["a".to_string(), "b".to_string()]);

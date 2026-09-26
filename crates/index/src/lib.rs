@@ -35,7 +35,7 @@ pub use embed::{
     prune_model_cache, run_embedding_pass, run_embedding_pass_with_page,
 };
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
-pub use factory::open_store;
+pub use factory::{open_store, store_location};
 pub use store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,

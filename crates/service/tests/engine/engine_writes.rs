@@ -2352,7 +2352,7 @@ async fn a_capture_titled_manifest_never_replaces_the_domains_manifest() {
 }
 
 // ---------------------------------------------------------------------------
-// domain name normalization (Task 18): every write stores a cross-domain
+// domain name normalization: every write stores a cross-domain
 // link with the canonical domain name, wherever the registrations resolve it
 // back to the same domain.
 // ---------------------------------------------------------------------------

@@ -745,7 +745,7 @@ async fn issue_92_four_drifted_engrams_are_repaired_in_place() {
 }
 
 // ---------------------------------------------------------------------------
-// domain name normalization (Task 18)
+// domain name normalization
 // ---------------------------------------------------------------------------
 
 /// A cross-domain move rewrites references to the moved engram's OWN address,

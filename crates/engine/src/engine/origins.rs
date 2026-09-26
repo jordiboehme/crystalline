@@ -281,7 +281,7 @@ impl Engine {
             // nameless registration (or a legacy entry that says nothing)
             // records `derived`. Nothing is written back into the team's
             // MANIFEST either way: a team domain never gets `domain_name`
-            // written automatically (Jordi's ruling 2026-09-26).
+            // written automatically.
             entry.name_origin = match name_origin {
                 NameOrigin::Explicit => Some(NameOrigin::Explicit),
                 NameOrigin::Derived => entry.name_origin.or(Some(NameOrigin::Derived)),

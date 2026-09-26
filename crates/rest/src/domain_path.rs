@@ -34,16 +34,29 @@ pub(crate) async fn localize_domain_path(
     // The URI and the headers rather than the request: a body is not
     // `Sync`, so a borrow of the whole request held across an await would
     // make this future unsendable.
-    let rewritten = localized_uri(&state, req.uri(), req.headers()).await;
+    let mut resolved = None;
+    let rewritten = localized_uri(&state, req.uri(), req.headers(), &mut resolved).await;
     if let Some(uri) = rewritten {
         *req.uri_mut() = uri;
+    }
+    // The caller this step resolved, handed to the guard, which would
+    // otherwise resolve it a second time.
+    if let Some(resolved) = resolved {
+        req.extensions_mut()
+            .insert(crate::auth::ResolvedIdentity::new(resolved));
     }
     next.run(req).await
 }
 
 /// The request's URI with its domain segment spelled as the local name, or
-/// `None` when there is nothing to rewrite.
-async fn localized_uri(state: &RestState, uri: &Uri, headers: &HeaderMap) -> Option<Uri> {
+/// `None` when there is nothing to rewrite. A caller it had to resolve to
+/// decide lands in `resolved`, whatever the resolution said.
+async fn localized_uri(
+    state: &RestState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    resolved: &mut Option<Result<crate::auth::Identity, crate::error::ApiError>>,
+) -> Option<Uri> {
     let path = uri.path();
     let (start, end) = domain_segment(path)?;
     let typed = percent_decode_str(&path[start..end]).decode_utf8().ok()?;
@@ -55,7 +68,8 @@ async fn localized_uri(state: &RestState, uri: &Uri, headers: &HeaderMap) -> Opt
     }
     // Who is asking, resolved the way the guard resolves it. A request the
     // guard is going to refuse keeps its path; the guard answers it.
-    let identity = crate::auth::resolve(state, headers).await.ok()?;
+    let identity = resolved.insert(crate::auth::resolve(state, headers).await);
+    let identity = identity.as_ref().ok()?;
     let hidden = state.engine.hidden_for(&identity.scope()).await.ok()?;
     if hidden.contains(&local) {
         return None;

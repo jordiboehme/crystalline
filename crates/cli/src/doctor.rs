@@ -760,8 +760,50 @@ pub struct DoctorReport {
     /// Domain name findings. `None` when the check did not run: a `--domain`
     /// run, or no route to the index.
     pub names: Option<NamesDoctor>,
+    /// A domain rename an earlier run left half done. `None` when no rename
+    /// journal waits in the state directory.
+    pub rename: Option<RenameDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
+}
+
+/// A rename journal waiting in the state directory: a domain rename an
+/// earlier run left half done.
+///
+/// A journal that belongs to this machine's own index and configuration is
+/// finished by the daemon when it starts and by the next plain command.
+/// One recorded against another spelling of them (the database url or the
+/// configuration path written differently since) is finished by nobody on
+/// its own: the report names the command that finishes it, with the index
+/// and configuration the journal recorded, and `--discard-rename` is the
+/// explicit way to drop it. `--fix` never touches it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RenameDoctor {
+    /// The local name the domain had.
+    pub old: String,
+    /// The local name it gets.
+    pub new: String,
+    /// Whether the rename leaves the MANIFEST and links alone.
+    pub local_only: bool,
+    /// The steps the rename already ran, in order.
+    pub done: Vec<String>,
+    /// The steps still to run, in order.
+    pub remaining: Vec<String>,
+    /// The index, configuration and state directory the journal records;
+    /// `None` for a journal that does not say.
+    pub owner: Option<String>,
+    /// This machine's own index, configuration and state directory.
+    pub this_machine: Option<String>,
+    /// Whether the journal belongs to this machine's own index and
+    /// configuration, so the daemon or the next plain command finishes it.
+    pub belongs_here: bool,
+    /// The command that finishes the rename.
+    pub finish: Option<String>,
+    /// Whether `--discard-rename` deleted the journal in this run.
+    pub discarded: bool,
+    /// Why the journal could not be read or discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl DoctorReport {
@@ -863,6 +905,16 @@ impl DoctorReport {
                 .collect();
             n += files.len();
         }
+        // A rename journal nobody finishes on their own: it was recorded
+        // against another index or configuration than the ones this machine
+        // opens now, and its domain stays half moved until a person runs the
+        // command the report names or discards it.
+        if let Some(r) = &self.rename
+            && !r.discarded
+            && (!r.belongs_here || r.error.is_some())
+        {
+            n += 1;
+        }
         // Provisioning never contributes here, the same stance environment
         // takes: an undecided domain is a normal state awaiting a person's
         // answer, and drift, edited and orphaned rows all self-heal at the
@@ -876,6 +928,7 @@ impl DoctorReport {
 pub async fn run(
     domain_filter: Option<&str>,
     fix: bool,
+    discard_rename: bool,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<DoctorReport> {
@@ -1017,6 +1070,8 @@ pub async fn run(
 
     let tags = check_tags(store_ref, cfg).await?;
 
+    let rename = check_rename_journal(discard_rename);
+
     Ok(DoctorReport {
         index,
         domains,
@@ -1029,8 +1084,157 @@ pub async fn run(
         orphaned_rows,
         tags,
         names,
+        rename,
         fix,
     })
+}
+
+/// The rename journal waiting in this machine's state directory, compared
+/// with this machine's own index and configuration; with `discard`, deleted
+/// (only while this process can take the state directory, so a daemon
+/// running the journal is never cut off). Never an error: a journal that
+/// cannot be read is reported as such.
+fn check_rename_journal(discard: bool) -> Option<RenameDoctor> {
+    let state_dir = config::state_dir().ok()?;
+    let pending = match crystalline_service::pending_rename(&state_dir) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return None,
+        Err(e) => {
+            return Some(RenameDoctor {
+                error: Some(e.to_string()),
+                ..RenameDoctor::default()
+            });
+        }
+    };
+    let here = crystalline_service::machine_rename_owner();
+    let mut report = rename_doctor(&pending, here.as_ref().ok());
+    if let Err(e) = &here {
+        report.error = Some(format!(
+            "this machine's own index could not be named: {e:#}"
+        ));
+    }
+    if discard {
+        match crystalline_service::discard_rename_journal() {
+            Ok(_) => report.discarded = true,
+            Err(e) => report.error = Some(format!("{e:#}")),
+        }
+    }
+    Some(report)
+}
+
+/// [`RenameDoctor`] for `pending`, set against `here`, this machine's own
+/// index, configuration and state directory when they could be named.
+fn rename_doctor(
+    pending: &crystalline_service::PendingRename,
+    here: Option<&crystalline_service::RenameOwner>,
+) -> RenameDoctor {
+    let belongs_here = matches!((&pending.owner, here), (Some(owner), Some(here)) if owner == here);
+    let local = if pending.local_only { " --local" } else { "" };
+    let finish = if belongs_here {
+        Some(format!(
+            "crystalline domain rename {} {}{local}",
+            pending.old, pending.new
+        ))
+    } else {
+        pending.owner.as_ref().map(|owner| {
+            // A Turso index is a file the command names with `--db`; a
+            // Postgres one comes from the configuration alone.
+            let db = owner
+                .index
+                .as_deref()
+                .filter(|index| Path::new(index).is_absolute())
+                .map(|index| format!(" --db {index}"))
+                .unwrap_or_default();
+            let config = owner
+                .config
+                .as_deref()
+                .map(|config| format!(" --config {config}"))
+                .unwrap_or_default();
+            format!(
+                "crystalline{db} domain rename {} {}{local}{config}",
+                pending.old, pending.new
+            )
+        })
+    };
+    RenameDoctor {
+        old: pending.old.clone(),
+        new: pending.new.clone(),
+        local_only: pending.local_only,
+        done: pending.done.iter().map(|s| s.name().to_string()).collect(),
+        remaining: pending
+            .remaining
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect(),
+        owner: pending.owner.as_ref().map(|o| o.describe()),
+        this_machine: here.map(|h| h.describe()),
+        belongs_here,
+        finish,
+        discarded: false,
+        error: None,
+    }
+}
+
+/// The rename journal section of the human report.
+fn render_rename(out: &mut String, r: &RenameDoctor) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "rename:");
+    if r.old.is_empty() {
+        if let Some(error) = &r.error {
+            let _ = writeln!(out, "  [problem] {error}");
+        }
+        return;
+    }
+    let steps = |list: &[String]| {
+        if list.is_empty() {
+            "none".to_string()
+        } else {
+            list.join(", ")
+        }
+    };
+    let what = format!(
+        "the rename of '{}' to '{}' is half done: done {}; still to run {}",
+        r.old,
+        r.new,
+        steps(&r.done),
+        steps(&r.remaining)
+    );
+    if r.discarded {
+        let _ = writeln!(
+            out,
+            "  [discarded] {what}. The journal is gone; the steps already done stay as they are, \
+             so finish or undo them by hand"
+        );
+        return;
+    }
+    if r.belongs_here {
+        let _ = writeln!(
+            out,
+            "  [warning] {what}. The daemon finishes it when it starts, and so does the next \
+             command run without --db and --config"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  [problem] {what}. It belongs to {}, and this machine now opens {}, so nothing \
+             finishes it on its own",
+            r.owner.as_deref().unwrap_or("no recorded index"),
+            r.this_machine
+                .as_deref()
+                .unwrap_or("an index that could not be named")
+        );
+        if let Some(finish) = &r.finish {
+            let _ = writeln!(out, "  run: {finish}");
+        }
+        let _ = writeln!(
+            out,
+            "  or drop it with: crystalline doctor --discard-rename (the steps already done stay \
+             as they are)"
+        );
+    }
+    if let Some(error) = &r.error {
+        let _ = writeln!(out, "  [problem] {error}");
+    }
 }
 
 /// The domain name findings, asked of the daemon that owns the index and
@@ -2846,6 +3050,10 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(names) = &report.names {
         render_names(&mut out, names, report.fix);
+    }
+
+    if let Some(rename) = &report.rename {
+        render_rename(&mut out, rename);
     }
 
     // Advisory tag hygiene: near-duplicate clusters, never a counted problem.

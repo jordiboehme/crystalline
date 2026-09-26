@@ -285,6 +285,11 @@ enum Command {
         /// stale service lock or socket files.
         #[arg(long)]
         fix: bool,
+        /// Delete the journal of a domain rename an earlier run left half
+        /// done, leaving the steps it already ran as they are. Never done by
+        /// --fix: the report names what is half moved first.
+        #[arg(long)]
+        discard_rename: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -309,6 +314,11 @@ enum Command {
         /// never leaves the lock held.
         #[arg(long, default_value_t = 30)]
         secs: u64,
+        /// Publish the record a one-shot command publishes, naming this
+        /// command, instead of a daemon's, and let go of the lock when the
+        /// time is up, as that command does when it finishes.
+        #[arg(long)]
+        standalone: Option<String>,
     },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, plus MCP, the JSON API and the web UI over HTTP at
@@ -1763,10 +1773,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Doctor {
             domain,
             fix,
+            discard_rename,
             config,
-        }) => on_runtime(move || run_doctor(domain, fix, config, cli.db, cli.json)),
+        }) => on_runtime(move || run_doctor(domain, fix, discard_rename, config, cli.db, cli.json)),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
-        Some(Command::HoldLock { secs }) => hold_lock(secs),
+        Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
         Some(Command::Serve {
             http,
             allowed_host,
@@ -1917,11 +1928,14 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// left on their default handling on purpose, so a `SIGTERM` ends this process
 /// without running the ownership drop, exactly as a killed daemon leaves its
 /// record and socket file behind.
-fn hold_lock(secs: u64) -> anyhow::Result<()> {
+fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = {
         let ownership = crystalline_service::instance::acquire_ownership()?;
-        ownership.publish()?;
+        match standalone {
+            Some(command) => ownership.publish_standalone(command)?,
+            None => ownership.publish()?,
+        }
         ownership
     };
     // The readiness line: a caller waits for it before treating the lock as
@@ -2060,6 +2074,11 @@ async fn status_dispatch(
                     crystalline_service::instance::unknown_holder_error(&detail)
                 );
             }
+            crystalline_service::instance::HolderState::Standalone { pid, command } => {
+                eprintln!(
+                    "note: the standalone command `{command}` (pid {pid}) holds this machine's state directory until it finishes; reporting from a direct index read instead"
+                );
+            }
             _ => {
                 // A live record with a free lock: no holder to name, but the
                 // daemon it describes is unreachable all the same.
@@ -2109,12 +2128,13 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    let cfg = cmd::load(config.as_deref())?.effective;
+    let loaded = cmd::load(config.as_deref())?;
+    let cfg = &loaded.effective;
     let route = cmd::reach_index(
         Some(
             json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
         ),
-        &cfg,
+        cfg,
         config.as_deref(),
         db.as_deref(),
         cmd::OpenAs::Write,
@@ -2164,16 +2184,13 @@ async fn sync_dispatch(
     // own - unlike the daemon path above, whose ctl `sync` is one of
     // `control::DOMAIN_REFERENCE_COMMANDS` and so is pre-localized before it
     // ever reaches the engine. Resolved here through the config-only name
-    // table (Task 23 binding A), the same one every other standalone domain
+    // table, the same one every other standalone domain
     // command now uses: a canonical name or a machine-local alias means the
     // same domain here that it would with a daemon running.
-    let resolved_domain = domain.as_deref().map(|d| {
-        crystalline_core::names::NameTable::from_config(&cfg, &std::collections::BTreeMap::new())
-            .resolve(d)
-            .unwrap_or(d)
-            .to_string()
-    });
-    cmd::sync(store.clone(), &cfg, resolved_domain.as_deref(), embed, json).await?;
+    let resolved_domain = domain
+        .as_deref()
+        .map(|d| loaded.name_table().resolve(d).unwrap_or(d).to_string());
+    cmd::sync(store.clone(), cfg, resolved_domain.as_deref(), embed, json).await?;
     // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
     // synced MANIFEST may declare a new name. A sync that failed says so and
     // adopts nothing. The adoption cannot fail the sync that landed: its own
@@ -2192,6 +2209,14 @@ async fn sync_dispatch(
             serde_json::Value::Array(Vec::new())
         }
     };
+    // A sync of an index named by --db or --config never lines names up (the
+    // log says why at warn); this line says it whatever the log filter is.
+    if !crystalline_service::use_daemon(db.as_deref(), config.as_deref()) {
+        eprintln!(
+            "note: domain names were not lined up with their MANIFESTs; run `crystalline sync` \
+             without --db and --config to do it"
+        );
+    }
     if !json {
         for entry in names.as_array().into_iter().flatten() {
             match entry["action"].as_str() {
@@ -3124,11 +3149,19 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
 async fn run_doctor(
     domain: Option<String>,
     fix: bool,
+    discard_rename: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let report = doctor::run(domain.as_deref(), fix, config.as_deref(), db.as_deref()).await?;
+    let report = doctor::run(
+        domain.as_deref(),
+        fix,
+        discard_rename,
+        config.as_deref(),
+        db.as_deref(),
+    )
+    .await?;
     if json {
         print_value(&serde_json::to_value(&report)?, true);
     } else {

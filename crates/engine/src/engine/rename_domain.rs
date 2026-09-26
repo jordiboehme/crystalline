@@ -442,23 +442,31 @@ impl Engine {
     /// [`Engine::recover_rename_journal`] for an opener: the daemon, the
     /// embedded MCP stack and the standalone command engine call it before
     /// anything reads a name, each only while it holds the ownership of the
-    /// state directory, so no two processes run one journal. The outcome is logged rather than returned: a
-    /// rename that cannot be finished keeps its one domain paused and says
-    /// why, and every other domain is served.
-    pub async fn finish_leftover_rename(&self) {
+    /// state directory, so no two processes run one journal. A failure is
+    /// logged rather than returned: a rename that cannot be finished keeps
+    /// its one domain paused and says why, and every other domain is served.
+    /// A rename it finished is logged and its report answered, for the one
+    /// caller that was about to send that same rename again.
+    pub async fn finish_leftover_rename(&self) -> Option<Value> {
         match self.recover_rename_journal().await {
-            Ok(Some(report)) => tracing::info!(
-                "finished renaming domain '{}' to '{}', which an earlier run left half done",
-                report["previous"].as_str().unwrap_or_default(),
-                report["domain"].as_str().unwrap_or_default()
-            ),
-            Ok(None) => {}
-            Err(err) => tracing::error!(
-                "a domain rename an earlier run left half done could not be finished ({err}); \
+            Ok(Some(report)) => {
+                tracing::info!(
+                    "finished renaming domain '{}' to '{}', which an earlier run left half done",
+                    report["previous"].as_str().unwrap_or_default(),
+                    report["domain"].as_str().unwrap_or_default()
+                );
+                Some(report)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::error!(
+                    "a domain rename an earlier run left half done could not be finished ({err}); \
                  the next start tries again. If it stopped after its MANIFEST and link steps, \
                  that domain stays paused until then: every read of it waits 30 s before it is \
                  answered, and every write to it is refused"
-            ),
+                );
+                None
+            }
         }
     }
 
@@ -1446,7 +1454,8 @@ fn finish_hint(journal: &RenameJournal) -> String {
 fn finish_elsewhere_hint(journal: &RenameJournal) -> String {
     format!(
         "run `crystalline domain rename {} {}{}` without --db and --config, or restart the \
-         daemon, which finishes it before serving",
+         daemon, which finishes it before serving; when neither does, `crystalline doctor` \
+         names the command that finishes it with the index and configuration it recorded",
         journal.old,
         journal.new,
         if journal.local_only { " --local" } else { "" }

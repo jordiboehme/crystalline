@@ -232,13 +232,6 @@ impl Engine {
             .get("created")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // A MANIFEST engram that was already in the index (another instance
-        // over the same index wrote it) may declare a name, and a virtual
-        // domain's declared name is only read by a refresh. A new one was
-        // refreshed by the scaffold.
-        if !manifest_created {
-            self.refresh_names().await;
-        }
         // Best effort, for the same reason the local path's write-back is:
         // the registration already landed and must not be undone by a
         // MANIFEST write that fails afterwards. A no-op whenever the scaffold
@@ -250,6 +243,10 @@ impl Engine {
                 "writing the domain name back into its MANIFEST failed"
             );
         }
+        // Once, after the write-back: a MANIFEST engram that was already in
+        // the index (another instance over the same index wrote it) may
+        // declare a name, and a virtual domain's declared name is only read
+        // by a refresh.
         self.refresh_names().await;
 
         let mut result = json!({
@@ -270,12 +267,12 @@ impl Engine {
     /// A team domain (`entry.origin` set) never qualifies, whatever its
     /// name's origin: the owner adds the name upstream by hand, so this
     /// never plants a pending local change that would block review mode or
-    /// conflict with what the owner adds later (Jordi's ruling 2026-09-26).
+    /// conflict with what the owner adds later.
     ///
     /// Goes through the ordinary source-edit path (`DomainView::for_write`
     /// plus [`Engine::apply_source_edit`]), the way
     /// [`Engine::set_manifest_policies`] writes a policy key: a review-mode
-    /// domain gets a draft, which counts as written (open issue 7).
+    /// domain gets a draft, which counts as written.
     /// [`crate::scope::Scope::Unrestricted`] is the acting scope, the same
     /// one every other write this engine makes on its own account uses -
     /// there is no external caller here to carry a scope from.
@@ -347,10 +344,9 @@ impl Engine {
             if shadowed {
                 map.insert(
                     "note".to_string(),
-                    json!(format!(
-                        "'{canonical_name}' is already a domain here, so this one is registered \
-                         as '{local}'; links that name '{canonical_name}' still reach the other \
-                         domain. Rename one of them to line them up."
+                    json!(crystalline_core::names::shadowed_note(
+                        &canonical_name,
+                        local
                     )),
                 );
             }

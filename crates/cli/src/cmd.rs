@@ -432,15 +432,7 @@ pub(crate) fn domain_add_register(
                 ),
             };
 
-            let manifest = root.join("MANIFEST.md");
-            if !manifest.exists() {
-                bail!(
-                    "no MANIFEST.md at {}. Run: crystalline domain init {}",
-                    root.display(),
-                    root.display()
-                );
-            }
-            let abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let abs = domain_root_with_manifest(&root)?;
 
             match decide_registration(
                 name,
@@ -466,15 +458,7 @@ pub(crate) fn domain_add_register(
             let path =
                 path.ok_or_else(|| anyhow!("name the domain, or point at its folder with --path"))?;
 
-            let manifest = path.join("MANIFEST.md");
-            if !manifest.exists() {
-                bail!(
-                    "no MANIFEST.md at {}. Run: crystalline domain init {}",
-                    path.display(),
-                    path.display()
-                );
-            }
-            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let abs = domain_root_with_manifest(path)?;
 
             match existing_file_domain_at(&abs, &loaded.file) {
                 Some(existing_name) => Ok((existing_name, abs, true, None)),
@@ -503,6 +487,19 @@ pub(crate) fn domain_add_register(
             }
         }
     }
+}
+
+/// `root` in its canonical form, once it holds a `MANIFEST.md`; refused
+/// naming the command that scaffolds one otherwise.
+fn domain_root_with_manifest(root: &Path) -> Result<PathBuf> {
+    if !root.join("MANIFEST.md").exists() {
+        bail!(
+            "no MANIFEST.md at {}. Run: crystalline domain init {}",
+            root.display(),
+            root.display()
+        );
+    }
+    Ok(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
 }
 
 /// Declares `name` in `<root>/MANIFEST.md` when [`needs_manifest_write_back`]
@@ -558,7 +555,10 @@ fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
     let empty = std::collections::BTreeMap::new();
     let mut inputs: Vec<NameInput> = Vec::new();
     for cfg in [&loaded.file, &loaded.effective] {
-        inputs.extend(crystalline_core::names::config_name_inputs(cfg, &empty));
+        inputs.extend(crystalline_core::names::config_name_inputs(
+            &cfg.domains,
+            &empty,
+        ));
     }
     NameTable::build(&inputs)
 }
@@ -579,20 +579,6 @@ fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
             .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
     }
     Ok(())
-}
-
-/// The one sentence shown when a MANIFEST-declared name is already
-/// somebody else's here: `canonical` is the name the MANIFEST asked for,
-/// `local` is the name this registration actually landed on after stepping.
-/// Worded like the engine's own `Engine::append_name_fields` note, so a
-/// person sees the same collision explained the same way whichever surface
-/// registered the domain.
-fn shadowed_note(canonical: &str, local: &str) -> String {
-    format!(
-        "'{canonical}' is already a domain here, so this one is registered as '{local}'; links \
-         that name '{canonical}' still reach the other domain. Rename one of them to line them \
-         up."
-    )
 }
 
 /// Register a virtual domain in the global config (database-backed, no path).
@@ -733,7 +719,8 @@ pub(crate) fn print_domain_add(
             "sync": report,
         });
         if let Some(shadowed) = shadowed {
-            value["note"] = serde_json::json!(shadowed_note(shadowed, name));
+            value["note"] =
+                serde_json::json!(crystalline_core::names::shadowed_note(shadowed, name));
         }
         println!("{value}");
     } else {
@@ -746,7 +733,7 @@ pub(crate) fn print_domain_add(
             println!("Registered domain '{name}' at {}", path.display());
         }
         if let Some(shadowed) = shadowed {
-            println!("{}", shadowed_note(shadowed, name));
+            println!("{}", crystalline_core::names::shadowed_note(shadowed, name));
         }
         print_report(report);
     }
@@ -769,7 +756,8 @@ pub(crate) fn print_domain_add_no_sync(
             "synced": false,
         });
         if let Some(shadowed) = shadowed {
-            value["note"] = serde_json::json!(shadowed_note(shadowed, name));
+            value["note"] =
+                serde_json::json!(crystalline_core::names::shadowed_note(shadowed, name));
         }
         println!("{value}");
     } else {
@@ -782,7 +770,7 @@ pub(crate) fn print_domain_add_no_sync(
             println!("Registered domain '{name}' at {}", path.display());
         }
         if let Some(shadowed) = shadowed {
-            println!("{}", shadowed_note(shadowed, name));
+            println!("{}", crystalline_core::names::shadowed_note(shadowed, name));
         }
         println!("Not synced (--no-sync); run: crystalline sync --domain {name}");
     }
@@ -1706,18 +1694,27 @@ impl ListedStats {
         }
     }
 
-    fn from_json(v: &serde_json::Value) -> Option<ListedStats> {
-        let text = |key: &str| {
-            v.get(key)
+    /// One row of a daemon's `list_domains` reply: `Some(None)` for a domain
+    /// it has not synced yet (`engrams` null), `None` for a row that does not
+    /// read back at all.
+    fn from_list_domains(v: &serde_json::Value) -> Option<Option<ListedStats>> {
+        let name = v.get("name").and_then(serde_json::Value::as_str)?;
+        let engrams = match v.get("engrams") {
+            Some(serde_json::Value::Null) | None => return Some(None),
+            Some(count) => count.as_i64()?,
+        };
+        let host = |key: &str| {
+            v.get("host")
+                .and_then(|h| h.get(key))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         };
-        Some(ListedStats {
-            name: text("name")?,
-            engrams: v.get("engrams").and_then(serde_json::Value::as_i64)?,
-            host_instance_id: text("host_instance_id"),
-            host_heartbeat_at: text("host_heartbeat_at"),
-        })
+        Some(Some(ListedStats {
+            name: name.to_string(),
+            engrams,
+            host_instance_id: host("instance_id"),
+            host_heartbeat_at: host("heartbeat_at"),
+        }))
     }
 }
 
@@ -1821,8 +1818,10 @@ pub async fn domain_list(
     // `ctl_if_running` fail, and letting that fail the command would put the
     // daemon's bare error where this listing's registrations belong - the raw
     // backend text this whole task exists to stop showing a person.
+    // Over a daemon, one `list_domains` call carries both the counts and the
+    // name fields a virtual domain's declared name lives in.
     let route = match reach_index(
-        Some(serde_json::json!({ "v": 1, "cmd": "status" })),
+        Some(serde_json::json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} })),
         &cfg,
         config_override,
         db_override,
@@ -1847,23 +1846,26 @@ pub async fn domain_list(
     let stats: Option<Vec<ListedStats>> = match route {
         None => None,
         Some(route) => match route {
-            // The daemon's own `domain_stats`, annotated with a `hosted_here`
-            // field this command has no use for. A reply that carries no counts,
-            // or a row that does not read back, is a count nobody read: saying so
-            // is the point, and rendering it as an empty set would put every
-            // domain back on the "(not indexed)" line this routing exists to end.
+            // The daemon's own `list_domains`: one row per registered domain,
+            // `engrams` null for a domain it has not synced yet, which is the
+            // "(not indexed)" case below and not a count nobody read. A reply
+            // that carries no rows, or a row that does not read back, is a
+            // count nobody read: saying so is the point, and rendering it as
+            // an empty set would put every domain back on the "(not indexed)"
+            // line this routing exists to end.
             IndexRoute::Daemon(data) => {
                 let parsed = match data.get("domains").and_then(serde_json::Value::as_array) {
                     Some(rows) => {
-                        let parsed: Vec<ListedStats> =
-                            rows.iter().filter_map(ListedStats::from_json).collect();
-                        if parsed.len() == rows.len() {
-                            Some(parsed)
-                        } else {
-                            not_read = Some(
+                        let parsed: Option<Vec<Option<ListedStats>>> =
+                            rows.iter().map(ListedStats::from_list_domains).collect();
+                        match parsed {
+                            Some(parsed) => Some(parsed.into_iter().flatten().collect()),
+                            None => {
+                                not_read = Some(
                             "the running Crystalline daemon answered, but its per-domain counts did not read back in the shape this listing expects. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
                         );
-                            None
+                                None
+                            }
                         }
                     }
                     None => {
@@ -1873,21 +1875,10 @@ pub async fn domain_list(
                         None
                     }
                 };
-                // A running daemon is confirmed reachable - it just answered
-                // `status` - so a second, small ctl call asks it for the name
-                // fields `list_domains` has carried since Task 21
-                // (canonical_name, aliases, name_origin, shadowed, renaming):
-                // a virtual domain's declared name lives in its MANIFEST
-                // engram, in the database, out of reach from configuration
-                // alone. Best effort: a failure here costs the extra column,
-                // never the listing itself, which already has its counts.
-                if let Ok(Some(names_data)) = crystalline_service::ctl_if_running(
-                    serde_json::json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} }),
-                )
-                .await
-                {
-                    virtual_names = virtual_names_from_list_domains(&names_data);
-                }
+                // The same reply names every virtual domain's declared name,
+                // which lives in its MANIFEST engram in the database, out of
+                // reach from configuration alone.
+                virtual_names = virtual_names_from_list_domains(&data);
                 parsed
             }
             IndexRoute::Direct(store) => {

@@ -22,8 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::config::GlobalConfig;
 use crate::config::registration::validate_domain_name;
+use crate::config::{DomainEntry, GlobalConfig};
 use crate::manifest::domain_name_at;
 
 /// The names one registered domain brings to the table.
@@ -52,12 +52,12 @@ pub struct NameInput {
 /// caller (a fresh registration's collision check, most notably) that needs
 /// to union the inputs of more than one [`GlobalConfig`] before building one
 /// table over all of them.
-pub fn config_name_inputs(
-    cfg: &GlobalConfig,
+pub fn config_name_inputs<'a>(
+    domains: impl IntoIterator<Item = (&'a String, &'a DomainEntry)>,
     virtual_names: &BTreeMap<String, String>,
 ) -> Vec<NameInput> {
-    cfg.domains
-        .iter()
+    domains
+        .into_iter()
         .map(|(local, entry)| NameInput {
             local: local.clone(),
             canonical: if entry.is_virtual() {
@@ -68,6 +68,19 @@ pub fn config_name_inputs(
             aliases: entry.aliases.clone(),
         })
         .collect()
+}
+
+/// What a person is told when a domain registered here declares a canonical
+/// name another domain here already uses as its local name: this one is
+/// registered as `local`, and links that name `canonical` still reach the
+/// other one. One sentence for the engine's registration report and the
+/// CLI's direct path.
+pub fn shadowed_note(canonical: &str, local: &str) -> String {
+    format!(
+        "'{canonical}' is already a domain here, so this one is registered as '{local}'; links \
+         that name '{canonical}' still reach the other domain. Rename one of them to line them \
+         up."
+    )
 }
 
 /// A canonical name claimed by more than one domain, none of them
@@ -106,7 +119,8 @@ pub struct NameTable {
 
 impl NameTable {
     /// Builds the table. The result does not depend on the order of
-    /// `inputs`; a local name listed twice counts once (the first entry).
+    /// `inputs`, with one exception: a local name listed twice counts once,
+    /// and the entry that counts is the one that comes first in `inputs`.
     pub fn build(inputs: &[NameInput]) -> NameTable {
         let mut sorted: Vec<&NameInput> = inputs.iter().collect();
         sorted.sort_by(|a, b| a.local.cmp(&b.local));
@@ -222,7 +236,7 @@ impl NameTable {
     /// registration's collision check (by way of [`config_name_inputs`]
     /// directly, since that check unions more than one [`GlobalConfig`]).
     pub fn from_config(cfg: &GlobalConfig, virtual_names: &BTreeMap<String, String>) -> NameTable {
-        NameTable::build(&config_name_inputs(cfg, virtual_names))
+        NameTable::build(&config_name_inputs(&cfg.domains, virtual_names))
     }
 
     /// The local name `spelling` resolves to, if any. Exact spelling only.

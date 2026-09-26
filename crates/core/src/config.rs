@@ -2084,4 +2084,20 @@ mod tests {
         let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(back, cfg);
     }
+
+    #[test]
+    fn a_canonical_seen_value_round_trips() {
+        let mut entry = DomainEntry::file("/tmp/eng");
+        entry.canonical_seen = Some("platform".to_string());
+        let mut cfg = GlobalConfig::default();
+        cfg.domains.insert("eng".to_string(), entry);
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("canonical_seen: platform"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            back.domains["eng"].canonical_seen.as_deref(),
+            Some("platform")
+        );
+        assert_eq!(back, cfg);
+    }
 }

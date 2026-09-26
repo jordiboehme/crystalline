@@ -9,8 +9,8 @@
 
 use std::sync::atomic::Ordering as AtomicOrdering;
 
-use crystalline_core::manifest::{domain_name_at, domain_name_of_source};
-use crystalline_core::names::{NameInput, NameTable};
+use crystalline_core::manifest::domain_name_of_source;
+use crystalline_core::names::{NameTable, config_name_inputs};
 
 use super::*;
 use crate::params::DomainArgs;
@@ -363,7 +363,11 @@ impl Engine {
     /// See [`Engine::names_ticket_for_test`].
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
-    pub fn install_names_for_test(&self, generation: u64, inputs: &[NameInput]) -> Arc<NameTable> {
+    pub fn install_names_for_test(
+        &self,
+        generation: u64,
+        inputs: &[crystalline_core::names::NameInput],
+    ) -> Arc<NameTable> {
         self.install_names(generation, NameTable::build(inputs))
     }
 
@@ -537,19 +541,7 @@ fn build_table(
     entries: &IndexMap<String, DomainEntry>,
     virtual_names: &BTreeMap<String, String>,
 ) -> NameTable {
-    let inputs: Vec<NameInput> = entries
-        .iter()
-        .map(|(local, entry)| NameInput {
-            local: local.clone(),
-            canonical: if entry.is_virtual() {
-                virtual_names.get(local).cloned()
-            } else {
-                entry.file_path().and_then(|root| domain_name_at(&root))
-            },
-            aliases: entry.aliases.clone(),
-        })
-        .collect();
-    NameTable::build(&inputs)
+    NameTable::build(&config_name_inputs(entries, virtual_names))
 }
 
 /// Every domain spelling `p` carries, as written.

@@ -1207,6 +1207,111 @@ fn plant_rename_journal_for(env: &Env, index: &str) {
     .unwrap();
 }
 
+/// A journal of a rename of `eng` to `platform` recorded against this env's
+/// own index and the configuration file `config`, with `done` already run:
+/// the shape a crash leaves when the configuration was reached through
+/// another spelling than the one this machine opens now.
+fn plant_rename_journal_recorded_with(env: &Env, config: &Path, done: &[&str]) {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap().display().to_string();
+    std::fs::write(
+        env.state_dir().join("rename-journal.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "old": "eng",
+            "new": "platform",
+            "local_only": true,
+            "origin": "explicit",
+            "old_spellings": ["eng"],
+            "owner": {
+                "index": canonical(&env.state_dir().join("index.db")),
+                "config": canonical(config),
+                "state_dir": canonical(&env.state_dir()),
+            },
+            "done": done,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// A journal whose recorded configuration is no longer the one this machine
+/// opens is finished by nobody on its own. `doctor` names it as a problem,
+/// with what is done and what is left, and the command that finishes it with
+/// the recorded `--db` and `--config`; `--fix` leaves it alone; and that
+/// command, which the guard against renaming another index lets through for
+/// exactly this journal, finishes it.
+#[test]
+fn doctor_names_a_rename_journal_nobody_finishes_and_the_command_that_does() {
+    let env = env_with_movable_state("rendoc");
+    let recorded = env.dir.join("recorded.yaml");
+    std::fs::copy(env.config_path(), &recorded).unwrap();
+    plant_rename_journal_recorded_with(&env, &recorded, &[]);
+
+    let (ok, out, err) = env.run_full(&["--json", "doctor"]);
+    assert!(!ok, "a stuck rename is a problem: {out}{err}");
+    let report: Value = serde_json::from_str(&out).unwrap();
+    let rename = &report["rename"];
+    assert_eq!(rename["belongs_here"], json!(false), "{rename}");
+    assert_eq!(rename["done"], json!([]), "{rename}");
+    assert_eq!(rename["remaining"][0], json!("index_row"), "{rename}");
+    let finish = rename["finish"].as_str().unwrap().to_string();
+    let recorded_text = std::fs::canonicalize(&recorded)
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        finish.starts_with("crystalline --db ")
+            && finish.contains("domain rename eng platform --local --config ")
+            && finish.ends_with(&recorded_text),
+        "{finish}"
+    );
+
+    let (_, human, _) = env.run_full(&["doctor", "--fix"]);
+    assert!(
+        human.contains("the rename of 'eng' to 'platform' is half done")
+            && human.contains("crystalline doctor --discard-rename"),
+        "{human}"
+    );
+    assert!(
+        env.state_dir().join("rename-journal.json").is_file(),
+        "--fix never drops a journal"
+    );
+
+    let args: Vec<&str> = finish.split(' ').skip(1).collect();
+    let (ok, out, err) = env.run_full(&args);
+    assert!(ok, "the named command finishes the rename: {out}{err}");
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    assert!(
+        env.state_dir()
+            .join("origins/platform/state.json")
+            .is_file()
+    );
+    let cfg: GlobalConfig = config::load_yaml(&recorded).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+}
+
+/// `doctor --discard-rename` drops a journal on request, and says that the
+/// steps it already ran stay as they are.
+#[test]
+fn doctor_discards_a_rename_journal_only_when_asked() {
+    let env = env_with_movable_state("rendis");
+    let recorded = env.dir.join("recorded.yaml");
+    std::fs::copy(env.config_path(), &recorded).unwrap();
+    plant_rename_journal_recorded_with(&env, &recorded, &["index_row"]);
+
+    let (_, human, _) = env.run_full(&["doctor", "--discard-rename"]);
+    assert!(
+        human.contains("[discarded]")
+            && human.contains("done index_row")
+            && human.contains("finish or undo them by hand"),
+        "{human}"
+    );
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    let (_, out, _) = env.run_full(&["--json", "doctor"]);
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert!(report["rename"].is_null(), "{report}");
+}
+
 /// A command that names another index with `--db` leaves a rename journal of
 /// this machine's own index alone: nothing moves, the configuration keeps the
 /// old name, and a warning names the command that finishes it for real. The
@@ -1346,6 +1451,11 @@ fn a_sync_with_an_override_adopts_no_name() {
     let config_path = env.config_path();
     let (ok, out, err) = env.run_full(&["sync", "--config", config_path.to_str().unwrap()]);
     assert!(ok, "{out}{err}");
+    assert!(
+        err.contains("note: domain names were not lined up")
+            && err.contains("run `crystalline sync` without --db and --config"),
+        "the sync says the names were not lined up, and which command does it: {err}"
+    );
     let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
     assert!(
         cfg.domains.contains_key("kb-plat") && !cfg.domains.contains_key("platform"),
@@ -1407,6 +1517,155 @@ fn a_standalone_command_leaves_the_rename_to_the_lock_holder() {
     );
     let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
     assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+}
+
+/// The state a rename moves, read back byte for byte: the origin and draft
+/// folders under the state directory, the accounts database, the provision
+/// receipt and the configuration file, each keyed by its path.
+fn rename_state_snapshot(env: &Env, extra: &[&Path]) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        if path.is_dir() {
+            out.push((path.to_path_buf(), Vec::new()));
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                walk(&entry, out);
+            }
+        } else if path.is_file() {
+            out.push((path.to_path_buf(), std::fs::read(path).unwrap()));
+        }
+    }
+    let mut out = Vec::new();
+    let state = env.state_dir();
+    for part in ["origins", "overlays", "web-auth.db", "provisions.json"] {
+        walk(&state.join(part), &mut out);
+    }
+    walk(&env.config_path(), &mut out);
+    for path in extra {
+        walk(path, &mut out);
+    }
+    out
+}
+
+/// A domain `eng` with state a rename would move: an origin folder and a
+/// draft folder under this machine's state directory.
+fn env_with_movable_state(tag: &str) -> Env {
+    let env = Env::new(tag);
+    env.setup_domain("eng");
+    let state = env.state_dir();
+    std::fs::create_dir_all(state.join("origins/eng")).unwrap();
+    std::fs::write(state.join("origins/eng/state.json"), "{}").unwrap();
+    std::fs::create_dir_all(state.join("overlays/eng")).unwrap();
+    std::fs::write(state.join("overlays/eng/draft.json"), "{}").unwrap();
+    env
+}
+
+/// A rename through `--db` naming another index than this machine's own is
+/// refused before anything moves: this machine's state folders, its
+/// configuration and its own index all keep the old name, and the refusal
+/// names what does not match and the command to run instead.
+#[test]
+fn a_rename_against_another_index_is_refused_and_moves_nothing() {
+    let env = env_with_movable_state("renodb");
+    let other = env.dir.join("other.db");
+    let other = other.to_str().unwrap();
+    // The other index knows `eng` too, so nothing but the guard stops it.
+    let (ok, out, err) = env.run_full(&["--db", other, "sync"]);
+    assert!(ok, "{out}{err}");
+    let before = rename_state_snapshot(&env, &[]);
+
+    let (ok, out, err) = env.run_full(&[
+        "--db", other, "domain", "rename", "eng", "platform", "--local",
+    ]);
+    assert!(!ok, "a rename against another index is refused: {out}{err}");
+    assert!(
+        err.contains("runs only against this machine's own index")
+            && err.contains("is not this machine's own index")
+            && err.contains("crystalline domain rename eng platform --local` without --db"),
+        "the refusal names the index and the command to run: {err}"
+    );
+    assert!(
+        rename_state_snapshot(&env, &[]) == before,
+        "nothing moved: state folders and configuration are unchanged"
+    );
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    let (ok, out) = env.run(&["--json", "domain", "list"]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        domain_names(&serde_json::from_str(out.trim()).unwrap()),
+        ["eng"]
+    );
+}
+
+/// The same for `--config` naming another configuration file, here a copy
+/// of this machine's own, so it registers the same domain over the same
+/// index: neither file changes and nothing under the state directory moves.
+#[test]
+fn a_rename_through_another_configuration_is_refused_and_moves_nothing() {
+    let env = env_with_movable_state("renocfg");
+    let other = env.dir.join("other.yaml");
+    std::fs::copy(env.config_path(), &other).unwrap();
+    let before = rename_state_snapshot(&env, &[&other]);
+
+    let (ok, out, err) = env.run_full(&[
+        "domain",
+        "rename",
+        "eng",
+        "platform",
+        "--local",
+        "--config",
+        other.to_str().unwrap(),
+    ]);
+    assert!(
+        !ok,
+        "a rename through another configuration is refused: {out}{err}"
+    );
+    assert!(
+        err.contains("is not this machine's own configuration")
+            && !err.contains("is not this machine's own index"),
+        "the refusal names the configuration, and only that: {err}"
+    );
+    assert!(
+        rename_state_snapshot(&env, &[&other]) == before,
+        "nothing moved: state folders and both configuration files are unchanged"
+    );
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+}
+
+/// `--db` and `--config` spelling this machine's own index and configuration
+/// open nothing else, so the rename runs.
+#[test]
+fn a_rename_naming_this_machines_own_index_runs() {
+    let env = env_with_movable_state("renown");
+    let index = env.state_dir().join("index.db");
+    let config_path = env.config_path();
+    let (ok, out, err) = env.run_full(&[
+        "--db",
+        index.to_str().unwrap(),
+        "domain",
+        "rename",
+        "eng",
+        "platform",
+        "--local",
+        "--config",
+        config_path.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}{err}");
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+    assert!(
+        env.state_dir()
+            .join("origins/platform/state.json")
+            .is_file()
+    );
+    assert!(
+        env.state_dir()
+            .join("overlays/platform/draft.json")
+            .is_file()
+    );
 }
 
 fn finishes_a_half_done_rename_before_serving(tag: &str, spawn: fn(&Env) -> Mcp) {
@@ -2813,10 +3072,10 @@ fn domain_rename_with_a_daemon_renames_it() {
     assert_eq!(names, vec!["platform"], "{listed}");
 }
 
-/// Task 23b item 1: a virtual domain's declared canonical name shows in the
+/// A virtual domain's declared canonical name shows in the
 /// NAME column with a running daemon too, read from `list_domains`'s own
 /// name fields (canonical_name, aliases, name_origin, shadowed, renaming),
-/// the same data Task 21 added to it - not only standalone, where the index
+/// the same data the listing carries - not only standalone, where the index
 /// is opened directly. `--local` leaves the virtual domain's MANIFEST engram
 /// declaring its old name, so its local name ("platform") and its canonical
 /// name ("kb") differ, exactly the file-domain case `domain_rename_with_a_daemon_renames_it`
@@ -3231,10 +3490,25 @@ struct Wedge {
 
 impl Wedge {
     fn spawn(env: &Env) -> Wedge {
+        Wedge::spawn_with(env, &["hold-lock", "--secs", "60"])
+    }
+
+    /// A one-shot command holding the state directory for `secs` seconds:
+    /// the lock plus a record naming `command`, as a standalone rename or
+    /// sync publishes it, released when the time is up.
+    fn spawn_standalone(env: &Env, command: &str, secs: u64) -> Wedge {
+        let secs = secs.to_string();
+        Wedge::spawn_with(
+            env,
+            &["hold-lock", "--secs", &secs, "--standalone", command],
+        )
+    }
+
+    fn spawn_with(env: &Env, args: &[&str]) -> Wedge {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
         let mut child = cmd
-            .args(["hold-lock", "--secs", "60"])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3624,6 +3898,121 @@ fn a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost() {
 
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A daemon started while a one-shot command holds the state directory (a
+/// standalone rename, or the name adoption after a sync) waits for it and
+/// says in its log what it waits for, then starts once the command is done.
+#[test]
+fn a_daemon_start_waits_for_a_standalone_command() {
+    let env = Env::new("waitone");
+    env.setup_domain("eng");
+    let holder = Wedge::spawn_standalone(&env, "crystalline domain rename", 60);
+    let holder_pid = holder.pid();
+
+    let log = env.dir.join("serve.log");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--config"])
+        .arg(env.config_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+
+    // The daemon says what it waits for while the command still holds the
+    // state directory.
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("waiting up to") {
+            assert!(
+                text.contains("`crystalline domain rename`")
+                    && text.contains(&format!("pid {holder_pid}")),
+                "the log says what the daemon waits for: {text}"
+            );
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("the daemon gave up ({status}) instead of waiting: {text}");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the daemon never said it was waiting: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The command finishes, and the daemon starts.
+    drop(holder);
+    let start = Instant::now();
+    loop {
+        let (ok, _) = env.run(&["ctl", "status", "--json"]);
+        if ok {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the daemon gave up ({status}): {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the daemon did not start once the command let go: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
+/// A one-shot command that does not let go in time makes the daemon give
+/// up with the lock-held exit code, naming the command and its pid instead
+/// of a holder nobody can name.
+#[test]
+fn a_daemon_start_names_a_standalone_command_that_does_not_let_go() {
+    let env = Env::new("waitlong");
+    env.setup_domain("eng");
+    let holder = Wedge::spawn_standalone(&env, "crystalline domain rename", 60);
+    let holder_pid = holder.pid();
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let out = serve
+        .args(["serve", "--config"])
+        .arg(env.config_path())
+        .env("CRYSTALLINE_TEST_STANDALONE_WAIT_MS", "300")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "the lock-held exit code");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the standalone command `crystalline domain rename`")
+            && stderr.contains(&format!("pid {holder_pid}")),
+        "the refusal names the command and its pid: {stderr}"
+    );
+    drop(holder);
+}
+
+/// Nothing signals a one-shot command: `doctor --fix`, which ends a wedged
+/// daemon, leaves a standalone rename running.
+#[test]
+fn doctor_fix_never_signals_a_standalone_command() {
+    let env = Env::new("waitdoc");
+    env.setup_domain("eng");
+    let mut holder = Wedge::spawn_standalone(&env, "crystalline domain rename", 60);
+
+    let _ = env.run_full(&["--json", "doctor", "--fix"]);
+    assert!(
+        holder.still_holding(),
+        "the standalone command is still running after doctor --fix"
+    );
+    assert!(env.info_path().is_file(), "and its record is still there");
 }
 
 /// The owner record says how its daemon was started. A daemon an agent's

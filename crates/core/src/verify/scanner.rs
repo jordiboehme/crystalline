@@ -157,10 +157,9 @@ pub(crate) fn scanned_file_from_source(rel_path: &Path, source: &str) -> Scanned
     }
 }
 
-/// The domain's declared canonical [`crate::manifest::domain_name_at`] when
-/// its MANIFEST declares one, otherwise the root's final path component -
-/// the folder name is only ever a fallback once a MANIFEST speaks for
-/// itself.
+/// The domain's name: the `domain_name` its MANIFEST declares
+/// ([`crate::manifest::domain_name_at`]), or the root folder's name when the
+/// MANIFEST declares none.
 fn domain_name(root: &Path) -> String {
     crate::manifest::domain_name_at(root).unwrap_or_else(|| {
         root.file_name()

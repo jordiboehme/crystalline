@@ -12,6 +12,48 @@ fn input(local: &str, canonical: Option<&str>, aliases: &[&str]) -> NameInput {
 }
 
 #[test]
+fn a_shadowed_domains_own_local_name_normalizes_to_nothing() {
+    let t = NameTable::build(&[
+        input("platform", None, &[]),
+        input("platform-2", Some("platform"), &[]),
+    ]);
+    assert_eq!(
+        t.normalize("platform-2"),
+        None,
+        "its canonical name reaches the other domain, so it is never written"
+    );
+}
+
+#[test]
+fn an_alias_of_a_domain_without_a_declared_name_normalizes_to_its_local_name() {
+    let t = NameTable::build(&[input("eng", None, &["old-eng"])]);
+    assert_eq!(t.resolve("old-eng"), Some("eng"));
+    assert_eq!(t.normalize("old-eng"), Some("eng"));
+}
+
+#[test]
+fn an_alias_repeating_its_own_shadowed_or_contested_canonical_is_skipped() {
+    let shadowed = NameTable::build(&[
+        input("platform", None, &[]),
+        input("platform-2", Some("platform"), &["platform"]),
+    ]);
+    assert_eq!(shadowed.resolve("platform"), Some("platform"));
+    assert!(shadowed.aliases("platform-2").is_empty());
+    assert!(
+        shadowed.dropped_aliases().is_empty(),
+        "skipped as its own canonical, not dropped as taken"
+    );
+
+    let contested = NameTable::build(&[
+        input("a", Some("shared"), &["shared"]),
+        input("b", Some("shared"), &[]),
+    ]);
+    assert_eq!(contested.resolve("shared"), None);
+    assert!(contested.aliases("a").is_empty());
+    assert!(contested.dropped_aliases().is_empty());
+}
+
+#[test]
 fn a_local_name_always_resolves_to_itself() {
     let t = NameTable::build(&[input("eng", None, &[])]);
     assert_eq!(t.resolve("eng"), Some("eng"));

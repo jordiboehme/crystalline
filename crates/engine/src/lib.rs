@@ -24,7 +24,7 @@ pub mod poller;
 mod rename;
 #[cfg(any(test, feature = "testing"))]
 pub use rename::RenameHold;
-pub use rename::RenameStep;
+pub use rename::{PendingRename, RenameOwner, RenameStep, discard_pending_rename, pending_rename};
 #[doc(hidden)]
 pub mod review;
 #[doc(hidden)]

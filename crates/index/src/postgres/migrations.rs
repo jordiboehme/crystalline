@@ -498,8 +498,8 @@ CREATE TABLE attachment_blob (
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
 /// keys are satisfied at every step. `tag_alias`, `attachment`, `domain_lock`
 /// and `domain_spelling` all reference `domain(id)`, so they are cleared before
-/// `domain`; `attachment_blob` references `attachment`, so it goes first of the
-/// three, and `engram_content` references `engram`, so it goes before it.
+/// `domain`; `attachment_blob` references `attachment`, so it goes before it,
+/// and `engram_content` references `engram`, so it goes before that.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",

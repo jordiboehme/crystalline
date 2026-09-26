@@ -1931,7 +1931,7 @@ describe("the team sync card", () => {
 
 /**
  * One domain listing row, in the engine's own wire shape, with the stable
- * name fields Task 21 added: `canonical_name`, `aliases`, `name_origin`,
+ * name fields: `canonical_name`, `aliases`, `name_origin`,
  * `shadowed` and `renaming`. A function rather than a constant so a test
  * maps over a fresh copy, the way the policy rows above do.
  */

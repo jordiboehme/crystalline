@@ -157,7 +157,7 @@ pub(crate) struct RenameJournal {
 /// the state directory of the engine that started it, each path in its
 /// canonical form so two spellings of one file compare equal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RenameOwner {
+pub struct RenameOwner {
     /// The index as its store names it: the database file, or the Postgres
     /// host and database without credentials. `None` for an in-memory store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,7 +172,7 @@ pub(crate) struct RenameOwner {
 impl RenameOwner {
     /// The owner for an engine over `index` (as its store names it), `config`
     /// and `state_dir`.
-    pub(crate) fn new(index: Option<&str>, config: Option<&Path>, state_dir: &Path) -> RenameOwner {
+    pub fn new(index: Option<&str>, config: Option<&Path>, state_dir: &Path) -> RenameOwner {
         RenameOwner {
             index: index.map(|i| canonical_text(Path::new(i))),
             config: config.map(canonical_text),
@@ -181,7 +181,7 @@ impl RenameOwner {
     }
 
     /// The three, for a log line or a refusal.
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         format!(
             "index {}, configuration {}, state directory {}",
             self.index.as_deref().unwrap_or("in memory"),
@@ -189,6 +189,83 @@ impl RenameOwner {
             self.state_dir
         )
     }
+
+    /// Each part in which `self` differs from `other`, in words that name
+    /// both sides (`self` first as "this command opened", `other` second as
+    /// "this machine's own"); empty when the two are the same.
+    pub fn differences_from(&self, other: &RenameOwner) -> Vec<String> {
+        let side =
+            |value: &Option<String>, none: &str| value.clone().unwrap_or_else(|| none.to_string());
+        let mut parts = Vec::new();
+        if self.index != other.index {
+            parts.push(format!(
+                "the index {} is not this machine's own index {}",
+                side(&self.index, "in memory"),
+                side(&other.index, "in memory")
+            ));
+        }
+        if self.config != other.config {
+            parts.push(format!(
+                "the configuration {} is not this machine's own configuration {}",
+                side(&self.config, "none"),
+                side(&other.config, "none")
+            ));
+        }
+        if self.state_dir != other.state_dir {
+            parts.push(format!(
+                "the state directory {} is not this machine's own state directory {}",
+                self.state_dir, other.state_dir
+            ));
+        }
+        parts
+    }
+}
+
+/// A rename journal as it waits in a state directory, for a caller outside
+/// the engine: `doctor` names it, and a command that opened another index
+/// than this machine's own can tell whether it is that journal's to finish.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRename {
+    /// The local name the domain had.
+    pub old: String,
+    /// The local name it gets.
+    pub new: String,
+    /// Whether the rename leaves the MANIFEST and content alone.
+    pub local_only: bool,
+    /// What the journal belongs to; `None` for a journal that does not say.
+    pub owner: Option<RenameOwner>,
+    /// The steps completed so far, in order.
+    pub done: Vec<RenameStep>,
+    /// The steps still to run, in order.
+    pub remaining: Vec<RenameStep>,
+}
+
+/// The rename journal waiting under `state_dir`, or `None` when no rename is
+/// pending. A journal that does not parse is an error naming the file.
+pub fn pending_rename(state_dir: &Path) -> io::Result<Option<PendingRename>> {
+    Ok(RenameJournal::load(state_dir)?.map(|journal| {
+        let remaining = journal
+            .steps()
+            .iter()
+            .copied()
+            .filter(|step| !journal.done.contains(step))
+            .collect();
+        PendingRename {
+            old: journal.old,
+            new: journal.new,
+            local_only: journal.local_only,
+            owner: journal.owner,
+            done: journal.done,
+            remaining,
+        }
+    }))
+}
+
+/// Delete the rename journal under `state_dir`, leaving every step it
+/// already ran as it is. Only for a person who decided to finish or undo
+/// that rename by hand.
+pub fn discard_pending_rename(state_dir: &Path) -> io::Result<()> {
+    RenameJournal::remove(state_dir)
 }
 
 /// `path` in its canonical form when it exists, as given otherwise (a

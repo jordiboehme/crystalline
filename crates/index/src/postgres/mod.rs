@@ -890,7 +890,7 @@ fn kind_str(kind: DomainKind) -> &'static str {
 
 /// Strip the scheme, any credentials and the query string from a connection url,
 /// leaving `host:port/dbname` for display. Never returns credentials.
-fn sanitize_url(url: &str) -> Option<String> {
+pub(crate) fn sanitize_url(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1)?;
     let after_at = after_scheme
         .rsplit_once('@')

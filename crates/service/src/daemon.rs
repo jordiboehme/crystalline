@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::control::serve_ctl;
 use crate::engine::{Engine, WatchEvent};
-use crate::instance::{acquire_ownership, read_mode_line};
+use crate::instance::{acquire_ownership_after_standalone, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
 use crate::settings::DEFAULT_HTTP_ADDR;
@@ -370,7 +370,8 @@ pub async fn run_serve(
     let instance_id = config::read_or_create_instance_id()?;
 
     // Take ownership first so a second daemon fails fast with the live pid.
-    let ownership = acquire_ownership()?;
+    // A one-shot command holding it for a moment is waited for instead.
+    let ownership = acquire_ownership_after_standalone().await?;
 
     // The lock is held, so this daemon is the only writer of the scratch
     // directory: reclaim whatever a killed predecessor left spilled there. The

@@ -2809,7 +2809,7 @@ async fn a_draft_only_attachment_answers_its_authors_reference_in_the_sweep() {
 }
 
 // ---------------------------------------------------------------------------
-// V110 - a link spelled with a name only this machine uses (Task 19)
+// V110 - a link spelled with a name only this machine uses
 // ---------------------------------------------------------------------------
 
 /// `eng-knowledge` declares `domain_name: eng` and holds a hand-edited file -
@@ -2836,8 +2836,8 @@ async fn v110_fixture(shadow: bool) -> (tempfile::TempDir, Arc<Engine>) {
         "---\ntype: engram\ntitle: Target\npermalink: target\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe target of the cross reference.\n\n- [context] planted for the V110 fixture\n",
     )
     .unwrap();
-    // Hand-edited: this bypasses the write path's own normalization
-    // (Task 18), which is the only way a stored link ever carries a
+    // Hand-edited: this bypasses the write path's own normalization,
+    // which is the only way a stored link ever carries a
     // local-only spelling in the first place.
     std::fs::write(
         eng_dir.join("link-holder.md"),
@@ -2991,7 +2991,7 @@ async fn v110_visibility_fixture() -> (tempfile::TempDir, Arc<Engine>) {
     .unwrap();
     // Hand-edited, exactly as the other V110 fixture: a stored link never
     // carries a local-only spelling except by bypassing the write path's own
-    // normalization (Task 18).
+    // normalization.
     std::fs::write(
         platform_dir.join("cross-ref.md"),
         "---\ntype: engram\ntitle: Cross ref\npermalink: cross-ref\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng-knowledge:target]] over there.\n\n- [context] a hand-written cross-domain reference\n",
@@ -3071,7 +3071,7 @@ async fn a_hidden_domain_is_never_named_by_a_v110_finding() {
 }
 
 // ---------------------------------------------------------------------------
-// F5 - known_domains covers every visible spelling (Task 19, fix round 1)
+// known_domains covers every visible spelling
 // ---------------------------------------------------------------------------
 
 /// `eng-knowledge` declares `domain_name: eng` and carries the machine-local
