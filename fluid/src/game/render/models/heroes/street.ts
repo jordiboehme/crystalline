@@ -213,18 +213,23 @@ function clipAt(
 }
 
 /**
- * The windscreen's side profile, `[a, h]`: a dark wedge set high on top
- * of the cowl, its foot sunk in the cowl's forward slope and its top edge
- * leaning back towards the rider, up to `BIKE.screenTop` over the front
- * third.
+ * The windscreen's side profile, `[a, h]`: a dark shell set high on the
+ * cowl, its top edge leaning back towards the rider up to
+ * `BIKE.screenTop` over the front third and its lower edge running down
+ * the cowl's forward slope a little under the cowl's top. It is a hair
+ * wider than the cowl (`SCREEN_HALF`), so it wraps over the cowl's sides
+ * as a dark band and shows from the side without sharing their planes.
  */
 const SCREEN_PROFILE: readonly (readonly [number, number])[] = [
-  [1.12, 0.9],
-  [0.66, BIKE.screenTop],
-  [0.58, BIKE.screenTop],
-  [0.52, 1.0],
-  [0.85, 1.0],
+  [1.2, 0.86],
+  [0.68, BIKE.screenTop],
+  [0.6, BIKE.screenTop],
+  [0.56, 1.0],
+  [0.9, 0.94],
 ];
+
+/** The windscreen's half width: 5 mm wider than the cowl on each side. */
+const SCREEN_HALF = 0.265;
 
 /**
  * The side stand's side profile, `[a', h]` in the `sideways` frame, where
@@ -238,23 +243,133 @@ const STAND_PROFILE: readonly (readonly [number, number])[] = [
   [0.41, 0],
 ];
 
+/** The tyres' tread: a darker rubber than their side walls. */
+const TREAD: Rgb = [0.025, 0.025, 0.03];
+
+/** The front brake disc's bright steel. */
+export const BRAKE_STEEL: Rgb = [0.72, 0.72, 0.75];
+
+/** The bezels round the lamps, the caliper and the instrument panel: a dark grey. */
+const BIKE_DARK: Rgb = [0.14, 0.14, 0.16];
+
+/** The accent line along each side: an off white. */
+const ACCENT: Rgb = [0.88, 0.88, 0.84];
+
+/** The indicator lenses beside the headlight: amber, off while parked. */
+const INDICATOR: Rgb = [0.95, 0.55, 0.1];
+
+/** The saddle's rolled edge: a darker brown than its top. */
+const SADDLE_EDGE: Rgb = [0.16, 0.08, 0.06];
+
 /**
- * The red bike: the shell over two fat wheels with grey disc hubs, the
- * chassis under it, the saddle and its backrest, the windscreen, the
- * handlebar whose grips stand out each side of the cowl, two mirrors,
- * the headlight and the tail light, and the side stand.
+ * The bike's small parts, in metres:
+ * - `side`: a tyre's side wall starts this far in from the tread's half
+ *   width and its radius is `wallIn` smaller, so the tread shows round
+ *   the tyre as a darker band;
+ * - `holes`: the radius the hubs' ring of six holes sits at, `hole` half
+ *   a hole's side;
+ * - `disc`: the brake disc's radius, `discT` its thickness, standing
+ *   outboard of the front hub on the `+d` side;
+ * - `fork`: the fork legs' width; each leg runs from the front axle up
+ *   and back into the shell at `forkTop`;
+ * - `bezel`: how much wider a lamp's bezel is than its lamp;
+ * - `accent`: the accent line's heights; `seams` where the raised panel
+ *   seams stand along `a`.
+ */
+const BIKE_PARTS = {
+  side: 0.035,
+  wallIn: 0.01,
+  holes: 0.16,
+  hole: 0.018,
+  disc: 0.12,
+  discT: 0.008,
+  fork: 0.045,
+  forkTop: [0.86, 0.58],
+  bezel: 0.015,
+  accent: [0.6, 0.62],
+  seams: [-1.18, 0.3, 1.3],
+} as const;
+
+/**
+ * The shell's top at `a`: the highest crossing of the vertical line at
+ * `a` with `BIKE_PROFILE`, where a raised seam across the side ends.
+ */
+function shellTopAt(a: number): number {
+  let top = -Infinity;
+  BIKE_PROFILE.forEach((p, i) => {
+    const q = BIKE_PROFILE[(i + 1) % BIKE_PROFILE.length] ?? p;
+    if ((p[0] - a) * (q[0] - a) > 0 || p[0] === q[0]) return;
+    top = Math.max(top, p[1] + ((a - p[0]) / (q[0] - p[0])) * (q[1] - p[1]));
+  });
+  return top;
+}
+
+/**
+ * The red bike: the shell over two fat wheels with a dark tread band and
+ * grey disc hubs with a ring of holes, the front one with a steel brake
+ * disc, its caliper and the fork legs; the chassis, footpegs and the
+ * side stand under it; the saddle with its rolled edge and the backrest;
+ * the wrap-round windscreen with the instrument panel behind it and the
+ * handlebar whose grips, each with a mirror, stand out each side of the
+ * cowl; the headlight in its bezel between two indicators; the tail light
+ * in its bezel over a small bracket; and on each side the raised panel
+ * seams, the accent line and the vents ahead of the rear wheel.
  */
 const redBike: HeroRecipe = ({ k, kitAt, s }) => {
   const b = BIKE_BODY;
-  const tyre = s.tinted(TYRE);
+  const P = BIKE_PARTS;
   const hub = s.tinted(HUB_GREY);
   const black = s.tinted(BIKE_BLACK);
+  const dark = s.tinted(BIKE_DARK);
+  // The back view, for the decals on the `-d` sides: a' is -a, d' is -d.
+  const back = kitAt(yawed(ORIGIN, 0, 0, Math.PI));
+  const wall = b.tyre - P.side;
   for (const a of [-b.axle, b.axle]) {
-    k.extrude(discOutline(a, b.r, b.r, 14, "top"), -b.tyre, b.tyre, tyre);
+    k.extrude(
+      discOutline(a, b.r, b.r, 14, "top"),
+      -wall,
+      wall,
+      s.tinted(TREAD),
+    );
+    const walls = discOutline(a, b.r, b.r - P.wallIn, 14, "top");
+    k.extrude(walls, wall - 0.005, b.tyre, s.tinted(TYRE));
+    k.extrude(walls, -b.tyre, -wall + 0.005, s.tinted(TYRE));
     const disc = discOutline(a, b.r, b.hub, 12, "top");
     k.extrude(disc, b.tyre, b.tyre + b.hubT, hub);
     k.extrude(disc, -b.tyre - b.hubT, -b.tyre, hub);
+    const face = b.tyre + b.hubT + DECAL_LIFT;
+    for (let i = 0; i < 6; i++) {
+      const t = ((2 * i + 1) * Math.PI) / 6;
+      const ha = a + P.holes * Math.cos(t);
+      const hh = b.r + P.holes * Math.sin(t);
+      const [h0, h1] = [hh - P.hole, hh + P.hole];
+      k.panel(ha - P.hole, ha + P.hole, face, h0, h1, black);
+      back.panel(-ha - P.hole, -ha + P.hole, face, h0, h1, black);
+    }
   }
+  // The front brake disc outboard of the hub, its caliper and the fork.
+  const d0 = b.tyre + b.hubT + 0.005;
+  k.extrude(
+    discOutline(b.axle, b.r, P.disc, 12, "top"),
+    d0,
+    d0 + P.discT,
+    s.tinted(BRAKE_STEEL),
+  );
+  k.box(0.88, 0.95, d0 - 0.01, d0 + 0.02, 0.4, 0.46, dark);
+  const [fa, fh] = P.forkTop;
+  for (const d of [-1, 1])
+    k.extrude(
+      [
+        [b.axle + P.fork / 2, b.r],
+        [fa + P.fork / 2, fh],
+        [fa - P.fork / 2, fh],
+        [b.axle - P.fork / 2, b.r],
+      ],
+      d * 0.19,
+      d * 0.215,
+      black,
+    );
+
   const upper = clipAt(BIKE_PROFILE, 1, SEAM, false);
   const red = s.tinted(BIKE_RED);
   const front = clipAt(upper, 0, TAIL_CUT, false);
@@ -273,33 +388,107 @@ const redBike: HeroRecipe = ({ k, kitAt, s }) => {
     s.tinted(shade(BIKE_RED, 0.75)),
   );
   k.box(-0.6, 0.6, -0.16, 0.16, 0.22, 0.3, black);
+
+  // Each side: the accent line, the raised seams, the vents and a footpeg.
+  const accent = s.tinted(ACCENT);
+  const seam = s.tinted(shade(BIKE_RED, 0.85));
+  const [ah0, ah1] = P.accent;
+  for (const d of [-1, 1]) {
+    k.box(
+      TAIL_CUT + 0.02,
+      1.44,
+      d * (b.half - 0.005),
+      d * (b.half + 0.004),
+      ah0,
+      ah1,
+      accent,
+    );
+    k.box(
+      -1.45,
+      TAIL_CUT - 0.02,
+      d * (b.tailHalf - 0.005),
+      d * (b.tailHalf + 0.004),
+      ah0,
+      ah1,
+      accent,
+    );
+    for (const sa of P.seams) {
+      const half = sa < TAIL_CUT ? b.tailHalf : b.half;
+      k.box(
+        sa - 0.006,
+        sa + 0.006,
+        d * (half - 0.005),
+        d * (half + 0.008),
+        SEAM + 0.01,
+        shellTopAt(sa) - 0.015,
+        seam,
+      );
+    }
+    k.box(-0.33, -0.27, d * 0.19, d * 0.28, 0.33, 0.36, black);
+  }
+  for (let i = 0; i < 4; i++) {
+    const h = 0.35 + i * 0.04;
+    k.panel(-0.6, -0.36, b.lower + DECAL_LIFT, h, h + 0.02, black);
+    back.panel(0.36, 0.6, b.lower + DECAL_LIFT, h, h + 0.02, black);
+  }
+
   const saddle = s.tinted(SADDLE);
+  k.bevelBox(
+    -0.86,
+    -0.24,
+    -0.19,
+    0.19,
+    0.635,
+    0.675,
+    0.015,
+    s.tinted(SADDLE_EDGE),
+  );
   k.bevelBox(-0.85, -0.25, -0.18, 0.18, 0.64, 0.7, 0.02, saddle);
   // The small backrest, against the tail hump behind the saddle.
   k.bevelBox(-0.94, -0.87, -0.14, 0.14, 0.66, 0.85, 0.02, saddle);
-  k.extrude(SCREEN_PROFILE, -0.2, 0.2, s.tinted(SCREEN));
-  // The handlebar through the cowl behind the screen, its grips out each side.
-  k.box(0.5, 0.55, -0.34, 0.34, 1.0, 1.03, black);
+
+  k.extrude(SCREEN_PROFILE, -SCREEN_HALF, SCREEN_HALF, s.tinted(SCREEN));
+  // The instrument panel just behind the screen, then the handlebar with
+  // its grips out each side of the cowl and a mirror on each grip.
+  k.box(0.51, 0.555, -0.13, 0.13, 1.0, 1.1, dark);
+  k.box(0.45, 0.5, -0.34, 0.34, 1.0, 1.03, black);
   for (const d of [-1, 1]) {
-    k.box(0.49, 0.56, d * 0.28, d * 0.37, 0.99, 1.04, black);
-    k.box(0.7, 0.73, d * 0.21, d * 0.29, 1.02, 1.09, black);
+    k.box(0.44, 0.51, d * 0.28, d * 0.37, 0.99, 1.04, black);
+    k.box(0.47, 0.48, d * 0.33, d * 0.34, 1.04, 1.1, black);
+    k.box(0.465, 0.485, d * 0.31, d * 0.39, 1.1, 1.15, dark);
   }
+
   const side = kitAt(sideways(ORIGIN));
+  const nose = BIKE.length / 2;
   const [lampH, lampR] = b.lamp;
-  // A wide lamp: the disc stretched across the nose.
-  side.extrude(
-    discOutline(0, lampH, lampR, 10).map(([x, h]) => [x * LAMP_WIDE, h]),
-    BIKE.length / 2 - 0.01,
-    BIKE.length / 2,
-    s.signal(HEADLIGHT),
-  );
+  const oval = (r: number) =>
+    discOutline(0, lampH, r, 10).map(([x, h]): [number, number] => [
+      x * LAMP_WIDE,
+      h,
+    ]);
+  side.extrude(oval(lampR), nose - 0.01, nose, s.signal(HEADLIGHT));
+  side.extrude(oval(lampR + P.bezel), nose - 0.01, nose - 0.004, dark);
+  for (const d of [-1, 1])
+    side.extrude(
+      discOutline(-d * 0.19, 0.6, 0.025, 8),
+      nose - 0.01,
+      nose - 0.002,
+      s.tinted(INDICATOR),
+    );
   const [tailH, tailR] = b.tail;
   side.extrude(
     discOutline(0, tailH, tailR, 10),
-    -BIKE.length / 2,
-    -BIKE.length / 2 + 0.01,
+    -nose,
+    -nose + 0.01,
     s.blink(TAIL_LIGHT, 0),
   );
+  side.extrude(
+    discOutline(0, tailH, tailR + P.bezel, 10),
+    -nose + 0.004,
+    -nose + 0.01,
+    dark,
+  );
+  k.box(-1.465, -1.455, -0.1, 0.1, 0.34, 0.45, black);
   side.extrude(STAND_PROFILE, -0.22, -0.18, black);
 };
 

@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { FLAG, blinkFlag, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { partsOf, toLocal, type Part } from "../../modelChecks";
-import { BIKE, BOX_BACK, BOX_SIGN, boxSignLayout } from "./street";
+import { BIKE, BOX_BACK, BOX_SIGN, BRAKE_STEEL, boxSignLayout } from "./street";
 import { textRows } from "./pixels";
 
 const local = (p: Part): V3[] =>
@@ -47,6 +47,22 @@ describe("street hero models", () => {
     expect(Math.max(...local(tail[0] as Part).map((q) => q[0]))).toBeLessThan(
       -1.3,
     );
+  });
+
+  it("fits one brake disc, on the front wheel, outboard of its hub", () => {
+    // Mutation caught: the disc on the rear wheel, on both wheels, or
+    // sunk inside the hub where it cannot be seen. The guard: exactly one
+    // part in the disc's steel, so the test cannot pass on none.
+    const discs = partsOf("red-bike").filter(
+      (p) => p.tint !== null && p.tint.every((c, i) => c === BRAKE_STEEL[i]),
+    );
+    expect(discs).toHaveLength(1);
+    const pts = local(discs[0] as Part);
+    const as = pts.map((q) => q[0]);
+    expect((Math.max(...as) + Math.min(...as)) / 2).toBeCloseTo(1.0, 2);
+    expect(Math.max(...as) - Math.min(...as)).toBeLessThan(0.4);
+    // Outboard of the hub's face at 0.17 on the `+d` side.
+    expect(Math.min(...pts.map((q) => q[1]))).toBeGreaterThan(0.17);
   });
 
   it("lays the sign out as on the original: POLICE, PUBLIC over CALL, BOX, inside the band", () => {
