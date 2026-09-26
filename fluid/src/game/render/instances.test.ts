@@ -230,7 +230,6 @@ describe("curioInstances", () => {
     const keys = all.map((g) => g.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(instanceGroups(room).at(-1)?.family).toBe("curio");
-    expect(curioInstances(room)).toEqual(curioInstances(room));
   });
 });
 

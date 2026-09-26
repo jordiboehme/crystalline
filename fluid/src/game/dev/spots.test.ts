@@ -29,7 +29,6 @@ import {
 } from "../world/curios";
 import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
 import { generateRoom } from "../world/generate";
-import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
 import {
@@ -39,13 +38,13 @@ import {
   PLAYER_RADIUS,
   spawnPlayer,
 } from "../world/move";
-import { PROP_KINDS } from "../world/props";
 import { wallAnchor } from "../world/sites";
 import type {
   Box,
   Curio,
   Fixture,
   Hero,
+  Prop,
   RoomSpec,
   SurfaceSpec,
 } from "../world/types";
@@ -253,30 +252,46 @@ describe("spotView (C18)", () => {
   });
 
   it("keeps hero and prop spots as they were", () => {
-    for (const spot of ["door:4", "hatch:0", "portal:2", "prop:crate:0"]) {
-      const view = spotView(gallery, spot);
-      expect(view?.spawn, spot).toEqual(spotSpawn(gallery, spot));
-      expect(view?.pitch, spot).toBe(0);
-    }
-    const counts = new Map<string, number>();
-    for (const h of hall.heroes) {
-      const n = counts.get(h.kind) ?? 0;
-      counts.set(h.kind, n + 1);
-      const spot = `prop:${h.kind}:${String(n)}`;
-      const view = spotView(hall, spot);
-      expect(view?.spawn, spot).toEqual(spotSpawn(hall, spot));
-      expect(view?.pitch, spot).toBe(0);
+    // Spawns captured at 963097ca, before the curio branch existed: a
+    // fixture, two props and two heroes, each with pitch 0.
+    const pinned = [
+      [gallery, "door:4", { x: 9, y: 0, yaw: 0 }],
+      [gallery, "machine:1", { x: 21, y: 0.225, yaw: 0 }],
+      [gallery, "prop:crate:0", { x: 37, y: -0.25, yaw: Math.PI }],
+      [gallery, "prop:storage-shelf:1", { x: 37, y: 3.75, yaw: Math.PI }],
+      [hall, "prop:tube-bench:0", { x: 16, y: 1.4125, yaw: 0 }],
+      [hall, "prop:arcade-cabinet:0", { x: 1.0375, y: 6, yaw: Math.PI / 2 }],
+    ] as const;
+    for (const [room, spot, want] of pinned) {
+      const view = spotView(room, spot);
+      if (view === null) throw new Error(`no spot for ${spot}`);
+      expect(view.spawn.x, spot).toBeCloseTo(want.x, 9);
+      expect(view.spawn.y, spot).toBeCloseTo(want.y, 9);
+      expect(view.spawn.yaw, spot).toBeCloseTo(want.yaw, 9);
+      expect(view.pitch, spot).toBe(0);
     }
   });
 
-  it("never matches a curio kind name against the prop or hero branch first", () => {
+  it("reads a curio kind through the curio branch in a room with heroes and props", () => {
+    // The hero hall holds every curio kind and every hero; a crate makes
+    // it hold a prop as well. Every curio kind resolves to a close,
+    // tilted framing (pitch below 0), which only the curio branch gives:
+    // the hero and prop branches always give pitch 0.
+    const crate: Prop = {
+      kind: "crate",
+      variant: 0,
+      anchor: "floor",
+      x: 11.5,
+      y: 12.5,
+      turn: 0,
+      seed: 1,
+    };
+    const room: RoomSpec = { ...hall, props: [crate] };
+    expect(spotView(room, "prop:crate:0")?.pitch).toBe(0);
     for (const kind of CURIO_KINDS) {
-      expect((HERO_KINDS as readonly string[]).includes(kind), kind).toBe(
-        false,
-      );
-      expect((PROP_KINDS as readonly string[]).includes(kind), kind).toBe(
-        false,
-      );
+      const view = spotView(room, `prop:${kind}:0`);
+      expect(view, kind).not.toBeNull();
+      expect(view?.pitch ?? 0, kind).toBeLessThan(0);
     }
   });
 });

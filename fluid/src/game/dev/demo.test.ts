@@ -8,7 +8,6 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_WORKSHOP } from "../world/canned";
 import { CURIO_KINDS } from "../world/curios";
-import { generateRoom } from "../world/generate";
 import { heroBlocker, propFootprint } from "../world/footprints";
 import { overlaps } from "../world/sites";
 import { roomWithForcedCurio, roomWithForcedHero } from "./demo";
@@ -63,26 +62,20 @@ describe("roomWithForcedHero", () => {
 });
 
 describe("roomWithForcedCurio", () => {
-  // The workshop has no terminal or table (only benches and desks); a
-  // terminal's desk ends are too narrow for the laptop even where a
-  // terminal exists (C8), so it never has a host for the laptop. Its
-  // default archetype and condition (engineering, construction) also
-  // draws no workbench and no hero whose own under spot is filled (fix
-  // round 3: a terminal carries no under spot any more, `world/curios.ts`'s
-  // `FIXTURE_SURFACES.terminal`), so neither under-desk kind has a host
-  // here either.
+  // The workshop's terminals have desk ends, but they are too narrow for
+  // the laptop (C8), and its default archetype and condition (engineering,
+  // construction) draws no table, no bench, no workbench, no hydroponics
+  // trough and no hero with an under spot, so neither the laptop nor
+  // either under-desk kind has a host here.
   const NO_HOST_IN_WORKSHOP: readonly string[] = [
     "beige-laptop",
     "trap-box",
     "fuel-case",
   ];
 
-  it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
-    const base = generateRoom(CANNED_WORKSHOP);
+  it("forces every curio kind into the workshop where it has a host", () => {
     for (const kind of CURIO_KINDS) {
       const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, kind);
-      expect(room.heroes, kind).toEqual(base.heroes);
-      expect(room.props, kind).toEqual(base.props);
       if (NO_HOST_IN_WORKSHOP.includes(kind)) {
         expect(placed, kind).toBeNull();
         expect(

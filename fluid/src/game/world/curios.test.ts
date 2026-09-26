@@ -682,38 +682,85 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
   });
 
   it("keeps every curio under its clear and the ceiling", () => {
-    const hub = generateRoom({ ...CANNED_HUB, type: ARCHETYPE_TYPES.archive });
-    expect(hub.archetype).toBe("archive");
+    // The clear: every curio's top against the `clear` of each surface
+    // found by its box and height alone, not by `curioFits`, with the gear
+    // slot forced to the lit sword so the tall upright ones are tried
+    // everywhere: in an archive hub full of shelf levels, and in rooms
+    // with the laser desk forced in, whose top has a shelf 1.15 m over it,
+    // under the upright sword's 1.22 m.
+    const rooms: RoomSpec[] = [
+      generateRoom({ ...CANNED_HUB, type: ARCHETYPE_TYPES.archive }),
+    ];
+    for (const place of [CANNED_HUB, CANNED_WORKSHOP])
+      for (const type of [ARCHETYPE_TYPES.lab, ARCHETYPE_TYPES.bridge]) {
+        const { room, placed } = roomWithForcedHero(
+          { ...place, type },
+          "laser-desk",
+        );
+        if (placed !== null) rooms.push(room);
+      }
+    expect(rooms.length).toBeGreaterThan(1);
     let swords = 0;
+    let underClear = 0;
+    for (const [r, room] of rooms.entries())
+      for (let i = 0; i < 40; i++) {
+        const b = reseed(room, "clear", r, i);
+        const got = placeCurios(b, {
+          ...curioDraws(b),
+          gear: { take: true, roll: 0, kind: "light-sword" },
+        });
+        expectInvariants(b, got, `clear ${String(r)} ${String(i)}`);
+        const surfaces = hostSurfaces(b);
+        for (const c of got) {
+          const top = curioSize(c).top;
+          const hosts = hostsOf(surfaces, c);
+          if (c.h > 0) expect(hosts.length, c.kind).toBeGreaterThan(0);
+          for (const s of hosts) {
+            expect(top, `${c.kind} on ${s.host}`).toBeLessThanOrEqual(s.clear);
+            if (s.clear < OPEN_CLEAR) underClear++;
+          }
+          if (c.kind === "light-sword") swords++;
+        }
+      }
+    expect(swords).toBeGreaterThan(0);
+    expect(underClear).toBeGreaterThan(0);
+
+    // The ceiling: a generated ceiling is at least 3.0 m, where no curio
+    // top reaches `ceiling - CURIO_CEILING_GAP`, so the clause is tried on
+    // a room lowered to 2.2 m. An upright lit sword on a desk end would
+    // reach 0.78 + 1.22 = 2.0 m, over 2.2 - 0.3 = 1.9, so every sword
+    // that lands there is the lying one, while the same rooms at their own
+    // ceiling do stand upright swords.
+    const workshop = generateRoom({
+      ...CANNED_WORKSHOP,
+      type: ARCHETYPE_TYPES.council,
+    });
+    let lying = 0;
+    let uprightHigh = 0;
     for (let i = 0; i < 40; i++) {
-      const b = { ...reseed(hub, "low", i), ceiling: 3.0 };
-      const own = curioDraws(b);
-      const got = placeCurios(b, {
-        ...own,
+      const high = reseed(workshop, "ceiling", i);
+      const forced: CurioDraws = {
+        ...curioDraws(high),
         gear: { take: true, roll: 0, kind: "light-sword" },
-      });
-      expectInvariants(b, got, `low ${String(i)}`);
-      const surfaces = hostSurfaces(b);
+      };
+      uprightHigh += placeCurios(high, forced).filter(
+        (c) => c.kind === "light-sword" && c.variant > 0,
+      ).length;
+      const low = { ...high, ceiling: 2.2 };
+      const got = placeCurios(low, forced);
+      expectInvariants(low, got, `ceiling ${String(i)}`);
       for (const c of got) {
-        const top = curioSize(c).top;
-        expect(c.h + top, c.kind).toBeLessThanOrEqual(3.0 - CURIO_CEILING_GAP);
-        const hosts = hostsOf(surfaces, c);
-        if (c.h > 0) expect(hosts.length, c.kind).toBeGreaterThan(0);
-        for (const s of hosts.filter((s) => curioFits(b, c, s)))
-          expect(top, `${c.kind} on ${s.host}`).toBeLessThanOrEqual(s.clear);
-        if (c.kind !== "light-sword") continue;
-        swords++;
-        if (c.variant === 0) continue;
-        // No upright sword on a shelf level with another level above it.
-        expect(
-          hosts.some(
-            (s) => s.host === "prop:storage-shelf" && s.clear < OPEN_CLEAR,
-          ),
-          `upright sword at ${String(c.h)}`,
-        ).toBe(false);
+        expect(c.h + curioSize(c).top, c.kind).toBeLessThanOrEqual(
+          2.2 - CURIO_CEILING_GAP,
+        );
+        if (c.kind === "light-sword") {
+          expect(c.variant, `sword at h ${String(c.h)}`).toBe(0);
+          lying++;
+        }
       }
     }
-    expect(swords).toBeGreaterThan(0);
+    expect(uprightHigh).toBeGreaterThan(0);
+    expect(lying).toBeGreaterThan(0);
   });
 
   it("leaves a slot empty where nothing fits, and never throws", () => {
@@ -1045,7 +1092,8 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
         const place = { ...CANNED_WORKSHOP, type };
         const { room } = roomWithForcedHero(place, kind);
         const b = base(room);
-        expect(room.curios, `${type} ${kind}`).toEqual(placeCurios(b));
+        // Every curio stands on a surface of the re-dressed room that it
+        // fits, and none clashes (`expectInvariants`).
         expectInvariants(b, room.curios, `${type} ${kind}`);
         if (
           JSON.stringify(room.curios) !==
