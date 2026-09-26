@@ -20,11 +20,13 @@
  *   per variant (`PROP_SURFACES`) and the heroes' (`HERO_CATALOGUE[kind]
  *   .surfaces` and `.under`). Each has its height, its free height `clear`
  *   (`OPEN_CLEAR` for an open top) and its class. Nothing is read off a
- *   mesh at run time. A terminal carries no under spot (fix round 3): its
- *   knee space is where the model draws the swivel chair, so no standing
- *   player can ever see a curio placed there (`dev/spots.test.ts`'s
- *   documented-limit tests, round 2). An under-desk curio's only hosts are
- *   now the workbench's lower shelf and a hero's `under` spots.
+ *   mesh at run time. An `under` spot is catalogued only where a standing
+ *   player can see it: under an open-fronted desk, table, bench or trough
+ *   (the workbench's lower shelf, the hydroponics trough, the round
+ *   table's rim, the bench's seat) and a hero's `under` spots. A terminal
+ *   carries none: its knee space holds the swivel chair, between the wall
+ *   and every spot a player can stand on, so a curio there could never be
+ *   seen.
  * - **C4. One transform.** Every local point goes to the world through
  *   `turnedPoint` (`footprints.ts`), a wall host from its slot's wall
  *   anchor and a free host from its centre (`hostSurfaces`).
@@ -381,15 +383,19 @@ export const CURIO_CEILING_GAP = 0.3;
 /**
  * The tops and under spots of the fixtures that have any (C3), local to
  * their wall slot (`d` from the wall): a terminal's two desk ends beside
- * its screen and key deck, a workbench's top and lower shelf, and a lab
- * bench's two clear ends. The terminal's ends are 0.22 m wide, too narrow
- * for the laptop (C8). A terminal carries no under spot: the model draws
- * its swivel chair in that knee space (`render/models/terminal.ts`'s
- * `TERMINAL_OCCLUDERS`), which sits between the wall and every standable
- * spot on the only side with any floor at all, so no curio placed there
- * could ever be seen (fix round 3, `dev/spots.test.ts`'s documented-limit
- * tests from round 2). The workbench's lower shelf is the only fixture
- * `under` spot left.
+ * its screen and key deck, a workbench's top and lower shelf, a lab
+ * bench's two clear ends, and the floor under the hydroponics trough. The
+ * terminal's ends are 0.22 m wide, too narrow for the laptop (C8).
+ *
+ * A terminal carries no under spot: the model draws its swivel chair in
+ * that knee space (`render/models/terminal.ts`'s `TERMINAL_OCCLUDERS`),
+ * between the wall and every spot a player can stand on, so no curio
+ * placed there could ever be seen. The hydroponics trough stands on four
+ * corner legs (`render/models/machines.ts`, legs inside `a` of +-0.77,
+ * the trough's underside at 0.55 m), open at the front, so its floor spot
+ * runs between the legs and under the whole trough. The lab bench is a
+ * closed cabinet down to the floor and the nav table a solid pedestal, so
+ * neither has one.
  */
 export const FIXTURE_SURFACES = {
   terminal: [
@@ -453,6 +459,17 @@ export const FIXTURE_SURFACES = {
         cls: "bench",
       },
     ],
+    hydroponics: [
+      {
+        a0: -0.75,
+        a1: 0.75,
+        d0: 0.12,
+        d1: 0.68,
+        h: 0,
+        clear: 0.54,
+        cls: "under",
+      },
+    ],
   },
 } as const satisfies {
   terminal: readonly SurfaceSpec[];
@@ -460,9 +477,20 @@ export const FIXTURE_SURFACES = {
 };
 
 /**
- * The tops of the decor that has any (C3), local to the piece's centre: the
- * lab island's clear stretch between its hood and its sink, and the round
- * table's four places around its glowing disc.
+ * The tops and under spots of the decor that has any (C3), local to the
+ * piece's centre: the lab island's clear stretch between its hood and its
+ * sink, the round table's four places around its glowing disc, and then
+ * the floor under the table's rim at the same four places.
+ *
+ * The round table (`render/models/decor.ts`'s `ROUND_TABLE`) is lathe
+ * turned: a foot disc 0.5 m in radius, a column, and an underside that
+ * flares from 0.64 m at the column to 0.72 m at 1.1 m out, so every spot
+ * keeps outside the foot (0.55 m from the centre at its nearest) and
+ * inside the flare (1.08 m at its farthest corner), and its `clear` of
+ * 0.63 m stays under the flare's lowest point. It is open all round. The places along `d` take
+ * the trap or the case; the places along `a` are 0.45 m wide there and
+ * take only the case, since a `fixed` under curio keeps its width along
+ * the host's `a`.
  */
 export const DECOR_SURFACES = {
   "lab-island": [
@@ -513,14 +541,57 @@ export const DECOR_SURFACES = {
       clear: OPEN_CLEAR,
       cls: "table",
     },
+    {
+      a0: -0.4,
+      a1: 0.4,
+      d0: -1.0,
+      d1: -0.55,
+      h: 0,
+      clear: 0.63,
+      cls: "under",
+    },
+    {
+      a0: 0.55,
+      a1: 1.0,
+      d0: -0.4,
+      d1: 0.4,
+      h: 0,
+      clear: 0.63,
+      cls: "under",
+    },
+    {
+      a0: -0.4,
+      a1: 0.4,
+      d0: 0.55,
+      d1: 1.0,
+      h: 0,
+      clear: 0.63,
+      cls: "under",
+    },
+    {
+      a0: -1.0,
+      a1: -0.55,
+      d0: -0.4,
+      d1: 0.4,
+      h: 0,
+      clear: 0.63,
+      cls: "under",
+    },
   ],
 } as const satisfies Partial<Record<DecorKind, readonly SurfaceSpec[]>>;
 
 /**
- * The shelf levels and tops of the floor props that have any (C3), per
- * variant, local to the prop's centre: the storage shelf's open top (v0)
- * or its three levels, each `clear` up to the next level's underside, and
- * its top (v1), and each filing cabinet's top.
+ * The shelf levels, tops and under spots of the floor props that have any
+ * (C3), per variant, local to the prop's centre: the storage shelf's open
+ * top (v0) or its three levels, each `clear` up to the next level's
+ * underside, and its top (v1), each filing cabinet's top, and the floor
+ * under each bench's seat.
+ *
+ * The bench (`render/models/props/floor.ts`'s `bench`) is a slab seat from
+ * 0.42 m on two slab legs whose inner faces stand at `a` of +-0.59, open
+ * along `d` on both sides (v0) or at the front, under a back panel that
+ * starts over the seat (v1). The spot keeps between the legs and under
+ * the seat, which runs +-0.23 along `d` on v0 and -0.105 to 0.28 on v1.
  */
 export const PROP_SURFACES = {
   "storage-shelf": [
@@ -578,6 +649,30 @@ export const PROP_SURFACES = {
         h: 1.4,
         clear: OPEN_CLEAR,
         cls: "shelf",
+      },
+    ],
+  ],
+  bench: [
+    [
+      {
+        a0: -0.57,
+        a1: 0.57,
+        d0: -0.22,
+        d1: 0.22,
+        h: 0,
+        clear: 0.41,
+        cls: "under",
+      },
+    ],
+    [
+      {
+        a0: -0.57,
+        a1: 0.57,
+        d0: -0.105,
+        d1: 0.28,
+        h: 0,
+        clear: 0.41,
+        cls: "under",
       },
     ],
   ],

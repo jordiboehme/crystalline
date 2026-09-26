@@ -164,7 +164,12 @@ const FIXTURE_HOSTS: readonly ("terminal" | MachineKind)[] = [
 
 describe("host surfaces on their hosts' meshes", () => {
   it("covers the terminal and every machine with a surface table", () => {
-    expect(FIXTURE_HOSTS).toEqual(["terminal", "workbench", "lab-bench"]);
+    expect(FIXTURE_HOSTS).toEqual([
+      "terminal",
+      "workbench",
+      "lab-bench",
+      "hydroponics",
+    ]);
   });
 
   for (const host of FIXTURE_HOSTS)

@@ -22,16 +22,33 @@ import {
   curioOn,
   curioSize,
   CURIO_KINDS,
+  DECOR_SURFACES,
+  FIXTURE_SURFACES,
+  PROP_SURFACES,
   hostSurfaces,
 } from "../world/curios";
 import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
+import { generateRoom } from "../world/generate";
 import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
-import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
+import {
+  blockersFor,
+  EYE_HEIGHT,
+  MAX_PITCH,
+  PLAYER_RADIUS,
+  spawnPlayer,
+} from "../world/move";
 import { PROP_KINDS } from "../world/props";
 import { wallAnchor } from "../world/sites";
-import type { Box, Curio, Fixture, Hero, RoomSpec } from "../world/types";
+import type {
+  Box,
+  Curio,
+  Fixture,
+  Hero,
+  RoomSpec,
+  SurfaceSpec,
+} from "../world/types";
 import { CELL } from "../world/units";
 import { GAME_VERSION } from "../version";
 import { roomWithForcedCurio } from "./demo";
@@ -576,5 +593,142 @@ describe("frameCurio's sight line on real rooms (browser-shots review item 4)", 
     const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "fuel-case");
     expect(placed).toBeNull();
     expect(room.curios.some((c) => c.kind === "fuel-case")).toBe(false);
+  });
+});
+
+describe("every catalogued under spot seen from a standing player", () => {
+  /**
+   * The sight-line check for the under spots of the fixture (terminal and
+   * machine), decor and floor prop tables (`world/curios.ts`): each spot, found in generated
+   * rooms, takes the trap and the case at its centre and its four corners
+   * wherever `curioOn` fits them, and some spot a player can stand on (the
+   * circle on floor and clear of every blocker, on a 0.25 m grid within
+   * 4 m) must see the curio's middle past every occluder
+   * (`curioSightClear`). A host whose legs stand at its `a` ends (a bench,
+   * a workbench, the hydroponics trough) has them in no occluder, so its
+   * spots must be seen from its open front or back: the standing spot's
+   * offset from the curio runs more along the host's `d` than its `a`.
+   * The round table is open all round.
+   */
+  const OPEN_ALL_ROUND: ReadonlySet<string> = new Set(["decor:round-table"]);
+  const ARCHETYPE_TYPES = [
+    "manifest",
+    "decision",
+    "runbook",
+    "reference",
+    "guide",
+  ] as const;
+
+  /** Every under spot the tables catalogue, as `<host> v<variant> <j>`. */
+  function catalogued(): Set<string> {
+    const out = new Set<string>();
+    const terminal: readonly SurfaceSpec[] = FIXTURE_SURFACES.terminal;
+    for (const [j, s] of terminal.entries())
+      if (s.cls === "under") out.add(`terminal v0 ${String(j)}`);
+    const machines: Partial<Record<string, readonly SurfaceSpec[]>> =
+      FIXTURE_SURFACES.machine;
+    for (const [kind, specs] of Object.entries(machines))
+      for (const [j, s] of (specs ?? []).entries())
+        if (s.cls === "under") out.add(`machine:${kind} v0 ${String(j)}`);
+    const decor: Partial<Record<string, readonly SurfaceSpec[]>> =
+      DECOR_SURFACES;
+    for (const [kind, specs] of Object.entries(decor))
+      for (const [j, s] of (specs ?? []).entries())
+        if (s.cls === "under") out.add(`decor:${kind} v0 ${String(j)}`);
+    const props: Partial<Record<string, readonly (readonly SurfaceSpec[])[]>> =
+      PROP_SURFACES;
+    for (const [kind, variants] of Object.entries(props))
+      for (const [v, specs] of (variants ?? []).entries())
+        for (const [j, s] of specs.entries())
+          if (s.cls === "under")
+            out.add(`prop:${kind} v${String(v)} ${String(j)}`);
+    return out;
+  }
+
+  /** The standable points within 4 m of `(cx, cz)`, world metres. */
+  function standable(room: RoomSpec, cx: number, cz: number) {
+    const blockers = blockersFor(room);
+    const out: { x: number; z: number }[] = [];
+    for (let ix = -16; ix <= 16; ix++)
+      for (let iz = -16; iz <= 16; iz++) {
+        const x = cx + ix * 0.25;
+        const z = cz + iz * 0.25;
+        const onFloor = [x - PLAYER_RADIUS, x + PLAYER_RADIUS].every((px) =>
+          [z - PLAYER_RADIUS, z + PLAYER_RADIUS].every((pz) =>
+            isFloor(room.grid, Math.floor(px / CELL), Math.floor(pz / CELL)),
+          ),
+        );
+        if (onFloor && !blockers.some((b) => circleOverlapsBox(x, z, b)))
+          out.push({ x, z });
+      }
+    return out;
+  }
+
+  it("sees every trap and case on every under spot of the host tables from a spot on the host's open side", () => {
+    const want = catalogued();
+    expect(want.size).toBeGreaterThan(0);
+    const checked = new Map<string, number>();
+    for (let i = 0; i < 60; i++) {
+      const place = [CANNED_WORKSHOP, CANNED_BRIDGE, CANNED_HUB][i % 3];
+      if (place === undefined) throw new Error("places");
+      const tags = Array.from(
+        { length: i % 6 },
+        (_, j) => `sight-${String(i)}-${String(j)}`,
+      );
+      for (const type of ARCHETYPE_TYPES) {
+        const generated = generateRoom({
+          ...place,
+          permalink: `under-sight-${String(i)}-${type}`,
+          tags,
+          type,
+        });
+        const room: RoomSpec = { ...generated, curios: [] };
+        for (const s of hostSurfaces(room)) {
+          if (s.cls !== "under" || s.host.startsWith("hero:")) continue;
+          const variant =
+            "variant" in s.anchorOf && typeof s.anchorOf.variant === "number"
+              ? s.anchorOf.variant
+              : 0;
+          const j = s.key[2].split("-").pop() ?? "";
+          const key = `${s.host} v${String(variant)} ${j}`;
+          if ((checked.get(key) ?? 0) >= 2) continue;
+          let fitted = 0;
+          for (const kind of ["trap-box", "fuel-case"] as const)
+            for (const [u, v] of [
+              [0.5, 0.5],
+              [0, 0],
+              [1, 1],
+              [0, 1],
+              [1, 0],
+            ] as const) {
+              let c: Curio;
+              try {
+                c = curioOn(s, kind, 0, u, v, 1);
+              } catch {
+                continue;
+              }
+              fitted++;
+              const withCurio: RoomSpec = { ...room, curios: [c] };
+              const box = curioBox(c);
+              const cx = (box.x0 + box.x1) / 2;
+              const cz = (box.z0 + box.z1) / 2;
+              const [fx, fz] = HERO_FRONT[s.turn] ?? [0, -1];
+              const seen = standable(withCurio, cx, cz).some((p) => {
+                const along = Math.abs(fz * (p.x - cx) - fx * (p.z - cz));
+                const out = Math.abs(fx * (p.x - cx) + fz * (p.z - cz));
+                if (!OPEN_ALL_ROUND.has(s.host) && out < along) return false;
+                return curioSightClear(withCurio, p, c);
+              });
+              expect(
+                seen,
+                `${generated.permalink} ${key} ${kind} at ${String(u)},${String(v)}`,
+              ).toBe(true);
+            }
+          expect(fitted, `${generated.permalink} ${key}`).toBeGreaterThan(0);
+          checked.set(key, (checked.get(key) ?? 0) + 1);
+        }
+      }
+    }
+    expect([...checked.keys()].sort()).toEqual([...want].sort());
   });
 });

@@ -838,6 +838,68 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(within(balls, 1500, BALL_SHARE), `balls ${balls}`).toBe(true);
   });
 
+  it("places an under curio in about 1 generated room in 19, in every archetype", () => {
+    // The realized rate, counted on what `generateRoom` actually placed,
+    // over 1000 rooms: the three canned places in turn, each permalink its
+    // own (so its own room seed), with 0 to 5 made-up tags (so the machine
+    // mix, and with it the workbench and the hydroponics trough, varies),
+    // in all five archetypes. The spec asks for 1 room in 10; the rate is
+    // `UNDER_SHARE` times the share of rooms with a visible under host,
+    // which is about 0.97 in a council chamber (its round table and its
+    // benches) and about 0.4 elsewhere (a workbench, a hydroponics trough
+    // or a hero's under spot), so about 0.55 over all and 1 room in 19 in
+    // all. Two bands pin it: the host share within 0.45 to 0.70 (losing
+    // any one host family drops it to 0.40 or less), and the rooms that
+    // hold an under curio within 4 standard deviations of `UNDER_SHARE`
+    // of the hosted rooms, so the share and the fit cannot drift either.
+    const n = 200;
+    const rooms: Record<Archetype, { rooms: number; hosted: number }> = {
+      bridge: { rooms: 0, hosted: 0 },
+      council: { rooms: 0, hosted: 0 },
+      engineering: { rooms: 0, hosted: 0 },
+      archive: { rooms: 0, hosted: 0 },
+      lab: { rooms: 0, hosted: 0 },
+    };
+    let hosted = 0;
+    let placed = 0;
+    for (let i = 0; i < n; i++) {
+      const place = [CANNED_WORKSHOP, CANNED_BRIDGE, CANNED_HUB][i % 3];
+      if (place === undefined) throw new Error("places");
+      const tags = Array.from(
+        { length: i % 6 },
+        (_, j) => `under-${String(i)}-${String(j)}`,
+      );
+      for (const [archetype, type] of Object.entries(ARCHETYPE_TYPES)) {
+        const room = generateRoom({
+          ...place,
+          permalink: `under-rate-${String(i)}-${archetype}`,
+          tags,
+          type,
+        });
+        const tally = rooms[archetype as Archetype];
+        tally.rooms++;
+        if (hostSurfaces(base(room)).some((s) => s.cls === "under")) {
+          tally.hosted++;
+          hosted++;
+        }
+        if (room.curios.some((c) => CURIO_CATALOGUE[c.kind].slot === "under"))
+          placed++;
+      }
+    }
+    const total = n * 5;
+    expect(hosted / total, `hosted ${String(hosted)}`).toBeGreaterThanOrEqual(
+      0.45,
+    );
+    expect(hosted / total, `hosted ${String(hosted)}`).toBeLessThanOrEqual(0.7);
+    expect(
+      within(placed, hosted, UNDER_SHARE),
+      `placed ${String(placed)} of ${String(hosted)} hosted`,
+    ).toBe(true);
+    expect(rooms.council.hosted / rooms.council.rooms).toBeGreaterThan(0.9);
+    for (const [archetype, t] of Object.entries(rooms))
+      expect(t.hosted, archetype).toBeGreaterThan(0);
+  });
+
   it("puts a curio where it is told on a surface, and throws where it cannot stand (curioOn)", () => {
     const surfaces = hostSurfaces(base(generateRoom(CANNED_WORKSHOP)));
     const desk = surfaces.find((s) => s.cls === "desk");
@@ -1071,14 +1133,11 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
  * The forced council workshop's curios (C11), written from the pass's
  * output after a look at each host: the upright green sword and the
  * laptop on two places of the round table (its places 2 and 1, the laptop
- * an exact fit, facing the table's front), and the star ball on the desk
- * end of the west terminal at row 8. The mess table stands at (3.5, 7.5)
- * turned 3; no curio's first fitting candidate is on it, by the seed
- * order of C9. The under slot draws `trap-box` but places nothing (fix
- * round 3): this room has no workbench and the mess table's own under
- * spot is empty, so the terminal it would once have used is now the
- * room's only host for anything, and a terminal carries no under spot any
- * more.
+ * an exact fit, facing the table's front), the trap under the seat of the
+ * bench (v0) against the east wall at (12.5, 6.5), turned 3, and the star
+ * ball on the desk end of the west terminal at row 8. The mess table
+ * stands at (3.5, 7.5) turned 3; no curio's first fitting candidate is on
+ * it, by the seed order of C9, and it has no under spot of its own.
  */
 const PINNED: Curio[] = [
   {
@@ -1098,6 +1157,15 @@ const PINNED: Curio[] = [
     h: 0.78,
     turn: 0,
     seed: 574460450533092,
+  },
+  {
+    kind: "trap-box",
+    variant: 0,
+    x: 12.687,
+    y: 6.419,
+    h: 0,
+    turn: 3,
+    seed: 63837989656857,
   },
   {
     kind: "star-ball",
