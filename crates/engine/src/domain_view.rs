@@ -103,6 +103,11 @@ pub struct DomainView<'a> {
     /// rather than from an inference, and the receipt, which tells the caller
     /// whose draft their work landed in.
     joined: Option<String>,
+    /// The count of this write in its domain, held for as long as the view
+    /// lives, so a rename of the domain waits for the write to finish rather
+    /// than moving the domain's stores out from under it. `None` on every
+    /// read view.
+    _writing: Option<crate::rename::WriteTicket<'a>>,
 }
 
 impl<'a> DomainView<'a> {
@@ -122,6 +127,7 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: None,
             joined: None,
+            _writing: None,
         })
     }
 
@@ -154,6 +160,7 @@ impl<'a> DomainView<'a> {
             base: Some(base),
             actor,
             joined: None,
+            _writing: None,
         })
     }
 
@@ -182,6 +189,7 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: Some(actor.to_string()),
             joined: None,
+            _writing: None,
         })
     }
 
@@ -242,12 +250,16 @@ impl<'a> DomainView<'a> {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<DomainView<'a>> {
+        // A domain a rename has paused is waited for before anything is
+        // decided about it, and this write is counted until the view goes.
+        let ticket = engine.enter_write(name).await?;
         let seen = |actor: Option<String>| DomainView {
             engine,
             domain: name.to_string(),
             base: engine.content_source(name).ok(),
             actor,
             joined: None,
+            _writing: Some(ticket),
         };
         if !engine.reviews_changes(name) {
             return Ok(seen(None));
@@ -297,9 +309,11 @@ impl<'a> DomainView<'a> {
         let Some(join) = joined else {
             return DomainView::for_write(engine, name, scope).await;
         };
+        let ticket = engine.enter_write(name).await?;
         engine.refuse_hidden_domain(name, scope).await?;
         let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
         view.joined = Some(join.owner.clone());
+        view._writing = Some(ticket);
         Ok(view)
     }
 

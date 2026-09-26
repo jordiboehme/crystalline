@@ -392,14 +392,20 @@ pub async fn run_serve(
     // socket never wait on the model download. The engine holds the file config
     // and the overlay separately (persist and refresh hit the resolved file even
     // when it came from CRYSTALLINE_CONFIG); its effective config drives reads.
-    let engine = Arc::new(
-        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
-            .with_watch_channel(watch_tx)
-            .with_embed_channel(embed_tx)
-            .with_read_only(read_only)
-            .with_instance_id(instance_id)
-            .with_env_overlay(loaded.overlay.clone()),
-    );
+    let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+        .with_watch_channel(watch_tx)
+        .with_embed_channel(embed_tx)
+        .with_read_only(read_only)
+        .with_instance_id(instance_id)
+        .with_env_overlay(loaded.overlay.clone());
+    // Told where the state directory is, as the standalone opener is: the
+    // same path the engine resolves on its own in a release build, and under
+    // the test seam (which refuses to guess one) the isolated directory a
+    // test set, so the rename journal and the overlay journal are found.
+    if let Ok(state) = config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    let engine = Arc::new(engine);
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     if let Some(park) = parked_blocking_task() {
         // Said out loud, so the test that sets it can tell its own parked
@@ -407,6 +413,13 @@ pub async fn run_serve(
         tracing::info!("test hook: parking a blocking task for {}s", park.as_secs());
         tokio::task::spawn_blocking(move || std::thread::sleep(park));
     }
+
+    // A domain rename a stopped daemon left half done is finished before
+    // anything reads the names: before the routing cache, the watcher, the
+    // first sync and the orphan sweep, and before the socket is bound. A
+    // rename that cannot be finished keeps its domain paused and says why;
+    // every other domain is served.
+    engine.finish_leftover_rename().await;
 
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
@@ -569,7 +582,9 @@ pub async fn run_serve(
     // The file watcher.
     {
         let e = engine.clone();
-        let watch_domains = domain_roots(&loaded.effective);
+        // From the engine rather than the startup load: a rename finished
+        // above changed the names.
+        let watch_domains = domain_roots(&engine.config());
         let rx = shared.watch();
         tokio::spawn(async move {
             if let Err(err) =

@@ -47,8 +47,8 @@ pub use client::{
     run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use crystalline_engine::engine::{
-    ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
-    WrittenAttachment,
+    ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, RenameStep,
+    ShareActor, WrittenAttachment,
 };
 pub use crystalline_engine::harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,

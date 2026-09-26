@@ -182,6 +182,15 @@ impl OriginPollerState {
             .and_then(|d| d.last_result.clone())
     }
 
+    /// Carry `old`'s schedule and last result over to `new`, for a domain
+    /// renamed on this machine.
+    pub(crate) fn rename_domain(&self, old: &str, new: &str) {
+        let mut domains = self.domains.lock().unwrap();
+        if let Some(state) = domains.remove(old) {
+            domains.insert(new.to_string(), state);
+        }
+    }
+
     /// Pauses every domain's polling until `until`: GitHub rate limits are
     /// per-token, so one domain hitting the limit means every domain is
     /// paused, not just the one that tripped it. `None` clears the pause.

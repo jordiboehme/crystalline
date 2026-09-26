@@ -277,6 +277,27 @@ impl Mcp {
         }
     }
 
+    /// Spawn `mcp --embedded`: the whole stack in this process, no daemon.
+    fn spawn_embedded(env: &Env) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.args(["mcp", "--embedded"]);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
     /// Spawn an `mcp` daemon that owns a config and index other than the
     /// environment's own defaults, `--db` given ahead of the subcommand the
     /// way the global flag is placed, `--config` after it. Used to prove a
@@ -1105,6 +1126,100 @@ fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
         found,
         "the watcher picked up an external write in a domain added after daemon start"
     );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A rename a crash stopped right after writing its journal is finished by
+/// the next daemon before it answers anything: the first call a client makes
+/// already sees the new name, the configuration carries it with the old name
+/// as an alias, and the domain's state folder moved with it.
+#[test]
+fn a_daemon_finishes_a_half_done_rename_before_it_serves() {
+    finishes_a_half_done_rename_before_serving("renjrnl", Mcp::spawn);
+}
+
+/// The same for the embedded MCP stack, which opens the index itself when no
+/// daemon runs.
+#[test]
+fn the_embedded_stack_finishes_a_half_done_rename_before_it_serves() {
+    finishes_a_half_done_rename_before_serving("renemb", Mcp::spawn_embedded);
+}
+
+/// The same for a one-shot command with no daemon running: it opens the
+/// index itself and finishes the rename before it reads anything.
+#[test]
+fn a_standalone_command_finishes_a_half_done_rename_first() {
+    let env = Env::new("renone");
+    env.setup_domain("eng");
+    plant_rename_journal(&env);
+
+    let (ok, out) = env.run(&["--json", "search", "seed"]);
+    assert!(ok, "{out}");
+    let hits: Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        hits["hits"]
+            .as_array()
+            .is_some_and(|h| !h.is_empty() && h.iter().all(|h| h["domain"] == "platform")),
+        "the hits carry the new name: {hits}"
+    );
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+}
+
+/// The journal a rename of `eng` to `platform` leaves when it stops right
+/// after writing it, before its first step.
+fn plant_rename_journal(env: &Env) {
+    std::fs::write(
+        env.state_dir().join("rename-journal.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "old": "eng",
+            "new": "platform",
+            "local_only": true,
+            "origin": "explicit",
+            "old_spellings": ["eng"],
+            "done": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn finishes_a_half_done_rename_before_serving(tag: &str, spawn: fn(&Env) -> Mcp) {
+    let env = Env::new(tag);
+    env.setup_domain("eng");
+    let origins = env.state_dir().join("origins");
+    std::fs::create_dir_all(origins.join("eng")).unwrap();
+    std::fs::write(origins.join("eng/state.json"), "{}").unwrap();
+    plant_rename_journal(&env);
+
+    let mut c1 = spawn(&env);
+    c1.initialize();
+    c1.send_call("list_domains", json!({}));
+    let listed = c1.read_tool_value();
+    let names = domain_names(&listed);
+    assert!(
+        names.contains(&"platform".to_string()) && !names.contains(&"eng".to_string()),
+        "the first answer already carries the new name: {listed}"
+    );
+    c1.send_call(
+        "search_engrams",
+        json!({ "query": "seed body token", "domains": ["eng"] }),
+    );
+    let hits = c1.read_tool_value();
+    assert!(
+        hits["total"].as_u64().unwrap_or(0) >= 1,
+        "the old name still reaches the content: {hits}"
+    );
+
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    assert!(origins.join("platform/state.json").is_file());
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(!cfg.domains.contains_key("eng"), "{:?}", cfg.domains.keys());
+    assert_eq!(cfg.domains["platform"].aliases, vec!["eng".to_string()]);
 
     drop(c1);
     let _ = env.run(&["ctl", "shutdown"]);

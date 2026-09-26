@@ -1,11 +1,342 @@
 //! Renaming a domain on this machine. The rename runs as a series of steps,
 //! each one idempotent so a rename a crash interrupted can be completed by
-//! running every step again; this module holds the steps that are not a
-//! method of the store they change.
+//! running every step again; this module holds the journal that records
+//! which steps are done, the pause that keeps everything else off the domain
+//! while it moves, and the steps that are not a method of the store they
+//! change.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crystalline_core::config::NameOrigin;
+use serde::{Deserialize, Serialize};
+
+/// The file the rename journal lives in, directly under the state directory.
+pub(crate) const JOURNAL_FILE: &str = "rename-journal.json";
+
+/// How long a write, a sync or a rename waits on a domain another rename has
+/// paused, or on the writes a rename is waiting to see finish.
+pub(crate) const RENAME_WAIT: Duration = Duration::from_secs(30);
+
+/// One step of a domain rename, in the order they run. The journal records
+/// each one as it completes; a rename completed after a crash runs every step
+/// the journal does not list, and every step is safe to run twice.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameStep {
+    /// Write the new name into the domain's MANIFEST (a full rename only).
+    Manifest,
+    /// Respell links to the domain in every domain this machine can write (a
+    /// full rename only).
+    Relink,
+    /// Rename the index's domain row in place, keeping its id.
+    IndexRow,
+    /// Move the visibility, membership and share-link records.
+    AuthTables,
+    /// Move the `origins/<name>/` state folder.
+    OriginsDir,
+    /// Move the `overlays/<name>/` draft journal folder.
+    OverlaysDir,
+    /// Move the provision receipt's entries.
+    ProvisionReceipt,
+    /// Write the configuration: the new key, the old spellings as aliases.
+    Config,
+}
+
+impl RenameStep {
+    /// The steps of a rename of this machine's name only.
+    pub(crate) const LOCAL: [RenameStep; 6] = [
+        RenameStep::IndexRow,
+        RenameStep::AuthTables,
+        RenameStep::OriginsDir,
+        RenameStep::OverlaysDir,
+        RenameStep::ProvisionReceipt,
+        RenameStep::Config,
+    ];
+
+    /// The steps of a rename that also writes the MANIFEST and respells
+    /// links: those two first, then the local ones.
+    pub(crate) const FULL: [RenameStep; 8] = [
+        RenameStep::Manifest,
+        RenameStep::Relink,
+        RenameStep::IndexRow,
+        RenameStep::AuthTables,
+        RenameStep::OriginsDir,
+        RenameStep::OverlaysDir,
+        RenameStep::ProvisionReceipt,
+        RenameStep::Config,
+    ];
+
+    /// The step's name as a report and the journal spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RenameStep::Manifest => "manifest",
+            RenameStep::Relink => "relink",
+            RenameStep::IndexRow => "index_row",
+            RenameStep::AuthTables => "auth_tables",
+            RenameStep::OriginsDir => "origins_dir",
+            RenameStep::OverlaysDir => "overlays_dir",
+            RenameStep::ProvisionReceipt => "provision_receipt",
+            RenameStep::Config => "config",
+        }
+    }
+}
+
+/// A rename in progress, written before its first step and after every step,
+/// and deleted once the configuration carries the new name. A journal found
+/// at startup is a rename a crash stopped, and it is finished before the
+/// daemon serves anything.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RenameJournal {
+    /// The journal format, 1.
+    pub version: u32,
+    /// The local name the domain had.
+    pub old: String,
+    /// The local name it gets.
+    pub new: String,
+    /// Whether the rename leaves the MANIFEST and content alone.
+    pub local_only: bool,
+    /// What the configuration records for `new`.
+    pub origin: NameOrigin,
+    /// Every spelling the domain had before step one (local name, canonical
+    /// name, aliases), minus `new`. Captured once, before any step: after the
+    /// `Manifest` step the name table no longer knows the previous canonical,
+    /// so Relink, Config and recovery read the spellings from here, never
+    /// from the table.
+    pub old_spellings: Vec<String>,
+    /// The name the domain's MANIFEST declared before step one, if any: what
+    /// the Config step records as the canonical name last seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<String>,
+    /// The steps completed so far, in order.
+    pub done: Vec<RenameStep>,
+}
+
+impl RenameJournal {
+    /// Where the journal lives under `state_dir`.
+    pub(crate) fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join(JOURNAL_FILE)
+    }
+
+    /// The journal under `state_dir`, or `None` when no rename is pending.
+    /// A file that does not parse is an error naming it: guessing at a half
+    /// written rename is not something to do silently.
+    pub(crate) fn load(state_dir: &Path) -> io::Result<Option<RenameJournal>> {
+        let path = RenameJournal::path(state_dir);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the rename journal {} could not be read ({e}); finish or undo that rename \
+                     by hand, then delete the file",
+                    path.display()
+                ),
+            )
+        })
+    }
+
+    /// Write the journal atomically: a temporary file beside it, then a
+    /// rename over it, so a crash leaves the previous journal or this one and
+    /// never half of either.
+    pub(crate) fn save(&self, state_dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(state_dir)?;
+        let path = RenameJournal::path(state_dir);
+        let temp = state_dir.join(format!("{JOURNAL_FILE}.tmp"));
+        let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, &path)
+    }
+
+    /// Delete the journal; a missing one is fine.
+    pub(crate) fn remove(state_dir: &Path) -> io::Result<()> {
+        match std::fs::remove_file(RenameJournal::path(state_dir)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The steps this rename runs, in order.
+    pub(crate) fn steps(&self) -> &'static [RenameStep] {
+        if self.local_only {
+            &RenameStep::LOCAL
+        } else {
+            &RenameStep::FULL
+        }
+    }
+}
+
+/// The domains a rename has paused, and the writes still running in each.
+///
+/// A write, a sync or a watcher pass into a paused domain waits (up to
+/// [`RENAME_WAIT`]) or is skipped; a rename, once it has paused a domain,
+/// waits for the writes already running in it to finish before its first
+/// step, so nothing writes under the old name after the index row has moved.
+#[derive(Default)]
+pub(crate) struct RenamePause {
+    paused: std::sync::RwLock<HashSet<String>>,
+    writers: std::sync::Mutex<HashMap<String, usize>>,
+    changed: tokio::sync::Notify,
+}
+
+impl RenamePause {
+    /// Whether `name` is paused.
+    pub(crate) fn is_paused(&self, name: &str) -> bool {
+        self.paused.read().unwrap().contains(name)
+    }
+
+    /// Whether any domain is paused.
+    pub(crate) fn any(&self) -> bool {
+        !self.paused.read().unwrap().is_empty()
+    }
+
+    /// Every paused name.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.paused.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Pause `names`.
+    pub(crate) fn pause(&self, names: &[&str]) {
+        let mut paused = self.paused.write().unwrap();
+        paused.extend(names.iter().map(|n| n.to_string()));
+    }
+
+    /// Lift the pause on `names` and wake everything waiting on it.
+    pub(crate) fn resume(&self, names: &[&str]) {
+        {
+            let mut paused = self.paused.write().unwrap();
+            for name in names {
+                paused.remove(*name);
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Wait until none of `names` is paused. Answers whether it had to wait
+    /// at all, or the name still paused when `limit` ran out.
+    pub(crate) async fn wait_clear(
+        &self,
+        names: &[String],
+        limit: Duration,
+    ) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut waited = false;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let busy = {
+                let paused = self.paused.read().unwrap();
+                names.iter().find(|n| paused.contains(n.as_str())).cloned()
+            };
+            let Some(busy) = busy else {
+                return Ok(waited);
+            };
+            waited = true;
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err(busy);
+            }
+        }
+    }
+
+    /// Count a write into `name`, unless `name` is paused.
+    pub(crate) fn try_enter(&self, name: &str) -> Option<WriteTicket<'_>> {
+        *self
+            .writers
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default() += 1;
+        let ticket = WriteTicket {
+            pause: self,
+            name: name.to_string(),
+        };
+        // Counted before the check, so a rename that paused the domain in
+        // between either sees this write in its count or this write sees the
+        // pause; never neither.
+        if self.is_paused(name) {
+            return None;
+        }
+        Some(ticket)
+    }
+
+    /// Wait until no write counted into `name` is still running. False when
+    /// `limit` ran out first.
+    pub(crate) async fn drained(&self, name: &str, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.writers.lock().unwrap().contains_key(name) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+/// One running write into a domain, counted until it is dropped.
+pub(crate) struct WriteTicket<'a> {
+    pause: &'a RenamePause,
+    name: String,
+}
+
+impl Drop for WriteTicket<'_> {
+    fn drop(&mut self) {
+        {
+            let mut writers = self.pause.writers.lock().unwrap();
+            if let Some(count) = writers.get_mut(&self.name) {
+                *count -= 1;
+                if *count == 0 {
+                    writers.remove(&self.name);
+                }
+            }
+        }
+        self.pause.changed.notify_waiters();
+    }
+}
+
+/// A test seam: a rename armed with one stops after its step, says so, and
+/// goes on only when released. See `Engine::hold_rename_after`.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub struct RenameHold {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl RenameHold {
+    /// Resolves once the rename has finished the step it was held after.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the held rename go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// The rename's side: say the step is done, then wait for the release.
+    pub(crate) async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
 
 /// Move the per-domain state folder `<parent>/<old>` to `<parent>/<new>`, for
 /// the `origins/` and `overlays/` folders a domain keeps under its name.
@@ -29,10 +360,6 @@ use std::path::Path;
 /// On Windows a folder that holds an open file (the overlay journal, or one
 /// a watcher is reading) cannot be renamed; the caller pauses the domain
 /// before this step so nothing holds one.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rename verb that calls it is not wired yet")
-)]
 pub(crate) fn move_state_dir(parent: &Path, old: &str, new: &str) -> io::Result<()> {
     if old == new {
         return Ok(());

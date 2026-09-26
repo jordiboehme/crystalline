@@ -51,6 +51,14 @@ impl Engine {
     /// that caches its routing bullets, because a virtual domain declares its
     /// name in the database where the table build cannot reach.
     pub async fn refresh_names(&self) {
+        // A rename between its index row and its config step: the push
+        // would drop the alias the index row step left for the old name,
+        // which the configuration does not list yet. The rename refreshes
+        // once its config step is done.
+        if self.names_frozen() {
+            self.mark_names_stale();
+            return;
+        }
         self.reload_virtual_manifests().await;
         // Rebuilt here rather than marked and left to `name_table_now`: a
         // lookup racing this call may have taken the stale mark and be
@@ -78,6 +86,9 @@ impl Engine {
     /// `hidden` stays exactly as typed, so the ordinary unknown-domain path
     /// answers it with the caller's own words and never names the local name.
     pub async fn localize_visible(&self, spelling: &str, hidden: &HashSet<String>) -> String {
+        // A spelling of a domain being renamed waits for the rename, so it
+        // maps to the name the domain has once it is done.
+        let _ = self.wait_for_renames(&[spelling.to_string()]).await;
         let table = self.table_knowing([spelling.to_string()]).await;
         localize_in(&table, spelling, hidden)
     }
@@ -86,6 +97,9 @@ impl Engine {
     /// [`Engine::localize_visible`]. Mapping a local name answers it
     /// unchanged, so a value localized twice is localized once.
     pub async fn localized<P: DomainArgs + Clone>(&self, p: &P, hidden: &HashSet<String>) -> P {
+        // A read of a domain being renamed waits for the rename, and past
+        // the wait is answered by the names as they stand.
+        let _ = self.wait_for_renames(&spellings_of(p)).await;
         let table = self.table_knowing(spellings_of(p)).await;
         let mut p = p.clone();
         p.localize_domains(&|spelling| localize_in(&table, spelling, hidden));
@@ -101,6 +115,9 @@ impl Engine {
         p: &P,
         scope: &crate::scope::Scope,
     ) -> Result<P> {
+        // A write into a domain being renamed waits for the rename, then
+        // maps to the name the domain has now.
+        self.wait_for_renames(&spellings_of(p)).await?;
         let table = self.table_knowing(spellings_of(p)).await;
         let respelled = std::cell::Cell::new(false);
         let mut probe = p.clone();
@@ -220,7 +237,7 @@ impl Engine {
 
     /// [`Engine::registered_domain_entries`], with the file read on the
     /// blocking pool.
-    async fn registered_domain_entries_now(&self) -> IndexMap<String, DomainEntry> {
+    pub(super) async fn registered_domain_entries_now(&self) -> IndexMap<String, DomainEntry> {
         let read = self.registration_reader();
         match tokio::task::spawn_blocking(read).await {
             Ok(entries) => entries,
@@ -392,29 +409,46 @@ impl Engine {
 
         // The reset unbound references in every domain that spelled one of
         // the changed names, whoever registers it, so every row gets a pass.
-        let mut every: Vec<DomainId> = store
-            .domain_spellings()
-            .await?
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
-        every.sort_by_key(|id| id.0);
-        every.dedup();
-        store.begin().await?;
-        let pass = async {
-            for id in &every {
-                store.resolve_pending_relations(*id).await?;
-                store.resolve_pending_links(*id).await?;
-            }
-            Ok::<(), crystalline_index::IndexError>(())
+        resolve_pending_in_every_domain(store).await
+    }
+
+    /// Bind every pending reference in every domain the index knows, for a
+    /// change that may have unbound references without a spelling push to
+    /// notice it: a rename that took a spelling another domain held. Best
+    /// effort, like the push.
+    pub(super) async fn resolve_pending_everywhere(&self) {
+        let store = self.store.lock().await;
+        if let Err(e) = resolve_pending_in_every_domain(&*store).await {
+            tracing::warn!("binding the references a rename left pending failed: {e}");
         }
-        .await;
-        match pass {
-            Ok(()) => store.commit().await,
-            Err(e) => {
-                let _ = store.rollback().await;
-                Err(e)
-            }
+    }
+}
+
+/// One resolve pass over every domain row the index's spellings reach, in
+/// one transaction.
+async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index::Result<()> {
+    let mut every: Vec<DomainId> = store
+        .domain_spellings()
+        .await?
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    every.sort_by_key(|id| id.0);
+    every.dedup();
+    store.begin().await?;
+    let pass = async {
+        for id in &every {
+            store.resolve_pending_relations(*id).await?;
+            store.resolve_pending_links(*id).await?;
+        }
+        Ok::<(), crystalline_index::IndexError>(())
+    }
+    .await;
+    match pass {
+        Ok(()) => store.commit().await,
+        Err(e) => {
+            let _ = store.rollback().await;
+            Err(e)
         }
     }
 }
@@ -452,7 +486,7 @@ fn spellings_of<P: DomainArgs + Clone>(p: &P) -> Vec<String> {
 
 /// The local name `spelling` means in `table`, unless that domain is in
 /// `hidden`: then, as for a spelling nothing answers to, the spelling itself.
-fn localize_in(table: &NameTable, spelling: &str, hidden: &HashSet<String>) -> String {
+pub(super) fn localize_in(table: &NameTable, spelling: &str, hidden: &HashSet<String>) -> String {
     match table.resolve(spelling) {
         Some(local) if !hidden.contains(local) => local.to_string(),
         _ => spelling.to_string(),

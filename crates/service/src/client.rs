@@ -626,13 +626,20 @@ async fn build_embedded(
     // added mid-session resolve for data operations, not for picking up external
     // file changes. The engine holds the file config and the overlay apart, so
     // its effective config drives reads while persistence stays env-free.
-    let engine = Arc::new(
-        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
-            .with_embed_channel(embed_tx)
-            .with_read_only(read_only)
-            .with_env_overlay(loaded.overlay.clone()),
-    );
+    let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+        .with_embed_channel(embed_tx)
+        .with_read_only(read_only)
+        .with_env_overlay(loaded.overlay.clone());
+    // Told where the state directory is, as the daemon and the standalone
+    // opener are; see `open_standalone`.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    let engine = Arc::new(engine);
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
+    // A rename a stopped daemon left half done is finished before the first
+    // sync and before the routing cache reads a name, as the daemon does.
+    engine.finish_leftover_rename().await;
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();

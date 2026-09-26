@@ -1154,7 +1154,7 @@ impl Engine {
         let stamps = !dry_run;
         let removes = !dry_run && !self.read_only;
 
-        let Some(registered) = self.registered_domain_names_checked() else {
+        let Some(mut registered) = self.registered_domain_names_checked() else {
             return Ok(json!({
                 "grace_seconds": grace.map(|g| g.num_seconds()),
                 "on_demand": grace.is_none(),
@@ -1169,6 +1169,11 @@ impl Engine {
                             collected",
             }));
         };
+
+        // Both names of a rename in flight, or one a crash left half done,
+        // are registered: the index row may carry either while the
+        // configuration still says the other.
+        registered.extend(self.names_being_renamed());
 
         // The registered set is stamped FIRST, before a single domain is
         // considered. A registered domain that went unstamped would age like

@@ -22,6 +22,9 @@ pub mod params;
 #[doc(hidden)]
 pub mod poller;
 mod rename;
+#[cfg(any(test, feature = "testing"))]
+pub use rename::RenameHold;
+pub use rename::RenameStep;
 #[doc(hidden)]
 pub mod review;
 #[doc(hidden)]

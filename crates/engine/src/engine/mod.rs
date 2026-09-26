@@ -990,6 +990,25 @@ pub struct Engine {
     // [`crate::join`] for why a join belongs to a session and not to an
     // account.
     joins: Arc<crate::join::Joins>,
+    // The domains a rename has paused and the writes running in each: a
+    // write, sync or watcher pass into a paused domain waits or is skipped,
+    // and a rename waits for the writes already running. See
+    // [`crate::rename::RenamePause`] and `Engine::rename_domain_local`.
+    rename_pause: crate::rename::RenamePause,
+    // The one rename this engine runs at a time, by the local name it
+    // renames; a second one is refused while it is taken.
+    rename_slot: std::sync::Mutex<Option<String>>,
+    // Set while a rename is between its index row step and its config step:
+    // a spelling push then would drop the alias the index row step left for
+    // the old name, since the configuration does not list it yet. A refresh
+    // in that window only marks the table stale.
+    names_frozen: std::sync::atomic::AtomicBool,
+    // The rename test seams: a failure after one step, and a hold after one.
+    #[cfg(any(test, feature = "testing"))]
+    rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
+    #[cfg(any(test, feature = "testing"))]
+    rename_hold:
+        std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
 }
 
 /// One drafted engram, as the share-link surface hands it to the account a
@@ -1210,6 +1229,9 @@ pub enum PreviewCredential {
     ReadScopeFallback,
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub use crate::rename::RenameHold;
+pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
 
 /// What a write is told when it reaches a domain that reviews changes before
@@ -1666,6 +1688,13 @@ impl Engine {
             domain_access: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
+            rename_pause: crate::rename::RenamePause::default(),
+            rename_slot: std::sync::Mutex::new(None),
+            names_frozen: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            rename_fail_after: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            rename_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -2500,7 +2529,9 @@ impl Engine {
     /// reports `Acquired` when collaboration is off or the domain is virtual, so
     /// the caller arms the watch uniformly.
     pub async fn claim_host(&self, name: &str, take_over: bool) -> Result<HostClaim> {
-        if self.instance_id.is_empty() {
+        // A domain a rename has paused is claimed by the sync that ends the
+        // rename, under the name it ends with.
+        if self.instance_id.is_empty() || self.is_renaming(name) {
             return Ok(HostClaim::Acquired);
         }
         let ContentSource::File { root } = self.content_source(name)? else {
@@ -4150,6 +4181,7 @@ mod move_;
 mod names;
 mod origins;
 mod read;
+mod rename_domain;
 mod review_mode;
 mod schemas;
 mod search;
@@ -4748,6 +4780,10 @@ pub async fn open_standalone(
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);
     }
+    // A rename a stopped daemon or command left half done is finished before
+    // this command reads a name. One that cannot be finished keeps its domain
+    // paused and is said once; the command still runs for everything else.
+    engine.finish_leftover_rename().await;
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

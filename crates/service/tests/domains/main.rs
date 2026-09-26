@@ -14,6 +14,7 @@ mod collaboration;
 mod configure;
 mod domain_access;
 mod domain_admin;
+mod domain_rename;
 mod evolve;
 mod evolve_twins;
 mod toon_measurement;
