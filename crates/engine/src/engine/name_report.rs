@@ -42,7 +42,10 @@ impl Engine {
     /// when one is known; a shadowed or contested name is reported under its
     /// own key instead. `local_spellings` counts, per engram and spelling,
     /// the links and `crystalline://` URLs [`Engine::fix_local_spellings`]
-    /// would respell. Every list is sorted.
+    /// would respell in the domain's own text. In a domain that reviews
+    /// changes the fix lands in the owner's draft; once it has, the entry
+    /// carries `in_draft: true`, since the domain's text changes only when
+    /// that draft is accepted. Every list is sorted.
     pub async fn name_report(&self) -> Result<Value> {
         let table = self.name_table_now().await;
         let entries = self.registered_domain_entries_now().await;
@@ -94,15 +97,19 @@ impl Engine {
             .collect();
 
         let mut local_spellings = Vec::new();
-        for (domain, path, counts) in self.local_spelling_counts(&table).await? {
+        for (domain, path, counts, in_draft) in self.local_spelling_counts(&table).await? {
             for (spelling, (canonical, count)) in counts {
-                local_spellings.push(json!({
+                let mut entry = json!({
                     "domain": domain,
                     "path": path,
                     "spelling": spelling,
                     "canonical": canonical,
                     "count": count,
-                }));
+                });
+                if in_draft {
+                    entry["in_draft"] = json!(true);
+                }
+                local_spellings.push(entry);
             }
         }
 
@@ -139,7 +146,11 @@ impl Engine {
         let table = self.name_table_now().await;
         let scope = crate::scope::Scope::Unrestricted;
         let mut fixed: u64 = 0;
-        for (domain, path, _) in self.local_spelling_counts(&table).await? {
+        for (domain, path, _, in_draft) in self.local_spelling_counts(&table).await? {
+            // Already respelled in the owner's draft: nothing to write again.
+            if in_draft {
+                continue;
+            }
             match self.respell_one(&domain, &path, &table, &scope).await {
                 Ok(n) => fixed += n as u64,
                 Err(e) => tracing::warn!(
@@ -204,9 +215,9 @@ impl Engine {
         }
         if !entries.contains_key(canonical) && self.leftover_row_holds(canonical).await {
             return Some(format!(
-                "the index still holds a row named '{canonical}' from a domain removed \
-                 earlier; run `crystalline doctor --fix` to drop it, then the next sync \
-                 renames '{name}'"
+                "the index still holds a row named '{canonical}' for a domain that is not \
+                 registered here; run `crystalline doctor --fix` to drop it, then the next \
+                 sync renames '{name}'"
             ));
         }
         None
@@ -214,13 +225,15 @@ impl Engine {
 
     /// Every base engram that spells a domain by a name the name table would
     /// rewrite, with its count per spelling: `(domain, path, spelling ->
-    /// (canonical, count))`, sorted by domain, then path. The count is taken
-    /// with the same rewrite [`Engine::fix_local_spellings`] applies, so the
-    /// report and the fix never disagree.
+    /// (canonical, count), in_draft)`, sorted by domain, then path. The count
+    /// is taken with the same rewrite [`Engine::fix_local_spellings`]
+    /// applies, so the report and the fix never disagree. `in_draft` says the
+    /// fix already sits in the owner's review draft.
+    #[allow(clippy::type_complexity)]
     async fn local_spelling_counts(
         &self,
         table: &NameTable,
-    ) -> Result<Vec<(String, String, BTreeMap<String, (String, usize)>)>> {
+    ) -> Result<Vec<(String, String, BTreeMap<String, (String, usize)>, bool)>> {
         let spellings: Vec<String> = table
             .spellings()
             .into_iter()
@@ -241,10 +254,37 @@ impl Engine {
             };
             let counts = count_respellings(&text, table);
             if !counts.is_empty() {
-                out.push((domain, path, counts));
+                let in_draft = self.draft_holds_fix(&domain, &path, table).await;
+                out.push((domain, path, counts, in_draft));
             }
         }
         Ok(out)
+    }
+
+    /// Whether `path` in a domain that reviews changes has an owner's draft
+    /// that spells no local-only name any more: the fix is written and waits
+    /// for review. Anything that cannot be read answers `false`.
+    async fn draft_holds_fix(&self, domain: &str, path: &str, table: &NameTable) -> bool {
+        if !self.reviews_changes(domain) {
+            return false;
+        }
+        let scope = crate::scope::Scope::Unrestricted;
+        let Ok(view) = DomainView::for_write(self, domain, &scope).await else {
+            return false;
+        };
+        if view.actor().is_none() {
+            return false;
+        }
+        let Ok(Some(desc)) = self.descriptor_at(domain, path).await else {
+            return false;
+        };
+        let Ok(source) = self.content_source(domain) else {
+            return false;
+        };
+        match view.text_at(&source, &desc).await {
+            Ok(Some(text)) => respell_local(&text, table).1 == 0,
+            _ => false,
+        }
     }
 
     /// Respell one engram's local-only domain names, answering how many

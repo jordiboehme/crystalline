@@ -685,6 +685,11 @@ pub struct LocalSpellingDoctor {
     pub canonical: String,
     /// How many links and URLs spell it that way.
     pub count: u64,
+    /// Whether the fix already sits in the owner's draft of a domain that
+    /// reviews changes: written, and waiting for review rather than for
+    /// `--fix`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_draft: bool,
 }
 
 /// The domain name findings. Shadowed and contested names, dropped aliases,
@@ -834,20 +839,29 @@ impl DoctorReport {
         // domain's rows, and every row on a read-only instance, are reported
         // and never counted - no `--fix` collects them, so counting them
         // would fail doctor forever over a state that has no remedy here.
-        // An empty row left behind counts the same way, once per domain: it
-        // holds a name against a rename or an adoption, and `--fix` drops it.
+        // An empty row left behind is a warning, not counted: it only holds
+        // a name against a rename or an adoption, and the line says `--fix`
+        // drops it.
         if let Some(o) = &self.orphaned_rows {
             n += o
                 .domains
                 .iter()
-                .filter(|d| (d.collectable && !d.collected) || (d.row_droppable && !d.row_dropped))
+                .filter(|d| d.collectable && !d.collected)
                 .count();
         }
         // A link spelled with a name only this machine uses breaks for every
         // colleague who reads it, and `--fix` respells it: one problem per
-        // file until then. The other name findings are warnings and hints.
+        // file until then. A file whose fix already waits in a review draft
+        // is done as far as `--fix` goes. The other name findings are
+        // warnings and hints.
         if let Some(names) = &self.names {
-            n += names.local_spellings.len();
+            let files: HashSet<(&str, &str)> = names
+                .local_spellings
+                .iter()
+                .filter(|s| !s.in_draft)
+                .map(|s| (s.domain.as_str(), s.path.as_str()))
+                .collect();
+            n += files.len();
         }
         // Provisioning never contributes here, the same stance environment
         // takes: an undecided domain is a normal state awaiting a person's
@@ -2892,7 +2906,7 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
         }
         if d.row_droppable {
             return format!(
-                "  [problem] {name}: an empty row left behind by a removed domain ({age}). It holds the name '{name}' against a rename or an adoption; rerun with --fix to drop it"
+                "  {name}: an empty row left behind by a removed domain ({age}). It holds the name '{name}' against a rename or an adoption; `crystalline doctor --fix` drops it"
             );
         }
     }
@@ -3026,8 +3040,22 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
             "could not write the domain's name into the links: {err}"
         ));
     }
-    if !names.local_spellings.is_empty() {
-        let total: u64 = names.local_spellings.iter().map(|s| s.count).sum();
+    let (drafted, open): (Vec<&LocalSpellingDoctor>, Vec<&LocalSpellingDoctor>) =
+        names.local_spellings.iter().partition(|s| s.in_draft);
+    if !drafted.is_empty() {
+        let total: u64 = drafted.iter().map(|s| s.count).sum();
+        lines.push(format!(
+            "{total} link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"
+        ));
+        for s in &drafted {
+            lines.push(format!(
+                "  {}/{}: {} x '{}', the domain's name is '{}'",
+                s.domain, s.path, s.count, s.spelling, s.canonical
+            ));
+        }
+    }
+    if !open.is_empty() {
+        let total: u64 = open.iter().map(|s| s.count).sum();
         let tail = match (fix, &names.fix_error) {
             (false, _) => "rerun with --fix to write the domain's name instead",
             (true, Some(_)) => "--fix could not write them, see the line above",
@@ -3038,7 +3066,7 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
         lines.push(format!(
             "[problem] {total} links name a domain by a name only this machine uses; {tail}"
         ));
-        for s in &names.local_spellings {
+        for s in &open {
             lines.push(format!(
                 "  {}/{}: {} x '{}', the domain's name is '{}'",
                 s.domain, s.path, s.count, s.spelling, s.canonical
@@ -3802,11 +3830,11 @@ mod tests {
         );
     }
 
-    /// An empty row a removed domain left behind is a problem until `--fix`
-    /// drops it, and says what it blocks; once dropped it is reported and not
-    /// counted.
+    /// An empty row a removed domain left behind is a warning that says what
+    /// it blocks and that `--fix` drops it; it never counts toward the exit
+    /// code, before or after the drop.
     #[test]
-    fn an_empty_leftover_row_is_a_problem_until_dropped() {
+    fn an_empty_leftover_row_is_a_warning_until_dropped() {
         let mut row = orphan("platform", 0, None);
         row.collectable = false;
         row.kept = Some("no_rows".to_string());
@@ -3814,11 +3842,12 @@ mod tests {
         let report = orphan_report(vec![row.clone()], None, false);
         let out = render_human(&report);
         assert!(
-            out.contains("[problem] platform: an empty row left behind by a removed domain")
-                && out.contains("rerun with --fix to drop it"),
+            out.contains("platform: an empty row left behind by a removed domain")
+                && out.contains("`crystalline doctor --fix` drops it")
+                && !out.contains("[problem] platform"),
             "{out}"
         );
-        assert_eq!(report.remaining_problems(), 1);
+        assert_eq!(report.remaining_problems(), 0);
 
         row.row_droppable = false;
         row.row_dropped = true;
@@ -3867,5 +3896,53 @@ mod tests {
             "{out}"
         );
         assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// Local-only spellings count once per file, and a file whose fix waits
+    /// in a review draft is shown as such and not counted, with no line
+    /// claiming the file could not be written.
+    #[test]
+    fn local_spellings_count_per_file_and_a_drafted_fix_is_not_counted() {
+        let entry = |path: &str, spelling: &str, in_draft: bool| LocalSpellingDoctor {
+            domain: "ops".to_string(),
+            path: path.to_string(),
+            spelling: spelling.to_string(),
+            canonical: format!("{spelling}-team"),
+            count: 1,
+            in_draft,
+        };
+        let report = DoctorReport {
+            names: Some(NamesDoctor {
+                local_spellings: vec![
+                    entry("a.md", "eng", false),
+                    entry("a.md", "ops", false),
+                    entry("b.md", "eng", true),
+                ],
+                fixed: Some(0),
+                ..NamesDoctor::default()
+            }),
+            fix: true,
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1, "one open file");
+        let out = render_human(&report);
+        assert!(
+            out.contains("1 link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"),
+            "{out}"
+        );
+
+        let drafted_only = DoctorReport {
+            names: Some(NamesDoctor {
+                local_spellings: vec![entry("b.md", "eng", true)],
+                fixed: Some(0),
+                ..NamesDoctor::default()
+            }),
+            fix: true,
+            ..DoctorReport::default()
+        };
+        assert_eq!(drafted_only.remaining_problems(), 0);
+        let out = render_human(&drafted_only);
+        assert!(!out.contains("could not be written"), "{out}");
+        assert!(!out.contains("[problem]"), "{out}");
     }
 }

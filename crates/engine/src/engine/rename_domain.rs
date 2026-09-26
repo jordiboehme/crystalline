@@ -1127,7 +1127,7 @@ impl Engine {
         };
         if row.is_some() {
             return Err(EngineError::Conflict(format!(
-                "the index still holds a domain named '{new}' from a domain removed earlier; \
+                "the index still holds a domain named '{new}' that is not registered here; \
                  pick another name, or run `crystalline doctor --fix`, which drops it once it \
                  holds nothing"
             )));

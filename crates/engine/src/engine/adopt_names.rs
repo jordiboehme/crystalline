@@ -8,6 +8,7 @@
 //! the sync a rename ends with, or the one inside a registration, never runs
 //! an adoption of its own.
 
+#[cfg(any(test, feature = "testing"))]
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crystalline_core::names::NameTable;

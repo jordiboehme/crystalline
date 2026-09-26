@@ -1534,6 +1534,71 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// `doctor --fix` over a running daemon respells a link that names a domain
+/// by a name only this machine uses: the daemon runs the fix (ctl
+/// `fix_local_spellings`) and then the report (ctl `name_report`), and the
+/// next plain run is clean for that finding.
+#[test]
+fn doctor_fix_over_a_running_daemon_respells_local_only_links() {
+    let env = Env::new("docnames");
+    env.setup_domain("eng");
+    env.setup_domain("ops");
+    // `eng` keeps its explicit local name here while its MANIFEST calls it
+    // `engineering`; a link in `ops` spells it `eng`.
+    std::fs::write(
+        env.dir.join("kb-eng/MANIFEST.md"),
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ndomain_name: engineering\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- eng\n\n## When to Use\n\n- Route here for eng\n",
+    )
+    .unwrap();
+    let note = env.dir.join("kb-ops/note.md");
+    std::fs::write(
+        &note,
+        "---\ntype: engram\ntitle: Note\npermalink: note\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nSee [[eng:seed]] for the seed.\n",
+    )
+    .unwrap();
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // The daemon's startup sync indexes the edits; wait until it reports
+    // the link.
+    let start = Instant::now();
+    let report = loop {
+        let (_, out) = env.run(&["--json", "doctor"]);
+        let report: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+        if report["names"]["local_spellings"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        {
+            break report;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the daemon never reported the link: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(report["index"]["source"], json!("daemon"), "{report}");
+
+    let (ok, out, err) = env.run_full(&["--json", "doctor", "--fix"]);
+    let fixed: Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: stdout={out} stderr={err}"));
+    assert!(ok, "{fixed}");
+    assert_eq!(fixed["names"]["fixed"], json!(1), "{fixed}");
+    assert_eq!(fixed["names"]["local_spellings"], json!([]), "{fixed}");
+    let text = std::fs::read_to_string(&note).unwrap();
+    assert!(text.contains("[[engineering:seed]]"), "{text}");
+
+    let (ok, out) = env.run(&["--json", "doctor"]);
+    let again: Value = serde_json::from_str(&out).unwrap();
+    assert!(ok, "{again}");
+    assert_eq!(again["names"]["local_spellings"], json!([]), "{again}");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The domain names in a `list_domains` result value.
 fn domain_names(value: &Value) -> Vec<String> {
     value["domains"]

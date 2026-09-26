@@ -511,3 +511,60 @@ async fn a_failed_adoption_reports_its_error_as_the_reason() {
     let report = engine.name_report().await.unwrap();
     assert_eq!(report["adoption_pending"], json!([]), "{report}");
 }
+
+/// In a domain that reviews changes the fix lands in the owner's draft. The
+/// domain's own text keeps the old spelling until the draft is accepted, so
+/// the report still lists the file, marked `in_draft`, and a second fix
+/// writes nothing.
+#[tokio::test]
+async fn a_fix_in_a_reviewing_domain_is_reported_as_waiting_in_a_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = declared_folder(tmp.path(), "eng", "engineering");
+    std::fs::write(
+        eng.join("runbook.md"),
+        engram("Runbook", "runbook", "The steps."),
+    )
+    .unwrap();
+    let ops = bare_folder(tmp.path(), "ops");
+    let note = engram("Note", "note", "See [[eng:runbook]] for the steps.");
+    std::fs::write(ops.join("note.md"), &note).unwrap();
+    let mut reviewed = explicit(ops.clone());
+    reviewed.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![("eng", explicit(eng)), ("ops", reviewed)],
+    );
+    engine.sync(None).await.unwrap();
+
+    let before = engine.name_report().await.unwrap();
+    assert_eq!(
+        before["local_spellings"],
+        json!([{
+            "domain": "ops", "path": "note.md", "spelling": "eng",
+            "canonical": "engineering", "count": 1
+        }]),
+        "{before}"
+    );
+
+    assert_eq!(engine.fix_local_spellings().await.unwrap(), 1);
+    assert_eq!(
+        std::fs::read_to_string(ops.join("note.md")).unwrap(),
+        note,
+        "the reviewed file itself is untouched"
+    );
+    let after = engine.name_report().await.unwrap();
+    assert_eq!(
+        after["local_spellings"],
+        json!([{
+            "domain": "ops", "path": "note.md", "spelling": "eng",
+            "canonical": "engineering", "count": 1, "in_draft": true
+        }]),
+        "{after}"
+    );
+    assert_eq!(
+        engine.fix_local_spellings().await.unwrap(),
+        0,
+        "the draft is not written again"
+    );
+}
