@@ -1,8 +1,8 @@
 /**
  * The exhibits' shape tests: the hand has no light and holds four fingers
  * and a thumb, the rocket's hull is a true chequer with three fins on its
- * plinth, and the hammer's head is its true size with its crack flat on
- * the floor.
+ * plinth and four portholes centred on its front, and the hammer's head
+ * is its true size with its crack flat on the floor.
  */
 
 import { describe, expect, it } from "vitest";
@@ -52,6 +52,41 @@ describe("exhibit hero models", () => {
         ROCKET.plinth,
         4,
       );
+  });
+
+  it("sets four portholes in a row near the top, centred on the front", () => {
+    // Mutation caught: three portholes (a lopsided row), the row turned
+    // off the front, or a porthole slipped out of the top band.
+    const ports = partsOf("moon-rocket")
+      .filter((p) => p.method === "extrude" && extent(local(p), 2) < 0.1)
+      .map((p) => {
+        const pts = local(p);
+        // The middle of its bounds (a mean of the vertices leans with
+        // the triangulation, which is not mirror symmetric).
+        const mid = (i: 0 | 1 | 2) =>
+          (Math.max(...pts.map((q) => q[i])) +
+            Math.min(...pts.map((q) => q[i]))) /
+          2;
+        return [mid(0), mid(1), mid(2)] as const;
+      })
+      .sort((x, y) => x[0] - y[0]);
+    expect(ports).toHaveLength(4);
+    const band = (ROCKET.h1 - ROCKET.h0) / ROCKET.bands;
+    for (const [, d, h] of ports) {
+      expect(d).toBeGreaterThan(0);
+      expect(h).toBeGreaterThan(ROCKET.h1 - band);
+      expect(h).toBeLessThan(ROCKET.h1);
+    }
+    // Mirror pairs about the front: the outer two and the inner two.
+    for (const [i, j] of [
+      [0, 3],
+      [1, 2],
+    ] as const) {
+      const [p, q] = [ports[i], ports[j]];
+      if (p === undefined || q === undefined) throw new Error("no port");
+      expect(p[0] + q[0]).toBeCloseTo(0, 6);
+      expect(p[1]).toBeCloseTo(q[1], 6);
+    }
   });
 
   it("gives the hammer the screen prop's head and lays its crack flat round it", () => {

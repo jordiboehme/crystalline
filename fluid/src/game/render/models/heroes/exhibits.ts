@@ -8,7 +8,8 @@
  *
  * - The hand is a craggy brick-red stone right fist, twice human size,
  *   upright on a grey plinth: a broken edge where the forearm meets the
- *   plinth, faceted slabs and dark cracks on its faces, four thick fingers
+ *   plinth, faceted slabs of slightly different stone with dark grooves
+ *   between them and dark cracks on their faces, four thick fingers
  *   curled on its front (`+d`) under big square knuckles, and the thumb
  *   folded across them from its `+a` side.
  * - The rocket is a slim red and white chequered hull (an octagonal prism
@@ -19,8 +20,10 @@
  *   (`HAMMER_HEAD`), its long axis along `a`, flat on the floor, with two
  *   faint knotwork bands. Its leather-wrapped handle rises from the head's
  *   top middle towards `-d` at 55 degrees and ends in a pommel with a
- *   strap hanging from it. Dark bars 4 mm high radiate from under the head
- *   as the floor's crack; the head is the hammer's one `bevelBox`.
+ *   strap hanging from it. Under the head a dark dent marks the floor,
+ *   and flat jagged cracks a few millimetres high radiate from it,
+ *   wide at the root and narrowing to a point, a few of them forking;
+ *   the head is the hammer's one `bevelBox`.
  *
  * The numbers each kind is built to are named in a table above its
  * recipe: `HAND`, `ROCKET`, and `HAMMER_HEAD` with `HAMMER`.
@@ -45,26 +48,44 @@ const STONE_RED: Rgb = [0.55, 0.16, 0.12];
 const STONE_CRACK: Rgb = [0.3, 0.1, 0.08];
 
 /**
- * The stone hand's measures, in metres, `[lo, hi]` pairs along `a`, `d`
- * and `h`:
+ * The stone hand's measures, in metres. Every block is
+ * `[a0, a1, d0, d1, h0, h1, bevel, shade]`: its ranges along `a`, `d` and
+ * `h`, its bevel and how light its stone is (`shade` of `STONE_RED`), so
+ * neighbouring slabs differ a little and the facets read as separate
+ * stones, not one moulded shell.
  * - `plinth`: the plinth's height and bevel (it fills the footprint);
  * - `base`: the broken edge, five irregular slabs round the forearm's
- *   foot, each `[a0, a1, d0, d1, h1]` from the plinth's top up to `h1`;
- * - `forearm`, `wrist` and `fist`: bevelled blocks `[a, d, h, bevel]`,
- *   the fist wider than the forearm, so the hand reads as the big end;
- * - `slabs`: the faceting slabs on the forearm's front and back;
- * - `fingers`: each finger's `a` range (index at `+a`, little finger at
- *   `-a`) and its knuckle's top; every finger is a block over `fingerD`
- *   and `fingerH` bevelled by `fingerBevel`, so the gaps between them
- *   read, with a dark crease across its front over `crease` (the joint
- *   of the curled finger), under a big square knuckle over `knuckleD`
- *   from `knuckleH`, bevelled by `knuckleBevel` and standing a little
- *   proud of the fingers at the front;
- * - `thumb`, `thumbTip` and `thumbRoot`: bevelled blocks, the thumb
- *   folded across the fingers from the `+a` side, its tip tucked in at
- *   `-a`, and the ball of the thumb joining it to the fist;
- * - `cracks`: dark bars laid `DECAL_LIFT` proud on the flat faces.
- * Everything fits inside the 0.45 half width and under the 1.4 top.
+ *   foot, each `[a0, a1, d0, d1, h1]` from the plinth's top up to `h1`,
+ *   in the `baseShade` stone;
+ * - `blocks`: the forearm, its uneven faceting slabs (two on the front
+ *   with a groove between them, one on each side, two at the back), the
+ *   darker recessed wrist, the fist wider than the forearm so the hand
+ *   reads as the big end, a slab on the fist's back, and the thumb: its
+ *   ball on the `+a` side, the thumb folded across the fingers and its
+ *   tip tucked in at `-a`;
+ * - `chips`: broken lumps on two of the forearm's top corners (back
+ *   `-a` and front `+a`), each standing a little proud of the faces it
+ *   sits on so no face of it lies in one of the forearm's, which breaks
+ *   the straight edges;
+ * - `fingers`: `[a0, a1, front, knuckleTop, shade, knuckleShade,
+ *   knuckleFront]`, index at `+a` to little finger at `-a`. A finger is
+ *   a block from `fingerD0` to its `front` over `fingerH`, bevelled by
+ *   `fingerBevel`, with a dark crease across its front over `crease` (the
+ *   joint of the curled finger) and a dark line under its knuckle over
+ *   `underKnuckle`; its big square knuckle runs from `knuckleD0` to
+ *   `knuckleFront`, from `knuckleH` up to `knuckleTop`, bevelled by
+ *   `knuckleBevel`. The fronts differ by millimetres, so the row is not
+ *   ruler straight;
+ * - `gaps`: the `a` ranges of the dark grooves that fill the gaps between
+ *   fingers and between knuckles, each a little wider than its gap so its
+ *   sides hide in the stone, set back from the fronts (`gapFront` and
+ *   `gapKnuckleFront`) so it reads as a deep crack;
+ * - `grooves`: other dark recesses `[a0, a1, d0, d1, h0, h1]`, here the
+ *   one between the two front slabs;
+ * - `cracks`: dark bars `[a0, a1, d0, d1, h0, h1]` laid `DECAL_LIFT`
+ *   proud on the flat faces of the forearm, the slabs and the fist.
+ * There are no carved marks, runes or text. Everything fits inside the
+ * 0.45 half width and under the 1.4 top.
  */
 const HAND = {
   plinth: { h: 0.3, bevel: 0.03 },
@@ -75,63 +96,77 @@ const HAND = {
     [-0.05, 0.08, -0.21, -0.15, 0.38],
     [-0.24, -0.17, -0.02, 0.11, 0.39],
   ],
-  forearm: [[-0.2, 0.2], [-0.17, 0.17], [0.3, 0.85], 0.04],
-  slabs: [
-    [[-0.16, 0.16], [0.17, 0.2], [0.45, 0.8], 0.02],
-    [[-0.13, 0.13], [-0.2, -0.17], [0.5, 0.78], 0.02],
+  baseShade: 0.72,
+  blocks: [
+    // The forearm and its slabs.
+    [-0.2, 0.2, -0.17, 0.17, 0.3, 0.85, 0.04, 1.0],
+    [-0.165, -0.005, 0.17, 0.2, 0.44, 0.8, 0.02, 0.74],
+    [0.005, 0.16, 0.17, 0.19, 0.5, 0.77, 0.015, 0.94],
+    [0.2, 0.225, -0.13, 0.06, 0.4, 0.7, 0.012, 0.78],
+    [-0.222, -0.2, -0.05, 0.13, 0.5, 0.82, 0.012, 0.9],
+    [-0.13, 0.13, -0.2, -0.17, 0.5, 0.78, 0.02, 0.86],
+    [-0.1, 0.06, -0.19, -0.17, 0.36, 0.49, 0.015, 0.74],
+    // The wrist, the fist and the slab on its back.
+    [-0.17, 0.17, -0.15, 0.15, 0.85, 0.95, 0.03, 0.66],
+    [-0.25, 0.25, -0.15, 0.12, 0.95, 1.3, 0.04, 1.0],
+    [-0.2, 0.08, -0.165, -0.15, 1.0, 1.24, 0.01, 0.84],
+    // The thumb's ball, the thumb and its tip.
+    [0.16, 0.27, 0.08, 0.26, 0.95, 1.13, 0.03, 0.82],
+    [-0.1, 0.25, 0.21, 0.29, 1.0, 1.13, 0.02, 1.12],
+    [-0.16, -0.09, 0.19, 0.27, 1.0, 1.11, 0.02, 0.9],
   ],
-  wrist: [[-0.17, 0.17], [-0.15, 0.15], [0.85, 0.95], 0.03],
-  fist: [[-0.25, 0.25], [-0.15, 0.12], [0.95, 1.3], 0.04],
+  chips: [
+    [-0.205, -0.14, -0.175, -0.12, 0.79, 0.855, 0.01, 0.74],
+    [0.12, 0.205, 0.13, 0.205, 0.79, 0.86, 0.012, 0.9],
+  ],
   fingers: [
-    [0.127, 0.245, 1.4],
-    [0.003, 0.121, 1.4],
-    [-0.121, -0.003, 1.385],
-    [-0.245, -0.127, 1.36],
+    [0.127, 0.245, 0.212, 1.4, 1.02, 0.84, 0.222],
+    [0.003, 0.121, 0.216, 1.4, 0.82, 0.76, 0.226],
+    [-0.121, -0.003, 0.209, 1.385, 1.08, 0.9, 0.218],
+    [-0.245, -0.127, 0.205, 1.36, 0.86, 0.8, 0.214],
   ],
-  fingerD: [0.12, 0.21],
+  fingerD0: 0.12,
   fingerH: [1.0, 1.28],
   fingerBevel: 0.015,
-  knuckleD: [0.02, 0.22],
+  knuckleD0: 0.02,
   knuckleH: 1.26,
   knuckleBevel: 0.025,
   crease: [1.16, 1.172],
-  thumb: [[-0.1, 0.25], [0.21, 0.29], [1.0, 1.13], 0.02],
-  thumbTip: [[-0.16, -0.09], [0.19, 0.27], [1.0, 1.11], 0.02],
-  thumbRoot: [[0.16, 0.27], [0.08, 0.26], [0.95, 1.13], 0.03],
+  underKnuckle: [1.245, 1.257],
+  gaps: [
+    [0.119, 0.129],
+    [-0.005, 0.005],
+    [-0.129, -0.119],
+  ],
+  gapFront: 0.2,
+  gapKnuckleFront: 0.21,
+  gapKnuckleTop: 1.36,
+  grooves: [[-0.008, 0.008, 0.17, 0.185, 0.46, 0.78]],
   cracks: [
-    // The forearm's +a side.
-    ["a+", [-0.056, -0.044], [0.42, 0.72]],
-    ["a+", [-0.044, 0.12], [0.6, 0.612]],
-    // The forearm's -a side.
-    ["a-", [0.02, 0.032], [0.36, 0.8]],
-    ["a-", [-0.12, 0.02], [0.52, 0.532]],
-    // The front slab.
-    ["front", [0.03, 0.042], [0.48, 0.78]],
-    ["front", [-0.13, 0.03], [0.64, 0.652]],
-    // The fist's back and its -a side.
-    ["fistBack", [-0.02, -0.008], [0.99, 1.26]],
-    ["fistSide", [-0.1, 0.08], [1.12, 1.132]],
+    // The +a side slab, and the forearm's +a face under it.
+    [0.225, 0.235, -0.03, -0.018, 0.43, 0.67],
+    [0.2, 0.21, -0.12, 0.1, 0.36, 0.372],
+    // The forearm's -a face.
+    [-0.21, -0.2, -0.12, -0.108, 0.36, 0.8],
+    [-0.21, -0.2, -0.12, 0.12, 0.42, 0.432],
+    // The two front slabs.
+    [-0.1, -0.088, 0.2, 0.21, 0.48, 0.77],
+    [0.025, 0.14, 0.19, 0.2, 0.62, 0.632],
+    // The fist's back slab and its -a side.
+    [-0.04, -0.028, -0.175, -0.165, 1.02, 1.22],
+    [-0.26, -0.25, -0.1, 0.08, 1.12, 1.132],
   ],
 } as const;
 
-/** A bevelled block of `HAND`: its `a`, `d` and `h` ranges and its bevel. */
-type Block = readonly [
-  readonly [number, number],
-  readonly [number, number],
-  readonly [number, number],
-  number,
-];
-
 /**
- * The stone hand: plinth, broken base, forearm with its slabs, wrist,
- * fist, fingers and knuckles, the folded thumb, and the cracks. The slabs
- * and the base are a shade darker than the forearm, so the facets read
- * even under flat light.
+ * The stone hand: plinth, broken base, the blocks (forearm, slabs, wrist,
+ * fist, thumb) each in its own shade of stone, the chipped corners, the
+ * fingers and knuckles with the dark grooves between them, and the
+ * cracks.
  */
 const stoneHand: HeroRecipe = ({ k, s, variant, kind }) => {
   const { hw } = heroHalf(kind, variant);
-  const red = s.tinted(STONE_RED);
-  const facet = s.tinted(shade(STONE_RED, 0.88));
+  const stone = (x: number) => s.tinted(shade(STONE_RED, x));
   const crack = s.tinted(STONE_CRACK);
   k.bevelBox(
     -hw,
@@ -143,39 +178,48 @@ const stoneHand: HeroRecipe = ({ k, s, variant, kind }) => {
     HAND.plinth.bevel,
     s.tinted(HAND_PLINTH),
   );
+  const base = stone(HAND.baseShade);
   for (const [a0, a1, d0, d1, h1] of HAND.base)
-    k.box(a0, a1, d0, d1, HAND.plinth.h, h1, facet);
-  const block = ([[a0, a1], [d0, d1], [h0, h1], bevel]: Block, sf = red) =>
-    k.bevelBox(a0, a1, d0, d1, h0, h1, bevel, sf);
-  block(HAND.forearm);
-  for (const slab of HAND.slabs) block(slab, facet);
-  block(HAND.wrist);
-  block(HAND.fist);
-  const [fd0, fd1] = HAND.fingerD;
+    k.box(a0, a1, d0, d1, HAND.plinth.h, h1, base);
+  for (const [a0, a1, d0, d1, h0, h1, bevel, x] of [
+    ...HAND.blocks,
+    ...HAND.chips,
+  ])
+    k.bevelBox(a0, a1, d0, d1, h0, h1, bevel, stone(x));
   const [fh0, fh1] = HAND.fingerH;
-  const [kd0, kd1] = HAND.knuckleD;
   const [c0, c1] = HAND.crease;
+  const [u0, u1] = HAND.underKnuckle;
   const L = DECAL_LIFT;
-  for (const [a0, a1, top] of HAND.fingers) {
-    k.bevelBox(a0, a1, fd0, fd1, fh0, fh1, HAND.fingerBevel, red);
-    k.bevelBox(a0, a1, kd0, kd1, HAND.knuckleH, top, HAND.knuckleBevel, facet);
-    const b = HAND.fingerBevel;
-    k.box(a0 + b, a1 - b, fd1, fd1 + L, c0, c1, crack);
+  const b = HAND.fingerBevel;
+  for (const [a0, a1, front, top, x, kx, kFront] of HAND.fingers) {
+    k.bevelBox(a0, a1, HAND.fingerD0, front, fh0, fh1, b, stone(x));
+    k.bevelBox(
+      a0,
+      a1,
+      HAND.knuckleD0,
+      kFront,
+      HAND.knuckleH,
+      top,
+      HAND.knuckleBevel,
+      stone(kx),
+    );
+    k.box(a0 + b, a1 - b, front, front + L, c0, c1, crack);
+    k.box(a0 + b, a1 - b, front, front + L, u0, u1, crack);
   }
-  for (const part of [HAND.thumbRoot, HAND.thumb, HAND.thumbTip]) block(part);
-  const fa1 = HAND.forearm[0][1];
-  const slabFront = HAND.slabs[0][1][1];
-  const fistBack = HAND.fist[1][0];
-  const fistSide = HAND.fist[0][0];
-  for (const [face, [u0, u1], [h0, h1]] of HAND.cracks) {
-    if (face === "a+") k.box(fa1, fa1 + L, u0, u1, h0, h1, crack);
-    else if (face === "a-") k.box(-fa1 - L, -fa1, u0, u1, h0, h1, crack);
-    else if (face === "front")
-      k.box(u0, u1, slabFront, slabFront + L, h0, h1, crack);
-    else if (face === "fistBack")
-      k.box(u0, u1, fistBack - L, fistBack, h0, h1, crack);
-    else k.box(fistSide - L, fistSide, u0, u1, h0, h1, crack);
+  for (const [a0, a1] of HAND.gaps) {
+    k.box(a0, a1, HAND.fingerD0, HAND.gapFront, fh0, HAND.knuckleH, crack);
+    k.box(
+      a0,
+      a1,
+      HAND.knuckleD0,
+      HAND.gapKnuckleFront,
+      HAND.knuckleH,
+      HAND.gapKnuckleTop,
+      crack,
+    );
   }
+  for (const [a0, a1, d0, d1, h0, h1] of [...HAND.grooves, ...HAND.cracks])
+    k.box(a0, a1, d0, d1, h0, h1, crack);
 };
 
 /** The rocket's red. */
@@ -347,7 +391,10 @@ const LEATHER: Rgb = [0.3, 0.18, 0.1];
 const WRAP: Rgb = [0.2, 0.12, 0.07];
 
 /** The crack in the floor: near black. */
-const FLOOR_CRACK: Rgb = [0.12, 0.12, 0.13];
+const FLOOR_CRACK: Rgb = [0.15, 0.14, 0.14];
+
+/** The dent under the head: a dark scorched grey. */
+const FLOOR_DENT: Rgb = [0.28, 0.27, 0.26];
 
 /**
  * The hammer's measures past its head, in metres and radians:
@@ -363,15 +410,21 @@ const FLOOR_CRACK: Rgb = [0.12, 0.12, 0.13];
  * - `strap`: its angle and length, `width` its thickness in the handle's
  *   plane and `half` its half breadth along `a`, a flat ribbon whose broad
  *   side faces the front;
- * - `crack`: the floor's eight cracks, each heading out from under the
- *   head: an inner bar from `from` to `bend`, `half` wide either side and
- *   `h` high, then a thinner outer bar (`outHalf`, `outH`) kinked by
- *   `kink` times -1, 0 or 1 at the bend and running on to `to` plus
- *   `grow` times `k % 3` from the centre, so each crack narrows and
- *   jags; `branch` names the cracks that fork, `branchAt` along the inner
- *   bar, at `branchTurn`, each branch `branchLen` long, `branchHalf`
- *   wide and `branchH` high. Every bar is a little lower than the one it
- *   leaves, so no two tops share a plane.
+ * - `dent`: the flat dark patch under the head, a disc of radius `r`
+ *   and `sides` facets, `h` over the floor: the head covers its middle,
+ *   so it shows as a scorched ring where the hammer struck;
+ * - `crack`: the floor's eight flat cracks, `h` over the floor (well over
+ *   the dent, so neither fights the other or the floor). Each heads out
+ *   from `from`, under the head, as a chain of bars given by `steps`
+ *   (`[length, half width]`): wide at the root and narrowing to a point.
+ *   At each joint the next bar turns by that crack's `kinks` entry and
+ *   starts `overlap` back inside the last, so the crack jags without a
+ *   notch; the bars share one colour and one height, so where two overlap
+ *   nothing shows. `to` is the reach of the first crack's third bar end
+ *   from the centre, `grow` times `k % 3` more for crack `k`. `forks`
+ *   names the cracks that fork: a fork leaves where the second bar
+ *   starts, `forkAt` along it, turned `forkTurn` away (to alternate
+ *   sides), and narrows over `forkSteps`.
  */
 const HAMMER = {
   bevel: 0.015,
@@ -395,22 +448,36 @@ const HAMMER = {
     width: 0.005,
     half: 0.009,
   },
+  dent: { r: 0.2, sides: 12, h: 0.002 },
   crack: {
-    from: 0.06,
-    bend: 0.16,
-    to: 0.25,
+    from: 0.05,
+    h: 0.0045,
+    steps: [
+      [0.09, 0.013],
+      [0.07, 0.008],
+      [0, 0.004],
+      [0.025, 0.0018],
+    ],
+    to: 0.27,
     grow: 0.03,
-    half: 0.007,
-    h: 0.004,
-    outHalf: 0.004,
-    outH: 0.003,
-    kink: 0.3,
-    branch: [1, 4, 6],
-    branchAt: 0.14,
-    branchTurn: Math.PI / 6,
-    branchLen: 0.07,
-    branchHalf: 0.003,
-    branchH: 0.0025,
+    overlap: 0.004,
+    kinks: [
+      [0.3, -0.35, 0.2],
+      [-0.3, 0.25, -0.3],
+      [0.15, -0.4, 0.25],
+      [-0.2, 0.35, -0.15],
+      [0.35, -0.2, 0.3],
+      [-0.25, 0.3, -0.25],
+      [0.2, -0.3, 0.35],
+      [-0.35, 0.2, -0.2],
+    ],
+    forks: [1, 4, 6],
+    forkAt: 0.01,
+    forkTurn: 0.55,
+    forkSteps: [
+      [0.05, 0.0035],
+      [0.025, 0.0015],
+    ],
   },
 } as const;
 
@@ -484,32 +551,53 @@ const thunderHammer: HeroRecipe = ({ k, kitAt, s }) => {
     St.half,
     leather,
   );
+  const D = HAMMER.dent;
+  k.cylinder(0, 0, 0, D.h, D.r, D.sides, s.tinted(FLOOR_DENT));
   const C = HAMMER.crack;
   const dark = s.tinted(FLOOR_CRACK);
+  // A chain of bars from `start` along `f`, each turned by the next of
+  // `turns` at its joint; returns the frame each bar was laid in.
+  const chain = (
+    f: Frame,
+    start: number,
+    steps: readonly (readonly [number, number])[],
+    turns: readonly number[],
+  ): Frame[] => {
+    const frames: Frame[] = [];
+    let at = f;
+    let from = start;
+    steps.forEach(([len, half], n) => {
+      if (n > 0) at = yawed(at, from, 0, turns[n - 1] ?? 0);
+      const a0 = n === 0 ? start : -C.overlap;
+      const a1 = n === 0 ? start + len : len;
+      kitAt(at).box(a0, a1, -half, half, 0, C.h, dark);
+      frames.push(at);
+      from = a1;
+    });
+    return frames;
+  };
+  const fixed = C.steps.reduce((sum, [len]) => sum + len, 0);
   for (let i = 0; i < 8; i++) {
     const theta = (i * Math.PI) / 4 + 0.2 * (((i * 7) % 3) - 1);
-    const f = yawed(ORIGIN, 0, 0, theta);
-    kitAt(f).box(C.from, C.bend, -C.half, C.half, 0, C.h, dark);
-    const kink = C.kink * (((i * 5) % 3) - 1);
-    kitAt(yawed(f, C.bend, 0, kink)).box(
-      0,
-      C.to + C.grow * (i % 3) - C.bend,
-      -C.outHalf,
-      C.outHalf,
-      0,
-      C.outH,
-      dark,
+    const reach = C.to + C.grow * (i % 3);
+    const steps = C.steps.map(([len, half], n) =>
+      n === 2
+        ? ([reach - C.from - fixed, half] as const)
+        : ([len, half] as const),
     );
-    if ((C.branch as readonly number[]).includes(i))
-      kitAt(yawed(f, C.branchAt, 0, C.branchTurn)).box(
-        0,
-        C.branchLen,
-        -C.branchHalf,
-        C.branchHalf,
-        0,
-        C.branchH,
-        dark,
-      );
+    const frames = chain(
+      yawed(ORIGIN, 0, 0, theta),
+      C.from,
+      steps,
+      C.kinks[i] ?? [],
+    );
+    const second = frames[1];
+    if (second !== undefined && (C.forks as readonly number[]).includes(i)) {
+      const side = i % 2 === 0 ? 1 : -1;
+      chain(yawed(second, C.forkAt, 0, side * C.forkTurn), 0, C.forkSteps, [
+        -side * 0.2,
+      ]);
+    }
   }
 };
 
