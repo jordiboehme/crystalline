@@ -19,7 +19,7 @@ use crystalline_index::{Store, TursoStore};
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::{
-    BrowseParams, EditParams, ReadParams, SearchParams, WriteParams,
+    BrowseParams, EditParams, ListDomainsParams, ReadParams, SearchParams, WriteParams,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -1307,4 +1307,109 @@ async fn a_rename_and_its_sync_never_run_an_adoption() {
         1,
         "the adoption's own rename and its sync run no second one"
     );
+}
+
+// --- list_domains name fields (Task 21) --------------------------------------
+
+async fn listed_domains(engine: &Engine) -> Value {
+    engine
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+}
+
+fn domain_row<'a>(listed: &'a Value, name: &str) -> &'a Value {
+    listed["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == name)
+        .unwrap_or_else(|| panic!("no '{name}' row in {listed}"))
+}
+
+/// A plain domain, whose MANIFEST declares no `domain_name` of its own: the
+/// canonical name is the local name, it carries no aliases, is not shadowed
+/// and is not being renamed.
+#[tokio::test]
+async fn list_domains_reports_name_fields_for_a_plain_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![("eng", DomainEntry::file(root))],
+    );
+    engine.sync(None).await.unwrap();
+
+    let listed = listed_domains(&engine).await;
+    let row = domain_row(&listed, "eng");
+    assert_eq!(row["canonical_name"], "eng", "{row}");
+    assert_eq!(row["aliases"], serde_json::json!([]), "{row}");
+    assert_eq!(row["shadowed"], false, "{row}");
+    assert_eq!(row["renaming"], false, "{row}");
+    assert_eq!(
+        row["name_origin"],
+        Value::Null,
+        "a legacy entry nothing has inferred yet: {row}"
+    );
+}
+
+/// A domain registered under one local name whose MANIFEST declares a
+/// different, free `domain_name`: the listing reports the declared name as
+/// `canonical_name` while the domain stays registered under its local name
+/// (a sync alone never adopts it), and it is not shadowed.
+#[tokio::test]
+async fn list_domains_reports_the_canonical_name_of_a_declared_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = declared_folder(tmp.path(), "eng-folder", "eng");
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![("eng-old", DomainEntry::file(root))],
+    );
+    engine.sync(None).await.unwrap();
+
+    let listed = listed_domains(&engine).await;
+    let row = domain_row(&listed, "eng-old");
+    assert_eq!(row["canonical_name"], "eng", "{row}");
+    assert_eq!(row["shadowed"], false, "{row}");
+    assert_eq!(row["renaming"], false, "{row}");
+}
+
+/// Two domains where one's declared `domain_name` is already another
+/// domain's local name: the claiming domain is shadowed, and the listing says
+/// so with a bare bool, naming no domain.
+#[tokio::test]
+async fn list_domains_reports_a_shadowed_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ops = bare_manifest_folder(tmp.path(), "ops", "Ops");
+    let eng = declared_folder(tmp.path(), "eng", "ops");
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![
+            ("ops", DomainEntry::file(ops)),
+            ("eng", DomainEntry::file(eng)),
+        ],
+    );
+    engine.sync(None).await.unwrap();
+
+    let listed = listed_domains(&engine).await;
+    let shadowed_row = domain_row(&listed, "eng");
+    assert_eq!(shadowed_row["canonical_name"], "ops", "{shadowed_row}");
+    assert_eq!(shadowed_row["shadowed"], true, "{shadowed_row}");
+    assert!(
+        shadowed_row.get("note").is_none(),
+        "the listing carries a bare bool, no explanatory note naming the domain holding the \
+         name: {shadowed_row}"
+    );
+
+    let holder_row = domain_row(&listed, "ops");
+    assert_eq!(holder_row["canonical_name"], "ops", "{holder_row}");
+    assert_eq!(holder_row["shadowed"], false, "{holder_row}");
 }

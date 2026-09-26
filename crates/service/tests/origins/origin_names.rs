@@ -138,6 +138,9 @@ async fn a_nameless_connect_takes_the_name_the_manifest_declares() {
     assert_eq!(result["name_origin"], "derived", "{result}");
     assert_eq!(result["canonical_name"], "eng", "{result}");
     assert_eq!(result["shadowed"], false, "{result}");
+    // A team connect carries every name field a local `add_domain` result
+    // does, `aliases` included, not only the three already asserted above.
+    assert_eq!(result["aliases"], serde_json::json!([]), "{result}");
     let root = r.domains_root.join("eng");
     assert_eq!(result["root"], root.display().to_string());
     assert_eq!(

@@ -115,6 +115,15 @@ impl Engine {
     /// That is not the same fact as the one above and it is not a leak of it:
     /// a caller who may not see a domain never gets a row for it to read.
     ///
+    /// Each row also carries `canonical_name`, `aliases`, `name_origin` and
+    /// `shadowed` from the name table (see [`crystalline_core::names::NameTable`]),
+    /// and `renaming`, whether a rename has this domain paused right now (see
+    /// [`Engine::is_renaming`]). `shadowed` is a bool and never names the other
+    /// domain that holds the canonical name - a caller who may not see that
+    /// other domain must not learn of it this way either. `renaming` is always
+    /// present, `false` when nothing is paused, so a list-shaped rendering of
+    /// this array keeps one uniform set of columns.
+    ///
     /// The rows come back sorted by name, case-insensitively, so the sidebar
     /// and the CLI inherit one order rather than settling it three times.
     /// Registration order is what the config map preserves and it is
@@ -134,6 +143,14 @@ impl Engine {
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
+        // The name table as it stands, read once for every row: each domain's
+        // canonical name, its effective aliases and whether its canonical name
+        // is shadowed by another domain's local name. A caller who may not see
+        // a domain never gets a row for it (filtered below, same as every
+        // other field here), so `shadowed` never names the domain that holds
+        // the name - it is a bool, and that is the whole of what a caller who
+        // cannot see the holder is told.
+        let table = self.name_table_now().await;
 
         let mut out = Vec::new();
         // Every registration this instance has, not the startup snapshot
@@ -178,6 +195,19 @@ impl Engine {
                 // that takes changes directly, which is how a domain starts
                 // out.
                 "review": entry.is_overlay().then_some("overlay"),
+                // The name this domain's content carries (its MANIFEST
+                // `domain_name`, else its local name), its machine-local former
+                // names still accepted as input, how this registration got its
+                // name (`null` for a legacy entry nothing has inferred yet),
+                // whether its own canonical name is shadowed by another
+                // domain's local name here, and whether a rename has this
+                // domain paused right now. `renaming` is always a bool, never
+                // left out when false, so every row keeps the same columns.
+                "canonical_name": table.canonical(name).unwrap_or(name),
+                "aliases": table.aliases(name),
+                "name_origin": entry.name_origin,
+                "shadowed": table.is_shadowed(name),
+                "renaming": self.is_renaming(name),
             });
             // What THIS caller is holding in a domain that reviews changes, so
             // a screen can say "you have work waiting here" off the listing it

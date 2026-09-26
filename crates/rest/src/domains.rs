@@ -50,7 +50,18 @@ use crystalline_core::{
                            are absent on a domain that takes changes directly, \
                            and `my_drafts` is absent rather than zero when \
                            there is no account to count for - a client reads \
-                           presence, since null and 0 are different facts.",
+                           presence, since null and 0 are different facts.\n\n\
+                           Every domain also carries `canonical_name` (the \
+                           name its content carries), `aliases` (its former \
+                           local names, still accepted as input), \
+                           `name_origin` (`explicit` or `derived`, `null` for \
+                           a legacy entry nothing has inferred yet), \
+                           `shadowed` (whether another domain's local name \
+                           already holds this one's canonical name - a bool, \
+                           never naming the other domain) and `renaming` \
+                           (whether a rename has this domain paused right \
+                           now; always present, so every row keeps the same \
+                           columns).",
             body = Object,
             example = json!({
                 "behavior": [
@@ -66,6 +77,11 @@ use crystalline_core::{
                     "relations": 3,
                     "last_sync": "2026-08-05T09:14:22Z",
                     "private": false,
+                    "canonical_name": "eng",
+                    "aliases": [],
+                    "name_origin": "derived",
+                    "shadowed": false,
+                    "renaming": false,
                     "when_to_use": ["Route here for eng questions."]
                 }]
             }),

@@ -1762,6 +1762,18 @@ async fn domains_lists_every_domain_with_its_routing_bullets() {
             .any(|b| b.as_str().unwrap().contains("Route here for eng")),
         "the routing bullets come from the MANIFEST: {body}"
     );
+    // Every domain carries its canonical name, its aliases, how it got its
+    // name, whether that name is shadowed and whether a rename has it paused
+    // right now: neither seeded domain declares a `domain_name` of its own or
+    // clashes with the other, so both resolve to their local name, carry no
+    // aliases, are not shadowed and are not being renamed.
+    for row in domains {
+        assert_eq!(row["canonical_name"], row["name"], "{row}");
+        assert_eq!(row["aliases"], serde_json::json!([]), "{row}");
+        assert_eq!(row["name_origin"], serde_json::Value::Null, "{row}");
+        assert_eq!(row["shadowed"], false, "{row}");
+        assert_eq!(row["renaming"], false, "{row}");
+    }
 }
 
 /// The tree endpoint is `browse_domain` behind a query string: the defaults

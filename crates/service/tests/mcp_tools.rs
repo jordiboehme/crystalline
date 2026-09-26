@@ -1023,6 +1023,36 @@ async fn list_domains_routing_carries_the_behavior_rules() {
     );
 }
 
+/// Every domain in `list_domains` carries its canonical name, its aliases,
+/// how it got its name, whether that name is shadowed and whether a rename
+/// has it paused right now - and `renaming` rides along even when false, so
+/// the rows stay uniform enough for the TOON encoder to render them as one
+/// tabular block rather than falling back to the expanded list form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_domains_carries_name_fields_as_uniform_toon_columns() {
+    let h = Harness::new_toon(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let text = call_text(peer, "list_domains", json!({})).await.unwrap();
+    let header = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("domains["))
+        .unwrap_or_else(|| panic!("no tabular domains header: {text}"));
+    for column in [
+        "canonical_name",
+        "aliases",
+        "name_origin",
+        "shadowed",
+        "renaming",
+    ] {
+        assert!(
+            header.contains(column),
+            "the tabular header names every column, {column} included: {header}"
+        );
+    }
+}
+
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
 /// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
 /// `["array", "null"]` union: some MCP clients (Claude Desktop) do not

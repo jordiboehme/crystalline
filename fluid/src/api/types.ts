@@ -4192,6 +4192,8 @@ export interface operations {
              * @description The engine's own domain listing, unchanged.
              *
              *     A domain that reviews changes before they land carries `review: "overlay"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.
+             *
+             *     Every domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).
              */
             200: {
                 headers: {
@@ -4206,14 +4208,19 @@ export interface operations {
                      *       ],
                      *       "domains": [
                      *         {
+                     *           "aliases": [],
+                     *           "canonical_name": "eng",
                      *           "engrams": 4,
                      *           "kind": "file",
                      *           "last_sync": "2026-08-05T09:14:22Z",
                      *           "name": "eng",
+                     *           "name_origin": "derived",
                      *           "observations": 12,
                      *           "path": "/Users/ada/Documents/Crystalline/eng",
                      *           "private": false,
                      *           "relations": 3,
+                     *           "renaming": false,
+                     *           "shadowed": false,
                      *           "when_to_use": [
                      *             "Route here for eng questions."
                      *           ]
