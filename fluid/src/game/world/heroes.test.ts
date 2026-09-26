@@ -919,7 +919,7 @@ describe("the hero pass", () => {
       turret: false,
       picks: [{ take: true, roll: forcedPoolRoll("lab", "garden-robot") }],
     };
-    for (const ceiling of [] as number[])
+    for (const ceiling of [3.0, 3.6, 3.69])
       expect(placeHeroes({ ...lab.base, ceiling }, forced)).toEqual([]);
     for (const ceiling of [3.7, 3.8, 5.0])
       expect(
