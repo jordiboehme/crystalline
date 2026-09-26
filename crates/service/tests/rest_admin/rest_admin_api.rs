@@ -368,6 +368,57 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
     assert_eq!(nonsense.status(), 422);
 }
 
+/// `repo` and `path` are validated before anything is asked of the forge - on
+/// this instance, before even the not-connected check, since a malformed
+/// request is refused ahead of a state check either way answers with
+/// "anything but success". A `repo` carrying a `..` segment through an extra
+/// slash, or a `path` that is absolute or climbs out with `..`, is a 422
+/// naming the field, never a request that reaches `origin_add` and a GitHub
+/// API path built from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_repo_or_path_is_refused_before_the_connection_is_asked_about() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for repo in [
+        "acme/kb/../../secret",
+        "acme",
+        "acme/kb/extra",
+        "../acme/kb",
+        "acme/..",
+        "ac me/kb",
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&serde_json::json!({"mode": "github", "repo": repo}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
+    }
+
+    for path in ["/etc/passwd", "../../secret", "domains/../../secret"] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&serde_json::json!({"mode": "github", "repo": "acme/kb", "path": path}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "path {path:?} must be refused");
+    }
+
+    // A well-formed repo still answers the ordinary not-connected 409: the
+    // validation added nothing but a 422 for genuinely bad input.
+    let ready = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 409);
+}
+
 /// The GitHub domain-name peek is admin only, refuses a missing `repo` with
 /// the same 422 a nameless team-domain create's own repo check answers, and
 /// is a 409 pointing at the settings screen when no credential is on file -
@@ -382,6 +433,11 @@ async fn github_domain_name_peek_needs_admin_and_a_connection() {
     let admin = login(fx.addr, "root", "rootpw").await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
+    // `repo` is a required query parameter now (F11's sibling fix: the
+    // OpenAPI document and the generated Fluid types must say so too), so an
+    // entirely absent one fails query deserialization before this handler
+    // runs at all - a 400, axum's own rejection status, rather than the
+    // handler's 422.
     let missing_repo = as_session(
         fx.addr,
         reqwest::Method::GET,
@@ -391,7 +447,20 @@ async fn github_domain_name_peek_needs_admin_and_a_connection() {
     .send()
     .await
     .unwrap();
-    assert_eq!(missing_repo.status(), 422);
+    assert_eq!(missing_repo.status(), 400);
+
+    // Present but empty is the handler's own 422, the same one create's
+    // repo check answers.
+    let empty_repo = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(empty_repo.status(), 422);
 
     let forbidden = as_session(
         fx.addr,
@@ -422,6 +491,70 @@ async fn github_domain_name_peek_needs_admin_and_a_connection() {
             .to_lowercase()
             .contains("settings"),
         "the refusal points at the fix: {problem}"
+    );
+}
+
+/// `repo` and `path` are validated the same way for the peek as for create,
+/// before anything is asked of the forge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_refuses_a_malformed_repo_or_path() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for repo in ["acme/kb/../../secret", "acme", "acme/..", "ac me/kb"] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo={repo}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
+    }
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb&path=../../secret",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+}
+
+/// With `branch` omitted, the peek asks the forge for the repository's
+/// default branch before it can read anything; when that call fails (the
+/// repository is unreadable, or gone), the answer is a 4xx that names the
+/// problem rather than a 500 or a silent success, exactly like a nameless
+/// team-domain create's own default-branch lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_reports_an_unreadable_repository() {
+    let (fx, mock) = serve_team_with_mock_manifest(false, KB_MANIFEST).await;
+    mock.fail_default_branch();
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status != 200 && status != 401 && status != 403,
+        "an unreadable repository must not answer as if it were read: {status} {text}"
     );
 }
 

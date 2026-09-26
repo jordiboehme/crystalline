@@ -1140,7 +1140,7 @@
             }
           },
           "422": {
-            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, or a field that does not belong to the mode asked for.",
+            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6246,8 +6246,8 @@
           {
             "name": "repo",
             "in": "query",
-            "description": "owner/name. Required; absent or empty answers 422, the same one\nrequesting a team-domain create without it does.",
-            "required": false,
+            "description": "owner/name. Required (an absent or unparseable query string is a\n400 before this handler runs; present and empty or malformed is a\n422 from the handler's own check, the same one a nameless\nteam-domain create answers).",
+            "required": true,
             "schema": {
               "type": "string"
             },
@@ -6289,6 +6289,16 @@
               }
             }
           },
+          "400": {
+            "description": "The query string will not parse - `repo` is a required parameter and an entirely absent one lands here rather than in the 422 below.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
           "401": {
             "description": "No identity, or an anonymous one.",
             "content": {
@@ -6320,7 +6330,7 @@
             }
           },
           "422": {
-            "description": "`repo` is missing or empty.",
+            "description": "`repo` is present and empty or not owner/name, or `path` is absolute or holds a `..` segment.",
             "content": {
               "application/problem+json": {
                 "schema": {

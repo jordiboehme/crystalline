@@ -4374,7 +4374,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, or a field that does not belong to the mode asked for. */
+            /** @description An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -8405,13 +8405,15 @@ export interface operations {
     };
     github_domain_name: {
         parameters: {
-            query?: {
+            query: {
                 /**
-                 * @description owner/name. Required; absent or empty answers 422, the same one
-                 *     requesting a team-domain create without it does.
+                 * @description owner/name. Required (an absent or unparseable query string is a
+                 *     400 before this handler runs; present and empty or malformed is a
+                 *     422 from the handler's own check, the same one a nameless
+                 *     team-domain create answers).
                  * @example acme/knowledge
                  */
-                repo?: string;
+                repo: string;
                 /**
                  * @description Branch to read from; defaults to the repository's default branch.
                  * @example main
@@ -8444,6 +8446,15 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
+            /** @description The query string will not parse - `repo` is a required parameter and an entirely absent one lands here rather than in the 422 below. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
             /** @description No identity, or an anonymous one. */
             401: {
                 headers: {
@@ -8471,7 +8482,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description `repo` is missing or empty. */
+            /** @description `repo` is present and empty or not owner/name, or `path` is absolute or holds a `..` segment. */
             422: {
                 headers: {
                     [name: string]: unknown;

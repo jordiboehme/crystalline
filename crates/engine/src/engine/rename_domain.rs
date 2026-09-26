@@ -175,9 +175,21 @@ impl Engine {
 
         let entry = self.domain_entry(old)?;
         if self.registered_domain_entries_now().await.contains_key(new) {
-            return Err(EngineError::Conflict(format!(
-                "'{new}' is already a domain here; pick another name or rename that domain first"
-            )));
+            // A name a private domain hidden from this caller already holds
+            // answers no differently from one nobody holds: naming it "already
+            // a domain here" would confirm a domain this caller cannot see
+            // exists under exactly that name, which is the existence oracle
+            // `require_domain` refuses everywhere else on this surface. The
+            // status is the same 409 either way; only the wording that would
+            // disclose something narrows.
+            return Err(EngineError::Conflict(if hidden.contains(new) {
+                format!("'{new}' cannot be used as a name here")
+            } else {
+                format!(
+                    "'{new}' is already a domain here; pick another name or rename that domain \
+                     first"
+                )
+            }));
         }
         let manifest_draft = if local_only {
             false
@@ -185,7 +197,7 @@ impl Engine {
             self.refuse_unwritable_manifest(old, new).await?
         };
         self.refuse_shared_index(old).await?;
-        self.refuse_leftovers(new, &state_dir).await?;
+        self.refuse_leftovers(new, &state_dir, scope).await?;
 
         // An origin pull or share of this domain finishes first, and none
         // starts until the rename is done, under either name: the lock is
@@ -205,7 +217,15 @@ impl Engine {
         }
 
         let table = self.name_table_now().await;
-        let shadows = shadowed_by(&table, old, new);
+        // A domain hidden from this caller must name no spelling of itself
+        // anywhere in the report: `shadowed_by` reads the instance-wide
+        // table, which knows nothing about who may see what, so its answer
+        // is filtered by the same `hidden` set the caller's own name was
+        // localized against above.
+        let shadows: Vec<String> = shadowed_by(&table, old, new)
+            .into_iter()
+            .filter(|shadowed| !hidden.contains(shadowed))
+            .collect();
         let canonical = self.declared_domain_name(old, &entry);
         let mut old_spellings: Vec<String> = vec![old.to_string()];
         if let Some(canonical) = table.canonical(old) {
@@ -1120,7 +1140,18 @@ impl Engine {
     /// Refuse when state a removed domain left under the new name is in the
     /// way: an index row (removal keeps it) or a state folder. Both would
     /// otherwise stop the rename halfway or hand the old state to it.
-    async fn refuse_leftovers(&self, new: &str, state_dir: &Path) -> Result<()> {
+    ///
+    /// The state-folder refusal names a path on this server's filesystem,
+    /// which is server-layout information a non-admin owner of a private
+    /// domain (the other caller who reaches this rename) has no other way to
+    /// learn; `scope` decides whether the message may say it, never whether
+    /// the rename is refused - the status is the same 409 either way.
+    async fn refuse_leftovers(
+        &self,
+        new: &str,
+        state_dir: &Path,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
         let row = {
             let store = self.store.lock().await;
             store.domain_id(new).await?
@@ -1143,11 +1174,18 @@ impl Engine {
                 Err(_) => false,
             };
             if taken {
-                return Err(EngineError::Conflict(format!(
-                    "{} is left over from a domain once named '{new}'; move it out of the way \
-                     and rename again",
-                    parent.join(new).display()
-                )));
+                return Err(EngineError::Conflict(if may_see_server_paths(scope) {
+                    format!(
+                        "{} is left over from a domain once named '{new}'; move it out of the \
+                         way and rename again",
+                        parent.join(new).display()
+                    )
+                } else {
+                    format!(
+                        "'{new}' cannot be used as a name here; ask an instance admin to clear \
+                         what a removed domain left behind under that name"
+                    )
+                }));
             }
         }
         Ok(())
@@ -1218,6 +1256,19 @@ fn renaming_conflict(name: String) -> EngineError {
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::Internal(e.to_string())
+}
+
+/// Whether `scope` may already learn a path on this server's filesystem: the
+/// machine owner (the CLI, the control socket, a local stdio MCP session)
+/// always can, and so can an instance admin, who administers every domain. A
+/// private domain's own non-admin owner reaches a rename too - the same
+/// `require_domain_owner_refusing` gate that admits an admin admits them -
+/// and a refusal built for them carries none of the server's own layout.
+fn may_see_server_paths(scope: &crate::scope::Scope) -> bool {
+    matches!(
+        scope,
+        crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+    )
 }
 
 /// How to finish the rename `journal` records: the same rename sent again,

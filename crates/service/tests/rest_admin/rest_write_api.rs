@@ -1588,6 +1588,22 @@ async fn an_invalid_name_a_missing_domain_and_a_non_owner_are_refused_honestly()
     .await
     .unwrap();
     assert_eq!(forbidden.status(), 403);
+
+    // F11: the owner rule is the same for `local_only` - the engine checks
+    // ownership before it branches on the flag (`rename_domain.rs:131-137`
+    // runs ahead of the `local_only` split) - so the non-owner refusal is not
+    // something a caller can dodge by asking for the local-only path.
+    let forbidden_local = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "engineering", "local_only": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(forbidden_local.status(), 403);
 }
 
 /// A full rename whose MANIFEST cannot be written here (F11's ruling names
@@ -1669,6 +1685,65 @@ async fn a_read_only_instance_refuses_a_rename() {
     .await
     .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+/// A non-admin owner of a private domain renaming it onto a hidden domain's
+/// canonical name still gets a 200 - the rename is fine, another domain's
+/// declared name is not a taken local name - but the report must not name the
+/// hidden domain anywhere: not in `shadows`, not in a `note`. `scrap`
+/// declares `domain_name: secretcanon` and is closed to `root` alone;
+/// `eddy` (an instance editor, not an admin, no membership on `scrap`) owns a
+/// private domain of his own, `mine`, and renames it onto `secretcanon`.
+/// Before the engine fix this leaked `scrap`'s local name through
+/// `shadows`/`note`, reachable over HTTP for the first time by this task
+/// (review focus: a hidden domain must name no spelling of itself).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_onto_a_hidden_domains_canonical_name_never_names_it() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // `scrap` declares `domain_name: secretcanon` and is closed to `root`
+    // alone - hidden from `eddy`, an instance editor with no membership on it.
+    std::fs::write(
+        fx._tmp.path().join("scrap/MANIFEST.md"),
+        "---\ntype: manifest\ntitle: scrap\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: secretcanon\n---\n\n# scrap\n\n## Scope\n\n- Scratch knowledge\n\n## When to Use\n\n- Route here for scrap questions\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    fx.auth
+        .set_domain_visibility("scrap", true, "root")
+        .await
+        .unwrap();
+
+    // `mine`, a virtual domain `eddy` owns privately.
+    fx.engine.domain_add_virtual("mine").await.unwrap();
+    fx.auth
+        .set_domain_visibility("mine", true, "eddy")
+        .await
+        .unwrap();
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/mine/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "secretcanon"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        !text.contains("scrap"),
+        "the hidden domain's local name leaked into the report: {text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["domain"], "secretcanon");
+    assert_eq!(body["previous"], "mine");
+    assert_eq!(body["shadows"], serde_json::json!([]), "{body}");
+    assert!(body.get("note").is_none(), "{body}");
 }
 
 /// A server fixture with one virtual domain (`docs`), its `MANIFEST.md`
@@ -3178,6 +3253,25 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// the code rather than off the caller. What bounds it is the PKCE verifier
 /// behind the challenge the authorization was started with, and that, the RFC
 /// 6749 refusals and the rotation rules are pinned by `tests/auth/oauth.rs`.
+/// The rename row's admin leg really renames `eng` (see its own comment in
+/// `write_ops()`), so every row that still addresses `eng` by that name has
+/// to run before it - an invariant a comment alone cannot enforce. A row
+/// appended after it would not fail loudly: `eng` answering 404 once renamed
+/// away still clears `the_write_matrix_holds_on_every_route`'s "anything but
+/// 401/403" bar, so the matrix would keep passing while quietly testing the
+/// wrong thing. This pins the ordering by name instead.
+#[test]
+fn the_rename_row_stays_last_in_write_ops() {
+    let ops = write_ops();
+    let last = ops.last().expect("write_ops is not empty");
+    assert_eq!(
+        (last.method.clone(), last.path),
+        (reqwest::Method::POST, "/api/v1/domains/eng/rename"),
+        "a row was appended after the one that renames eng for real; move the new row above \
+         it, or give the rename row a domain of its own so the order stops being load-bearing"
+    );
+}
+
 #[test]
 fn write_ops_covers_every_mutating_route_mounted() {
     use std::collections::BTreeSet;

@@ -197,8 +197,10 @@ pub struct CreateDomainBody {
             status = 422,
             description = "An unknown mode, no name for a local or virtual \
                            domain (github alone may omit it), a name that \
-                           could escape the domains root, or a field that \
-                           does not belong to the mode asked for.",
+                           could escape the domains root, a github `repo` \
+                           that is not owner/name or a `path` that is \
+                           absolute or holds a `..` segment, or a field \
+                           that does not belong to the mode asked for.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -240,6 +242,10 @@ pub async fn create(
                 .ok_or_else(|| {
                     ApiError::unprocessable("a team domain requires repo as owner/name")
                 })?;
+            validate_github_repo(repo)?;
+            if let Some(path) = body.path.as_deref() {
+                validate_github_path(path)?;
+            }
             // The TRIMMED name, and it has to be the one that travels on:
             // `origin_add` uses what it is handed verbatim as the config key
             // and as the folder segment under the domains root, so passing
@@ -2758,6 +2764,59 @@ fn github_not_ready_conflict() -> ApiError {
     )
 }
 
+/// Whether `segment` is one GitHub allows in an owner or a repository name:
+/// letters, digits, `-`, `_` and `.`, never empty and never `.` or `..` on
+/// their own (a real name is never exactly that, and refusing it here closes
+/// the one segment `..` could otherwise smuggle through the character
+/// allowlist).
+fn valid_github_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Validate `repo` as `owner/name` before it reaches the forge: both this
+/// surface's github-mode create and the domain-name peek pass it straight
+/// into a GitHub API path (`crates/remote/src/github/mod.rs`'s `split_repo`
+/// takes the first `/` and nothing else, and percent-encoding a segment
+/// keeps `.` unescaped), so an unchecked `repo=a/b/../../user` would reach
+/// the forge as a path GitHub itself then normalizes across a segment this
+/// request never named. Exactly one slash, and each side a single valid
+/// segment; nothing here reaches the network, so a bad `repo` is refused
+/// before either surface asks the forge anything.
+fn validate_github_repo(repo: &str) -> Result<(), ApiError> {
+    let mut segments = repo.split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some(owner), Some(name), None)
+            if valid_github_segment(owner) && valid_github_segment(name) =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::unprocessable(format!(
+            "'{repo}' is not a valid repository: expected owner/name, letters, digits, '-', \
+             '_' and '.' only in each, and exactly one slash"
+        ))),
+    }
+}
+
+/// Validate a repository-relative `path` before it reaches the forge: no
+/// leading slash (which would read as absolute once joined onto the
+/// `contents/` route) and no `..` segment (which would climb out of the
+/// subtree this surface may read).
+fn validate_github_path(path: &str) -> Result<(), ApiError> {
+    let bad = path.starts_with('/') || path.split('/').any(|segment| segment == "..");
+    if bad {
+        return Err(ApiError::unprocessable(format!(
+            "'{path}' is not a valid path within the repository: no leading slash and no '..' \
+             segment"
+        )));
+    }
+    Ok(())
+}
+
 /// What `POST /domains/{domain}/rename` takes.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[schema(description = "The new name, and whether the rename stays on this \
@@ -2907,11 +2966,12 @@ pub async fn rename(
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct GithubDomainNameQuery {
-    /// owner/name. Required; absent or empty answers 422, the same one
-    /// requesting a team-domain create without it does.
-    #[serde(default)]
+    /// owner/name. Required (an absent or unparseable query string is a
+    /// 400 before this handler runs; present and empty or malformed is a
+    /// 422 from the handler's own check, the same one a nameless
+    /// team-domain create answers).
     #[param(example = "acme/knowledge")]
-    pub repo: Option<String>,
+    pub repo: String,
     /// Branch to read from; defaults to the repository's default branch.
     #[serde(default)]
     #[param(example = "main")]
@@ -2957,6 +3017,14 @@ pub struct GithubDomainNameQuery {
             example = json!({ "domain_name": "engineering", "default_name": "knowledge" }),
         ),
         (
+            status = 400,
+            description = "The query string will not parse - `repo` is a \
+                           required parameter and an entirely absent one \
+                           lands here rather than in the 422 below.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 401,
             description = "No identity, or an anonymous one.",
             body = ProblemDetail,
@@ -2978,7 +3046,8 @@ pub struct GithubDomainNameQuery {
         ),
         (
             status = 422,
-            description = "`repo` is missing or empty.",
+            description = "`repo` is present and empty or not owner/name, or \
+                           `path` is absolute or holds a `..` segment.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -2990,12 +3059,14 @@ pub async fn github_domain_name(
     ApiQuery(query): ApiQuery<GithubDomainNameQuery>,
 ) -> Result<Json<Value>, ApiError> {
     identity.require_admin()?;
-    let repo = query
-        .repo
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .ok_or_else(|| ApiError::unprocessable("repo is required, as owner/name"))?;
+    let repo = query.repo.trim();
+    if repo.is_empty() {
+        return Err(ApiError::unprocessable("repo is required, as owner/name"));
+    }
+    validate_github_repo(repo)?;
+    if let Some(path) = query.path.as_deref() {
+        validate_github_path(path)?;
+    }
     if !state.engine.github_ready().await {
         return Err(github_not_ready_conflict());
     }
