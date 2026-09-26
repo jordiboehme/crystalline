@@ -426,3 +426,105 @@ fn domain_list_marks_a_shadowed_canonical_name() {
     let human = fx.ok(&["domain", "list", "--config", fx.config_str()]);
     assert!(human.contains("shadowed"), "{human}");
 }
+
+/// Task 23b item 1: a virtual domain's declared canonical name (its
+/// MANIFEST engram, in the database) shows in the NAME column too, not only
+/// a file domain's (read straight off disk). Standalone, no daemon: the
+/// index is opened read-only to read the one MANIFEST engram the virtual
+/// domain carries.
+#[test]
+fn domain_list_shows_a_virtual_domains_declared_name_without_a_daemon() {
+    let fx = Fixture::new();
+    fx.ok(&[
+        "domain",
+        "add",
+        "kb",
+        "--virtual",
+        "--config",
+        fx.config_str(),
+    ]);
+    let src = fx.home.path().join("import-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: KB\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: knowledge-base\n---\n\n# KB\n",
+    )
+    .unwrap();
+    fx.ok(&[
+        "domain",
+        "import",
+        src.to_str().unwrap(),
+        "--domain",
+        "kb",
+        "--overwrite",
+        "--config",
+        fx.config_str(),
+    ]);
+
+    let listed = fx.ok(&["--json", "domain", "list", "--config", fx.config_str()]);
+    let listed: serde_json::Value = serde_json::from_str(listed.trim()).unwrap();
+    let row = &listed["domains"][0];
+    assert_eq!(row["name"], "kb", "{row}");
+    assert_eq!(
+        row["canonical_name"], "knowledge-base",
+        "a virtual domain's declared name reads from its MANIFEST engram too: {row}"
+    );
+
+    let human = fx.ok(&["domain", "list", "--config", fx.config_str()]);
+    assert!(
+        human.contains("kb (knowledge-base)"),
+        "the NAME column shows both when they differ, for a virtual domain too: {human}"
+    );
+}
+
+/// Task 23b item 2: `sync <name>` without a daemon resolves its argument
+/// through the name table like every other standalone domain command
+/// (Task 23 binding A), rather than matching it against the config's local
+/// keys directly.
+#[test]
+fn sync_standalone_accepts_a_canonical_name_like_the_daemon_path() {
+    let fx = Fixture::new();
+    let dir = fx.home.path().join("wiki");
+    fx.register(&dir, "wiki", "knowledge-base");
+
+    let out = fx.ok(&[
+        "--json",
+        "sync",
+        "--domain",
+        "knowledge-base",
+        "--config",
+        fx.config_str(),
+    ]);
+    let reports: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let rows = reports.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{reports}");
+    assert_eq!(
+        rows[0]["domain"], "wiki",
+        "the canonical name resolved to the local registration: {reports}"
+    );
+}
+
+/// The same, for a machine-local alias rather than a canonical name.
+#[test]
+fn sync_standalone_accepts_an_alias_like_the_daemon_path() {
+    let fx = Fixture::new();
+    let dir = fx.home.path().join("wiki");
+    fx.register(&dir, "wiki", "wiki");
+    fx.add_alias("wiki", "old-wiki");
+
+    let out = fx.ok(&[
+        "--json",
+        "sync",
+        "--domain",
+        "old-wiki",
+        "--config",
+        fx.config_str(),
+    ]);
+    let reports: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let rows = reports.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{reports}");
+    assert_eq!(
+        rows[0]["domain"], "wiki",
+        "the alias resolved to the local registration: {reports}"
+    );
+}

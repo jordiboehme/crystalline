@@ -225,3 +225,62 @@ fn an_empty_table_resolves_nothing() {
     assert!(t.spellings().is_empty());
     assert_eq!(t.aliases("eng"), &[] as &[String]);
 }
+
+// --- `NameTable::from_config` -------------------------------------------------
+
+use std::collections::BTreeMap;
+
+use crystalline_core::config::{DomainEntry, GlobalConfig};
+
+fn cfg_with(entries: &[(&str, DomainEntry)]) -> GlobalConfig {
+    let mut cfg = GlobalConfig::default();
+    for (name, entry) in entries {
+        cfg.domains.insert((*name).to_string(), entry.clone());
+    }
+    cfg
+}
+
+/// A virtual domain's declared canonical name has no `MANIFEST.md` on disk
+/// to read: `from_config` takes it from `virtual_names` instead, keyed by
+/// local name, exactly the input `domain list`'s daemon and no-daemon routes
+/// both feed it.
+#[test]
+fn from_config_reads_a_virtual_domains_canonical_name_from_virtual_names() {
+    let cfg = cfg_with(&[("platform", DomainEntry::virtual_domain())]);
+    let mut virtual_names = BTreeMap::new();
+    virtual_names.insert("platform".to_string(), "kb".to_string());
+
+    let t = NameTable::from_config(&cfg, &virtual_names);
+    assert_eq!(t.canonical("platform"), Some("kb"));
+    assert_eq!(t.resolve("kb"), Some("platform"));
+}
+
+/// With no index reachable to read a virtual domain's MANIFEST engram from,
+/// an empty `virtual_names` map is the config-only fallback: the domain
+/// contributes only its local name, the same answer an unsynced file domain
+/// gets too.
+#[test]
+fn from_config_treats_a_virtual_domain_as_local_name_only_with_no_virtual_names() {
+    let cfg = cfg_with(&[("platform", DomainEntry::virtual_domain())]);
+    let t = NameTable::from_config(&cfg, &BTreeMap::new());
+    assert_eq!(t.canonical("platform"), Some("platform"));
+    assert_eq!(t.resolve("kb"), None);
+}
+
+/// A file domain's canonical name always comes from its own `MANIFEST.md` on
+/// disk, regardless of `virtual_names` - the input `virtual_names` carries is
+/// only ever consulted for a domain registered as virtual.
+#[test]
+fn from_config_reads_a_file_domains_canonical_name_off_its_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: KB\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: knowledge-base\n---\n\n# KB\n",
+    )
+    .unwrap();
+    let cfg = cfg_with(&[("wiki", DomainEntry::file(dir.path()))]);
+
+    let t = NameTable::from_config(&cfg, &BTreeMap::new());
+    assert_eq!(t.canonical("wiki"), Some("knowledge-base"));
+    assert_eq!(t.resolve("knowledge-base"), Some("wiki"));
+}

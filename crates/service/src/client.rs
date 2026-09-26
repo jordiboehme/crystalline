@@ -800,23 +800,14 @@ async fn localize_standalone(engine: &Engine, spelling: &str) -> String {
 
 /// [`localize_standalone`] for the handful of verbs (`provision` among them)
 /// that never open an engine at all: built straight from the loaded
-/// configuration, the same inputs [`Engine::name_table_now`] itself reads for
-/// a file domain (a virtual domain's own declared name lives in the database,
-/// out of reach here, and is not needed by anything that calls this: none of
-/// them ever names a virtual domain by its canonical spelling).
+/// configuration through [`crystalline_core::names::NameTable::from_config`],
+/// the same inputs [`Engine::name_table_now`] itself reads for a file domain
+/// (a virtual domain's own declared name lives in the database, out of reach
+/// here, and is not needed by anything that calls this: none of them ever
+/// names a virtual domain by its canonical spelling, so an empty
+/// `virtual_names` map is always correct here).
 fn localize_in_config(cfg: &crystalline_core::config::GlobalConfig, spelling: &str) -> String {
-    let inputs: Vec<crystalline_core::names::NameInput> = cfg
-        .domains
-        .iter()
-        .map(|(local, entry)| crystalline_core::names::NameInput {
-            local: local.clone(),
-            canonical: entry
-                .file_path()
-                .and_then(|root| crystalline_core::manifest::domain_name_at(&root)),
-            aliases: entry.aliases.clone(),
-        })
-        .collect();
-    crystalline_core::names::NameTable::build(&inputs)
+    crystalline_core::names::NameTable::from_config(cfg, &std::collections::BTreeMap::new())
         .resolve(spelling)
         .unwrap_or(spelling)
         .to_string()

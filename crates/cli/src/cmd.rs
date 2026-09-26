@@ -17,7 +17,6 @@ use crystalline_core::config::{
         derive_domain_name, needs_manifest_write_back, validate_domain_name,
     },
 };
-use crystalline_core::manifest::domain_name_at;
 use crystalline_core::names::{NameInput, NameTable};
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
@@ -552,21 +551,16 @@ fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<Strin
 /// to be a config key somewhere.
 ///
 /// A virtual domain contributes only its local name: its canonical name
-/// lives in the database, which this path never opens.
-fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> crystalline_core::NameTable {
-    let mut inputs: Vec<crystalline_core::NameInput> = Vec::new();
+/// lives in the database, which this path never opens - an empty
+/// `virtual_names` map into [`crystalline_core::names::config_name_inputs`],
+/// same as [`domain_list`]'s own no-index case.
+fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
+    let empty = std::collections::BTreeMap::new();
+    let mut inputs: Vec<NameInput> = Vec::new();
     for cfg in [&loaded.file, &loaded.effective] {
-        for (local, entry) in &cfg.domains {
-            inputs.push(crystalline_core::NameInput {
-                local: local.clone(),
-                canonical: entry
-                    .file_path()
-                    .and_then(|root| crystalline_core::domain_name_at(&root)),
-                aliases: entry.aliases.clone(),
-            });
-        }
+        inputs.extend(crystalline_core::names::config_name_inputs(cfg, &empty));
     }
-    crystalline_core::NameTable::build(&inputs)
+    NameTable::build(&inputs)
 }
 
 /// Rewrite `<root>/MANIFEST.md` to declare `domain_name: <name>`; a no-op
@@ -1727,23 +1721,70 @@ impl ListedStats {
     }
 }
 
-/// The name table built from this machine's own registrations, with no index
-/// needed: each file domain's canonical name is read straight off its
-/// MANIFEST on disk, and every domain's aliases come from its own
-/// configuration entry. A virtual domain's declared name lives in its
-/// MANIFEST engram, in the database, out of reach here - it always reads as
-/// its own local name, the same answer an unsynced file domain gets too.
-fn local_name_table(cfg: &GlobalConfig) -> NameTable {
-    let inputs: Vec<NameInput> = cfg
-        .domains
-        .iter()
-        .map(|(local, entry)| NameInput {
-            local: local.clone(),
-            canonical: entry.file_path().and_then(|root| domain_name_at(&root)),
-            aliases: entry.aliases.clone(),
-        })
-        .collect();
-    NameTable::build(&inputs)
+/// Every registered virtual domain's declared canonical name, from a
+/// `list_domains` reply already in hand - the daemon's own JSON over the ctl
+/// `tool` command. Keyed by local name, one entry per virtual domain row
+/// `data` carries; a row missing either field, or a reply with no `domains`
+/// array at all, contributes nothing rather than failing the read this rides
+/// along with. Feeds [`crystalline_core::names::NameTable::from_config`]'s
+/// `virtual_names` input, the one canonical name a config-only table
+/// (`build_name_table`'s own no-index case) cannot supply for a
+/// database-backed domain: its MANIFEST lives in the database, not on disk.
+fn virtual_names_from_list_domains(
+    data: &serde_json::Value,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(rows) = data.get("domains").and_then(serde_json::Value::as_array) else {
+        return out;
+    };
+    for row in rows {
+        if row.get("kind").and_then(serde_json::Value::as_str) != Some("virtual") {
+            continue;
+        }
+        let name = row.get("name").and_then(serde_json::Value::as_str);
+        let canonical = row
+            .get("canonical_name")
+            .and_then(serde_json::Value::as_str);
+        if let (Some(name), Some(canonical)) = (name, canonical) {
+            out.insert(name.to_string(), canonical.to_string());
+        }
+    }
+    out
+}
+
+/// [`virtual_names_from_list_domains`], read directly off the index instead
+/// of a daemon's reply: for every registered virtual domain, its one
+/// MANIFEST engram (permalink `manifest`), read once through the store this
+/// listing already opened read-only for its counts - the way every other
+/// standalone read command reaches the index, per `reach_index`'s own doc
+/// comment. A domain with no MANIFEST engram synced yet, or an engram this
+/// read cannot parse, is silently absent from the map rather than failing
+/// the whole listing: the NAME column falls back to the local name alone,
+/// same as today.
+async fn virtual_names_direct(
+    store: &Arc<TokioMutex<dyn Store>>,
+    cfg: &GlobalConfig,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let guard = store.lock().await;
+    for (name, entry) in &cfg.domains {
+        if !entry.is_virtual() {
+            continue;
+        }
+        let Ok(Some(descriptor)) = guard.find_engram(name, "manifest").await else {
+            continue;
+        };
+        let Ok(Some(content)) = guard
+            .engram_content(descriptor.domain_id, &descriptor.path)
+            .await
+        else {
+            continue;
+        };
+        if let Some(declared) = crystalline_core::manifest::domain_name_of_source(&content) {
+            out.insert(name.clone(), declared);
+        }
+    }
+    out
 }
 
 /// List registered domains, with engram counts when the index can be read.
@@ -1764,14 +1805,16 @@ pub async fn domain_list(
     // overlay marks which rows an environment variable defines.
     let loaded = load(config_override)?;
     let cfg = loaded.effective;
-    // Every domain's canonical name and effective aliases, from this
-    // machine's own registrations: no index or daemon needed for this part
-    // of the listing, so it is built once, ahead of everything below that
-    // does need one.
-    let name_table = local_name_table(&cfg);
     // Why the counts are missing when they are, in the helper's words; `None`
     // once they were read, whichever route delivered them.
     let mut not_read: Option<String> = None;
+    // Every virtual domain's declared canonical name, read alongside the
+    // route below: `None` unless one was actually reached, so a virtual
+    // domain whose row falls through to `IndexRoute::Absent` or
+    // `Unreachable` reads as its own local name, same as an unsynced file
+    // domain - the config-only fallback this whole command exists to keep.
+    let mut virtual_names: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     // The one verb that must answer whatever the index does, so the route is
     // matched rather than propagated with `?`. A daemon that replies with an
     // error envelope, or dies mid-exchange leaving a truncated line, makes
@@ -1810,7 +1853,7 @@ pub async fn domain_list(
             // is the point, and rendering it as an empty set would put every
             // domain back on the "(not indexed)" line this routing exists to end.
             IndexRoute::Daemon(data) => {
-                match data.get("domains").and_then(serde_json::Value::as_array) {
+                let parsed = match data.get("domains").and_then(serde_json::Value::as_array) {
                     Some(rows) => {
                         let parsed: Vec<ListedStats> =
                             rows.iter().filter_map(ListedStats::from_json).collect();
@@ -1829,20 +1872,45 @@ pub async fn domain_list(
                     );
                         None
                     }
+                };
+                // A running daemon is confirmed reachable - it just answered
+                // `status` - so a second, small ctl call asks it for the name
+                // fields `list_domains` has carried since Task 21
+                // (canonical_name, aliases, name_origin, shadowed, renaming):
+                // a virtual domain's declared name lives in its MANIFEST
+                // engram, in the database, out of reach from configuration
+                // alone. Best effort: a failure here costs the extra column,
+                // never the listing itself, which already has its counts.
+                if let Ok(Some(names_data)) = crystalline_service::ctl_if_running(
+                    serde_json::json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} }),
+                )
+                .await
+                {
+                    virtual_names = virtual_names_from_list_domains(&names_data);
                 }
+                parsed
             }
-            IndexRoute::Direct(store) => match store.lock().await.domain_stats().await {
-                Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
-                // Open, and still no counts: the index answered the open and not
-                // the question, which is a different state from both "unreachable"
-                // and "never synced" and must not be rendered as either.
-                Err(e) => {
-                    not_read = Some(format!(
-                        "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
-                    ));
-                    None
-                }
-            },
+            IndexRoute::Direct(store) => {
+                let result = match store.lock().await.domain_stats().await {
+                    Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
+                    // Open, and still no counts: the index answered the open and not
+                    // the question, which is a different state from both "unreachable"
+                    // and "never synced" and must not be rendered as either.
+                    Err(e) => {
+                        not_read = Some(format!(
+                            "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
+                        ));
+                        None
+                    }
+                };
+                // No daemon (or an explicit override bypassing one): read
+                // each virtual domain's MANIFEST engram directly, the way
+                // every other standalone read command reaches the index -
+                // through the same store this route already opened
+                // read-only for the counts above.
+                virtual_names = virtual_names_direct(&store, &cfg).await;
+                result
+            }
             // No index yet is not a failure to read one: a registered domain that
             // was never synced is exactly the "(not indexed)" case below.
             IndexRoute::Absent(_) => Some(Vec::new()),
@@ -1857,6 +1925,10 @@ pub async fn domain_list(
     {
         eprintln!("note: engram counts were not read; {why}");
     }
+    // Every domain's canonical name and effective aliases, from this
+    // machine's own registrations plus, when the route above reached one, a
+    // virtual domain's declared name straight from its MANIFEST engram.
+    let name_table = NameTable::from_config(&cfg, &virtual_names);
     let stat_for = |name: &str| {
         stats
             .as_ref()

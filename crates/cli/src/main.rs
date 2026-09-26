@@ -2158,7 +2158,22 @@ async fn sync_dispatch(
         return Ok(());
     }
     let store = cmd::local_store(route, "sync")?;
-    cmd::sync(store.clone(), &cfg, domain.as_deref(), embed, json).await?;
+    // Standalone (no daemon, or an explicit `--db`/`--config` override that
+    // bypasses one): `cmd::sync`'s own `select_domains` matches `domain`
+    // against `cfg.domains`'s local keys directly, with no resolution of its
+    // own - unlike the daemon path above, whose ctl `sync` is one of
+    // `control::DOMAIN_REFERENCE_COMMANDS` and so is pre-localized before it
+    // ever reaches the engine. Resolved here through the config-only name
+    // table (Task 23 binding A), the same one every other standalone domain
+    // command now uses: a canonical name or a machine-local alias means the
+    // same domain here that it would with a daemon running.
+    let resolved_domain = domain.as_deref().map(|d| {
+        crystalline_core::names::NameTable::from_config(&cfg, &std::collections::BTreeMap::new())
+            .resolve(d)
+            .unwrap_or(d)
+            .to_string()
+    });
+    cmd::sync(store.clone(), &cfg, resolved_domain.as_deref(), embed, json).await?;
     // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
     // synced MANIFEST may declare a new name. A sync that failed says so and
     // adopts nothing. The adoption cannot fail the sync that landed: its own

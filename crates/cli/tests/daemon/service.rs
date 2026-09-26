@@ -2592,6 +2592,44 @@ fn domain_rename_with_a_daemon_renames_it() {
     assert_eq!(names, vec!["platform"], "{listed}");
 }
 
+/// Task 23b item 1: a virtual domain's declared canonical name shows in the
+/// NAME column with a running daemon too, read from `list_domains`'s own
+/// name fields (canonical_name, aliases, name_origin, shadowed, renaming),
+/// the same data Task 21 added to it - not only standalone, where the index
+/// is opened directly. `--local` leaves the virtual domain's MANIFEST engram
+/// declaring its old name, so its local name ("platform") and its canonical
+/// name ("kb") differ, exactly the file-domain case `domain_rename_with_a_daemon_renames_it`
+/// exercises above, but for a database-backed domain.
+#[test]
+fn domain_list_shows_a_virtual_domains_declared_name_with_a_daemon() {
+    let env = Env::new("list-virtual");
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    config::save_yaml(&env.config_path(), &GlobalConfig::default()).unwrap();
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["domain", "add", "kb", "--virtual"]);
+    assert!(ok, "{out}");
+    let (ok, out) = env.run(&["domain", "rename", "kb", "platform", "--local"]);
+    assert!(ok, "{out}");
+
+    let (ok, out) = env.run(&["--json", "domain", "list"]);
+    assert!(ok, "{out}");
+    let listed: Value = serde_json::from_str(out.trim()).unwrap();
+    let row = listed["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "platform")
+        .unwrap();
+    assert_eq!(
+        row["canonical_name"], "kb",
+        "the daemon's own list_domains carries the virtual domain's declared name: {row}"
+    );
+}
+
 /// With the index unreachable, `domain list` still answers: the registrations
 /// come from configuration, and only the counts are missing. They say so in
 /// words, rather than reading as a domain nobody has synced.

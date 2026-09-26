@@ -22,7 +22,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::config::GlobalConfig;
 use crate::config::registration::validate_domain_name;
+use crate::manifest::domain_name_at;
 
 /// The names one registered domain brings to the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,39 @@ pub struct NameInput {
     pub canonical: Option<String>,
     /// Machine-local former names.
     pub aliases: Vec<String>,
+}
+
+/// The [`NameInput`]s a machine's own registered configuration contributes,
+/// one per registered domain: a file domain's canonical name is read straight
+/// off its `MANIFEST.md` on disk, since content there is the whole of what a
+/// standalone reader (no daemon, no index) ever has to ask; a virtual
+/// domain's declared name lives in its MANIFEST engram, in the database, so it
+/// comes from `virtual_names` instead - keyed by local name, and empty (or
+/// missing an entry) whenever no index was reachable to read it from, in
+/// which case the domain contributes only its local name, same as an
+/// unsynced file domain. Aliases always come from the registration entry
+/// itself, whichever kind of domain it is.
+///
+/// The shared building block behind [`NameTable::from_config`], and behind a
+/// caller (a fresh registration's collision check, most notably) that needs
+/// to union the inputs of more than one [`GlobalConfig`] before building one
+/// table over all of them.
+pub fn config_name_inputs(
+    cfg: &GlobalConfig,
+    virtual_names: &BTreeMap<String, String>,
+) -> Vec<NameInput> {
+    cfg.domains
+        .iter()
+        .map(|(local, entry)| NameInput {
+            local: local.clone(),
+            canonical: if entry.is_virtual() {
+                virtual_names.get(local).cloned()
+            } else {
+                entry.file_path().and_then(|root| domain_name_at(&root))
+            },
+            aliases: entry.aliases.clone(),
+        })
+        .collect()
 }
 
 /// A canonical name claimed by more than one domain, none of them
@@ -168,6 +203,26 @@ impl NameTable {
             .dropped_aliases
             .sort_by(|a, b| (&a.domain, &a.alias).cmp(&(&b.domain, &b.alias)));
         table
+    }
+
+    /// The table built from one machine's own registered configuration alone
+    /// (see [`config_name_inputs`]): every domain this machine's config
+    /// registers, each carrying its own file domain's declared canonical
+    /// name, read straight off its MANIFEST since a caller with no index has
+    /// nothing else to ask, and its recorded aliases. A virtual domain's
+    /// canonical name comes from `virtual_names` (its local name to its
+    /// declared name, when known), empty for a caller with no index reachable
+    /// to read one from; such a domain then contributes only its local name,
+    /// the same answer an unsynced file domain gets too.
+    ///
+    /// The single building block behind every place on the CLI and the
+    /// service's standalone (no-daemon) commands that used to build this same
+    /// table by hand: `domain list`'s own NAME/ALIASES/`shadowed` columns, a
+    /// standalone command's own-name resolution before it acts, and a fresh
+    /// registration's collision check (by way of [`config_name_inputs`]
+    /// directly, since that check unions more than one [`GlobalConfig`]).
+    pub fn from_config(cfg: &GlobalConfig, virtual_names: &BTreeMap<String, String>) -> NameTable {
+        NameTable::build(&config_name_inputs(cfg, virtual_names))
     }
 
     /// The local name `spelling` resolves to, if any. Exact spelling only.
