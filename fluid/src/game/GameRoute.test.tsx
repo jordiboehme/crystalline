@@ -584,6 +584,9 @@ describe("GameRoute", () => {
       await settle(300);
       await typeWord("idclev");
       await settle(200);
+      // No dev route mounts LevelSelect, so this holds by construction; the
+      // storage check below is the one that actually pins the word being
+      // ignored (it fails if a dev host ever passes `onLevels`).
       expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
       // The word's I stays a plain toggle there: nothing takes it back.
       expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
