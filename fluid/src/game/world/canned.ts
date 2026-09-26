@@ -989,12 +989,14 @@ function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
  * 15, 18 and 21 in the east half, all turned to face the entrance; the spider
  * tank, the robot head, the red bike and the garden robot down the west
  * interior at x 4, the first three turned east; and the police box backed
- * against the east wall's edge (22, 13). Each one frames from the front with a
- * clear sight line, and none meets another hero, a pinned hero or prop spot,
- * or a curio host's framing side. Every hero's seed is `seedFor(seed, "hero",
- * kind, variant)`, keyed by its kind and variant since a hand-placed room has
- * no candidate to key a seed by anchor with, and the list is sorted by
- * `HERO_ORDER`, the order a generated room's own heroes keep.
+ * against the east wall's edge (22, 13). The 2.6d slab walker (C17) stands
+ * at (21, 11), turn 2, a band hero clear of every other one. Each one frames
+ * from the front with a clear sight line, and none meets another hero, a
+ * pinned hero or prop spot, or a curio host's framing side. Every hero's seed
+ * is `seedFor(seed, "hero", kind, variant)`, keyed by its kind and variant
+ * since a hand-placed room has no candidate to key a seed by anchor with,
+ * and the list is sorted by `HERO_ORDER`, the order a generated room's own
+ * heroes keep.
  *
  * No fixture but the placard, which tells the visitor how to frame one hero
  * at a time (`?AT=PROP:KIND:N`); one round table at (20, 16.5), turn 0,
@@ -1066,6 +1068,9 @@ export function heroHallRoom(): RoomSpec {
     at("red-bike", 0, 4, 16.5, 1),
     at("garden-robot", 0, 4, 21, 2),
     wall("police-box", 0, { x: 22, y: 13, side: "e" }),
+    // 2.6d C17: its 1.0 m moat clears every hero, and it frames from the
+    // south with a clear sight line.
+    at("slab-walker", 0, 21, 11, 2),
   ].sort(HERO_ORDER);
 
   const base: RoomSpec = {

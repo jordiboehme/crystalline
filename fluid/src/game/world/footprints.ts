@@ -256,6 +256,7 @@ export const FOOTPRINTS: Footprints = {
     "moon-rocket": [{ width: 1.4, depth: 1.4 }],
     "thunder-hammer": [{ width: 0.8, depth: 0.8 }],
     "police-box": [{ width: 1.3, depth: 1.3 }],
+    "slab-walker": [{ width: 0.9, depth: 1.5 }],
   },
 };
 
@@ -402,6 +403,7 @@ export const HERO_FOOTING = {
   "moon-rocket": "free",
   "thunder-hammer": "free",
   "police-box": "backed",
+  "slab-walker": "free",
 } as const satisfies Record<HeroKind, "flush" | "backed" | "free">;
 
 /**

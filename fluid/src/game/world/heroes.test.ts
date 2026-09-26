@@ -106,7 +106,7 @@ function heroAt(kind: HeroKind, variant: number, side: Side = "s"): Hero {
 describe("the hero catalogue", () => {
   it("lists every kind once, with a size per variant and a footing that matches its placement", () => {
     expect(new Set(HERO_KINDS).size).toBe(HERO_KINDS.length);
-    expect(HERO_KINDS).toHaveLength(27);
+    expect(HERO_KINDS).toHaveLength(28);
     const footing = {
       wall: "flush",
       backed: "backed",
@@ -223,16 +223,33 @@ describe("the hero catalogue", () => {
       "thunder-hammer",
       "police-box",
     ]);
-    expect(HERO_POOLS.engineering.slice(-3)).toEqual([
+    // 2.6d C9, C17: the slab walker appended at the end of the engineering
+    // pool, after the spider tank.
+    expect(HERO_POOLS.engineering.slice(-4)).toEqual([
       ["mech-head", 1],
       ["red-bike", 1],
       ["spider-tank", 1],
+      ["slab-walker", 1],
     ]);
     expect(HERO_POOLS.archive.at(-1)).toEqual(["stone-hand", 1]);
     expect(HERO_POOLS.lab.slice(-2)).toEqual([
       ["stone-hand", 1],
       ["garden-robot", 1],
     ]);
+  });
+
+  it("draws the slab walker from the bridge and engineering pools at weight 1 (2.6d C9, C17)", () => {
+    // Mutation caught: the walker missing from a pool, or put in another
+    // archetype's.
+    for (const [a, pool] of Object.entries(HERO_POOLS)) {
+      const w = pool.find(([k]) => k === "slab-walker")?.[1] ?? 0;
+      expect(w, a).toBe(a === "bridge" || a === "engineering" ? 1 : 0);
+    }
+    expect(HERO_CATALOGUE["slab-walker"]).toMatchObject({
+      placement: "band",
+      top: 1.8,
+    });
+    expect(isTallHero("slab-walker")).toBe(false);
   });
 
   it("keeps a use point only where a later spec needs one, inside the reserve", () => {

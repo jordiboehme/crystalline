@@ -166,6 +166,7 @@ export const HERO_KINDS: readonly HeroKind[] = [
   "moon-rocket",
   "thunder-hammer",
   "police-box",
+  "slab-walker",
 ];
 
 /** One kind's entry: where it stands, how many variants, how tall, its edges and its tops. */
@@ -531,6 +532,15 @@ export const HERO_CATALOGUE = {
     under: [],
     use: { a: 0, d: 1.3 + HERO_USE_OUT },
   },
+  "slab-walker": {
+    placement: "band",
+    variants: 1,
+    top: 1.8,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
 } satisfies Record<HeroKind, HeroEntry>;
 
 /**
@@ -546,6 +556,7 @@ export const HERO_POOLS = {
     ["laser-desk", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
+    ["slab-walker", 1],
   ],
   council: [
     ["mess-table", 6],
@@ -564,6 +575,7 @@ export const HERO_POOLS = {
     ["mech-head", 1],
     ["red-bike", 1],
     ["spider-tank", 1],
+    ["slab-walker", 1],
   ],
   archive: [
     ["core-wall", 6],

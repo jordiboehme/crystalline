@@ -9,10 +9,11 @@
  * slot is its kind's blink bank (`HERO_BANK`), which its blinking lights
  * pulse with.
  *
- * The recipes live in eight batch files grouped by the parts they share:
+ * The recipes live in nine batch files grouped by the parts they share:
  * `optics.ts`, `living.ts`, `workshop.ts` and `arcade.ts`, and the large ones
  * in `floaters.ts` (the three hovering heroes), `exhibits.ts`, `mechs.ts` and
- * `street.ts`, all built on `common.ts`. The hero test (`heroModels.test.ts`)
+ * `street.ts`, all built on `common.ts`; `walker.ts` holds the slab walker's
+ * blockout alone until it gets its own recipe. The hero test (`heroModels.test.ts`)
  * builds every kind and variant, places it at every turn the way the GPU does
  * and checks the envelope (its footprint and its top), that it reaches its
  * top, the winding, the triangle budget, that nothing glows in mid-air, that
@@ -39,6 +40,7 @@ import { LIVING_RECIPES } from "./living";
 import { MECH_RECIPES } from "./mechs";
 import { OPTICS_RECIPES } from "./optics";
 import { STREET_RECIPES } from "./street";
+import { WALKER_RECIPES } from "./walker";
 import { WORKSHOP_RECIPES } from "./workshop";
 
 /** Every hero kind's recipe, whatever its batch. */
@@ -51,6 +53,7 @@ const RECIPES = {
   ...EXHIBIT_RECIPES,
   ...MECH_RECIPES,
   ...STREET_RECIPES,
+  ...WALKER_RECIPES,
 } satisfies Record<HeroKind, HeroRecipe>;
 
 /**
