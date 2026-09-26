@@ -982,7 +982,15 @@ function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
  * them, into the anchor `(7, 0)` at turn 2), the band, corner and centre
  * ones at fixed coordinates directly, and the turret turned to face the
  * hall's centre the way a generated room's corner hero would (`faceCentre`
- * in `heroes.ts`, H10). Every hero's seed is `seedFor(seed, "hero",
+ * in `heroes.ts`, H10). The eleven large heroes of 2.6c (C16) fill the
+ * rest: the question block, the hoverboard and the flying cloud in a row
+ * at y 4 and the stone hand, the thunder hammer and the moon rocket in a
+ * row at y 8, at x 15, 18 and 21 in the east half, all turned to face the
+ * entrance; the spider tank, the robot head, the red bike and the garden
+ * robot down the west interior at x 4, the first three turned east; and
+ * the police box backed against the east wall's edge (22, 13). Each one
+ * frames from the front with a clear sight line, and none meets another
+ * hero, a pinned hero or prop spot, or a curio host's framing side. Every hero's seed is `seedFor(seed, "hero",
  * kind, variant)`, keyed by its kind and variant since a hand-placed room
  * has no candidate to key a seed by anchor with, and the list is sorted by
  * `HERO_ORDER`, the order a generated room's own heroes keep.
@@ -1042,6 +1050,20 @@ export function heroHallRoom(): RoomSpec {
     at("turret", 0, 21.5, 22.5, faceCentre(hall, 21.5, 22.5)),
     at("field-pack", 0, 1.5, 22.5, 1),
     at("field-pack", 1, 21.5, 1.5, 2),
+    // 2.6c (C16): the east half in two rows facing the entrance, the west
+    // interior facing east, the police box on the east wall. Every spot
+    // frames from the front with a clear sight line (spots.test.ts).
+    at("question-block", 0, 15, 4, 2),
+    at("hoverboard", 0, 18, 4, 2),
+    at("flying-cloud", 0, 21, 4, 2),
+    at("stone-hand", 0, 15, 8, 2),
+    at("thunder-hammer", 0, 18, 8, 2),
+    at("moon-rocket", 0, 21, 8, 2),
+    at("spider-tank", 0, 4, 5.5, 1),
+    at("mech-head", 0, 4, 9.5, 1),
+    at("red-bike", 0, 4, 16.5, 1),
+    at("garden-robot", 0, 4, 21, 2),
+    wall("police-box", 0, { x: 22, y: 13, side: "e" }),
   ].sort(HERO_ORDER);
 
   const base: RoomSpec = {

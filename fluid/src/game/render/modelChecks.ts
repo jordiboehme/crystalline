@@ -10,8 +10,8 @@
  * catalogue surface sits on a real upward face and stays clear above it
  * (`upwardFaceAt`, `clearAbove` at a point, `clearAboveBox` over a whole
  * curio host surface), whether every part traces a path back to
- * the floor or its wall through the parts it touches (`touching`,
- * `looseParts`), and whether every glowing part (a screen, a frame, a
+ * the floor (or a hovering hero's lift, `heroLift`) or its wall through
+ * the parts it touches (`touching`, `looseParts`), and whether every glowing part (a screen, a frame, a
  * portal, a signal light or a blinking one) touches a lit host or its
  * wall. A prop or hero mesh, built once at the origin, is turned and
  * placed the way the GPU places an instance (`placeMesh`, `placeParts`)
@@ -300,24 +300,26 @@ export function touching(p: Shape, q: Shape): boolean {
 /**
  * Every part with no path back to the floor or the wall through the parts
  * it touches (`touching`): held parts start on the floor (a shape whose
- * lowest point sits within 0.1 mm of `y = 0`) or, when `wall` is given, on
+ * lowest point sits within 0.1 mm of `y = floor`) or, when `wall` is given, on
  * the wall plane (some vertex within 0.1 mm of it, in the wall frame's
  * terms); every other part joins once it touches a held one, repeated to a
  * fixed point. What is left after that is loose, named `"<index>:<method>"`
  * in build order: a genuine floater, not a part chained to the floor only
  * through parts still unheld when it was its turn to check. Pass every
  * part of a hero, built once at the origin; a part with no points (an
- * empty primitive) is dropped rather than counted loose.
+ * empty primitive) is dropped rather than counted loose. `floor` is where
+ * parts are held from: 0, or a hovering hero's lift (`heroLift`, C4).
  */
 export function looseParts(
   parts: readonly Part[],
   wall: Frame | null,
+  floor = 0,
 ): string[] {
   const solid = parts.filter((p) => p.points.length > 0);
   const shapes = solid.map((p) => shape(p.points));
   const held = shapes.map(
     (s) =>
-      s.lo[1] <= 1e-4 ||
+      s.lo[1] <= floor + 1e-4 ||
       (wall !== null && s.points.some((q) => toLocal(wall, q)[1] <= 1e-4)),
   );
   for (let changed = true; changed;) {

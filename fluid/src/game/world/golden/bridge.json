@@ -183,7 +183,16 @@
   ],
   "decor": [],
   "scaffold": [],
-  "heroes": [],
+  "heroes": [
+    {
+      "kind": "flying-cloud",
+      "variant": 0,
+      "x": 4.5,
+      "y": 3.5,
+      "turn": 3,
+      "seed": 117700435699395
+    }
+  ],
   "props": [
     {
       "kind": "cable-tray",

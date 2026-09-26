@@ -10,8 +10,19 @@
  * (`HeroPlacement`), how many variants it has, how tall it is, how many
  * wall edges it takes, the tops a later pass may set a small prop on and
  * where a player would stand to use it. The pools (`HERO_POOLS`, H7) weight
- * each archetype's own kinds; the turret and the black slab are drawn
- * apart from every pool, at `TURRET_SHARE` and `SLAB_SHARE`.
+ * each archetype's own kinds; the turret, the black slab and the question
+ * block are drawn apart from every pool, at `TURRET_SHARE`, `SLAB_SHARE`
+ * and `BLOCK_SHARE`, and the five any-archetype kinds (`ANY_POOL`) by one
+ * draw of their own that only fills a slot the pools left empty (C9).
+ *
+ * Three rules read a kind's height and lift. A hero's top plus
+ * `HERO_CEILING_GAP` stays under its lowest ceiling (`heroMinCeiling`:
+ * `LOWEST_CEILING`, or its `HERO_MIN_CEILING` entry), and the pass skips a
+ * kind whose ceiling the room does not reach (C7). A floor hero whose top
+ * passes `HERO_FLOOR_TOP` is tall (`isTallHero`, C6), and its moat keeps
+ * off every pipe run. A hovering hero (`heroLift` in `footprints.ts`, C4)
+ * stands on the floor like any other in the pass; only its collision and
+ * its mesh read the lift.
  *
  * What a hero reserves (`heroReserve`, H19) is what the dressing keeps off:
  * a free or backed hero's box grown by `HERO_CLEAR` on every side, a flush
@@ -23,11 +34,13 @@
  * before the dressing, on the room's sites (`dressingSites`, which read no
  * hero and no prop). In this order:
  *
- * 1. The draws (`heroDraws`, H6, H7): `seedFor(room.seed, "hero", "draw")`
- *    draws the slab's chance (`SLAB_SHARE`) and then the turret's
- *    (`TURRET_SHARE`); each of the `heroCap(room.hall)` pool slots draws a
- *    chance of `HERO_SHARE` and a roll from `seedFor(room.seed, "hero",
- *    "pick", i)`.
+ * 1. The draws (`heroDraws`, H6, H7, C9): `seedFor(room.seed, "hero",
+ *    "draw")` draws the slab's chance (`SLAB_SHARE`), then the turret's
+ *    (`TURRET_SHARE`), then the question block's (`BLOCK_SHARE`), the third
+ *    value on that stream; each of the `heroCap(room.hall)` pool slots
+ *    draws a chance of `HERO_SHARE` and a roll from `seedFor(room.seed,
+ *    "hero", "pick", i)`; the any-archetype draw a chance of `ANY_SHARE`
+ *    and a roll from `seedFor(room.seed, "hero", "any")`.
  * 2. The slab, when drawn: one candidate, at the hall's centre x with its
  *    south face on the hall's centre line, facing the entrance (turn 2,
  *    H9). It stands only where the centre is free: its box grown by
@@ -35,12 +48,17 @@
  * 3. The turret, when drawn and a slot is left: the cells of the hall's
  *    corner zones that kept all four spots, centred on the cell and turned
  *    to face the hall's centre (H10).
- * 4. The pool slots, in order, while a slot is left: a slot that drew its
+ * 4. The question block, when drawn and a slot is left, as a band kind.
+ * 5. The pool slots, in order, while a slot is left: a slot that drew its
  *    chance picks by its roll from the archetype's pool (`HERO_POOLS`) less
  *    the kinds already placed, and tries that kind. A kind that finds no
  *    place leaves its slot empty; nothing is drawn again.
- * 5. Trying a kind: its candidates by placement, in the order of their
- *    seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18; ties
+ * 6. The any-archetype draw, when it took and a slot is left: it picks by
+ *    its roll from `ANY_POOL` less the kinds already placed and tries that
+ *    kind, so it only fills a slot the steps before left empty.
+ * 7. Trying a kind: nothing when the room's ceiling is under the kind's
+ *    `heroMinCeiling` (C7); else its candidates by placement, in the
+ *    order of their seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18; ties
  *    by the anchor's y, then x):
  *    - `wall` and `backed`: every free wall edge of the hall that is not
  *      beside a door, hatch or portal on its run (H5) and not a placed
@@ -54,11 +72,12 @@
  *    Each candidate's first draw is the variant. The first candidate whose
  *    hero's box fits the hall's floor and enters no lane is placed when,
  *    for a free or backed hero, the box grown by `HERO_CLEAR` overlaps no
- *    taken box and no placed hero (H20), and, for a flush one, the box
+ *    taken box and no placed hero (H20), and for a tall one (`isTallHero`,
+ *    C6) no pipe run's box either, and, for a flush one, the box
  *    grown by `HERO_CLEAR` overlaps no placed free or backed hero (the
  *    same moat, seen from the flush side). Anchors are rounded to three
  *    decimals before they are measured.
- * 6. The output, sorted by `HERO_ORDER`.
+ * 8. The output, sorted by `HERO_ORDER`.
  *
  * The surface hook (H21, C3): `HERO_CATALOGUE[kind].surfaces` lists each
  * top in the hero's local terms (`SurfaceSpec`, with its free height
@@ -68,7 +87,7 @@
  * them in world metres for the curios (`curios.ts`), each rectangle
  * through `turnedBox` (`footprints.ts`), which turns its corners with
  * `turnedPoint` at the hero's anchor and turn, as `heroPoint` does.
- * `heroUsePoint` gives a cabinet's use point through `heroPoint`.
+ * `heroUsePoint` gives a kind's use point through `heroPoint`.
  *
  * This is the generator side: it imports `footprints.ts`, `sites.ts`,
  * `types.ts`, `units.ts` and the seeds (and may import `props.ts`), and
@@ -136,6 +155,17 @@ export const HERO_KINDS: readonly HeroKind[] = [
   "field-pack",
   "arcade-cabinet",
   "recruit-cabinet",
+  "stone-hand",
+  "question-block",
+  "mech-head",
+  "red-bike",
+  "hoverboard",
+  "flying-cloud",
+  "spider-tank",
+  "garden-robot",
+  "moon-rocket",
+  "thunder-hammer",
+  "police-box",
 ];
 
 /** One kind's entry: where it stands, how many variants, how tall, its edges and its tops. */
@@ -159,9 +189,10 @@ export interface HeroEntry {
   under: readonly SurfaceSpec[];
   /**
    * Where a player would stand to use it, in the same local terms, or null:
-   * the arcade cabinets keep one (spec: a later spec makes E open a game),
-   * `HERO_USE_OUT` (0.45 m) in front of the cabinet's face on its centre
-   * line. Nothing reads it in 2.6a but the tests.
+   * only the kinds a later spec gives a use keep one. The cabinets, the
+   * thunder hammer and the police box keep one `HERO_USE_OUT` (0.45 m) in
+   * front of the face on the centre line, the question block one under its
+   * middle (C15); nothing reads them in 2.6c but the tests.
    */
   use: { a: number; d: number } | null;
 }
@@ -178,9 +209,12 @@ export const HERO_USE_OUT = 0.45;
  * Every hero kind (H8, H13): its placement, its variant count (one size
  * each in `FOOTPRINTS.hero`), its top in metres, its wall edges (1, unused,
  * for a kind that stands free), its surfaces (H21) and its use point. A
- * floor hero stays under 2.2 m but the slab (`SLAB_TOP`), a wall hero under
- * `HERO_WALL_TOP`. An arcade cabinet's three variants are its three games,
- * one size.
+ * hero's top plus `HERO_CEILING_GAP` stays under the lowest ceiling it
+ * may stand under (`heroMinCeiling`), a wall hero's top under
+ * `HERO_WALL_TOP`; a top over `HERO_FLOOR_TOP` makes the kind tall
+ * (`isTallHero`, C6), and a tall kind stands in the band, at the centre or
+ * backed against a wall, never in a corner. An arcade cabinet's three
+ * variants are its three games, one size.
  */
 export const HERO_CATALOGUE = {
   turret: {
@@ -398,11 +432,110 @@ export const HERO_CATALOGUE = {
     under: [],
     use: { a: 0, d: 1.2 + HERO_USE_OUT },
   },
+  "stone-hand": {
+    placement: "band",
+    variants: 1,
+    top: 1.4,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "question-block": {
+    placement: "band",
+    variants: 1,
+    top: 2.9,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: { a: 0, d: 0 },
+  },
+  "mech-head": {
+    placement: "band",
+    variants: 1,
+    top: 2.1,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "red-bike": {
+    placement: "band",
+    variants: 1,
+    top: 1.2,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  hoverboard: {
+    placement: "corner",
+    variants: 1,
+    top: 0.33,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "flying-cloud": {
+    placement: "band",
+    variants: 1,
+    top: 1.0,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "spider-tank": {
+    placement: "band",
+    variants: 1,
+    top: 2.5,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "garden-robot": {
+    placement: "band",
+    variants: 1,
+    top: 3.44,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "moon-rocket": {
+    placement: "band",
+    variants: 1,
+    top: 2.4,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: null,
+  },
+  "thunder-hammer": {
+    placement: "band",
+    variants: 1,
+    top: 0.5,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: { a: 0, d: 0.4 + HERO_USE_OUT },
+  },
+  "police-box": {
+    placement: "backed",
+    variants: 1,
+    top: 2.7,
+    edges: 1,
+    surfaces: [],
+    under: [],
+    use: { a: 0, d: 1.3 + HERO_USE_OUT },
+  },
 } satisfies Record<HeroKind, HeroEntry>;
 
 /**
- * Each archetype's weighted pool (H7); the turret and the slab are drawn
- * apart. The pools are listed in catalogue order, and that order is part
+ * Each archetype's weighted pool (H7); the turret, the slab, the question
+ * block and the any-archetype kinds (`ANY_POOL`) are drawn apart. The pools are listed in catalogue order, and that order is part
  * of the seeded result, so do not reorder them.
  */
 export const HERO_POOLS = {
@@ -427,11 +560,15 @@ export const HERO_POOLS = {
     ["field-pack", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
+    ["mech-head", 1],
+    ["red-bike", 1],
+    ["spider-tank", 1],
   ],
   archive: [
     ["core-wall", 6],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
+    ["stone-hand", 1],
   ],
   lab: [
     ["photo-console", 3],
@@ -441,6 +578,8 @@ export const HERO_POOLS = {
     ["field-pack", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
+    ["stone-hand", 1],
+    ["garden-robot", 1],
   ],
 } satisfies Record<Archetype, readonly (readonly [HeroKind, number])[]>;
 
@@ -452,6 +591,25 @@ export const HERO_SHARE = 1 / 2;
 export const TURRET_SHARE = 1 / 6;
 /** Chance a room draws the slab (spec: about 1 room in 40, where the centre is free). */
 export const SLAB_SHARE = 1 / 40;
+/** Chance a room draws the question block (spec: about 1 hall in 20), after the turret (C9). */
+export const BLOCK_SHARE = 1 / 20;
+
+/**
+ * The any-archetype heroes drawn apart from every pool (C9), in catalogue
+ * order, each at weight 1. Their one draw runs after the pool slots and
+ * only fills a slot those left empty, so it never takes a place from an
+ * earlier hero.
+ */
+export const ANY_POOL = [
+  ["hoverboard", 1],
+  ["flying-cloud", 1],
+  ["moon-rocket", 1],
+  ["thunder-hammer", 1],
+  ["police-box", 1],
+] as const satisfies readonly (readonly [HeroKind, number])[];
+
+/** Chance the any-archetype draw takes (C9). */
+export const ANY_SHARE = 1 / 2;
 /** The moat around a free or backed hero, in metres (H19, H20): wider than the player (0.7 m). */
 export const HERO_CLEAR = 1.0;
 /** How deep the clear view box in front of a flush wall hero is, in metres (H19). */
@@ -463,6 +621,48 @@ export const SLAB_TOP = 2.7;
  * flush hero reaches; `heroModels.test.ts` pins them equal (H13).
  */
 export const HERO_WALL_TOP = 2.25;
+
+/** The lowest ceiling the generator makes, in metres (salience 0). */
+export const LOWEST_CEILING = 3.0;
+
+/** How far under the ceiling a hero's top stays at the least, in metres (the models' `HEADROOM`). */
+export const HERO_CEILING_GAP = 0.05;
+
+/**
+ * The world side's copy of the props' `FLOOR_TOP` (2.2), the highest a
+ * floor prop reaches; `heroModels.test.ts` pins them equal. A hero whose
+ * top passes it is tall (`isTallHero`, C6).
+ */
+export const HERO_FLOOR_TOP = 2.2;
+
+/**
+ * The kinds that need a higher ceiling than `LOWEST_CEILING` (C7), in
+ * metres: only the garden robot (3.44 m tall, Jordi 2026-09-26). The pass
+ * skips a kind whose ceiling the room does not reach.
+ */
+export const HERO_MIN_CEILING = {
+  "garden-robot": 3.7,
+} as const satisfies Partial<Record<HeroKind, number>>;
+
+/** The lowest ceiling a kind stands under: its `HERO_MIN_CEILING` entry, else `LOWEST_CEILING`. */
+export function heroMinCeiling(kind: HeroKind): number {
+  return (
+    (HERO_MIN_CEILING as Partial<Record<HeroKind, number>>)[kind] ??
+    LOWEST_CEILING
+  );
+}
+
+/**
+ * Whether a kind is tall (C6): a floor hero whose top passes
+ * `HERO_FLOOR_TOP`, so it reaches the band where pipe runs and spans
+ * hang. A tall hero's moat keeps off every pipe run box. A wall hero is
+ * never tall: it hangs flush on its wall under `HERO_WALL_TOP` like a wall
+ * prop, so the core wall (2.25 m) is not.
+ */
+export function isTallHero(kind: HeroKind): boolean {
+  const e = HERO_CATALOGUE[kind];
+  return e.placement !== "wall" && e.top > HERO_FLOOR_TOP;
+}
 
 /** How many heroes a hall holds (H6): 2 when both sides reach `HERO_BIG_HALL`, else 1. */
 export function heroCap(hall: Rect): 1 | 2 {
@@ -621,28 +821,46 @@ export function heroUsePoint(h: Hero): { x: number; z: number } | null {
   return heroPoint(h, use.a, use.d);
 }
 
-/** The draws of one room (H6, H7): the slab, the turret and each pool slot's chance and roll. */
+/**
+ * The draws of one room (H6, H7, C9): the slab, the turret, the question
+ * block, each pool slot's chance and roll, and the any-archetype draw's
+ * chance and roll. `block` and `any` are optional: absent means not drawn,
+ * so a forced-draws literal without them draws neither.
+ */
 export interface HeroDraws {
   slab: boolean;
   turret: boolean;
+  block?: boolean;
   picks: readonly { take: boolean; roll: number }[];
+  any?: { take: boolean; roll: number };
 }
 
 /**
  * A room's hero draws, from its own streams: `seedFor(room.seed, "hero",
- * "draw")` draws the slab's chance and then the turret's; pool slot `i`
- * (one per `heroCap`) draws its chance of `HERO_SHARE` and its roll from
- * `seedFor(room.seed, "hero", "pick", i)`.
+ * "draw")` draws the slab's chance, then the turret's, then the question
+ * block's (`BLOCK_SHARE`); pool slot `i` (one per `heroCap`) draws its
+ * chance of `HERO_SHARE` and its roll from `seedFor(room.seed, "hero",
+ * "pick", i)`; the any-archetype draw its chance of `ANY_SHARE` and its
+ * roll from `seedFor(room.seed, "hero", "any")`.
  */
 export function heroDraws(room: SiteBase): HeroDraws {
   const rng = createRng(seedFor(room.seed, "hero", "draw"));
   const slab = rng.chance(SLAB_SHARE);
   const turret = rng.chance(TURRET_SHARE);
+  // Third on the same stream, so the slab's and the turret's stay as they were.
+  const block = rng.chance(BLOCK_SHARE);
   const picks = Array.from({ length: heroCap(room.hall) }, (_, i) => {
     const r = createRng(seedFor(room.seed, "hero", "pick", i));
     return { take: r.chance(HERO_SHARE), roll: r.next() };
   });
-  return { slab, turret, picks };
+  const a = createRng(seedFor(room.seed, "hero", "any"));
+  return {
+    slab,
+    turret,
+    block,
+    picks,
+    any: { take: a.chance(ANY_SHARE), roll: a.next() },
+  };
 }
 
 /** One place a hero may be tried at: its seed, its anchor and how to make the hero. */
@@ -733,7 +951,7 @@ export function placeHeroes(
     const solid = [
       ...sites.taken,
       ...out.map((o) => heroFootprint(o)),
-      ...(placement === "centre" ? pipeRuns : []),
+      ...(isTallHero(kind) ? pipeRuns : []),
     ];
     return !solid.some((b) => overlaps(moat, b));
   };
@@ -849,6 +1067,8 @@ export function placeHeroes(
   };
 
   const tryPlace = (kind: HeroKind) => {
+    // The ceiling gate (C7): a kind the room's ceiling does not clear.
+    if (heroMinCeiling(kind) > room.ceiling + EPS) return;
     for (const c of candidates(kind)) {
       const h = c.make(createRng(c.seed));
       if (fits(h)) {
@@ -860,6 +1080,7 @@ export function placeHeroes(
 
   if (draws.slab && out.length < cap) tryPlace("black-slab");
   if (draws.turret && out.length < cap) tryPlace("turret");
+  if (draws.block === true && out.length < cap) tryPlace("question-block");
   const pool: readonly (readonly [HeroKind, number])[] =
     HERO_POOLS[room.archetype];
   for (const pick of draws.picks) {
@@ -867,6 +1088,13 @@ export function placeHeroes(
     if (!pick.take) continue;
     const left = pool.filter(([k]) => !out.some((h) => h.kind === k));
     const kind = pickByRoll(pick.roll, left);
+    if (kind !== null) tryPlace(kind);
+  }
+  // The any-archetype draw (C9): only a slot the pools left empty.
+  const any = draws.any;
+  if (any !== undefined && any.take && out.length < cap) {
+    const left = ANY_POOL.filter(([k]) => !out.some((h) => h.kind === k));
+    const kind = pickByRoll(any.roll, left);
     if (kind !== null) tryPlace(kind);
   }
   return out.sort(HERO_ORDER);

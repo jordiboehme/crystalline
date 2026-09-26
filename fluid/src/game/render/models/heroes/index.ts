@@ -9,13 +9,15 @@
  * slot is its kind's blink bank (`HERO_BANK`), which its blinking lights
  * pulse with.
  *
- * The recipes live in four batch files grouped by the parts they share:
- * `optics.ts`, `living.ts`, `workshop.ts` and `arcade.ts`, all built on
- * `common.ts`. The hero test (`heroModels.test.ts`) builds every kind and
+ * The recipes live in eight batch files grouped by the parts they share:
+ * `optics.ts`, `living.ts`, `workshop.ts` and `arcade.ts`, and the large
+ * ones in `floaters.ts` (the three hovering heroes), `exhibits.ts`,
+ * `mechs.ts` and `street.ts`, all built on `common.ts`. The hero test (`heroModels.test.ts`) builds every kind and
  * variant, places it at every turn the way the GPU does and checks the
  * envelope (its footprint and its top), that it reaches its top, the
  * winding, the triangle budget, that nothing glows in mid-air, that no
- * part floats clear of the floor, its wall or another part, that blinking
+ * part floats clear of the floor (or of its lift, for a hovering hero),
+ * its wall or another part, that the mesh rests exactly at its lift, that blinking
  * parts appear exactly in the kinds whose bank blinks, and, for a kind
  * with a catalogue surface, that a grid over it lands on a real upward
  * face with its headroom clear. What that grid does not reach (a shape
@@ -31,8 +33,12 @@ import type { Look } from "../../looks";
 import { surfaces, type KitAt } from "../common";
 import { ARCADE_RECIPES } from "./arcade";
 import type { HeroRecipe } from "./common";
+import { EXHIBIT_RECIPES } from "./exhibits";
+import { FLOATER_RECIPES } from "./floaters";
 import { LIVING_RECIPES } from "./living";
+import { MECH_RECIPES } from "./mechs";
 import { OPTICS_RECIPES } from "./optics";
+import { STREET_RECIPES } from "./street";
 import { WORKSHOP_RECIPES } from "./workshop";
 
 /** Every hero kind's recipe, whatever its batch. */
@@ -41,6 +47,10 @@ const RECIPES = {
   ...LIVING_RECIPES,
   ...WORKSHOP_RECIPES,
   ...ARCADE_RECIPES,
+  ...FLOATER_RECIPES,
+  ...EXHIBIT_RECIPES,
+  ...MECH_RECIPES,
+  ...STREET_RECIPES,
 } satisfies Record<HeroKind, HeroRecipe>;
 
 /**

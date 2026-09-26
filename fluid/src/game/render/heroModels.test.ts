@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { HERO_FOOTING, heroFootprint } from "../world/footprints";
+import { HERO_FOOTING, heroFootprint, heroLift } from "../world/footprints";
 import {
   HERO_CATALOGUE,
+  HERO_FLOOR_TOP,
   HERO_KINDS,
   HERO_WALL_TOP,
   heroSurfaces,
@@ -28,7 +29,7 @@ import {
 } from "./modelChecks";
 import { buildHero, buildHeroMesh } from "./models/heroes";
 import { HERO_BANK } from "./models/heroes/common";
-import { WALL_TOP } from "./models/props/common";
+import { FLOOR_TOP, WALL_TOP } from "./models/props/common";
 
 const EPS = 1e-4;
 /** A free hero's anchor, in cell units: the middle of a cell's width, on a row line. */
@@ -110,8 +111,16 @@ describe("hero models", () => {
       it(`${kind} variant ${String(v)} stands on the floor, its wall or another part`, () => {
         const wall =
           HERO_FOOTING[kind] === "free" ? null : frameAt([0, 0, 0], 0);
-        expect(looseParts(parts, wall)).toEqual([]);
+        expect(looseParts(parts, wall, heroLift(kind))).toEqual([]);
       });
+
+      if (HERO_FOOTING[kind] !== "flush")
+        it(`${kind} variant ${String(v)} rests exactly at its lift`, () => {
+          // Mutation caught: a floater whose part hangs below its lift, or
+          // a standing hero that floats clear of the floor.
+          const low = Math.min(...positions(mesh).map((p) => p[1]));
+          expect(low).toBeCloseTo(heroLift(kind), 4);
+        });
 
       for (let t = 0; t < 4; t++) {
         describe(`${kind} variant ${String(v)} turned ${String(t)}`, () => {
@@ -125,7 +134,7 @@ describe("hero models", () => {
             expect(points.length).toBeGreaterThan(0);
             for (const p of points) {
               expect(inBox(box, p, EPS)).toBe(true);
-              expect(p[1]).toBeGreaterThanOrEqual(-EPS);
+              expect(p[1]).toBeGreaterThanOrEqual(heroLift(kind) - EPS);
               expect(p[1]).toBeLessThanOrEqual(entry.top + EPS);
             }
           });
@@ -181,6 +190,10 @@ describe("hero models", () => {
 
   it("gives the world the models' wall top", () => {
     expect(HERO_WALL_TOP).toBe(WALL_TOP);
+  });
+
+  it("gives the world the props' floor top", () => {
+    expect(HERO_FLOOR_TOP).toBe(FLOOR_TOP);
   });
 
   it("puts blink-flagged parts exactly in the kinds whose bank blinks", () => {

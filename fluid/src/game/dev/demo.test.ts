@@ -48,6 +48,31 @@ describe("roomWithForcedHero", () => {
     expect(room.heroes.some((h) => h.kind === "mess-table")).toBe(false);
   });
 
+  it("forces every new kind into the canned workshop", () => {
+    // Review Focus 5. Mutation caught: a forced any-archetype kind not
+    // reaching the free-slot draw, or the block not forced.
+    for (const kind of [
+      "stone-hand",
+      "question-block",
+      "mech-head",
+      "red-bike",
+      "hoverboard",
+      "flying-cloud",
+      "spider-tank",
+      "garden-robot",
+      "moon-rocket",
+      "thunder-hammer",
+      "police-box",
+    ] as const) {
+      const { room, placed } = roomWithForcedHero(CANNED_WORKSHOP, kind);
+      expect(placed, kind).toBe(kind);
+      expect(
+        room.heroes.map((h) => h.kind),
+        kind,
+      ).toEqual([kind]);
+    }
+  });
+
   it("dresses the room's props clear of the forced hero's blocker", () => {
     const { room } = roomWithForcedHero(CANNED_WORKSHOP, "turret");
     const hero = room.heroes[0];

@@ -363,9 +363,11 @@ const LEDGE_FRONT_H1 = 0.89;
 const LEDGE_FRONT = 0.3;
 
 /**
- * The name on the bank's top plate. The one approved exception to the
- * rule that no name from a film or game appears in this code: this string
- * only, nowhere else, and every identifier and test round it stays generic.
+ * The name on the bank's top plate: one of the three approved exceptions
+ * to the rule that no name or marking from a film, comic or game appears
+ * in this code (with the block's mark and the police box's sign, C12 of
+ * the 2.6c plan). This string only, and every identifier and test round
+ * it stays generic.
  */
 const CORE_NAMEPLATE = "W.O.P.R.";
 

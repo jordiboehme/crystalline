@@ -358,7 +358,18 @@ export type HeroKind =
   | "tube-bench"
   | "field-pack"
   | "arcade-cabinet"
-  | "recruit-cabinet";
+  | "recruit-cabinet"
+  | "stone-hand"
+  | "question-block"
+  | "mech-head"
+  | "red-bike"
+  | "hoverboard"
+  | "flying-cloud"
+  | "spider-tank"
+  | "garden-robot"
+  | "moon-rocket"
+  | "thunder-hammer"
+  | "police-box";
 
 /**
  * Where a hero kind stands (H8): flush on one or two hall wall edges

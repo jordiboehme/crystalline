@@ -11,6 +11,7 @@ import {
   type V3,
 } from "./geometry";
 import { createKit, frameForSlot } from "./kit";
+import { LAYER } from "./layers";
 import {
   GLOWING,
   floatingGlow,
@@ -253,5 +254,30 @@ describe("looseParts", () => {
       points: [],
     };
     expect(looseParts([held, empty], null)).toEqual([]);
+  });
+});
+
+/** A recorded box part from h0 to h1 over a 0.2 m square at the origin. */
+function slab(h0: number, h1: number): Part {
+  const pts: V3[] = [];
+  for (const x of [0, 0.2])
+    for (const z of [0, 0.2]) for (const y of [h0, h1]) pts.push([x, y, z]);
+  return {
+    builder: {},
+    method: "box",
+    layer: LAYER.panel,
+    flag: 0,
+    tint: null,
+    points: pts,
+  };
+}
+
+describe("looseParts' floor", () => {
+  it("holds a part resting at the floor it is given and lets a part above it float", () => {
+    // Mutation caught: `floor` ignored (the hovering part is loose at 0),
+    // or every part held whatever its height.
+    expect(looseParts([slab(2.3, 2.9)], null, 2.3)).toEqual([]);
+    expect(looseParts([slab(2.3, 2.9)], null)).toEqual(["0:box"]);
+    expect(looseParts([slab(2.5, 2.9)], null, 2.3)).toEqual(["0:box"]);
   });
 });

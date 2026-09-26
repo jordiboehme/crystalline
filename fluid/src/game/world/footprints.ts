@@ -5,7 +5,10 @@
  * The things are fixtures, decor, floor props and the hero props
  * (`FOOTPRINTS.hero`, `heroFootprint`, `heroBlocker`), whose sizes stand
  * apart from the floor props' so `MAX_FLOOR_PROP` stays true of every
- * floor prop kind (H2).
+ * floor prop kind (H2). The three hovering heroes' lifts (`HERO_LIFT`,
+ * `heroLift`, C4) live here too, since collision reads them: a hero lifted
+ * to `HERO_WALK_UNDER` or more hangs over the player's head and does not
+ * block.
  *
  * It also holds the one local-to-world transform (`turnedPoint`, C4, and
  * `turnedBox` over it) that the hero helpers and the curios' host surfaces
@@ -242,6 +245,17 @@ export const FOOTPRINTS: Footprints = {
       { width: 0.8, depth: 0.9 },
     ],
     "recruit-cabinet": [{ width: 1.0, depth: 1.2 }],
+    "stone-hand": [{ width: 0.9, depth: 0.9 }],
+    "question-block": [{ width: 0.6, depth: 0.6 }],
+    "mech-head": [{ width: 1.6, depth: 2.0 }],
+    "red-bike": [{ width: 3.0, depth: 1.0 }],
+    hoverboard: [{ width: 0.9, depth: 0.25 }],
+    "flying-cloud": [{ width: 1.0, depth: 1.9 }],
+    "spider-tank": [{ width: 2.4, depth: 3.5 }],
+    "garden-robot": [{ width: 1.8, depth: 1.5 }],
+    "moon-rocket": [{ width: 1.4, depth: 1.4 }],
+    "thunder-hammer": [{ width: 0.8, depth: 0.8 }],
+    "police-box": [{ width: 1.3, depth: 1.3 }],
   },
 };
 
@@ -377,7 +391,48 @@ export const HERO_FOOTING = {
   "field-pack": "free",
   "arcade-cabinet": "backed",
   "recruit-cabinet": "backed",
+  "stone-hand": "free",
+  "question-block": "free",
+  "mech-head": "free",
+  "red-bike": "free",
+  hoverboard: "free",
+  "flying-cloud": "free",
+  "spider-tank": "free",
+  "garden-robot": "free",
+  "moon-rocket": "free",
+  "thunder-hammer": "free",
+  "police-box": "backed",
 } as const satisfies Record<HeroKind, "flush" | "backed" | "free">;
+
+/**
+ * The heroes that hover (C4): each one's underside, in metres above the
+ * floor. Its mesh is built at that height (the instance still stands at
+ * `y` 0), the model test's float check starts from it (`looseParts`'
+ * `floor`), and its lowest vertex is exactly this height. These three
+ * are the only exceptions to the float check, and `heroes.test.ts` names
+ * them, so a fourth is a conscious change.
+ */
+export const HERO_LIFT = {
+  "question-block": 2.3,
+  hoverboard: 0.25,
+  "flying-cloud": 0.4,
+} as const satisfies Partial<Record<HeroKind, number>>;
+
+/** A hero kind that hovers. */
+export type LiftedHeroKind = keyof typeof HERO_LIFT;
+
+/** A hero kind's lift (`HERO_LIFT`), 0 for every kind that stands on the floor. */
+export function heroLift(kind: HeroKind): number {
+  return (HERO_LIFT as Partial<Record<HeroKind, number>>)[kind] ?? 0;
+}
+
+/**
+ * The lift from which a hero hangs over a walking player's head and
+ * stops blocking (C5), in metres: well over the eye (1.6 m) and a head.
+ * Only the question block (2.3) reaches it; the hoverboard and the cloud
+ * block by their footprint.
+ */
+export const HERO_WALK_UNDER = 2.0;
 
 /**
  * The way a thing at each quarter turn faces, as `[x, z]`: north at turn 0,
@@ -493,9 +548,15 @@ export function heroFootprint(h: Hero, depth?: number): Box {
   return { x0, x1, z0, z1 };
 }
 
-/** What the player collides with: `heroFootprint`, or null for a flush hero. */
+/**
+ * What the player collides with: `heroFootprint`, or null for a flush
+ * hero and for one that hovers over the player's head (`heroLift` at
+ * least `HERO_WALK_UNDER`, C5).
+ */
 export function heroBlocker(h: Hero): Box | null {
-  return HERO_FOOTING[h.kind] === "flush" ? null : heroFootprint(h);
+  if (HERO_FOOTING[h.kind] === "flush") return null;
+  if (heroLift(h.kind) >= HERO_WALK_UNDER) return null;
+  return heroFootprint(h);
 }
 
 /** The longest pipe run, in metres. */

@@ -937,8 +937,9 @@ describe("density measure", () => {
 
   it("raises the canned hub to at least 13 floor props per 100 floor cells in every archetype", () => {
     // Baseline 2.1 to 2.4, 7.7 to 8.9 before the clusters grew; 15.77 to
-    // 17.19 (E9). The hub's seed draws no hero; reseeded with the heroes
-    // they draw, the clean hub's lowest is 14.77 (2.6a).
+    // 17.19 (E9), 15.63 to 17.05 with the hoverboard the hub's own seed
+    // draws (2.6c); reseeded with the heroes they draw, the clean hub's
+    // lowest is 14.77 (2.6a).
     for (const { name, condition, room } of HUBS)
       if (condition === "clean")
         expect(measureDensity(room).floorPer100, name).toBeGreaterThanOrEqual(
@@ -1289,9 +1290,10 @@ describe("the cap (Review Focus 4)", () => {
   });
 
   it("keeps the canned hub's candidates at or under PROP_CAP in every archetype and condition", () => {
-    // D8: the cap never drops a hub's ceiling tier. 212 to 249; the hub's
-    // seed draws no hero, and over about 1000 reseeds that do, a hero only
-    // ever removed candidates (at most 10), never added one (2.6a).
+    // D8: the cap never drops a hub's ceiling tier. 211 to 246 with the
+    // hoverboard the hub's own seed draws (2.6c); over about 1000 reseeds
+    // that draw a hero, a hero only ever removed candidates (at most 10),
+    // never added one (2.6a).
     for (const { name, room } of HUBS)
       expect(dressCandidates(room).length, name).toBeLessThanOrEqual(PROP_CAP);
   });

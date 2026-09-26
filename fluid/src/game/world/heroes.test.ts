@@ -6,38 +6,50 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { seedFor } from "../core/seed";
+import { createRng, seedFor } from "../core/seed";
+import { roomWithForcedHero } from "../dev/demo";
 import { frameAt, turnPoint } from "../render/kit";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import { dressCandidates, dressRoom } from "./dress";
 import {
   FOOTPRINTS,
   HERO_FOOTING,
+  HERO_LIFT,
+  HERO_WALK_UNDER,
   footprint,
   heroBlocker,
   heroFootprint,
+  heroLift,
+  pipeRunBox,
   propFootprint,
 } from "./footprints";
 import { generateRoom } from "./generate";
 import {
+  ANY_POOL,
+  BLOCK_SHARE,
   HERO_CATALOGUE,
+  HERO_CEILING_GAP,
   HERO_CLEAR,
   HERO_KINDS,
+  HERO_MIN_CEILING,
   HERO_POOLS,
   HERO_SHARE,
   HERO_USE_OUT,
   HERO_VIEW,
   HERO_WALL_TOP,
+  LOWEST_CEILING,
   SLAB_SHARE,
   SLAB_TOP,
   TURRET_SHARE,
   heroCap,
   heroDraws,
   heroEdges,
+  heroMinCeiling,
   heroPoint,
   heroReserve,
   heroSurfaces,
   heroUsePoint,
+  isTallHero,
   placeHeroes,
   type HeroDraws,
 } from "./heroes";
@@ -53,7 +65,9 @@ import {
 import {
   dressingSites,
   edgeKey,
+  edgeOf,
   fitsFloor,
+  grow,
   interiorBand,
   overlaps,
   wallAnchor,
@@ -91,7 +105,7 @@ function heroAt(kind: HeroKind, variant: number, side: Side = "s"): Hero {
 describe("the hero catalogue", () => {
   it("lists every kind once, with a size per variant and a footing that matches its placement", () => {
     expect(new Set(HERO_KINDS).size).toBe(HERO_KINDS.length);
-    expect(HERO_KINDS).toHaveLength(16);
+    expect(HERO_KINDS).toHaveLength(27);
     const footing = {
       wall: "flush",
       backed: "backed",
@@ -107,19 +121,59 @@ describe("the hero catalogue", () => {
     }
   });
 
-  it("keeps every hero under its height band", () => {
+  it("keeps every hero under its lowest ceiling less the gap, and names the tall ones", () => {
+    // Mutation caught: a tall kind added without a ceiling entry, or the
+    // robot's entry dropped, or a wall hero over the wall band.
     for (const kind of HERO_KINDS) {
       const e = HERO_CATALOGUE[kind];
-      if (kind === "black-slab") expect(e.top).toBe(SLAB_TOP);
-      else if (e.placement === "wall")
+      expect(e.top + HERO_CEILING_GAP, kind).toBeLessThanOrEqual(
+        heroMinCeiling(kind) + 1e-9,
+      );
+      if (e.placement === "wall")
         expect(e.top, kind).toBeLessThanOrEqual(HERO_WALL_TOP);
-      else expect(e.top, kind).toBeLessThanOrEqual(2.2);
     }
-    expect(SLAB_TOP).toBeLessThanOrEqual(3.0 - 0.05);
+    expect(HERO_KINDS.filter(isTallHero).sort()).toEqual([
+      "black-slab",
+      "garden-robot",
+      "moon-rocket",
+      "police-box",
+      "question-block",
+      "spider-tank",
+    ]);
+    expect(HERO_MIN_CEILING).toEqual({ "garden-robot": 3.7 });
+    expect(generateRoom({ ...CANNED_WORKSHOP, salience: 0 }).ceiling).toBe(
+      LOWEST_CEILING,
+    );
+    expect(HERO_CATALOGUE["black-slab"].top).toBe(SLAB_TOP);
     const slab = FOOTPRINTS.hero["black-slab"][0];
     if (slab === undefined) throw new Error("no slab size");
     expect(slab.width / slab.depth).toBeCloseTo(4);
     expect(SLAB_TOP / slab.depth).toBeCloseTo(9);
+  });
+
+  it("stands a tall hero only in the band, at the centre or backed against a wall (C6)", () => {
+    // Mutation caught: the police box made a corner hero, where ceiling
+    // props hang through its roof.
+    for (const kind of HERO_KINDS.filter(isTallHero))
+      expect(["band", "centre", "backed"], kind).toContain(
+        HERO_CATALOGUE[kind].placement,
+      );
+  });
+
+  it("names exactly three floating heroes and their lifts (C4)", () => {
+    expect(HERO_LIFT).toEqual({
+      "question-block": 2.3,
+      hoverboard: 0.25,
+      "flying-cloud": 0.4,
+    });
+    for (const kind of HERO_KINDS)
+      expect(heroLift(kind), kind).toBe(
+        (HERO_LIFT as Partial<Record<HeroKind, number>>)[kind] ?? 0,
+      );
+    // Only the block floats over a walking player's head.
+    expect(HERO_KINDS.filter((k) => heroLift(k) >= HERO_WALK_UNDER)).toEqual([
+      "question-block",
+    ]);
   });
 
   it("keeps flush heroes within the wall band and inside their edges", () => {
@@ -135,52 +189,88 @@ describe("the hero catalogue", () => {
     }
   });
 
-  it("draws pools from each archetype's own kinds, never the turret or the slab", () => {
+  it("draws pools from each archetype's own kinds; the slab, turret, block and any-archetype kinds apart", () => {
+    const apart = new Set<HeroKind>([
+      "turret",
+      "black-slab",
+      "question-block",
+      ...ANY_POOL.map(([k]) => k),
+    ]);
     const pooled = new Set<HeroKind>();
     for (const a of ARCHETYPES) {
       const kinds = HERO_POOLS[a].map(([k]) => k);
       expect(new Set(kinds).size, a).toBe(kinds.length);
       expect(kinds, a).toContain("arcade-cabinet");
       expect(kinds, a).toContain("recruit-cabinet");
+      // Catalogue order is part of the seeded result.
+      expect(kinds, a).toEqual(
+        [...kinds].sort(
+          (x, y) => HERO_KINDS.indexOf(x) - HERO_KINDS.indexOf(y),
+        ),
+      );
       for (const [k, w] of HERO_POOLS[a]) {
         expect(w, `${a} ${k}`).toBeGreaterThan(0);
+        expect(apart.has(k), `${a} ${k}`).toBe(false);
         pooled.add(k);
       }
     }
-    expect(pooled.has("turret")).toBe(false);
-    expect(pooled.has("black-slab")).toBe(false);
-    expect([...pooled].sort()).toEqual(
-      HERO_KINDS.filter((k) => k !== "turret" && k !== "black-slab").sort(),
-    );
+    expect([...pooled, ...apart].sort()).toEqual([...HERO_KINDS].sort());
+    expect(ANY_POOL.map(([k]) => k)).toEqual([
+      "hoverboard",
+      "flying-cloud",
+      "moon-rocket",
+      "thunder-hammer",
+      "police-box",
+    ]);
+    expect(HERO_POOLS.engineering.slice(-3)).toEqual([
+      ["mech-head", 1],
+      ["red-bike", 1],
+      ["spider-tank", 1],
+    ]);
+    expect(HERO_POOLS.archive.at(-1)).toEqual(["stone-hand", 1]);
+    expect(HERO_POOLS.lab.slice(-2)).toEqual([
+      ["stone-hand", 1],
+      ["garden-robot", 1],
+    ]);
   });
 
-  it("keeps a use point only on the cabinets, in front of the box and inside the reserve", () => {
-    // The reserve is the box grown by HERO_CLEAR, so a point HERO_USE_OUT in
-    // front of the face lies inside it; checked against heroReserve below.
+  it("keeps a use point only where a later spec needs one, inside the reserve", () => {
+    // In front of the face for the cabinets, the hammer and the police box;
+    // under the middle for the block (C15). Mutation caught: a use point
+    // dropped, moved into the box, or added to another kind.
+    const FRONT = [
+      "arcade-cabinet",
+      "recruit-cabinet",
+      "thunder-hammer",
+      "police-box",
+    ];
     for (const kind of HERO_KINDS) {
       const use = HERO_CATALOGUE[kind].use;
-      if (kind !== "arcade-cabinet" && kind !== "recruit-cabinet") {
+      if (!FRONT.includes(kind) && kind !== "question-block") {
         expect(use, kind).toBeNull();
         continue;
       }
       if (use === null) throw new Error(kind);
       const h = heroAt(kind, 0, "s");
       const box = heroFootprint(h);
-      // At turn 0 (a south wall) the local d runs north, towards smaller z.
-      const x = h.x * CELL + use.a;
-      const z = h.y * CELL - use.d;
-      expect(x, kind).toBeGreaterThan(box.x0);
-      expect(x, kind).toBeLessThan(box.x1);
-      expect(box.z0 - z, kind).toBeCloseTo(HERO_USE_OUT);
-      expect(HERO_USE_OUT).toBeGreaterThan(0.35);
-      expect(HERO_USE_OUT).toBeLessThan(HERO_CLEAR);
+      const p = heroUsePoint(h);
+      if (p === null) throw new Error(kind);
+      if (kind === "question-block") {
+        expect(p.x).toBeCloseTo((box.x0 + box.x1) / 2);
+        expect(p.z).toBeCloseTo((box.z0 + box.z1) / 2);
+      } else {
+        // At turn 0 the local d runs north, towards smaller z.
+        expect(p.x, kind).toBeGreaterThan(box.x0);
+        expect(p.x, kind).toBeLessThan(box.x1);
+        expect(box.z0 - p.z, kind).toBeCloseTo(HERO_USE_OUT);
+      }
       const reserve = heroReserve([h]).boxes[0];
       if (reserve === undefined) throw new Error(kind);
-      expect(x, kind).toBeGreaterThan(reserve.x0);
-      expect(x, kind).toBeLessThan(reserve.x1);
-      expect(z, kind).toBeGreaterThan(reserve.z0);
-      expect(z, kind).toBeLessThan(reserve.z1);
+      expect(p.x > reserve.x0 && p.x < reserve.x1, kind).toBe(true);
+      expect(p.z > reserve.z0 && p.z < reserve.z1, kind).toBe(true);
     }
+    expect(HERO_USE_OUT).toBeGreaterThan(0.35);
+    expect(HERO_USE_OUT).toBeLessThan(HERO_CLEAR);
   });
 
   it("allows two heroes only in halls of 16 by 16 cells or more", () => {
@@ -287,7 +377,9 @@ describe("hero local terms against the kit's frame", () => {
         checked++;
       }
     }
-    expect(checked).toBe(8);
+    // Five kinds with a use point (the two cabinets, the block, the
+    // hammer and the police box), at four turns.
+    expect(checked).toBe(20);
   });
 });
 
@@ -369,12 +461,14 @@ describe("hero footprints", () => {
     expect((b.z0 + b.z1) / 2).toBeCloseTo(3 * CELL);
   });
 
-  it("blocks with every hero but the flush ones", () => {
+  it("blocks with every hero but the flush ones and the block over the player's head", () => {
     for (const kind of HERO_KINDS) {
       const h = heroAt(kind, 0);
-      if (HERO_FOOTING[kind] === "flush")
-        expect(heroBlocker(h), kind).toBeNull();
-      else expect(heroBlocker(h), kind).toEqual(heroFootprint(h));
+      const blocks = heroBlocker(h) !== null;
+      expect(blocks, kind).toBe(
+        HERO_FOOTING[kind] !== "flush" && kind !== "question-block",
+      );
+      if (blocks) expect(heroBlocker(h)).toEqual(heroFootprint(h));
     }
   });
 
@@ -600,6 +694,24 @@ function expectHeroInvariants(
 }
 
 describe("the hero pass", () => {
+  /** The roll at the middle of `kind`'s weight in `pool`. */
+  const middleRoll = (
+    pool: readonly (readonly [HeroKind, number])[],
+    kind: HeroKind,
+  ): number => {
+    const i = pool.findIndex(([k]) => k === kind);
+    const w = pool[i]?.[1];
+    if (w === undefined) throw new Error(`${kind} is not in the pool`);
+    const before = pool.slice(0, i).reduce((s, [, x]) => s + x, 0);
+    const total = pool.reduce((s, [, x]) => s + x, 0);
+    return (before + w / 2) / total;
+  };
+  /** The any-archetype draw's roll that picks `kind` out of the full `ANY_POOL`. */
+  const forcedAnyRoll = (kind: HeroKind) => middleRoll(ANY_POOL, kind);
+  /** A pool slot's roll that picks `kind` out of `archetype`'s full pool. */
+  const forcedPoolRoll = (archetype: Archetype, kind: HeroKind) =>
+    middleRoll(HERO_POOLS[archetype], kind);
+
   it("places at most heroCap heroes, two only in halls of 16 by 16 or more", () => {
     let two = 0;
     for (const { base } of EVERY_BASE)
@@ -668,11 +780,18 @@ describe("the hero pass", () => {
 
   it("draws pool heroes from the archetype's pool only, at about HERO_SHARE per slot", () => {
     for (const { archetype, base } of WORKSHOP_BASES) {
-      const pool = new Set<HeroKind>(HERO_POOLS[archetype].map(([k]) => k));
+      // Besides the pool: the slab, the turret, the block and the
+      // any-archetype kinds, each drawn apart.
+      const pool = new Set<HeroKind>([
+        ...HERO_POOLS[archetype].map(([k]) => k),
+        "turret",
+        "black-slab",
+        "question-block",
+        ...ANY_POOL.map(([k]) => k),
+      ]);
       for (const r of reseeded(base, 200))
         for (const h of place(base, r))
-          if (h.kind !== "turret" && h.kind !== "black-slab")
-            expect(pool.has(h.kind), `${archetype} ${h.kind}`).toBe(true);
+          expect(pool.has(h.kind), `${archetype} ${h.kind}`).toBe(true);
     }
     const first = WORKSHOP_BASES[0];
     if (first === undefined) throw new Error("no workshop base");
@@ -682,6 +801,255 @@ describe("the hero pass", () => {
     expect(taken).toBeGreaterThanOrEqual(lo);
     expect(taken).toBeLessThanOrEqual(hi);
   }, 30_000);
+
+  it("draws the block in about 1 hall in 20 where the slab and turret left a slot", () => {
+    // Mutation caught: BLOCK_SHARE wrong, the block drawn on another
+    // stream, or tried after the pools. The spec's rate is pinned here
+    // too, since the binomial below reads the constant it checks.
+    expect(BLOCK_SHARE).toBe(1 / 20);
+    let eligible = 0;
+    let blocks = 0;
+    for (const { base } of WORKSHOP_BASES)
+      for (const r of reseeded(base, 200)) {
+        const d = heroDraws(r);
+        const before = place(base, r, {
+          slab: d.slab,
+          turret: d.turret,
+          picks: [],
+        });
+        if (before.length >= heroCap(r.hall)) continue;
+        eligible++;
+        if (place(base, r).some((h) => h.kind === "question-block")) blocks++;
+      }
+    const [lo, hi] = binomial(eligible, BLOCK_SHARE);
+    expect(blocks).toBeGreaterThanOrEqual(Math.max(1, lo));
+    expect(blocks).toBeLessThanOrEqual(hi);
+    // Tried before the pool slots: in a one-hero hall a drawn block takes
+    // the slot a taken pool slot would have had.
+    for (const { archetype, base } of WORKSHOP_BASES) {
+      expect(heroCap(base.hall), archetype).toBe(1);
+      expect(
+        placeHeroes(base, {
+          slab: false,
+          turret: false,
+          block: true,
+          picks: [{ take: true, roll: 0.5 }],
+        }).map((h) => h.kind),
+        archetype,
+      ).toEqual(["question-block"]);
+    }
+  }, 30_000);
+
+  it("keeps every slab and turret outcome as it was before the block's draw", () => {
+    // The block is the third value on the "draw" stream (C9). Mutation
+    // caught: the block drawn first or second, or on a stream of its own.
+    for (const { base } of WORKSHOP_BASES)
+      for (const r of reseeded(base, 200)) {
+        const rng = createRng(seedFor(r.seed, "hero", "draw"));
+        const d = heroDraws(r);
+        expect(d.slab).toBe(rng.chance(SLAB_SHARE));
+        expect(d.turret).toBe(rng.chance(TURRET_SHARE));
+        // The block is the third value on the same stream.
+        expect(d.block).toBe(rng.chance(BLOCK_SHARE));
+      }
+  });
+
+  it("fills only a slot the pools left empty with the any-archetype draw (Review Focus 3)", () => {
+    // Mutation caught: the any draw run before the pools, or ignoring the cap.
+    let added = 0;
+    for (const { base } of EVERY_BASE)
+      for (const r of reseeded(base, 200)) {
+        const d = heroDraws(r);
+        // The same draws less the any-archetype one.
+        const rest: HeroDraws = {
+          slab: d.slab,
+          turret: d.turret,
+          picks: d.picks,
+          ...(d.block === undefined ? {} : { block: d.block }),
+        };
+        const without = place(base, r, rest);
+        const withAny = place(base, r);
+        for (const h of without) expect(withAny).toContainEqual(h);
+        expect(withAny.length - without.length).toBeLessThanOrEqual(1);
+        expect(withAny.length).toBeLessThanOrEqual(heroCap(r.hall));
+        const extra = withAny.filter(
+          (h) => !without.some((o) => o.kind === h.kind),
+        );
+        for (const h of extra) {
+          expect(
+            ANY_POOL.map(([k]) => k),
+            h.kind,
+          ).toContain(h.kind);
+          added++;
+        }
+      }
+    expect(added).toBeGreaterThan(0);
+  }, 60_000);
+
+  it("lands each any-archetype kind in about 1 hall in 27 in the workshop", () => {
+    // Expected about 37 per 1000 (ANY_SHARE / 5 of the ~37 percent of halls
+    // left empty). Mutation caught: a kind that never fits, or the draw
+    // taking twice as often or never.
+    const counts = new Map<HeroKind, number>();
+    for (const { base } of WORKSHOP_BASES)
+      for (const r of reseeded(base, 200))
+        for (const h of place(base, r))
+          counts.set(h.kind, (counts.get(h.kind) ?? 0) + 1);
+    for (const [kind] of ANY_POOL) {
+      const n = counts.get(kind) ?? 0;
+      expect(n, kind).toBeGreaterThanOrEqual(12);
+      expect(n, kind).toBeLessThanOrEqual(70);
+    }
+    console.info(
+      `2.6c kinds per 1000 workshop rooms: ${JSON.stringify([...counts])}`,
+    );
+  }, 30_000);
+
+  it("stands the garden robot only under a ceiling of 3.7 m or more (Review Focus 1)", () => {
+    // Mutation caught: the gate dropped (the robot under 3.6), or the
+    // comparison turned (no robot at 3.8).
+    const lab = WORKSHOP_BASES.find((b) => b.archetype === "lab");
+    if (lab === undefined) throw new Error("no lab base");
+    const forced: HeroDraws = {
+      slab: false,
+      turret: false,
+      picks: [{ take: true, roll: forcedPoolRoll("lab", "garden-robot") }],
+    };
+    for (const ceiling of [3.0, 3.6, 3.69])
+      expect(placeHeroes({ ...lab.base, ceiling }, forced)).toEqual([]);
+    for (const ceiling of [3.7, 3.8, 5.0])
+      expect(
+        placeHeroes({ ...lab.base, ceiling }, forced).map((h) => h.kind),
+      ).toEqual(["garden-robot"]);
+    for (const salience of [null, 0, 3]) {
+      const room = generateRoom({
+        ...CANNED_WORKSHOP,
+        type: "guide",
+        salience,
+      });
+      expect(room.ceiling).toBeLessThan(3.7);
+      expect(
+        roomWithForcedHero(
+          { ...CANNED_WORKSHOP, type: "guide", salience },
+          "garden-robot",
+        ).placed,
+      ).toBeNull();
+    }
+    expect(
+      roomWithForcedHero(
+        { ...CANNED_WORKSHOP, type: "guide", salience: 4 },
+        "garden-robot",
+      ).placed,
+    ).toBe("garden-robot");
+    // Every generated hero stays under its room's ceiling less the gap.
+    for (const { base } of EVERY_BASE)
+      for (const r of reseeded(base, 100))
+        for (const h of place(base, r))
+          expect(
+            HERO_CATALOGUE[h.kind].top + HERO_CEILING_GAP,
+            h.kind,
+          ).toBeLessThanOrEqual(r.ceiling);
+  }, 30_000);
+
+  it("lets the player walk under the block and stops them at the board and the cloud (Review Focus 2)", () => {
+    // Mutation caught: the block blocking, or a floater without a blocker.
+    for (const kind of [
+      "question-block",
+      "hoverboard",
+      "flying-cloud",
+    ] as const) {
+      const { room, placed } = roomWithForcedHero(CANNED_WORKSHOP, kind);
+      expect(placed, kind).toBe(kind);
+      const h = room.heroes.find((x) => x.kind === kind);
+      if (h === undefined) throw new Error(kind);
+      const box = heroFootprint(h);
+      const blockers = blockersFor(room);
+      const has = blockers.some(
+        (b) =>
+          b.x0 === box.x0 &&
+          b.x1 === box.x1 &&
+          b.z0 === box.z0 &&
+          b.z1 === box.z1,
+      );
+      expect(has, kind).toBe(kind !== "question-block");
+      const bare = { ...room, props: [], heroes: [] };
+      const without = reachedTargets(bare, blockersFor(bare));
+      const withAll = reachedTargets(room, blockers);
+      for (const t of without)
+        expect(withAll.has(t), `${kind} ${t}`).toBe(true);
+      expect(
+        dressingSites(room).lanes.some((l) => overlaps(box, l)),
+        kind,
+      ).toBe(false);
+    }
+  });
+
+  it("keeps tall heroes off pipe runs, spans and the ceiling band (Review Focus 4)", () => {
+    // Mutation caught: isTallHero's pipe-run clause dropped (the tank or the
+    // rocket lands under an engineering pipe run), or the police box's edge
+    // not reserved.
+    const eng = [...WORKSHOP_BASES, ...HUB_BASES].filter(
+      (b) => b.archetype === "engineering",
+    );
+    let seen = 0;
+    for (const { base } of eng) {
+      const low = { ...base, ceiling: LOWEST_CEILING };
+      const pipes = low.decor
+        .map((d) => pipeRunBox(d, low.hall))
+        .filter((b) => b !== null);
+      expect(pipes.length).toBeGreaterThan(0);
+      for (const kind of HERO_KINDS.filter(isTallHero)) {
+        if (kind === "black-slab" || kind === "garden-robot") continue;
+        for (const r of reseeded(low, 40)) {
+          const draws: HeroDraws =
+            kind === "question-block"
+              ? { slab: false, turret: false, block: true, picks: [] }
+              : ANY_POOL.some(([k]) => k === kind)
+                ? {
+                    slab: false,
+                    turret: false,
+                    picks: [],
+                    any: { take: true, roll: forcedAnyRoll(kind) },
+                  }
+                : {
+                    slab: false,
+                    turret: false,
+                    picks: [
+                      {
+                        take: true,
+                        roll: forcedPoolRoll("engineering", kind),
+                      },
+                    ],
+                  };
+          const heroes = place(base, r, draws);
+          const room = withHeroes(r, heroes);
+          for (const h of heroes) {
+            seen++;
+            const moat = grow(heroFootprint(h), HERO_CLEAR);
+            for (const p of pipes)
+              expect(overlaps(moat, p), h.kind).toBe(false);
+            expect(
+              HERO_CATALOGUE[h.kind].top + HERO_CEILING_GAP,
+            ).toBeLessThanOrEqual(r.ceiling);
+            // Span lines are not edge-anchored; H4 already keeps them off
+            // every reserved box, and dress.test.ts pins that.
+            const edges = new Set(heroEdges(h).map(edgeKey));
+            for (const p of room.props)
+              if (
+                p.anchor !== "floor" &&
+                p.kind !== "span-duct" &&
+                p.kind !== "span-tray"
+              )
+                expect(
+                  edges.has(edgeKey(edgeOf(p))),
+                  `${h.kind} ${p.kind}`,
+                ).toBe(false);
+          }
+        }
+      }
+    }
+    expect(seen).toBeGreaterThan(50);
+  }, 60_000);
 
   it("keeps every hero in its hall, on its floor, out of every lane, its moat clear of every taken box and every other hero", () => {
     for (const { archetype, base } of EVERY_BASE)
@@ -785,8 +1153,9 @@ describe("the hero pass", () => {
     }, 30_000);
 
   it("gives the same heroes whatever order the lists come in", () => {
-    // The canned hub and workshop draw no hero at their own seeds, so the
-    // lists are reversed on reseeds, and some of those must carry heroes.
+    // The canned workshop draws no hero at its own seed and the hub only
+    // the hoverboard, so the lists are reversed on reseeds, and some of
+    // those must carry heroes.
     let placed = 0;
     for (const { base } of [...HUB_BASES, ...WORKSHOP_BASES])
       for (const r of reseeded(base, 20)) {

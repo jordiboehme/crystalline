@@ -33,8 +33,8 @@
  * What a hero reserves does keep props off, so it can only lower the
  * numbers: measured with the hero pass (2.6a), the seeds give 15.58 floor
  * props per 100 floor cells (15.97 with every hero taken out; 190 of the
- * 300 carry one), and the canned hub, whose seed draws no hero, 15.77 to
- * 17.19 clean.
+ * 300 carry one), and the canned hub, whose own seed draws the hoverboard
+ * (2.6c), 15.63 to 17.05 clean.
  *
  * This is the generator side: it imports only `props.ts`, `sites.ts`,
  * `layout.ts` and `types.ts`, and never `move.ts` or `render/`.

@@ -396,7 +396,14 @@ describe("walking on the grid", () => {
       anchor: "ceiling",
       seed: 3,
     };
-    const bare: RoomSpec = { ...room, fixtures: [], decor: [], props: [] };
+    // No heroes either: the canned bridge's own flying cloud blocks too.
+    const bare: RoomSpec = {
+      ...room,
+      fixtures: [],
+      decor: [],
+      props: [],
+      heroes: [],
+    };
     const dressed: RoomSpec = { ...bare, props: [crate, vent, beacon] };
     const box = propFootprint(crate);
     if (box === null) throw new Error("a crate stands on the floor");

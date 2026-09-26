@@ -12,7 +12,10 @@
  * a prop band. A `free` hero is built centred on the origin; a
  * wall-anchored one (flush or backed) from the wall point outward along
  * `d`, its back on the wall at `d = 0`. `heroHalf` gives both in the
- * recipe's local terms, so no recipe repeats a catalogue number.
+ * recipe's local terms, so no recipe repeats a catalogue number. A
+ * hovering hero (`heroLift`, C4) is built at its hover height: the
+ * instance still stands at `y` 0, and the mesh's lowest vertex is the
+ * lift.
  *
  * A hero's lights: a steady one uses `s.signal(tint)` (or `s.glow(tint)`
  * for a screen that carries the panel texture), a blinking one
@@ -25,7 +28,7 @@
  * import cycle through the dispatcher.
  */
 
-import { FOOTPRINTS, HERO_FOOTING } from "../../../world/footprints";
+import { FOOTPRINTS, HERO_FOOTING, heroLift } from "../../../world/footprints";
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import type { HeroKind } from "../../../world/types";
 import type { BlinkBank } from "../../blink";
@@ -72,7 +75,7 @@ export type HeroRecipe = (r: {
   kind: HeroKind;
 }) => void;
 
-/** Each hero kind's blink bank (the table in Task 3 of the plan). */
+/** Each hero kind's blink bank (the tables in the 2.6a plan's Task 3 and the 2.6c plan's C13). */
 export const HERO_BANK = {
   turret: "breathe",
   "black-slab": "steady",
@@ -90,19 +93,32 @@ export const HERO_BANK = {
   "field-pack": "chase",
   "arcade-cabinet": "swap",
   "recruit-cabinet": "swap",
+  "stone-hand": "steady",
+  "question-block": "breathe",
+  "mech-head": "breathe",
+  "red-bike": "breathe",
+  hoverboard: "steady",
+  "flying-cloud": "steady",
+  "spider-tank": "breathe",
+  "garden-robot": "breathe",
+  "moon-rocket": "steady",
+  "thunder-hammer": "steady",
+  "police-box": "breathe",
 } as const satisfies Record<HeroKind, BlinkBank>;
 
 /**
  * A hero's half width and its depth range in the recipe's local terms:
  * `a` from `-hw` to `hw`; `d` from `d0` to `d1`, which is `-depth / 2` to
  * `depth / 2` for a free footing and `0` to `depth` for a wall-anchored
- * one. Read the sizes from here, never repeat them in a recipe. Throws on
- * a variant the kind does not have.
+ * one; its `top`, and its `lift` (`heroLift`, C4: the height its
+ * underside hovers at, 0 for a kind that stands on the floor). Read the
+ * sizes from here, never repeat them in a recipe. Throws on a variant the
+ * kind does not have.
  */
 export function heroHalf(
   kind: HeroKind,
   variant: number,
-): { hw: number; d0: number; d1: number; top: number } {
+): { hw: number; d0: number; d1: number; top: number; lift: number } {
   const size = FOOTPRINTS.hero[kind][variant];
   if (size === undefined)
     throw new Error(`heroHalf: ${kind} has no variant ${String(variant)}`);
@@ -112,6 +128,7 @@ export function heroHalf(
     d0: free ? -size.depth / 2 : 0,
     d1: free ? size.depth / 2 : size.depth,
     top: HERO_CATALOGUE[kind].top,
+    lift: heroLift(kind),
   };
 }
 
@@ -132,17 +149,18 @@ const CAP_TINT: Rgb = [1.0, 0.92, 0.8];
 
 /**
  * The blockout every hero starts as (like `blockout` for props): one
- * bevelled box over its whole footprint up to its top, less 0.02 m for a
+ * bevelled box over its whole footprint from its lift (`heroHalf`'s
+ * `lift`, 0 for a kind on the floor) up to its top, less 0.02 m for a
  * kind whose bank blinks, which gets a 0.1 m blink-group-0 cap sitting on
  * the box's top in the middle, so every check (glow contact, the bank rule)
  * runs on it from the start. The cap is `CAP_SIDE` square and
  * `CAP_HEIGHT` thick, so it ends exactly at the top.
  */
 export const heroBlockout: HeroRecipe = ({ k, s, variant, kind }) => {
-  const { hw, d0, d1, top } = heroHalf(kind, variant);
+  const { hw, d0, d1, top, lift } = heroHalf(kind, variant);
   const blinks = HERO_BANK[kind] !== "steady";
   const h1 = blinks ? top - CAP_HEIGHT : top;
-  k.bevelBox(-hw, hw, d0, d1, 0, h1, BLOCKOUT_BEVEL, s.body);
+  k.bevelBox(-hw, hw, d0, d1, lift, h1, BLOCKOUT_BEVEL, s.body);
   if (!blinks) return;
   const dm = (d0 + d1) / 2;
   const c = CAP_SIDE / 2;

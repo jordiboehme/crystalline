@@ -26,9 +26,13 @@
  * still swaps the condition, rebuilding the same way.
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
- * own forced-draws path (`roomWithForcedHero`): a canned demo room draws no
- * hero on its own, so this is how the demo shows one standing in a real,
- * generated room rather than only in the hand-built hero hall. It overrides
+ * own forced-draws path (`roomWithForcedHero`): a canned demo room draws at
+ * most one hero of its own (the canned bridge a flying cloud, the hub a
+ * hoverboard, the workshop none), so this is
+ * how the demo shows any kind standing in a real, generated room rather
+ * than only in the hand-built hero hall. The question block is forced
+ * through its own draw and the five any-archetype kinds through the draw
+ * that fills a free slot, the rest through a pool slot. It overrides
  * `options.props`, since the point is to see the hero dressed into the
  * room, not undressed. A kind that finds no fitting place (its own room's
  * hall has no spot the moat rule and its placement leave clear) falls back
@@ -66,6 +70,7 @@ import {
 import { dressRoom } from "../world/dress";
 import { generateRoom } from "../world/generate";
 import {
+  ANY_POOL,
   HERO_POOLS,
   heroCap,
   placeHeroes,
@@ -89,7 +94,8 @@ const RETIRED_STATUS = "archived";
  * already holds it, else the first archetype in `HERO_POOLS`'s own order
  * that does. Every pool kind sits in at least one archetype's pool
  * (`heroes.test.ts` pins it), so this only falls back to `own` for the
- * slab and the turret, which `forcedHeroDraws` never asks it for.
+ * slab, the turret, the block and the any-archetype kinds, which
+ * `forcedHeroDraws` forces apart and never asks it for.
  */
 function poolArchetypeFor(kind: HeroKind, own: Archetype): Archetype {
   if (HERO_POOLS[own].some(([k]) => k === kind)) return own;
@@ -100,8 +106,12 @@ function poolArchetypeFor(kind: HeroKind, own: Archetype): Archetype {
 /**
  * The forced draws that make `placeHeroes` try `kind` before anything else
  * (exposing forced draws directly as `{slab, turret, picks}`), and the
- * archetype to place it under. The slab and the turret force their own
- * draw, since `placeHeroes` draws them apart from the archetype's pool.
+ * archetype to place it under. The slab, the turret and the question
+ * block force their own draw, since `placeHeroes` draws them apart from
+ * the archetype's pool; the five any-archetype kinds (`ANY_POOL`) force
+ * the any-archetype draw to take with the roll at the middle of their
+ * weight, and every pool slot to stay empty, so that draw finds its slot
+ * free.
  * Any other kind forces the first pool slot to roll exactly `kind`, the
  * same arithmetic `pickByRoll` runs, out of `poolArchetypeFor`'s pool
  * rather than `room`'s own, so `?hero=` forces a kind foreign to the shown
@@ -128,6 +138,26 @@ function forcedHeroDraws(
   if (kind === "turret") {
     return {
       draws: { slab: false, turret: true, picks },
+      archetype: room.archetype,
+    };
+  }
+  if (kind === "question-block")
+    return {
+      draws: { slab: false, turret: false, block: true, picks },
+      archetype: room.archetype,
+    };
+  const anyIndex = ANY_POOL.findIndex(([k]) => k === kind);
+  if (anyIndex !== -1) {
+    const before = ANY_POOL.slice(0, anyIndex).reduce((s, [, w]) => s + w, 0);
+    const total = ANY_POOL.reduce((s, [, w]) => s + w, 0);
+    const w = ANY_POOL[anyIndex]?.[1] ?? 0;
+    return {
+      draws: {
+        slab: false,
+        turret: false,
+        picks,
+        any: { take: true, roll: (before + w / 2) / total },
+      },
       archetype: room.archetype,
     };
   }
