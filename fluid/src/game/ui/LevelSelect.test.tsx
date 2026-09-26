@@ -4,15 +4,24 @@
  * listing that is still loading or failed.
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../../api/client";
+import { DOMAINS_QUERY_KEY, readListing } from "../../api/domains";
 import { answersFor, type Answer } from "../../test/harness";
 import { LevelSelect } from "./LevelSelect";
 import {
   LEVEL_ROWS,
   LEVELS_FAILED,
+  LEVELS_FOOTER,
   LEVELS_LOADING,
   NO_SUCH_LEVEL,
 } from "./levels";
@@ -46,7 +55,7 @@ function renderSelect(answer: Answer, current = "eng") {
     </QueryClientProvider>,
   );
   const field = screen.getByRole("textbox", { name: "Domain name" });
-  return { onJump, onClose, field };
+  return { onJump, onClose, field, client };
 }
 
 /** The names of the rows shown, top to bottom. */
@@ -80,6 +89,18 @@ describe("LevelSelect", () => {
     expect(within(options[2]!).getByText("HERE")).toBeInTheDocument();
     expect(within(options[0]!).queryByText("HERE")).toBeNull();
     expect(screen.getByText("1/3")).toBeInTheDocument();
+  });
+
+  // Final review Minor 1: the footer's double spaces collapse without
+  // `whitespace-pre`. `jsdom` has no layout engine, so a plain text-content
+  // check would pass either way; the class is what actually pins it.
+  it("keeps the footer's double spaces from collapsing", async () => {
+    renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    const footer = screen.getByText(
+      (_, element) => element?.textContent === LEVELS_FOOTER,
+    );
+    expect(footer).toHaveClass("whitespace-pre");
   });
 
   it("filters by name ignoring case, and says NO SUCH LEVEL when nothing matches", async () => {
@@ -116,14 +137,49 @@ describe("LevelSelect", () => {
     expect(onJump).toHaveBeenCalledWith("b");
   });
 
+  // Final review Minor 3: the arrow handler must step from the shown
+  // clamp (`at`), not the stored `selected`, or a background refetch that
+  // shrinks the list leaves the first arrow press looking like a no-op.
+  it("steps the selection from the shown clamp, not the stored value, after a background refetch shrinks the list", async () => {
+    const { field, client } = renderSelect(() =>
+      listing(["a", "b", "c", "d", "e"]),
+    );
+    await screen.findAllByRole("option");
+    for (let i = 0; i < 4; i++) fireEvent.keyDown(field, { key: "ArrowDown" });
+    expect(selected()).toBe("e");
+
+    // A background refetch, not the player's own filter: the query's data
+    // changes under the selection without going through `onChange`, which
+    // is the only place that resets `selected`. The stored value stays 4,
+    // clamped to "c" for display.
+    act(() => {
+      client.setQueryData(
+        DOMAINS_QUERY_KEY,
+        readListing(listing(["a", "b", "c"])),
+      );
+    });
+    await waitFor(() => {
+      expect(selected()).toBe("c");
+    });
+
+    // One ArrowUp must step from the shown "c" to "b". Stepping from the
+    // stored 4 would clamp straight back to "c" and look like nothing
+    // happened.
+    fireEvent.keyDown(field, { key: "ArrowUp" });
+    expect(selected()).toBe("b");
+  });
+
   it("jumps on a click, and a mousedown keeps the focus in the field", async () => {
-    const { field, onJump } = renderSelect(() => listing(["a", "b"]));
+    const { onJump } = renderSelect(() => listing(["a", "b"]));
     await screen.findAllByRole("option");
     const row = screen.getAllByRole("option")[1]!;
+    // The real check: a mousedown outside the field is prevented, which is
+    // what keeps the focus in a browser. `jsdom`'s `fireEvent` never moves
+    // focus on its own, so asserting `toHaveFocus()` here would hold
+    // whether or not the prevention fired.
     expect(fireEvent.mouseDown(row)).toBe(false);
     fireEvent.click(row);
     expect(onJump).toHaveBeenCalledWith("b");
-    expect(field).toHaveFocus();
   });
 
   it("closes on Esc, and not on its auto-repeat", async () => {

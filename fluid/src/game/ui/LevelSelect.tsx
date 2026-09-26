@@ -86,10 +86,10 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.key) {
         case "ArrowUp":
-          setSelected((s) => stepSelection(shown.length, s, -1));
+          setSelected(stepSelection(shown.length, at, -1));
           break;
         case "ArrowDown":
-          setSelected((s) => stepSelection(shown.length, s, 1));
+          setSelected(stepSelection(shown.length, at, 1));
           break;
         case "Enter": {
           const name = shown[at];
@@ -188,7 +188,9 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
             </ul>
           )}
         </div>
-        <div className="mt-2 text-xs text-white/60">{LEVELS_FOOTER}</div>
+        <div className="mt-2 whitespace-pre text-xs text-white/60">
+          {LEVELS_FOOTER}
+        </div>
       </div>
     </div>
   );
