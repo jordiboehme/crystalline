@@ -468,6 +468,20 @@ function resolvedLocalName(listing: DomainListing, seg: string): string | null {
  * segment the same way does this navigate at all. A segment with no
  * cache-level match costs nothing extra: the ordinary case, a wrong address a
  * fresh read would not fix, is not taxed with a request it does not need.
+ *
+ * The confirming fetch's `confirming` guard - which segment a fetch has
+ * already been sent for, so a stubborn stale value does not queue a fresh
+ * one on every unrelated re-render - is cleared once that fetch settles,
+ * whichever way it settles: a fresh read that resolves to "nothing to
+ * redirect to" clears it so a LATER change to the listing gets its own
+ * fresh try, and a REJECTED fetch (a dropped connection, a 5xx) clears it
+ * the same way rather than leaving this segment's redirect silently and
+ * permanently disabled for the rest of the session over one transient
+ * failure. Nothing here retries on its own, though: the next attempt only
+ * ever comes from the next render this effect would have run for anyway
+ * (the listing refetching for an unrelated reason, a window focus, this
+ * segment's own rename actually landing), so a fetch that keeps failing
+ * costs one request per such change, never a loop.
  */
 function useDomainNameRedirect(): void {
   const match = useMatch("/d/:domain/*");
@@ -505,6 +519,12 @@ function useDomainNameRedirect(): void {
         }
         const local = resolvedLocalName(fresh, seg);
         if (local === null) {
+          // Confirmed there is nothing to redirect to, off a fresh read -
+          // cleared rather than left set, so a LATER change to the listing
+          // (the rename this segment is waiting on actually landing, a
+          // window-focus refetch, anything) earns this segment a fresh
+          // confirming read of its own instead of being skipped forever.
+          confirming.current = null;
           return;
         }
         // The tail is copied out of the raw pathname rather than rebuilt
@@ -516,11 +536,41 @@ function useDomainNameRedirect(): void {
           `${domainRoute(local)}${tail}${location.search}${location.hash}`,
           { replace: true, state: location.state as unknown },
         );
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        // A transient failure (a dropped connection, a 5xx) must not
+        // permanently disable a legitimate redirect for the rest of the
+        // session: cleared the same way an "nothing to redirect to" answer
+        // is, so a later change to `domains.data` gets its own fresh try
+        // rather than this segment being silently given up on. Never
+        // retried from in here directly - only ever from the next render
+        // this effect would have run for anyway - so a fetch that keeps
+        // failing costs one request per change to the listing, not a loop.
+        confirming.current = null;
       });
     return () => {
       cancelled = true;
     };
-  }, [seg, pathnameBase, domains.data, location, navigate, queryClient]);
+  }, [
+    seg,
+    pathnameBase,
+    domains.data,
+    // Alongside `domains.data`, not instead of it: react-query keeps `.data`
+    // at the SAME object reference across a refetch whose answer is
+    // structurally identical to what was already cached ("structural
+    // sharing"), so a retry after a transient failure - the exact case
+    // `confirming` being cleared above exists for - could refetch
+    // successfully and still never earn this effect another run if `.data`
+    // were the only signal watched. This timestamp changes on every
+    // successful fetch regardless of whether the content did.
+    domains.dataUpdatedAt,
+    location,
+    navigate,
+    queryClient,
+  ]);
 }
 
 export function Layout() {

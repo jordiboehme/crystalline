@@ -32,7 +32,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Link,
@@ -227,23 +227,44 @@ function DomainPage({
    * read with no subscription of its own, so it costs nothing beyond this
    * one lookup and asks for no dependency array to keep in step.
    *
-   * Cleared on the way OUT rather than right after the render that showed
-   * it: this page re-renders many times over while it is up (its own other
-   * queries settling, the listing's poll, and so on), and clearing on the
-   * first of those would drop the summary before a reader - or a test
-   * merely waiting for the heading - ever caught it. The cleanup below fires
-   * once `domain` changes again or this page unmounts, which is exactly
-   * "on the way out": a later revisit or a reload of this same domain still
-   * never replays it, because by the time either happens the slot is gone.
+   * Cleared by an explicit event only, and never from an effect's cleanup:
+   * an earlier version of this cleared the slot from the cleanup half of a
+   * `useEffect` keyed on `domain`, on the theory that the cleanup would
+   * only ever run on a real domain change or a real unmount. Under
+   * `<StrictMode>` (`main.tsx` wraps the whole app in it) that theory does
+   * not hold - React's dev-only double-invoke runs setup, then cleanup,
+   * then setup again, synchronously, right after the very first mount, with
+   * no domain change and no unmount anywhere in it. That phantom cleanup
+   * fired `removeQueries` once, unconditionally, moments after the page
+   * first showed the summary; this page's own five other queries
+   * (`manifest`, `members`, `tags`, `syncStatus`, `listing`) then settle and
+   * force a re-render that reads the now-empty slot, and the summary
+   * silently disappears mid-page with no domain change of any kind.
+   *
+   * The fix: the ONLY thing that clears a domain's slot is this effect's
+   * BODY - never its cleanup, which stays absent - observing that the
+   * domain THIS RENDER shows differs from the domain the PREVIOUS render
+   * showed. `previousDomain` starts `null`, so nothing is cleared on the
+   * very first mount; StrictMode's double-invoke re-runs this same body a
+   * second time with the identical `domain`, which the guard reads as "no
+   * change" and again clears nothing. Only a genuine domain change - the
+   * reader actually navigating on - ever satisfies `prior !== domain`, and
+   * that only happens once per real transition, never as a double-invoked
+   * echo of one that already happened. A later revisit or a reload of this
+   * same domain still never replays the summary, because by the time
+   * either happens the slot for that domain was cleared the moment the
+   * reader first moved on from it.
    */
   const renamed =
     queryClient.getQueryData<RenameReport>(renameReportKey(domain)) ?? null;
-  useEffect(
-    () => () => {
-      queryClient.removeQueries({ queryKey: renameReportKey(domain) });
-    },
-    [domain, queryClient],
-  );
+  const previousDomain = useRef<string | null>(null);
+  useEffect(() => {
+    const prior = previousDomain.current;
+    if (prior !== null && prior !== domain) {
+      queryClient.removeQueries({ queryKey: renameReportKey(prior) });
+    }
+    previousDomain.current = domain;
+  }, [domain, queryClient]);
 
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,

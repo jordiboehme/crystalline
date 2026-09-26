@@ -2088,6 +2088,15 @@ describe("the domain's declared name", () => {
     expect(newEngram).toHaveAttribute("aria-disabled", "true");
     expect(newEngram).toHaveAccessibleDescription(REASON);
 
+    // The launcher itself: the same reason as every other control here,
+    // not the read-only one - a rename in progress is what is disabling it.
+    const renameLauncher = screen.getByRole("button", {
+      name: "Rename domain",
+    });
+    expect(renameLauncher).not.toBeDisabled();
+    expect(renameLauncher).toHaveAttribute("aria-disabled", "true");
+    expect(renameLauncher).toHaveAccessibleDescription(REASON);
+
     const editManifest = await screen.findByRole("link", {
       name: "Edit MANIFEST",
     });
@@ -2112,10 +2121,11 @@ describe("the domain's declared name", () => {
     expect(share).toHaveAccessibleDescription(REASON);
 
     // A click on any of them does nothing: guarded at the press, not merely
-    // painted as inert. New engram and Import archive each open a dialog
-    // when they act, and Edit MANIFEST navigates to the editor; none of the
-    // three does either.
+    // painted as inert. New engram, Import archive and the launcher each
+    // open a dialog when they act, and Edit MANIFEST navigates to the
+    // editor; none of the four does either.
     await userEvent.click(newEngram);
+    await userEvent.click(renameLauncher);
     await userEvent.click(editManifest);
     await userEvent.click(importArchive);
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -2148,6 +2158,62 @@ describe("the domain's declared name", () => {
     await new Promise((resolve) => setTimeout(resolve, 1100));
     expect(requested().filter((path) => path === "/domains").length).toBe(
       settled,
+    );
+  });
+
+  it("resumes the poll on its own once a later fetch of the listing succeeds", async () => {
+    // Answered a refusal a real one would not retry on its own (`isDecided`
+    // in `query/client.ts`), so the query settles into an error state after
+    // exactly one failed attempt rather than this app's own retry policy
+    // spending several before it gives up.
+    let mode: "ok" | "fail" = "ok";
+    serve({
+      "/domains": () => {
+        if (mode === "fail") {
+          throw new ApiProblem(422, "invalid", "temporary failure");
+        }
+        return listingOf(domainRow({ renaming: true }));
+      },
+    });
+
+    renderApp("/d/eng");
+    await screen.findByText("Renaming...");
+
+    const domainsReads = () =>
+      requested().filter((path) => path === "/domains").length;
+    const before = domainsReads();
+    mode = "fail";
+    // A window-focus refetch, standing in for whatever asks the listing
+    // again first: the query's own `refetchInterval` re-evaluates on every
+    // settle regardless of what triggered it, and a failed one turns
+    // polling off (`query.state.status === "error"`).
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(domainsReads()).toBeGreaterThan(before);
+    });
+    const afterFailure = domainsReads();
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(domainsReads()).toBe(afterFailure);
+
+    // A later fetch that succeeds - again standing in for anything that
+    // would ask, a focus refetch here - resumes the once-a-second poll on
+    // its own: nothing needed to be told to restart it, since
+    // `refetchInterval` reads `renaming: true` off this very read and
+    // schedules the next one exactly as it would have all along. Waited
+    // for two reads beyond the failure, not one: the first is the recovery
+    // fetch itself succeeding, and only the second is the interval having
+    // actually resumed and fired again on its own.
+    mode = "ok";
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(
+      () => {
+        expect(domainsReads()).toBeGreaterThan(afterFailure + 1);
+      },
+      { timeout: 3000 },
     );
   });
 
@@ -2386,5 +2452,91 @@ describe("a domain's old address", () => {
         "/d/eng-knowledge?tab=activity#section-2",
       );
     });
+  });
+
+  it("tries again after a failed confirming fetch, once the listing is asked again", async () => {
+    let call = 0;
+    const listing = () =>
+      listingOf(
+        domainRow({
+          name: "eng-knowledge",
+          canonical_name: "eng-knowledge",
+          aliases: ["old-eng"],
+          name_origin: "explicit",
+        }),
+      );
+
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () => {
+          call += 1;
+          // The second call is the redirect's own confirming `fetchQuery`,
+          // off the cache-level match the first (ordinary) read already
+          // supplied. Answered with a refusal a real one would not retry
+          // on its own (`isDecided` in `query/client.ts`), so this is one
+          // clean failed attempt rather than this app's own retry policy
+          // quietly turning it into several.
+          if (call === 2) {
+            throw new ApiProblem(422, "invalid", "temporary failure");
+          }
+          return listing();
+        },
+        "/domains/eng-knowledge/manifest": () => ({
+          domain: "eng-knowledge",
+          markdown: "# eng-knowledge",
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/engrams": () => ({
+          mode: "text",
+          total: 0,
+          page: 1,
+          limit: 50,
+          count: 0,
+          hits: [],
+        }),
+        "/vocabulary": () => ({
+          domain: "eng-knowledge",
+          tags: [],
+          categories: [],
+          relation_types: [],
+        }),
+        "/domains/eng-knowledge/members": () => ({
+          owner: null,
+          visibility: "shared",
+          members: [],
+        }),
+      }),
+    );
+
+    renderApp("/d/old-eng");
+
+    // The confirming fetch (the second read) has failed, and nothing
+    // redirects off a failure: still the not-found state for the address
+    // as typed, since "old-eng" answers to nothing under its own name.
+    await waitFor(() => {
+      expect(call).toBeGreaterThanOrEqual(2);
+    });
+    expect(
+      screen.getByRole("heading", { name: "Domain not found" }),
+    ).toBeVisible();
+
+    // A later read of the listing - a window-focus refetch here, standing
+    // in for any of the several ordinary things that would ask again - is
+    // what the failure cleared the guard for: this segment gets a fresh
+    // confirming fetch of its own rather than staying disabled for the
+    // rest of the session.
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "eng-knowledge" }),
+    ).toBeVisible();
   });
 });

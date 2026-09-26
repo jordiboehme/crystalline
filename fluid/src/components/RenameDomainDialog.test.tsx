@@ -8,10 +8,13 @@
  * app answers a 409 or a 422.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
+import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import App from "../App";
 import { ApiProblem, api } from "../api/client";
 import type { Answer } from "../test/harness";
 import {
@@ -367,6 +370,103 @@ describe("the rename dialog", () => {
     expect(
       screen.getByRole("heading", { level: 1, name: "engineering" }),
     ).toBeVisible();
+    expect(screen.getByText("Renamed from eng.")).toBeVisible();
+  });
+
+  it("keeps the rename summary through StrictMode's double-invoked effects", async () => {
+    // The same shape as the test above, wrapped in <StrictMode> - what
+    // `main.tsx` actually renders the whole app inside. StrictMode's
+    // dev-only double-invoke (setup, cleanup, setup, right after the very
+    // first mount) is exactly what broke an earlier version of the summary:
+    // its cleanup cleared the slot unconditionally, before the domain page's
+    // OTHER queries (manifest, members, tags, sync status) had even settled,
+    // so the very next of their re-renders read an already-empty slot.
+    let done = false;
+    const listing = () =>
+      done
+        ? {
+            behavior: [],
+            domains: [
+              {
+                name: "engineering",
+                kind: "file",
+                engrams: 4,
+                when_to_use: [],
+                canonical_name: "engineering",
+                aliases: ["eng"],
+                name_origin: "explicit",
+                shadowed: false,
+                renaming: false,
+              },
+            ],
+          }
+        : {
+            behavior: [],
+            domains: [
+              {
+                name: "eng",
+                kind: "file",
+                engrams: 4,
+                when_to_use: [],
+                canonical_name: "engineering",
+                aliases: [],
+                name_origin: "explicit",
+                shadowed: false,
+                renaming: false,
+              },
+            ],
+          };
+
+    serveAs("admin", {
+      "/domains": listing,
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        done = true;
+        return {
+          domain: "engineering",
+          previous: "eng",
+          local_only: false,
+          manifest_written: true,
+          manifest_draft: true,
+          rewritten: [{ domain: "ops", engrams: 2, references: 3 }],
+          left_behind: [],
+          aliases: ["eng"],
+          shadows: [],
+        };
+      },
+      ...domainFixtures("engineering"),
+    });
+
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={["/d/eng"]}>
+          <App />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+
+    const dialog = await openDialog();
+    await userEvent.type(
+      within(dialog).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    expect(screen.getByText("Renamed from eng.")).toBeVisible();
+
+    // Let this page's OTHER queries settle and force further re-renders -
+    // exactly what exposed the StrictMode bug, since none of them touch
+    // the rename summary directly. The summary must still be there once
+    // they have.
+    await screen.findByRole("heading", { name: "Members" });
     expect(screen.getByText("Renamed from eng.")).toBeVisible();
   });
 });
