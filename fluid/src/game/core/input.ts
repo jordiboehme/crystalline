@@ -22,8 +22,9 @@
  *
  * `typed` keeps a separate ordered log of the same fresh presses `pressed`
  * tracks per code, for the level cheat's word: it needs the order two
- * presses came in, which a per-code set cannot give. It leaves out the same
- * auto-repeat and modified presses `pressed` would answer false for.
+ * presses came in, which a per-code set cannot give. It leaves out
+ * auto-repeat, same as `pressed`, but also leaves out a press held with
+ * Ctrl, Cmd or Alt, which `pressed` still answers true for.
  */
 
 /** The live input state of one canvas. */
@@ -37,9 +38,11 @@ export interface Input {
    * consumes them: one per physical press (no auto-repeat), none pressed
    * with Ctrl, Cmd or Alt, and at most `TYPED_CAP`, the oldest dropped
    * first. The session reads it once per tick for the level cheat's word,
-   * which needs the order `pressed` cannot give. `clear` and `dropPresses`
-   * forget it together with the presses, so a code is in the log exactly
-   * while its press is unconsumed.
+   * which needs the order `pressed` cannot give. A code enters the log on
+   * such a press and leaves it at the next call to `typed`, which drains
+   * the whole log at once, or earlier, when `clear` or `dropPresses` empties
+   * it; unlike the edges `pressed` reads, a code here is not tied to
+   * whether its own press was read yet.
    */
   typed(): string[];
   /** The mouse movement since the last call, in pixels, while locked. */
@@ -48,9 +51,10 @@ export interface Input {
   readonly locked: boolean;
   /**
    * Forgets every held key, every unconsumed press and the mouse movement
-   * gathered so far. The session calls it when an overlay that read the
-   * keys itself (the CRT reader) closes, so a key pressed for the overlay
-   * is not replayed as a command or a step once the game has the keys back.
+   * gathered so far. The session calls it when an overlay that reads the
+   * keys itself (the CRT reader or the level select) opens or closes, so a
+   * key pressed on one side of the switch is not replayed as a command or a
+   * step on the other.
    */
   clear(): void;
   /**
