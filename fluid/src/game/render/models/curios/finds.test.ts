@@ -3,7 +3,8 @@
  * do not pin for the treasure radar, the capsule case and the reactor
  * case. Parts are found by their lighting flag and by their tint, in the
  * recipe's own local `(a, d, h)` terms. The radar blinks three to five
- * dots on its round screen, one at the centre. The capsule case stands
+ * dots on its round screen, one at the centre, each over a steady dim
+ * orange base it never shows darker than. The capsule case stands
  * five capsules of five colours in a row, and its lid stands open at the
  * back with the maker's mark on its inner face. The reactor case breathes
  * its core and its segment ring in two groups, all inside the glass
@@ -13,9 +14,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { CurioKind } from "../../../world/types";
+import type { Rgb } from "../../looks";
 import { blinkFlag, createBuilder, FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
+import { BLINK_LOW } from "../../blink";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { pixelRuns, textRows } from "../heroes/pixels";
 import { MARK_BLUE, MARKS } from "../marks";
@@ -45,6 +48,20 @@ const span = (pts: readonly V3[], i: 0 | 1 | 2) => {
   };
 };
 
+/** A colour's hue in degrees, 0 to 360: orange lies between about 15 and 50. */
+function hue([r, g, b]: Rgb): number {
+  const max = Math.max(r, g, b);
+  const c = max - Math.min(r, g, b);
+  if (c === 0) return 0;
+  const h =
+    max === r
+      ? ((g - b) / c) % 6
+      : max === g
+        ? (b - r) / c + 2
+        : (r - g) / c + 4;
+  return (h * 60 + 360) % 360;
+}
+
 describe("the finds' models", () => {
   it("blinks three to five dots on the round screen, one at its centre", () => {
     // Mutation caught: a dot off the screen, no centre dot, or the dots
@@ -66,6 +83,43 @@ describe("the finds' models", () => {
     expect(
       at.some(([a, d]) => Math.hypot(a - sa.mid, d - sd.mid) < 0.004),
     ).toBe(true);
+  });
+
+  it("sets every dot over a steady orange base it never shows darker than", () => {
+    // Mutation caught: a dot's base removed, its base not orange or not
+    // steady, or a dot whose low phase reads darker than its base.
+    const parts = recorded("treasure-radar");
+    const dots = parts.filter((p) => p.flag >= FLAG.blink);
+    expect(dots.length).toBeGreaterThan(0);
+    for (const dot of dots) {
+      const q = local(dot);
+      const [a, d, h] = [span(q, 0).mid, span(q, 1).mid, span(q, 2)];
+      const bases = parts.filter((p) => {
+        if (p.flag !== FLAG.signal || p.tint === null) return false;
+        const b = local(p);
+        return (
+          hue(p.tint) >= 15 &&
+          hue(p.tint) <= 50 &&
+          span(b, 0).lo < a &&
+          span(b, 0).hi > a &&
+          span(b, 1).lo < d &&
+          span(b, 1).hi > d &&
+          span(b, 2).lo < h.lo &&
+          span(b, 2).hi <= h.hi
+        );
+      });
+      expect(
+        bases,
+        `a base under the dot at ${a.toFixed(3)}, ${d.toFixed(3)}`,
+      ).toHaveLength(1);
+      const base = bases[0]?.tint;
+      const tint = dot.tint;
+      if (!base || !tint) throw new Error("tinted dot and base");
+      for (const i of [0, 1, 2] as const)
+        expect((tint[i] ?? 0) * BLINK_LOW).toBeGreaterThanOrEqual(
+          (base[i] ?? 0) * 0.9,
+        );
+    }
   });
 
   it("stands five capsules in a row across the tray, each in its own colour", () => {

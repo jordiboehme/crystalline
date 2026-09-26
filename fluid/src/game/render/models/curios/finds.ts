@@ -13,7 +13,9 @@
  *   by a five-by-five grid of darker green lines, and a round button on a
  *   short stem at its top edge (`-d`), like a stopwatch's crown. Four
  *   yellow-orange dots sit on grid crossings, one at the centre, and blink
- *   in groups 0 to 3 of the `status` bank; the screen is a steady
+ *   in groups 0 to 3 of the `status` bank, each on a steady dim orange
+ *   base (`s.signal`) that it never shows darker than, so a dot at the
+ *   strobe's low reads dim orange, never dark; the screen is a steady
  *   `s.glow`. No text.
  * - The capsule case is a light grey tray with a dark foam top and a small
  *   latch at its front, its lid standing open upright at the back on a
@@ -85,8 +87,19 @@ const RADAR_RIM: Rgb = [0.74, 0.75, 0.74];
 const RADAR_SCREEN: Rgb = [0.15, 0.55, 0.25];
 /** The grid lines: a darker green over the screen. */
 const RADAR_GRID: Rgb = [0.04, 0.26, 0.1];
-/** The blinking dots: yellow-orange. */
-const RADAR_DOT: Rgb = [0.9, 0.6, 0.1];
+/**
+ * A dot's steady base: a dim orange `s.signal` under each blinking dot,
+ * a little wider than the dot, so the dot never reads dark.
+ */
+const DOT_BASE: Rgb = [0.5, 0.24, 0.03];
+/**
+ * The blinking dots: about `DOT_BASE` over `BLINK_LOW` (0.15), past 1
+ * on purpose. A blink light is its tint times its gain, so at the strobe's
+ * low the dot shows its base's own dim orange, and at the flash the
+ * renderer's clamp takes it to a bright yellow-orange (red and green both
+ * at 1, blue low).
+ */
+const RADAR_DOT: Rgb = [3.4, 1.6, 0.2];
 
 /** The radar's body centre in plan, a little forward so the crown fits behind it. */
 const RADAR_D = 0.005;
@@ -100,9 +113,13 @@ const GRID_TOP = 0.0245;
 /** The grid's line spacing and width: five lines each way. */
 const GRID_STEP = 0.011;
 const GRID_W = 0.0014;
-/** A dot's side and its top. */
+/** A dot's side, its bottom (sunk in its base) and its top. */
 const DOT = 0.0065;
-const DOT_TOP = 0.0265;
+const DOT_BOTTOM = 0.025;
+const DOT_TOP = 0.0266;
+/** A dot's base: its side and its top, under the dot's top so no face is shared. */
+const DOT_BASE_SIDE = 0.0075;
+const DOT_BASE_TOP = 0.0255;
 /** The dots, `[a, d]` from the screen's centre in grid steps, the first at the centre. */
 const DOTS: readonly (readonly [number, number])[] = [
   [0, 0],
@@ -172,17 +189,28 @@ const treasureRadar: CurioRecipe = ({ k, kitAt, s }) => {
       grid,
     );
   }
-  // The dots on grid crossings, each its own status group.
+  // The dots on grid crossings, each its own status group, each on its
+  // steady dim orange base.
   const c = DOT / 2;
+  const cb = DOT_BASE_SIDE / 2;
   DOTS.forEach(([ga, gd], i) => {
     const a = ga * GRID_STEP;
     const d = RADAR_D + gd * GRID_STEP;
+    k.box(
+      a - cb,
+      a + cb,
+      d - cb,
+      d + cb,
+      SCREEN_TOP,
+      DOT_BASE_TOP,
+      s.signal(DOT_BASE),
+    );
     k.box(
       a - c,
       a + c,
       d - c,
       d + c,
-      SCREEN_TOP,
+      DOT_BOTTOM,
       DOT_TOP,
       s.blink(RADAR_DOT, i),
     );
