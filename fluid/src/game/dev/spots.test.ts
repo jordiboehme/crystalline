@@ -22,6 +22,7 @@ import {
   curioOn,
   curioSize,
   CURIO_KINDS,
+  CURIO_LIFT,
   DECOR_SURFACES,
   FIXTURE_SURFACES,
   PROP_SURFACES,
@@ -295,6 +296,30 @@ describe("spotView (C18)", () => {
       const expectedYaw = Math.atan2(player.x - cx, player.z - cz);
       expect(player.yaw, spot).toBeCloseTo(expectedYaw, 6);
     }
+  });
+
+  it("aims at the hovering drone's body, not the gap under it (2.6d C4, Review Focus 2)", () => {
+    // Mutation caught: the aim point taken from the drone's surface to its
+    // top, ignoring its lift, so the frame looks at the empty gap under it.
+    const drone = hall.curios.find((c) => c.kind === "hover-drone");
+    if (drone === undefined) throw new Error("the hall holds the drone");
+    const view = spotView(hall, "prop:hover-drone:0");
+    if (view === null) throw new Error("the drone frames");
+    // Unclamped, so the pitch says exactly where it aims.
+    expect(Math.abs(view.pitch)).toBeLessThan(MAX_PITCH);
+    const player = spawnPlayer({ ...hall, spawn: view.spawn });
+    const box = curioBox(drone);
+    const dist = Math.hypot(
+      player.x - (box.x0 + box.x1) / 2,
+      player.z - (box.z0 + box.z1) / 2,
+    );
+    const aim = EYE_HEIGHT + Math.tan(view.pitch) * dist;
+    // The body runs from its lift to its top, both from the catalogue.
+    const lo = drone.h + CURIO_LIFT["hover-drone"];
+    const hi = drone.h + curioSize(drone).top;
+    expect(aim).toBeGreaterThan(lo);
+    expect(aim).toBeLessThan(hi);
+    expect(aim).toBeCloseTo((lo + hi) / 2, 6);
   });
 
   it("frames the laptop from behind with :back", () => {
