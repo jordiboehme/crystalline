@@ -82,6 +82,26 @@ impl Engine {
             .map(str::to_string)
     }
 
+    /// Rewrite every domain spelling `source` carries by something other than
+    /// its canonical name to that canonical name, wherever the registrations
+    /// as they stand resolve the canonical back to the same domain (see
+    /// [`NameTable::normalize`]). Answers the text and how many spellings
+    /// were rewritten, `0` when none were.
+    ///
+    /// The single point every write funnels its final text through before it
+    /// is stored: a link written `[[eng-knowledge:x]]` or `[[engineering:x]]`
+    /// when `eng-knowledge` declares the canonical name `eng` (and lists
+    /// `engineering` as an alias) is stored as `[[eng:x]]`. A spelling that is
+    /// shadowed or contested is left exactly as written, since
+    /// [`NameTable::normalize`] answers `None` for it: content never gets a
+    /// spelling that points elsewhere.
+    pub(super) async fn normalize_domain_spellings(&self, source: &str) -> (String, usize) {
+        let table = self.name_table_now().await;
+        crystalline_core::relink::respell_domains(source, &|domain: &str| {
+            table.normalize(domain).map(str::to_string)
+        })
+    }
+
     /// `localize` for one caller: a spelling that resolves to a domain in
     /// `hidden` stays exactly as typed, so the ordinary unknown-domain path
     /// answers it with the caller's own words and never names the local name.

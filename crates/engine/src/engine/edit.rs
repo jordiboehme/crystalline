@@ -185,6 +185,7 @@ impl Engine {
             response["present"] = json!(live.participants);
         }
         note_unmirrored(&mut response, edited.warning);
+        note_domain_names_normalized(&mut response, edited.normalized);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
@@ -314,6 +315,7 @@ impl Engine {
                 // later, for a reason nobody watching could connect to this.
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, normalized) = self.normalize_domain_spellings(&edited).await;
                 let applied = rooms
                     .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
                     .await
@@ -323,6 +325,7 @@ impl Engine {
                 return Ok(SourceEdited {
                     warning: None,
                     live: Some(applied),
+                    normalized,
                 });
             }
         }
@@ -370,6 +373,7 @@ impl Engine {
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
             let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+            let (edited, normalized) = self.normalize_domain_spellings(&edited).await;
             if self.take_armed_failure() {
                 return Err(SourceEditFailure::before(EngineError::Internal(
                     "reindex failed (test seam)".to_string(),
@@ -386,10 +390,13 @@ impl Engine {
             return Ok(SourceEdited {
                 warning,
                 live: None,
+                normalized,
             });
         }
 
-        match source {
+        // Answered by whichever arm below runs, so the tail's `SourceEdited`
+        // reports the count whichever kind of source this write landed on.
+        let normalized = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
@@ -414,6 +421,7 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, count) = self.normalize_domain_spellings(&edited).await;
                 // The last step that can fail with the file as it was:
                 // `write_bytes` renames a sibling temp into place, and a rename
                 // either happens or does not, so a refusal here leaves the
@@ -428,6 +436,7 @@ impl Engine {
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await
                     .map_err(SourceEditFailure::after)?;
+                count
             }
             ContentSource::Virtual => {
                 let current = {
@@ -449,6 +458,7 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, count) = self.normalize_domain_spellings(&edited).await;
                 let stamp = virtual_stamp(&edited);
                 // The seam, on this arm: a token nothing can match, so the
                 // store raises its own compare-and-swap conflict and rolls the
@@ -478,8 +488,9 @@ impl Engine {
                 )
                 .await
                 .map_err(SourceEditFailure::before)?;
+                count
             }
-        }
+        };
 
         // An edit may have rewritten this domain's MANIFEST, its routing and
         // its declared name. The store locks above are all released.
@@ -495,6 +506,7 @@ impl Engine {
         Ok(SourceEdited {
             warning: None,
             live: None,
+            normalized,
         })
     }
 

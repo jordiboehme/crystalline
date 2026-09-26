@@ -5043,6 +5043,9 @@ struct SourceEdited {
     warning: Option<String>,
     /// The live document this edit composed into, when one was open.
     live: Option<crate::collab::session::LiveApplied>,
+    /// How many domain spellings the final text had rewritten to their
+    /// canonical name, `0` when none were.
+    normalized: usize,
 }
 
 /// A source edit that failed, and whether the source may already carry the new
@@ -6224,6 +6227,16 @@ fn assets_reserved_error(rel: &str) -> String {
 pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
     if let Some(text) = warning {
         receipt["draft_warning"] = json!(text);
+    }
+}
+
+/// Put the domain-spelling normalization count on a receipt, only when a
+/// write actually rewrote one: a caller reads no key at all as "nothing was
+/// respelled", the same silence [`note_unmirrored`] keeps for an ordinary
+/// write.
+pub(crate) fn note_domain_names_normalized(receipt: &mut Value, normalized: usize) {
+    if normalized > 0 {
+        receipt["domain_names_normalized"] = json!(normalized);
     }
 }
 

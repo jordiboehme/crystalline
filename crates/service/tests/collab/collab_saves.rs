@@ -960,3 +960,104 @@ async fn dispose_domain_sweeps_every_overlay_owners_room() {
     assert!(!oak.session.is_disposed(), "and oak was not swept");
     assert_eq!(sessions.session_count().await, 1);
 }
+
+// ---------------------------------------------------------------------------
+// domain name normalization (Task 18): the Fluid editor's save path is the
+// same funnel write_engram and edit_engram pass their final text through, not
+// a route around it.
+// ---------------------------------------------------------------------------
+
+/// A domain registered locally as `eng-knowledge`, whose MANIFEST declares
+/// `domain_name: eng` with the machine-local alias `engineering`, holding
+/// `alpha`, synced. Mirrors `engine_writes.rs::normalize_fixture`, trimmed to
+/// what the room save path needs; integration test crates share no helpers,
+/// so it is written fresh here rather than imported.
+async fn normalize_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("eng-knowledge");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-01-01"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.aliases = vec!["engineering".to_string()];
+    cfg.domains.insert("eng-knowledge".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+/// The room's own saver (`Engine::save_engram`, the same verb the Fluid
+/// editor's PUT reaches) normalizes a cross-domain link the same way
+/// `write_engram` and `edit_engram` do: `[[engineering:runbook]]`, spelled
+/// with the machine-local alias, lands as `[[eng:runbook]]`, the canonical
+/// name its MANIFEST declares.
+///
+/// Normalization means the receipt's checksum is of bytes the room never
+/// itself computed (the room's own text still reads `engineering`, since the
+/// rewrite happens only in the engine before the write): a second edit and
+/// save has to still succeed on the CAS the first save's receipt handed
+/// back, not fall into the external-change path over a mismatch this change
+/// introduced. Both saves are asserted `Saved` here for exactly that reason.
+#[tokio::test]
+async fn a_room_save_normalizes_a_cross_domain_link_to_the_canonical_name() {
+    let (tmp, engine, _scratch) = normalize_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let mut joined = sessions.join("eng-knowledge", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "See [[engineering:runbook]] for more.").await;
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    assert!(
+        matches!(next_control(&mut joined.rx).await, Control::Saved { .. }),
+        "the first save lands"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng-knowledge/alpha.md")).unwrap();
+    assert!(
+        on_disk.contains("[[eng:runbook]]"),
+        "the room's save normalizes the same way write_engram and edit_engram do: {on_disk}"
+    );
+
+    // A second edit and save: the room's next CAS token is the receipt's own
+    // checksum (of the normalized bytes actually on disk), not a hash the
+    // room computed over its own unnormalized text, so this still succeeds
+    // rather than reading as an external change.
+    append_line(&joined, &doc, "and a second line").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 200))
+        .await;
+    assert!(
+        matches!(next_control(&mut joined.rx).await, Control::Saved { .. }),
+        "the second save also lands, not a conflict"
+    );
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng-knowledge/alpha.md")).unwrap();
+    assert!(on_disk.contains("[[eng:runbook]]"), "{on_disk}");
+    assert!(on_disk.contains("and a second line"), "{on_disk}");
+}

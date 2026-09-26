@@ -743,3 +743,85 @@ async fn issue_92_four_drifted_engrams_are_repaired_in_place() {
     assert_eq!(f.glob(VELOG).await.len(), 4);
     assert!(f.unresolved("notes").await.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// domain name normalization (Task 18)
+// ---------------------------------------------------------------------------
+
+/// A cross-domain move rewrites references to the moved engram's OWN address,
+/// but its own text may carry a cross-domain link to some OTHER domain, spelled
+/// however the author wrote it - a spelling the move's relink pass never looks
+/// at, since that pass follows only this engram's address. It is normalized to
+/// the canonical name on the same funnel every other write's final text passes
+/// through, moved or not.
+#[tokio::test]
+async fn a_cross_domain_move_normalizes_the_moved_engrams_own_cross_domain_link() {
+    let f = Fixture::new().await;
+    // `ops` is registered locally as `ops`; its MANIFEST declares the
+    // canonical name `operations`, which nothing else claims here.
+    std::fs::write(
+        f.ops().join("MANIFEST.md"),
+        crystalline_core::manifest_template("operations", "2026-01-01"),
+    )
+    .unwrap();
+    seed(
+        f.notes(),
+        "alpha.md",
+        &engram("Alpha", "alpha", "See [[ops:runbook]] for details."),
+    );
+    f.sync().await;
+
+    f.mv("alpha", "notes", "alpha.md", Some("vault"), None)
+        .await
+        .unwrap();
+
+    let moved = f.content("vault", "alpha").await;
+    assert!(
+        moved.contains("[[operations:runbook]]"),
+        "the moved engram's own cross-domain link is normalized to the \
+         canonical name, the same as any other write's final text: {moved}"
+    );
+}
+
+/// A move's relink pass localizes the destination before it ever reaches
+/// `relink_engram`, so a referencing engram was written with the destination
+/// domain's LOCAL name - not its canonical one, when the two differ. That
+/// text passes through the same normalization funnel too.
+#[tokio::test]
+async fn a_cross_domain_move_writes_referencing_links_with_the_canonical_destination_name() {
+    let f = Fixture::new().await;
+    // `ops` is registered locally as `ops`; its MANIFEST declares the
+    // canonical name `operations`.
+    std::fs::write(
+        f.ops().join("MANIFEST.md"),
+        crystalline_core::manifest_template("operations", "2026-01-01"),
+    )
+    .unwrap();
+    seed(
+        f.notes(),
+        "alpha.md",
+        &engram("Alpha", "alpha", "the alpha body"),
+    );
+    seed(
+        f.notes(),
+        "linker.md",
+        &engram("Linker", "linker", "See [[alpha]] for details."),
+    );
+    f.sync().await;
+
+    f.mv("alpha", "notes", "alpha.md", Some("ops"), None)
+        .await
+        .unwrap();
+
+    let linker = read(f.notes(), "linker.md");
+    assert!(
+        linker.contains("[[operations:alpha]]"),
+        "the rewritten reference carries the destination's canonical name, \
+         not its local name 'ops': {linker}"
+    );
+    assert!(
+        f.unresolved("notes").await.is_empty(),
+        "and it still resolves: {:?}",
+        f.unresolved("notes").await
+    );
+}

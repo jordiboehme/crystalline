@@ -328,6 +328,11 @@ impl Engine {
             p.metadata.as_ref(),
             &p.content,
         )?;
+        // The single point this capture's text funnels through before it is
+        // stored, whichever of the three exits below takes it: a cross-domain
+        // link spelled with an alias or a non-canonical local name is written
+        // with the canonical one instead.
+        let (markdown, domain_names_normalized) = self.normalize_domain_spellings(&markdown).await;
 
         let mut receipt = json!({
             "domain": p.domain,
@@ -345,6 +350,7 @@ impl Engine {
         if !notices.is_empty() {
             receipt["notices"] = json!(notices);
         }
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
 
         // **The live arm, and it stands ahead of every arm that writes**, the
         // way the edit's does (`Engine::apply_source_edit_staged`). While a
@@ -602,8 +608,11 @@ impl Engine {
     /// The full-document counterpart of [`Engine::edit_engram`], for the HTTP
     /// PUT: the client edited the whole file, so the whole file is what lands.
     /// Nothing is rebuilt and `generated` is not touched - a save of what was
-    /// read must be byte-identical, which is the editor's fidelity contract,
-    /// and the text already carries whatever provenance its author put there.
+    /// read lands byte-identical but for one deliberate rewrite (a
+    /// cross-domain link normalized to its canonical spelling, the same
+    /// funnel every other write's final text passes through), which is the
+    /// editor's fidelity contract, and the text already carries whatever
+    /// provenance its author put there.
     ///
     /// `expected_checksum` is enforced on BOTH storage kinds. File domains get
     /// the comparison here (read, hash, compare, write), virtual domains get
@@ -702,6 +711,13 @@ impl Engine {
             return self.save_into_overlay(&view, p, &desc, &source).await;
         }
 
+        // The single point this save's text funnels through before it lands:
+        // a cross-domain link spelled with an alias or a non-canonical local
+        // name is written with the canonical one instead. The CAS token
+        // guards the version this caller read, not the bytes it is about to
+        // land, so it stays checked against `p.expected_checksum` unchanged.
+        let (content, domain_names_normalized) = self.normalize_domain_spellings(&p.content).await;
+
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
@@ -739,19 +755,19 @@ impl Engine {
                         &found,
                     )));
                 }
-                write_file(&abs, &p.content)?;
+                write_file(&abs, &content)?;
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await?;
             }
             ContentSource::Virtual => {
-                let stamp = virtual_stamp(&p.content);
+                let stamp = virtual_stamp(&content);
                 let store = self.store.lock().await;
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
                     &desc.path,
-                    &p.content,
+                    &content,
                     stamp,
                     Some(&p.expected_checksum),
                     true,
@@ -789,12 +805,14 @@ impl Engine {
         self.refresh_index_files(&desc.domain).await;
         self.nudge_embed();
 
-        Ok(json!({
+        let mut receipt = json!({
             "domain": desc.domain,
             "permalink": permalink,
             "path": desc.path,
-            "checksum": sha256_hex(p.content.as_bytes()),
-        }))
+            "checksum": sha256_hex(content.as_bytes()),
+        });
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
+        Ok(receipt)
     }
 
     /// Save a co-editing room's text into the overlay document the room is a
@@ -876,6 +894,12 @@ impl Engine {
     /// it with a view it built itself over the owner of the document the room
     /// is a room over.
     ///
+    /// A save of what was read lands byte-identical but for one deliberate
+    /// rewrite: a cross-domain link spelled with an alias or a non-canonical
+    /// local name is normalized to the canonical one before it is stored, the
+    /// same funnel every other write's final text passes through. The
+    /// receipt's `checksum` is of the bytes that actually landed.
+    ///
     /// Everything a caller must decide BEFORE this is deliberately not here:
     /// whose view it is, whether the document parses, whether the path is
     /// writable, and - for a request - whether a grant or a join routes it.
@@ -891,10 +915,11 @@ impl Engine {
         // Written directly rather than through `apply_source_edit`, and
         // that is the save's own contract rather than an omission: the
         // shared edit path stamps `generated`, and a save of what was read
-        // has to land byte-identical. The compare and the write are held
-        // apart from every other writer of the same draft by the one lock
-        // they all take, keyed on the draft's own mirror path. See
-        // `Engine::draft_lock`.
+        // has to land byte-identical but for the one normalization pass this
+        // function itself runs (see its own doc comment above). The compare
+        // and the write are held apart from every other writer of the same
+        // draft by the one lock they all take, keyed on the draft's own
+        // mirror path. See `Engine::draft_lock`.
         let lock = self.draft_lock(&desc.domain, who, &desc.path)?;
         let _guard = lock.lock().await;
         let current = view.text_at(source, desc).await?.ok_or_else(|| {
@@ -910,22 +935,24 @@ impl Engine {
                 &found,
             )));
         }
-        let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
+        let (content, domain_names_normalized) = self.normalize_domain_spellings(&p.content).await;
+        let warning = view.write(desc.domain_id, &desc.path, &content).await?;
         // Where the draft now answers, derived exactly as the row's own
         // permalink is: an author who edited the frontmatter's permalink
         // line has just moved the address, and the receipt has to say so.
-        let permalink = parse_engram(&p.content)
+        let permalink = parse_engram(&content)
             .map(|engram| {
-                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content)).permalink
+                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&content)).permalink
             })
             .unwrap_or_else(|_| desc.permalink.clone());
         let mut receipt = json!({
             "domain": desc.domain,
             "permalink": permalink,
             "path": desc.path,
-            "checksum": sha256_hex(p.content.as_bytes()),
+            "checksum": sha256_hex(content.as_bytes()),
             "draft": true,
         });
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
         // Whose draft it landed in, when that is not the caller's own. The
         // one thing a joined save has to say that an ordinary one does
         // not: somebody typing inside a colleague's draft is owed a
