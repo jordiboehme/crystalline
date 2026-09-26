@@ -14,7 +14,7 @@
 
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -2010,6 +2010,32 @@ describe("the domain's declared name", () => {
     expect(screen.getByRole("button", { name: "Rename domain" })).toBeVisible();
   });
 
+  it("keeps Rename domain inert on a read-only instance, and says why", async () => {
+    serve({}, "admin", () =>
+      meResponse({
+        user: userFixture({ role: "admin" }),
+        read_only: true,
+      }),
+    );
+
+    renderApp("/d/eng");
+
+    const trigger = await screen.findByRole("button", {
+      name: "Rename domain",
+    });
+    expect(trigger).not.toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-disabled", "true");
+    expect(trigger).toHaveAccessibleDescription(
+      "This instance is read only, so nothing here can be changed.",
+    );
+
+    await userEvent.click(trigger);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(
+      requested().some((path) => path.startsWith("/domains/eng/rename")),
+    ).toBe(false);
+  });
+
   it("hides both rename controls from a plain member of a private domain", async () => {
     serve(
       {
@@ -2037,10 +2063,13 @@ describe("the domain's declared name", () => {
     expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
   });
 
-  it("shows Renaming... and disables New engram while a rename runs", async () => {
-    serve({
-      "/domains": () => listingOf(domainRow({ renaming: true })),
-    });
+  it("shows Renaming... and disables every write control, each with the same reason", async () => {
+    serve(
+      {
+        "/domains": () => listingOf(domainRow({ renaming: true })),
+      },
+      "admin",
+    );
 
     renderApp("/d/eng");
 
@@ -2048,7 +2077,121 @@ describe("the domain's declared name", () => {
       "role",
       "status",
     );
-    expect(screen.getByRole("button", { name: "New engram" })).toBeDisabled();
+
+    const REASON = "A rename of this domain is already running.";
+
+    // New engram: `aria-disabled`, not the native attribute, the same trade
+    // every other control on this app makes - a control taken out of the tab
+    // order could never have its reason heard.
+    const newEngram = screen.getByRole("button", { name: "New engram" });
+    expect(newEngram).not.toBeDisabled();
+    expect(newEngram).toHaveAttribute("aria-disabled", "true");
+    expect(newEngram).toHaveAccessibleDescription(REASON);
+
+    const editManifest = await screen.findByRole("link", {
+      name: "Edit MANIFEST",
+    });
+    expect(editManifest).toHaveAttribute("aria-disabled", "true");
+    expect(editManifest).toHaveAccessibleDescription(REASON);
+
+    const importArchive = await screen.findByRole("button", {
+      name: "Import archive",
+    });
+    expect(importArchive).toHaveAttribute("aria-disabled", "true");
+    expect(importArchive).toHaveAccessibleDescription(REASON);
+
+    const unregister = await screen.findByRole("button", {
+      name: "Unregister domain",
+    });
+    expect(unregister).toHaveAttribute("aria-disabled", "true");
+    expect(unregister).toHaveAccessibleDescription(REASON);
+
+    // Gated on the members read landing, the way the card itself gates it.
+    const share = await screen.findByRole("button", { name: "Make private" });
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    expect(share).toHaveAccessibleDescription(REASON);
+
+    // A click on any of them does nothing: guarded at the press, not merely
+    // painted as inert. New engram and Import archive each open a dialog
+    // when they act, and Edit MANIFEST navigates to the editor; none of the
+    // three does either.
+    await userEvent.click(newEngram);
+    await userEvent.click(editManifest);
+    await userEvent.click(importArchive);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("heading", { name: /^Editing/ })).toBeNull();
+  });
+
+  it("polls only while THIS domain is renaming, and stops once it clears", async () => {
+    let renaming = true;
+    serve({
+      "/domains": () => listingOf(domainRow({ renaming })),
+    });
+
+    renderApp("/d/eng");
+    await screen.findByText("Renaming...");
+
+    const before = requested().filter((path) => path === "/domains").length;
+    renaming = false;
+    await waitFor(() => {
+      expect(
+        requested().filter((path) => path === "/domains").length,
+      ).toBeGreaterThan(before);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Renaming...")).toBeNull();
+    });
+
+    // Once it has cleared, waiting a poll interval brings no further read:
+    // the interval turned itself off rather than continuing to ask.
+    const settled = requested().filter((path) => path === "/domains").length;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(requested().filter((path) => path === "/domains").length).toBe(
+      settled,
+    );
+  });
+
+  it("offers the rename controls to a non-admin owner of a private domain", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "eng", private: true })),
+        "/domains/eng/members": () => ({
+          owner: "ada",
+          visibility: "private",
+          members: [],
+        }),
+      },
+      "editor",
+    );
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByRole("button", { name: "Rename domain" }),
+    ).toBeVisible();
+  });
+
+  it("opens the rename dialog from the shadowed banner's own action", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "knowledge", shadowed: true })),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const sentence = await screen.findByText(/^This domain calls itself/);
+    const banner = sentence.closest('[role="status"]') as HTMLElement;
+    await userEvent.click(
+      within(banner).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("dialog", { name: "Rename domain" }),
+    ).toBeVisible();
   });
 });
 
@@ -2173,5 +2316,75 @@ describe("a domain's old address", () => {
     expect(
       await screen.findByRole("heading", { name: "Domain not found" }),
     ).toBeVisible();
+  });
+
+  it("keeps the query string and the hash across the redirect", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+        "/domains/eng-knowledge/manifest": () => ({
+          domain: "eng-knowledge",
+          markdown: "# eng-knowledge",
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/engrams": () => ({
+          mode: "text",
+          total: 0,
+          page: 1,
+          limit: 50,
+          count: 0,
+          hits: [],
+        }),
+        "/vocabulary": () => ({
+          domain: "eng-knowledge",
+          tags: [],
+          categories: [],
+          relation_types: [],
+        }),
+        "/domains/eng-knowledge/members": () => ({
+          owner: null,
+          visibility: "shared",
+          members: [],
+        }),
+      }),
+    );
+
+    /** A sibling of `App`, under the same in-memory history, reading it. */
+    function LocationProbe() {
+      const location = useLocation();
+      return (
+        <div data-testid="probe">
+          {`${location.pathname}${location.search}${location.hash}`}
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/d/old-eng?tab=activity#section-2"]}>
+        <App />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("heading", { level: 1, name: "eng-knowledge" });
+    await waitFor(() => {
+      expect(screen.getByTestId("probe")).toHaveTextContent(
+        "/d/eng-knowledge?tab=activity#section-2",
+      );
+    });
   });
 });

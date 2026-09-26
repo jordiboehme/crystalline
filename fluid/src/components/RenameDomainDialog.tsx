@@ -19,31 +19,41 @@
  * own already-declared canonical name (the "shadowed" case a rename usually
  * exists to fix), that stale row still resolves the new name back to the OLD
  * one, and the redirect sends the reader straight back to the address they
- * just left.
+ * just left. So the cache is patched with what this report already says
+ * before this component navigates at all, and the navigation itself is a
+ * plain, inline call - nothing here waits or defers.
  *
- * So the cache is patched with what this report already says before this
- * component navigates at all - but the patch's own subscribers (the
- * old-address redirect included) are notified on React Query's own schedule,
- * which is not guaranteed to resolve, as a render, before this component's own
- * navigation call would otherwise run right after it: a redirect effect
+ * The report itself does NOT ride on that navigation's `location.state`,
+ * which an earlier version of this file did. The cache patch above notifies
+ * its own subscribers - the old-address redirect included - on React Query's
+ * own schedule, which is not guaranteed to resolve, as a render, before this
+ * component's own navigation call runs right after it; a redirect effect
  * reacting to that patch can still be holding a stale closure over the OLD
- * location - the segment this dialog was opened from - when it fires, and it
- * then issues its own, entirely reasonable, redirect to the very address this
- * component is about to navigate to anyway, carrying whatever state (none)
- * that OLD location held. Both calls target the same underlying history
- * entry, so whichever actually runs last decides what state survives, and a
- * plain synchronous call here cannot promise it runs after an effect React
- * has not yet flushed. Deferring this component's own navigation with a
- * `setTimeout` (rather than calling it inline) is what removes the coin flip:
- * a passive effect reacting to the patch above is scheduled long before a
- * macrotask boundary, so by the time this call actually runs, any redirect
- * the patch was going to trigger has already happened and already resolved to
- * the same address; this call is then unambiguously the last write to that
- * history entry, and its state is what lands. The background
- * `invalidateQueries` that follows is only there to true up anything the
- * optimistic patch could not know (a shadow on the new name, say); by the
- * time it resolves the reader is already on the right address, so the
- * redirect has nothing left to do with it.
+ * location (the segment this dialog was opened from) when it fires, and it
+ * then issues its own, entirely reasonable, redirect to the very address
+ * this component is about to navigate to anyway - carrying whatever state
+ * (none) that OLD location held. Both calls target the same underlying
+ * history entry, so whichever actually runs last decides what `location.state`
+ * survives, and nothing here can promise this component's own call is the
+ * one that does: a passive effect and this synchronous callback do not have
+ * a fixed relative order in general, only whatever a particular scheduler
+ * and a particular router happen to give them today. A `setTimeout` was
+ * tried here first, on the theory that deferring this component's own call
+ * would let any such effect go first and lose the race for good; it worked,
+ * but only because of a specific, undocumented ordering between two
+ * unrelated libraries' internal timer scheduling, confirmed by reading
+ * their source rather than guaranteed by either one's public contract - a
+ * future version of either could reorder it silently. So the report instead
+ * waits in the query cache, at `renameReportKey(report.domain)`
+ * (`api/admin.ts`), which is not `location.state` and so is not at stake in
+ * that race at all: whichever navigation actually lands the reader on this
+ * domain's page, `DomainHome` reads the slot for the domain it is now
+ * showing and clears it, once, the same page shows regardless of which
+ * navigation call put it there. The background `invalidateQueries` that
+ * follows is only there to true up anything the optimistic patch could not
+ * know (a shadow on the new name, say); by the time it resolves the reader
+ * is already on the right address, so the redirect has nothing left to do
+ * with it.
  *
  * Not behind a lazy import the way `CreateDomainDialog` is: that split earns
  * its keep on a control mounted on every screen for every session (the
@@ -61,7 +71,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import type { DomainListing } from "../api/domains";
 import type { RenameReport } from "../api/admin";
-import { renameDomain } from "../api/admin";
+import { renameDomain, renameReportKey } from "../api/admin";
 import { domainRoute } from "../paths";
 import { BUTTON, FIELD } from "./primitives";
 
@@ -107,15 +117,12 @@ export function RenameDomainDialog({
           };
         },
       );
+      // Set before navigating: whichever navigation actually lands the
+      // reader on this domain's page, the report is already waiting there.
+      // See the module doc above for why this is not `location.state`.
+      queryClient.setQueryData(renameReportKey(report.domain), report);
       onClose();
-      // Deferred - see the module doc above for why this must not be a
-      // plain, inline call.
-      setTimeout(() => {
-        void navigate(domainRoute(report.domain), {
-          replace: true,
-          state: { renamed: report },
-        });
-      }, 0);
+      void navigate(domainRoute(report.domain), { replace: true });
       // The full truth, in the background, for anything the patch above
       // could not know (a shadow the new name now carries, say): by the
       // time this resolves the reader is already on the right address, so

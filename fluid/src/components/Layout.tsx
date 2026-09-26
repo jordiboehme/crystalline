@@ -20,7 +20,7 @@
  * how wide what you came to read is allowed to be.
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AArrowDown,
   AArrowUp,
@@ -66,7 +66,7 @@ import {
 } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
-import type { DomainSummary } from "../api/domains";
+import type { DomainListing, DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
@@ -422,6 +422,22 @@ function useShareAction(): ShareAction {
 }
 
 /**
+ * The local name a listing resolves `seg` to, or null when there is nothing
+ * to redirect to: `seg` is already a local name, or it is not exactly one
+ * domain's canonical name or alias.
+ */
+function resolvedLocalName(listing: DomainListing, seg: string): string | null {
+  if (listing.domains.some((entry) => entry.name === seg)) {
+    return null;
+  }
+  const matches = listing.domains.filter(
+    (entry) => entry.canonicalName === seg || entry.aliases.includes(seg),
+  );
+  const [only] = matches;
+  return only !== undefined && matches.length === 1 ? only.name : null;
+}
+
+/**
  * A domain segment in the current address that used to be a domain's local
  * name here, sent to the local name it answers to now.
  *
@@ -431,7 +447,7 @@ function useShareAction(): ShareAction {
  * Read once, above every screen the pattern matches (`DomainHome`, the
  * engram screen, both editors, the graph), rather than once per screen: all
  * of them need only the listing the sidebar already fetches under the same
- * key, so this costs no request of its own.
+ * key, so the first look at it costs no request of its own.
  *
  * Waits for that listing to answer before it decides anything, and only ever
  * redirects when the segment resolves to EXACTLY one domain: zero or several
@@ -440,6 +456,18 @@ function useShareAction(): ShareAction {
  * positioned to resolve. Never on the server, and never before an authorized
  * read has landed, so a domain a caller may not see is never disclosed by a
  * redirect firing ahead of that read.
+ *
+ * A cache-level match is never enough to act on by itself, though: this
+ * client's own copy of the listing can be stale (nothing here forces a
+ * refetch on every route change), and a stale copy that still carries a
+ * domain's OLD local name as its canonical one would resolve a fresh link to
+ * that domain's NEW local name straight back to the address a rename already
+ * retired - sending the reader backward instead of forward. So a cache-level
+ * match only earns a confirming `fetchQuery` (a genuine round trip, not
+ * answered from the cache alone); only if that fresh read still resolves the
+ * segment the same way does this navigate at all. A segment with no
+ * cache-level match costs nothing extra: the ordinary case, a wrong address a
+ * fresh read would not fix, is not taxed with a request it does not need.
  */
 function useDomainNameRedirect(): void {
   const match = useMatch("/d/:domain/*");
@@ -449,33 +477,50 @@ function useDomainNameRedirect(): void {
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
   });
+  const queryClient = useQueryClient();
   const location = useLocation();
   const navigate = useNavigate();
+  // Which segment a confirming fetch has already been sent for, so a
+  // stubborn stale value sitting in `domains.data` (nothing here changes it)
+  // does not queue a fresh round trip on every unrelated re-render.
+  const confirming = useRef<string | null>(null);
 
   useEffect(() => {
     if (seg === null || pathnameBase === null || domains.data === undefined) {
       return;
     }
-    const known = domains.data.domains;
-    if (known.some((entry) => entry.name === seg)) {
+    if (confirming.current === seg) {
       return;
     }
-    const matches = known.filter(
-      (entry) => entry.canonicalName === seg || entry.aliases.includes(seg),
-    );
-    const [only] = matches;
-    if (only === undefined || matches.length !== 1) {
+    if (resolvedLocalName(domains.data, seg) === null) {
       return;
     }
-    // The tail is copied out of the raw pathname rather than rebuilt from
-    // the splat's decoded params: a permalink segment already carries its
-    // own encoding, and re-encoding a decoded value can change it.
-    const tail = location.pathname.slice(pathnameBase.length);
-    void navigate(
-      `${domainRoute(only.name)}${tail}${location.search}${location.hash}`,
-      { replace: true, state: location.state as unknown },
-    );
-  }, [seg, pathnameBase, domains.data, location, navigate]);
+    confirming.current = seg;
+    let cancelled = false;
+    void queryClient
+      .fetchQuery({ queryKey: DOMAINS_QUERY_KEY, queryFn: fetchDomains })
+      .then((fresh: DomainListing) => {
+        if (cancelled) {
+          return;
+        }
+        const local = resolvedLocalName(fresh, seg);
+        if (local === null) {
+          return;
+        }
+        // The tail is copied out of the raw pathname rather than rebuilt
+        // from the splat's decoded params: a permalink segment already
+        // carries its own encoding, and re-encoding a decoded value can
+        // change it.
+        const tail = location.pathname.slice(pathnameBase.length);
+        void navigate(
+          `${domainRoute(local)}${tail}${location.search}${location.hash}`,
+          { replace: true, state: location.state as unknown },
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [seg, pathnameBase, domains.data, location, navigate, queryClient]);
 }
 
 export function Layout() {

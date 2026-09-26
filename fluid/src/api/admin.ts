@@ -471,6 +471,22 @@ export async function renameDomain(
   };
 }
 
+/**
+ * Where a rename's own report waits for the domain page it lands on to read
+ * it once, keyed by the domain's new name.
+ *
+ * Not the navigation's own `location.state`: a screen this app's own
+ * old-address redirect might also send a competing, state-less navigation
+ * to (see `RenameDomainDialog`'s module doc) would otherwise have a real
+ * chance of winning that race and dropping the report on the floor. A slot
+ * in the query cache has no such race - whichever navigation actually lands
+ * the reader on this domain's page, the report is still sitting here for it
+ * to read and clear.
+ */
+export function renameReportKey(domain: string): readonly unknown[] {
+  return ["rename-report", domain] as const;
+}
+
 /** One comment or review left on a proposal, in the forge's own words. */
 export interface ProposalFeedback {
   /** The commenting account's login. */

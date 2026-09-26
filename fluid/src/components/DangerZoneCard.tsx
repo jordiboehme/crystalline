@@ -46,13 +46,18 @@ import {
   setVisibility,
 } from "../api/members";
 import { useAuth } from "../auth/AuthContext";
-import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
+import {
+  DestructiveAction,
+  READ_ONLY_REASON,
+  RENAMING_REASON,
+} from "./DestructiveAction";
 
 export function DangerZoneCard({
   domain,
   kind,
   confirming,
   onConfirmingChange,
+  renaming = false,
 }: {
   domain: string;
   /** `file`, `virtual`, or null when the listing did not say. */
@@ -60,6 +65,8 @@ export function DangerZoneCard({
   /** Whether the unregister confirmation is armed; the palette arms it too. */
   confirming: boolean;
   onConfirmingChange: (confirming: boolean) => void;
+  /** Whether a rename has this domain paused, which disables both controls. */
+  renaming?: boolean;
 }): ReactElement | null {
   const { user, capabilities } = useAuth();
   const navigate = useNavigate();
@@ -145,7 +152,11 @@ export function DangerZoneCard({
   // `readOnly` is a certainty this side already holds, unlike a per-domain
   // right: the control is shown shut, with the reason as its accessible
   // description, rather than removed. See `READ_ONLY_REASON` itself.
-  const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
+  const disabledReason = capabilities.readOnly
+    ? READ_ONLY_REASON
+    : renaming
+      ? RENAMING_REASON
+      : undefined;
   const visibilityLabel = isPrivate ? "Share with everyone" : "Make private";
 
   // Nothing to offer, nothing to draw: a member or a manager administers the

@@ -261,14 +261,20 @@ describe("the rename dialog", () => {
     ).not.toBeChecked();
   });
 
-  it("carries the rewritten counts and left-behind list to the renamed page, without bouncing back once the listing catches up", async () => {
+  it("carries the rewritten counts and left-behind list to the renamed page, and survives the listing's own later read turning over", async () => {
     // A domain whose MANIFEST already declares the name this rename lines
     // it up with - the "shadowed" case a rename most often fixes - so the
     // listing the reader started on already names both spellings, the way a
-    // real one would before the POST lands.
+    // real one would before the POST lands. It only turns over to the
+    // renamed shape once the POST itself has answered, matching what a real
+    // server would say from that point on: this is what the dialog's own
+    // background `invalidateQueries` reads when it lands, after the cache
+    // patch and the navigation have already run inline.
     let done = false;
-    const listing = () =>
-      done
+    let domainsReads = 0;
+    const listing = () => {
+      domainsReads += 1;
+      return done
         ? {
             behavior: [],
             domains: [
@@ -301,6 +307,7 @@ describe("the rename dialog", () => {
               },
             ],
           };
+    };
 
     serveAs("admin", {
       "/domains": listing,
@@ -308,10 +315,6 @@ describe("the rename dialog", () => {
         if (init?.method !== "POST") {
           throw new ApiProblem(404, "not found", "no stub for GET");
         }
-        // The listing only turns over once the rename itself has answered,
-        // the way the real invalidate-then-refetch does: the dialog awaits
-        // it before it navigates, so the redirect above every screen never
-        // reads the stale row.
         done = true;
         return {
           domain: "engineering",
@@ -328,8 +331,10 @@ describe("the rename dialog", () => {
       ...domainFixtures("engineering"),
     });
     renderApp("/d/eng");
+    await screen.findByRole("heading", { level: 1, name: "eng" });
 
     const dialog = await openDialog();
+    const before = domainsReads;
     await userEvent.type(
       within(dialog).getByLabelText("New name"),
       "engineering",
@@ -350,13 +355,18 @@ describe("the rename dialog", () => {
     ).toBeVisible();
     expect(screen.getByText("Links left as they were:")).toBeVisible();
     expect(screen.getByText("archive/old.md (1 reference)")).toBeVisible();
-    // Nothing sends the reader back to the old address: by the time the
-    // redirect above every screen next looks at the listing, "eng" already
-    // reads as an alias of "engineering" rather than its own local name.
+    // Not a trivial re-check of a heading `findByRole` already found: this
+    // waits for an ACTUAL later read of "/domains" to land - the dialog's
+    // own background invalidate, reading the listing the POST above turned
+    // over - and only then re-asserts. A page that quietly bounced back to
+    // "eng" once that real refetch landed would fail here; one that merely
+    // held onto its first render would not have been caught by this at all.
     await waitFor(() => {
-      expect(
-        screen.getByRole("heading", { level: 1, name: "engineering" }),
-      ).toBeVisible();
+      expect(domainsReads).toBeGreaterThan(before);
     });
+    expect(
+      screen.getByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    expect(screen.getByText("Renamed from eng.")).toBeVisible();
   });
 });

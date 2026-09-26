@@ -49,6 +49,18 @@ import { BUTTON, FIELD } from "./primitives";
 export const READ_ONLY_REASON =
   "This instance is read only, so nothing here can be changed.";
 
+/**
+ * A rename has this domain paused, so every write control on its page is
+ * shown disabled rather than removed - it is a transient certainty, not a
+ * right this side is guessing at, and it clears itself the moment the
+ * domain listing says the rename is done.
+ *
+ * Shared for the reason `READ_ONLY_REASON` is: the domain page, the danger
+ * zone and the backup card all say it, and a sentence met three times must
+ * not be able to drift into three.
+ */
+export const RENAMING_REASON = "A rename of this domain is already running.";
+
 export function DestructiveAction({
   label,
   confirmLabel,
