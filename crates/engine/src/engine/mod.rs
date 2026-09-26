@@ -1006,6 +1006,9 @@ pub struct Engine {
     // The rename test seams: a failure after one step, and a hold after one.
     #[cfg(any(test, feature = "testing"))]
     rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
+    // And a hold on the next write right after it is counted.
+    #[cfg(any(test, feature = "testing"))]
+    write_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
     #[cfg(any(test, feature = "testing"))]
     rename_hold:
         std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
@@ -1693,6 +1696,8 @@ impl Engine {
             names_frozen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             rename_fail_after: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            write_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_hold: std::sync::Mutex::new(None),
         }

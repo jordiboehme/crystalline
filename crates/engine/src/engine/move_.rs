@@ -100,6 +100,14 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
+        // A move into another domain writes there too, so it is counted there
+        // for the whole move: a rename of the destination waits for it, and a
+        // destination a rename has paused is waited for first.
+        let _dest_ticket = if cross {
+            Some(self.enter_write(&dest_domain).await?)
+        } else {
+            None
+        };
         let new_permalink = Self::moved_permalink(&src, &dest_rel, p.permalink.as_deref())?;
         let in_place = !cross && dest_rel == src.path;
         if in_place && new_permalink == src.permalink {

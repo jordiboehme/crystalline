@@ -405,18 +405,28 @@ both_backends!(
 /// the journal stays, and a new engine over the same config, state directory
 /// and store finishes it before its first sync. The new engine has no
 /// accounts resolver installed, as a daemon at startup does not.
+///
+/// Each step is crashed twice: once after the journal recorded it, and once
+/// in the real crash window, where the step's effect landed and the journal
+/// did not record it yet (the last `done` entry is dropped again), so the
+/// recovery runs that step a second time over its own result.
 async fn a_leftover_journal_is_completed_before_the_first_sync_body(store: Arc<Mutex<dyn Store>>) {
-    for step in [
+    let steps = [
         RenameStep::IndexRow,
         RenameStep::AuthTables,
         RenameStep::OriginsDir,
         RenameStep::OverlaysDir,
         RenameStep::ProvisionReceipt,
         RenameStep::Config,
-    ] {
-        // A machine per step over the one store, its names tagged with the
-        // step so the turns never meet in the shared index.
-        let m = machine_tagged(store.clone(), &format!("-{step:?}").to_lowercase()).await;
+    ];
+    for (step, unrecorded) in steps
+        .iter()
+        .flat_map(|step| [(*step, false), (*step, true)])
+    {
+        // A machine per turn over the one store, its names tagged with the
+        // turn so the turns never meet in the shared index.
+        let tag = format!("-{step:?}{}", if unrecorded { "-u" } else { "" }).to_lowercase();
+        let m = machine_tagged(store.clone(), &tag).await;
         let engine = m.engine(true).await;
         let eng_id = domain_id(&m.store, &m.eng).await.expect("eng indexed");
 
@@ -440,6 +450,14 @@ async fn a_leftover_journal_is_completed_before_the_first_sync_body(store: Arc<M
             "{step:?}: a stopped rename keeps the domain paused"
         );
         drop(engine);
+        if unrecorded {
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(m.journal()).unwrap()).unwrap();
+            let done = journal["done"].as_array_mut().unwrap();
+            assert_eq!(done.last(), Some(&serde_json::json!(step.name())));
+            done.pop();
+            std::fs::write(m.journal(), serde_json::to_vec(&journal).unwrap()).unwrap();
+        }
 
         let restarted = m.engine(false).await;
         let recovered = restarted
@@ -556,6 +574,163 @@ both_backends!(
     a_write_during_a_rename_waits_and_then_lands_in_the_new_name_body
 );
 
+/// A write already running when the rename starts is waited for: the rename
+/// does not touch the index row until the write is done, the write lands
+/// under the old name, and the rename then carries it to the new one.
+async fn a_rename_waits_for_a_write_already_running_body(store: Arc<Mutex<dyn Store>>) {
+    let m = machine(store).await;
+    let engine = m.engine(true).await;
+    let eng_id = domain_id(&m.store, "eng").await.expect("eng indexed");
+    let write_hold = engine.hold_next_write();
+
+    let writer = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .write_engram(&write_params("eng", "Beta", "written before the rename"))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), write_hold.reached())
+        .await
+        .expect("the write is counted and held");
+
+    let renamer = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .rename_domain_local(
+                    "eng",
+                    "platform",
+                    NameOrigin::Explicit,
+                    &Scope::Unrestricted,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        engine.is_renaming("eng"),
+        "the rename has paused the domain"
+    );
+    assert!(
+        !renamer.is_finished(),
+        "the rename waits for the running write"
+    );
+    assert!(!m.journal().exists(), "no step has started");
+    assert_eq!(
+        domain_id(&m.store, "eng").await,
+        Some(eng_id),
+        "the index row still has its old name"
+    );
+
+    write_hold.release();
+    let written = writer.await.unwrap().unwrap();
+    assert_eq!(
+        written["domain"], "eng",
+        "the write landed under the old name"
+    );
+    renamer.await.unwrap().unwrap();
+
+    let beta = engine
+        .read_engram(&read_params("beta", "platform"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(beta["domain"], "platform", "{beta}");
+    assert_eq!(domain_id(&m.store, "platform").await, Some(eng_id));
+    let rows = row_names(&m.store).await;
+    assert!(
+        !rows.contains(&"eng".to_string()),
+        "no row named eng: {rows:?}"
+    );
+}
+both_backends!(
+    a_rename_waits_for_a_write_already_running,
+    a_rename_waits_for_a_write_already_running_body
+);
+
+/// A move from another domain into the domain being renamed is counted in
+/// its destination too: one that passed its source's pause check before the
+/// rename started waits for the rename and is then refused, rather than
+/// registering a second row under the old name.
+async fn a_move_into_a_domain_being_renamed_never_registers_the_old_name_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    let engine = m.engine(true).await;
+    // The move is held right after its source (ops) counted it, before it
+    // reached its destination.
+    let write_hold = engine.hold_next_write();
+    let mover = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .move_engram(
+                    &MoveParams {
+                        identifier: "pager".to_string(),
+                        domain: "ops".to_string(),
+                        destination: "pager.md".to_string(),
+                        destination_domain: Some("eng".to_string()),
+                        permalink: None,
+                        update_links: None,
+                    },
+                    &Scope::Unrestricted,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), write_hold.reached())
+        .await
+        .expect("the move is counted in its source and held");
+
+    let rename_hold = engine.hold_rename_after(RenameStep::IndexRow);
+    let renamer = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .rename_domain_local(
+                    "eng",
+                    "platform",
+                    NameOrigin::Explicit,
+                    &Scope::Unrestricted,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), rename_hold.reached())
+        .await
+        .expect("the rename is past its index row step");
+
+    write_hold.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        domain_id(&m.store, "eng").await,
+        None,
+        "the move did not register the old name"
+    );
+    rename_hold.release();
+    renamer.await.unwrap().unwrap();
+    let err = mover.await.unwrap().expect_err("the move is refused");
+    assert!(
+        conflict(err).contains("was renamed while this request waited; send it again"),
+        "the refusal says to send the move again"
+    );
+    let rows = row_names(&m.store).await;
+    assert!(
+        !rows.contains(&"eng".to_string()),
+        "no row named eng: {rows:?}"
+    );
+    let pager = engine
+        .read_engram(&read_params("pager", "ops"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(pager["domain"], "ops", "the engram stayed where it was");
+}
+both_backends!(
+    a_move_into_a_domain_being_renamed_never_registers_the_old_name,
+    a_move_into_a_domain_being_renamed_never_registers_the_old_name_body
+);
+
 fn conflict(err: EngineError) -> String {
     match err {
         EngineError::Conflict(msg) => msg,
@@ -586,7 +761,10 @@ async fn refusals_name_the_next_step_body(store: Arc<Mutex<dyn Store>>) {
         .await
         .unwrap_err()
     {
-        EngineError::Invalid(msg) => assert!(!msg.is_empty()),
+        EngineError::Invalid(msg) => assert!(
+            msg.contains("'../up' cannot name a domain: use letters, digits, hyphens"),
+            "the registration error text: {msg}"
+        ),
         other => panic!("expected invalid, got {other:?}"),
     }
 

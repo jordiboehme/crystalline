@@ -82,10 +82,9 @@ impl Engine {
         if let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? {
             // The same rename a crash stopped: finish it rather than refuse.
             if journal.old == old && journal.new == new {
-                let origin_lock = self.origin_lock(old);
-                let _origin = origin_lock.lock().await;
+                let _origins = self.lock_both_origins(old, new).await;
                 self.rename_pause.pause(&[old, new]);
-                return self.finish_rename(journal, &state_dir).await;
+                return self.finish_rename(journal, &state_dir, true).await;
             }
             return Err(EngineError::Conflict(format!(
                 "a rename of '{}' is still finishing; try again in a moment",
@@ -103,9 +102,9 @@ impl Engine {
         self.refuse_leftovers(new, &state_dir).await?;
 
         // An origin pull or share of this domain finishes first, and none
-        // starts until the rename is done.
-        let origin_lock = self.origin_lock(old);
-        let _origin = origin_lock.lock().await;
+        // starts until the rename is done, under either name: the lock is
+        // keyed by name, so both are held.
+        let _origins = self.lock_both_origins(old, new).await;
 
         // Records a removed domain left under the new name are stale: a live
         // domain there was refused above. Forgotten before any step, so a
@@ -132,16 +131,28 @@ impl Engine {
 
         // Rooms save their last text while the domain is still registered
         // under its old name, and a join names the domain it was opened in.
-        if let Some(sessions) = self.collab.get().and_then(std::sync::Weak::upgrade) {
-            sessions.dispose_domain(old).await;
-        }
-        self.joins.end_domain(old);
+        // This has to come before the pause and the drain, not after: a
+        // room's last save is a write into the domain, and once the domain is
+        // paused that write would wait on the very rename that is waiting for
+        // it. So a rename the drain then refuses has already closed the
+        // editors, and its refusal says so.
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(old).await,
+            None => 0,
+        };
+        let joins_ended = self.joins.end_domain(old);
 
         self.rename_pause.pause(&[old, new]);
         if !self.rename_pause.drained(old, RENAME_WAIT).await {
             self.rename_pause.resume(&[old, new]);
+            let closed = if rooms_closed + joins_ended > 0 {
+                " Its open editors were closed and reopen on the next edit."
+            } else {
+                ""
+            };
             return Err(EngineError::Conflict(format!(
-                "domain '{old}' is busy with a write that has not finished; try again in a moment"
+                "domain '{old}' is busy with a write that has not finished; try again in a \
+                 moment.{closed}"
             )));
         }
         let journal = RenameJournal {
@@ -158,7 +169,7 @@ impl Engine {
             self.rename_pause.resume(&[old, new]);
             return Err(io_error(e));
         }
-        let mut report = self.finish_rename(journal, &state_dir).await?;
+        let mut report = self.finish_rename(journal, &state_dir, true).await?;
         if let Value::Object(map) = &mut report {
             if !shadows.is_empty() {
                 map.insert(
@@ -195,15 +206,19 @@ impl Engine {
         let _slot = self.take_rename_slot(&journal.old)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
-        let origin_lock = self.origin_lock(&journal.old);
-        let _origin = origin_lock.lock().await;
+        let _origins = self.lock_both_origins(&journal.old, &journal.new).await;
         self.rename_pause.pause(&[&journal.old, &journal.new]);
         tracing::info!(
             "finishing the rename of domain '{}' to '{}' that an earlier run left half done",
             journal.old,
             journal.new
         );
-        self.finish_rename(journal, &state_dir).await.map(Some)
+        // No sync here: every opener runs its own first sync after this,
+        // and the daemon calls this before its socket binds, where a scan of
+        // the whole domain would hold every client back.
+        self.finish_rename(journal, &state_dir, false)
+            .await
+            .map(Some)
     }
 
     /// [`Engine::recover_rename_journal`] for an opener: the daemon, the
@@ -221,7 +236,8 @@ impl Engine {
             Ok(None) => {}
             Err(err) => tracing::error!(
                 "a domain rename an earlier run left half done could not be finished ({err}); \
-                 that domain stays paused until the next start or until the rename is run again"
+                 that domain stays paused until the next start: every read of it waits 30 s \
+                 before it is answered, and every write to it is refused"
             ),
         }
     }
@@ -230,6 +246,16 @@ impl Engine {
     /// new one.
     pub fn is_renaming(&self, domain: &str) -> bool {
         self.rename_pause.is_paused(domain)
+    }
+
+    /// Hold the next write into any domain right after it is counted, until
+    /// the answered hold is released: a write already running when a rename
+    /// starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_write(&self) -> Arc<crate::rename::RenameHold> {
+        let hold = Arc::new(crate::rename::RenameHold::default());
+        *self.write_hold.lock().unwrap() = Some(hold.clone());
+        hold
     }
 
     /// Arm a failure right after `step` of the next rename, leaving its
@@ -296,6 +322,13 @@ impl Engine {
                 )));
             }
             if let Some(ticket) = self.rename_pause.try_enter(name) {
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    let hold = self.write_hold.lock().unwrap().take();
+                    if let Some(hold) = hold {
+                        hold.hold().await;
+                    }
+                }
                 return Ok(ticket);
             }
         }
@@ -327,9 +360,15 @@ impl Engine {
     }
 
     /// Run every step of `journal` it does not list as done, re-key what
-    /// memory holds, write the configuration, drop the journal, publish the
-    /// names, lift the pause and sync the domain under its new name.
-    async fn finish_rename(&self, mut journal: RenameJournal, state_dir: &Path) -> Result<Value> {
+    /// memory holds, write the configuration, publish the names, drop the
+    /// journal, lift the pause and, when `sync_after`, sync the domain under
+    /// its new name.
+    async fn finish_rename(
+        &self,
+        mut journal: RenameJournal,
+        state_dir: &Path,
+        sync_after: bool,
+    ) -> Result<Value> {
         let (old, new) = (journal.old.clone(), journal.new.clone());
         let mut moved: Vec<&'static str> = Vec::new();
         for &step in journal.steps() {
@@ -358,19 +397,31 @@ impl Engine {
         }
         self.names_frozen
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        RenameJournal::remove(state_dir).map_err(io_error)?;
 
         // The table and the index learn the new name and keep the old
         // spellings as aliases; references the index row step unbound (the
-        // new name was another domain's spelling) bind again.
+        // new name was another domain's spelling) bind again. Before the
+        // journal goes: a crash here is finished by redoing just this.
         self.mark_names_stale();
         self.refresh_names().await;
         self.resolve_pending_everywhere().await;
-        self.origin_locks.lock().unwrap().remove(&old);
+        if let Err(e) = RenameJournal::remove(state_dir) {
+            // Every step is done and the configuration holds the new name, so
+            // the domain is served; a journal left behind is finished again,
+            // harmlessly, at the next start.
+            tracing::error!(
+                "the rename of domain '{old}' to '{new}' is done, but its journal could not be \
+                 deleted ({e}); the next start runs its last steps again"
+            );
+        }
+        {
+            let mut locks = self.origin_locks.lock().unwrap();
+            locks.remove(&old);
+        }
         self.rename_pause.resume(&[&old, &new]);
 
         let entry = self.domain_entry(&new)?;
-        if let Err(e) = self.sync(Some(&new)).await {
+        if sync_after && let Err(e) = self.sync(Some(&new)).await {
             tracing::warn!(
                 domain = %new,
                 error = %e,
@@ -396,6 +447,12 @@ impl Engine {
         step: RenameStep,
         e: EngineError,
     ) -> EngineError {
+        // The spelling pushes resume for every other domain. They cannot drop
+        // the old name's alias of the renamed row: until the config step no
+        // configured local name finds that row, so a push never touches its
+        // spellings.
+        self.names_frozen
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         tracing::error!(
             "the rename of domain '{}' to '{}' stopped at its {} step: {e}",
             journal.old,
@@ -581,6 +638,18 @@ impl Engine {
         }
     }
 
+    /// Hold the origin lock of both names, `old` first, so no origin pull or
+    /// share runs under either while the rename moves the domain.
+    async fn lock_both_origins(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> [tokio::sync::OwnedMutexGuard<()>; 2] {
+        let first = self.origin_lock(old).lock_owned().await;
+        let second = self.origin_lock(new).lock_owned().await;
+        [first, second]
+    }
+
     /// Take the one-rename slot, or say which rename holds it.
     fn take_rename_slot(&self, old: &str) -> Result<RenameSlot<'_>> {
         let mut slot = self.rename_slot.lock().unwrap();
@@ -627,7 +696,8 @@ impl Engine {
         if row.is_some() {
             return Err(EngineError::Conflict(format!(
                 "the index still holds a domain named '{new}' from a domain removed earlier; \
-                 pick another name"
+                 pick another name, or stop the daemon and rebuild the index with `crystalline \
+                 reindex --wipe`, which drops it"
             )));
         }
         for parent in [
@@ -755,5 +825,59 @@ fn quoted_list(names: &[String]) -> String {
         None => String::new(),
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crystalline_index::TursoStore;
+
+    /// While a rename has a domain paused, the read views' way to a domain
+    /// row looks the row up and never creates one: before the index row step
+    /// it finds the row under the old name, after it the old name answers a
+    /// conflict instead of registering a second, empty row.
+    #[tokio::test]
+    async fn a_paused_domain_row_is_looked_up_never_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            "---\ntype: manifest\ntitle: Eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Eng\n\n## Scope\n\n- things\n\n## When to Use\n\n- routing\n",
+        )
+        .unwrap();
+        let mut cfg = GlobalConfig::default();
+        cfg.domains
+            .insert("eng".to_string(), DomainEntry::file(root.clone()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), cfg, None, None)
+            .with_state_dir(tmp.path().join("state"));
+        engine.sync(None).await.unwrap();
+        let id = engine.store.lock().await.domain_id("eng").await.unwrap();
+
+        engine.rename_pause.pause(&["eng", "platform"]);
+        let (found, _) = engine.domain_source("eng").await.unwrap();
+        assert_eq!(Some(found), id, "the row under the old name is found");
+
+        engine
+            .store
+            .lock()
+            .await
+            .rename_domain_row("eng", "platform")
+            .await
+            .unwrap();
+        let Err(err) = engine.domain_source("eng").await else {
+            panic!("the old name answered a row after the index row moved");
+        };
+        assert!(
+            matches!(&err, EngineError::Conflict(m) if m.contains("is being renamed")),
+            "{err:?}"
+        );
+        assert_eq!(
+            engine.store.lock().await.domain_id("eng").await.unwrap(),
+            None,
+            "no second row under the old name"
+        );
     }
 }

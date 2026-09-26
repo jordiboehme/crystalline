@@ -88,9 +88,22 @@ impl Engine {
     pub async fn localize_visible(&self, spelling: &str, hidden: &HashSet<String>) -> String {
         // A spelling of a domain being renamed waits for the rename, so it
         // maps to the name the domain has once it is done.
-        let _ = self.wait_for_renames(&[spelling.to_string()]).await;
+        self.read_past_renames(&[spelling.to_string()]).await;
         let table = self.table_knowing([spelling.to_string()]).await;
         localize_in(&table, spelling, hidden)
+    }
+
+    /// Wait for a rename of a domain a read names, and past the wait answer
+    /// with the names as they stand, saying why the read was slow: a rename
+    /// that stopped keeps its domain paused until the next start.
+    async fn read_past_renames(&self, spellings: &[String]) {
+        if let Err(e) = self.wait_for_renames(spellings).await {
+            tracing::warn!(
+                "a read waited 30 s for a domain rename that has not finished ({e}); if that \
+                 rename stopped, its domain stays paused until the next start, and the read is \
+                 answered with the names as they stand"
+            );
+        }
     }
 
     /// `p` with every domain it names mapped to a local name, through
@@ -99,7 +112,7 @@ impl Engine {
     pub async fn localized<P: DomainArgs + Clone>(&self, p: &P, hidden: &HashSet<String>) -> P {
         // A read of a domain being renamed waits for the rename, and past
         // the wait is answered by the names as they stand.
-        let _ = self.wait_for_renames(&spellings_of(p)).await;
+        self.read_past_renames(&spellings_of(p)).await;
         let table = self.table_knowing(spellings_of(p)).await;
         let mut p = p.clone();
         p.localize_domains(&|spelling| localize_in(&table, spelling, hidden));

@@ -1460,9 +1460,24 @@ impl Engine {
     /// way a create does. The domain-addressed half of what
     /// [`Engine::resolve`] does for an identifier, for a write path whose
     /// engram is not in the index to resolve.
+    ///
+    /// While a rename has the domain paused the row is looked up, never
+    /// created: a write that holds a ticket from before the pause still finds
+    /// it under the old name, and anything else (a read that waited past the
+    /// pause, or one of a domain a stopped rename keeps paused) must not
+    /// register a second row under a name the index row may already have
+    /// left.
     pub(crate) async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
         let source = self.content_source(domain)?;
         let store = self.store.lock().await;
+        if self.is_renaming(domain) {
+            return match store.domain_id(domain).await? {
+                Some(id) => Ok((id, source)),
+                None => Err(EngineError::Conflict(format!(
+                    "domain '{domain}' is being renamed; try again in a moment"
+                ))),
+            };
+        }
         let domain_id = match &source {
             ContentSource::File { root } => {
                 store
