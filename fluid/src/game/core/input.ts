@@ -19,6 +19,11 @@
  * retried without when refused; and Chrome refuses a new lock for about a
  * second after the last one ended, so a request inside that window is
  * dropped instead of raising an error the player cannot act on.
+ *
+ * `typed` keeps a separate ordered log of the same fresh presses `pressed`
+ * tracks per code, for the level cheat's word: it needs the order two
+ * presses came in, which a per-code set cannot give. It leaves out the same
+ * auto-repeat and modified presses `pressed` would answer false for.
  */
 
 /** The live input state of one canvas. */
@@ -27,6 +32,16 @@ export interface Input {
   held(code: string): boolean;
   /** Whether a key was pressed since the last call for it. Consumes the press. */
   pressed(code: string): boolean;
+  /**
+   * The codes of the keys pressed since the last call, oldest first, and
+   * consumes them: one per physical press (no auto-repeat), none pressed
+   * with Ctrl, Cmd or Alt, and at most `TYPED_CAP`, the oldest dropped
+   * first. The session reads it once per tick for the level cheat's word,
+   * which needs the order `pressed` cannot give. `clear` and `dropPresses`
+   * forget it together with the presses, so a code is in the log exactly
+   * while its press is unconsumed.
+   */
+  typed(): string[];
   /** The mouse movement since the last call, in pixels, while locked. */
   takeLook(): { dx: number; dy: number };
   /** Whether the pointer is locked to the target. */
@@ -55,6 +70,12 @@ export interface Input {
 /** How long Chrome refuses a new lock after one ended. */
 const RELOCK_DELAY_MS = 1100;
 
+/**
+ * How many typed codes wait at most between two reads of `typed`. A tick
+ * reads them 35 times a second, so only a stalled loop ever fills it.
+ */
+export const TYPED_CAP = 16;
+
 /** The shape of `Element.requestPointerLock` across browsers: newer ones return a Promise, older Safari returns nothing. */
 type LockRequest = (options?: {
   unadjustedMovement?: boolean;
@@ -68,6 +89,7 @@ export function createInput(
   const win = doc.defaultView ?? window;
   const down = new Set<string>();
   const edges = new Set<string>();
+  const log: string[] = [];
   let dx = 0;
   let dy = 0;
   let lockEndedAt = -Infinity;
@@ -75,7 +97,13 @@ export function createInput(
   const isLocked = () => doc.pointerLockElement === target;
 
   const onKeyDown = (e: KeyboardEvent) => {
-    if (!e.repeat) edges.add(e.code);
+    if (!e.repeat) {
+      edges.add(e.code);
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        log.push(e.code);
+        if (log.length > TYPED_CAP) log.shift();
+      }
+    }
     down.add(e.code);
   };
   const onKeyUp = (e: KeyboardEvent) => {
@@ -108,6 +136,9 @@ export function createInput(
       edges.delete(code);
       return was;
     },
+    typed() {
+      return log.splice(0);
+    },
     takeLook() {
       const look = { dx, dy };
       dx = 0;
@@ -120,11 +151,13 @@ export function createInput(
     clear() {
       down.clear();
       edges.clear();
+      log.length = 0;
       dx = 0;
       dy = 0;
     },
     dropPresses() {
       edges.clear();
+      log.length = 0;
     },
     requestLock() {
       // `requestPointerLock` is feature-detected: jsdom and browsers without
@@ -152,6 +185,7 @@ export function createInput(
       if (isLocked()) doc.exitPointerLock();
       down.clear();
       edges.clear();
+      log.length = 0;
     },
   };
 }

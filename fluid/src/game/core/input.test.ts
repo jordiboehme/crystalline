@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createInput, type Input } from "./input";
+import { createInput, TYPED_CAP, type Input } from "./input";
 
 let input: Input | null = null;
 afterEach(() => {
@@ -87,5 +87,57 @@ describe("createInput", () => {
     expect(input.pressed("KeyW")).toBe(false);
     key("keydown", "KeyE");
     expect(input.pressed("KeyE")).toBe(true);
+  });
+});
+
+describe("typed", () => {
+  it("hands over the fresh presses in order, once", () => {
+    input = createInput(document.createElement("canvas"));
+    key("keydown", "KeyI");
+    key("keyup", "KeyI");
+    key("keydown", "KeyD");
+    key("keydown", "KeyC");
+    expect(input.typed()).toEqual(["KeyI", "KeyD", "KeyC"]);
+    expect(input.typed()).toEqual([]);
+  });
+
+  it("leaves auto-repeat and Ctrl, Cmd and Alt presses out of the log", () => {
+    input = createInput(document.createElement("canvas"));
+    key("keydown", "KeyD");
+    key("keydown", "KeyD", true);
+    key("keydown", "KeyD", true);
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyC", ctrlKey: true }),
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyL", metaKey: true }),
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyE", altKey: true }),
+    );
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyV", shiftKey: true }),
+    );
+    expect(input.typed()).toEqual(["KeyD", "KeyV"]);
+  });
+
+  it("keeps the newest TYPED_CAP presses", () => {
+    input = createInput(document.createElement("canvas"));
+    const codes = Array.from(
+      { length: TYPED_CAP + 4 },
+      (_, i) => `Key${String.fromCharCode(65 + i)}`,
+    );
+    for (const code of codes) key("keydown", code);
+    expect(input.typed()).toEqual(codes.slice(4));
+  });
+
+  it("forgets the log on clear and on dropPresses", () => {
+    input = createInput(document.createElement("canvas"));
+    key("keydown", "KeyI");
+    input.clear();
+    expect(input.typed()).toEqual([]);
+    key("keydown", "KeyD");
+    input.dropPresses();
+    expect(input.typed()).toEqual([]);
   });
 });
