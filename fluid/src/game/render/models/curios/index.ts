@@ -5,11 +5,11 @@
  * space (`curio:<kind>:<variant>`).
  *
  * A curio is built once at the origin, in `frameAt([0, 0, 0], 0)`, centred
- * with its base at `h` 0, and every instance of it is turned by its quarter
- * turn and moved to its anchor on the GPU, at the height of the surface it
- * stands on, so a recipe is a pure function of kind, variant and look. Its
- * slot is its kind's blink bank (`CURIO_BANK`), which its blinking lights
- * pulse with.
+ * with its base at `h` 0 (the hovering drone from its lift, `CURIO_LIFT`),
+ * and every instance of it is turned by its quarter turn and moved to its
+ * anchor on the GPU, at the height of the surface it stands on, so a
+ * recipe is a pure function of kind, variant and look. Its slot is its
+ * kind's blink bank (`CURIO_BANK`), which its blinking lights pulse with.
  *
  * The recipes live in six batch files on disjoint lists of kinds:
  * `gear.ts`, `retro.ts`, `keepsakes.ts`, `finds.ts`, `desktop.ts` and
@@ -17,9 +17,10 @@
  * curio test (`curioModels.test.ts`) builds every kind and variant, places
  * it at every turn on a surface the way the GPU does and checks the
  * envelope (its turned size and its top), that it reaches its top and
- * sits on its surface (the hovering drone from its lift), the winding, the triangle budget, that nothing
- * glows in mid-air, that no part floats clear of its base or another part,
- * and that blinking parts appear exactly in the kinds whose bank blinks.
+ * sits on its surface (the hovering drone from its lift), the winding, the
+ * triangle budget, that nothing glows in mid-air, that no part floats
+ * clear of its base or another part, and that blinking parts appear
+ * exactly in the kinds whose bank blinks.
  */
 
 import { CURIO_CATALOGUE } from "../../../world/curios";
@@ -48,10 +49,11 @@ const RECIPES = {
 
 /**
  * Builds variant `variant` of a curio kind into the kits `kitAt` makes, in
- * `frameAt([0, 0, 0], 0)`: centred on the origin, its base at `h` 0 and
- * its front towards `+d`. Throws `buildCurio: <kind> has no variant <n>`
- * on a variant the catalogue does not give the kind, as `buildHero` does:
- * a generator bug should not pass silently.
+ * `frameAt([0, 0, 0], 0)`: centred on the origin, its base at `h` 0 (the
+ * hovering drone from its lift) and its front towards `+d`. Throws
+ * `buildCurio: <kind> has no variant <n>` on a variant the catalogue does
+ * not give the kind, as `buildHero` does: a generator bug should not pass
+ * silently.
  */
 export function buildCurio(
   kitAt: KitAt,

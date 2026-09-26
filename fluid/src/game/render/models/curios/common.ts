@@ -117,11 +117,11 @@ const CAP_TINT: Rgb = [1.0, 0.92, 0.8];
 
 /**
  * The blockout every curio starts as (like `heroBlockout`): one bevelled
- * box over its whole size from its lift up to its top, less `CAP_HEIGHT` for a kind
- * whose bank blinks, which gets a blink-group-0 cap sitting on the box's
- * top in the middle, so every check (glow contact, the bank rule) runs on
- * it from the start. The cap is `CAP_SIDE` square and `CAP_HEIGHT` thick,
- * so it ends exactly at the top.
+ * box over its whole size from its lift up to its top, less `CAP_HEIGHT`
+ * for a kind whose bank blinks, which gets a blink-group-0 cap sitting on
+ * the box's top in the middle, so every check (glow contact, the bank
+ * rule) runs on it from the start. The cap is `CAP_SIDE` square and
+ * `CAP_HEIGHT` thick, so it ends exactly at the top.
  */
 export const curioBlockout: CurioRecipe = ({ k, s, variant, kind }) => {
   const { hw, hd, top, lift } = curioHalf(kind, variant);

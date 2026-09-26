@@ -1131,19 +1131,19 @@ export function heroHallRoom(): RoomSpec {
  * (the round table's places, turned to face out from its centre) keeps
  * each item's extent along the row equal to its width, and `row` throws
  * when the two differ in parity, since a row turned across itself is a
- * bug in this file. Laying along `a` rather than whichever axis a surface's box happens
- * to span more matters because a surface can be narrower along `a` than
- * along `d`, as the tube bench and the gun bench both are: a row run into
- * the room instead of along the wall would stand one item's box behind the
- * next on the only line a player can stand, so the one behind would never be
- * visible. Throws, naming the host and the kind, when an item does not fit
- * the row's own budget (`surfaceLen - 2 * CURIO_MARGIN`), whether because
- * the item alone is too big for the surface or because the items before it
- * in the row already used the space: a hand-built row is trusted arithmetic
- * (H15's own "fits by the Baselines numbers"), so a row that does not fit is
- * a bug in this file, never a silent overlap. Exported for
- * `canned.test.ts`'s own direct test of the throw; `heroHallCurios` is its
- * only production caller.
+ * bug in this file. Laying along `a` rather than whichever axis a
+ * surface's box happens to span more matters because a surface can be
+ * narrower along `a` than along `d`, as the tube bench and the gun bench
+ * both are: a row run into the room instead of along the wall would stand
+ * one item's box behind the next on the only line a player can stand, so
+ * the one behind would never be visible. Throws, naming the host and the
+ * kind, when an item does not fit the row's own budget (`surfaceLen - 2 *
+ * CURIO_MARGIN`), whether because the item alone is too big for the
+ * surface or because the items before it in the row already used the
+ * space: a hand-built row is trusted arithmetic (H15's own "fits by the
+ * Baselines numbers"), so a row that does not fit is a bug in this file,
+ * never a silent overlap. Exported for `canned.test.ts`'s own direct test
+ * of the throw; `heroHallCurios` is its only production caller.
  */
 export function row(
   s: HostSurface,
@@ -1195,9 +1195,10 @@ export function row(
 
 /**
  * The hero hall's curios (2.6b, 2.6d): one of every curio kind and
- * variant, hand-placed on the hero and round-table surfaces they fit (`hostSurfaces`, `curioOn` and
- * `row`). `row` lays each row along its host's local `a` axis
- * (wall-parallel), and the tube bench and the gun bench are both narrower
+ * variant, hand-placed on the hero and round-table surfaces they fit
+ * (`hostSurfaces`, `curioOn` and `row`). `row` lays each row along its
+ * host's local `a` axis (wall-parallel), and the tube bench and the gun
+ * bench are both narrower
  * along `a` than along `d`, so the rows are grouped to fit those budgets:
  *
  * - the mess table's top, in a row: the laptop, the tape drive, the tape

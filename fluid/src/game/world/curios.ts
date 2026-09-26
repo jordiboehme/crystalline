@@ -112,9 +112,10 @@
  *    curio, with its candidate's seed.
  * 6. **Fitting a surface** (`curioFits`, C12): the variant stands on the
  *    surface's class (`curioClasses`: the upright lit swords never on a
- *    shelf class top), a `floorOnly` kind only at `h` 0, its box lies inside the surface's box less
- *    `CURIO_MARGIN`, its top is at most the surface's `clear`, and its top
- *    stays `CURIO_CEILING_GAP` under the ceiling.
+ *    shelf class top), a `floorOnly` kind only at `h` 0, its box lies
+ *    inside the surface's box less `CURIO_MARGIN`, its top is at most the
+ *    surface's `clear`, and its top stays `CURIO_CEILING_GAP` under the
+ *    ceiling.
  * 7. **Clashing** (`curiosClash`): two curios whose plan boxes, one grown
  *    by `CURIO_GAP`, overlap and whose height ranges overlap.
  * 8. **Corner spots** (`cornerSpots`): the hall's four corner cells, each
@@ -424,7 +425,10 @@ export const CURIO_CATALOGUE: Readonly<Record<CurioKind, CurioEntry>> = {
   },
 };
 
-/** The retro slot's base pool (C7): the laptop now and then, the rest rarer; `RETRO_POOLS` builds on it. Order is part of the seeded result. */
+/**
+ * The retro slot's base pool (C7): the laptop now and then, the rest
+ * rarer; `RETRO_POOLS` builds on it. Order is part of the seeded result.
+ */
 export const RETRO_POOL = [
   ["beige-laptop", 4],
   ["pocket-console", 2],
@@ -519,7 +523,10 @@ export const RETRO_POOLS = {
   readonly (readonly [CurioKind, number])[]
 >;
 
-/** The tech slot's pool per archetype (2.6d C5, C9): the reactor case in lab and engineering rooms, the drone everywhere. */
+/**
+ * The tech slot's pool per archetype (2.6d C5, C9): the reactor case in lab
+ * and engineering rooms, the drone everywhere.
+ */
 export const TECH_POOLS = {
   bridge: [["hover-drone", 1]],
   council: [["hover-drone", 1]],
@@ -564,7 +571,10 @@ export const RADAR_SHARE = 1 / 24;
 export const RADAR_BESIDE_BALL = 1 / 2;
 /** Chance a room draws the capsule case (2.6d C9)... */
 export const CAPSULE_SHARE = 1 / 24;
-/** ...and its chance in a room that holds a star ball or the radar (2.6d C5). */
+/**
+ * ...and its chance in a room that holds a star ball or the radar (2.6d
+ * C5).
+ */
 export const CAPSULE_BESIDE = 1 / 3;
 
 /**
@@ -578,7 +588,10 @@ export const CURIO_LIFT = { "hover-drone": 0.35 } as const satisfies Partial<
   Record<CurioKind, number>
 >;
 
-/** A curio kind's lift (`CURIO_LIFT`), 0 for every kind that stands on its surface. */
+/**
+ * A curio kind's lift (`CURIO_LIFT`), 0 for every kind that stands on its
+ * surface.
+ */
 export function curioLift(kind: CurioKind): number {
   return (CURIO_LIFT as Partial<Record<CurioKind, number>>)[kind] ?? 0;
 }
@@ -1562,7 +1575,10 @@ function trial(
   return placed.some((p) => curiosClash(p, mine)) ? null : c;
 }
 
-/** A slot's pool: the kind its draw forces, or its own weighted pool (C7, 2.6d C6, C9). */
+/**
+ * A slot's pool: the kind its draw forces, or its own weighted pool (C7,
+ * 2.6d C6, C9).
+ */
 function poolOf(
   slot: CurioSlot,
   draw: SlotDraw,

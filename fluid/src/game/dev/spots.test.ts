@@ -509,6 +509,43 @@ describe("frameCurio's sight line", () => {
     expect(curioSightClear(room, player, ball)).toBe(true);
   });
 
+  it("sees a curio through the gap under a hovering drone (2.6d C4)", () => {
+    // Mutation caught: another curio's occluding volume started at its
+    // surface instead of its lift, so the empty gap under the drone hides
+    // what stands behind it.
+    // A star ball at cell (5, 5) (world 10, 10), h 0.7, its middle at
+    // 0.7375 m.
+    const ball: Curio = {
+      kind: "star-ball",
+      variant: 0,
+      x: 5,
+      y: 5,
+      h: 0.7,
+      turn: 0,
+      seed: 1,
+    };
+    // The drone 0.3 m north of it on the same surface: its 0.18 m box
+    // spans world z 9.61 to 9.79, and its body hovers from 0.7 + 0.35 =
+    // 1.05 m up to 1.23 m.
+    const drone: Curio = {
+      kind: "hover-drone",
+      variant: 0,
+      x: 5,
+      y: 4.85,
+      h: 0.7,
+      turn: 0,
+      seed: 2,
+    };
+    const room = bareRoom([ball, drone]);
+    // From 3 m north (world z 7), the eye line to the ball's middle
+    // crosses the drone's box between 0.85 m and 0.80 m: under its body,
+    // over its surface.
+    expect(curioSightClear(room, { x: 10, z: 7 }, ball)).toBe(true);
+    // From 0.8 m north (world z 9.2) the line enters the box at 1.16 m,
+    // inside the body, so the drone itself still occludes.
+    expect(curioSightClear(room, { x: 10, z: 9.2 }, ball)).toBe(false);
+  });
+
   it("hides a curio under its host's top from a line through the top, and frames it from the first spot that sees under the edge", () => {
     // A gun bench backed against a north wall edge (its front is +z), with
     // the fuel case on its under spot: a shelf at h 0.31 with 0.52 of free

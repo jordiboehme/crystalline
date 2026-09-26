@@ -37,7 +37,9 @@ import {
   RADAR_SHARE,
   RETRO_POOLS,
   RETRO_SHARE,
+  TECH_POOLS,
   TECH_SHARE,
+  UNDER_POOL,
   UNDER_SHARE,
   cornerSpots,
   curioBox,
@@ -1307,6 +1309,79 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
     expect(
       placeCurios(base(generateRoom(CANNED_WORKSHOP)), only("soot-puffs")),
     ).toEqual([]);
+  });
+
+  it("holds a hand-built soot puff to the floor in curioFits too (2.6d C7)", () => {
+    // Mutation caught: the `floorOnly` clause dropped from `curioFits`, so
+    // a hand-built room could stand the puffs on a trolley deck.
+    const surfaces = hostSurfaces(galleryRoom());
+    const deck = surfaces.find((s) => s.host === "prop:trolley");
+    const floor = surfaces.find((s) => s.cls === "under" && s.h === 0);
+    if (deck === undefined || floor === undefined)
+      throw new Error("the gallery has a trolley and a floor-level under spot");
+    expect(deck.h).toBeGreaterThan(0);
+    const onDeck = curioOn(deck, "soot-puffs", 0, 0.5, 0.5, 1);
+    expect(curioFits(galleryRoom(), onDeck, deck)).toBe(false);
+    const onFloor = curioOn(floor, "soot-puffs", 0, 0.5, 0.5, 1);
+    expect(curioFits(galleryRoom(), onFloor, floor)).toBe(true);
+  });
+
+  it("pins the 2.6d pools and shares as C9 states them", () => {
+    // Mutation caught: any C9 weight or share drifting, which the share
+    // sweeps (measured against the constants themselves) cannot see.
+    const tails = Object.fromEntries(
+      Object.entries(RETRO_POOLS).map(([a, pool]) => [a, pool.slice(-3)]),
+    );
+    expect(tails).toEqual({
+      bridge: [
+        ["breadbin-computer", 2],
+        ["slim-computer", 2],
+        ["space-bricks", 2],
+      ],
+      council: [
+        ["breadbin-computer", 1],
+        ["slim-computer", 1],
+        ["space-bricks", 1],
+      ],
+      engineering: [
+        ["breadbin-computer", 1],
+        ["slim-computer", 1],
+        ["space-bricks", 1],
+      ],
+      archive: [
+        ["breadbin-computer", 2],
+        ["slim-computer", 2],
+        ["space-bricks", 1],
+      ],
+      lab: [
+        ["breadbin-computer", 1],
+        ["slim-computer", 1],
+        ["space-bricks", 2],
+      ],
+    });
+    expect(TECH_POOLS).toEqual({
+      bridge: [["hover-drone", 1]],
+      council: [["hover-drone", 1]],
+      engineering: [
+        ["reactor-case", 2],
+        ["hover-drone", 1],
+      ],
+      archive: [["hover-drone", 1]],
+      lab: [
+        ["reactor-case", 2],
+        ["hover-drone", 1],
+      ],
+    });
+    expect(UNDER_POOL).toEqual([
+      ["trap-box", 1],
+      ["fuel-case", 1],
+      ["soot-puffs", 1],
+    ]);
+    expect(TECH_SHARE).toBe(1 / 10);
+    expect(RADAR_SHARE).toBe(1 / 24);
+    expect(RADAR_BESIDE_BALL).toBe(1 / 2);
+    expect(CAPSULE_SHARE).toBe(1 / 24);
+    expect(CAPSULE_BESIDE).toBe(1 / 3);
   });
 
   it("hovers the drone over a terminal's desk end first, where the room has one (2.6d C8, Review Focus 2)", () => {

@@ -413,10 +413,10 @@ function sightClear(
 
 /**
  * True when the sight line from world point `from` at eye height to curio
- * `c`'s middle (`curioMid`, halfway from its lift to its top) crosses no occluding volume (`occludersFor`): the exact
- * predicate `frameCurio`'s own search applies at every candidate, exported
- * so `spots.test.ts` can check a forced curio's chosen spot with it
- * directly.
+ * `c`'s middle (`curioMid`, halfway from its lift to its top) crosses no
+ * occluding volume (`occludersFor`): the exact predicate `frameCurio`'s
+ * own search applies at every candidate, exported so `spots.test.ts` can
+ * check a forced curio's chosen spot with it directly.
  */
 export function curioSightClear(
   room: RoomSpec,
