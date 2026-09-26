@@ -359,7 +359,9 @@ describe("galleryRoom", () => {
     );
   });
 
-  it("stands every rare floor prop at its hall point, off every lane and every other box (2.6d C19)", () => {
+  it("stands every rare floor prop at its hall point, off every lane, framed from its front (2.6d C19)", () => {
+    // Its boxes against every other blocker are held by "lets nothing that
+    // blocks overlap anything else that blocks" above.
     // Mutation caught: a rare kind left in the bays' loop (the bays run out
     // of cells), or a hall point moved into a lane.
     const rare = room.props.filter(

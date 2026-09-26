@@ -367,7 +367,7 @@ const GALLERY_LIGHT = 210;
  *   variant as a segment hung over row 6. The rare floor kinds stand in the
  *   hall instead, at `GALLERY_HALL_PROPS` (2.6d C19): the canisters, the
  *   console and the marked crates east of the specimen tank, the designer
- *   tower beside the west terminal.
+ *   tower north of the west wall's northern terminal.
  * - **Light.** One steady zone per block of four by four cells, so every
  *   floor cell is lit and nothing flickers while a model is looked at.
  *
@@ -753,8 +753,10 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
  * marked crates stand in two rows east of the specimen tank, turn 2,
  * facing the entrance, each off every lane, fixture and piece of furniture;
  * the designer tower stands where its own rule puts it (C13), the
- * wall-side spot of cell (0, 13) backed to the west wall, its north side
- * `TOWER_DESK_GAP` from the border with the terminal's cell (0, 12).
+ * wall-side spot of cell (0, 11) backed to the west wall, its south side
+ * `TOWER_DESK_GAP` from the border with the terminal's cell (0, 12). It
+ * keeps out of cell (0, 13), between the two terminals, where the west
+ * wall stays open to walk along.
  */
 export const GALLERY_HALL_PROPS = [
   ["ooze-canisters", 0, 10.5, 10.5, 2],
@@ -762,7 +764,7 @@ export const GALLERY_HALL_PROPS = [
   ["gravity-console", 0, 14.5, 10.5, 2],
   ["marked-crate", 0, 10.5, 12.5, 2],
   ["marked-crate", 1, 12.5, 12.5, 2],
-  ["designer-tower", 0, 0.1325, 13.0875, 1],
+  ["designer-tower", 0, 0.1325, 11.9125, 1],
 ] as const satisfies readonly (readonly [
   FloorPropKind,
   number,

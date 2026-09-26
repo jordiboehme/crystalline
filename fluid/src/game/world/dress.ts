@@ -109,7 +109,10 @@
  *     wall-side floor prop does, carrying the rare token's seed; the tower
  *     backs onto its wall and is pushed along it until its near side is
  *     `TOWER_DESK_GAP` from the cell border on the desk's side. A kind that
- *     finds no spot is left out.
+ *     finds no spot is left out. The rare props obey the cap of step 13
+ *     like every other candidate: in a room near `PROP_CAP` (280) a rare
+ *     floor prop, which comes before the ceiling candidates, can push out
+ *     a late ceiling duct, tray or loop.
  * 11. The mark (2.6d C12), when `rare.mark.take` is drawn: the candidates
  *     so far that `markedVariant` accepts (a large crate or a crate stack,
  *     `MARK_FROM`), sorted by seed, then `y`, then `x`; the one at
@@ -416,7 +419,9 @@ export function markedVariant(p: Prop): number | null {
  * the fixture's wall side. The value is the along-wall direction from that
  * cell towards the desk: +1 when the desk lies at the higher x (a north or
  * south wall) or y (an east or west wall), -1 when it lies at the lower. A
- * cell between two desks keeps the later fixture's direction.
+ * cell between two desks on its wall points to the one at the lower
+ * coordinate (-1), whatever order the fixtures come in, so the tower's
+ * place is a rule of the room, not of its fixture list.
  */
 export function deskSides(
   room: Pick<RoomBase, "fixtures">,
@@ -433,8 +438,10 @@ export function deskSides(
     for (const step of [-1, 1] as const) {
       const cx = along ? x + step : x;
       const cy = along ? y : y + step;
-      // The desk lies back towards the fixture's own cell.
-      out.set(`${String(cx)},${String(cy)},${side}`, step === 1 ? -1 : 1);
+      // The desk lies back towards the fixture's own cell. Between two
+      // desks the lower one wins (-1).
+      const key = `${String(cx)},${String(cy)},${side}`;
+      out.set(key, step === 1 || out.get(key) === -1 ? -1 : 1);
     }
   }
   return out;

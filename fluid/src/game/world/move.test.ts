@@ -717,15 +717,7 @@ describe("blockersFor", () => {
   it("collides with every hero but the flush ones (Review Focus 5)", () => {
     // The gallery hall's cell (4, 14) is open floor with no blocker within
     // 2 m of the turret's box, so every push below meets the turret alone.
-    // The gallery's designer tower stands in cell (0, 13) against the west
-    // wall (2.6d C19), on the eye panel's edge, so it is left out: the walk
-    // along that wall below holds the flush panel alone.
-    const gallery = galleryRoom();
-    const room = {
-      ...gallery,
-      heroes: [] as Hero[],
-      props: gallery.props.filter((p) => p.kind !== "designer-tower"),
-    };
+    const room = { ...galleryRoom(), heroes: [] as Hero[] };
     const free: Hero = {
       kind: "turret",
       variant: 0,

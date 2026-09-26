@@ -16,6 +16,7 @@ import {
   WALL_GAP,
   NO_RARE,
   capProps,
+  deskSides,
   dressCandidates,
   dressRoom,
   markedVariant,
@@ -62,6 +63,7 @@ import {
   RARE_PROP_KINDS,
   RARE_SHARES,
   SPAN_CELLS,
+  TOWER_DESK_GAP,
   USE_LANE_DEPTH,
 } from "./props";
 import {
@@ -583,6 +585,8 @@ describe("floor props", () => {
           expect(gap).toBeGreaterThanOrEqual(
             (kind === undefined ? WALL_GAP : SCREEN_GAP) - 1e-9,
           );
+          if (kind !== undefined)
+            expect(PROP_CATALOGUE[kind].keepClear).toBe(false);
           continue;
         }
         if (kind !== undefined) {
@@ -2019,9 +2023,13 @@ describe("rare props (2.6d C9 to C13)", () => {
       panel: true,
     };
     let towers = 0;
+    let canisters = 0;
+    let consoles = 0;
     for (const { name, room } of rooms) {
       const props = dressRoom(room, NO_RESERVE, forced);
       expectFloorInvariants(name, { ...room, props });
+      canisters += props.filter((p) => p.kind === "ooze-canisters").length;
+      consoles += props.filter((p) => p.kind === "gravity-console").length;
       for (const t of props.filter((p) => p.kind === "designer-tower")) {
         towers++;
         const side = SIDE_OF_TURN[t.turn];
@@ -2053,7 +2061,11 @@ describe("rare props (2.6d C9 to C13)", () => {
         name,
       ).toBe(false);
     }
+    // Each forced kind lands somewhere, so dropping any one of the three
+    // steps fails here.
     expect(towers).toBeGreaterThan(0);
+    expect(canisters).toBeGreaterThan(0);
+    expect(consoles).toBeGreaterThan(0);
     // The canned bridge's desk cells are all taken: the tower falls back.
     const bridge = generateRoom(CANNED_BRIDGE);
     expect(
@@ -2061,6 +2073,83 @@ describe("rare props (2.6d C9 to C13)", () => {
         (p) => p.kind === "designer-tower",
       ),
     ).toBe(false);
+  });
+  it("pushes the tower to its desk's side, its near side TOWER_DESK_GAP from that border, the lower desk between two (2.6d C13)", () => {
+    // Mutation caught: the push flipped (the tower's far side on the desk's
+    // border), or the tie between two desks read from the fixture list.
+    const isDesk = (f: Fixture) =>
+      f.kind === "terminal" ||
+      (f.kind === "machine" &&
+        (DESK_MACHINES as readonly string[]).includes(f.machine));
+    // The near side's gap to the border on the desk's side, in metres.
+    const nearGap = (room: RoomBase, t: Prop) => {
+      const side = SIDE_OF_TURN[t.turn];
+      const cx = Math.floor(t.x);
+      const cy = Math.floor(t.y);
+      const along = side === "n" || side === "s";
+      const at = along ? cx : cy;
+      const desks = room.fixtures
+        .filter(
+          (f) =>
+            isDesk(f) &&
+            f.slot.side === side &&
+            (along ? f.slot.y === cy : f.slot.x === cx) &&
+            Math.abs((along ? f.slot.x : f.slot.y) - at) === 1,
+        )
+        .map((f) => (along ? f.slot.x : f.slot.y))
+        .sort((a, b) => a - b);
+      const desk = desks[0];
+      if (desk === undefined) throw new Error("a tower stands beside a desk");
+      const box = boxOf(t);
+      const [lo, hi] = along ? [box.x0, box.x1] : [box.z0, box.z1];
+      return {
+        between: desks.length === 2,
+        gap: desk < at ? lo - at * CELL : (at + 1) * CELL - hi,
+      };
+    };
+    const forced: RareDraws = { ...NO_RARE, tower: true };
+    let towers = 0;
+    for (const { name, room } of [
+      ...ALL,
+      ...BRIDGES,
+      ...SEEDS.map((r, k) => ({ name: `seed ${String(k)}`, room: r })),
+    ])
+      for (const t of dressRoom(room, NO_RESERVE, forced).filter(
+        (p) => p.kind === "designer-tower",
+      )) {
+        towers++;
+        // round3 rounds the anchor to a thousandth of a cell, 1 mm.
+        expect(
+          Math.abs(nearGap(room, t).gap - TOWER_DESK_GAP),
+          name,
+        ).toBeLessThanOrEqual(1.01e-3);
+      }
+    expect(towers).toBeGreaterThan(0);
+
+    // Between two desks: the gallery's west wall holds terminals at y 12
+    // and 14 with cell (0, 13) between them. With the bay benches taken
+    // out and cell (0, 11) reserved, (0, 13) is the tower's only place. It
+    // goes to the lower desk (y 12) in either fixture order.
+    const gallery = galleryRoom();
+    const walls = gallery.fixtures.filter(
+      (f) => f.kind !== "machine" || !isDesk(f),
+    );
+    const north: Reserved = {
+      boxes: [{ x0: 0, x1: CELL, z0: 11 * CELL, z1: 12 * CELL }],
+      edges: new Set<string>(),
+    };
+    for (const fixtures of [walls, [...walls].reverse()]) {
+      const room = { ...gallery, fixtures };
+      expect(deskSides(room).get("0,13,w")).toBe(-1);
+      const tower = dressRoom(room, north, forced).find(
+        (p) => p.kind === "designer-tower",
+      );
+      if (tower === undefined) throw new Error("the tower lands at (0, 13)");
+      expect([Math.floor(tower.x), Math.floor(tower.y)]).toEqual([0, 13]);
+      const { between, gap } = nearGap(room, tower);
+      expect(between).toBe(true);
+      expect(Math.abs(gap - TOWER_DESK_GAP)).toBeLessThanOrEqual(1.01e-3);
+    }
   });
 });
 
