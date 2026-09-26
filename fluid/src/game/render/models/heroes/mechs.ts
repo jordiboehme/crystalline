@@ -51,7 +51,7 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import type { HeroRecipe } from "./common";
+import { heroHalf, type HeroRecipe } from "./common";
 
 /** The recipe's own frame: the origin, facing north. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
@@ -137,8 +137,9 @@ const HOSE_BLACK: Rgb = [0.05, 0.05, 0.06];
  *   further, so the jaw narrows to a point; `trimW`: the width of every
  *   lime line; the outer step's upper and lower edges carry one each;
  * - `brow`: the brow ridge's box, darker;
- * - `horn`: the horn's root centre and tip `[d, h]`, its half width at
- *   the root and half thickness `half`; `band`: where along it the lime
+ * - `horn`: the horn's root centre `[d, h]` and its tip's `d` (the tip
+ *   is the hero's top, `heroHalf`'s `top`), its half width at the root
+ *   and half thickness `half`; `band`: where along it the lime
  *   band sits and how long it is;
  * - `sideTrim`: the lime lines on the helmet's sides, `[d0, d1, h0, h1]`,
  *   on the side faces inside the bevel;
@@ -152,16 +153,16 @@ const HEAD = {
   saddle: { a: 0.5, d0: -0.55, d1: 0.35, h0: 0.04, h1: 0.12 },
   clamps: {
     at: [
-      [-0.54, -0.45],
-      [0.54, -0.45],
-      [-0.54, 0.25],
-      [0.54, 0.25],
+      [-0.5, -0.45],
+      [0.5, -0.45],
+      [-0.5, 0.25],
+      [0.5, 0.25],
     ],
     half: 0.08,
     bevel: 0.02,
     h: [0.12, 0.5],
   },
-  neck: { d: -0.1, r: 0.42, h: [0.12, 0.37] },
+  neck: { d: -0.1, r: 0.36, h: [0.12, 0.37] },
   hoses: [
     [1, -0.35, 0.24],
     [-1, 0.05, 0.26],
@@ -170,20 +171,20 @@ const HEAD = {
   hoseIn: 0.3,
   hoseOut: 0.56,
   hoseR: 0.04,
-  helmet: { a: 0.55, d0: -0.7, d1: 0.5, h0: 0.36, h1: 1.35, bevel: 0.2 },
+  helmet: { a: 0.45, d0: -0.7, d1: 0.5, h0: 0.36, h1: 1.35, bevel: 0.18 },
   crownD: -0.1,
   crown: [
     [0, 1.3],
-    [0.5, 1.3],
-    [0.42, 1.52],
-    [0.2, 1.62],
+    [0.42, 1.3],
+    [0.36, 1.52],
+    [0.17, 1.62],
     [0, 1.64],
   ],
-  face: { a: 0.36, h0: 0.86, h1: 1.06 },
+  face: { a: 0.3, h0: 0.86, h1: 1.06 },
   faceBack: 0.03,
   eyes: [
-    [-0.32, -0.1],
-    [0.1, 0.32],
+    [-0.27, -0.08],
+    [0.08, 0.27],
   ],
   eyeH: [0.93, 0.99],
   jawRoot: [
@@ -191,17 +192,17 @@ const HEAD = {
     [0.3, 0.86],
   ],
   jaw: [
-    [0.3, 0.72, 0.5],
-    [0.2, 0.85, 0.47],
-    [0.1, 0.95, 0.44],
+    [0.26, 0.72, 0.5],
+    [0.17, 0.85, 0.47],
+    [0.08, 0.95, 0.44],
   ],
   trimW: 0.03,
-  brow: { a: 0.46, d0: 0.4, d1: 0.62, h0: 1.05, h1: 1.16 },
-  horn: { root: [0.36, 1.28], tip: [0.97, 2.1], width: 0.08, half: 0.035 },
+  brow: { a: 0.38, d0: 0.4, d1: 0.62, h0: 1.05, h1: 1.16 },
+  horn: { root: [0.36, 1.28], tipD: 0.97, width: 0.08, half: 0.035 },
   band: { at: 0.26, length: 0.05 },
   sideTrim: [
-    [-0.45, 0.25, 0.62, 0.66],
-    [0.21, 0.25, 0.66, 1.1],
+    [-0.45, 0.27, 0.62, 0.66],
+    [0.23, 0.27, 0.66, 1.1],
   ],
   crest: [
     [-0.35, 1.6],
@@ -223,7 +224,8 @@ const HEAD = {
  * eyes, the jaw guard, the brow ridge, the horn and its band, the crest
  * and the lime trim.
  */
-const mechHead: HeroRecipe = ({ k, kitAt, s }) => {
+const mechHead: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+  const { top } = heroHalf(kind, variant);
   const violet = s.tinted(HEAD_VIOLET);
   const lime = s.tinted(HEAD_LIME);
   const grey = s.tinted(CRADLE_GREY);
@@ -288,7 +290,7 @@ const mechHead: HeroRecipe = ({ k, kitAt, s }) => {
   });
   const B = HEAD.brow;
   k.box(-B.a, B.a, B.d0, B.d1, B.h0, B.h1, s.tinted(shade(HEAD_VIOLET, 0.8)));
-  const Hn = HEAD.horn;
+  const Hn = { ...HEAD.horn, tip: [HEAD.horn.tipD, top] as const };
   const len = Math.hypot(Hn.tip[0] - Hn.root[0], Hn.tip[1] - Hn.root[1]);
   // The unit normal to the horn's axis in the side plane.
   const nx = -(Hn.tip[1] - Hn.root[1]) / len;
@@ -366,8 +368,9 @@ export const TANK_LENSES: readonly { a: number; h: number; r: number }[] = [
  * ±1.75, the top 2.5):
  * - `pods`: the abdomen's two ovoids, `[d, scale]`: the full one at
  *   `d -0.7` and one at 0.85 of its size behind it, both on the `pod`
- *   profile of `[r, h]` (the smaller one scaled about the profile's foot)
- *   and the smaller a shade darker;
+ *   profile of `[r, h]` closed at the hero's top (`heroHalf`'s `top`) on
+ *   its axis (the smaller one scaled about the profile's foot) and the
+ *   smaller a shade darker;
  * - `waist`, `cabin`, `under`: the white waist cylinder, the cabin's
  *   bevelled box and the grey underparts;
  * - `lens`: the bezels' depth range, from inside the cabin to in front
@@ -391,7 +394,6 @@ const TANK = {
     [0.8, 1.6],
     [0.7, 2.2],
     [0.35, 2.45],
-    [0, 2.5],
   ],
   waist: { d: -0.05, r: 0.32, h: [1.15, 1.7] },
   cabin: { a: 0.45, d0: 0.3, d1: 1.2, h0: 1.1, h1: 1.8, bevel: 0.16 },
@@ -420,14 +422,14 @@ const TANK = {
  */
 const TANK_LEGS = {
   hips: [
-    [0.35, (50 * Math.PI) / 180],
-    [0.35, Math.PI - (50 * Math.PI) / 180],
-    [-0.5, -(44 * Math.PI) / 180],
-    [-0.5, Math.PI + (44 * Math.PI) / 180],
+    [0.4, (45 * Math.PI) / 180],
+    [0.4, Math.PI - (45 * Math.PI) / 180],
+    [-0.6, -(39 * Math.PI) / 180],
+    [-0.6, Math.PI + (39 * Math.PI) / 180],
   ],
   hip: [0.3, 1.3],
   knee: [0.95, 1.75],
-  foot: [1.3, 0.24],
+  foot: [1.35, 0.24],
   upper: 0.18,
   lower: 0.14,
   half: 0.09,
@@ -493,7 +495,8 @@ function tankLeg(kitAt: KitAt, s: Surfaces, f: Frame): void {
  * underparts, the three lenses, the arms and claws, the gun pod and the
  * four legs.
  */
-const spiderTank: HeroRecipe = ({ k, kitAt, s }) => {
+const spiderTank: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+  const { top } = heroHalf(kind, variant);
   const blue = s.tinted(TANK_BLUE);
   const white = s.tinted(TANK_WHITE);
   const grey = s.tinted(TANK_GREY);
@@ -502,7 +505,9 @@ const spiderTank: HeroRecipe = ({ k, kitAt, s }) => {
     k.lathe(
       0,
       d,
-      TANK.pod.map(([r, h]) => [r * x, foot + (h - foot) * x] as const),
+      [...TANK.pod, [0, top] as const].map(
+        ([r, h]) => [r * x, foot + (h - foot) * x] as const,
+      ),
       12,
       x === 1 ? blue : s.tinted(shade(TANK_BLUE, 0.94)),
     );
@@ -595,7 +600,8 @@ const FLOWER_TINTS: readonly Rgb[] = [
  *   the palm down to `reach` below the wrist, ten centimetres off the
  *   floor. The hand hangs from the wrist, so a higher wrist lifts it;
  * - `neck` and `head`: the thin neck from inside the body, the domed
- *   head's profile `[r, h]` and the `knob` on top;
+ *   head's profile `[r, h]` and the `knob` on top, up to the hero's top
+ *   (`heroHalf`'s `top`);
  * - `face`: the lighter face plate's radius and depth range; `eye`: the
  *   socket's and the glowing eye's radius, height and depth ranges;
  * - `moss`: patches draped over the upper body, `[turn, half width, h0,
@@ -667,7 +673,7 @@ const ROBOT = {
     [0.09, 3.35],
     [0, 3.36],
   ],
-  knob: { r: 0.04, h: [3.35, 3.44] },
+  knob: { r: 0.04, h0: 3.35 },
   face: { r: 0.17, d: [0.22, 0.28] },
   eye: { h: 3.04, socket: 0.1, glow: 0.06, d: [0.26, 0.29, 0.3] },
   moss: {
@@ -748,7 +754,8 @@ function armRun(
  * shoulders and arms with their hands, the neck, the head with its face
  * and eye, the moss, the bird and the flowers in their crack.
  */
-const gardenRobot: HeroRecipe = ({ k, kitAt, s }) => {
+const gardenRobot: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+  const { top } = heroHalf(kind, variant);
   const rust = (x: number) => s.tinted(shade(ROBOT_RUST, x));
   const dark = s.tinted(ROBOT_DARK);
   const moss = s.tinted(ROBOT_MOSS);
@@ -839,7 +846,7 @@ const gardenRobot: HeroRecipe = ({ k, kitAt, s }) => {
   k.cylinder(0, 0, Nk.h[0], Nk.h[1], Nk.r, 8, dark, false);
   k.lathe(0, 0, ROBOT.head, 10, rust(1.0));
   const Kn = ROBOT.knob;
-  k.cylinder(0, 0, Kn.h[0], Kn.h[1], Kn.r, 6, dark);
+  k.cylinder(0, 0, Kn.h0, top, Kn.r, 6, dark);
   const E = ROBOT.eye;
   const Fc = ROBOT.face;
   k.extrude(discOutline(0, E.h, Fc.r, 10), Fc.d[0], Fc.d[1], rust(1.35));
