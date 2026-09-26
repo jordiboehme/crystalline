@@ -848,6 +848,94 @@ async fn branch_ref_reports_the_sha_and_none_on_404() {
     assert_eq!(provider.branch_ref(&origin(), "gone").await.unwrap(), None);
 }
 
+// --- read_file ---------------------------------------------------------------
+
+/// What the contents fake saw on its one route: the file path, the decoded
+/// `ref` query and every `Accept` value the request carried.
+#[derive(Default, Clone)]
+struct ContentsSeen {
+    path: Option<String>,
+    reference: Option<String>,
+    accept: Vec<String>,
+}
+
+/// A contents endpoint that answers `body` for `team/eng/MANIFEST.md` and 404
+/// for anything else, recording what each request carried.
+async fn contents_fake(body: &'static [u8]) -> (String, Arc<Mutex<ContentsSeen>>) {
+    let seen: Arc<Mutex<ContentsSeen>> = Arc::default();
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/contents/{*path}",
+        get(
+            move |Path(path): Path<String>,
+                  Query(params): Query<HashMap<String, String>>,
+                  headers: HeaderMap| {
+                let state = state.clone();
+                async move {
+                    *state.lock().unwrap() = ContentsSeen {
+                        path: Some(path.clone()),
+                        reference: params.get("ref").cloned(),
+                        accept: headers
+                            .get_all("accept")
+                            .iter()
+                            .map(|v| v.to_str().unwrap().to_string())
+                            .collect(),
+                    };
+                    if path == "team/eng/MANIFEST.md" {
+                        (StatusCode::OK, body).into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"message": "Not Found"})),
+                        )
+                            .into_response()
+                    }
+                }
+            },
+        ),
+    );
+    (spawn(app).await, seen)
+}
+
+#[tokio::test]
+async fn read_file_returns_the_raw_body_and_sends_the_ref() {
+    let (base, seen) = contents_fake(b"---\ndomain_name: eng\n---\n").await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    // A branch name carrying a slash, a space and an ampersand: the ref must
+    // arrive whole, not split into a second query parameter.
+    let bytes = provider
+        .read_file(&origin(), "release/2026 q3&x", "team/eng/MANIFEST.md")
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_deref(),
+        Some(b"---\ndomain_name: eng\n---\n".as_slice())
+    );
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.path.as_deref(), Some("team/eng/MANIFEST.md"));
+    assert_eq!(seen.reference.as_deref(), Some("release/2026 q3&x"));
+    assert_eq!(
+        seen.accept,
+        vec!["application/vnd.github.raw+json".to_string()],
+        "exactly one Accept, the raw media type"
+    );
+}
+
+#[tokio::test]
+async fn read_file_answers_none_on_404() {
+    let (base, seen) = contents_fake(b"unused").await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let bytes = provider
+        .read_file(&origin(), "main", "MANIFEST.md")
+        .await
+        .unwrap();
+    assert_eq!(bytes, None, "no such file is an answer, not a failure");
+    assert_eq!(seen.lock().unwrap().reference.as_deref(), Some("main"));
+}
+
 // --- update_branch -----------------------------------------------------------
 
 #[tokio::test]

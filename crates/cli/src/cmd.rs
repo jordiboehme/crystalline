@@ -842,6 +842,11 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
     }
     let name = data["domain"].as_str().unwrap_or("");
     println!("Connected team domain '{name}' to {repo}");
+    // The name the repository's MANIFEST declares was already taken here, so
+    // the domain stepped to another one: said plainly, in the engine's words.
+    if let Some(note) = data["note"].as_str() {
+        println!("  {note}");
+    }
     println!("  root: {}", data["root"].as_str().unwrap_or(""));
     println!(
         "  {} engrams at {}",

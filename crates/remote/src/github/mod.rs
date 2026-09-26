@@ -27,6 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
@@ -43,6 +44,15 @@ use types::{
     ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
     UpdateProposalRequest, UpdateRefRequest,
 };
+
+/// What a single URL path segment or query value keeps unencoded: the
+/// alphanumerics and the RFC 3986 unreserved marks `- . _ ~`. Everything
+/// else, `/`, `&`, `?`, `#` and spaces included, is percent-encoded.
+const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// The default GitHub REST API base url.
 const DEFAULT_API_URL: &str = "https://api.github.com";
@@ -106,11 +116,25 @@ impl GitHubProvider {
     /// attaching the standard GitHub headers and the bearer token when one
     /// is configured.
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.request_accepting(method, path, "application/vnd.github+json")
+    }
+
+    /// [`request`](GitHubProvider::request) with a different `Accept` media
+    /// type, for the endpoints that answer another representation (the raw
+    /// bytes of a file). The one `Accept` is set here rather than added
+    /// afterwards: a second `.header("Accept", ..)` appends a second value
+    /// instead of replacing the first.
+    fn request_accepting(
+        &self,
+        method: Method,
+        path: &str,
+        accept: &str,
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}{path}", self.api_url);
         let mut builder = self
             .client
             .request(method, url)
-            .header("Accept", "application/vnd.github+json")
+            .header("Accept", accept)
             .header("X-GitHub-Api-Version", API_VERSION)
             .header("User-Agent", "crystalline");
         if let Some(token) = &self.token {
@@ -347,6 +371,44 @@ impl Provider for GitHubProvider {
         let response = self.check(response, Some(&origin.repo)).await?;
         let body: BlobResponse = parse_json(response).await?;
         decode_base64(&body.content)
+    }
+
+    async fn read_file(
+        &self,
+        origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        // Each path segment and the ref are encoded on their own, so a `/`
+        // between segments stays a separator while one inside the ref (a
+        // `release/x` branch) cannot split the query.
+        let encoded_path = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| utf8_percent_encode(segment, URL_COMPONENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let encoded_ref = utf8_percent_encode(reference, URL_COMPONENT);
+        let url = format!("/repos/{owner}/{name}/contents/{encoded_path}?ref={encoded_ref}");
+        let response = self
+            .send(self.request_accepting(Method::GET, &url, "application/vnd.github.raw+json"))
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // No such file on that ref is an answer: check() would map this
+            // 404 to RepoNotFound, so it is read here, as branch_ref does.
+            return Ok(None);
+        }
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let status = response.status().as_u16();
+        response
+            .bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| RemoteError::Api {
+                status,
+                message: format!("could not read the file response body: {e}"),
+            })
     }
 
     async fn tarball(&self, origin: &OriginSpec, commit: &str) -> Result<Vec<u8>, RemoteError> {

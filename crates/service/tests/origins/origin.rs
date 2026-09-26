@@ -1488,7 +1488,10 @@ async fn origin_status_reports_behind_and_connection() {
     assert_eq!(domains[0]["domain"], "brand");
     assert_eq!(domains[0]["repo"], "acme/brand-knowledge");
     assert_eq!(domains[0]["behind"], false);
-    assert_eq!(domains[0]["local_changes"], 0);
+    assert_eq!(
+        domains[0]["local_changes"], 1,
+        "connecting as `brand` wrote the name into the MANIFEST"
+    );
 
     // A local edit shows up as "ahead" (a local change against the base).
     std::fs::create_dir_all(root.join("notes")).unwrap();
@@ -1501,7 +1504,7 @@ async fn origin_status_reports_behind_and_connection() {
         .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
-    assert_eq!(status_local["domains"][0]["local_changes"], 1);
+    assert_eq!(status_local["domains"][0]["local_changes"], 2);
 
     let c2 = mock.add_commit(commit_files(&[
         ("MANIFEST.md", manifest()),
@@ -1573,6 +1576,9 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
     )
     .await
     .unwrap();
+    // Exactly one change of each kind is the subject, so the name's
+    // write-back into the MANIFEST is put back first.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
 
     // One of each kind, plus two refreshed folder listings that ride along.
     std::fs::write(
@@ -1766,7 +1772,10 @@ async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
         domains[0]["behind"].is_null(),
         "behind must degrade to unknown, not error: {status}"
     );
-    assert_eq!(domains[0]["local_changes"], 1);
+    assert_eq!(
+        domains[0]["local_changes"], 2,
+        "the local edit, and the MANIFEST connecting as `brand` wrote the name into"
+    );
     let probe_error = domains[0]["probe_error"]
         .as_str()
         .expect("probe_error must carry the offline message");
@@ -2185,6 +2194,10 @@ async fn a_pulled_manifest_flips_the_policy_for_the_next_share_with_no_state_cha
     )
     .await
     .unwrap();
+    // The name's write-back sits in the MANIFEST's frontmatter exactly where
+    // the upstream edit below lands, and would make this pull a conflict
+    // (pinned on its own in `origin_names`); the subject here is the policy.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
 
     // Upstream flips the policy; the pull brings it down as an ordinary edit.
     let flipped = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
@@ -2254,7 +2267,16 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
     assert_eq!(plan["branch"], "main");
     assert_eq!(plan["sharing"], "direct");
     assert_eq!(plan["repo"], "acme/brand-knowledge");
-    assert_eq!(plan["changes"][0]["path"], "notes/new.md");
+    // The new engram, and the MANIFEST that connecting as `brand` wrote the
+    // name into: both are this domain's unshared work.
+    let mut paths: Vec<&str> = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["MANIFEST.md", "notes/new.md"], "{plan}");
 
     // A proposal this machine recorded stands in the way, by number and url.
     let state_dir = origins_dir.join("brand");
@@ -2425,6 +2447,8 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     )
     .await
     .unwrap();
+    // The scenario is a domain with nothing of its own unshared.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
 
     let found = |needle: &'static str| {
         let eng = &eng;
@@ -2904,7 +2928,13 @@ async fn origin_withdraw_with_revert_restores_files() {
         .origin_withdraw("kb", Some(number), true, ShareActor::Owner)
         .await
         .unwrap();
-    assert_eq!(v["restored"][0], "notes/a.md");
+    // The share carried the engram and the MANIFEST connecting as `kb` wrote
+    // the name into, so the revert puts both back.
+    assert_eq!(
+        v["restored"],
+        serde_json::json!(["MANIFEST.md", "notes/a.md"]),
+        "{v}"
+    );
     let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
     assert!(!text.contains("alpha v2"), "restored to base: {text}");
 }
@@ -3643,6 +3673,9 @@ async fn reviewing_domain(
     )
     .await
     .unwrap();
+    // Review mode refuses to start over an unshared folder change, and the
+    // explicit name's write-back is one; these scenarios are about drafts.
+    crate::support::discard_name_write_back(&eng, "team", &root).await;
     eng.set_review_mode(
         "team",
         Some(crystalline_core::config::ReviewMode::Overlay),
@@ -4383,10 +4416,15 @@ async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        direct_plan["changes"][0]["last_author"], "human:ada",
-        "{direct_plan}"
-    );
+    // Looked up by path: the MANIFEST connecting as `kb` wrote the name into
+    // travels in the same plan.
+    let authored = direct_plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "notes/authored.md")
+        .unwrap_or_else(|| panic!("the authored engram is in the plan: {direct_plan}"));
+    assert_eq!(authored["last_author"], "human:ada", "{direct_plan}");
 }
 
 /// A base path the state directory holds no copy of is an error naming the way
@@ -5824,6 +5862,9 @@ async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
     )
     .await
     .unwrap();
+    // Exactly one change is the subject, so the name's write-back into the
+    // MANIFEST is put back first.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
 
     // One substantive change the team has not seen.
     std::fs::write(
@@ -5897,6 +5938,9 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
     )
     .await
     .unwrap();
+    // A domain that owes nothing is the subject, so the name's write-back
+    // into the MANIFEST is put back first.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
 
     // Counted for this domain's own folder, which is this test's tempdir: a
     // sibling test in this binary walks its own team domain, and `cargo test`

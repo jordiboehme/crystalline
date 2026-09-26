@@ -7,8 +7,12 @@ impl Engine {
     /// subtree, registers it in the global config and brings it into the
     /// index, mirroring what `domain add` does for a local folder.
     ///
-    /// `domain` defaults to the repository's own name segment; `folder`
-    /// defaults to `~/Documents/Crystalline/<domain>`. `path` is the
+    /// Without `domain`, the name is the `domain_name` the repository's
+    /// MANIFEST declares (read through the forge first; stepped to
+    /// `<name>-2` when taken, never adopting the holder), else the
+    /// repository's own name segment; `folder` defaults to
+    /// `<domains_root>/<domain>`. An explicit name is written into a MANIFEST
+    /// that declares none, as a pending local change. `path` is the
     /// subfolder within the repository that is the domain root (absent means
     /// the repository root); `branch` defaults to the repository's default
     /// branch, asked from the forge and recorded in the entry.
@@ -22,7 +26,9 @@ impl Engine {
     /// of the exact same connect - matching repo, subpath, branch and folder -
     /// instead returns `{ domain, root, engrams, base_commit, already_connected:
     /// true }`, so a client that timed out on the first attempt reads the
-    /// connected state rather than a conflict.
+    /// connected state rather than a conflict. Both also carry the name
+    /// fields every registration result does: `name_origin`,
+    /// `canonical_name`, `aliases`, `shadowed` and, when shadowed, a `note`.
     pub async fn origin_add(
         &self,
         repo: &str,
@@ -61,23 +67,74 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
 
-        let domain_name = match domain {
-            Some(d) => d.to_string(),
-            None => origin::default_domain_name(repo),
+        // The name, in order: the caller's own; else the `domain_name` the
+        // repository's MANIFEST declares, read through the forge before
+        // anything is downloaded; else the repository's own name. A nameless
+        // connect needs the provider and the branch for that read, so it
+        // resolves both here and the download below reuses them.
+        let mut resolved: Option<(Arc<dyn Provider>, String)> = None;
+        let (domain_name, name_origin, declared_by_manifest) = match domain {
+            Some(d) => (d.to_string(), NameOrigin::Explicit, false),
+            None => {
+                // A retry of a nameless connect that already landed answers
+                // the connected state before anything else, and without a
+                // network call: the name it landed on may be a stepped one,
+                // or one the MANIFEST gave, so looking the repository's
+                // default name up (or re-reading the MANIFEST, whose name is
+                // now taken by that very connect) would miss it and connect
+                // a second copy.
+                if let Some((name, entry)) = self.connection_matching(repo, path, branch, folder) {
+                    return self.origin_already_connected(&name, &entry).await;
+                }
+                let provider = self.resolve_origin_provider()?;
+                let branch_name = self
+                    .origin_branch_or_default(provider.as_ref(), repo, branch)
+                    .await?;
+                let declared = self
+                    .origin_manifest_name(provider.as_ref(), repo, path, &branch_name)
+                    .await;
+                resolved = Some((provider, branch_name));
+                let entries = self.registered_domain_entries();
+                let table = self.name_table_now().await;
+                let choice = choose_domain_name(
+                    None,
+                    declared.as_deref(),
+                    || origin::default_domain_name(repo),
+                    |candidate| {
+                        entries.contains_key(candidate) || table.resolve(candidate).is_some()
+                    },
+                );
+                let declared_by_manifest = declared
+                    .as_deref()
+                    .is_some_and(|d| validate_domain_name(d).is_ok());
+                (choice.name, choice.origin, declared_by_manifest)
+            }
         };
         // A name nothing holds is a new registration: check it before the
         // default folder is derived from it. A derived name passes by
-        // construction (`origin::default_domain_name`); an explicit one may
-        // not.
+        // construction (`origin::default_domain_name`, and
+        // `choose_domain_name` only ever hands back a MANIFEST name, stepped
+        // or not, that validates); an explicit one may not.
         if self.domain_entry(&domain_name).is_err() {
             validate_domain_name(&domain_name).map_err(EngineError::Invalid)?;
         }
+        // Open issue 4, ruled: an explicit name and the repository default
+        // keep adopting an origin-less domain that holds them in place, as
+        // they always have; a MANIFEST-declared name that is taken has
+        // already stepped to `<name>-2` above and never adopts. This one
+        // flag is the whole ruling, so a different one flips it here.
+        let adopts_in_place = !declared_by_manifest;
         // A registered name is adoptable when it is an origin-less file
         // domain and the caller does not point somewhere else: the origin
         // attaches to the existing root in place and local knowledge is
         // kept. Anything else stays a conflict.
         let existing = match self.domain_entry(&domain_name) {
             Err(_) => None,
+            Ok(_) if !adopts_in_place => {
+                return Err(EngineError::Conflict(format!(
+                    "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
+                )));
+            }
             Ok(entry) => {
                 // An env-defined domain names the variable that owns it, so
                 // the operator knows to unset it rather than pick another
@@ -163,18 +220,15 @@ impl Engine {
                 None,
             ),
         };
-        let provider = self.resolve_origin_provider()?;
-        // No branch named: ask the forge which branch the repository calls its
-        // default and record that, so the entry says what it tracks. Never a
-        // silent `main`: a repository whose default is `trunk` would track a
-        // branch that does not exist. A failed lookup refuses the add.
-        let branch_name = match branch {
-            Some(b) => b.to_string(),
-            None => provider
-                .default_branch(repo)
-                .await
-                .inspect_err(|e| self.drop_github_credential_on_auth(e))
-                .map_err(|e| default_branch_refusal(repo, e))?,
+        let (provider, branch_name) = match resolved {
+            Some(both) => both,
+            None => {
+                let provider = self.resolve_origin_provider()?;
+                let branch_name = self
+                    .origin_branch_or_default(provider.as_ref(), repo, branch)
+                    .await?;
+                (provider, branch_name)
+            }
         };
         let spec = OriginSpec {
             repo: repo.to_string(),
@@ -200,32 +254,31 @@ impl Engine {
         {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard);
-            // Adopting a registered domain keeps the decisions already made
-            // about it: whether its artifacts are provisioned, and whether it
-            // reviews changes. Read from the file when it holds the entry,
-            // else from the entry this call adopted.
-            let (provision, review) = file
+            // Adopting a registered domain keeps everything already decided
+            // about it - whether its artifacts are provisioned, whether it
+            // reviews changes, the aliases it answers to and the canonical
+            // name it last saw - and gains the origin. Built from the file
+            // when it holds the entry, else from the entry this call adopted.
+            let mut entry = file
                 .domains
                 .get(&domain_name)
                 .or(adopted_entry.as_ref())
-                .map(|e| (e.provision, e.review))
-                .unwrap_or((None, None));
-            file.domains.insert(
-                domain_name.clone(),
-                DomainEntry {
-                    kind: CoreDomainKind::File,
-                    path: Some(root.clone()),
-                    origin: Some(OriginConfig {
-                        repo: repo.to_string(),
-                        path: path.map(str::to_string),
-                        branch: Some(branch_name.clone()),
-                        poll_secs: None,
-                    }),
-                    provision,
-                    review,
-                    ..Default::default()
-                },
-            );
+                .cloned()
+                .unwrap_or_default();
+            entry.kind = CoreDomainKind::File;
+            entry.path = Some(root.clone());
+            entry.origin = Some(OriginConfig {
+                repo: repo.to_string(),
+                path: path.map(str::to_string),
+                branch: Some(branch_name.clone()),
+                poll_secs: None,
+            });
+            // How THIS connect arrived at the name, adoption included: a
+            // nameless connect that adopted the repository default records
+            // `derived` even over an entry that said `explicit`, so its
+            // defaulted name is never written into the team's MANIFEST.
+            entry.name_origin = Some(name_origin);
+            file.domains.insert(domain_name.clone(), entry);
             self.persist_config(&file)?;
             let effective = self.overlay.apply(&file);
             *file_guard = file;
@@ -245,6 +298,24 @@ impl Engine {
 
         progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
+        // A name the caller gave is written into a MANIFEST that declares
+        // none, through the ordinary edit path, so in a team domain it is a
+        // pending local change the next share carries and never a proposal
+        // of its own. A derived name never is: one the MANIFEST gave is
+        // already there, and a repository default must not be pushed into
+        // the team's file (the guard in `write_back_domain_name` says the
+        // same). Best effort: the connect has landed and must not be undone
+        // by a MANIFEST write that fails afterwards.
+        if name_origin == NameOrigin::Explicit
+            && let Err(e) = self.write_back_domain_name(&domain_name).await
+        {
+            tracing::warn!(
+                domain = %domain_name,
+                error = %e,
+                "writing the domain name back into its MANIFEST failed"
+            );
+        }
+        self.refresh_names().await;
         // Embedding a whole freshly connected repo can outlast any client
         // timeout, so a daemon or in-process MCP server runs it on the embed
         // worker; without a worker (standalone one-shot commands, tests) the
@@ -257,7 +328,7 @@ impl Engine {
         }
 
         progress_at(4, "connected");
-        Ok(json!({
+        let mut result = json!({
             "domain": domain_name,
             "root": root.display().to_string(),
             "engrams": report.engrams,
@@ -265,7 +336,102 @@ impl Engine {
             "adopted": report.adopted || adopts_registered,
             "files_added": report.files_written,
             "local_changes": report.local_changes,
-        }))
+        });
+        self.append_name_fields(&mut result, &domain_name).await?;
+        Ok(result)
+    }
+
+    /// The branch a connect tracks: the one asked for, else the one the forge
+    /// calls the repository's default. Never a silent `main`: a repository
+    /// whose default is `trunk` would track a branch that does not exist. A
+    /// failed lookup refuses the connect.
+    async fn origin_branch_or_default(
+        &self,
+        provider: &dyn Provider,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        match branch {
+            Some(b) => Ok(b.to_string()),
+            None => Ok(provider
+                .default_branch(repo)
+                .await
+                .inspect_err(|e| self.drop_github_credential_on_auth(e))
+                .map_err(|e| default_branch_refusal(repo, e))?),
+        }
+    }
+
+    /// The `domain_name` the MANIFEST at the root of the connected subtree
+    /// declares on `branch`, read through the forge before anything is
+    /// downloaded, or `None` when it declares none, is missing or cannot be
+    /// read. A failed read is only logged: the connect goes on under the
+    /// repository's own name, and the download that follows reports any real
+    /// problem with the repository in its own words.
+    async fn origin_manifest_name(
+        &self,
+        provider: &dyn Provider,
+        repo: &str,
+        subpath: Option<&str>,
+        branch: &str,
+    ) -> Option<String> {
+        let file = match subpath
+            .map(|s| s.trim_matches('/'))
+            .filter(|s| !s.is_empty())
+        {
+            Some(sub) => format!("{sub}/MANIFEST.md"),
+            None => "MANIFEST.md".to_string(),
+        };
+        let spec = OriginSpec {
+            repo: repo.to_string(),
+            subpath: subpath.map(str::to_string),
+            branch: branch.to_string(),
+        };
+        match provider.read_file(&spec, branch, &file).await {
+            Ok(Some(bytes)) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| domain_name_of_source(&text)),
+            Ok(None) => None,
+            Err(e) => {
+                self.drop_github_credential_on_auth(&e);
+                tracing::warn!(
+                    repo = %repo,
+                    file = %file,
+                    error = %e,
+                    "reading the MANIFEST before connecting failed; naming the domain after the repository"
+                );
+                None
+            }
+        }
+    }
+
+    /// The registered domain an earlier NAMELESS connect already connected
+    /// exactly the way this request asks, judged the way a retry is
+    /// everywhere else ([`origin_matches_request`](Self::origin_matches_request)),
+    /// so a nameless retry finds its connection whatever name it landed on.
+    ///
+    /// Only a domain whose name was derived counts: a nameless retry can only
+    /// repeat a nameless connect, and the match is loose on purpose (no branch
+    /// asked for matches any, no folder matches any root), so a domain
+    /// somebody connected to the same repository under a name of their own,
+    /// on another branch, must not answer for it.
+    fn connection_matching(
+        &self,
+        repo: &str,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+    ) -> Option<(String, DomainEntry)> {
+        self.registered_domain_entries()
+            .into_iter()
+            .find(|(name, entry)| {
+                let derived = entry.name_origin.unwrap_or_else(|| {
+                    infer_name_origin(name, entry, self.overlay.env_domain(name).is_some())
+                }) == NameOrigin::Derived;
+                derived
+                    && entry.origin.as_ref().is_some_and(|origin_cfg| {
+                        Self::origin_matches_request(entry, origin_cfg, repo, path, branch, folder)
+                    })
+            })
     }
 
     /// Whether a registered domain's origin matches this connect request
@@ -337,13 +503,15 @@ impl Engine {
                 .map(|d| d.engrams)
                 .unwrap_or(0)
         };
-        Ok(json!({
+        let mut result = json!({
             "domain": name,
             "root": root.display().to_string(),
             "engrams": engrams,
             "base_commit": base_commit,
             "already_connected": true,
-        }))
+        });
+        self.append_name_fields(&mut result, name).await?;
+        Ok(result)
     }
 
     /// Brings one origin-connected domain (or every one, when `domain` is

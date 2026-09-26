@@ -758,6 +758,9 @@ async fn a_poll_tick_converges_a_merged_draft() {
     )
     .await
     .unwrap();
+    // Review mode refuses to start over an unshared folder change, and the
+    // explicit name's write-back is one; this scenario is about a draft.
+    crate::support::discard_name_write_back(&eng, "team", &root).await;
     eng.set_review_mode(
         "team",
         Some(crystalline_core::config::ReviewMode::Overlay),

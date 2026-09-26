@@ -2090,6 +2090,9 @@ async fn edited_team_engine(tmp: &tempfile::TempDir) -> (Arc<Engine>, std::path:
     )
     .await
     .unwrap();
+    // The fixture is exactly one edit and one new file, so the name's
+    // write-back into the MANIFEST is put back first.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
     std::fs::write(
         root.join("notes/a.md"),
         engram("Alpha", "notes/a", "alpha, edited"),
@@ -2282,6 +2285,9 @@ async fn discard_changes_clears_only_the_callers_draft_in_a_reviewing_domain() {
     )
     .await
     .unwrap();
+    // Review mode refuses to start over an unshared folder change, and the
+    // explicit name's write-back is one; this scenario is about drafts.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
     eng.set_review_mode(
         "brand",
         Some(crystalline_core::config::ReviewMode::Overlay),
@@ -2696,7 +2702,9 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     let domains = out["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], json!("brand"));
-    assert_eq!(domains[0]["local_changes"], json!(1));
+    // The local file, and the MANIFEST connecting as `brand` wrote the name
+    // into.
+    assert_eq!(domains[0]["local_changes"], json!(2));
     assert!(
         domains[0].get("detail").is_none(),
         "nobody asked for detail: {}",
@@ -2742,6 +2750,9 @@ async fn origin_status_names_the_drafts_a_reviewing_domain_holds() {
     )
     .await
     .unwrap();
+    // Review mode refuses to start over an unshared folder change, and the
+    // explicit name's write-back is one; this scenario is about drafts.
+    crate::support::discard_name_write_back(&eng, "brand", &root).await;
     eng.set_review_mode(
         "brand",
         Some(crystalline_core::config::ReviewMode::Overlay),

@@ -94,6 +94,10 @@ serde_json = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
+# The stand-in forge in `tests/team/origin.rs` answers a connect's download
+# with a real GitHub-shaped tar.gz archive, built in the test.
+flate2 = { workspace = true }
+tar = { workspace = true }
 # The degraded-stub binary test holds an exclusive index lock in the test
 # process (the fs4 lock a rival daemon would hold) so the spawned `mcp` child
 # fails to acquire it and serves the stub.

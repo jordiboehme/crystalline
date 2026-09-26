@@ -146,6 +146,38 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
+/// Puts a freshly connected team domain's MANIFEST back the way the team has
+/// it, for a fixture whose subject is not the name.
+///
+/// Connecting under an explicit name writes `domain_name` into a MANIFEST
+/// that declares none, as a pending local change the next share carries. A
+/// fixture that goes on to enable review, or counts a share's files, would
+/// otherwise be about that line instead of its own subject; this drops it
+/// through the engine's own discard path, the one a person would use.
+pub async fn discard_name_write_back(
+    eng: &crystalline_service::Engine,
+    domain: &str,
+    root: &std::path::Path,
+) {
+    let current = std::fs::read(root.join("MANIFEST.md")).unwrap();
+    let discarded = eng
+        .discard_local_changes(
+            domain,
+            &[crystalline_remote::ops::DiscardTarget {
+                path: "MANIFEST.md".to_string(),
+                sha256: Some(sha256_hex(&current)),
+            }],
+            &crystalline_service::engine::ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        discarded["restored"],
+        serde_json::json!(["MANIFEST.md"]),
+        "the name write-back is the one change a fresh connect leaves: {discarded}"
+    );
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -180,6 +212,11 @@ struct Inner {
     /// Whether `default_branch` fails with `RemoteError::Offline`. Set through
     /// `MockProvider::fail_default_branch`.
     default_branch_fails: bool,
+    /// Whether `read_file` fails with `RemoteError::Offline`. Set through
+    /// `MockProvider::fail_read_file`.
+    read_file_fails: bool,
+    /// Every `read_file` call as `(reference, path)`, in order.
+    read_file_calls: Vec<(String, String)>,
     /// Branches whose `branch_head` probe should fail with
     /// `RemoteError::Offline`, simulating a live network outage. Set through
     /// `MockProvider::fail_branch_head_offline`.
@@ -356,6 +393,16 @@ impl MockProvider {
     /// Makes every `default_branch` call fail with `RemoteError::Offline`.
     pub fn fail_default_branch(&self) {
         self.inner.lock().unwrap().default_branch_fails = true;
+    }
+
+    /// Makes every `read_file` call fail with `RemoteError::Offline`.
+    pub fn fail_read_file(&self) {
+        self.inner.lock().unwrap().read_file_fails = true;
+    }
+
+    /// Every `read_file` call so far as `(reference, path)`, in order.
+    pub fn read_file_calls(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().read_file_calls.clone()
     }
 
     /// Adds a commit built from repo-relative path to content pairs and
@@ -742,6 +789,33 @@ impl Provider for MockProvider {
             files,
             truncated: false,
         })
+    }
+
+    async fn read_file(
+        &self,
+        _origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        // Answered from the tree the reference names (a branch, else a commit
+        // id), so the file a connect reads first is the very one its download
+        // then lands on disk.
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .read_file_calls
+            .push((reference.to_string(), path.to_string()));
+        if inner.read_file_fails {
+            return Err(RemoteError::Offline);
+        }
+        let commit = inner
+            .branches
+            .get(reference)
+            .cloned()
+            .unwrap_or_else(|| reference.to_string());
+        Ok(inner
+            .commits
+            .get(&commit)
+            .and_then(|c| c.files.get(path).cloned()))
     }
 
     async fn blob(&self, _origin: &OriginSpec, sha: &str) -> Result<Vec<u8>, RemoteError> {
