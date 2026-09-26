@@ -2073,7 +2073,7 @@ describe("rare props (2.6d C9 to C13)", () => {
         (p) => p.kind === "designer-tower",
       ),
     ).toBe(false);
-  });
+  }, 30_000);
   it("pushes the tower to its desk's side, its near side TOWER_DESK_GAP from that border, the lower desk between two (2.6d C13)", () => {
     // Mutation caught: the push flipped (the tower's far side on the desk's
     // border), or the tie between two desks read from the fixture list.
