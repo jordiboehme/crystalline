@@ -1040,11 +1040,13 @@ async fn an_explicit_name_is_kept_and_the_canonical_resolves_to_it() {
 }
 
 /// A declared name another domain registers here is left shadowed: the
-/// derived domain keeps its name.
+/// derived domain keeps its name, quietly and with nothing written, and
+/// takes the name on the first sync after the other domain is gone.
 #[tokio::test]
-async fn a_taken_name_is_left_shadowed() {
+async fn a_taken_name_is_left_shadowed_until_it_is_free() {
     let tmp = tempfile::tempdir().unwrap();
-    let ops = declared_folder(tmp.path(), "ops", "ops");
+    // `ops` holds the name as its local name and declares none of its own.
+    let ops = bare_manifest_folder(tmp.path(), "ops", "Ops");
     let eng = declared_folder(tmp.path(), "eng", "ops");
     let engine = adopting_engine(
         memory_store().await,
@@ -1061,16 +1063,54 @@ async fn a_taken_name_is_left_shadowed() {
         ],
     );
 
-    sync_and_adopt(&engine).await;
+    let report = sync_and_adopt(&engine).await;
+    assert_eq!(
+        report,
+        serde_json::json!([{
+            "domain": "eng", "canonical": "ops", "action": "shadowed", "held_by": "ops"
+        }]),
+        "{report}"
+    );
 
     let cfg = saved(tmp.path());
     assert!(cfg.domains.contains_key("eng") && cfg.domains.contains_key("ops"));
-    assert_eq!(cfg.domains["eng"].canonical_seen.as_deref(), Some("ops"));
+    assert_eq!(
+        cfg.domains["eng"].canonical_seen, None,
+        "a shadowed name is not recorded as seen, so it is adopted once free"
+    );
     assert!(engine.name_table_now().await.is_shadowed("eng"));
     assert_eq!(
         engine.local_domain_name("ops").await.as_deref(),
         Some("ops")
     );
+
+    // A second pass changes nothing on disk.
+    let config_bytes = std::fs::read(tmp.path().join("config.yaml")).unwrap();
+    sync_and_adopt(&engine).await;
+    assert_eq!(
+        std::fs::read(tmp.path().join("config.yaml")).unwrap(),
+        config_bytes
+    );
+
+    // The other claimant gives the name up (renamed here, so `ops` is left
+    // to it only as an alias, which a declared name outranks): the next sync
+    // adopts the name.
+    engine
+        .rename_domain_local(
+            "ops",
+            "operations",
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let report = sync_and_adopt(&engine).await;
+    let cfg = saved(tmp.path());
+    assert!(!cfg.domains.contains_key("eng"), "{report}");
+    let entry = &cfg.domains["ops"];
+    assert_eq!(entry.name_origin, Some(NameOrigin::Derived));
+    assert!(entry.aliases.contains(&"eng".to_string()), "{entry:?}");
+    assert_eq!(entry.canonical_seen.as_deref(), Some("ops"));
 }
 
 /// A changed canonical name: the previous one becomes an alias and the
@@ -1132,8 +1172,8 @@ async fn an_environment_domain_is_never_renamed() {
 }
 
 /// The one-time catch-up for a config written before 0.20.0: every entry
-/// gets its name origin inferred, local domains declare their name in their
-/// MANIFEST, team domains never get one written (explicit or derived), and a
+/// gets its name origin inferred, local file domains declare their name in
+/// their MANIFEST and a virtual domain in its database MANIFEST, team domains never get one written (explicit or derived), and a
 /// second pass writes nothing.
 #[tokio::test]
 async fn the_catch_up_infers_every_origin_once_and_writes_local_manifests_only() {
@@ -1159,8 +1199,20 @@ async fn the_catch_up_infers_every_origin_once_and_writes_local_manifests_only()
             ("my-notes", DomainEntry::file(notes.clone())),
             ("kb", team(kb.clone(), "acme/kb")),
             ("handbook", team(handbook.clone(), "acme/eng-handbook")),
+            ("scratch", DomainEntry::virtual_domain()),
         ],
     );
+    // The virtual domain's MANIFEST lives in the database and, from before
+    // 0.20.0, declares no name.
+    engine
+        .scaffold_virtual_manifest(
+            "scratch",
+            "---\ntype: manifest\ntitle: Scratch\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Scratch\n\n## Scope\n\n- x\n\n## When to Use\n\n- x\n",
+        )
+        .await
+        .unwrap();
+    let scratch_before = engine.manifest_markdown("scratch").await.unwrap();
+    assert!(!scratch_before.contains("domain_name"), "{scratch_before}");
     let kb_before = std::fs::read(kb.join("MANIFEST.md")).unwrap();
     let handbook_before = std::fs::read(handbook.join("MANIFEST.md")).unwrap();
 
@@ -1172,6 +1224,17 @@ async fn the_catch_up_infers_every_origin_once_and_writes_local_manifests_only()
     assert_eq!(origin("my-notes"), Some(NameOrigin::Explicit));
     assert_eq!(origin("kb"), Some(NameOrigin::Derived));
     assert_eq!(origin("handbook"), Some(NameOrigin::Explicit));
+    assert_eq!(origin("scratch"), Some(NameOrigin::Explicit));
+    let scratch = engine.manifest_markdown("scratch").await.unwrap();
+    assert_eq!(
+        crystalline_core::domain_name_of_source(&scratch).as_deref(),
+        Some("scratch"),
+        "the database MANIFEST declares the name: {scratch}"
+    );
+    assert_eq!(
+        engine.local_domain_name("scratch").await.as_deref(),
+        Some("scratch")
+    );
     let declared = |root: &Path| {
         crystalline_core::domain_name_of_source(
             &std::fs::read_to_string(root.join("MANIFEST.md")).unwrap(),
@@ -1202,6 +1265,11 @@ async fn the_catch_up_infers_every_origin_once_and_writes_local_manifests_only()
     for (root, before) in roots.iter().zip(manifests) {
         assert_eq!(std::fs::read(root.join("MANIFEST.md")).unwrap(), before);
     }
+    assert_eq!(
+        engine.manifest_markdown("scratch").await.unwrap(),
+        scratch,
+        "nor into the database MANIFEST"
+    );
 }
 
 /// The rename an adoption runs syncs the renamed domain, and that sync never

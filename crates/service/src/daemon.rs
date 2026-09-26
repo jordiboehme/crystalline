@@ -997,6 +997,9 @@ async fn run_watcher(
     // drops a change silently: the flag escalates the next flush to a full
     // rescan, so a full queue only costs coalescing, never a missed edit.
     let overflow = Arc::new(AtomicBool::new(false));
+    // The name adoptions a flush asks for, run on their own task: at most one
+    // running and one more queued however many flushes ask.
+    let adoptions = Arc::new(Coalesced::default());
     let cb_overflow = overflow.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
@@ -1152,10 +1155,18 @@ async fn run_watcher(
                         }
                     }
                 }
-                // A rename it runs moves this watcher's watch through the
-                // unbounded `new_roots` channel, read on the next turn.
+                // Off this task: the adoption waits on `domain_admin`, which
+                // a registration holds across a whole download, and file
+                // watching must never wait on it. A rename it runs moves this
+                // watcher's watch through the unbounded `new_roots` channel.
                 if names_may_move {
-                    engine.adopt_domain_names_after("the watch sync").await;
+                    let engine = engine.clone();
+                    adoptions.request(move || {
+                        let engine = engine.clone();
+                        async move {
+                            engine.adopt_domain_names_after("the watch sync").await;
+                        }
+                    });
                 }
                 if touched
                     && !engine.request_embed()
@@ -2401,6 +2412,70 @@ fn domain_roots(config: &GlobalConfig) -> Vec<(String, PathBuf)> {
 /// cheaper way to reconcile, and the cap also bounds the memory one burst holds.
 const MAX_DIRTY_PATHS: usize = 256;
 
+/// A job run on its own task, at most one run at a time and at most one more
+/// queued: a request while a run is going queues exactly one follow-up, and
+/// further requests fold into it. The follow-up covers them all because the
+/// job reads the state as it stands when it starts.
+#[derive(Default)]
+struct Coalesced {
+    /// `(running, queued)`.
+    state: std::sync::Mutex<(bool, bool)>,
+}
+
+impl Coalesced {
+    /// Run `job` on a task of its own now, or queue one more run of it when a
+    /// run is already going. Never waits.
+    fn request<F, Fut>(self: &Arc<Self>, job: F)
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.0 {
+                state.1 = true;
+                return;
+            }
+            state.0 = true;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            // A job that panics must not leave the slot marked running for
+            // ever: the next request starts a fresh run.
+            let _reset = ResetOnPanic(this.clone());
+            loop {
+                job().await;
+                let again = {
+                    let mut state = this.state.lock().unwrap();
+                    if state.1 {
+                        state.1 = false;
+                        true
+                    } else {
+                        state.0 = false;
+                        false
+                    }
+                };
+                if !again {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Frees a [`Coalesced`] slot when its task unwinds.
+struct ResetOnPanic(Arc<Coalesced>);
+
+impl Drop for ResetOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Ok(mut state) = self.0.state.lock()
+        {
+            *state = (false, false);
+        }
+    }
+}
+
 /// One domain's pending watcher work for a single debounce flush: a set of dirty
 /// relative markdown paths, or `full` when the batch must fall back to a full
 /// rescan.
@@ -2867,6 +2942,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Five requests while the first run is held: one run at a time, and
+    /// exactly one follow-up for the four that came in during it. The caller
+    /// never waits.
+    #[tokio::test]
+    async fn a_coalesced_job_runs_once_at_a_time_and_queues_one_more() {
+        use std::sync::atomic::AtomicUsize;
+        let queue = Arc::new(Coalesced::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let job = {
+            let (runs, active, most) = (runs.clone(), active.clone(), most.clone());
+            move || {
+                let (runs, active, most) = (runs.clone(), active.clone(), most.clone());
+                let mut gate = gate_rx.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    while !*gate.borrow_and_update() {
+                        gate.changed().await.unwrap();
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        };
+        for _ in 0..5 {
+            queue.request(job.clone());
+        }
+        let settled = |want: usize| {
+            let runs = runs.clone();
+            let queue = queue.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let idle = *queue.state.lock().unwrap() == (false, false);
+                        if runs.load(Ordering::SeqCst) == want && (want == 1 || idle) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the queue settles");
+            }
+        };
+        settled(1).await;
+        assert_eq!(*queue.state.lock().unwrap(), (true, true));
+        gate_tx.send(true).unwrap();
+        settled(2).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(most.load(Ordering::SeqCst), 1, "never two at once");
+    }
 
     fn locked() -> crystalline_index::IndexError {
         // The shape turso actually raises, catch-all variant and all.

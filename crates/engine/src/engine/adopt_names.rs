@@ -24,9 +24,11 @@ impl Engine {
     /// reaches only it here is renamed to it with
     /// [`Engine::rename_domain_local`] recorded as derived; an explicit one
     /// keeps its name; a name another domain holds here is left shadowed.
-    /// `canonical_seen` is updated in every case but a planned rename, whose
-    /// own config step records it, so a rename that fails is tried again
-    /// after the next sync.
+    /// `canonical_seen` is updated in every case but two, both so a later
+    /// pass tries again: a planned rename, whose own config step records it
+    /// (a rename that fails is tried after the next sync), and a derived
+    /// domain whose name is shadowed or contested (it adopts the name once
+    /// the other claimant goes away).
     ///
     /// Skipped for a domain an environment variable defines (nothing about it
     /// can be persisted) and for a domain a rename holds or a leftover rename
@@ -41,8 +43,10 @@ impl Engine {
     /// Answers the list of what it did, for logs and for the ctl `sync`
     /// reply's `names`: `{domain, action, ..}` with `action` one of
     /// `inferred`, `alias`, `kept`, `shadowed`, `contested`, `deferred`,
-    /// `renamed` or `failed`. Empty on a read-only instance and on an engine that knows no
-    /// configuration file of its own.
+    /// `renamed` or `failed`; a derived domain's `shadowed` or `contested`
+    /// comes back on every pass while it lasts, without a log line. Empty on
+    /// a read-only instance and on an engine that knows no configuration file
+    /// of its own.
     pub async fn adopt_domain_names(&self) -> Result<Value> {
         #[cfg(any(test, feature = "testing"))]
         self.adoptions.fetch_add(1, AtomicOrdering::Relaxed);
@@ -233,34 +237,29 @@ impl Engine {
                 }
                 continue;
             }
-            if canonical != *name {
-                if reaches_it {
-                    report.push(json!({
-                        "domain": name,
-                        "canonical": canonical,
-                        "action": "kept",
-                    }));
-                } else if table.resolve(&canonical).is_none() {
-                    // More than one domain declares it: the table warns
-                    // about that with its own fix.
-                    report.push(json!({
-                        "domain": name,
-                        "canonical": canonical,
-                        "action": "contested",
-                    }));
-                } else {
-                    tracing::warn!(
-                        "the MANIFEST of '{name}' declares domain_name '{canonical}', which \
-                         another domain answers to here; '{name}' keeps its name. Rename one \
-                         of them to line them up"
-                    );
-                    report.push(json!({
-                        "domain": name,
-                        "canonical": canonical,
-                        "action": "shadowed",
-                        "held_by": table.resolve(&canonical),
-                    }));
+            if canonical != *name && !reaches_it {
+                // Shadowed (another domain answers to the name here) or
+                // contested (more than one declares it, which the table
+                // warns about with its own fix). A normal state, so no
+                // warning of its own. A derived domain does not record the
+                // name as seen: once the other claimant goes away, the next
+                // pass finds the name free and adopts it.
+                let held_by = table.resolve(&canonical);
+                report.push(json!({
+                    "domain": name,
+                    "canonical": canonical,
+                    "action": if held_by.is_some() { "shadowed" } else { "contested" },
+                    "held_by": held_by,
+                }));
+                if entry.name_origin == Some(NameOrigin::Derived) {
+                    continue;
                 }
+            } else if canonical != *name {
+                report.push(json!({
+                    "domain": name,
+                    "canonical": canonical,
+                    "action": "kept",
+                }));
             }
             entry.canonical_seen = Some(canonical);
             changed = true;

@@ -2138,11 +2138,20 @@ async fn sync_dispatch(
         return Ok(());
     }
     let store = cmd::local_store(route, "sync")?;
-    let synced = cmd::sync(store.clone(), &cfg, domain.as_deref(), embed, json).await;
-    // Once the sync has returned, as the daemon's ctl `sync` does: a synced
-    // MANIFEST may declare a new name. The JSON stays the report array it
-    // always was; a person reads what was renamed.
-    let names = crystalline_service::adopt_domain_names_direct(store, config.as_deref()).await?;
+    cmd::sync(store.clone(), &cfg, domain.as_deref(), embed, json).await?;
+    // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
+    // synced MANIFEST may declare a new name. A sync that failed says so and
+    // adopts nothing. The adoption cannot fail the sync that landed: its own
+    // failure is a warning. The JSON stays the report array it always was; a
+    // person reads what was renamed.
+    let names = match crystalline_service::adopt_domain_names_direct(store, config.as_deref()).await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!("warning: lining the domain names up with their MANIFESTs failed: {e:#}");
+            serde_json::Value::Array(Vec::new())
+        }
+    };
     if !json {
         for entry in names.as_array().into_iter().flatten() {
             match entry["action"].as_str() {
@@ -2161,7 +2170,7 @@ async fn sync_dispatch(
             }
         }
     }
-    synced
+    Ok(())
 }
 
 /// `reindex`: route to the daemon when one owns the index and no explicit
