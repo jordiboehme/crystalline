@@ -49,12 +49,7 @@ async fn localized_uri(state: &RestState, uri: &Uri, headers: &HeaderMap) -> Opt
     let typed = percent_decode_str(&path[start..end]).decode_utf8().ok()?;
     // The in-memory check first, so a path that already names a local name
     // (nearly every request) costs no identity lookup.
-    let local = state
-        .engine
-        .name_table_now()
-        .await
-        .resolve(&typed)?
-        .to_string();
+    let local = state.engine.local_domain_name(&typed).await?;
     if local == typed {
         return None;
     }

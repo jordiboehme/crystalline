@@ -19,26 +19,19 @@ use crate::params::DomainArgs;
 const MANIFEST_PATH: &str = "MANIFEST.md";
 
 impl Engine {
-    /// The current name table, rebuilt when stale. Never touches the store.
+    /// The current name table, rebuilt when stale. Never touches the store
+    /// once the virtual names are loaded.
     ///
-    /// A stale rebuild reads the configuration file and every file domain's
-    /// MANIFEST on the calling thread; a verb on the async path asks
-    /// [`Engine::name_table_now`] instead, which reads them on the blocking
-    /// pool.
-    pub fn name_table(&self) -> Arc<NameTable> {
-        if self.names_stale.swap(false, AtomicOrdering::SeqCst) {
-            let generation = self.names_ticket();
-            let virtual_names = self.virtual_domain_names.read().unwrap().clone();
-            let table = build_table(&self.registered_domain_entries(), &virtual_names);
-            return self.install_names(generation, table);
-        }
-        self.names.read().unwrap().1.clone()
-    }
-
-    /// [`Engine::name_table`] for a verb: a stale rebuild runs on the blocking
-    /// pool, and the first call on an engine that never read its virtual
-    /// domains' MANIFEST engrams reads them first, so a one-shot command or a
-    /// REST request before any MCP connection knows the names they declare.
+    /// A stale rebuild runs on the blocking pool, and the first call on an
+    /// engine that never read its virtual domains' MANIFEST engrams reads them
+    /// first, so a one-shot command or a REST request before any MCP
+    /// connection knows the names they declare.
+    ///
+    /// The stale mark is cleared when the rebuild starts, not when it ends:
+    /// a lookup that arrives while the build is on the pool is answered from
+    /// the table that stands. So "marked stale" means "a later lookup builds",
+    /// not "the very next lookup sees the change"; a caller that needs the
+    /// change seen at once calls [`Engine::refresh_names`] and waits for it.
     pub async fn name_table_now(&self) -> Arc<NameTable> {
         if !self.virtual_names_loaded.load(AtomicOrdering::SeqCst) {
             self.reload_virtual_manifests().await;
@@ -59,9 +52,10 @@ impl Engine {
     /// name in the database where the table build cannot reach.
     pub async fn refresh_names(&self) {
         self.reload_virtual_manifests().await;
-        // Rebuilt here rather than marked and left to `name_table`: a lookup
-        // racing this call may have taken the stale mark and be building from
-        // what it read before, and the push must carry what is true now.
+        // Rebuilt here rather than marked and left to `name_table_now`: a
+        // lookup racing this call may have taken the stale mark and be
+        // building from what it read before, and the push must carry what is
+        // true now.
         self.names_stale.store(false, AtomicOrdering::SeqCst);
         let table = self.rebuild_names().await;
         let pairs = table.spellings();
@@ -71,23 +65,20 @@ impl Engine {
         }
     }
 
-    /// The local name `spelling` resolves to, if any.
-    pub fn local_domain_name(&self, spelling: &str) -> Option<String> {
-        self.name_table().resolve(spelling).map(str::to_string)
-    }
-
-    /// `local_domain_name`, falling back to the input unchanged so a later
-    /// `UnknownDomain` names what the caller typed.
-    pub fn localize(&self, spelling: &str) -> String {
-        self.local_domain_name(spelling)
-            .unwrap_or_else(|| spelling.to_string())
+    /// The local name `spelling` resolves to, if any, for a caller that may
+    /// see every domain.
+    pub async fn local_domain_name(&self, spelling: &str) -> Option<String> {
+        self.table_knowing([spelling.to_string()])
+            .await
+            .resolve(spelling)
+            .map(str::to_string)
     }
 
     /// `localize` for one caller: a spelling that resolves to a domain in
     /// `hidden` stays exactly as typed, so the ordinary unknown-domain path
     /// answers it with the caller's own words and never names the local name.
     pub async fn localize_visible(&self, spelling: &str, hidden: &HashSet<String>) -> String {
-        let table = self.name_table_now().await;
+        let table = self.table_knowing([spelling.to_string()]).await;
         localize_in(&table, spelling, hidden)
     }
 
@@ -95,7 +86,7 @@ impl Engine {
     /// [`Engine::localize_visible`]. Mapping a local name answers it
     /// unchanged, so a value localized twice is localized once.
     pub async fn localized<P: DomainArgs + Clone>(&self, p: &P, hidden: &HashSet<String>) -> P {
-        let table = self.name_table_now().await;
+        let table = self.table_knowing(spellings_of(p)).await;
         let mut p = p.clone();
         p.localize_domains(&|spelling| localize_in(&table, spelling, hidden));
         p
@@ -110,7 +101,7 @@ impl Engine {
         p: &P,
         scope: &crate::scope::Scope,
     ) -> Result<P> {
-        let table = self.name_table_now().await;
+        let table = self.table_knowing(spellings_of(p)).await;
         let respelled = std::cell::Cell::new(false);
         let mut probe = p.clone();
         probe.localize_domains(&|spelling| {
@@ -127,6 +118,35 @@ impl Engine {
         let mut p = p.clone();
         p.localize_domains(&|spelling| localize_in(&table, spelling, &hidden));
         Ok(p)
+    }
+
+    /// The table to map `spellings` through, sure to know every one of them
+    /// that is itself a registered local name.
+    ///
+    /// Local names always win, but the cached table only knows the
+    /// registrations it was built from, and a registration written by another
+    /// process (the CLI's `domain add` with a daemon running) marks nothing
+    /// stale here. Mapped through such a table, the new domain's own name
+    /// would land on the older domain whose canonical name or alias it
+    /// shadows. So a spelling the table would map to a DIFFERENT local name
+    /// is first looked up in the registrations as they stand, and a hit
+    /// rebuilds the table before anything is mapped. A spelling the table
+    /// maps to itself, or to nothing, costs no read at all.
+    async fn table_knowing(&self, spellings: impl IntoIterator<Item = String>) -> Arc<NameTable> {
+        let table = self.name_table_now().await;
+        let respelled: Vec<String> = spellings
+            .into_iter()
+            .filter(|s| table.resolve(s).is_some_and(|local| local != s))
+            .collect();
+        if respelled.is_empty() {
+            return table;
+        }
+        let entries = self.registered_domain_entries_now().await;
+        if !respelled.iter().any(|s| entries.contains_key(s)) {
+            return table;
+        }
+        self.mark_names_stale();
+        self.name_table_now().await
     }
 
     /// How many times the spelling push replaced the index's spellings since
@@ -420,6 +440,16 @@ fn build_table(
     NameTable::build(&inputs)
 }
 
+/// Every domain spelling `p` carries, as written.
+fn spellings_of<P: DomainArgs + Clone>(p: &P) -> Vec<String> {
+    let seen = std::cell::RefCell::new(Vec::new());
+    p.clone().localize_domains(&|spelling| {
+        seen.borrow_mut().push(spelling.to_string());
+        spelling.to_string()
+    });
+    seen.into_inner()
+}
+
 /// The local name `spelling` means in `table`, unless that domain is in
 /// `hidden`: then, as for a spelling nothing answers to, the spelling itself.
 fn localize_in(table: &NameTable, spelling: &str, hidden: &HashSet<String>) -> String {
@@ -491,7 +521,7 @@ mod tests {
             None,
             Some(config_path),
         );
-        assert_eq!(engine.name_table().resolve("fresh-alias"), None);
+        assert_eq!(engine.name_table_now().await.resolve("fresh-alias"), None);
 
         let mut saved = GlobalConfig::default();
         let mut entry = DomainEntry::virtual_domain();
@@ -499,6 +529,9 @@ mod tests {
         saved.domains.insert("fresh".to_string(), entry);
         engine.persist_config(&saved).unwrap();
 
-        assert_eq!(engine.name_table().resolve("fresh-alias"), Some("fresh"));
+        assert_eq!(
+            engine.name_table_now().await.resolve("fresh-alias"),
+            Some("fresh")
+        );
     }
 }

@@ -133,16 +133,22 @@ async fn a_manifest_domain_name_resolves_after_sync() {
     engine.sync(None).await.unwrap();
 
     assert_eq!(
-        engine.local_domain_name("eng").as_deref(),
+        engine.local_domain_name("eng").await.as_deref(),
         Some("eng-knowledge")
     );
     assert_eq!(
-        engine.local_domain_name("eng-knowledge").as_deref(),
+        engine.local_domain_name("eng-knowledge").await.as_deref(),
         Some("eng-knowledge")
     );
-    assert_eq!(engine.local_domain_name("nowhere"), None);
-    assert_eq!(engine.localize("eng"), "eng-knowledge");
-    assert_eq!(engine.localize("nowhere"), "nowhere");
+    assert_eq!(engine.local_domain_name("nowhere").await, None);
+    assert_eq!(
+        engine.localize_visible("eng", &HashSet::new()).await,
+        "eng-knowledge"
+    );
+    assert_eq!(
+        engine.localize_visible("nowhere", &HashSet::new()).await,
+        "nowhere"
+    );
     assert!(
         link_resolved(&engine, "ops", "oncall").await,
         "a link spelled with the canonical name binds"
@@ -184,10 +190,10 @@ async fn a_manifest_edit_changes_the_table() {
         .unwrap();
 
     assert_eq!(
-        engine.local_domain_name("platform").as_deref(),
+        engine.local_domain_name("platform").await.as_deref(),
         Some("eng-knowledge")
     );
-    assert_eq!(engine.local_domain_name("eng"), None);
+    assert_eq!(engine.local_domain_name("eng").await, None);
     assert!(
         !link_resolved(&engine, "ops", "oncall").await,
         "a link spelled with the former canonical name no longer binds"
@@ -226,7 +232,7 @@ async fn a_virtual_domain_declares_its_name_too() {
         vec![("scratch", DomainEntry::virtual_domain())],
     );
     engine.domain_add_virtual("scratch").await.unwrap();
-    assert_eq!(engine.local_domain_name("notes"), None);
+    assert_eq!(engine.local_domain_name("notes").await, None);
 
     engine
         .edit_engram(&replace_manifest_name("scratch", "scratch", "notes"))
@@ -234,7 +240,7 @@ async fn a_virtual_domain_declares_its_name_too() {
         .unwrap();
 
     assert_eq!(
-        engine.local_domain_name("notes").as_deref(),
+        engine.local_domain_name("notes").await.as_deref(),
         Some("scratch")
     );
     let id = store
@@ -528,19 +534,19 @@ async fn a_targeted_sync_of_the_manifest_moves_the_name() {
         .await
         .unwrap();
     assert_eq!(
-        engine.local_domain_name("platform").as_deref(),
+        engine.local_domain_name("platform").await.as_deref(),
         Some("eng-knowledge")
     );
-    assert_eq!(engine.local_domain_name("eng"), None);
+    assert_eq!(engine.local_domain_name("eng").await, None);
 
     std::fs::remove_file(&manifest).unwrap();
     engine
         .sync_paths("eng-knowledge", vec!["MANIFEST.md".to_string()])
         .await
         .unwrap();
-    assert_eq!(engine.local_domain_name("platform"), None);
+    assert_eq!(engine.local_domain_name("platform").await, None);
     assert_eq!(
-        engine.local_domain_name("old-eng").as_deref(),
+        engine.local_domain_name("old-eng").await.as_deref(),
         Some("eng-knowledge"),
         "the alias outlives the MANIFEST"
     );
@@ -570,11 +576,11 @@ async fn registering_a_virtual_domain_over_an_existing_manifest_reads_its_name()
     // The second instance has built its table, and read every virtual
     // MANIFEST it registers (none), before the registration.
     second.refresh_names().await;
-    assert_eq!(second.local_domain_name("notes"), None);
+    assert_eq!(second.local_domain_name("notes").await, None);
 
     second.domain_add_virtual("scratch").await.unwrap();
     assert_eq!(
-        second.local_domain_name("notes").as_deref(),
+        second.local_domain_name("notes").await.as_deref(),
         Some("scratch")
     );
 }
@@ -639,7 +645,46 @@ async fn a_slower_older_build_never_replaces_a_newer_table() {
     assert_eq!(standing.resolve("platform"), Some("eng-knowledge"));
     assert_eq!(standing.resolve("legacy"), None);
     assert_eq!(
-        engine.local_domain_name("platform").as_deref(),
+        engine.local_domain_name("platform").await.as_deref(),
         Some("eng-knowledge")
+    );
+}
+
+/// Another process (the CLI's `domain add` beside a running daemon) registers
+/// `eng` while `eng-knowledge` declares `domain_name: eng`. Nothing marks this
+/// engine's table stale, yet the new local name must win at once: a call
+/// naming `eng` reaches the new domain, never the one whose canonical name it
+/// shadows.
+#[tokio::test]
+async fn a_local_name_registered_by_another_process_wins_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = eng_with_alias(tmp.path()).await;
+    assert_eq!(
+        engine.local_domain_name("eng").await.as_deref(),
+        Some("eng-knowledge"),
+        "the table is built and maps the canonical name"
+    );
+
+    let mut on_disk = GlobalConfig::default();
+    on_disk.domains.insert(
+        "eng".to_string(),
+        file_domain(tmp.path(), "eng-new", "eng-new", &[]),
+    );
+    crystalline_core::config::save_yaml(&tmp.path().join("config.yaml"), &on_disk).unwrap();
+
+    let none = HashSet::new();
+    assert_eq!(engine.localize_visible("eng", &none).await, "eng");
+    let p = ReadParams {
+        identifier: "crystalline://eng/x".to_string(),
+        domain: Some("eng".to_string()),
+        share_link: None,
+    };
+    let seen = engine.localized(&p, &none).await;
+    assert_eq!(seen.domain.as_deref(), Some("eng"));
+    assert_eq!(seen.identifier, "crystalline://eng/x");
+    // The alias is untouched by the new registration.
+    assert_eq!(
+        engine.localize_visible("old-eng", &none).await,
+        "eng-knowledge"
     );
 }

@@ -6093,7 +6093,15 @@ async fn an_alias_of_a_hidden_domain_answers_like_an_unknown_name_over_mcp() {
         let unknown = answer_text(anon.peer(), tool, arg("never-registered")).await;
         for typed in ["team-secret", "old-secret"] {
             let text = answer_text(anon.peer(), tool, arg(typed)).await;
-            assert!(!text.contains("hush-lab"), "{tool} {typed}: {text}");
+            for other in ["hush-lab", "team-secret", "old-secret"]
+                .into_iter()
+                .filter(|other| *other != typed)
+            {
+                assert!(
+                    !text.contains(other),
+                    "{tool} {typed} names {other}: {text}"
+                );
+            }
             assert_eq!(
                 masked(text, typed),
                 masked(unknown.clone(), "never-registered"),

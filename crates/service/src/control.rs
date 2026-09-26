@@ -784,8 +784,10 @@ fn folds_on_the_way_in(req: &Value) -> bool {
 /// The commands whose `domain` names a domain that already exists, so any of
 /// its names will do. `origin_add` is not one: the name it carries is the one
 /// a new registration takes, and mapping it through the table would let a new
-/// domain collide with the one an alias already points at.
-const DOMAIN_REFERENCE_COMMANDS: [&str; 17] = [
+/// domain collide with the one an alias already points at. Nor is
+/// `forget_domain`: it names a domain that was just removed, and mapping that
+/// name could only land on a different, live domain.
+const DOMAIN_REFERENCE_COMMANDS: [&str; 16] = [
     "sync",
     "file_stamps",
     "scaffold_manifest",
@@ -802,7 +804,6 @@ const DOMAIN_REFERENCE_COMMANDS: [&str; 17] = [
     "origin_discard",
     "origin_resolve",
     "provision",
-    "forget_domain",
 ];
 
 /// `req` with its `domain` spelled as the local name, when it is a command
@@ -837,6 +838,54 @@ fn envelope_err(message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's `domain add eng` beside a running daemon writes the config
+    /// file from its own process and then asks the daemon to `sync` `eng`.
+    /// `eng-knowledge` declares `domain_name: eng`, and the daemon's table was
+    /// built before the registration, but the new local name wins: the sync
+    /// reaches the new domain, not the one whose canonical name it shadows.
+    #[tokio::test]
+    async fn a_sync_after_another_process_registers_a_shadowing_name_syncs_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = |name: &str, declared: &str| {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("MANIFEST.md"),
+                crystalline_core::manifest_template(declared, "2026-01-01"),
+            )
+            .unwrap();
+            crystalline_core::config::DomainEntry::file(root)
+        };
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains
+            .insert("eng-knowledge".to_string(), folder("eng-knowledge", "eng"));
+        let config_path = tmp.path().join("config.yaml");
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg.clone(),
+                None,
+                Some(config_path.clone()),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+        let (before, _) = handle(&json!({ "cmd": "sync", "domain": "eng" }), &shared).await;
+        assert_eq!(before["data"]["reports"][0]["domain"], "eng-knowledge");
+
+        // What the CLI's registration writes, from outside this engine.
+        cfg.domains
+            .insert("eng".to_string(), folder("eng-new", "eng-new"));
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+        let (reply, _) = handle(&json!({ "cmd": "sync", "domain": "eng" }), &shared).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["reports"][0]["domain"], "eng", "{reply}");
+    }
 
     /// A command naming an existing domain takes its canonical name or an
     /// alias: `sync` with `eng` syncs `eng-knowledge`, whose MANIFEST
