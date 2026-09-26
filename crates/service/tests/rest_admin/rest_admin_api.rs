@@ -555,6 +555,40 @@ async fn github_domain_name_peek_refuses_a_malformed_repo_or_path() {
     }
 }
 
+/// An empty `path` and one that is nothing but a trailing slash both name the
+/// repository root and pass validation - the regression Task 22 introduced
+/// (carried to Task 23): both used to reach past this check before the
+/// traversal guard tightened the rule. Neither repo nor GitHub is actually
+/// reachable in this fixture, so a valid path clears the 422 and lands on the
+/// same 409 "not ready" the bare `repo=acme/kb` case above answers with,
+/// which is what proves the path was accepted rather than refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_accepts_an_empty_or_trailing_slash_path_as_the_repo_root() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for path in ["", "domains/eng/"] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo=acme/kb&path={path}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "path {path:?} must be accepted as the repo root"
+        );
+    }
+}
+
 /// With `branch` omitted, the peek asks the forge for the repository's
 /// default branch before it can read anything; when that call fails (the
 /// repository is unreadable, or gone), the answer is a 4xx that names the

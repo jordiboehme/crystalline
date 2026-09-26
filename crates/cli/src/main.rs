@@ -1181,6 +1181,26 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Rename a domain: its MANIFEST `domain_name` (unless `--local`), this
+    /// machine's registered name, and every link in a domain you can write
+    /// that spells one of its former names - the old local name, the old
+    /// canonical name, every alias. Every former name keeps resolving here
+    /// afterward. `--local` renames only this machine's own record: the
+    /// MANIFEST and every link are left exactly as they are.
+    Rename {
+        /// The domain to rename: its local name, its canonical name, or any
+        /// alias.
+        domain: String,
+        /// The new name.
+        new: String,
+        /// Rename only this machine's own record; leave the MANIFEST and
+        /// every link untouched.
+        #[arg(long)]
+        local: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Who may reach a private domain: list the members, invite one at a
     /// level, or remove one. The machine operator administers every domain,
     /// so these commands need no web role and are not refused by one.
@@ -3552,6 +3572,12 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             end_drafts,
             config,
         } => on_runtime(move || domain_remove_dispatch(name, purge, end_drafts, config, db, json)),
+        DomainCommand::Rename {
+            domain,
+            new,
+            local,
+            config,
+        } => on_runtime(move || domain_rename_dispatch(domain, new, local, config, db, json)),
         DomainCommand::Members { domain, command } => {
             on_runtime(move || members::run(domain, command, json))
         }
@@ -4181,6 +4207,21 @@ async fn domain_remove_dispatch(
     )
     .await?;
     cmd::print_domain_remove(&name, &report, json);
+    Ok(())
+}
+
+async fn domain_rename_dispatch(
+    domain: String,
+    new: String,
+    local: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report =
+        crystalline_service::domain_rename(&domain, &new, local, db.as_deref(), config.as_deref())
+            .await?;
+    cmd::print_domain_rename(&report, local, json);
     Ok(())
 }
 

@@ -17,6 +17,8 @@ use crystalline_core::config::{
         derive_domain_name, needs_manifest_write_back, validate_domain_name,
     },
 };
+use crystalline_core::manifest::domain_name_at;
+use crystalline_core::names::{NameInput, NameTable};
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
     download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
@@ -1615,6 +1617,76 @@ pub fn print_domain_review(report: &serde_json::Value, json: bool) {
     }
 }
 
+// --- domain rename ------------------------------------------------------------
+
+/// Render `Engine::rename_domain`'s report (over `crystalline_service::domain_rename`,
+/// the entry point every surface calls).
+///
+/// `--local` renames only this machine's own record, so its report is printed
+/// as the one sentence that says so and nothing else: `rewritten` and
+/// `left_behind` are always empty for it (nothing outside the configuration
+/// moved), and `aliases` is not worth a second line about content that never
+/// changed. A full rename prints the domain's new name first, then one line
+/// per domain a link was rewritten in, then the paths a rewrite could not
+/// reach (read-only here), then the former names that still resolve, then a
+/// shadowing note when the engine attached one.
+pub fn print_domain_rename(report: &serde_json::Value, local_only: bool, json: bool) {
+    if json {
+        println!("{report}");
+        return;
+    }
+    let domain = report["domain"].as_str().unwrap_or("?");
+    let previous = report["previous"].as_str().unwrap_or("?");
+    if local_only {
+        println!(
+            "Renamed '{previous}' to '{domain}' on this machine only; its MANIFEST and links \
+             are unchanged."
+        );
+        return;
+    }
+    println!("Renamed '{previous}' to '{domain}'.");
+    for row in report["rewritten"].as_array().cloned().unwrap_or_default() {
+        let rewritten_domain = row["domain"].as_str().unwrap_or("?");
+        let engrams = row["engrams"].as_u64().unwrap_or(0);
+        let references = row["references"].as_u64().unwrap_or(0);
+        let link_word = if references == 1 { "link" } else { "links" };
+        let engram_word = if engrams == 1 { "engram" } else { "engrams" };
+        println!("{rewritten_domain}: {references} {link_word} in {engrams} {engram_word}");
+    }
+    let left_behind = report["left_behind"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !left_behind.is_empty() {
+        // Each row is `{domain, path, references, reason}`: the domain the
+        // caller could only read (a rewrite that failed for some other
+        // reason lands here too, with `reason` set, and reads the same way -
+        // its link was left exactly as it was, whatever stopped it).
+        let entries: Vec<String> = left_behind
+            .iter()
+            .map(|row| {
+                let domain = row["domain"].as_str().unwrap_or("?");
+                let path = row["path"].as_str().unwrap_or("?");
+                format!("{domain}/{path}")
+            })
+            .collect();
+        println!("Left as they were (read-only here): {}", entries.join(", "));
+    }
+    let aliases: Vec<String> = report["aliases"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if !aliases.is_empty() {
+        println!("Former names still work: {}", aliases.join(", "));
+    }
+    if let Some(note) = report["note"].as_str() {
+        println!("{note}");
+    }
+}
+
 // --- domain list -------------------------------------------------------------
 
 /// The slice of a domain's index stats this listing prints: how many engrams
@@ -1655,6 +1727,25 @@ impl ListedStats {
     }
 }
 
+/// The name table built from this machine's own registrations, with no index
+/// needed: each file domain's canonical name is read straight off its
+/// MANIFEST on disk, and every domain's aliases come from its own
+/// configuration entry. A virtual domain's declared name lives in its
+/// MANIFEST engram, in the database, out of reach here - it always reads as
+/// its own local name, the same answer an unsynced file domain gets too.
+fn local_name_table(cfg: &GlobalConfig) -> NameTable {
+    let inputs: Vec<NameInput> = cfg
+        .domains
+        .iter()
+        .map(|(local, entry)| NameInput {
+            local: local.clone(),
+            canonical: entry.file_path().and_then(|root| domain_name_at(&root)),
+            aliases: entry.aliases.clone(),
+        })
+        .collect();
+    NameTable::build(&inputs)
+}
+
 /// List registered domains, with engram counts when the index can be read.
 ///
 /// The registrations come from configuration, so this command always answers:
@@ -1673,6 +1764,11 @@ pub async fn domain_list(
     // overlay marks which rows an environment variable defines.
     let loaded = load(config_override)?;
     let cfg = loaded.effective;
+    // Every domain's canonical name and effective aliases, from this
+    // machine's own registrations: no index or daemon needed for this part
+    // of the listing, so it is built once, ahead of everything below that
+    // does need one.
+    let name_table = local_name_table(&cfg);
     // Why the counts are missing when they are, in the helper's words; `None`
     // once they were read, whichever route delivered them.
     let mut not_read: Option<String> = None;
@@ -1799,6 +1895,9 @@ pub async fn domain_list(
                         "instance_id": id,
                         "heartbeat_at": hb,
                     })),
+                    "canonical_name": name_table.canonical(name).unwrap_or(name),
+                    "aliases": name_table.aliases(name),
+                    "shadowed": name_table.is_shadowed(name),
                 })
             })
             .collect();
@@ -1844,12 +1943,44 @@ pub async fn domain_list(
                 }
             })
             .unwrap_or_default();
+        // The NAME column shows the local name alone, unless the canonical
+        // name (the MANIFEST `domain_name`) differs from it, in which case
+        // both appear as `local (canonical)`. ALIASES lists the former names
+        // that still resolve, `-` when there are none; `shadowed` marks a
+        // domain whose own canonical name is claimed by another domain's
+        // local name here, and so never appears in a link written that way.
+        let canonical = name_table.canonical(name).unwrap_or(name);
+        let name_col = if canonical != name.as_str() {
+            format!("{name} ({canonical})")
+        } else {
+            name.clone()
+        };
+        let aliases = name_table.aliases(name);
+        let aliases_col = if aliases.is_empty() {
+            "-".to_string()
+        } else {
+            aliases.join(", ")
+        };
+        let shadowed = if name_table.is_shadowed(name) {
+            "\tshadowed"
+        } else {
+            ""
+        };
+        // ALIASES (and the `shadowed` marker beside it) sits right after the
+        // count, at a fixed column, whether or not this row also carries a
+        // host field: `host` already brings its own leading tab, so it goes
+        // last rather than splitting the columns that are always there from
+        // the one that only sometimes is.
         match count_for(name) {
-            Some(n) => println!("{name}\t{location}\t{n} engrams{host}"),
-            None if not_read.is_some() => {
-                println!("{name}\t{location}\t(counts not read){host}")
+            Some(n) => {
+                println!("{name_col}\t{location}\t{n} engrams\t{aliases_col}{shadowed}{host}")
             }
-            None => println!("{name}\t{location}\t(not indexed){host}"),
+            None if not_read.is_some() => {
+                println!("{name_col}\t{location}\t(counts not read)\t{aliases_col}{shadowed}{host}")
+            }
+            None => {
+                println!("{name_col}\t{location}\t(not indexed)\t{aliases_col}{shadowed}{host}")
+            }
         }
     }
     Ok(())

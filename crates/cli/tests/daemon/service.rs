@@ -2555,6 +2555,43 @@ fn domain_list_with_a_daemon_reports_its_counts() {
     );
 }
 
+/// `domain rename` reaches a running daemon over the ctl `domain_rename`
+/// command (`control.rs`) exactly the way `domain remove` and `domain review`
+/// already do, rather than falling through to the standalone path and
+/// opening the index a second time while the daemon holds it.
+#[test]
+fn domain_rename_with_a_daemon_renames_it() {
+    let env = Env::new("rename-up");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["domain", "rename", "eng", "platform", "--local"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("Renamed 'eng' to 'platform' on this machine only"),
+        "{out}"
+    );
+
+    // `--local` leaves the MANIFEST (and so the canonical name it still
+    // declares, "eng") untouched, so the NAME column reads "platform (eng)"
+    // rather than a bare "platform": read the registered name itself over
+    // `--json` instead of the human column, which is what is actually under
+    // test here (the daemon route, not the NAME-column rendering).
+    let (ok, out) = env.run(&["--json", "domain", "list"]);
+    assert!(ok, "{out}");
+    let listed: Value = serde_json::from_str(out.trim()).unwrap();
+    let names: Vec<&str> = listed["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["platform"], "{listed}");
+}
+
 /// With the index unreachable, `domain list` still answers: the registrations
 /// come from configuration, and only the counts are missing. They say so in
 /// words, rather than reading as a domain nobody has synced.

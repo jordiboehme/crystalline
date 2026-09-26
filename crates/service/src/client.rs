@@ -780,6 +780,48 @@ async fn open_standalone_reporting(
     Ok(engine)
 }
 
+/// The local name `spelling` means, once an engine is open: a canonical name
+/// or a machine-local alias resolves to its registration's own local name,
+/// the same resolution `control::localized_request` gives the daemon path
+/// for every command `control::DOMAIN_REFERENCE_COMMANDS` lists, before the
+/// request ever reaches the shared engine. A name nothing answers to comes
+/// back unchanged, so the caller's own not-found wording still fires.
+///
+/// The standalone branch below has no pre-pass of its own - only the daemon
+/// path gets one for free - so a function here that opens its own engine and
+/// then calls one that expects a registration's own local name outright
+/// (unlike a data verb's `DomainArgs` params struct, which localizes itself
+/// through `Engine::localized_for`) does this once, right after opening it.
+async fn localize_standalone(engine: &Engine, spelling: &str) -> String {
+    engine
+        .localize_visible(spelling, &std::collections::HashSet::new())
+        .await
+}
+
+/// [`localize_standalone`] for the handful of verbs (`provision` among them)
+/// that never open an engine at all: built straight from the loaded
+/// configuration, the same inputs [`Engine::name_table_now`] itself reads for
+/// a file domain (a virtual domain's own declared name lives in the database,
+/// out of reach here, and is not needed by anything that calls this: none of
+/// them ever names a virtual domain by its canonical spelling).
+fn localize_in_config(cfg: &crystalline_core::config::GlobalConfig, spelling: &str) -> String {
+    let inputs: Vec<crystalline_core::names::NameInput> = cfg
+        .domains
+        .iter()
+        .map(|(local, entry)| crystalline_core::names::NameInput {
+            local: local.clone(),
+            canonical: entry
+                .file_path()
+                .and_then(|root| crystalline_core::manifest::domain_name_at(&root)),
+            aliases: entry.aliases.clone(),
+        })
+        .collect();
+    crystalline_core::names::NameTable::build(&inputs)
+        .resolve(spelling)
+        .unwrap_or(spelling)
+        .to_string()
+}
+
 /// Run a tool by name: over the socket when a daemon is up, else in-process
 /// against a directly opened store.
 pub async fn run_tool(
@@ -830,7 +872,8 @@ pub async fn scaffold_virtual_manifest(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.scaffold_virtual_manifest(domain, markdown).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.scaffold_virtual_manifest(&domain, markdown).await?)
 }
 
 /// Import engram files into a virtual domain: over the daemon when one owns the
@@ -856,8 +899,9 @@ pub async fn domain_import(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .import_domain(domain, src, overwrite, dry_run)
+        .import_domain(&domain, src, overwrite, dry_run)
         .await?)
 }
 
@@ -887,8 +931,12 @@ pub async fn tags_retag(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
     Ok(engine
-        .retag(old, new, domain, merge, dry_run, !no_alias)
+        .retag(old, new, domain.as_deref(), merge, dry_run, !no_alias)
         .await?)
 }
 
@@ -915,7 +963,8 @@ pub async fn domain_export(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.export_domain(domain, dest, force, dry_run).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.export_domain(&domain, dest, force, dry_run).await?)
 }
 
 /// What the index still holds for domains nobody registers any more, and,
@@ -1096,6 +1145,8 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    let name = localize_standalone(&engine, name).await;
+    let name = name.as_str();
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
         && auth_path.exists()
     {
@@ -1111,6 +1162,47 @@ pub async fn domain_remove(
         let _ = ctl_if_running(json!({ "v": 1, "cmd": "forget_domain", "domain": name })).await;
     }
     Ok(report)
+}
+
+/// Rename a domain everywhere this caller can write, or (`local_only`) on
+/// this machine alone: over the daemon when one owns the index, else against
+/// a directly opened store.
+///
+/// The same shape [`domain_remove`] has, and for the same reason: the CLI is
+/// the machine owner, so it passes [`Scope::Unrestricted`] and the gate
+/// resolves to `Own` on every domain. Unlike `domain_remove`, the standalone
+/// branch localizes nothing itself: [`crate::engine::Engine::rename_domain`]
+/// resolves `domain` against its own name table as the very first thing it
+/// does, before the privacy and ownership checks that follow, so a canonical
+/// name or an alias already works here exactly as it does over the daemon
+/// (`control::DOMAIN_REFERENCE_COMMANDS` never lists `domain_rename` for the
+/// same reason). It also needs no accounts database installed ahead of time:
+/// [`crate::engine::Engine::rename_domain`]'s own `rename_access` opens
+/// `web-auth.db` under the state directory itself when one exists and none
+/// was installed, the same fallback `domain_remove` has no equivalent of.
+pub async fn domain_rename(
+    domain: &str,
+    new: &str,
+    local_only: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_rename", "domain": domain, "new": new,
+            "local_only": local_only,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    Ok(engine
+        .rename_domain(domain, new, local_only, &Scope::Unrestricted)
+        .await?)
 }
 
 /// The socket request one `domain_review` call sends.
@@ -1182,6 +1274,8 @@ pub async fn domain_review(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let name = localize_standalone(&engine, name).await;
+    let name = name.as_str();
     let mode = overlay_mode.then_some(crystalline_core::config::ReviewMode::Overlay);
     let confirm = if preview {
         crate::review::ReviewModeConfirm::Preview
@@ -1278,7 +1372,13 @@ pub async fn origin_update(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.origin_update(domain, &Scope::Unrestricted).await?)
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
+    Ok(engine
+        .origin_update(domain.as_deref(), &Scope::Unrestricted)
+        .await?)
 }
 
 /// Report where one origin-connected domain (or every one) stands relative to
@@ -1312,8 +1412,12 @@ pub async fn origin_status(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
     Ok(engine
-        .origin_status(domain, detail, diff, &Scope::Unrestricted)
+        .origin_status(domain.as_deref(), detail, diff, &Scope::Unrestricted)
         .await?)
 }
 
@@ -1348,9 +1452,10 @@ pub async fn origin_share(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
         .origin_share(
-            domain,
+            &domain,
             title,
             description,
             proposal,
@@ -1382,8 +1487,9 @@ pub async fn origin_withdraw(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
+        .origin_withdraw(&domain, proposal, revert, ShareActor::Owner)
         .await?)
 }
 
@@ -1409,7 +1515,8 @@ pub async fn origin_changes(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(crate::control::origin_changes_inline(&engine, domain, path, sides).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(crate::control::origin_changes_inline(&engine, &domain, path, sides).await?)
 }
 
 /// Put named paths of one team domain back the way the team has them, for
@@ -1438,6 +1545,7 @@ pub async fn origin_discard(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     let targets: Vec<DiscardTarget> = targets
         .iter()
         .map(|(path, sha)| DiscardTarget {
@@ -1446,7 +1554,7 @@ pub async fn origin_discard(
         })
         .collect();
     Ok(engine
-        .discard_local_changes(domain, &targets, &ShareActor::Owner)
+        .discard_local_changes(&domain, &targets, &ShareActor::Owner)
         .await?)
 }
 
@@ -1479,8 +1587,9 @@ pub async fn origin_resolve(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_resolve(domain, path, keep, content, ShareActor::Owner)
+        .origin_resolve(&domain, path, keep, content, ShareActor::Owner)
         .await?)
 }
 
@@ -1605,6 +1714,12 @@ pub async fn provision(
     }
 
     let loaded = overlay::load(config_path)?;
+    // `provision` opens no engine at all (see the doc comment above), so it
+    // has no [`localize_standalone`] to call: a canonical name or alias is
+    // resolved straight from the loaded configuration instead, the same
+    // inputs an engine's own name table would read for a file domain.
+    let domain = domain.map(|d| localize_in_config(&loaded.effective, d));
+    let domain = domain.as_deref();
     let install_receipt = crystalline_core::provision::install_receipt_path()
         .map_err(|e| anyhow::anyhow!("could not resolve the install receipt path: {e}"))?;
     let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);

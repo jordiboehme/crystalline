@@ -4,7 +4,7 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
-//! sessions, tool, configure, origin_add,
+//! sessions, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
@@ -392,6 +392,29 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Rename a domain everywhere the caller can write, or (`local_only`)
+        // on this machine alone: the same entry point the JSON API's rename
+        // route calls. As the machine owner, for the reason `domain_remove`
+        // and `domain_review` above state; `domain` is not in
+        // `DOMAIN_REFERENCE_COMMANDS` because `Engine::rename_domain` already
+        // localizes it against the name table itself, before anything else it
+        // does.
+        "domain_rename" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let new = req.get("new").and_then(Value::as_str).unwrap_or("");
+            let local_only = req
+                .get("local_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match shared
+                .engine
+                .rename_domain(domain, new, local_only, &crate::scope::Scope::Unrestricted)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "origin_add" => {
             let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
             let domain = req.get("domain").and_then(Value::as_str);
@@ -631,10 +654,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
-                 domain_remove, retag, collect_orphaned_domains, name_report, \
-                 fix_local_spellings, configure, origin_add, origin_update, origin_status, origin_share, \
-                 origin_withdraw, origin_changes, origin_discard, origin_resolve, provision, \
-                 forget_domain or shutdown"
+                 domain_remove, domain_review, domain_rename, retag, collect_orphaned_domains, \
+                 name_report, fix_local_spellings, configure, origin_add, origin_update, \
+                 origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
+                 origin_resolve, provision, forget_domain or shutdown"
             )),
             false,
         ),

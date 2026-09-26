@@ -864,17 +864,35 @@ pub fn validate_repo(repo: &str) -> Result<(), RemoteError> {
 /// empty, `.` or `..` (each a way to say "no real path component" rather
 /// than name one, `..` being the one that climbs out of the subtree this
 /// surface may read).
+///
+/// An empty path, or one that is nothing but a TRAILING slash
+/// (`"domains/eng/"`), names the repository root: trimmed away before the
+/// segment check runs, so a caller who types the folder name the way a shell
+/// completion or a form field leaves it does not meet a refusal that "" or a
+/// trailing `/` never used to trigger. The leading-slash check runs on the
+/// untrimmed path first and on its own, so a bare `"/"` (all trailing slashes,
+/// nothing else) is still refused rather than trimmed down to the same empty
+/// string a genuinely empty path answers to; a slash in the MIDDLE of the
+/// path is likewise still a real, empty segment and still refused.
 pub fn validate_repo_path(path: &str) -> Result<(), RemoteError> {
-    let bad_segment = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
-    let bad = path.starts_with('/')
-        || path.contains('\\')
-        || path.contains('%')
-        || path.split('/').any(bad_segment);
-    if bad {
-        return Err(RemoteError::Refused(format!(
+    let refusal = || {
+        RemoteError::Refused(format!(
             "'{path}' is not a valid path within the repository: no leading slash, no \
              backslash, no '%' character, and no '.', '..' or empty segment"
-        )));
+        ))
+    };
+    if path.starts_with('/') {
+        return Err(refusal());
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let bad_segment = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
+    let bad =
+        trimmed.contains('\\') || trimmed.contains('%') || trimmed.split('/').any(bad_segment);
+    if bad {
+        return Err(refusal());
     }
     Ok(())
 }
@@ -1425,7 +1443,8 @@ mod tests {
     /// component" - an empty or a `.`/`..` segment - and every way a caller
     /// could try to smuggle one past a naive check: a leading slash, a raw
     /// backslash and a literal `%` (which this module's own encoder would
-    /// otherwise re-encode rather than treat as already-escaped).
+    /// otherwise re-encode rather than treat as already-escaped). A middle
+    /// slash still makes a real, empty segment and is still refused.
     #[test]
     fn validate_repo_path_rejects_traversal_and_smuggled_separators() {
         for good in ["domains/eng", "a", "a.b/c-d_e"] {
@@ -1441,9 +1460,26 @@ mod tests {
             "a//b",
             ".",
             "..",
-            "",
+            // A bare `/`, or one with more slashes behind it, is not the same
+            // as an empty path: the leading-slash check runs on it before the
+            // trailing slashes are trimmed away, so it is refused rather than
+            // silently read as the repository root.
+            "/",
+            "///",
         ] {
             assert!(validate_repo_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An empty path, or one that is nothing but a trailing slash, names the
+    /// repository root and is accepted - the regression Task 22 introduced
+    /// (F-carry to Task 23): both used to work before the traversal guard
+    /// above tightened the rule, and a form field or a shell-completed folder
+    /// name commonly ends in either shape.
+    #[test]
+    fn validate_repo_path_accepts_empty_and_trailing_slash_as_the_repo_root() {
+        for good in ["", "domains/eng/", "a/"] {
+            assert!(validate_repo_path(good).is_ok(), "{good:?}");
         }
     }
 }
