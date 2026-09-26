@@ -2137,14 +2137,31 @@ async fn sync_dispatch(
         }
         return Ok(());
     }
-    cmd::sync(
-        cmd::local_store(route, "sync")?,
-        &cfg,
-        domain.as_deref(),
-        embed,
-        json,
-    )
-    .await
+    let store = cmd::local_store(route, "sync")?;
+    let synced = cmd::sync(store.clone(), &cfg, domain.as_deref(), embed, json).await;
+    // Once the sync has returned, as the daemon's ctl `sync` does: a synced
+    // MANIFEST may declare a new name. The JSON stays the report array it
+    // always was; a person reads what was renamed.
+    let names = crystalline_service::adopt_domain_names_direct(store, config.as_deref()).await?;
+    if !json {
+        for entry in names.as_array().into_iter().flatten() {
+            match entry["action"].as_str() {
+                Some("renamed") => println!(
+                    "renamed domain '{}' to '{}', the name its MANIFEST declares",
+                    entry["previous"].as_str().unwrap_or_default(),
+                    entry["domain"].as_str().unwrap_or_default()
+                ),
+                Some("failed") => eprintln!(
+                    "domain '{}' declares the name '{}' but could not be renamed: {}",
+                    entry["domain"].as_str().unwrap_or_default(),
+                    entry["canonical"].as_str().unwrap_or_default(),
+                    entry["error"].as_str().unwrap_or_default()
+                ),
+                _ => {}
+            }
+        }
+    }
+    synced
 }
 
 /// `reindex`: route to the daemon when one owns the index and no explicit

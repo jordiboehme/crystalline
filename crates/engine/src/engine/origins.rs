@@ -279,10 +279,9 @@ impl Engine {
             // says: a name somebody chose on purpose stays `explicit`, so it
             // never becomes eligible for an automatic rename. Only a fresh
             // nameless registration (or a legacy entry that says nothing)
-            // records `derived`. The write-back below reads this connect's
-            // own decision, not the stored field, so an adopted `explicit`
-            // entry still gets no repository default pushed into the team's
-            // MANIFEST.
+            // records `derived`. Nothing is written back into the team's
+            // MANIFEST either way: a team domain never gets `domain_name`
+            // written automatically (Jordi's ruling 2026-09-26).
             entry.name_origin = match name_origin {
                 NameOrigin::Explicit => Some(NameOrigin::Explicit),
                 NameOrigin::Derived => entry.name_origin.or(Some(NameOrigin::Derived)),
@@ -307,24 +306,6 @@ impl Engine {
 
         progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
-        // Every domain this connect reaches is a team domain (its `origin`
-        // is set above), so `write_back_domain_name`'s own guard always
-        // answers `Ok(false)` here, whatever `name_origin` is: a team domain
-        // never gets `domain_name` written into its MANIFEST automatically
-        // (Jordi's ruling 2026-09-26). The call stays, at the cost of one
-        // no-op MANIFEST read, so this path keeps going through the same
-        // guard as every other write-back rather than special-casing
-        // itself. Best effort: the connect has landed and must not be undone
-        // by a MANIFEST write that fails afterwards.
-        if name_origin == NameOrigin::Explicit
-            && let Err(e) = self.write_back_domain_name(&domain_name).await
-        {
-            tracing::warn!(
-                domain = %domain_name,
-                error = %e,
-                "writing the domain name back into its MANIFEST failed"
-            );
-        }
         self.refresh_names().await;
         // Embedding a whole freshly connected repo can outlast any client
         // timeout, so a daemon or in-process MCP server runs it on the embed
@@ -595,6 +576,8 @@ impl Engine {
     /// never aborts the others, each per-domain failure is collected into the
     /// `errors` array instead. Allowed on a read-only instance: a pull is a
     /// derived-truth update like sync, not a user-authored content write.
+    /// Ends with [`Engine::adopt_domain_names`] once every pull has finished;
+    /// the report is the pulls' own.
     pub async fn origin_update(
         &self,
         domain: Option<&str>,
@@ -614,6 +597,9 @@ impl Engine {
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
             }
         }
+        // Once every pull has finished and let go of its origin lock, which a
+        // rename takes: a pulled MANIFEST may declare a new name.
+        self.adopt_domain_names_after("the update").await;
         Ok(json!({ "domains": domains, "errors": errors }))
     }
 
@@ -1125,7 +1111,9 @@ impl Engine {
     /// and ends the tick immediately, since GitHub rate limits are
     /// per-token, not per-repository. Any other per-domain failure (offline,
     /// a revoked token, a corrupt state directory) is recorded quietly and
-    /// never stops the tick from moving on to the next due domain.
+    /// never stops the tick from moving on to the next due domain. A tick
+    /// whose pulls landed anything ends with [`Engine::adopt_domain_names`],
+    /// since a pulled MANIFEST may declare a new name.
     pub async fn origin_poll_tick(&self, now: Instant, wall_now: DateTime<Utc>) {
         if !self.config.read().unwrap().github_enabled() {
             return;
@@ -1157,6 +1145,9 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.poll_secs);
 
+        // Whether any pull of this tick landed something, which is when a
+        // MANIFEST may declare a new name.
+        let mut moved = false;
         for (name, entry) in targets {
             if !self.origin_poller.is_due(&name, now) {
                 continue;
@@ -1173,6 +1164,7 @@ impl Engine {
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => {
                     let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
+                    moved |= !up_to_date;
                     let applied = v["applied"].as_array().map(Vec::len).unwrap_or(0);
                     let conflict_paths: Vec<&str> = v["conflicts"]
                         .as_array()
@@ -1233,7 +1225,7 @@ impl Engine {
                         "origin poll: GitHub is rate limiting this machine; pausing every domain until {until}"
                     );
                     self.origin_poller.set_rate_limited_until(Some(until));
-                    return;
+                    break;
                 }
                 Err(e) => {
                     tracing::debug!("origin poll: '{name}' failed: {e}");
@@ -1241,6 +1233,10 @@ impl Engine {
                         .record_result(&name, poller::DomainPollOutcome::Error(e.to_string()));
                 }
             }
+        }
+        // After the loop, when every pull has let go of its origin lock.
+        if moved {
+            self.adopt_domain_names_after("the origin poll").await;
         }
     }
 

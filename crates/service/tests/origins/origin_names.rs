@@ -658,3 +658,58 @@ async fn a_declared_name_makes_a_refused_repo_name_moot() {
         .unwrap();
     assert_eq!(result["domain"], "eng", "{result}");
 }
+
+// --- adoption after a pull (Task 17) ------------------------------------------
+
+/// The owner adds `domain_name: eng` upstream: the pull lands it, and once
+/// the pull has finished the derived team domain is renamed to `eng` on this
+/// machine, its repository name kept as an alias. The pull report is the
+/// pull's own, under the name the pull ran with.
+#[tokio::test]
+async fn a_pulled_domain_name_renames_a_derived_team_domain_after_the_pull() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[("MANIFEST.md", bare_manifest())]);
+    let r = rig(tmp.path(), mock.clone(), &[]).await;
+    let connected = r
+        .eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(connected["domain"], "eng-knowledge", "{connected}");
+
+    let declared = mock.add_commit(
+        [("MANIFEST.md".to_string(), declaring_manifest())]
+            .into_iter()
+            .collect(),
+    );
+    mock.set_branch("main", &declared);
+    let pulled = r
+        .eng
+        .origin_update(
+            Some("eng-knowledge"),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(pulled["domains"][0]["domain"], "eng-knowledge", "{pulled}");
+    assert_eq!(
+        pulled["domains"][0]["applied"],
+        serde_json::json!(["MANIFEST.md"]),
+        "{pulled}"
+    );
+    let cfg = on_disk(&r.config_path);
+    assert!(!cfg.domains.contains_key("eng-knowledge"));
+    let entry = &cfg.domains["eng"];
+    assert_eq!(
+        entry.name_origin,
+        Some(crystalline_core::config::NameOrigin::Derived)
+    );
+    assert!(
+        entry.aliases.contains(&"eng-knowledge".to_string()),
+        "{entry:?}"
+    );
+    assert_eq!(entry.canonical_seen.as_deref(), Some("eng"));
+    assert!(tmp.path().join("origins").join("eng").is_dir());
+    assert!(change_paths(&r.eng, "eng").await.is_empty());
+}

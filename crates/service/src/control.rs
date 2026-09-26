@@ -131,6 +131,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .unwrap_or(false);
             match shared.engine.sync_take_over(domain, take_over).await {
                 Ok(mut data) => {
+                    // After the sync has returned: a synced MANIFEST may
+                    // declare a new name, and a pre-0.20.0 entry is caught up.
+                    let names = shared.engine.adopt_domain_names_after("the sync").await;
+                    if let Value::Object(map) = &mut data {
+                        map.insert("names".to_string(), names);
+                    }
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)
                 }
@@ -900,7 +906,10 @@ mod tests {
             crystalline_core::manifest_template("eng", "2026-01-01"),
         )
         .unwrap();
-        let mut entry = crystalline_core::config::DomainEntry::file(root);
+        // Named on purpose, so the adoption after the first sync keeps the
+        // name rather than renaming the domain to the one it declares.
+        let mut entry = crystalline_core::config::DomainEntry::file(root)
+            .with_name_origin(crystalline_core::config::NameOrigin::Explicit);
         entry.aliases = vec!["old-eng".to_string()];
         let mut cfg = crystalline_core::config::GlobalConfig::default();
         cfg.domains.insert("eng-knowledge".to_string(), entry);
@@ -928,6 +937,56 @@ mod tests {
                 "{spelling}: {reply}"
             );
         }
+    }
+
+    /// The ctl `sync` runs the name adoption once its sync has returned, and
+    /// answers what it did under `names`: a derived domain whose MANIFEST
+    /// declares another name is renamed to it on this machine.
+    #[tokio::test]
+    async fn a_ctl_sync_adopts_a_declared_name_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng-knowledge");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            crystalline_core::manifest_template("eng", "2026-01-01"),
+        )
+        .unwrap();
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert(
+            "eng-knowledge".to_string(),
+            crystalline_core::config::DomainEntry::file(root)
+                .with_name_origin(crystalline_core::config::NameOrigin::Derived),
+        );
+        let config_path = tmp.path().join("config.yaml");
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg,
+                None,
+                Some(config_path.clone()),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+
+        let (reply, _) = handle(&json!({ "cmd": "sync" }), &shared).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        let names = reply["data"]["names"].as_array().expect("a names list");
+        assert!(
+            names
+                .iter()
+                .any(|n| n["action"] == "renamed" && n["domain"] == "eng"),
+            "{reply}"
+        );
+        let saved: crystalline_core::config::GlobalConfig =
+            crystalline_core::config::load_yaml(&config_path).unwrap();
+        assert!(saved.domains.contains_key("eng"), "{reply}");
+        assert!(!saved.domains.contains_key("eng-knowledge"), "{reply}");
     }
 
     /// `origin_share`'s amend target is the parameter this guards: absent

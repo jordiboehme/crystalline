@@ -939,3 +939,304 @@ async fn a_numeric_looking_explicit_name_round_trips_as_a_string() {
         "{source}"
     );
 }
+
+// --- adoption after a sync (Task 17) ------------------------------------------
+
+/// A config file on disk holding `domains`, and an engine over it with a
+/// state directory, the way a daemon reads both at startup.
+fn adopting_engine(store: SharedStore, dir: &Path, domains: Vec<(&str, DomainEntry)>) -> Engine {
+    let mut cfg = GlobalConfig::default();
+    for (name, entry) in domains {
+        cfg.domains.insert(name.to_string(), entry);
+    }
+    let config_path = dir.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    Engine::new(store, cfg, None, Some(config_path)).with_state_dir(dir.join("state"))
+}
+
+/// The caller sequence every surface runs: a sync, then the adoption.
+async fn sync_and_adopt(engine: &Engine) -> Value {
+    engine.sync(None).await.unwrap();
+    engine.adopt_domain_names().await.unwrap()
+}
+
+fn saved(dir: &Path) -> GlobalConfig {
+    crystalline_core::config::load_yaml(&dir.join("config.yaml")).unwrap()
+}
+
+fn declare(root: &Path, name: &str) {
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        crystalline_core::manifest_template(name, TODAY),
+    )
+    .unwrap();
+}
+
+/// A derived local name follows a `domain_name` the MANIFEST gains: the
+/// domain is renamed on this machine, stays derived, and keeps its old
+/// local name as an alias.
+#[tokio::test]
+async fn a_derived_name_follows_a_new_manifest_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root.clone()).with_name_origin(NameOrigin::Derived),
+        )],
+    );
+    sync_and_adopt(&engine).await;
+
+    declare(&root, "platform");
+    let report = sync_and_adopt(&engine).await;
+
+    let cfg = saved(tmp.path());
+    assert!(!cfg.domains.contains_key("eng"), "{report}");
+    let entry = &cfg.domains["platform"];
+    assert_eq!(entry.name_origin, Some(NameOrigin::Derived));
+    assert!(entry.aliases.contains(&"eng".to_string()), "{entry:?}");
+    assert_eq!(entry.canonical_seen.as_deref(), Some("platform"));
+    let renamed = report
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["action"] == "renamed")
+        .unwrap_or_else(|| panic!("a rename is reported: {report}"));
+    assert_eq!(renamed["domain"], "platform", "{report}");
+    assert_eq!(renamed["previous"], "eng", "{report}");
+    assert_eq!(
+        engine.local_domain_name("eng").await.as_deref(),
+        Some("platform")
+    );
+}
+
+/// An explicit local name is kept; the declared name resolves to it.
+#[tokio::test]
+async fn an_explicit_name_is_kept_and_the_canonical_resolves_to_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = declared_folder(tmp.path(), "eng", "platform");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root).with_name_origin(NameOrigin::Explicit),
+        )],
+    );
+
+    sync_and_adopt(&engine).await;
+
+    let cfg = saved(tmp.path());
+    assert!(!cfg.domains.contains_key("platform"));
+    let entry = &cfg.domains["eng"];
+    assert_eq!(entry.name_origin, Some(NameOrigin::Explicit));
+    assert_eq!(entry.canonical_seen.as_deref(), Some("platform"));
+    assert_eq!(
+        engine.local_domain_name("platform").await.as_deref(),
+        Some("eng")
+    );
+}
+
+/// A declared name another domain registers here is left shadowed: the
+/// derived domain keeps its name.
+#[tokio::test]
+async fn a_taken_name_is_left_shadowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ops = declared_folder(tmp.path(), "ops", "ops");
+    let eng = declared_folder(tmp.path(), "eng", "ops");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![
+            (
+                "ops",
+                DomainEntry::file(ops).with_name_origin(NameOrigin::Explicit),
+            ),
+            (
+                "eng",
+                DomainEntry::file(eng).with_name_origin(NameOrigin::Derived),
+            ),
+        ],
+    );
+
+    sync_and_adopt(&engine).await;
+
+    let cfg = saved(tmp.path());
+    assert!(cfg.domains.contains_key("eng") && cfg.domains.contains_key("ops"));
+    assert_eq!(cfg.domains["eng"].canonical_seen.as_deref(), Some("ops"));
+    assert!(engine.name_table_now().await.is_shadowed("eng"));
+    assert_eq!(
+        engine.local_domain_name("ops").await.as_deref(),
+        Some("ops")
+    );
+}
+
+/// A changed canonical name: the previous one becomes an alias and the
+/// derived domain follows the new one.
+#[tokio::test]
+async fn a_changed_canonical_keeps_the_previous_one_as_an_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = declared_folder(tmp.path(), "eng", "platform");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root.clone()).with_name_origin(NameOrigin::Derived),
+        )],
+    );
+    sync_and_adopt(&engine).await;
+    assert!(saved(tmp.path()).domains.contains_key("platform"));
+
+    declare(&root, "core");
+    sync_and_adopt(&engine).await;
+
+    let cfg = saved(tmp.path());
+    assert!(!cfg.domains.contains_key("platform"));
+    let entry = &cfg.domains["core"];
+    assert_eq!(entry.name_origin, Some(NameOrigin::Derived));
+    assert!(entry.aliases.contains(&"platform".to_string()), "{entry:?}");
+    assert!(entry.aliases.contains(&"eng".to_string()), "{entry:?}");
+    assert_eq!(entry.canonical_seen.as_deref(), Some("core"));
+    assert_eq!(
+        engine.local_domain_name("platform").await.as_deref(),
+        Some("core")
+    );
+}
+
+/// A domain an environment variable defines is never renamed, and nothing
+/// about it is written to the config file.
+#[tokio::test]
+async fn an_environment_domain_is_never_renamed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = declared_folder(tmp.path(), "envdom", "platform");
+    let overlay = crystalline_service::EnvOverlay::from_vars(vec![(
+        "CRYSTALLINE_DOMAIN_ENVDOM".to_string(),
+        root.display().to_string(),
+    )])
+    .unwrap();
+    let engine =
+        adopting_engine(memory_store().await, tmp.path(), vec![]).with_env_overlay(overlay);
+
+    let report = sync_and_adopt(&engine).await;
+
+    assert_eq!(report, serde_json::json!([]), "{report}");
+    let cfg = saved(tmp.path());
+    assert!(cfg.domains.is_empty(), "{:?}", cfg.domains.keys());
+    assert_eq!(
+        engine.local_domain_name("platform").await.as_deref(),
+        Some("envdom")
+    );
+}
+
+/// The one-time catch-up for a config written before 0.20.0: every entry
+/// gets its name origin inferred, local domains declare their name in their
+/// MANIFEST, team domains never get one written (explicit or derived), and a
+/// second pass writes nothing.
+#[tokio::test]
+async fn the_catch_up_infers_every_origin_once_and_writes_local_manifests_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let notes = bare_manifest_folder(tmp.path(), "notes", "Notes");
+    let kb = bare_manifest_folder(tmp.path(), "kb", "Kb");
+    let handbook = bare_manifest_folder(tmp.path(), "hb", "Handbook");
+    let team = |root: PathBuf, repo: &str| DomainEntry {
+        origin: Some(crystalline_core::config::OriginConfig {
+            repo: repo.to_string(),
+            path: None,
+            branch: None,
+            poll_secs: None,
+        }),
+        ..DomainEntry::file(root)
+    };
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![
+            ("eng", DomainEntry::file(eng.clone())),
+            ("my-notes", DomainEntry::file(notes.clone())),
+            ("kb", team(kb.clone(), "acme/kb")),
+            ("handbook", team(handbook.clone(), "acme/eng-handbook")),
+        ],
+    );
+    let kb_before = std::fs::read(kb.join("MANIFEST.md")).unwrap();
+    let handbook_before = std::fs::read(handbook.join("MANIFEST.md")).unwrap();
+
+    sync_and_adopt(&engine).await;
+
+    let cfg = saved(tmp.path());
+    let origin = |name: &str| cfg.domains[name].name_origin;
+    assert_eq!(origin("eng"), Some(NameOrigin::Derived));
+    assert_eq!(origin("my-notes"), Some(NameOrigin::Explicit));
+    assert_eq!(origin("kb"), Some(NameOrigin::Derived));
+    assert_eq!(origin("handbook"), Some(NameOrigin::Explicit));
+    let declared = |root: &Path| {
+        crystalline_core::domain_name_of_source(
+            &std::fs::read_to_string(root.join("MANIFEST.md")).unwrap(),
+        )
+    };
+    assert_eq!(declared(&eng).as_deref(), Some("eng"));
+    assert_eq!(declared(&notes).as_deref(), Some("my-notes"));
+    assert_eq!(std::fs::read(kb.join("MANIFEST.md")).unwrap(), kb_before);
+    assert_eq!(
+        std::fs::read(handbook.join("MANIFEST.md")).unwrap(),
+        handbook_before,
+        "an explicit team domain gets no automatic write either"
+    );
+
+    let config_bytes = std::fs::read(tmp.path().join("config.yaml")).unwrap();
+    let roots = [&eng, &notes, &kb, &handbook];
+    let manifests: Vec<Vec<u8>> = roots
+        .iter()
+        .map(|root| std::fs::read(root.join("MANIFEST.md")).unwrap())
+        .collect();
+    let again = sync_and_adopt(&engine).await;
+    assert_eq!(again, serde_json::json!([]), "{again}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("config.yaml")).unwrap(),
+        config_bytes,
+        "the second pass writes nothing"
+    );
+    for (root, before) in roots.iter().zip(manifests) {
+        assert_eq!(std::fs::read(root.join("MANIFEST.md")).unwrap(), before);
+    }
+}
+
+/// The rename an adoption runs syncs the renamed domain, and that sync never
+/// runs an adoption of its own: only the surfaces that call
+/// `adopt_domain_names` after their sync do.
+#[tokio::test]
+async fn a_rename_and_its_sync_never_run_an_adoption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = declared_folder(tmp.path(), "eng", "eng");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root.clone()).with_name_origin(NameOrigin::Derived),
+        )],
+    );
+    engine.sync(None).await.unwrap();
+    engine
+        .rename_domain_local("eng", "moved", NameOrigin::Derived, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(engine.adoptions_run(), 0);
+
+    declare(&root, "platform");
+    engine.sync(None).await.unwrap();
+    assert_eq!(engine.adoptions_run(), 0, "a sync alone adopts nothing");
+    let report = engine.adopt_domain_names().await.unwrap();
+    assert!(
+        saved(tmp.path()).domains.contains_key("platform"),
+        "{report}"
+    );
+    assert_eq!(
+        engine.adoptions_run(),
+        1,
+        "the adoption's own rename and its sync run no second one"
+    );
+}

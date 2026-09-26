@@ -162,7 +162,10 @@ async fn serve(opts: Options) -> Fixture {
         .with_read_only(opts.read_only)
         .with_token_store_dir(root.join("tokens"))
         .with_connect_auth(connect_auth)
-        .with_origins_dir(root.join("origins"));
+        .with_origins_dir(root.join("origins"))
+        // Where a rename keeps its journal: a name adoption after a pull
+        // renames a derived team domain.
+        .with_state_dir(root.join("state"));
     if let Some(provider) = opts.origin_provider {
         engine = engine.with_origin_provider(provider);
     }
@@ -643,6 +646,53 @@ async fn team_sync_status_and_sync_now_walk_the_contract() {
         .unwrap();
         assert_eq!(resp.status(), 403, "{name} must not read sync status");
     }
+}
+
+/// `POST /domains/{domain}/sync` pulls, and once the pull has finished the
+/// name adoption runs: a `domain_name` the owner added upstream renames the
+/// derived team domain on this machine. The response is the pull's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_now_adopts_a_pulled_domain_name() {
+    let (fx, mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+
+    let declaring = String::from_utf8(KB_MANIFEST.to_vec()).unwrap().replacen(
+        "status: current\n",
+        "status: current\ndomain_name: team-kb\n",
+        1,
+    );
+    let head = mock.branch_commit("main").unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("MANIFEST.md".to_string(), declaring.into_bytes());
+    files.insert(
+        "shared.md".to_string(),
+        mock.commit_file(&head, "shared.md").unwrap(),
+    );
+    let next = mock.add_commit_on(files, Some(&head));
+    mock.set_branch("main", &next);
+
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+    let pulled: serde_json::Value = pulled.json().await.unwrap();
+    assert_eq!(pulled["domain"], "kb", "{pulled}");
+
+    let cfg: GlobalConfig =
+        crystalline_core::config::load_yaml(&fx._tmp.path().join("config.yaml")).unwrap();
+    assert!(!cfg.domains.contains_key("kb"), "{:?}", cfg.domains.keys());
+    assert!(
+        cfg.domains["team-kb"].aliases.contains(&"kb".to_string()),
+        "{:?}",
+        cfg.domains["team-kb"]
+    );
 }
 
 /// The share half of the sync surface, walked end to end against the mock

@@ -931,6 +931,10 @@ pub struct Engine {
     // index's spellings. See `Engine::spelling_replaces_issued`.
     #[cfg(any(test, feature = "testing"))]
     spelling_replaces: std::sync::atomic::AtomicU64,
+    // The test seam for the name adoption: how many times it ran. See
+    // `Engine::adoptions_run`.
+    #[cfg(any(test, feature = "testing"))]
+    adoptions: std::sync::atomic::AtomicU64,
     // A live view of what this engine is doing (sync, embed, reindex), fed by
     // RAII guards from the maintenance operations and read by `status_report`'s
     // activity block. Behind an `Arc` so a guard owns its own handle and a
@@ -1688,6 +1692,8 @@ impl Engine {
             virtual_domain_names: std::sync::RwLock::new(BTreeMap::new()),
             #[cfg(any(test, feature = "testing"))]
             spelling_replaces: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
             domain_admin: tokio::sync::Mutex::new(()),
@@ -4180,6 +4186,7 @@ impl Engine {
 
 // The `impl Engine` sections, one file each; FILES in the split script
 // lists them in the order they stood in the single engine.rs.
+mod adopt_names;
 mod attachments;
 mod configure;
 mod context;

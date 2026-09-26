@@ -1854,3 +1854,60 @@ async fn old_rest_paths_answer_the_renamed_domain() {
     assert_eq!(bodies[0], bodies[1], "eng answers the renamed domain");
     assert_eq!(bodies[0], bodies[2], "eng-team answers the renamed domain");
 }
+
+/// A full rename that stopped after its relink step leaves a MANIFEST that
+/// already declares the new name, a config that still holds the old one and,
+/// once the engine is gone, a domain nothing pauses. The adoption after a
+/// sync must not rename that domain outside the journal, nor infer or write
+/// anything for it: the journal is how the rename finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adoption_leaves_a_domain_with_a_pending_rename_journal_alone() {
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::Relink));
+    engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("the failpoint stops the rename after its relink step");
+    drop(engine);
+    let manifest_text = std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap();
+    assert!(
+        manifest_text.contains("domain_name: platform\n"),
+        "{manifest_text}"
+    );
+    let eng_before = crystalline_service::overlay::load_file(&m.config_path())
+        .unwrap()
+        .domains["eng"]
+        .clone();
+    let journal_before = std::fs::read(m.journal()).unwrap();
+
+    // A fresh engine over the same state: nothing pauses `eng` now.
+    let engine = m.engine(true).await;
+    assert!(!engine.is_renaming("eng"));
+    engine.sync(None).await.unwrap();
+    let report = engine.adopt_domain_names().await.unwrap();
+
+    assert!(
+        report
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["domain"] != "eng" && r["domain"] != "platform"),
+        "{report}"
+    );
+    let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("eng"), "{:?}", cfg.domains.keys());
+    assert!(!cfg.domains.contains_key("platform"));
+    assert_eq!(cfg.domains["eng"].name_origin, None, "nothing inferred");
+    assert_eq!(cfg.domains["eng"], eng_before, "nothing written for it");
+    assert_eq!(std::fs::read(m.journal()).unwrap(), journal_before);
+
+    // The journal still finishes the rename as the user asked for it.
+    let recovered = engine.recover_rename_journal().await.unwrap().unwrap();
+    assert_eq!(recovered["domain"], "platform", "{recovered}");
+    engine.sync(None).await.unwrap();
+    assert_fully_renamed(&f, &engine).await;
+}

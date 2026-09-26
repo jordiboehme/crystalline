@@ -645,6 +645,8 @@ async fn build_embedded(
     let bg_config = loaded.effective.clone();
     tokio::spawn(async move {
         let _ = bg.sync(None).await;
+        // As at the daemon's startup, once the first sync has returned.
+        bg.adopt_domain_names_after("the initial sync").await;
         if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
             // Schedule on the worker spawned just above rather than embedding
@@ -1171,6 +1173,26 @@ pub async fn origin_add(
     Ok(engine
         .origin_add(repo, domain, path, branch, folder)
         .await?)
+}
+
+/// The name adoption a sync run without a daemon owes once it has returned
+/// ([`Engine::adopt_domain_names`]), over the store that sync opened: the
+/// daemon's ctl `sync` runs the same adoption after its own sync. A failure
+/// is logged and answered as an empty list; the sync has landed.
+pub async fn adopt_domain_names_direct(
+    store: Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    let loaded = overlay::load(config_path)?;
+    let read_only = loaded.effective.read_only();
+    let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
+        .with_read_only(read_only)
+        .with_env_overlay(loaded.overlay);
+    // Where a rename keeps its journal, as every other opener says.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    Ok(engine.adopt_domain_names_after("the sync").await)
 }
 
 /// Bring one origin-connected domain (or every one) up to date: over the

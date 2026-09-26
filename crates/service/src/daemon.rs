@@ -547,6 +547,10 @@ pub async fn run_serve(
             if let Err(err) = e.sync_take_over(None, take_over).await {
                 tracing::warn!("initial sync failed: {err}");
             }
+            // Once the first sync has returned: the one-time catch-up for a
+            // configuration from before 0.20.0, and any domain_name a
+            // MANIFEST gained while the daemon was down.
+            e.adopt_domain_names_after("the initial sync").await;
             // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on
@@ -1126,6 +1130,12 @@ async fn run_watcher(
                     );
                 }
                 let touched = !dirty.is_empty();
+                // A full rescan or an edit of a MANIFEST may bring a new
+                // domain_name, which the adoption below lines up once every
+                // pass of this flush is done.
+                let names_may_move = dirty
+                    .values()
+                    .any(|work| work.full || work.paths.contains("MANIFEST.md"));
                 for (name, work) in dirty {
                     // full: today's walk-based rescan; otherwise a targeted pass
                     // over just the dirty paths. The full fallback plus the
@@ -1141,6 +1151,11 @@ async fn run_watcher(
                             tracing::warn!("targeted watch sync of '{name}' failed: {err}");
                         }
                     }
+                }
+                // A rename it runs moves this watcher's watch through the
+                // unbounded `new_roots` channel, read on the next turn.
+                if names_may_move {
+                    engine.adopt_domain_names_after("the watch sync").await;
                 }
                 if touched
                     && !engine.request_embed()
