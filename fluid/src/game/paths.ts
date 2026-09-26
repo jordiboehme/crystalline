@@ -8,9 +8,14 @@
  * prefix, with no lookup table and no second encoder that could drift from the
  * first. The F key's "open this in Fluid" and the arrival after a reload both
  * rest on that.
+ *
+ * A domain's bridge, its MANIFEST room, has the address `bridgeAddress`
+ * names: the domain and the permalink `MANIFEST_PERMALINK`. The level
+ * cheat's jump goes there.
  */
 
 import { engramRoute } from "../paths";
+import type { PlaceAddress } from "./world/types";
 
 /** The prefix every game route sits under. */
 const GAME_PREFIX = "/game";
@@ -53,4 +58,20 @@ export function fluidRouteOf(gamePath: string): string {
  */
 export function placeKeyOf(domain: string, permalink: string): string {
   return `${domain}\u0000${permalink}`;
+}
+
+/**
+ * The permalink of a domain's MANIFEST, the engram its bridge is built
+ * from: the slug the index gives `MANIFEST.md` when its frontmatter names
+ * none, and the one the server's starter MANIFEST declares. A MANIFEST
+ * that declares another permalink is not found under it (C9).
+ */
+export const MANIFEST_PERMALINK = "manifest";
+
+/**
+ * The address of a domain's bridge, its MANIFEST room: where the level
+ * cheat's jump goes (`Session.jump`).
+ */
+export function bridgeAddress(domain: string): PlaceAddress {
+  return { domain, permalink: MANIFEST_PERMALINK };
 }

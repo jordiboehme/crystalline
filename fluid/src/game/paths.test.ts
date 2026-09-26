@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import { engramRoute } from "../paths";
-import { fluidRouteOf, gameEngramRoute, placeKeyOf } from "./paths";
+import {
+  MANIFEST_PERMALINK,
+  bridgeAddress,
+  fluidRouteOf,
+  gameEngramRoute,
+  placeKeyOf,
+} from "./paths";
 
 describe("gameEngramRoute", () => {
   it("mirrors the engram route under /game", () => {
@@ -45,5 +51,16 @@ describe("fluidRouteOf", () => {
 describe("placeKeyOf", () => {
   it("joins domain and permalink with a NUL", () => {
     expect(placeKeyOf("eng", "a/b")).toBe("eng\u0000a/b");
+  });
+});
+
+describe("bridgeAddress", () => {
+  it("names a domain's MANIFEST room, whose game route mirrors its engram route", () => {
+    expect(MANIFEST_PERMALINK).toBe("manifest");
+    const bridge = bridgeAddress("platform eng");
+    expect(bridge).toEqual({ domain: "platform eng", permalink: "manifest" });
+    expect(gameEngramRoute(bridge.domain, bridge.permalink)).toBe(
+      "/game/d/platform%20eng/e/manifest",
+    );
   });
 });

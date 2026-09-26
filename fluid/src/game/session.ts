@@ -22,7 +22,8 @@
  * player where they stand with a notice for three seconds; with no room to
  * stand in yet, the notice stays over the dark screen.
  *
- * Each tick, in order: the look and command keys, movement, what the player
+ * Each tick, in order: the typed keys for the level cheat's word, the look
+ * and command keys, movement, what the player
  * faces and E at it, the doors, the faults of the broken ways, the HUD
  * prompt, the ways out of the room, warming the cache for the places
  * behind the doors the player walks up to, the room's light specials and
@@ -51,17 +52,25 @@
  * `INVERT_KEY`), and 1, 2 and 4 switch the look. While the CRT reader is
  * open it reads the keys itself: the session ignores its own commands and
  * all movement until the host calls `closeReader`.
+ *
+ * Typed with no pause longer than a second, `idclev` opens the level select
+ * when the host passed `onLevels` (the game route): the word's I toggle is
+ * taken back on the match, and its E is swallowed right after `I D C L`, so
+ * the word never opens a terminal. While the select is open the session
+ * reads no keys, exactly as with the CRT reader, until the host calls
+ * `closeLevels` or `jump` goes somewhere.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
 
 import { engramRoute } from "../paths";
+import { createCheatReader } from "./core/cheat";
 import { createInput } from "./core/input";
 import { createLoop, type Clock } from "./core/loop";
 import { loadPlace, prefetchPlace, type LoadedPlace } from "./data/source";
 import { backbufferSize } from "./device";
 import { createContext } from "./gl/context";
-import { gameEngramRoute, placeKeyOf } from "./paths";
+import { bridgeAddress, gameEngramRoute, placeKeyOf } from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
@@ -172,6 +181,8 @@ export type RendererFactory = (
  *   `?fault=` answers every travel with a failure through it, and tests use
  *   it to fail a travel without the API. Without it, `go` loads through
  *   `client`, or says `SIGNAL LOST` when there is none.
+ * - `onLevels`: the level cheat's switch and channel; only the game route
+ *   passes it. See the member.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -184,6 +195,14 @@ export interface SessionOptions {
   initialLook?: LookId;
   clock?: Clock;
   load?: PlaceLoader;
+  /**
+   * The level cheat's switch and channel (C8): with it, typing `idclev`
+   * opens the level select and the session calls it with true; closing
+   * the select (`closeLevels`, a `go`, `dispose`) calls it with false.
+   * Without it the word is nothing but its letters: the look demo and
+   * the model gallery never pass it.
+   */
+  onLevels?: (open: boolean) => void;
 }
 
 /**
@@ -214,9 +233,14 @@ export type PlaceLoader = (
  *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
  *   for those dev seams only; every other caller omits it and keeps the
  *   entrance's own pitch of 0.
- * - `go`, `showCanned` and `showRoom` close an open CRT reader first.
+ * - `go`, `showCanned` and `showRoom` close an open CRT reader or level
+ *   select first.
  * - `closeReader` tells the session the CRT reader was closed, which gives
  *   it the keys back.
+ * - `jump` goes to a domain's bridge (`bridgeAddress`), the level select's
+ *   jump: a `go` from outside, so the player enters at the entrance.
+ * - `closeLevels` tells the session the level select was closed, which
+ *   gives it the keys back.
  * - `dispose` stops everything and frees the GPU objects. It takes the
  *   reader and the connector down; nothing is written to the HUD after it.
  * - `current` is the place the player is in, null before the first one.
@@ -226,6 +250,10 @@ export interface Session {
   showCanned(place: PlaceInput): void;
   showRoom(room: RoomSpec, view?: { pitch: number }): void;
   closeReader(): void;
+  /** Goes to a domain's bridge (`bridgeAddress`): the level select's jump. */
+  jump(domain: string): void;
+  /** The level select was closed: gives the session the keys back. */
+  closeLevels(): void;
   dispose(): void;
   readonly current: PlaceAddress | null;
 }
@@ -321,6 +349,16 @@ export function createSession(opts: SessionOptions): Session {
   let prefetched = new Set<string>();
   let latched: number | null = null;
   let readerOpen = false;
+  /** Whether the level select is open (only with `onLevels`). */
+  let levelsOpen = false;
+  /** The level cheat's word, read only when the host passed `onLevels`. */
+  const cheat = opts.onLevels === undefined ? null : createCheatReader();
+  /** Ticks run so far: the clock the word's gap is counted on (C2). */
+  let ticks = 0;
+  /** Whether the timed notice up is the inverted-look one (C6). */
+  let lookFlash = false;
+  /** Whether an overlay (the CRT reader or the level select) has the keys. */
+  const modal = () => readerOpen || levelsOpen;
   let lastPrompt: string | null = null;
   /** Ways whose travel failed this visit: fixture index to its seal label. */
   let failed = new Map<number, string>();
@@ -352,7 +390,7 @@ export function createSession(opts: SessionOptions): Session {
 
   const input = createInput(canvas);
   const onClick = () => {
-    if (!readerOpen) input.requestLock();
+    if (!modal()) input.requestLock();
   };
   canvas.addEventListener("click", onClick);
 
@@ -366,11 +404,13 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   const flash = (text: string, ms: number) => {
+    lookFlash = false;
     if (disposed) return;
     if (noticeTimer !== null) clearTimeout(noticeTimer);
     hud.notice(text);
     noticeTimer = setTimeout(() => {
       noticeTimer = null;
+      lookFlash = false;
       showStanding();
     }, ms);
   };
@@ -542,11 +582,12 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Leaves whatever the session was doing for a new place: closes the CRT
-   * reader, drops the load in flight (a new generation, the old one
+   * reader and the level select, drops the load in flight (a new generation, the old one
    * aborted) and takes the connector down if it was up.
    */
   const leave = (): number => {
     closeReader();
+    closeLevels();
     travelling = null;
     const gen = ++generation;
     controller?.abort();
@@ -623,6 +664,7 @@ export function createSession(opts: SessionOptions): Session {
     if (fixture?.kind !== "terminal" || place === null) return;
     readerOpen = true;
     input.clear();
+    cheat?.reset();
     if (document.pointerLockElement !== null) {
       document.exitPointerLock?.();
     }
@@ -639,7 +681,41 @@ export function createSession(opts: SessionOptions): Session {
     if (disposed || !readerOpen) return;
     readerOpen = false;
     input.clear();
+    cheat?.reset();
     hud.reader(null);
+  };
+
+  /**
+   * Opens the level select on a match of the word: takes the word's I
+   * back (C6), gives the keys and the mouse to the overlay as the CRT
+   * reader does, and tells the host.
+   */
+  const openLevels = () => {
+    if (disposed || opts.onLevels === undefined) return;
+    levelsOpen = true;
+    cheat?.reset();
+    input.clear();
+    inverted = !inverted;
+    writeInverted(inverted);
+    if (lookFlash && noticeTimer !== null) {
+      clearTimeout(noticeTimer);
+      noticeTimer = null;
+      lookFlash = false;
+      showStanding();
+    }
+    if (document.pointerLockElement !== null) {
+      document.exitPointerLock?.();
+    }
+    setPrompt(null);
+    opts.onLevels(true);
+  };
+
+  const closeLevels = () => {
+    if (disposed || !levelsOpen) return;
+    levelsOpen = false;
+    cheat?.reset();
+    input.clear();
+    opts.onLevels?.(false);
   };
 
   // Sizes the backbuffer to the canvas's CSS size times the pixel ratio and
@@ -718,11 +794,27 @@ export function createSession(opts: SessionOptions): Session {
     (input.held(plus) ? 1 : 0) - (input.held(minus) ? 1 : 0);
 
   const tick = () => {
-    if (readerOpen) {
-      // The reader reads W, S, F and Esc itself; none of them is ours.
+    ticks++;
+    // The keys typed since the last tick, in order: the level cheat's
+    // word is read from them, and they are dropped unread while an
+    // overlay has the keys (C4).
+    const typed = input.typed();
+    if (modal()) {
+      // The reader and the level select read their keys themselves;
+      // none of them is ours.
       for (const code of COMMAND_KEYS) input.pressed(code);
       input.takeLook();
     } else {
+      let matched = false;
+      if (cheat !== null) {
+        for (const code of typed) {
+          const step = cheat.feed(code, ticks);
+          // The word's E is not a use: typed in front of a terminal it
+          // never opens the reader (C7).
+          if (step === "swallow") input.pressed("KeyE");
+          if (step === "match") matched = true;
+        }
+      }
       // Nothing takes E while a place loads. Its press is dropped here
       // rather than kept for the room that loads or, when the load fails,
       // for this one.
@@ -745,15 +837,17 @@ export function createSession(opts: SessionOptions): Session {
         inverted = !inverted;
         writeInverted(inverted);
         flash(inverted ? "LOOK INVERTED" : "LOOK NORMAL", LOOK_NOTICE_MS);
+        lookFlash = true;
       }
       if (input.pressed("KeyF") && current !== null) {
         opts.openFluid(engramRoute(current.domain, current.permalink));
       }
+      if (matched) openLevels();
     }
     if (room === null || player === null) return;
 
-    const look = readerOpen || loading ? { dx: 0, dy: 0 } : input.takeLook();
-    const still = readerOpen || loading;
+    const look = modal() || loading ? { dx: 0, dy: 0 } : input.takeLook();
+    const still = modal() || loading;
     previous = player;
     player = stepPlayer(
       player,
@@ -771,7 +865,7 @@ export function createSession(opts: SessionOptions): Session {
       blockers,
     );
 
-    const focus = readerOpen ? null : focusOf(room, player, doors, failed);
+    const focus = modal() ? null : focusOf(room, player, doors, failed);
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
     if (!still && input.pressed("KeyE") && focus !== null) {
@@ -792,9 +886,9 @@ export function createSession(opts: SessionOptions): Session {
     doorOpen = new Map();
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
-    setPrompt(readerOpen || loading ? null : (focus?.prompt ?? null));
+    setPrompt(modal() || loading ? null : (focus?.prompt ?? null));
 
-    if (!loading && !readerOpen) {
+    if (!loading && !modal()) {
       const travel = travelOf(room, player, doors, failed);
       if (travel === null) {
         latched = null;
@@ -891,11 +985,16 @@ export function createSession(opts: SessionOptions): Session {
     showCanned,
     showRoom,
     closeReader,
+    jump(domain) {
+      go(bridgeAddress(domain));
+    },
+    closeLevels,
     dispose() {
       if (disposed) return;
       // The host's overlays go down with the session, so a host that
       // outlives it (StrictMode's second mount) starts clean.
       hud.reader(null);
+      opts.onLevels?.(false);
       hud.connector(false, loadingLabel, lookId);
       disposed = true;
       generation++;

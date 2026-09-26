@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiProblem, api } from "../api/client";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
+import { CHEAT_GAP_TICKS } from "./core/cheat";
 import { TICK_MS, type Clock } from "./core/loop";
 import { prefetchPlace } from "./data/source";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
@@ -30,7 +31,7 @@ import {
   type Session,
 } from "./session";
 import { CANNED_BRIDGE, galleryRoom } from "./world/canned";
-import { generateRoom } from "./world/generate";
+import { NOT_FOUND, generateRoom } from "./world/generate";
 import { wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
@@ -185,6 +186,7 @@ function start(
     canvas?: HTMLCanvasElement;
     factory?: RendererFactory;
     load?: PlaceLoader;
+    onLevels?: (open: boolean) => void;
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -203,6 +205,7 @@ function start(
     createRenderer: factory,
     clock,
     ...(options.load === undefined ? {} : { load: options.load }),
+    ...(options.onLevels === undefined ? {} : { onLevels: options.onLevels }),
   });
   sessions.push(session);
   return session;
@@ -222,8 +225,17 @@ function lastCamera(): Camera {
   return call[0];
 }
 
-function key(type: "keydown" | "keyup", code: string) {
-  window.dispatchEvent(new KeyboardEvent(type, { code }));
+function key(type: "keydown" | "keyup", code: string, repeat = false) {
+  window.dispatchEvent(new KeyboardEvent(type, { code, repeat }));
+}
+
+/** Types a word by `KeyboardEvent.code`, each letter pressed and released. */
+function type(word: string) {
+  for (const ch of word) {
+    const code = `Key${ch.toUpperCase()}`;
+    key("keydown", code);
+    key("keyup", code);
+  }
 }
 
 /** Lets every settled promise run its callbacks. */
@@ -892,6 +904,270 @@ describe("keys", () => {
     frames(4);
     expect(lastCamera().pitch).toBeGreaterThan(0);
     key("keyup", "ArrowUp");
+  });
+});
+
+describe("the level cheat", () => {
+  let levels: ReturnType<typeof vi.fn<(open: boolean) => void>>;
+  beforeEach(() => {
+    levels = vi.fn<(open: boolean) => void>();
+  });
+
+  /** A session on the canned bridge with the cheat on, one tick in. */
+  function onBridge(): Session {
+    const session = start({ client: null, onLevels: levels });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    return session;
+  }
+
+  it("opens the level select on idclev and takes the word's I back", () => {
+    const session = onBridge();
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenCalledTimes(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    // The I toggled the look on its way through; the match took it back
+    // and took its notice down with it (C6).
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
+    expect(hud.notice).toHaveBeenLastCalledWith(null);
+
+    session.closeLevels();
+    expect(levels).toHaveBeenLastCalledWith(false);
+    key("keydown", "ArrowUp");
+    frames(4);
+    expect(lastCamera().pitch).toBeGreaterThan(0);
+    key("keyup", "ArrowUp");
+  });
+
+  it("reads the word across ticks, letter by letter", () => {
+    onBridge();
+    for (const ch of "idclev") {
+      type(ch);
+      frames(3);
+    }
+    expect(levels).toHaveBeenLastCalledWith(true);
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
+    expect(hud.notice).toHaveBeenLastCalledWith(null);
+  });
+
+  it("forgets a word paused for longer than the gap", () => {
+    onBridge();
+    type("idc");
+    frames(CHEAT_GAP_TICKS + 2);
+    type("lev");
+    frames(1);
+    expect(levels).not.toHaveBeenCalled();
+    // A plain I: its toggle stays.
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
+  });
+
+  it("swallows only the E right after i d c l, in front of a terminal", () => {
+    const session = onBridge();
+    walkToScope();
+    hud.reader.mockClear();
+    type("idcle");
+    frames(2);
+    expect(hud.reader).not.toHaveBeenCalled();
+    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+
+    type("e");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    session.closeReader();
+    hud.reader.mockClear();
+
+    type("idcxe");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    expect(levels).not.toHaveBeenCalled();
+  });
+
+  it("does nothing without onLevels, as on the look demo and the gallery", () => {
+    const plain = start({ client: null });
+    plain.showCanned(CANNED_BRIDGE);
+    frames(1);
+    type("idclev");
+    frames(1);
+    // No select, and the I is a plain toggle that nothing takes back.
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
+    expect(hud.notice).toHaveBeenLastCalledWith("LOOK INVERTED");
+
+    walkToScope();
+    type("idcle");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+  });
+
+  // Review Focus 1.
+  it("reads the word through auto-repeat and a held key", () => {
+    const session = onBridge();
+    key("keydown", "KeyW");
+    for (const ch of "idclev") {
+      const code = `Key${ch.toUpperCase()}`;
+      key("keydown", code);
+      key("keydown", code, true);
+      key("keydown", "KeyW", true);
+      key("keydown", code, true);
+      key("keyup", code);
+      frames(2);
+    }
+    expect(levels).toHaveBeenCalledTimes(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
+
+    // Open: the held W walks no further, its repeats included. The walk's
+    // momentum runs out first, as in the reader test. It was walking at
+    // full speed when the select opened and loses only 45 % a tick, so it
+    // takes about twenty ticks to fall below the checks' precision.
+    frames(30);
+    const still = eyeAt();
+    key("keydown", "KeyW", true);
+    frames(10);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+
+    // Closed: the W taken on the way in is forgotten until pressed again.
+    session.closeLevels();
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    key("keyup", "KeyW");
+  });
+
+  // Review Focus 2.
+  it("ignores every key typed while the level select is open", () => {
+    const session = onBridge();
+    type("idclev");
+    frames(1);
+    const still = eyeAt();
+    const pitch = lastCamera().pitch;
+    const rooms = renderer.setRoom.mock.calls.length;
+    for (const code of [
+      "KeyW",
+      "KeyA",
+      "KeyS",
+      "KeyD",
+      "ArrowLeft",
+      "ArrowUp",
+      "KeyE",
+      "KeyF",
+      "KeyI",
+      "Digit1",
+    ]) {
+      key("keydown", code);
+      frames(2);
+      key("keyup", code);
+    }
+    type("idclev");
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    expect(lastCamera().pitch).toBeCloseTo(pitch, 6);
+    expect(levels).toHaveBeenCalledTimes(1);
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
+    expect(openFluid).not.toHaveBeenCalled();
+    expect(hud.reader).not.toHaveBeenCalled();
+    expect(renderer.setRoom.mock.calls.length).toBe(rooms);
+
+    // Closed: nothing typed inside comes back as a command or a step.
+    session.closeLevels();
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    expect(openFluid).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
+  });
+
+  // Review Focus 3.
+  it("reads no word while the CRT reader is open", () => {
+    const session = onBridge();
+    walkToScope();
+    key("keydown", "KeyE");
+    key("keyup", "KeyE");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    type("idclev");
+    frames(2);
+    expect(levels).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe(null);
+
+    session.closeReader();
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+  });
+
+  it("jumps to a domain's bridge with an ordinary go and closes the select", async () => {
+    serve({
+      "/domains/eng/engrams/manifest": () => detailResponse("manifest", "Eng"),
+      "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
+    });
+    const session = start({ onLevels: levels });
+    session.go({ domain: "eng", permalink: "alpha" });
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledTimes(1);
+    });
+    frames(1);
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+
+    session.jump("eng");
+    expect(levels).toHaveBeenLastCalledWith(false);
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      true,
+      "manifest",
+      expect.any(String),
+    );
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledTimes(2);
+    });
+    expect(navigate).toHaveBeenLastCalledWith("/game/d/eng/e/manifest");
+    expect(session.current).toEqual({ domain: "eng", permalink: "manifest" });
+    expect(roomsSet()).toEqual(["alpha", "manifest"]);
+  });
+
+  it("closes the select on a go from outside and on dispose", () => {
+    const session = onBridge();
+    type("idclev");
+    frames(1);
+    session.go({ domain: "station", permalink: "old-bridge" });
+    expect(levels).toHaveBeenLastCalledWith(false);
+
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    session.dispose();
+    expect(levels).toHaveBeenLastCalledWith(false);
+  });
+
+  it("opens on the dark screen before the first room (C5)", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () => {
+        throw new ApiProblem(404, "not found", "no alpha");
+      },
+    });
+    const session = start({ onLevels: levels });
+    session.go({ domain: "eng", permalink: "alpha" });
+    await vi.waitFor(() => {
+      expect(hud.notice).toHaveBeenLastCalledWith(NOT_FOUND);
+    });
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    // The standing notice comes back once the look notice is taken down.
+    expect(hud.notice).toHaveBeenLastCalledWith(NOT_FOUND);
+    expect(session.current).toBe(null);
   });
 });
 
