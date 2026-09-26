@@ -6,15 +6,18 @@
  *
  * - The head is the helmeted head of a giant violet bio-machine, set down
  *   as a spare part in a low dark-grey maintenance cradle: two rails and
- *   two cross beams on the floor, a saddle under its neck, four clamps
- *   gripping the helmet's lower edge and three black hoses from the rails
- *   into the neck. The helmet is deep violet with lime-green trim lines:
- *   a rounded, heavily bevelled skull under a low domed crown; a long
- *   jaw guard jutting forward to a point, narrowing in three steps; a
- *   hard brow ridge over two narrow yellow-green eyes set in a dark face;
- *   one thin horn with a lime band at its root, sweeping forward and up
- *   from the forehead to the hero's top; and a hooked crest curling up
- *   and back from the crown, edged in lime. No number, no emblem.
+ *   two cross beams on the floor, a saddle under its neck, uprights on
+ *   the rails, a clamp from each side in to the neck and three black
+ *   hoses from the rails into the neck. The helmet is deep violet with
+ *   lime-green trim lines: a long, narrow skull swept back and up, built
+ *   of a row of overlapping squashed balls; a dark face with two narrow,
+ *   slanted yellow-green eyes deep under a hard chevron brow; a forehead
+ *   ridge from which one horn grows just above the brow, curving forward
+ *   and up in tapering segments to the hero's top, with a lime band; a
+ *   long jaw guard jutting to a point, its upper edge stepped like teeth
+ *   and a lime line along its lower edge, narrowing in three slices;
+ *   cheek plates on both sides sweeping back and up, edged in lime; and a
+ *   hooked crest at the skull's back. No number, no emblem.
  * - The tank is pale sky blue with white joints and darker grey
  *   underparts: a big rounded pod abdomen at its back (two overlapping
  *   ovoids), a white waist, a smaller cabin in front with three round
@@ -40,7 +43,8 @@
  */
 
 import type { HeroKind } from "../../../world/types";
-import { DECAL_LIFT, frameAt, type Frame } from "../../kit";
+import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
+import type { Surface } from "../../geometry";
 import type { Rgb } from "../../looks";
 import {
   discOutline,
@@ -112,117 +116,248 @@ const NECK_DARK: Rgb = [0.1, 0.1, 0.11];
 const HOSE_BLACK: Rgb = [0.05, 0.05, 0.06];
 
 /**
- * The giant robot head's measures, in metres (the footprint is ±0.8 by
- * ±1.0, the top 2.1):
+ * A squashed ball round the vertical axis at `(a, d)`: radius `r`, its
+ * middle at `h`, its lower half `down` and its upper half `up` high, with
+ * `sides` facets and rings every 30 degrees. The skull is built of a row
+ * of these.
+ */
+function ovoid(
+  k: Kit,
+  [a, d, h, r, down, up]: readonly [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ],
+  sides: number,
+  s: Surface,
+): void {
+  const ring = (deg: number): [number, number] => {
+    const t = (deg * Math.PI) / 180;
+    const x = Math.abs(deg) === 90 ? 0 : r * Math.cos(t);
+    return [x, h + (deg < 0 ? down : up) * Math.sin(t)];
+  };
+  k.lathe(a, d, [-90, -60, -30, 0, 30, 60, 90].map(ring), sides, s);
+}
+
+/**
+ * A tapered bar through `pts` (`[d, h]`) in the side plane, `widths`
+ * wide at each point (0 at a sharp tip). At an inner point its edge
+ * follows the mean of the two segments' normals, so the pieces meet
+ * edge to edge. One outline per segment, so a caller can give each its
+ * own thickness.
+ */
+function taperedSegments(
+  pts: readonly P2[],
+  widths: readonly number[],
+): [number, number][][] {
+  const normal = (p: P2, q: P2): [number, number] => {
+    const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    return [-(q[1] - p[1]) / len, (q[0] - p[0]) / len];
+  };
+  const at = pts.map((p, i) => {
+    const prev = pts[i - 1];
+    const next = pts[i + 1];
+    const n0 = prev ? normal(prev, p) : null;
+    const n1 = next ? normal(p, next) : null;
+    const n = n0 && n1 ? [n0[0] + n1[0], n0[1] + n1[1]] : (n0 ?? n1 ?? [0, 1]);
+    const len = Math.hypot(n[0] ?? 0, n[1] ?? 1);
+    const w = (widths[i] ?? 0) / 2;
+    const nx = ((n[0] ?? 0) / len) * w;
+    const ny = ((n[1] ?? 1) / len) * w;
+    return {
+      lo: [p[0] - nx, p[1] - ny] as [number, number],
+      hi: [p[0] + nx, p[1] + ny] as [number, number],
+      tip: w === 0,
+    };
+  });
+  const out: [number, number][][] = [];
+  for (let i = 0; i + 1 < at.length; i++) {
+    const p = at[i];
+    const q = at[i + 1];
+    if (!p || !q) continue;
+    out.push(q.tip ? [p.lo, q.lo, p.hi] : [p.lo, q.lo, q.hi, p.hi]);
+  }
+  return out;
+}
+
+/**
+ * The giant robot head's measures, in metres (its footprint and top are
+ * the catalogue's, read through `heroHalf`). The skull is long, narrow
+ * and swept back; every side profile is `[d, h]`:
  * - `rail`: the cradle's two floor rails, `a` from `in` to `out` on each
  *   side, the half length `d` and height `h`; `beams`: the two cross
  *   beams' centres along `d`, their half depth and height, reaching a
  *   centimetre into each rail; `saddle`: the plate under the neck between
  *   the rails, a little darker;
- * - `clamps`: the four clamps' centres `[a, d]` (each standing on its
- *   rail), their half side, bevel and heights, up over the helmet's lower
- *   edge;
- * - `neck`: the neck's centre along `d`, its radius and heights;
+ * - `posts`: the cradle's uprights on the rails, their `d`, half side and
+ *   heights; `clamp`: on each side a post at the neck's `d` and a bar
+ *   from it in to the neck, `a` from `in` to `out`, half depth and
+ *   heights;
+ * - `neck`: the neck's centre along `d`, its radius and heights, from
+ *   the saddle up into the skull;
  * - `hoses`: `[side, d, h]` for each hose: it runs level from inside the
  *   neck (`hoseIn`) out to the rail at `a = side * hoseOut` at height
  *   `h`, then down into the rail; `hoseR` its radius;
- * - `helmet`: the helmet's box and its heavy bevel, which rounds it;
- *   `crown`: its low domed top, a profile of `[r, h]` round `crownD`;
- * - `face`: the dark face plate under the brow, its front half a decal
- *   off the helmet's front and `faceBack` deep; `eyes`: the two eyes' `a`
- *   ranges, at `eyeH`, a decal off the face plate;
- * - `jaw`: the jaw guard in three steps `[half width, tip d, tip h]`,
- *   each a wedge from the helmet's front (`jawRoot`, `[d, h]` of its
- *   lower and upper back corners) to its tip, the narrower steps reaching
- *   further, so the jaw narrows to a point; `trimW`: the width of every
- *   lime line; the outer step's upper and lower edges carry one each;
- * - `brow`: the brow ridge's box, darker;
- * - `horn`: the horn's root centre `[d, h]` and its tip's `d` (the tip
- *   is the hero's top, `heroHalf`'s `top`), its half width at the root
- *   and half thickness `half`; `band`: where along it the lime
- *   band sits and how long it is;
- * - `sideTrim`: the lime lines on the helmet's sides, `[d0, d1, h0, h1]`,
- *   on the side faces inside the bevel;
- * - `crest`: the hooked crest at the crown's back, its side profile
- *   `[d, h]` and half width; `crestEdge`: the indices of the outline
- *   points its lime edge runs through.
+ * - `skull`: a row of overlapping squashed balls `[a, d, h, r, down,
+ *   up]` (`ovoid`), from the face back, each smaller and higher than the
+ *   last, so the helmet is long, narrow and swept back and up;
+ * - `face`: the dark face plate, `a` half width, `d` and `h` ranges;
+ *   `eyes`: the two narrow slanted eyes, `[a, h]` centre, length, width
+ *   and slant (the outer end higher), a decal off the plate;
+ * - `brow`: the hard brow ridge, a chevron seen from the front (`a`,
+ *   `h`), from inside the skull (`d0`) out to `d1`, overhanging the
+ *   eyes;
+ * - `keel`: the forehead ridge the horn grows from, running back over the
+ *   crown, and its half width;
+ * - `horn`: the horn's points from the root in the keel just above the
+ *   brow to the tip, which is the hero's top (the tip's `h` is replaced
+ *   by `heroHalf`'s `top`); its width at each point and each segment's
+ *   half thickness, so it curves forward and up and tapers; `band`: the
+ *   lime band on the first segment, where along it and how long;
+ * - `jaw`: the jaw guard's side profile, its upper edge stepped like
+ *   teeth down to a point, `jawTop` and `jawLow` the upper and lower
+ *   edges, `jawTip` the point; `jawSlices`: `[half width, tip d, grow]`,
+ *   the narrower slices reaching further and standing `grow` proud at
+ *   top and bottom, so the jaw narrows to its point without two faces in
+ *   one plane; `jawTrim` the lime line along the lower edge;
+ * - `cheek`: the cheek plates sweeping back and up on each side, their
+ *   profile, their frame's turn outward, the offset from the centre
+ *   line and their thickness; the lime line along their upper edge
+ *   (`cheekTrim`, indices into the profile);
+ * - `crest`: the hooked crest at the skull's back, its profile, half
+ *   width and the indices its lime edge runs through; `trimW` the width
+ *   of every lime line.
  */
 const HEAD = {
   rail: { in: 0.5, out: 0.62, d: 0.9, h: 0.12 },
   beams: { at: [-0.75, 0.75], half: 0.05, h: 0.1 },
   saddle: { a: 0.5, d0: -0.55, d1: 0.35, h0: 0.04, h1: 0.12 },
-  clamps: {
-    at: [
-      [-0.5, -0.45],
-      [0.5, -0.45],
-      [-0.5, 0.25],
-      [0.5, 0.25],
-    ],
-    half: 0.08,
-    bevel: 0.02,
-    h: [0.12, 0.5],
+  posts: { at: [-0.6, 0.35], half: 0.05, h: [0.12, 0.42] },
+  clamp: {
+    in: 0.22,
+    out: 0.6,
+    half: 0.06,
+    h: [0.34, 0.44],
+    post: [0.12, 0.48],
   },
-  neck: { d: -0.1, r: 0.36, h: [0.12, 0.37] },
+  neck: { d: -0.12, r: 0.28, h: [0.12, 0.72] },
   hoses: [
     [1, -0.35, 0.24],
-    [-1, 0.05, 0.26],
-    [-1, -0.4, 0.21],
+    [-1, 0.08, 0.26],
+    [-1, -0.38, 0.21],
   ],
-  hoseIn: 0.3,
+  hoseIn: 0.15,
   hoseOut: 0.56,
   hoseR: 0.04,
-  helmet: { a: 0.45, d0: -0.7, d1: 0.5, h0: 0.36, h1: 1.35, bevel: 0.18 },
-  crownD: -0.1,
-  crown: [
-    [0, 1.3],
-    [0.42, 1.3],
-    [0.36, 1.52],
-    [0.17, 1.62],
-    [0, 1.64],
+  skull: [
+    [0, 0.08, 1.0, 0.3, 0.42, 0.36],
+    [0, -0.2, 1.08, 0.33, 0.48, 0.36],
+    [0, -0.48, 1.16, 0.28, 0.4, 0.3],
+    [0, -0.7, 1.24, 0.2, 0.28, 0.22],
+    [0, -0.86, 1.32, 0.12, 0.16, 0.14],
   ],
-  face: { a: 0.3, h0: 0.86, h1: 1.06 },
-  faceBack: 0.03,
-  eyes: [
-    [-0.27, -0.08],
-    [0.08, 0.27],
+  face: { a: 0.24, d0: 0.2, d1: 0.4, h0: 0.8, h1: 1.02 },
+  eyes: { at: 0.13, h: 0.93, length: 0.16, width: 0.04, slant: 0.26 },
+  brow: {
+    front: [
+      [-0.3, 1.04],
+      [0, 0.99],
+      [0.3, 1.04],
+      [0.3, 1.13],
+      [0, 1.1],
+      [-0.3, 1.13],
+    ],
+    d0: 0.22,
+    d1: 0.5,
+  },
+  keel: [
+    [0.48, 1.08],
+    [0.48, 1.18],
+    [0.05, 1.42],
+    [-0.35, 1.47],
+    [-0.35, 1.3],
+    [0.2, 1.06],
   ],
-  eyeH: [0.93, 0.99],
-  jawRoot: [
-    [0.3, 0.36],
-    [0.3, 0.86],
+  keelHalf: 0.08,
+  horn: {
+    pts: [
+      [0.4, 1.14],
+      [0.5, 1.45],
+      [0.68, 1.78],
+      [0.97, 0],
+    ],
+    widths: [0.14, 0.1, 0.07, 0],
+    halves: [0.05, 0.04, 0.03],
+  },
+  band: { at: 0.45, length: 0.05 },
+  jawTop: [
+    [0.3, 0.8],
+    [0.3, 0.76],
+    [0.45, 0.74],
+    [0.45, 0.7],
+    [0.6, 0.66],
+    [0.6, 0.62],
+    [0.72, 0.58],
   ],
-  jaw: [
-    [0.26, 0.72, 0.5],
-    [0.17, 0.85, 0.47],
-    [0.08, 0.95, 0.44],
+  jawLow: [
+    [0.7, 0.44],
+    [0.4, 0.46],
+    [0.05, 0.56],
+    [0.05, 0.82],
   ],
-  trimW: 0.03,
-  brow: { a: 0.38, d0: 0.4, d1: 0.62, h0: 1.05, h1: 1.16 },
-  horn: { root: [0.36, 1.28], tipD: 0.97, width: 0.08, half: 0.035 },
-  band: { at: 0.26, length: 0.05 },
-  sideTrim: [
-    [-0.45, 0.27, 0.62, 0.66],
-    [0.23, 0.27, 0.66, 1.1],
+  jawTip: 0.46,
+  jawSlices: [
+    [0.22, 0.9, 0],
+    [0.14, 0.95, 0.012],
+    [0.07, 0.99, 0.024],
   ],
+  cheek: {
+    pts: [
+      [0.22, 0.72],
+      [0.2, 0.98],
+      [-0.3, 1.2],
+      [-0.72, 1.44],
+      [-0.62, 1.2],
+      [-0.3, 0.92],
+      [0, 0.7],
+    ],
+    turn: (12 * Math.PI) / 180,
+    at: 0.3,
+    thick: 0.04,
+  },
+  cheekTrim: [1, 2, 3],
   crest: [
-    [-0.35, 1.6],
-    [-0.6, 1.3],
-    [-0.9, 1.3],
+    [-0.6, 1.38],
+    [-0.85, 1.33],
     [-0.98, 1.55],
-    [-0.88, 1.85],
-    [-0.75, 1.84],
-    [-0.84, 1.6],
-    [-0.6, 1.62],
+    [-0.9, 1.82],
+    [-0.78, 1.8],
+    [-0.86, 1.58],
+    [-0.7, 1.5],
   ],
-  crestHalf: 0.06,
-  crestEdge: [2, 3, 4],
+  crestHalf: 0.05,
+  crestEdge: [1, 2, 3],
+  trimW: 0.03,
 } as const;
 
+/** The jaw's side profile with its tip at `tipD`, grown `grow` at top and bottom. */
+function jawProfile(tipD: number, grow: number): P2[] {
+  return [
+    ...HEAD.jawTop.map(([d, h]): P2 => [d, h + grow]),
+    [tipD, HEAD.jawTip],
+    ...HEAD.jawLow.map(([d, h]): P2 => [d, h - grow]),
+  ];
+}
+
 /**
- * The giant robot head: the cradle (rails, beams, saddle, clamps), the
- * neck and hoses, the helmet with its crown, the dark face and the
- * eyes, the jaw guard, the brow ridge, the horn and its band, the crest
- * and the lime trim.
+ * The giant robot head: the cradle (rails, beams, saddle, posts,
+ * clamps), the neck and hoses, the swept-back skull, the dark face and
+ * the slanted eyes under the brow, the forehead keel and the horn with
+ * its band, the stepped jaw guard, the cheek plates, the crest and the
+ * lime trim.
  */
 const mechHead: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const { top } = heroHalf(kind, variant);
@@ -231,6 +366,7 @@ const mechHead: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const grey = s.tinted(CRADLE_GREY);
   const side = kitAt(sideways(ORIGIN));
   const L = DECAL_LIFT;
+  const t = HEAD.trimW;
   const R = HEAD.rail;
   for (const sg of [-1, 1])
     k.box(sg * R.in, sg * R.out, -R.d, R.d, 0, R.h, grey);
@@ -239,19 +375,41 @@ const mechHead: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     k.box(-R.in - 0.01, R.in + 0.01, d - Bm.half, d + Bm.half, 0, Bm.h, grey);
   const S = HEAD.saddle;
   k.box(-S.a, S.a, S.d0, S.d1, S.h0, S.h1, s.tinted(shade(CRADLE_GREY, 0.8)));
-  const C = HEAD.clamps;
-  for (const [a, d] of C.at)
-    k.bevelBox(
-      a - C.half,
-      a + C.half,
-      d - C.half,
-      d + C.half,
-      C.h[0],
-      C.h[1],
-      C.bevel,
+  const Po = HEAD.posts;
+  const Cl = HEAD.clamp;
+  const N = HEAD.neck;
+  const mid = (R.in + R.out) / 2;
+  for (const sg of [-1, 1]) {
+    for (const d of Po.at)
+      k.bevelBox(
+        sg * mid - Po.half,
+        sg * mid + Po.half,
+        d - Po.half,
+        d + Po.half,
+        Po.h[0],
+        Po.h[1],
+        0.015,
+        grey,
+      );
+    k.box(
+      sg * mid - Po.half,
+      sg * mid + Po.half,
+      N.d - Cl.half,
+      N.d + Cl.half,
+      Cl.post[0],
+      Cl.post[1],
       grey,
     );
-  const N = HEAD.neck;
+    k.box(
+      sg * Cl.in,
+      sg * Cl.out,
+      N.d - Cl.half + 0.01,
+      N.d + Cl.half - 0.01,
+      Cl.h[0],
+      Cl.h[1],
+      grey,
+    );
+  }
   k.cylinder(0, N.d, N.h[0], N.h[1], N.r, 12, s.tinted(NECK_DARK));
   const hose = s.tinted(HOSE_BLACK);
   for (const [sg, d, h] of HEAD.hoses) {
@@ -259,70 +417,78 @@ const mechHead: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     k.cylinderAlong(sg * HEAD.hoseIn, out, d, h, HEAD.hoseR, 6, hose);
     k.cylinder(out, d, R.h - 0.01, h, HEAD.hoseR, 6, hose);
   }
-  const H = HEAD.helmet;
-  k.bevelBox(-H.a, H.a, H.d0, H.d1, H.h0, H.h1, H.bevel, violet);
-  k.lathe(0, HEAD.crownD, HEAD.crown, 8, violet);
-  const F = HEAD.face;
-  const faceFront = H.d1 + L / 2;
-  k.box(
-    -F.a,
-    F.a,
-    H.d1 - HEAD.faceBack,
-    faceFront,
-    F.h0,
-    F.h1,
-    s.tinted(HEAD_FACE),
+  HEAD.skull.forEach((b, i) =>
+    ovoid(k, b, 10, i % 2 === 0 ? violet : s.tinted(shade(HEAD_VIOLET, 0.92))),
   );
-  const [e0, e1] = HEAD.eyeH;
-  HEAD.eyes.forEach(([a0, a1], g) => {
-    k.panel(a0, a1, faceFront + L, e0, e1, s.blink(HEAD_EYE, g));
+  const F = HEAD.face;
+  k.box(-F.a, F.a, F.d0, F.d1, F.h0, F.h1, s.tinted(HEAD_FACE));
+  const E = HEAD.eyes;
+  for (const [g, sg] of [
+    [0, -1],
+    [1, 1],
+  ] as const)
+    k.extrude(
+      tiltedBar(sg * E.at, E.h, sg * E.slant, E.length, E.width),
+      F.d1,
+      F.d1 + L,
+      s.blink(HEAD_EYE, g),
+    );
+  const Bw = HEAD.brow;
+  k.extrude(Bw.front, Bw.d0, Bw.d1, s.tinted(shade(HEAD_VIOLET, 0.8)));
+  const kh = HEAD.keelHalf;
+  side.extrude(across(HEAD.keel), -kh, kh, violet);
+  const Hn = HEAD.horn;
+  const hornPts = Hn.pts.map(([d, h], i): P2 =>
+    i === Hn.pts.length - 1 ? [d, top] : [d, h],
+  );
+  taperedSegments(hornPts, Hn.widths).forEach((seg, i) => {
+    const half = Hn.halves[i] ?? 0.03;
+    side.extrude(across(seg), -half, half, violet);
   });
-  const [lo, hi] = HEAD.jawRoot;
-  const t = HEAD.trimW;
-  HEAD.jaw.forEach(([w, d, h], i) => {
-    const tip: P2 = [d, h];
-    side.extrude(across([lo, tip, hi]), -w, w, violet);
+  const [h0, h1] = hornPts;
+  if (h0 && h1) {
+    const Bd = HEAD.band;
+    const len = Math.hypot(h1[0] - h0[0], h1[1] - h0[1]);
+    const w = (Hn.widths[0] + Hn.widths[1]) / 2;
+    const half = (Hn.halves[0] ?? 0.05) + L;
+    side.extrude(
+      across(
+        barBetween(
+          lerp2(h0, h1, Bd.at - Bd.length / len / 2),
+          lerp2(h0, h1, Bd.at + Bd.length / len / 2),
+          w + 2 * L,
+        ),
+      ),
+      -half,
+      half,
+      lime,
+    );
+  }
+  HEAD.jawSlices.forEach(([w, tipD, grow], i) => {
+    side.extrude(across(jawProfile(tipD, grow)), -w, w, violet);
     if (i > 0) return;
-    for (const sg of [-1, 1]) {
-      side.extrude(across(barBetween(hi, tip, t)), sg * w, sg * (w + L), lime);
-      side.extrude(across(barBetween(lo, tip, t)), sg * w, sg * (w + L), lime);
+    const low: P2[] = [[tipD, HEAD.jawTip], ...HEAD.jawLow.slice(0, 3)];
+    for (let j = 0; j + 1 < low.length; j++) {
+      const p = low[j];
+      const q = low[j + 1];
+      if (!p || !q) continue;
+      for (const sg of [-1, 1])
+        side.extrude(across(barBetween(p, q, t)), sg * w, sg * (w + L), lime);
     }
   });
-  const B = HEAD.brow;
-  k.box(-B.a, B.a, B.d0, B.d1, B.h0, B.h1, s.tinted(shade(HEAD_VIOLET, 0.8)));
-  const Hn = { ...HEAD.horn, tip: [HEAD.horn.tipD, top] as const };
-  const len = Math.hypot(Hn.tip[0] - Hn.root[0], Hn.tip[1] - Hn.root[1]);
-  // The unit normal to the horn's axis in the side plane.
-  const nx = -(Hn.tip[1] - Hn.root[1]) / len;
-  const ny = (Hn.tip[0] - Hn.root[0]) / len;
-  const w = Hn.width;
-  side.extrude(
-    across([
-      [Hn.root[0] - nx * w, Hn.root[1] - ny * w],
-      Hn.tip,
-      [Hn.root[0] + nx * w, Hn.root[1] + ny * w],
-    ]),
-    -Hn.half,
-    Hn.half,
-    violet,
-  );
-  const Bd = HEAD.band;
-  const bandWidth = 2 * (w * (1 - Bd.at) + L);
-  side.extrude(
-    across(
-      barBetween(
-        lerp2(Hn.root, Hn.tip, Bd.at - Bd.length / len / 2),
-        lerp2(Hn.root, Hn.tip, Bd.at + Bd.length / len / 2),
-        bandWidth,
-      ),
-    ),
-    -Hn.half - L,
-    Hn.half + L,
-    lime,
-  );
-  for (const sg of [-1, 1])
-    for (const [d0, d1, h0, h1] of HEAD.sideTrim)
-      k.box(sg * H.a, sg * (H.a + L), d0, d1, h0, h1, lime);
+  const Ch = HEAD.cheek;
+  for (const sg of [-1, 1]) {
+    const cheek = kitAt(sideways(yawed(ORIGIN, 0, 0, sg * Ch.turn)));
+    const [c0, c1] = [sg * Ch.at, sg * (Ch.at + Ch.thick)];
+    cheek.extrude(across(Ch.pts), c0, c1, violet);
+    const edge = HEAD.cheekTrim.map((i) => Ch.pts[i] ?? Ch.pts[0]);
+    for (let j = 0; j + 1 < edge.length; j++) {
+      const p = edge[j];
+      const q = edge[j + 1];
+      if (!p || !q) continue;
+      cheek.extrude(across(barBetween(p, q, t)), c1, c1 + sg * L, lime);
+    }
+  }
   const ch = HEAD.crestHalf;
   side.extrude(across(HEAD.crest), -ch, ch, violet);
   const edge = HEAD.crestEdge.map((i) => HEAD.crest[i] ?? HEAD.crest[0]);
@@ -365,7 +531,7 @@ export const TANK_LENSES: readonly { a: number; h: number; r: number }[] = [
 
 /**
  * The spider tank's body measures, in metres (the footprint is ±1.2 by
- * ±1.75, the top 2.5):
+ * ±1.75; its top is the catalogue's, read through `heroHalf`):
  * - `pods`: the abdomen's two ovoids, `[d, scale]`: the full one at
  *   `d -0.7` and one at 0.85 of its size behind it, both on the `pod`
  *   profile of `[r, h]` closed at the hero's top (`heroHalf`'s `top`) on
@@ -578,7 +744,7 @@ const FLOWER_TINTS: readonly Rgb[] = [
 
 /**
  * The garden robot's measures, in metres (the footprint is ±0.9 by
- * ±0.75, the top 3.44):
+ * ±0.75; its top is the catalogue's, read through `heroHalf`):
  * - `legs`: the two stubby block legs, `a` from `in` to `out`, their half
  *   depth, heights and bevel; `feet`: their flat feet, `a` from `in` to
  *   `out`, `d` and `h` ranges;

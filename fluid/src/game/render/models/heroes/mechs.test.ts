@@ -49,13 +49,17 @@ describe("mech hero models", () => {
   });
 
   it("hangs the garden robot's arms almost to the floor and gives it one eye", () => {
-    // Mutation caught: short arms, or a second eye.
+    // Mutation caught: short arms (a wrist 0.2 m higher lifts the fingers
+    // from 0.1 m to 0.3 m), one arm missing, or a second eye.
     const parts = partsOf("garden-robot");
     const arms = parts.filter((p) => {
       const pts = local(p);
-      return Math.min(...pts.map((q) => Math.abs(q[0]))) > 0.62 && lo(p) < 0.4;
+      return Math.min(...pts.map((q) => Math.abs(q[0]))) > 0.62 && lo(p) < 0.2;
     });
-    expect(arms.length).toBeGreaterThanOrEqual(2);
+    for (const sign of [-1, 1])
+      expect(
+        arms.filter((p) => Math.sign(local(p)[0]?.[0] ?? 0) === sign).length,
+      ).toBeGreaterThan(0);
     expect(parts.filter((p) => p.flag >= FLAG.blink)).toHaveLength(1);
   });
 });
