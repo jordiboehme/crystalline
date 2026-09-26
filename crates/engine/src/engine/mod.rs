@@ -1002,7 +1002,11 @@ pub struct Engine {
     // The one rename this engine runs at a time, as the local name it
     // renames and the name it gets; a second one is refused while it is
     // taken.
-    rename_slot: std::sync::Mutex<Option<(String, String)>>,
+    rename_slot: std::sync::Mutex<Option<(String, String, bool)>>,
+    // Why the last adoption of a declared name failed, by the local name that
+    // keeps waiting: set when the rename after a sync fails, cleared when it
+    // lands or waits for a known reason. `crystalline doctor` reads it.
+    adoption_failures: std::sync::Mutex<HashMap<String, String>>,
     // Set while a rename is between its index row step and its config step:
     // a spelling push then would drop the alias the index row step left for
     // the old name, since the configuration does not list it yet. A refresh
@@ -1704,6 +1708,7 @@ impl Engine {
             joins: Arc::new(crate::join::Joins::default()),
             rename_pause: crate::rename::RenamePause::default(),
             rename_slot: std::sync::Mutex::new(None),
+            adoption_failures: std::sync::Mutex::new(HashMap::new()),
             names_frozen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             rename_fail_after: std::sync::Mutex::new(None),
@@ -2524,13 +2529,29 @@ impl Engine {
     /// domain this instance has no registration for may be another's current
     /// work, and another instance's live registration is a registration.
     fn hosted_elsewhere(&self, row: &DomainStats, now: DateTime<Utc>) -> bool {
-        let Some(holder) = row.host_instance_id.as_deref().filter(|h| !h.is_empty()) else {
+        self.held_elsewhere(
+            row.host_instance_id.as_deref(),
+            row.host_heartbeat_at.as_deref(),
+            now,
+        )
+    }
+
+    /// [`Engine::hosted_elsewhere`] over a holder and its heartbeat as read,
+    /// for a caller that has a [`crystalline_index::DomainHost`] rather than
+    /// a stats row.
+    pub(super) fn held_elsewhere(
+        &self,
+        holder: Option<&str>,
+        beat: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(holder) = holder.filter(|h| !h.is_empty()) else {
             return false;
         };
         if holder == self.instance_id {
             return false;
         }
-        let Some(beat) = row.host_heartbeat_at.as_deref() else {
+        let Some(beat) = beat else {
             return false;
         };
         match DateTime::parse_from_rfc3339(beat) {
@@ -4197,6 +4218,7 @@ mod edit;
 mod evolve;
 mod github;
 mod move_;
+mod name_report;
 mod names;
 mod origins;
 mod read;

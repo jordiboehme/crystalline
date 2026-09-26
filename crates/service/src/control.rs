@@ -3,7 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! file_stamps, collect_orphaned_domains, sessions, tool, configure, origin_add,
+//! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
+//! sessions, tool, configure, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
@@ -169,6 +170,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // The domain name findings `crystalline doctor` shows, and the fix
+        // it runs for links spelled with a name only this machine uses.
+        // Served here for the reason `file_stamps` is: this daemon holds the
+        // index, and doctor must not have to stop it to ask or to fix.
+        "name_report" => match shared.engine.name_report().await {
+            Ok(data) => (envelope_ok(data), false),
+            Err(e) => (envelope_err(e.to_string()), false),
+        },
+        "fix_local_spellings" => match shared.engine.fix_local_spellings().await {
+            Ok(fixed) => (envelope_ok(json!({ "fixed": fixed })), false),
+            Err(e) => (envelope_err(e.to_string()), false),
+        },
         "reindex" => {
             let full = req.get("full").and_then(Value::as_bool).unwrap_or(false);
             let embed = req.get("embed").and_then(Value::as_bool).unwrap_or(false);
@@ -618,8 +631,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
-                 domain_remove, retag, collect_orphaned_domains, \
-                 configure, origin_add, origin_update, origin_status, origin_share, \
+                 domain_remove, retag, collect_orphaned_domains, name_report, \
+                 fix_local_spellings, configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_withdraw, origin_changes, origin_discard, origin_resolve, provision, \
                  forget_domain or shutdown"
             )),

@@ -43,8 +43,11 @@ impl Engine {
     /// Answers the list of what it did, for logs and for the ctl `sync`
     /// reply's `names`: `{domain, action, ..}` with `action` one of
     /// `inferred`, `alias`, `kept`, `shadowed`, `contested`, `deferred`,
-    /// `renamed` or `failed`; a derived domain's `shadowed` or `contested`
-    /// comes back on every pass while it lasts, without a log line. Empty on
+    /// `waiting`, `renamed` or `failed`; a derived domain's `shadowed` or
+    /// `contested` comes back on every pass while it lasts, without a log
+    /// line, and so does `waiting` (`reason: leftover_row`: an empty index
+    /// row of a removed domain holds the name until `crystalline doctor
+    /// --fix` drops it). Empty on
     /// a read-only instance and on an engine that knows no configuration file
     /// of its own.
     pub async fn adopt_domain_names(&self) -> Result<Value> {
@@ -89,6 +92,25 @@ impl Engine {
         };
 
         for (old, new) in planned {
+            // An empty row an older version's `domain remove` left under the
+            // name refuses the rename. Nothing a sync does changes that, so
+            // the adoption waits quietly (on every sync, without a warning)
+            // and `crystalline doctor` names the row and drops it with --fix.
+            if self.leftover_row_holds(&new).await {
+                tracing::debug!(
+                    domain = %old,
+                    "renaming '{old}' to '{new}' waits: the index still holds a row named \
+                     '{new}' from a removed domain; `crystalline doctor --fix` drops it"
+                );
+                self.adoption_failures.lock().unwrap().remove(&old);
+                report.push(json!({
+                    "domain": old,
+                    "canonical": new,
+                    "action": "waiting",
+                    "reason": "leftover_row",
+                }));
+                continue;
+            }
             match self
                 .rename_domain_local(
                     &old,
@@ -99,6 +121,7 @@ impl Engine {
                 .await
             {
                 Ok(_) => {
+                    self.adoption_failures.lock().unwrap().remove(&old);
                     tracing::info!(
                         "domain '{old}' is now called '{new}', the name its MANIFEST declares; \
                          '{old}' stays an alias"
@@ -120,6 +143,10 @@ impl Engine {
                          here failed; the next sync tries again, or run `crystalline domain \
                          rename {old} {new} --local`"
                     );
+                    self.adoption_failures
+                        .lock()
+                        .unwrap()
+                        .insert(old.clone(), e.to_string());
                     report.push(json!({
                         "domain": old,
                         "canonical": new,

@@ -1953,6 +1953,23 @@ pub trait Store: Send + Sync {
     /// [`Store::commit`].
     async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()>;
 
+    /// Drop the domain row named `name` when it holds nothing: no engram row
+    /// of any actor (a draft counts) and no attachment. Its spellings, tag
+    /// aliases, host lock and any stray relation or link rows go with it.
+    /// Answers `true` when a row was dropped, `false` when there is no row
+    /// under the name or the row still holds something, which is left exactly
+    /// as it was.
+    ///
+    /// For a domain nobody registers any more: `domain remove` leaves an
+    /// empty row after [`Store::clear_domain`], and the row would otherwise
+    /// hold the name against a rename or a later adoption. The caller decides
+    /// that the domain is unregistered and not another instance's; this only
+    /// guarantees that nothing with content is ever dropped.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool>;
+
     /// Every `(source domain name, engram path)` that names one of `spellings`
     /// as a target domain: through a relation or link row, or through a
     /// `crystalline://<spelling>` URL in its text, which no edge table records.

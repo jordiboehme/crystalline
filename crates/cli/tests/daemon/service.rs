@@ -1415,6 +1415,10 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
         json!("daemon"),
         "the index reads went through the running daemon: {report}"
     );
+    assert!(
+        report["names"].is_object() && report["names"].get("error").is_none(),
+        "the name findings came from the daemon too (ctl name_report): {report}"
+    );
     let docs_report = report["domains"]
         .as_array()
         .unwrap()

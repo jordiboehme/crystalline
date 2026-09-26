@@ -1232,6 +1232,48 @@ impl Store for PostgresStore {
         .await
     }
 
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            // -- actor: all - one actor's draft is content too, so any row of
+            // any actor keeps the domain row. `FOR UPDATE` holds the row until
+            // the commit, so a registration of the same name waits for it.
+            let id: Option<(i64,)> = sqlx::query_as(
+                "SELECT d.id FROM domain d WHERE d.name=$1 \
+                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
+                 FOR UPDATE OF d",
+            )
+            .bind(name)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+            let Some((id,)) = id else {
+                return Ok(false);
+            };
+            // `domain_lock` and `tag_alias` name the row without a cascade,
+            // and `relation` and `link` carry its id with no key at all, so
+            // each is cleared before the row itself.
+            for sql in [
+                "DELETE FROM domain_spelling WHERE domain_id=$1",
+                "DELETE FROM tag_alias WHERE domain_id=$1",
+                "DELETE FROM domain_lock WHERE domain_id=$1",
+                "DELETE FROM relation WHERE domain_id=$1",
+                "DELETE FROM link WHERE domain_id=$1",
+                "DELETE FROM domain WHERE id=$1",
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     async fn engrams_referencing_domains(
         &self,
         spellings: &[String],

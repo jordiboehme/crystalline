@@ -713,3 +713,49 @@ async fn a_pulled_domain_name_renames_a_derived_team_domain_after_the_pull() {
     assert!(tmp.path().join("origins").join("eng").is_dir());
     assert!(change_paths(&r.eng, "eng").await.is_empty());
 }
+
+/// `crystalline doctor --fix` respells a link in a team domain that names a
+/// local domain by a name only this machine uses, and the rewrite is an
+/// ordinary edit there: a local change, shared with the next share.
+#[tokio::test]
+async fn fixing_a_local_only_spelling_in_a_team_domain_is_a_local_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[
+        ("MANIFEST.md", declaring_manifest()),
+        (
+            "notes/link.md",
+            b"---\ntype: engram\ntitle: Link\npermalink: link\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nSee [[mine:runbook]] for the steps.\n".to_vec(),
+        ),
+    ]);
+    // `mine` is this machine's name for a local domain whose MANIFEST says
+    // `personal`.
+    let mine_root = tmp.path().join("mine");
+    let mine = local_domain(&mine_root, &manifest_body("domain_name: personal\n"))
+        .with_name_origin(crystalline_core::config::NameOrigin::Explicit);
+    std::fs::write(mine_root.join("runbook.md"), engram("Runbook", "runbook")).unwrap();
+    let r = rig(tmp.path(), mock, &[("mine", mine)]).await;
+    r.eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap();
+    r.eng.sync(None).await.unwrap();
+    assert!(change_paths(&r.eng, "eng").await.is_empty());
+
+    let report = r.eng.name_report().await.unwrap();
+    assert_eq!(
+        report["local_spellings"],
+        serde_json::json!([{
+            "domain": "eng", "path": "notes/link.md", "spelling": "mine",
+            "canonical": "personal", "count": 1
+        }]),
+        "{report}"
+    );
+    assert_eq!(r.eng.fix_local_spellings().await.unwrap(), 1);
+
+    let text = std::fs::read_to_string(r.domains_root.join("eng/notes/link.md")).unwrap();
+    assert!(text.contains("[[personal:runbook]]"), "{text}");
+    assert_eq!(
+        change_paths(&r.eng, "eng").await,
+        vec!["notes/link.md".to_string()]
+    );
+}

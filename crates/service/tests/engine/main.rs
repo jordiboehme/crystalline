@@ -20,6 +20,7 @@ mod graph;
 mod index_files;
 mod model_upgrade;
 mod move_permalink;
+mod name_report;
 mod orphaned_rows;
 mod similar;
 #[cfg(unix)]

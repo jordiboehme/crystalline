@@ -890,9 +890,7 @@ impl Engine {
     /// for a domain nobody has registered, which grants nothing until a domain
     /// of that name exists again; it is logged, and the residue is that a later
     /// re-add of the same name comes back private under the old owner rather
-    /// than shared. That is the safe direction, and it is the same shape as the
-    /// store's own domain row, which [`Engine::domain_remove`] also leaves in
-    /// place.
+    /// than shared. That is the safe direction.
     ///
     /// The report is [`Engine::domain_remove`]'s plus `rooms_closed`, so a
     /// client can say how many co-editing sessions it just ended.

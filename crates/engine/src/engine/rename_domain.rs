@@ -14,7 +14,7 @@ use crate::rename::{
 /// Frees the one-rename slot when the rename that took it ends, however it
 /// ends.
 struct RenameSlot<'a> {
-    slot: &'a std::sync::Mutex<Option<(String, String)>>,
+    slot: &'a std::sync::Mutex<Option<(String, String, bool)>>,
 }
 
 impl Drop for RenameSlot<'_> {
@@ -149,7 +149,7 @@ impl Engine {
             )));
         }
 
-        let _slot = self.take_rename_slot(old, new)?;
+        let _slot = self.take_rename_slot(old, new, local_only)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let state_dir = self.journal_state_dir()?;
@@ -314,7 +314,7 @@ impl Engine {
         let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? else {
             return Ok(None);
         };
-        let _slot = self.take_rename_slot(&journal.old, &journal.new)?;
+        let _slot = self.take_rename_slot(&journal.old, &journal.new, journal.local_only)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let _origins = self.lock_both_origins(&journal.old, &journal.new).await;
@@ -780,7 +780,11 @@ impl Engine {
     }
 
     /// The base row at `path` in `domain`, if the index holds one.
-    async fn descriptor_at(&self, domain: &str, path: &str) -> Result<Option<EngramDescriptor>> {
+    pub(super) async fn descriptor_at(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<EngramDescriptor>> {
         let store = self.store.lock().await;
         Ok(store
             .list_engrams(domain, Some(path), None)
@@ -791,7 +795,7 @@ impl Engine {
 
     /// The domain's own text at `path` (never a draft), with its descriptor
     /// and source, or `None` when nothing stands there.
-    async fn base_text(
+    pub(super) async fn base_text(
         &self,
         domain: &str,
         path: &str,
@@ -1077,16 +1081,16 @@ impl Engine {
     }
 
     /// Take the one-rename slot, or say which rename holds it.
-    fn take_rename_slot(&self, old: &str, new: &str) -> Result<RenameSlot<'_>> {
+    fn take_rename_slot(&self, old: &str, new: &str, local_only: bool) -> Result<RenameSlot<'_>> {
         let mut slot = self.rename_slot.lock().unwrap();
-        if let Some((running, to)) = slot.as_ref() {
+        if let Some((running, to, local)) = slot.as_ref() {
             return Err(EngineError::Conflict(format!(
                 "the rename of '{running}' to '{to}' is still running; try again once it is \
-                 done. If it stops before it is done, send that same rename again or restart \
-                 the daemon to finish it"
+                 done. If it stops before it is done, {}",
+                finish_hint_for(running, to, *local)
             )));
         }
-        *slot = Some((old.to_string(), new.to_string()));
+        *slot = Some((old.to_string(), new.to_string(), local_only));
         Ok(RenameSlot {
             slot: &self.rename_slot,
         })
@@ -1124,8 +1128,8 @@ impl Engine {
         if row.is_some() {
             return Err(EngineError::Conflict(format!(
                 "the index still holds a domain named '{new}' from a domain removed earlier; \
-                 pick another name, or stop the daemon and rebuild the index with `crystalline \
-                 reindex --wipe`, which drops it"
+                 pick another name, or run `crystalline doctor --fix`, which drops it once it \
+                 holds nothing"
             )));
         }
         for parent in [
@@ -1185,7 +1189,7 @@ impl Engine {
     }
 
     /// The valid name `name`'s MANIFEST declares, if any.
-    fn declared_domain_name(&self, name: &str, entry: &DomainEntry) -> Option<String> {
+    pub(super) fn declared_domain_name(&self, name: &str, entry: &DomainEntry) -> Option<String> {
         if entry.is_virtual() {
             return self.virtual_domain_names.read().unwrap().get(name).cloned();
         }
@@ -1219,12 +1223,16 @@ fn io_error(e: std::io::Error) -> EngineError {
 /// How to finish the rename `journal` records: the same rename sent again,
 /// or a daemon restart, which finishes it before serving.
 fn finish_hint(journal: &RenameJournal) -> String {
+    finish_hint_for(&journal.old, &journal.new, journal.local_only)
+}
+
+/// [`finish_hint`] for the rename of `old` to `new`, `--local` when
+/// `local_only`.
+fn finish_hint_for(old: &str, new: &str, local_only: bool) -> String {
     format!(
-        "send the same rename again (`crystalline domain rename {} {}{}`) to finish it, or \
-         restart the daemon, which finishes it before serving",
-        journal.old,
-        journal.new,
-        if journal.local_only { " --local" } else { "" }
+        "send the same rename again (`crystalline domain rename {old} {new}{}`) to finish it, \
+         or restart the daemon, which finishes it before serving",
+        if local_only { " --local" } else { "" }
     )
 }
 

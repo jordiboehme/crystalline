@@ -1413,6 +1413,143 @@ parity!(
     renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias
 );
 
+/// An empty domain row goes with everything that hangs off it - its spellings,
+/// its tag aliases and its host lock - and the name is free for the next
+/// registration or rename. A row that still holds anything, even one actor's
+/// draft or one attachment, stays, and so does every other row.
+async fn dropping_an_empty_domain_row(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let keep = store
+        .upsert_domain("keep", Some("/tmp/keep"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(gone, &[("old".to_string(), "new".to_string())])
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            gone,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("gone".to_string(), gone),
+            ("gone-alias".to_string(), gone),
+            ("keep".to_string(), keep),
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        store.drop_empty_domain_row("gone").await.unwrap(),
+        "an empty row is dropped"
+    );
+    assert_eq!(store.domain_id("gone").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("keep".to_string(), keep)],
+        "every spelling of the row went with it"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["keep".to_string()]
+    );
+    assert!(
+        !store.drop_empty_domain_row("gone").await.unwrap(),
+        "no row under the name is nothing to drop"
+    );
+
+    // The name is free again: a rename onto it works, and a fresh
+    // registration gets a clean row.
+    store.rename_domain_row("keep", "gone").await.unwrap();
+    assert_eq!(store.domain_id("gone").await.unwrap(), Some(keep));
+
+    // One actor's draft is a row, so the domain is not empty.
+    let drafted = store
+        .upsert_domain("drafted", Some("/tmp/drafted"), DomainKind::File)
+        .await
+        .unwrap();
+    let mut draft = record("a.md", "a", "draft", "sha-a");
+    draft.actor = "alice".to_string();
+    store.upsert_engram(drafted, &draft).await.unwrap();
+    assert!(
+        !store.drop_empty_domain_row("drafted").await.unwrap(),
+        "a row holding a draft stays"
+    );
+    assert_eq!(store.domain_id("drafted").await.unwrap(), Some(drafted));
+
+    // A base engram keeps it too.
+    let full = store
+        .upsert_domain("full", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(full, &record("b.md", "b", "base", "sha-b"))
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("full").await.unwrap());
+    assert_eq!(store.domain_id("full").await.unwrap(), Some(full));
+
+    // And so does one attachment.
+    let assets = store
+        .upsert_domain("assets", Some("/tmp/assets"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(
+            assets,
+            &AttachmentRow {
+                path: "assets/x.png".to_string(),
+                sha256: "abc".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                modified: "2026-09-26T10:00:00+00:00".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("assets").await.unwrap());
+    assert_eq!(store.domain_id("assets").await.unwrap(), Some(assets));
+
+    // A new registration under a dropped name holds no host lock of the
+    // row before it.
+    let first = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            first,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(store.drop_empty_domain_row("fresh").await.unwrap());
+    let second = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(store.domain_host(second).await.unwrap(), None);
+}
+parity!(
+    dropping_an_empty_domain_row_on_both_backends,
+    dropping_an_empty_domain_row
+);
+
 /// Names compare byte for byte, so a rename that only changes case is a real
 /// rename, and the old spelling stays behind as an alias like any other.
 async fn a_case_only_row_rename_works(store: &dyn Store) {
@@ -8823,11 +8960,12 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 158,
+        census.sites, 160,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         63 per backend in mod.rs (the URL half of `engrams_referencing_domains` is \
-         the newest, after the move's `readdress_engram` and `engrams_mentioning`, \
-         all three on the base rows), 9 per backend in search.rs, 14 in the shared \
+         64 per backend in mod.rs (the emptiness probe of `drop_empty_domain_row` is \
+         the newest, waived because a draft keeps the row too; before it the URL half \
+         of `engrams_referencing_domains`, the move's `readdress_engram` and \
+         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 14 in the shared \
          statement builders in store.rs: the reference-resolution expression's four \
          arms, the three engram hops of each of the two graph frontiers, the two \
          arms of the edge half of `engrams_referencing_domains` and the two arms of \
@@ -8846,9 +8984,10 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 18,
+        census.waived, 20,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Nine per backend: the six statements of `clear_domain` - the sixth is the one that \
+         Ten per backend: the emptiness probe of `drop_empty_domain_row`, where any \
+         actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \
          takes the bodies out of `engram_content`, which names the rows about to go because \
          that table has no domain of its own - the id-scoped delete inside `delete_engram` \
          and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \

@@ -33,9 +33,15 @@
 //! against the provisioning receipt, and every domain still awaiting a
 //! decision -
 //! entirely read-only, straight off `crystalline_core::provision::status`,
-//! never reconciling anything itself. `--fix` removes orphan rows and stale
-//! service artifacts; the rest, including the whole GitHub, environment,
-//! harnesses and provisioning sections, are report-only, and every finding
+//! never reconciling anything itself; (k) domain names: a declared name
+//! another domain holds here (shadowed), one several domains claim, an alias
+//! that does not resolve, a team domain whose MANIFEST declares no name, a
+//! derived domain still waiting to take its declared name, and links that
+//! spell a domain by a name only this machine uses. `--fix` removes orphan
+//! rows, the empty index rows removed domains left behind, and stale service
+//! artifacts, and respells those links; the rest, including the whole
+//! GitHub, environment, harnesses and provisioning sections, are
+//! report-only, and every finding
 //! that has a fix points at the right next command.
 //!
 //! The index reads are socket-first, the same shape `sync_dispatch` uses: a
@@ -64,7 +70,7 @@ use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
 use crystalline_service::EnvOverlay;
 use crystalline_service::instance;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cmd;
 use crate::install;
@@ -525,6 +531,15 @@ pub struct OrphanedDomainDoctor {
     /// through [`KeptReason`], whose vocabulary is the whole of the engine's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
+    /// Whether this run dropped the domain's empty row itself, so its name is
+    /// free for a rename or an adoption. Only `--fix` drops one: the row of a
+    /// domain it just collected, or one an older version's `domain remove`
+    /// left behind with nothing in it.
+    pub row_dropped: bool,
+    /// Whether a `--fix` run would drop the empty row. An empty row left
+    /// behind is a problem until it is dropped: it holds the name against a
+    /// rename or an adoption onto it.
+    pub row_droppable: bool,
 }
 
 /// Rows whose domain nobody registers any more, and, when the whole check
@@ -600,6 +615,112 @@ pub struct TagsDoctor {
     pub clusters: Vec<TagCluster>,
 }
 
+/// A domain whose declared name is another domain's local name here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowedNameDoctor {
+    /// The shadowed domain's local name.
+    pub domain: String,
+    /// The name its MANIFEST declares.
+    pub canonical: String,
+    /// The domain that answers to that name here.
+    #[serde(default)]
+    pub held_by: Option<String>,
+}
+
+/// A declared name more than one domain claims, none registered under it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NameConflictDoctor {
+    /// The contested name.
+    pub name: String,
+    /// The local names of the domains that declare it, sorted.
+    pub claimants: Vec<String>,
+}
+
+/// A machine-local alias that does not resolve because its spelling is taken.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DroppedAliasDoctor {
+    /// The domain that lists the alias.
+    pub domain: String,
+    /// The alias.
+    pub alias: String,
+    /// The domain that owns the spelling, `None` when no single one does.
+    #[serde(default)]
+    pub held_by: Option<String>,
+}
+
+/// A team domain whose MANIFEST declares no `domain_name`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamNameDoctor {
+    /// The local name this machine uses.
+    pub domain: String,
+    /// The repository it comes from.
+    pub repo: String,
+}
+
+/// A derived domain whose declared name it has not taken on yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdoptionPendingDoctor {
+    /// The local name it still has.
+    pub domain: String,
+    /// The name its MANIFEST declares.
+    pub canonical: String,
+    /// The declared name the last adoption recorded, if any.
+    #[serde(default)]
+    pub canonical_seen: Option<String>,
+    /// Why the rename has not happened, when that is known.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One engram's links that spell a domain by a name only this machine uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalSpellingDoctor {
+    /// The domain the engram lives in.
+    pub domain: String,
+    /// The engram's domain-relative path.
+    pub path: String,
+    /// The spelling it uses: a local name or an alias.
+    pub spelling: String,
+    /// The domain's declared name, which `--fix` writes instead.
+    pub canonical: String,
+    /// How many links and URLs spell it that way.
+    pub count: u64,
+}
+
+/// The domain name findings. Shadowed and contested names, dropped aliases,
+/// team domains without a declared name and adoptions still waiting are
+/// warnings and hints: they never feed [`DoctorReport::remaining_problems`].
+/// Links spelled with a name only this machine uses are problems until
+/// `--fix` respells them.
+///
+/// `None` on [`DoctorReport::names`] when the check did not run: a `--domain`
+/// run, or no route to the index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NamesDoctor {
+    #[serde(default)]
+    pub shadowed: Vec<ShadowedNameDoctor>,
+    #[serde(default)]
+    pub conflicts: Vec<NameConflictDoctor>,
+    #[serde(default)]
+    pub dropped_aliases: Vec<DroppedAliasDoctor>,
+    #[serde(default)]
+    pub team_without_domain_name: Vec<TeamNameDoctor>,
+    #[serde(default)]
+    pub adoption_pending: Vec<AdoptionPendingDoctor>,
+    #[serde(default)]
+    pub local_spellings: Vec<LocalSpellingDoctor>,
+    /// How many links `--fix` respelled, present only on a `--fix` run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<u64>,
+    /// Why `--fix` could not respell them (a read-only instance), when it
+    /// could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_error: Option<String>,
+    /// What went wrong when the check could not be made at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -631,6 +752,9 @@ pub struct DoctorReport {
     /// Advisory tag-hygiene diagnostics. `None` when there is no index yet;
     /// present (possibly with an empty cluster list) once one exists.
     pub tags: Option<TagsDoctor>,
+    /// Domain name findings. `None` when the check did not run: a `--domain`
+    /// run, or no route to the index.
+    pub names: Option<NamesDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
 }
@@ -710,12 +834,20 @@ impl DoctorReport {
         // domain's rows, and every row on a read-only instance, are reported
         // and never counted - no `--fix` collects them, so counting them
         // would fail doctor forever over a state that has no remedy here.
+        // An empty row left behind counts the same way, once per domain: it
+        // holds a name against a rename or an adoption, and `--fix` drops it.
         if let Some(o) = &self.orphaned_rows {
             n += o
                 .domains
                 .iter()
-                .filter(|d| d.collectable && !d.collected)
+                .filter(|d| (d.collectable && !d.collected) || (d.row_droppable && !d.row_dropped))
                 .count();
+        }
+        // A link spelled with a name only this machine uses breaks for every
+        // colleague who reads it, and `--fix` respells it: one problem per
+        // file until then. The other name findings are warnings and hints.
+        if let Some(names) = &self.names {
+            n += names.local_spellings.len();
         }
         // Provisioning never contributes here, the same stance environment
         // takes: an undecided domain is a normal state awaiting a person's
@@ -753,6 +885,19 @@ pub async fn run(
     // lines below and held to the end of the pass) would be a second opener
     // of the same file waiting on the first.
     let orphaned_rows = check_orphaned_rows(
+        domain_filter,
+        fix,
+        config_override,
+        db_override,
+        &db,
+        cfg.database().backend,
+    )
+    .await;
+
+    // After the collection, which frees the names of the rows it drops, and
+    // before doctor's own store for the same reason the collection comes
+    // first: the names check asks the daemon or opens the index itself.
+    let names = check_names(
         domain_filter,
         fix,
         config_override,
@@ -869,8 +1014,56 @@ pub async fn run(
         provisioning,
         orphaned_rows,
         tags,
+        names,
         fix,
     })
+}
+
+/// The domain name findings, asked of the daemon that owns the index and
+/// otherwise of a directly opened one, the same shape
+/// [`check_orphaned_rows`] takes; with `fix`, the links spelled with a name
+/// only this machine uses are respelled first, through the ordinary write
+/// path.
+///
+/// Skipped on a `--domain` run for the reason the orphan check is: the fix
+/// respells links in every domain, which would act on domains the reader did
+/// not name. Never an error: a check that could not be made says why.
+async fn check_names(
+    domain_filter: Option<&str>,
+    fix: bool,
+    config_override: Option<&Path>,
+    db_override: Option<&Path>,
+    db: &Path,
+    backend: DatabaseBackend,
+) -> Option<NamesDoctor> {
+    if domain_filter.is_some() {
+        return None;
+    }
+    let daemon_may_answer = crystalline_service::use_daemon(db_override, config_override)
+        && instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if !orphan_check_has_a_route(
+        daemon_may_answer,
+        matches!(backend, DatabaseBackend::Turso),
+        db.is_file(),
+    ) {
+        return None;
+    }
+    let report = match crystalline_service::name_report(fix, db_override, config_override).await {
+        Ok(report) => report,
+        Err(e) => {
+            return Some(NamesDoctor {
+                error: Some(format!("{e:#}")),
+                ..NamesDoctor::default()
+            });
+        }
+    };
+    match serde_json::from_value::<NamesDoctor>(report) {
+        Ok(names) => Some(names),
+        Err(e) => Some(NamesDoctor {
+            error: Some(format!("the name report did not parse: {e}")),
+            ..NamesDoctor::default()
+        }),
+    }
 }
 
 /// Rows whose domain nobody registers any more, asked of the daemon that owns
@@ -935,11 +1128,17 @@ async fn check_orphaned_rows(
         .unwrap_or_default()
     {
         let kept = row.get("kept").and_then(serde_json::Value::as_str);
-        // A domain whose rows are already gone has nothing at stake and
-        // nothing to do, and it stays in the index forever (the domain row
-        // outlives its engrams by design), so reporting it would be a line
-        // that never goes away and never means anything.
-        if kept == Some("no_rows") {
+        let row_dropped = row.get("row_dropped").and_then(serde_json::Value::as_bool) == Some(true);
+        let row_droppable = row
+            .get("row_droppable")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        // A domain whose rows are already gone has nothing at stake, and is
+        // reported only for its empty row: one `--fix` drops (or just
+        // dropped) so the name is free again. A row nothing here may drop (a
+        // journal that could not be read, a read-only instance) would be a
+        // line that never goes away, so it is left out.
+        if kept == Some("no_rows") && !row_dropped && !row_droppable {
             continue;
         }
         let collectable = row.get("collected").and_then(serde_json::Value::as_bool) == Some(true);
@@ -964,6 +1163,8 @@ async fn check_orphaned_rows(
             // run that was allowed to write actually took it.
             collected: collectable && !dry_run,
             kept: kept.map(str::to_string),
+            row_dropped,
+            row_droppable,
         });
     }
     Some(OrphanedRowsDoctor {
@@ -2629,6 +2830,10 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    if let Some(names) = &report.names {
+        render_names(&mut out, names, report.fix);
+    }
+
     // Advisory tag hygiene: near-duplicate clusters, never a counted problem.
     if let Some(t) = &report.tags
         && !t.clusters.is_empty()
@@ -2668,9 +2873,28 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
         None => "never seen registered by this version".to_string(),
     };
     if d.collected {
+        let row = if d.row_dropped {
+            ", and dropped its empty row so the name is free again"
+        } else {
+            ""
+        };
         return format!(
-            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched"
+            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched{row}"
         );
+    }
+    // An empty row left behind, a file domain's or a virtual one's: the only
+    // thing at stake is the name it holds.
+    if !d.collectable {
+        if d.row_dropped {
+            return format!(
+                "  dropped the empty row of removed domain '{name}'; the name is free again"
+            );
+        }
+        if d.row_droppable {
+            return format!(
+                "  [problem] {name}: an empty row left behind by a removed domain ({age}). It holds the name '{name}' against a rename or an adoption; rerun with --fix to drop it"
+            );
+        }
     }
     if d.collectable {
         return format!(
@@ -2713,6 +2937,115 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
             )
         }
     }
+}
+
+/// The domain name section: nothing at all when there is nothing to say.
+fn render_names(out: &mut String, names: &NamesDoctor, fix: bool) {
+    use std::fmt::Write as _;
+    let lines = name_lines(names, fix);
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "domain names:");
+    for line in lines {
+        let _ = writeln!(out, "  {line}");
+    }
+}
+
+/// One line per name finding, each naming its next step. Only the
+/// local-only spellings line is marked a problem; the rest are warnings and
+/// hints.
+fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(err) = &names.error {
+        lines.push(format!("not checked: {err}"));
+        return lines;
+    }
+    for s in &names.shadowed {
+        let c = &s.canonical;
+        lines.push(format!(
+            "domain '{}' says its name is '{c}', but '{c}' is another domain here; links that name '{c}' reach that one. Rename one of them: crystalline domain rename <domain> <new>",
+            s.domain
+        ));
+    }
+    for c in &names.conflicts {
+        let quoted: Vec<String> = c.claimants.iter().map(|n| format!("'{n}'")).collect();
+        let (who, reach) = match quoted.as_slice() {
+            [a, b] => (format!("{a} and {b} both"), "neither"),
+            [rest @ .., last] => (
+                format!("{} and {last} all", rest.join(", ")),
+                "none of them",
+            ),
+            [] => (String::new(), "none of them"),
+        };
+        lines.push(format!(
+            "domains {who} call themselves '{}'; links that name '{}' reach {reach}. Rename one of them",
+            c.name, c.name
+        ));
+    }
+    for d in &names.dropped_aliases {
+        lines.push(match &d.held_by {
+            Some(held_by) => format!(
+                "alias '{}' of '{}' is ignored: '{}' already names '{held_by}'",
+                d.alias, d.domain, d.alias
+            ),
+            None => format!(
+                "alias '{}' of '{}' is ignored: more than one domain here answers to '{}'",
+                d.alias, d.domain, d.alias
+            ),
+        });
+    }
+    for a in &names.adoption_pending {
+        let why = match &a.reason {
+            Some(reason) => reason.clone(),
+            None => format!(
+                "the next sync tries the rename again; if it keeps failing, the daemon log says why, or run: crystalline domain rename {} {} --local",
+                a.domain, a.canonical
+            ),
+        };
+        lines.push(format!(
+            "domain '{}' says its name is '{}' but is still called '{}' here: {why}",
+            a.domain, a.canonical, a.domain
+        ));
+    }
+    for t in &names.team_without_domain_name {
+        lines.push(format!(
+            "team domain '{}' declares no domain_name in its MANIFEST, so each colleague may name it differently. Ask the owner to add `domain_name: {}` to the MANIFEST",
+            t.domain, t.domain
+        ));
+    }
+    if let Some(fixed) = names.fixed
+        && fixed > 0
+    {
+        lines.push(format!(
+            "wrote the domain's name into {fixed} link(s) that named a domain by a name only this machine uses"
+        ));
+    }
+    if let Some(err) = &names.fix_error {
+        lines.push(format!(
+            "could not write the domain's name into the links: {err}"
+        ));
+    }
+    if !names.local_spellings.is_empty() {
+        let total: u64 = names.local_spellings.iter().map(|s| s.count).sum();
+        let tail = match (fix, &names.fix_error) {
+            (false, _) => "rerun with --fix to write the domain's name instead",
+            (true, Some(_)) => "--fix could not write them, see the line above",
+            (true, None) => {
+                "these files could not be written; check that they can be, then rerun with --fix"
+            }
+        };
+        lines.push(format!(
+            "[problem] {total} links name a domain by a name only this machine uses; {tail}"
+        ));
+        for s in &names.local_spellings {
+            lines.push(format!(
+                "  {}/{}: {} x '{}', the domain's name is '{}'",
+                s.domain, s.path, s.count, s.spelling, s.canonical
+            ));
+        }
+    }
+    lines
 }
 
 fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
@@ -3227,6 +3560,8 @@ mod tests {
             collectable: true,
             collected: false,
             kept: None,
+            row_dropped: false,
+            row_droppable: false,
         }
     }
 
@@ -3284,6 +3619,8 @@ mod tests {
             collectable: false,
             collected: false,
             kept: Some("virtual".to_string()),
+            row_dropped: false,
+            row_droppable: false,
         };
         let report = orphan_report(vec![row], None, false);
         let out = render_human(&report);
@@ -3463,5 +3800,72 @@ mod tests {
             orphan_check_has_a_route(true, true, false),
             "a daemon answers over its socket, file or no file"
         );
+    }
+
+    /// An empty row a removed domain left behind is a problem until `--fix`
+    /// drops it, and says what it blocks; once dropped it is reported and not
+    /// counted.
+    #[test]
+    fn an_empty_leftover_row_is_a_problem_until_dropped() {
+        let mut row = orphan("platform", 0, None);
+        row.collectable = false;
+        row.kept = Some("no_rows".to_string());
+        row.row_droppable = true;
+        let report = orphan_report(vec![row.clone()], None, false);
+        let out = render_human(&report);
+        assert!(
+            out.contains("[problem] platform: an empty row left behind by a removed domain")
+                && out.contains("rerun with --fix to drop it"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 1);
+
+        row.row_droppable = false;
+        row.row_dropped = true;
+        let report = orphan_report(vec![row], None, true);
+        let out = render_human(&report);
+        assert!(
+            out.contains("dropped the empty row of removed domain 'platform'"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A waiting adoption is a warning that says why when that is known and
+    /// names the manual rename when it is not; neither is counted.
+    #[test]
+    fn a_waiting_adoption_is_explained_and_not_counted() {
+        let report = DoctorReport {
+            names: Some(NamesDoctor {
+                adoption_pending: vec![
+                    AdoptionPendingDoctor {
+                        domain: "eng".to_string(),
+                        canonical: "platform".to_string(),
+                        canonical_seen: None,
+                        reason: Some("run `crystalline doctor --fix` to drop it".to_string()),
+                    },
+                    AdoptionPendingDoctor {
+                        domain: "ops".to_string(),
+                        canonical: "operations".to_string(),
+                        canonical_seen: None,
+                        reason: None,
+                    },
+                ],
+                ..NamesDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "domain 'eng' says its name is 'platform' but is still called 'eng' here: run `crystalline doctor --fix` to drop it"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("crystalline domain rename ops operations --local"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
     }
 }

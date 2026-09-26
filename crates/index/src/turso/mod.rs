@@ -1303,6 +1303,39 @@ impl Store for TursoStore {
         .await
     }
 
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
+        in_transaction(self, async {
+            // -- actor: all - one actor's draft is content too, so any row of
+            // any actor keeps the domain row.
+            let id = query_first(
+                &self.conn,
+                "SELECT d.id FROM domain d WHERE d.name=?1 \
+                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id)",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?
+            .and_then(|r| cell_i64(&r, 0));
+            let Some(id) = id else {
+                return Ok(false);
+            };
+            // Foreign keys are not enforced here, so every table that names
+            // the row is cleared by hand before the row itself.
+            for sql in [
+                "DELETE FROM domain_spelling WHERE domain_id=?1",
+                "DELETE FROM tag_alias WHERE domain_id=?1",
+                "DELETE FROM domain_lock WHERE domain_id=?1",
+                "DELETE FROM relation WHERE domain_id=?1",
+                "DELETE FROM link WHERE domain_id=?1",
+                "DELETE FROM domain WHERE id=?1",
+            ] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     async fn engrams_referencing_domains(
         &self,
         spellings: &[String],

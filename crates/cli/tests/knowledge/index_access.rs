@@ -50,7 +50,8 @@ const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[(
     "run",
     1,
     "doctor is the diagnosis of the index rather than a verb that reads it: it \
-     already asks the daemon first (file_stamps, collect_orphaned_domains) and \
+     already asks the daemon first (file_stamps, collect_orphaned_domains, \
+     name_report) and \
      falls back to this open only when none answered, and where the helper \
      refuses in one sentence doctor has to keep running and report the reason \
      it composed from the service check it just ran.",

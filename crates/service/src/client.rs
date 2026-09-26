@@ -951,6 +951,72 @@ pub async fn collect_orphaned_domains(
     Ok(engine.collect_orphaned_domains(None, dry_run).await?)
 }
 
+/// The domain name findings `crystalline doctor` shows
+/// ([`Engine::name_report`]), after, when `fix` is set, respelling every link
+/// that names a domain by a name only this machine uses
+/// ([`Engine::fix_local_spellings`]); the report then carries `fixed`, how
+/// many links changed. A fix that is refused (a read-only instance) keeps the
+/// report and carries `fix_error` instead. Over the daemon when one owns the
+/// index (the ctl commands `fix_local_spellings` and `name_report`), else
+/// against one directly opened store.
+pub async fn name_report(
+    fix: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path) {
+        let fixed = if fix {
+            match ctl_if_running(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
+                Ok(answer) => {
+                    answer.map(|data| Ok(data.get("fixed").and_then(Value::as_u64).unwrap_or(0)))
+                }
+                Err(e) => Some(Err(format!("{e:#}"))),
+            }
+        } else {
+            None
+        };
+        if (!fix || fixed.is_some())
+            && let Some(mut data) = ctl_if_running(json!({ "v": 1, "cmd": "name_report" })).await?
+        {
+            attach_fix_outcome(&mut data, fixed);
+            return Ok(data);
+        }
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let fixed = if fix {
+        Some(
+            engine
+                .fix_local_spellings()
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    } else {
+        None
+    };
+    let mut report = engine.name_report().await?;
+    attach_fix_outcome(&mut report, fixed);
+    Ok(report)
+}
+
+/// Put what a `--fix` did into a name report: `fixed`, or `fix_error`.
+fn attach_fix_outcome(report: &mut Value, fixed: Option<Result<u64, String>>) {
+    let Value::Object(map) = report else {
+        return;
+    };
+    match fixed {
+        Some(Ok(n)) => {
+            map.insert("fixed".to_string(), Value::from(n));
+        }
+        Some(Err(e)) => {
+            map.insert("fix_error".to_string(), Value::from(e));
+        }
+        None => {}
+    }
+}
+
 /// Unregister a domain: over the daemon when one owns the index, else against a
 /// directly opened store.
 ///

@@ -813,7 +813,10 @@ async fn refusals_name_the_next_step_body(store: Arc<Mutex<dyn Store>>) {
     );
     assert!(
         msg.contains("the rename of 'eng' to 'platform' is still running")
-            && msg.contains("send that same rename again or restart the daemon"),
+            && msg.contains(
+                "send the same rename again (`crystalline domain rename eng platform --local`)"
+            )
+            && msg.contains("restart the daemon"),
         "{msg}"
     );
     hold.release();

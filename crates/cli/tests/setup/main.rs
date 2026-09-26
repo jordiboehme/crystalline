@@ -11,6 +11,7 @@ mod common;
 
 mod configure;
 mod doctor;
+mod doctor_names;
 #[cfg(unix)]
 mod hook;
 #[cfg(unix)]
