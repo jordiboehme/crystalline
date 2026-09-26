@@ -469,4 +469,183 @@ describe("the rename dialog", () => {
     await screen.findByRole("heading", { name: "Members" });
     expect(screen.getByText("Renamed from eng.")).toBeVisible();
   });
+
+  it("does not replay the summary after a detour through a folder and back", async () => {
+    // A domain with one folder, so there is somewhere ordinary to browse
+    // into: `DomainHome` swaps `DomainPage` for `FolderPage` on the way in,
+    // an outright unmount of the component that holds the summary's state.
+    serveAs("admin", {
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return {
+          domain: "engineering",
+          previous: "eng",
+          local_only: false,
+          manifest_written: true,
+          manifest_draft: false,
+          rewritten: [],
+          left_behind: [],
+          aliases: ["eng"],
+          shadows: [],
+        };
+      },
+      "/domains/engineering/manifest": () => ({
+        domain: "engineering",
+        markdown: "# engineering",
+      }),
+      "/domains/engineering/tree": (path) =>
+        path.includes("path=notes")
+          ? { domain: "engineering", path: "notes", folders: [], engrams: [] }
+          : {
+              domain: "engineering",
+              path: "/",
+              folders: ["notes"],
+              engrams: [],
+            },
+      "/domains/engineering/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({
+        domain: "engineering",
+        tags: [],
+        categories: [],
+        relation_types: [],
+      }),
+      "/domains/engineering/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
+    });
+    renderApp("/d/eng");
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+
+    const dialog = await openDialog();
+    await userEvent.type(
+      within(dialog).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    expect(screen.getByText("Renamed from eng.")).toBeVisible();
+
+    // Browse into the folder: an ordinary detour, and a real unmount of the
+    // component whose state the summary now lives in.
+    await userEvent.click(await screen.findByRole("button", { name: "notes" }));
+    await screen.findByRole("heading", { level: 1, name: /notes/ });
+    expect(screen.queryByText("Renamed from eng.")).toBeNull();
+
+    // Back to the domain's own home - a FRESH mount of that component,
+    // with no memory of the earlier one - by the breadcrumb the folder
+    // page's own heading carries.
+    const folderHeading = screen.getByRole("heading", { level: 1 });
+    await userEvent.click(
+      within(folderHeading).getByRole("link", { name: "engineering" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    // The cache slot was already emptied the first time this domain's page
+    // showed the summary, so this later, unrelated mount finds nothing left
+    // to replay.
+    expect(screen.queryByText("Renamed from eng.")).toBeNull();
+  });
+
+  it("shows only the latest summary when a domain is renamed twice in a row", async () => {
+    serveAs("admin", {
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return {
+          domain: "engineering",
+          previous: "eng",
+          local_only: false,
+          manifest_written: false,
+          manifest_draft: false,
+          rewritten: [{ domain: "ops", engrams: 1, references: 1 }],
+          left_behind: [],
+          aliases: ["eng"],
+          shadows: [],
+        };
+      },
+      "/domains/engineering/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return {
+          domain: "engineering-team",
+          previous: "engineering",
+          local_only: false,
+          manifest_written: false,
+          manifest_draft: false,
+          rewritten: [{ domain: "docs", engrams: 9, references: 9 }],
+          left_behind: [],
+          aliases: ["engineering", "eng"],
+          shadows: [],
+        };
+      },
+      ...domainFixtures("engineering"),
+      ...domainFixtures("engineering-team"),
+    });
+    renderApp("/d/eng");
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+
+    const first = await openDialog();
+    await userEvent.type(
+      within(first).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(first).getByRole("button", { name: "Rename" }),
+    );
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    expect(screen.getByText("Renamed from eng.")).toBeVisible();
+    expect(
+      screen.getByText("ops: 1 engram rewritten, 1 reference."),
+    ).toBeVisible();
+
+    // Renamed again immediately, on the very page the first rename just
+    // landed on - the same continuously-mounted instance, not a detour.
+    const second = await openDialog();
+    await userEvent.type(
+      within(second).getByLabelText("New name"),
+      "engineering-team",
+    );
+    await userEvent.click(
+      within(second).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 1,
+        name: "engineering-team",
+      }),
+    ).toBeVisible();
+    // Only the second summary: its own report, not the first one's summary
+    // sitting alongside it or having leaked through.
+    expect(screen.getByText("Renamed from engineering.")).toBeVisible();
+    expect(
+      screen.getByText("docs: 9 engrams rewritten, 9 references."),
+    ).toBeVisible();
+    expect(screen.queryByText("Renamed from eng.")).toBeNull();
+    expect(
+      screen.queryByText("ops: 1 engram rewritten, 1 reference."),
+    ).toBeNull();
+  });
 });

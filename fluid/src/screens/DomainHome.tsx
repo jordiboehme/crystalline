@@ -32,7 +32,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Link,
@@ -219,51 +219,78 @@ function DomainPage({
    * own state (`RenameDomainDialog`'s module doc says why), keyed by the
    * domain this page is now showing.
    *
-   * Read straight out of the cache during render, not from a `useEffect` -
-   * an effect runs after the commit that already shows this domain's own
-   * heading, so a reader (or a test) that stops watching the moment the
-   * heading appears would still catch this summary rendering a beat later,
-   * as `location.state` once did. `getQueryData` is a plain, synchronous
-   * read with no subscription of its own, so it costs nothing beyond this
-   * one lookup and asks for no dependency array to keep in step.
+   * Taken into this component's OWN state, once, rather than read from the
+   * cache on every render - a second earlier version of this did the
+   * latter (a plain `getQueryData` call in the render body, cleared from an
+   * effect keyed on a domain change) and that has a real gap: `DomainPage`
+   * is not the only screen a reader reaches a renamed domain's engrams
+   * through. Browsing into a folder swaps this component out for
+   * `FolderPage` (`DomainHome`'s own conditional return, above), and
+   * opening an engram or its editor lands on an entirely different
+   * `<Route>` (`routes.tsx`) - both perfectly ordinary ways to read a
+   * domain, and both unmount `DomainPage` outright. An effect keyed on "the
+   * domain changed while THIS instance stayed mounted" never fires for any
+   * of that, so the report to a domain a reader had already left through
+   * one of those sat in the cache untouched - and a later, unrelated visit
+   * to that same domain's home page (a fresh `DomainPage` mount, with no
+   * memory of the earlier one) would read it right back out and show a
+   * rename that did not just happen, for as long as the query client's
+   * default `gcTime` (five minutes) kept the entry alive.
    *
-   * Cleared by an explicit event only, and never from an effect's cleanup:
-   * an earlier version of this cleared the slot from the cleanup half of a
-   * `useEffect` keyed on `domain`, on the theory that the cleanup would
-   * only ever run on a real domain change or a real unmount. Under
-   * `<StrictMode>` (`main.tsx` wraps the whole app in it) that theory does
-   * not hold - React's dev-only double-invoke runs setup, then cleanup,
-   * then setup again, synchronously, right after the very first mount, with
-   * no domain change and no unmount anywhere in it. That phantom cleanup
-   * fired `removeQueries` once, unconditionally, moments after the page
-   * first showed the summary; this page's own five other queries
-   * (`manifest`, `members`, `tags`, `syncStatus`, `listing`) then settle and
-   * force a re-render that reads the now-empty slot, and the summary
-   * silently disappears mid-page with no domain change of any kind.
+   * So the state below is what actually decides what shows, and the cache
+   * read only ever seeds it: the `useState` initializer runs once, at this
+   * component instance's own first render, and takes whatever the cache
+   * says for the domain that render shows. From then on the cache is never
+   * consulted again by this instance - a later effect (below) empties its
+   * slot outright, unconditionally, the first time this domain is ever
+   * shown, so no OTHER mount - a fresh one after a folder/engram/editor
+   * detour, or a plain revisit - can find anything left to replay.
    *
-   * The fix: the ONLY thing that clears a domain's slot is this effect's
-   * BODY - never its cleanup, which stays absent - observing that the
-   * domain THIS RENDER shows differs from the domain the PREVIOUS render
-   * showed. `previousDomain` starts `null`, so nothing is cleared on the
-   * very first mount; StrictMode's double-invoke re-runs this same body a
-   * second time with the identical `domain`, which the guard reads as "no
-   * change" and again clears nothing. Only a genuine domain change - the
-   * reader actually navigating on - ever satisfies `prior !== domain`, and
-   * that only happens once per real transition, never as a double-invoked
-   * echo of one that already happened. A later revisit or a reload of this
-   * same domain still never replays the summary, because by the time
-   * either happens the slot for that domain was cleared the moment the
-   * reader first moved on from it.
+   * `renamedFor` carries the domain the state was captured for alongside
+   * the report, because ONE thing an initializer cannot do is fire again
+   * when `domain` changes under a continuously-mounted instance - which is
+   * exactly what happens the moment a rename itself lands (the dialog
+   * navigates to the SAME `/d/:domain` route, just a new param, so React
+   * reuses this very instance rather than remounting it). Comparing
+   * `renamedFor.domain` against the render's own `domain` and calling
+   * `setState` right here, during render, when they disagree is a
+   * documented, StrictMode-safe pattern for exactly this ("adjusting state
+   * when a prop changes" - React's own docs use the identical shape): the
+   * mismatched render is never committed, React immediately re-runs this
+   * function with the corrected state, and calling it a second time with
+   * the same computed values (StrictMode's own extra render-phase
+   * invocation) is a no-op. This is what makes two renames in a row show
+   * only the second summary: the first `setRenamedFor` call already
+   * captured the first report, and the second domain change repeats the
+   * same adjustment for the second one, discarding the first from state
+   * entirely rather than appending to it.
+   *
+   * The effect that empties the cache slot is deliberately unconditional -
+   * it does not check whether a report was there, and it runs the same way
+   * whether this mount's domain came with one or not - because its only job
+   * is to guarantee nothing is left for a LATER, different mount to find.
+   * StrictMode's double-invoke (setup, cleanup, setup, right after this
+   * component's very first mount) calls it twice in a row; removing an
+   * already-removed entry a second time does nothing.
    */
-  const renamed =
-    queryClient.getQueryData<RenameReport>(renameReportKey(domain)) ?? null;
-  const previousDomain = useRef<string | null>(null);
+  const [renamedFor, setRenamedFor] = useState<{
+    domain: string;
+    report: RenameReport | null;
+  }>(() => ({
+    domain,
+    report:
+      queryClient.getQueryData<RenameReport>(renameReportKey(domain)) ?? null,
+  }));
+  if (renamedFor.domain !== domain) {
+    setRenamedFor({
+      domain,
+      report:
+        queryClient.getQueryData<RenameReport>(renameReportKey(domain)) ?? null,
+    });
+  }
+  const renamed = renamedFor.report;
   useEffect(() => {
-    const prior = previousDomain.current;
-    if (prior !== null && prior !== domain) {
-      queryClient.removeQueries({ queryKey: renameReportKey(prior) });
-    }
-    previousDomain.current = domain;
+    queryClient.removeQueries({ queryKey: renameReportKey(domain) });
   }, [domain, queryClient]);
 
   const listing = useQuery({
