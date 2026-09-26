@@ -624,9 +624,8 @@ export function spotView(
 }
 
 /**
- * `spotView`'s spawn alone, pitch dropped: every caller that only ever
- * wanted the spawn (a fixture's or an unpitched prop's spot, whose pitch is
- * always 0, or a lifted or low hero's own pitch, C16) keeps this signature.
+ * `spotView`'s spawn alone, its pitch dropped: for a caller that only reads
+ * where the player stands.
  */
 export function spotSpawn(
   room: RoomSpec,
