@@ -28,7 +28,7 @@
  */
 
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useId, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Link,
@@ -43,6 +43,7 @@ import {
   fetchSyncStatus,
   syncStatusKey,
 } from "../api/admin";
+import type { RenameReport } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import type {
@@ -69,6 +70,7 @@ import type { PaletteCommand } from "../commands";
 import { BackupCard } from "../components/BackupCard";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { DangerZoneCard } from "../components/DangerZoneCard";
+import { READ_ONLY_REASON } from "../components/DestructiveAction";
 import { DomainPoliciesCard } from "../components/DomainPoliciesCard";
 import { EngramList } from "../components/EngramList";
 import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
@@ -78,6 +80,7 @@ import { InlineMarkdown } from "../components/InlineMarkdown";
 import { Markdown } from "../components/Markdown";
 import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
+import { RenameDomainDialog } from "../components/RenameDomainDialog";
 import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
@@ -190,17 +193,33 @@ function DomainPage({
    * engram screen hands a discarded path over in the navigation state, since
    * there is nothing left at that address to read it back from.
    */
-  const arrived =
-    (useLocation().state as { discarded?: string } | null)?.discarded ?? null;
+  const locationState = useLocation().state as {
+    discarded?: string;
+    renamed?: RenameReport;
+  } | null;
+  const arrived = locationState?.discarded ?? null;
+  /** The report of a rename this reader just made, carried over the hop. */
+  const renamed = locationState?.renamed ?? null;
   const { path, filters, browse, filtering, listingOrder, apply } =
     useListingState();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [confirmingUnregister, setConfirmingUnregister] = useState(false);
+  const [renamingOpen, setRenamingOpen] = useState(false);
+  const renameReasonId = useId();
+  const bannerRenameReasonId = useId();
 
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
+    // A rename in progress - this session's own, or another live instance's
+    // sharing the same index - pauses the domain until it lands, and the
+    // page has no other way to learn that it cleared: nothing here pushes,
+    // so it polls, and only for as long as some domain is actually renaming.
+    refetchInterval: (query) =>
+      (query.state.data?.domains ?? []).some((entry) => entry.renaming)
+        ? 1000
+        : false,
   });
   const summary = listing.data?.domains.find((entry) => entry.name === domain);
   const manifest = useQuery({
@@ -218,6 +237,16 @@ function DomainPage({
   const canUnregister =
     capabilities.canAdminister ||
     (user !== null && owner !== null && sameAccount(owner, user.name));
+  // The rename controls share this exact rule with the danger zone: an
+  // instance admin, or a private domain's owner, which is the rule
+  // `POST /rename` itself enforces.
+  const own = canUnregister;
+  const isRenaming = summary?.renaming === true;
+  const renameDisabledReason = capabilities.readOnly
+    ? READ_ONLY_REASON
+    : isRenaming
+      ? "A rename of this domain is already running."
+      : undefined;
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
@@ -330,7 +359,66 @@ function DomainPage({
             that named this domain on the way here.
           */}
           {summary?.private === true && <Chip variant="accent">private</Chip>}
+          {/*
+            Reached only by the domain's owner or an instance admin - the
+            exact rule the danger zone's own controls follow, since it is the
+            rule `POST /rename` enforces server side too. Shown disabled
+            rather than withheld on a read-only instance or while a rename is
+            already running, the way the danger zone shows its own controls:
+            `aria-disabled` rather than `disabled`, so a keyboard user still
+            reaches the control and still hears why it will not act, the same
+            trade `DestructiveAction` documents.
+          */}
+          {own && (
+            <button
+              type="button"
+              aria-describedby={
+                renameDisabledReason !== undefined ? renameReasonId : undefined
+              }
+              aria-disabled={renameDisabledReason !== undefined}
+              onClick={() => {
+                if (renameDisabledReason !== undefined) {
+                  return;
+                }
+                setRenamingOpen(true);
+              }}
+              className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
+            >
+              Rename domain
+            </button>
+          )}
         </div>
+        {own && renameDisabledReason !== undefined && (
+          <span id={renameReasonId} className="sr-only">
+            {renameDisabledReason}
+          </span>
+        )}
+        {/*
+          The name this domain's content declares, when it reads differently
+          from the local name the heading above already said - the two agree
+          most of the time, and this line is silent then. Former names follow
+          the same rule: nothing to say when there are none.
+        */}
+        {summary !== undefined &&
+          summary.canonicalName !== null &&
+          summary.canonicalName !== domain && (
+            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              {`Known everywhere as ${summary.canonicalName}`}
+            </p>
+          )}
+        {summary !== undefined && summary.aliases.length > 0 && (
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            {`Former names: ${summary.aliases.join(", ")}`}
+          </p>
+        )}
+        {isRenaming && (
+          <p
+            role="status"
+            className="mt-1 text-sm text-slate-500 dark:text-slate-400"
+          >
+            Renaming...
+          </p>
+        )}
         {/*
           What the page somebody came from did before it stopped existing. A
           discarded addition or a discarded draft takes its own page with it,
@@ -370,6 +458,105 @@ function DomainPage({
           </p>
         )}
       </header>
+
+      {/*
+        A rename this reader just made, on the address it landed on: the
+        summary the report carried over the navigation's own state, since
+        there is nothing left to read it back from - the address that
+        answered it is gone the moment the hop lands.
+      */}
+      {renamed !== null && (
+        <div
+          role="status"
+          className="flex flex-col gap-1 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
+        >
+          <p>{`Renamed from ${renamed.previous}.`}</p>
+          {renamed.manifestDraft && (
+            <p>The MANIFEST change waits for review.</p>
+          )}
+          {renamed.rewritten.map((row) => (
+            <p key={row.domain}>
+              {`${row.domain}: ${plural(row.engrams, "engram", "engrams")} rewritten, ${plural(row.references, "reference", "references")}.`}
+            </p>
+          ))}
+          {renamed.leftBehind.length > 0 && (
+            <div>
+              {/*
+                Two different reasons share this list: a domain the caller
+                could only read, where the link was never this rename's to
+                touch, and one whose rewrite failed, where `reason` says why -
+                so the heading names neither on its own.
+              */}
+              <p>Links left as they were:</p>
+              <ul className="list-disc pl-5">
+                {renamed.leftBehind.map((row) => (
+                  <li key={`${row.domain}:${row.path}`}>
+                    {`${row.domain}/${row.path} (${plural(row.references, "reference", "references")})${row.reason !== null ? `: ${row.reason}` : ""}`}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/*
+        Another domain here already answers to this one's own canonical
+        name, so a link spelled with it reaches that domain instead. Shown to
+        every reader - it is a fact about how links resolve, not a secret -
+        with the rename action itself withheld from anybody who is not the
+        owner or an admin, exactly as the button above it is.
+      */}
+      {summary !== undefined && summary.shadowed && (
+        <div
+          role="status"
+          // The chip's own caution pair (amber-800 on amber-100, amber-300 on
+          // amber-950), already vetted for `CHIP_VARIANTS.caution`, lightened
+          // to amber-50 for the light background: a banner's box is larger
+          // than a chip and the paler wash only raises the ratio further.
+          className="flex flex-wrap items-center justify-between gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300"
+        >
+          <p>
+            {`This domain calls itself '${summary.canonicalName ?? domain}', but '${summary.canonicalName ?? domain}' is another domain here, so links that name '${summary.canonicalName ?? domain}' reach that one. Rename one of them to line them up.`}
+          </p>
+          {own && (
+            <>
+              <button
+                type="button"
+                aria-describedby={
+                  renameDisabledReason !== undefined
+                    ? bannerRenameReasonId
+                    : undefined
+                }
+                aria-disabled={renameDisabledReason !== undefined}
+                onClick={() => {
+                  if (renameDisabledReason !== undefined) {
+                    return;
+                  }
+                  setRenamingOpen(true);
+                }}
+                className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
+              >
+                Rename
+              </button>
+              {renameDisabledReason !== undefined && (
+                <span id={bannerRenameReasonId} className="sr-only">
+                  {renameDisabledReason}
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {renamingOpen && (
+        <RenameDomainDialog
+          domain={domain}
+          onClose={() => {
+            setRenamingOpen(false);
+          }}
+        />
+      )}
 
       {/*
         Only for a session that may share, because the endpoints behind it are
@@ -472,6 +659,7 @@ function DomainPage({
         creating={creating}
         onCreatingChange={setCreating}
         onApply={apply}
+        renaming={isRenaming}
       />
 
       {/*
@@ -678,6 +866,7 @@ function EngramsSection({
   creating,
   onCreatingChange,
   onApply,
+  renaming = false,
 }: {
   domain: string;
   /** The folder being browsed, empty at the domain's root. */
@@ -694,6 +883,14 @@ function EngramsSection({
   onCreatingChange: (creating: boolean) => void;
   /** Change the URL, which is the whole of the listing's state. */
   onApply: (next: ListingChange) => void;
+  /**
+   * Whether a rename has this domain paused right now. A write into a
+   * paused domain waits on the server rather than failing, but a reader who
+   * pressed New engram while it is renaming would sit on that wait with no
+   * idea why, so the control is withheld here instead. Defaults to false:
+   * the folder page reads no domain summary of its own to know otherwise.
+   */
+  renaming?: boolean;
 }) {
   const { capabilities } = useAuth();
 
@@ -706,6 +903,7 @@ function EngramsSection({
         {capabilities.canWrite && (
           <button
             type="button"
+            disabled={renaming}
             onClick={() => {
               onCreatingChange(true);
             }}

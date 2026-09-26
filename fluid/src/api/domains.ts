@@ -56,6 +56,38 @@ export interface DomainSummary {
    * unshared work is a fact about you rather than about the team.
    */
   myDrafts: number | null;
+  /**
+   * The name this domain's content declares - its MANIFEST's `domain_name`,
+   * or its registered name where nothing declares one - or null when the
+   * listing did not say. What every link elsewhere spells this domain with.
+   */
+  canonicalName: string | null;
+  /**
+   * Every former name this domain still answers to: an earlier local name, an
+   * earlier canonical one, or one this listing did not say. A link spelled
+   * with any of them still resolves here.
+   */
+  aliases: string[];
+  /**
+   * How this domain came by its registered name: `"explicit"` for one the
+   * MANIFEST declares, `"derived"` for one taken from the folder or the
+   * repository, or null for a legacy entry nothing has inferred yet, or for
+   * a listing that predates the field.
+   */
+  nameOrigin: "explicit" | "derived" | null;
+  /**
+   * Whether another domain's local name here already holds this domain's own
+   * canonical name, so a link spelled with it reaches that domain instead of
+   * this one. Never names the other domain: a caller who may not see it must
+   * not learn of it through this flag either.
+   */
+  shadowed: boolean;
+  /**
+   * Whether a rename has this domain paused right now, on this machine or
+   * another live one sharing the same index. Always present, false for a
+   * listing that predates the field.
+   */
+  renaming: boolean;
 }
 
 /** Everything `GET /domains` says. */
@@ -81,6 +113,17 @@ function readDomain(value: unknown): DomainSummary | null {
     private: record?.private === true,
     review: typeof record?.review === "string" ? record.review : null,
     myDrafts: typeof record?.my_drafts === "number" ? record.my_drafts : null,
+    canonicalName:
+      typeof record?.canonical_name === "string" && record.canonical_name !== ""
+        ? record.canonical_name
+        : null,
+    aliases: asStrings(record?.aliases),
+    nameOrigin:
+      record?.name_origin === "explicit" || record?.name_origin === "derived"
+        ? record.name_origin
+        : null,
+    shadowed: record?.shadowed === true,
+    renaming: record?.renaming === true,
   };
 }
 

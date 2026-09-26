@@ -421,9 +421,71 @@ function useShareAction(): ShareAction {
   };
 }
 
+/**
+ * A domain segment in the current address that used to be a domain's local
+ * name here, sent to the local name it answers to now.
+ *
+ * Renaming a domain keeps every former name - the old local name, the
+ * canonical one, every alias - resolving on the server, but every route in
+ * this app reads its `:domain` segment as a local name and nothing else.
+ * Read once, above every screen the pattern matches (`DomainHome`, the
+ * engram screen, both editors, the graph), rather than once per screen: all
+ * of them need only the listing the sidebar already fetches under the same
+ * key, so this costs no request of its own.
+ *
+ * Waits for that listing to answer before it decides anything, and only ever
+ * redirects when the segment resolves to EXACTLY one domain: zero or several
+ * candidates leave the address alone, and the screen underneath says what it
+ * always says about it - a wrong address, or an ambiguity nothing here is
+ * positioned to resolve. Never on the server, and never before an authorized
+ * read has landed, so a domain a caller may not see is never disclosed by a
+ * redirect firing ahead of that read.
+ */
+function useDomainNameRedirect(): void {
+  const match = useMatch("/d/:domain/*");
+  const seg = match?.params.domain ?? null;
+  const pathnameBase = match?.pathnameBase ?? null;
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (seg === null || pathnameBase === null || domains.data === undefined) {
+      return;
+    }
+    const known = domains.data.domains;
+    if (known.some((entry) => entry.name === seg)) {
+      return;
+    }
+    const matches = known.filter(
+      (entry) => entry.canonicalName === seg || entry.aliases.includes(seg),
+    );
+    const [only] = matches;
+    if (only === undefined || matches.length !== 1) {
+      return;
+    }
+    // The tail is copied out of the raw pathname rather than rebuilt from
+    // the splat's decoded params: a permalink segment already carries its
+    // own encoding, and re-encoding a decoded value can change it.
+    const tail = location.pathname.slice(pathnameBase.length);
+    void navigate(
+      `${domainRoute(only.name)}${tail}${location.search}${location.hash}`,
+      { replace: true, state: location.state as unknown },
+    );
+  }, [seg, pathnameBase, domains.data, location, navigate]);
+}
+
 export function Layout() {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
+  // A saved link, a bookmark or a search result may still carry a domain's
+  // old address; every screen under one keeps reaching it, so this fires
+  // once, above all of them, rather than in each screen that has a domain
+  // segment in its own route.
+  useDomainNameRedirect();
   const [navOpen, setNavOpen] = useState(false);
   const [rail, setRail] = useState(storedRail);
   const [fullWidth, setFullWidth] = useState(storedFullWidth);

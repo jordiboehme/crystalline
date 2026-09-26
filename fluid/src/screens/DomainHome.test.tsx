@@ -36,6 +36,15 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+/**
+ * The graph renderer paints to a canvas, which jsdom has none of. Only the
+ * old-address redirect suite below lands on the engram screen, which draws
+ * this; every other test in this file never mounts it.
+ */
+vi.mock("../components/GraphCanvas", () => ({
+  default: () => <div data-testid="canvas" />,
+}));
+
 const apiMock = vi.mocked(api);
 
 const MANIFEST = [
@@ -1917,5 +1926,252 @@ describe("the team sync card", () => {
     expect(
       requested().some((path) => path.startsWith("/domains/eng/sync")),
     ).toBe(false);
+  });
+});
+
+/**
+ * One domain listing row, in the engine's own wire shape, with the stable
+ * name fields Task 21 added: `canonical_name`, `aliases`, `name_origin`,
+ * `shadowed` and `renaming`. A function rather than a constant so a test
+ * maps over a fresh copy, the way the policy rows above do.
+ */
+function domainRow(overrides: Record<string, unknown> = {}) {
+  return {
+    name: "eng",
+    kind: "file",
+    engrams: 4,
+    when_to_use: ["Route here for eng questions."],
+    canonical_name: "eng",
+    aliases: [],
+    name_origin: "derived",
+    shadowed: false,
+    renaming: false,
+    ...overrides,
+  };
+}
+
+function listingOf(...rows: Record<string, unknown>[]) {
+  return {
+    behavior: ["Search before answering from memory."],
+    domains: rows,
+  };
+}
+
+describe("the domain's declared name", () => {
+  it("says nothing extra over an ordinary domain", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+    expect(screen.queryByText(/^Known everywhere as/)).toBeNull();
+    expect(screen.queryByText(/^Former names:/)).toBeNull();
+    expect(screen.queryByText(/^This domain calls itself/)).toBeNull();
+  });
+
+  it("names the canonical name and every former name in the header", async () => {
+    serve({
+      "/domains": () =>
+        listingOf(
+          domainRow({
+            canonical_name: "engineering",
+            aliases: ["old-eng", "eng-legacy"],
+          }),
+        ),
+    });
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByText("Known everywhere as engineering"),
+    ).toBeVisible();
+    expect(screen.getByText("Former names: old-eng, eng-legacy")).toBeVisible();
+  });
+
+  it("shows the shadowed banner and its Rename action to an admin", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "knowledge", shadowed: true })),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const sentence = await screen.findByText(
+      "This domain calls itself 'knowledge', but 'knowledge' is another domain here, so links that name 'knowledge' reach that one. Rename one of them to line them up.",
+    );
+    const banner = sentence.closest('[role="status"]');
+    expect(banner).not.toBeNull();
+    expect(
+      within(banner as HTMLElement).getByRole("button", { name: "Rename" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Rename domain" })).toBeVisible();
+  });
+
+  it("hides both rename controls from a plain member of a private domain", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              canonical_name: "knowledge",
+              shadowed: true,
+              private: true,
+            }),
+          ),
+        "/domains/eng/members": () => ({
+          owner: "grace",
+          visibility: "private",
+          members: [],
+        }),
+      },
+      "editor",
+    );
+
+    renderApp("/d/eng");
+
+    await screen.findByText(/^This domain calls itself/);
+    expect(screen.queryByRole("button", { name: "Rename domain" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("shows Renaming... and disables New engram while a rename runs", async () => {
+    serve({
+      "/domains": () => listingOf(domainRow({ renaming: true })),
+    });
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByText("Renaming...")).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(screen.getByRole("button", { name: "New engram" })).toBeDisabled();
+  });
+});
+
+describe("a domain's old address", () => {
+  /** The one graph node the neighborhood section needs to draw something. */
+  function soloGraph(domain: string, permalink: string, title: string) {
+    return {
+      nodes: [
+        { id: 1, domain, permalink, title, status: "stable", type: "engram" },
+      ],
+      edges: [],
+      truncated: false,
+    };
+  }
+
+  function runbookDetail() {
+    return {
+      domain: "eng-knowledge",
+      permalink: "runbook",
+      title: "Runbook",
+      type: "engram",
+      status: "stable",
+      path: "runbook.md",
+      url: "crystalline://eng-knowledge/runbook",
+      content: [
+        "---",
+        "title: Runbook",
+        "---",
+        "",
+        "# Runbook",
+        "",
+        "How to run it.",
+        "",
+      ].join("\n"),
+      checksum: "abc123",
+      frontmatter: {
+        engram_type: "engram",
+        title: "Runbook",
+        permalink: "runbook",
+        status: "stable",
+        tags: [],
+        extra: {},
+        valid_from: null,
+        valid_to: null,
+        stale_after: null,
+        verified: [],
+        last_verified: null,
+        review_after: null,
+        recorded_at: null,
+      },
+      observations: [],
+      relations: [],
+      links: [],
+      inbound: { count: 0, refs: [] },
+    };
+  }
+
+  it("sends an engram address under an old local name to the domain's local name now", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+        // The sidebar's own tree read fires for whatever domain the address
+        // names before the redirect lands, so both are stubbed.
+        "/domains/old-eng/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [
+            {
+              permalink: "runbook",
+              title: "Runbook",
+              type: "engram",
+              path: "runbook.md",
+            },
+          ],
+        }),
+        "/domains/eng-knowledge/engrams/runbook": runbookDetail,
+        "/graph": () => soloGraph("eng-knowledge", "runbook", "Runbook"),
+      }),
+    );
+
+    renderApp("/d/old-eng/e/runbook");
+
+    expect(
+      await screen.findByRole("heading", { name: "Runbook" }),
+    ).toBeVisible();
+  });
+
+  it("shows today's not-found state for a segment nobody answers to", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+      }),
+    );
+
+    renderApp("/d/nope");
+
+    expect(
+      await screen.findByRole("heading", { name: "Domain not found" }),
+    ).toBeVisible();
   });
 });
