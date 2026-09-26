@@ -3,14 +3,18 @@
  * from the street that ended up aboard. Both are lit on the `breathe`
  * bank (C13) and nothing on them moves.
  *
- * - The bike (`BIKE`) is a long, low racing motorcycle parked on its side
- *   stand, its length along `a` and its nose at `+a`: glossy red
- *   bodywork enclosing almost everything in one smooth shell, a long
- *   wheelbase, fat black tyres with solid grey disc hubs, their upper
- *   halves hidden inside the shell, a low saddle close to the rear wheel
- *   with a small backrest behind it, a dark windscreen leaning back from
- *   the sloped nose towards the rider, black under the chassis, a steady
- *   headlight in the nose and a tail light that breathes. It stands
+ * - The bike (`BIKE`) is a long racing motorcycle parked on its side
+ *   stand, its length along `a` and its nose at `+a`: bright glossy red
+ *   bodywork enclosing almost everything in one rounded capsule, narrow
+ *   in plan, highest over its front third. A high rounded cowl slopes
+ *   down and forward to the wide headlight, with a dark windscreen high
+ *   on top of it leaning back and the handlebar's grips standing out
+ *   each side just behind it; the saddle is sunk low behind the cowl,
+ *   with a small backrest, and a rounded tail hump, lower than the cowl,
+ *   rises over the rear wheel and ends in the round tail light, which
+ *   breathes. A long wheelbase, fat black tyres with solid grey disc
+ *   hubs, the front wheel showing under the nose and the rear one almost
+ *   covered, and black under the chassis. It stands
  *   upright (C14): the kit has no roll, so the stand is a bar from the
  *   chassis down to the floor on its `-d` side. No stickers and no text.
  * - The police box is backed against a wall, its doors facing `+d`
@@ -26,8 +30,8 @@
  *   The body stands `BOX_BACK` off the wall, so the back sign stays in
  *   front of the wall plane.
  *
- * The numbers each kind is built to are named above its recipe: `BIKE`
- * and `BIKE_BODY` for the bike, `BOX` for the box. Round parts use few
+ * The numbers each kind is built to are named above its recipe: `BIKE`,
+ * `BIKE_BODY` and `BIKE_PROFILE` for the bike, `BOX` for the box. Round parts use few
  * facets, as in every batch.
  */
 
@@ -50,7 +54,10 @@ import { pixelPanel, textRows } from "./pixels";
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
 
 /** The bike's glossy red. */
-const BIKE_RED: Rgb = [0.75, 0.05, 0.05];
+const BIKE_RED: Rgb = [0.9, 0.08, 0.06];
+
+/** The gloss on the top of the cowl: a lighter red where the light catches it. */
+const BIKE_SHINE: Rgb = [0.98, 0.22, 0.16];
 
 /** The bike's tyres: a near black rubber. */
 const TYRE: Rgb = [0.06, 0.06, 0.07];
@@ -88,68 +95,76 @@ export const BIKE = { length: 2.95, width: 0.83, screenTop: 1.17 } as const;
  * - `end`: how far the shell reaches from the middle along `a`, a few
  *   millimetres short of half the length, so each light stands proud of
  *   the end it is set in rather than sharing its plane;
- * - `half`: the half width of the shell's upper panels over the seat,
- *   the tank and the fairing; `tailHalf` the upper tail panel's and `lower`
- *   the lower panels', close round the wheels;
+ * - `half`: the half width of the shell's upper panels over the seat and
+ *   the cowl, as narrow as a motorbike's; `tailHalf` the tail hump's and
+ *   `lower` the lower panels', hugging the wheels;
  * - `axle`: the wheels' centres along `a` (at `±axle`), `r` their radius
  *   (the axles stand at `r`, the tyres on the floor), `tyre` a tyre's
  *   half width, `hub` a disc hub's radius and `hubT` its thickness on
  *   the tyre's side wall;
  * - `lamp`: the headlight's height and radius (its height; it is
- *   `LAMP_WIDE` times as wide), `tail` the tail light's.
+ *   `LAMP_WIDE` times as wide), `tail` the round tail light's.
  */
 const BIKE_BODY = {
   end: 1.47,
-  half: 0.3,
-  tailHalf: 0.24,
-  lower: 0.22,
+  half: 0.26,
+  tailHalf: 0.22,
+  lower: 0.2,
   axle: 1.0,
   r: 0.33,
-  tyre: 0.16,
+  tyre: 0.15,
   hub: 0.2,
   hubT: 0.02,
-  lamp: [0.56, 0.07],
-  tail: [0.56, 0.06],
+  lamp: [0.55, 0.07],
+  tail: [0.62, 0.08],
 } as const;
 
 /** How many times wider than tall the headlight is. */
-const LAMP_WIDE = 1.5;
-
-/** The height of the shell's underside over each wheel: the arch, just over the axle. */
-const ARCH = 0.42;
+const LAMP_WIDE = 1.6;
 
 /**
- * The shell's side profile, `[a, h]`, from the tail round to the nose
- * and back along the underside: the rounded tail with its small backrest
- * hump, the dip of the seat, the rise over the tank to the fairing, the
- * slope down to the nose's rounded front, where the headlight sits, and the
- * underside. Over each wheel the underside is an arch at `ARCH`, just
- * over the axle, so the shell hides the upper half of the wheel and its
- * hub; between the wheels it comes down to 0.3, over the chassis.
+ * The shell's side profile, `[a, h]`, a teardrop capsule from the tail
+ * round to the nose and back along the underside: the tail's flat end,
+ * where the round tail light sits, the rounded tail hump over the rear
+ * wheel, the backrest's drop into the seat sunk low behind the cowl, the
+ * rise to the high rounded cowl whose top (the bike's highest shell) is
+ * over the front third, and its slope down and forward to the nose's
+ * flat front, where the headlight sits. Underneath, the shell is cut away
+ * high over the front wheel (0.5), so the wheel shows under the nose; it
+ * comes down to 0.3 over the chassis, and to 0.22 round the rear wheel,
+ * which it almost covers.
  */
 const BIKE_PROFILE: readonly (readonly [number, number])[] = [
-  [-1.42, ARCH],
-  [-BIKE_BODY.end, 0.48],
-  [-BIKE_BODY.end, 0.64],
-  [-1.38, 0.74],
-  [-1.22, 0.84],
-  [-1.1, 0.87],
-  [-1.02, 0.82],
-  [-0.97, 0.7],
-  [-0.4, 0.68],
-  [-0.2, 0.8],
+  [-BIKE_BODY.end, 0.44],
+  [-BIKE_BODY.end, 0.74],
+  [-1.43, 0.81],
+  [-1.35, 0.87],
+  [-1.24, 0.9],
+  [-1.12, 0.9],
+  [-1.02, 0.87],
+  [-0.94, 0.8],
+  [-0.88, 0.66],
+  [-0.2, 0.64],
+  [-0.08, 0.7],
+  [0.05, 0.8],
   [0.2, 0.9],
-  [0.5, 0.93],
-  [0.8, 0.9],
-  [1.2, 0.77],
-  [1.4, 0.7],
+  [0.38, 0.98],
+  [0.58, 1.03],
+  [0.78, 1.04],
+  [0.95, 1.0],
+  [1.1, 0.93],
+  [1.24, 0.84],
+  [1.36, 0.75],
   [BIKE_BODY.end, 0.64],
-  [BIKE_BODY.end, 0.48],
-  [1.42, ARCH],
-  [0.68, ARCH],
-  [0.6, 0.3],
-  [-0.6, 0.3],
-  [-0.68, ARCH],
+  [BIKE_BODY.end, 0.46],
+  [1.4, 0.44],
+  [1.3, 0.5],
+  [0.72, 0.5],
+  [0.62, 0.3],
+  [-0.62, 0.3],
+  [-0.7, 0.22],
+  [-1.3, 0.22],
+  [-1.42, 0.32],
 ];
 
 /**
@@ -160,10 +175,16 @@ const BIKE_PROFILE: readonly (readonly [number, number])[] = [
 const SEAM = 0.56;
 
 /**
- * Where the tail's upper panel meets the seat's along `a`: behind it the
- * shell narrows to `BIKE_BODY.tailHalf`.
+ * The height over which the cowl's top wears `BIKE_SHINE`: the gloss the
+ * light catches on the highest curve.
  */
-const TAIL_CUT = -1.0;
+const SHINE = 0.95;
+
+/**
+ * Where the tail hump meets the seat along `a`: behind it the shell
+ * narrows to `BIKE_BODY.tailHalf`.
+ */
+const TAIL_CUT = -0.9;
 
 /**
  * The part of a plane outline on one side of a line: of the points whose
@@ -192,16 +213,17 @@ function clipAt(
 }
 
 /**
- * The windscreen's side profile, `[a, h]`: a dark wedge whose foot is sunk
- * in the fairing and whose top edge leans back towards the rider, up to
- * `BIKE.screenTop` just ahead of the handlebar.
+ * The windscreen's side profile, `[a, h]`: a dark wedge set high on top
+ * of the cowl, its foot sunk in the cowl's forward slope and its top edge
+ * leaning back towards the rider, up to `BIKE.screenTop` over the front
+ * third.
  */
 const SCREEN_PROFILE: readonly (readonly [number, number])[] = [
-  [1.06, 0.8],
-  [0.54, BIKE.screenTop],
-  [0.46, BIKE.screenTop],
-  [0.5, 0.9],
-  [0.8, 0.88],
+  [1.12, 0.9],
+  [0.66, BIKE.screenTop],
+  [0.58, BIKE.screenTop],
+  [0.52, 1.0],
+  [0.85, 1.0],
 ];
 
 /**
@@ -210,8 +232,8 @@ const SCREEN_PROFILE: readonly (readonly [number, number])[] = [
  * a flat foot on the floor.
  */
 const STAND_PROFILE: readonly (readonly [number, number])[] = [
-  [0.19, 0.27],
-  [0.215, 0.27],
+  [0.15, 0.27],
+  [0.175, 0.27],
   [0.435, 0],
   [0.41, 0],
 ];
@@ -219,8 +241,8 @@ const STAND_PROFILE: readonly (readonly [number, number])[] = [
 /**
  * The red bike: the shell over two fat wheels with grey disc hubs, the
  * chassis under it, the saddle and its backrest, the windscreen, the
- * handlebar with its two mirrors, the headlight and the tail light, and
- * the side stand.
+ * handlebar whose grips stand out each side of the cowl, two mirrors,
+ * the headlight and the tail light, and the side stand.
  */
 const redBike: HeroRecipe = ({ k, kitAt, s }) => {
   const b = BIKE_BODY;
@@ -235,23 +257,33 @@ const redBike: HeroRecipe = ({ k, kitAt, s }) => {
   }
   const upper = clipAt(BIKE_PROFILE, 1, SEAM, false);
   const red = s.tinted(BIKE_RED);
-  k.extrude(clipAt(upper, 0, TAIL_CUT, false), -b.half, b.half, red);
+  const front = clipAt(upper, 0, TAIL_CUT, false);
+  k.extrude(clipAt(front, 1, SHINE, true), -b.half, b.half, red);
+  k.extrude(
+    clipAt(front, 1, SHINE, false),
+    -b.half,
+    b.half,
+    s.tinted(BIKE_SHINE),
+  );
   k.extrude(clipAt(upper, 0, TAIL_CUT, true), -b.tailHalf, b.tailHalf, red);
   k.extrude(
     clipAt(BIKE_PROFILE, 1, SEAM, true),
     -b.lower,
     b.lower,
-    s.tinted(shade(BIKE_RED, 0.78)),
+    s.tinted(shade(BIKE_RED, 0.75)),
   );
-  k.box(-0.6, 0.6, -0.2, 0.2, 0.22, 0.3, black);
+  k.box(-0.6, 0.6, -0.16, 0.16, 0.22, 0.3, black);
   const saddle = s.tinted(SADDLE);
-  k.bevelBox(-0.95, -0.4, -0.22, 0.22, 0.68, 0.75, 0.02, saddle);
-  // The small backrest, against the tail's hump behind the saddle.
-  k.bevelBox(-1.02, -0.95, -0.18, 0.18, 0.72, 0.86, 0.02, saddle);
+  k.bevelBox(-0.85, -0.25, -0.18, 0.18, 0.64, 0.7, 0.02, saddle);
+  // The small backrest, against the tail hump behind the saddle.
+  k.bevelBox(-0.94, -0.87, -0.14, 0.14, 0.66, 0.85, 0.02, saddle);
   k.extrude(SCREEN_PROFILE, -0.2, 0.2, s.tinted(SCREEN));
-  k.box(0.38, 0.44, -0.4, 0.4, 0.92, 0.95, black);
-  for (const d of [-1, 1])
-    k.box(0.4, 0.43, d * 0.34, d * 0.42, 0.95, 1.01, black);
+  // The handlebar through the cowl behind the screen, its grips out each side.
+  k.box(0.5, 0.55, -0.34, 0.34, 1.0, 1.03, black);
+  for (const d of [-1, 1]) {
+    k.box(0.49, 0.56, d * 0.28, d * 0.37, 0.99, 1.04, black);
+    k.box(0.7, 0.73, d * 0.21, d * 0.29, 1.02, 1.09, black);
+  }
   const side = kitAt(sideways(ORIGIN));
   const [lampH, lampR] = b.lamp;
   // A wide lamp: the disc stretched across the nose.
@@ -336,6 +368,9 @@ const BOX = {
   inset2: 0.15,
   signW: 1.0,
 } as const;
+
+/** Half the width of the meeting stile between the two door leaves, in metres. */
+const STILE = 0.02;
 
 /**
  * The roof lamp's measures, in metres: a blue base from the roof's top
@@ -552,9 +587,6 @@ export function boxDoor(
       s.tinted(shade(BLUE, 0.85)),
     );
 }
-
-/** Half the width of the meeting stile between the two door leaves, in metres. */
-const STILE = 0.02;
 
 /**
  * The blue police box: the plinth, the body, the four corner posts, the
