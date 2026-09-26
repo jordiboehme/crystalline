@@ -2069,8 +2069,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_three_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 23);
+fn the_catalog_carries_twenty_four_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 24);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -2113,8 +2113,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         ids,
         vec![
             "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
-            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V201", "V202", "V203",
-            "V301",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V110", "V201", "V202",
+            "V203", "V301",
         ]
     );
     for rule in RULES {
@@ -2706,4 +2706,72 @@ fn a_v109_ack_holds_until_the_permalink_or_the_path_changes() {
         assert!(finding.ack_stale, "{permalink} at {path}");
         assert!(!finding.acknowledged);
     }
+}
+
+// ---------------------------------------------------------------------------
+// V110 - a link spelled with a name only this machine uses
+// ---------------------------------------------------------------------------
+
+/// A reference from `from` whose written prefix is `spelling`, naming
+/// `target` after the colon.
+fn spelled(from: i64, spelling: &str, target: &str) -> SpelledRef {
+    SpelledRef {
+        from: EngramId(from),
+        line: 7,
+        spelling: spelling.to_string(),
+        raw: format!("{spelling}:{target}"),
+    }
+}
+
+#[test]
+fn v110_fires_when_respell_names_a_spelled_references_prefix() {
+    let mut sweep = input(vec![fact(1, "link-holder")]);
+    sweep.respell = vec![("eng-knowledge".to_string(), "eng".to_string())];
+    sweep.spelled_refs = vec![spelled(1, "eng-knowledge", "a")];
+
+    let finding = only(&detect(&sweep), "V110");
+    assert_eq!(finding.family, Family::Structure);
+    assert_eq!(finding.class, Class::Mechanical);
+    assert_eq!(finding.permalink, "link-holder");
+    assert_eq!(finding.line, Some(7));
+    assert_eq!(
+        finding.evidence,
+        "`[[eng-knowledge:a]]` names domain `eng-knowledge`, a name only this machine uses; \
+         the domain's name is `eng`"
+    );
+    assert!(
+        finding.fix.contains("edit_engram")
+            && finding.fix.contains("eng-knowledge:a")
+            && finding.fix.contains("eng:a"),
+        "the fix names edit_engram and both spellings: {}",
+        finding.fix
+    );
+}
+
+/// An empty `respell` - nothing the name table would ever rewrite - draws no
+/// `V110` finding, whatever `spelled_refs` carries: the visibility rule
+/// (hidden domains, and any other reason a spelling was left out of
+/// `respell`) is enforced entirely by what the engine puts into `respell`
+/// before the sweep runs.
+#[test]
+fn v110_stays_quiet_when_respell_is_empty() {
+    let mut sweep = input(vec![fact(1, "link-holder")]);
+    sweep.spelled_refs = vec![spelled(1, "eng-knowledge", "a")];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V110"), "{:?}", fired(&report));
+}
+
+/// A `spelled_refs` entry whose prefix `respell` does not name is left alone
+/// too: `detect_local_spellings` matches on `respell`, never on the mere
+/// presence of a spelled reference, which is what keeps a hidden domain's
+/// spelling silent even if a row for it somehow reached this input.
+#[test]
+fn v110_ignores_a_spelled_ref_whose_prefix_respell_does_not_name() {
+    let mut sweep = input(vec![fact(1, "link-holder")]);
+    sweep.respell = vec![("eng-knowledge".to_string(), "eng".to_string())];
+    sweep.spelled_refs = vec![spelled(1, "other-local-name", "a")];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V110"), "{:?}", fired(&report));
 }

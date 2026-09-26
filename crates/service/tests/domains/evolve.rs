@@ -13,9 +13,11 @@ use std::time::{Duration, SystemTime};
 use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
+use crystalline_service::DomainAccess;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::{EditParams, EvolveParams};
+use crystalline_service::rest::{AuthStore, Role};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -2804,4 +2806,231 @@ async fn a_draft_only_attachment_answers_its_authors_reference_in_the_sweep() {
         missing,
         "and the team's reference goes on dangling, because the team has no such file"
     );
+}
+
+// ---------------------------------------------------------------------------
+// V110 - a link spelled with a name only this machine uses (Task 19)
+// ---------------------------------------------------------------------------
+
+/// `eng-knowledge` declares `domain_name: eng` and holds a hand-edited file -
+/// written straight to disk, never through `write_engram` - naming its own
+/// target with the local spelling `eng-knowledge` rather than the canonical
+/// `eng`. `shadow` additionally registers a second domain locally as `eng`,
+/// which shadows `eng-knowledge`'s canonical claim: `NameTable::normalize`
+/// then answers `None` for `eng-knowledge`, and the engine never puts that
+/// spelling into `respell`.
+async fn v110_fixture(shadow: bool) -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let eng_dir = root.join("eng-knowledge");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(
+        eng_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-07-25"),
+    )
+    .unwrap();
+    std::fs::write(
+        eng_dir.join("target.md"),
+        "---\ntype: engram\ntitle: Target\npermalink: target\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe target of the cross reference.\n\n- [context] planted for the V110 fixture\n",
+    )
+    .unwrap();
+    // Hand-edited: this bypasses the write path's own normalization
+    // (Task 18), which is the only way a stored link ever carries a
+    // local-only spelling in the first place.
+    std::fs::write(
+        eng_dir.join("link-holder.md"),
+        "---\ntype: engram\ntitle: Link holder\npermalink: link-holder\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng-knowledge:target]] for the details.\n\n- [context] a hand-written cross reference\n",
+    )
+    .unwrap();
+    cfg.domains
+        .insert("eng-knowledge".to_string(), DomainEntry::file(eng_dir));
+
+    if shadow {
+        let shadow_dir = root.join("eng");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        std::fs::write(
+            shadow_dir.join("MANIFEST.md"),
+            crystalline_core::manifest_template("eng", "2026-07-25"),
+        )
+        .unwrap();
+        cfg.domains
+            .insert("eng".to_string(), DomainEntry::file(shadow_dir));
+    }
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// A `V110`-only sweep of `eng-knowledge`.
+async fn v110_sweep(engine: &Engine, scope: &Scope) -> Value {
+    engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["eng-knowledge".to_string()],
+                rules: vec!["V110".to_string()],
+                today: Some("2026-07-26".to_string()),
+                limit: Some(10),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap()
+}
+
+/// A hand-edited `[[eng-knowledge:target]]` - the local name, never the
+/// canonical `eng` - draws exactly one `V110` finding naming both spellings
+/// and pointing at `edit_engram`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v110_fires_on_a_link_spelled_with_the_local_name() {
+    let (_tmp, engine) = v110_fixture(false).await;
+    let v = v110_sweep(&engine, &Scope::Unrestricted).await;
+
+    let queue = v["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1, "{v}");
+    let row = &queue[0];
+    assert_eq!(row["rule"], "V110");
+    assert_eq!(row["class"], "mechanical");
+    assert_eq!(row["permalink"], "link-holder");
+    let evidence = row["evidence"].as_str().unwrap();
+    assert!(evidence.contains("eng-knowledge"), "{evidence}");
+    assert!(evidence.contains("`eng`"), "{evidence}");
+    let fix = row["fix"].as_str().unwrap();
+    assert!(fix.contains("edit_engram"), "{fix}");
+    assert!(fix.contains("eng-knowledge:target"), "{fix}");
+    assert!(fix.contains("eng:target"), "{fix}");
+}
+
+/// Same hand-edited file, but `eng`'s canonical claim is now shadowed by a
+/// second domain registered locally as `eng`: `normalize("eng-knowledge")`
+/// answers `None`, the engine never puts that spelling into `respell`, and
+/// the sweep raises no `V110` finding over text that still, byte for byte,
+/// names the domain by its local spelling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shadowed_canonical_name_draws_no_v110() {
+    let (_tmp, engine) = v110_fixture(true).await;
+    let v = v110_sweep(&engine, &Scope::Unrestricted).await;
+    assert_eq!(v["total"], 0, "{v}");
+    assert!(v["queue"].as_array().unwrap().is_empty(), "{v}");
+}
+
+/// `eng-knowledge` (declaring `domain_name: eng`) and a plain `platform`,
+/// `platform` holding a hand-edited file that names `eng-knowledge` by its
+/// local spelling. `eng-knowledge` is made private to `keeper` alone, while
+/// `platform` stays visible to everyone - so a sweep of `platform`, which
+/// every caller may name as a scope, is what carries the `V110` finding, or
+/// not, depending on whether the sweeping caller may see the domain the link
+/// spells.
+async fn v110_visibility_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let eng_dir = root.join("eng-knowledge");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(
+        eng_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-07-25"),
+    )
+    .unwrap();
+    cfg.domains
+        .insert("eng-knowledge".to_string(), DomainEntry::file(eng_dir));
+
+    let platform_dir = root.join("platform");
+    std::fs::create_dir_all(&platform_dir).unwrap();
+    std::fs::write(
+        platform_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("platform", "2026-07-25"),
+    )
+    .unwrap();
+    // Hand-edited, exactly as the other V110 fixture: a stored link never
+    // carries a local-only spelling except by bypassing the write path's own
+    // normalization (Task 18).
+    std::fs::write(
+        platform_dir.join("cross-ref.md"),
+        "---\ntype: engram\ntitle: Cross ref\npermalink: cross-ref\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng-knowledge:target]] over there.\n\n- [context] a hand-written cross-domain reference\n",
+    )
+    .unwrap();
+    cfg.domains
+        .insert("platform".to_string(), DomainEntry::file(platform_dir));
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// A `V110`-only sweep of `platform`.
+async fn v110_platform_sweep(engine: &Engine, scope: &Scope) -> Value {
+    engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["platform".to_string()],
+                rules: vec!["V110".to_string()],
+                today: Some("2026-07-26".to_string()),
+                limit: Some(10),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap()
+}
+
+/// A caller who cannot see `eng-knowledge` sweeps `platform` - a domain they
+/// CAN see, and which they may always name as a scope - and draws no `V110`
+/// finding over the very same hand-edited `[[eng-knowledge:target]]`: the
+/// spelling never reaches `respell` for them (`Engine::sweep_domain_names`
+/// leaves out anything that resolves to a domain in `hidden`), so the store
+/// is never even asked about it. The domain's owner, sweeping the same
+/// `platform`, still draws the finding: the guard is about this caller's own
+/// visibility, not a global switch that turns `V110` off once any domain
+/// anywhere is private.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_domain_is_never_named_by_a_v110_finding() {
+    let (tmp, engine) = v110_visibility_fixture().await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "stranger"] {
+        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng-knowledge", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    let hidden = v110_platform_sweep(&engine, &account("stranger")).await;
+    assert_eq!(
+        hidden["total"], 0,
+        "a stranger to eng-knowledge gets no oracle about it: {hidden}"
+    );
+    assert!(hidden["queue"].as_array().unwrap().is_empty(), "{hidden}");
+
+    let seen = v110_platform_sweep(&engine, &account("keeper")).await;
+    assert_eq!(seen["total"], 1, "{seen}");
+    assert_eq!(seen["queue"][0]["rule"], "V110");
+    assert_eq!(seen["queue"][0]["permalink"], "cross-ref");
 }
