@@ -145,7 +145,6 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/draft-links/leave",
 ];
 
-/// The lowercase hex SHA-256 digest of `bytes`.
 /// Puts a freshly connected team domain's MANIFEST back the way the team has
 /// it, for a fixture whose subject is not the name.
 ///
@@ -178,6 +177,7 @@ pub async fn discard_name_write_back(
     );
 }
 
+/// The lowercase hex SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

@@ -532,3 +532,121 @@ async fn an_upstream_manifest_edit_before_the_name_is_shared_conflicts() {
     assert_eq!(conflicts.as_array().map(Vec::len), Some(1), "{pulled}");
     assert_eq!(conflicts[0]["path"], "MANIFEST.md", "{pulled}");
 }
+
+/// The same repository and branch already connected here under an explicit
+/// name that equals the declared one is this checkout: a nameless connect
+/// answers the connected state instead of stepping to `eng-2` and
+/// downloading the repository a second time.
+#[tokio::test]
+async fn a_nameless_connect_finds_the_repo_connected_under_its_declared_name_explicitly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[("MANIFEST.md", declaring_manifest())]);
+    let r = rig(tmp.path(), mock.clone(), &[]).await;
+
+    let named = r
+        .eng
+        .origin_add(REPO, Some("eng"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(named["domain"], "eng", "{named}");
+    assert_eq!(named["name_origin"], "explicit", "{named}");
+
+    let nameless = r
+        .eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(nameless["domain"], "eng", "{nameless}");
+    assert_eq!(nameless["already_connected"], true, "{nameless}");
+    assert_eq!(
+        mock.tarball_calls(),
+        1,
+        "one download, not a second checkout"
+    );
+    let names: Vec<String> = on_disk(&r.config_path).domains.keys().cloned().collect();
+    assert_eq!(names, vec!["eng".to_string()]);
+}
+
+/// A nameless connect that adopts a registration keeps the `name_origin` it
+/// already records: a name somebody chose on purpose stays `explicit`, so it
+/// never becomes eligible for an automatic rename - and the repository's
+/// default is still not written into the team's MANIFEST.
+#[tokio::test]
+async fn a_nameless_adoption_keeps_an_explicit_name_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[("MANIFEST.md", bare_manifest())]);
+    let local_root = tmp.path().join("kb");
+    let local = local_domain(&local_root, &bare_manifest())
+        .with_name_origin(crystalline_core::config::NameOrigin::Explicit);
+    let r = rig(tmp.path(), mock, &[("eng-knowledge", local)]).await;
+
+    let result = r
+        .eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(result["domain"], "eng-knowledge", "{result}");
+    assert_eq!(result["adopted"], true, "{result}");
+    assert_eq!(result["name_origin"], "explicit", "{result}");
+    let entry = on_disk(&r.config_path).domains["eng-knowledge"].clone();
+    assert_eq!(
+        entry.name_origin,
+        Some(crystalline_core::config::NameOrigin::Explicit)
+    );
+    assert!(entry.origin.is_some());
+    assert_eq!(
+        std::fs::read(local_root.join("MANIFEST.md")).unwrap(),
+        bare_manifest(),
+        "a nameless connect writes no name back, whatever the entry records"
+    );
+}
+
+/// A local refusal of the repository's own name is reported as itself when
+/// the forge cannot be asked, instead of the network error that would send
+/// the person to the wrong fix.
+#[tokio::test]
+async fn a_local_refusal_of_the_repo_name_is_reported_when_the_forge_cannot_be_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[("MANIFEST.md", bare_manifest())]);
+    mock.fail_default_branch();
+    let r = rig(
+        tmp.path(),
+        mock.clone(),
+        &[("eng-knowledge", DomainEntry::virtual_domain())],
+    )
+    .await;
+
+    let err = r
+        .eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::engine::EngineError::Conflict(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("virtual domain"), "{err}");
+    assert!(mock.read_file_calls().is_empty());
+}
+
+/// The same refusal is moot when the forge answers with a declared name of
+/// its own: the repository's name is never used, so nothing refuses.
+#[tokio::test]
+async fn a_declared_name_makes_a_refused_repo_name_moot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = forge(&[("MANIFEST.md", declaring_manifest())]);
+    let r = rig(
+        tmp.path(),
+        mock,
+        &[("eng-knowledge", DomainEntry::virtual_domain())],
+    )
+    .await;
+
+    let result = r
+        .eng
+        .origin_add(REPO, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(result["domain"], "eng", "{result}");
+}
