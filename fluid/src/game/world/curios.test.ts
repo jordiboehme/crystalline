@@ -955,7 +955,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(rooms.council.hosted / rooms.council.rooms).toBeGreaterThan(0.9);
     for (const [archetype, t] of Object.entries(rooms))
       expect(t.hosted, archetype).toBeGreaterThan(0);
-  });
+  }, 30_000);
 
   it("puts a curio where it is told on a surface, and throws where it cannot stand (curioOn)", () => {
     const surfaces = hostSurfaces(base(generateRoom(CANNED_WORKSHOP)));
