@@ -633,9 +633,16 @@ impl Engine {
         }
         // The answer here is a bool, so a mirror warning has nowhere to ride
         // out; `write_overlay_entry` has already logged it.
-        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
-            Ok(without_ack(current, &rule, scope))
-        })
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            acting,
+            |current| Ok(without_ack(current, &rule, scope)),
+        )
         .await?;
         Ok(true)
     }

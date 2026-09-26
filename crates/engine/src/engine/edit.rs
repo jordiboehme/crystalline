@@ -134,6 +134,7 @@ impl Engine {
                 p.expected_checksum.as_deref(),
                 &actor,
                 model.as_deref(),
+                scope,
                 peer,
                 |current| {
                     // The REPORTED model here, not the one resolved against
@@ -218,6 +219,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         model: Option<&str>,
+        scope: &crate::scope::Scope,
         apply: F,
     ) -> Result<Option<String>>
     where
@@ -241,6 +243,7 @@ impl Engine {
             expected_checksum,
             actor,
             model,
+            scope,
             None,
             apply,
         )
@@ -267,6 +270,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         model: Option<&str>,
+        scope: &crate::scope::Scope,
         peer: Option<&AgentPeer>,
         apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
@@ -315,7 +319,10 @@ impl Engine {
                 // later, for a reason nobody watching could connect to this.
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-                let (edited, normalized) = self.normalize_domain_spellings(&edited).await;
+                let (edited, normalized) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 let applied = rooms
                     .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
                     .await
@@ -373,7 +380,10 @@ impl Engine {
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
             let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-            let (edited, normalized) = self.normalize_domain_spellings(&edited).await;
+            let (edited, normalized) = self
+                .normalize_domain_spellings_for(&edited, scope)
+                .await
+                .map_err(SourceEditFailure::before)?;
             if self.take_armed_failure() {
                 return Err(SourceEditFailure::before(EngineError::Internal(
                     "reindex failed (test seam)".to_string(),
@@ -421,7 +431,10 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-                let (edited, count) = self.normalize_domain_spellings(&edited).await;
+                let (edited, count) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 // The last step that can fail with the file as it was:
                 // `write_bytes` renames a sibling temp into place, and a rename
                 // either happens or does not, so a refusal here leaves the
@@ -458,7 +471,10 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-                let (edited, count) = self.normalize_domain_spellings(&edited).await;
+                let (edited, count) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
                 // The seam, on this arm: a token nothing can match, so the
                 // store raises its own compare-and-swap conflict and rolls the

@@ -279,7 +279,7 @@ impl Engine {
             // relink pass above only follows THIS engram's address; a link to
             // some other domain is untouched by it and would otherwise cross
             // domains still spelled however it was written.
-            let (content, _) = self.normalize_domain_spellings(&content).await;
+            let (content, _) = self.normalize_domain_spellings(&content, &hidden).await;
             match &dest_source {
                 ContentSource::File { root } => {
                     let dest_abs = join_rel(root, &dest_rel);
@@ -330,7 +330,7 @@ impl Engine {
             // ordinary rename never rewrites content the move itself did not
             // touch.
             let moved_text = match moved_text {
-                Some(text) => Some(self.normalize_domain_spellings(&text).await.0),
+                Some(text) => Some(self.normalize_domain_spellings(&text, &hidden).await.0),
                 None => None,
             };
             if let ContentSource::File { root } = &src_source {
@@ -400,7 +400,10 @@ impl Engine {
         let mut rewritten: Vec<Value> = Vec::new();
         let mut references = 0usize;
         for linker in &linkers {
-            match self.relink_engram(linker, &spec, &linker_actor).await {
+            match self
+                .relink_engram(linker, &spec, &linker_actor, &hidden)
+                .await
+            {
                 Ok(Some((count, permalink))) => {
                     references += count;
                     rewritten.push(json!({ "domain": linker.domain, "permalink": permalink }));
@@ -662,6 +665,7 @@ impl Engine {
         linker: &MoveLinker,
         spec: &Relink<'_>,
         actor: &str,
+        hidden: &HashSet<String>,
     ) -> Result<Option<(usize, String)>> {
         let source = self.read_source(&linker.domain);
         let text = match &source {
@@ -693,7 +697,7 @@ impl Engine {
         // that local name is only an alias or a non-canonical spelling of the
         // domain's declared name. Called before the store lock below is
         // taken, since it may itself need the store.
-        let (replaced, _) = self.normalize_domain_spellings(&replaced).await;
+        let (replaced, _) = self.normalize_domain_spellings(&replaced, hidden).await;
         let store = self.store.lock().await;
         match &source {
             ContentSource::File { root } => {

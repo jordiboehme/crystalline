@@ -85,8 +85,9 @@ impl Engine {
     /// Rewrite every domain spelling `source` carries by something other than
     /// its canonical name to that canonical name, wherever the registrations
     /// as they stand resolve the canonical back to the same domain (see
-    /// [`NameTable::normalize`]). Answers the text and how many spellings
-    /// were rewritten, `0` when none were.
+    /// [`NameTable::normalize`]) AND the spelling does not resolve to a domain
+    /// in `hidden`. Answers the text and how many spellings were rewritten,
+    /// `0` when none were.
     ///
     /// The single point every write funnels its final text through before it
     /// is stored: a link written `[[eng-knowledge:x]]` or `[[engineering:x]]`
@@ -94,12 +95,56 @@ impl Engine {
     /// `engineering` as an alias) is stored as `[[eng:x]]`. A spelling that is
     /// shadowed or contested is left exactly as written, since
     /// [`NameTable::normalize`] answers `None` for it: content never gets a
-    /// spelling that points elsewhere.
-    pub(super) async fn normalize_domain_spellings(&self, source: &str) -> (String, usize) {
+    /// spelling that points elsewhere. A spelling that resolves to a domain
+    /// this writer may not see is left exactly as written too, for the same
+    /// reason [`localize_in`] leaves one alone: rewriting `[[old-secret:x]]`
+    /// into `[[secret:x]]` would tell a caller who cannot see `secret` both
+    /// that it exists and what its canonical name is, the exact oracle
+    /// `hidden` exists everywhere else to close.
+    pub(super) async fn normalize_domain_spellings(
+        &self,
+        source: &str,
+        hidden: &HashSet<String>,
+    ) -> (String, usize) {
         let table = self.name_table_now().await;
         crystalline_core::relink::respell_domains(source, &|domain: &str| {
+            let local = table.resolve(domain)?;
+            if hidden.contains(local) {
+                return None;
+            }
             table.normalize(domain).map(str::to_string)
         })
+    }
+
+    /// [`Engine::normalize_domain_spellings`], with the hidden set worked out
+    /// only when there turns out to be something to decide about.
+    ///
+    /// A first pass with an empty hidden set answers whether `source` holds
+    /// any spelling that normalization would ever touch, for any hidden set:
+    /// hiding a domain can only turn a would-be rewrite into a kept spelling,
+    /// never manufacture a new one, so a probe that rewrites nothing answers
+    /// the real question too and is returned as-is. Only when it rewrites
+    /// something does this call [`Engine::hidden_for`] and redo the pass for
+    /// real, over the ORIGINAL `source` rather than the probe's (possibly
+    /// leaky) output. The common case - an ordinary write with no
+    /// cross-domain spelling to respell - costs nothing beyond that first
+    /// pass; `hidden_for` runs only when there is something to actually
+    /// gate. Exposed to the co-editing session (`pub(crate)`), which
+    /// normalizes its own text under [`crate::scope::Scope::Unrestricted`]
+    /// before ever handing it to a save.
+    pub(crate) async fn normalize_domain_spellings_for(
+        &self,
+        source: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<(String, usize)> {
+        let probe = self
+            .normalize_domain_spellings(source, &HashSet::new())
+            .await;
+        if probe.1 == 0 {
+            return Ok(probe);
+        }
+        let hidden = self.hidden_for(scope).await?;
+        Ok(self.normalize_domain_spellings(source, &hidden).await)
     }
 
     /// `localize` for one caller: a spelling that resolves to a domain in

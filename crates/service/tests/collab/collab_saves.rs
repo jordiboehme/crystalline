@@ -1013,14 +1013,19 @@ async fn normalize_fixture() -> (
 /// editor's PUT reaches) normalizes a cross-domain link the same way
 /// `write_engram` and `edit_engram` do: `[[engineering:runbook]]`, spelled
 /// with the machine-local alias, lands as `[[eng:runbook]]`, the canonical
-/// name its MANIFEST declares.
+/// name its MANIFEST declares. The rewrite is CONVERGED into the room's own
+/// document before the save (`Control::Merged` arrives first), not left for
+/// the engine's own pass to rewrite silently underneath the person looking at
+/// the page.
 ///
 /// Normalization means the receipt's checksum is of bytes the room never
-/// itself computed (the room's own text still reads `engineering`, since the
-/// rewrite happens only in the engine before the write): a second edit and
-/// save has to still succeed on the CAS the first save's receipt handed
-/// back, not fall into the external-change path over a mismatch this change
-/// introduced. Both saves are asserted `Saved` here for exactly that reason.
+/// itself computed (the room's own text still reads `engineering` until the
+/// converge lands): a second edit and save has to still succeed on the CAS
+/// the first save's receipt handed back, not fall into the external-change
+/// path over a mismatch this change introduced. Both saves are asserted
+/// `Saved` here for exactly that reason; the second carries no `Merged` of
+/// its own, since by then the document already reads canonical and the
+/// normalizing pass finds nothing left to do.
 #[tokio::test]
 async fn a_room_save_normalizes_a_cross_domain_link_to_the_canonical_name() {
     let (tmp, engine, _scratch) = normalize_fixture().await;
@@ -1034,8 +1039,12 @@ async fn a_room_save_normalizes_a_cross_domain_link_to_the_canonical_name() {
         .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
         .await;
     assert!(
+        matches!(next_control(&mut joined.rx).await, Control::Merged),
+        "the normalizing rewrite converges into the document first"
+    );
+    assert!(
         matches!(next_control(&mut joined.rx).await, Control::Saved { .. }),
-        "the first save lands"
+        "then the first save lands"
     );
 
     let on_disk = std::fs::read_to_string(tmp.path().join("eng-knowledge/alpha.md")).unwrap();
@@ -1055,9 +1064,94 @@ async fn a_room_save_normalizes_a_cross_domain_link_to_the_canonical_name() {
         .await;
     assert!(
         matches!(next_control(&mut joined.rx).await, Control::Saved { .. }),
-        "the second save also lands, not a conflict"
+        "the second save also lands, not a conflict, and carries no Merged of its own"
     );
     let on_disk = std::fs::read_to_string(tmp.path().join("eng-knowledge/alpha.md")).unwrap();
     assert!(on_disk.contains("[[eng:runbook]]"), "{on_disk}");
     assert!(on_disk.contains("and a second line"), "{on_disk}");
+}
+
+/// Three things the converge step promises once a normalizing save has
+/// landed: the room's own document (not only the file) reads the canonical
+/// spelling and is clean (`snapshot`'s `dirty` is false); a further tick with
+/// nothing new typed writes nothing at all, since `file == last_saved_text`
+/// holds once both sides hold the same normalized text (setting
+/// `last_saved_text` without converging the document would leave that compare
+/// false forever, and the room would save on every debounce window for
+/// good); and an external edit elsewhere in the body, racing the room's own
+/// unsaved edit, still three-way merges cleanly - the extra converge step
+/// this fix adds is not itself an edit the room's own change detection ever
+/// sees as new, so it never collides with a legitimate external merge.
+#[tokio::test]
+async fn a_converged_room_settles_and_still_merges_an_external_edit_cleanly() {
+    let (tmp, engine, _scratch) = normalize_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng-knowledge", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "See [[engineering:runbook]] for more.").await;
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Merged
+    ));
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+
+    let (snapshot_text, dirty) = joined.session.snapshot().await;
+    assert!(
+        snapshot_text.contains("[[eng:runbook]]"),
+        "the document itself agrees with the canonical spelling, not only the \
+         file: {snapshot_text}"
+    );
+    assert!(!dirty, "and settles clean: {snapshot_text}");
+
+    let path = tmp.path().join("eng-knowledge/alpha.md");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 200))
+        .await;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before,
+        "nothing new was typed, so the already-converged document never re-saves"
+    );
+
+    // The room holds an unsaved edit of its own (a new line at the very end)
+    // while an external write lands elsewhere - the frontmatter, well clear
+    // of the body: a clean three-way merge, not a conflict.
+    append_line(&joined, &doc, "a further thought").await;
+    let external = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("status: stable", "status: draft");
+    std::fs::write(&path, &external).unwrap();
+    engine.sync(Some("eng-knowledge")).await.unwrap();
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(3 * SAVE_DEBOUNCE_MS + 300))
+        .await;
+    let first = next_control(&mut joined.rx).await;
+    assert!(
+        matches!(first, Control::Merged),
+        "the external change merges cleanly rather than raising a conflict: {first:?}"
+    );
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("status: draft"), "{on_disk}");
+    assert!(
+        on_disk.contains("[[eng:runbook]]"),
+        "the canonical spelling this fix introduced survives the merge: {on_disk}"
+    );
+    assert!(on_disk.contains("a further thought"), "{on_disk}");
 }

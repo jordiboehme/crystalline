@@ -331,8 +331,11 @@ impl Engine {
         // The single point this capture's text funnels through before it is
         // stored, whichever of the three exits below takes it: a cross-domain
         // link spelled with an alias or a non-canonical local name is written
-        // with the canonical one instead.
-        let (markdown, domain_names_normalized) = self.normalize_domain_spellings(&markdown).await;
+        // with the canonical one instead, wherever this caller's own
+        // visibility allows it.
+        let (markdown, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&markdown, scope)
+            .await?;
 
         let mut receipt = json!({
             "domain": p.domain,
@@ -607,12 +610,12 @@ impl Engine {
     ///
     /// The full-document counterpart of [`Engine::edit_engram`], for the HTTP
     /// PUT: the client edited the whole file, so the whole file is what lands.
-    /// Nothing is rebuilt and `generated` is not touched - a save of what was
-    /// read lands byte-identical but for one deliberate rewrite (a
-    /// cross-domain link normalized to its canonical spelling, the same
-    /// funnel every other write's final text passes through), which is the
-    /// editor's fidelity contract, and the text already carries whatever
-    /// provenance its author put there.
+    /// Nothing is rebuilt and `generated` is not touched. The editor's
+    /// fidelity contract is that a save of what was read lands byte-identical,
+    /// with one deliberate exception: a cross-domain link is normalized to
+    /// its canonical spelling, the same funnel every other write's final text
+    /// passes through, wherever this caller's own visibility allows it. The
+    /// text already carries whatever provenance its author put there.
     ///
     /// `expected_checksum` is enforced on BOTH storage kinds. File domains get
     /// the comparison here (read, hash, compare, write), virtual domains get
@@ -708,15 +711,20 @@ impl Engine {
 
         // The third place a save can land: this actor's own draft.
         if overlay.is_some() {
-            return self.save_into_overlay(&view, p, &desc, &source).await;
+            return self
+                .save_into_overlay(&view, p, &desc, &source, scope)
+                .await;
         }
 
         // The single point this save's text funnels through before it lands:
         // a cross-domain link spelled with an alias or a non-canonical local
-        // name is written with the canonical one instead. The CAS token
-        // guards the version this caller read, not the bytes it is about to
-        // land, so it stays checked against `p.expected_checksum` unchanged.
-        let (content, domain_names_normalized) = self.normalize_domain_spellings(&p.content).await;
+        // name is written with the canonical one instead, wherever this
+        // caller's own visibility allows it. The CAS token guards the version
+        // this caller read, not the bytes it is about to land, so it stays
+        // checked against `p.expected_checksum` unchanged.
+        let (content, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&p.content, scope)
+            .await?;
 
         match &source {
             ContentSource::File { root } => {
@@ -879,7 +887,17 @@ impl Engine {
         if is_assets_reserved(&desc.path) {
             return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
         }
-        self.save_into_overlay(view, p, &desc, &source).await
+        // No caller-carried scope reaches a room: this is the machine's own
+        // save of a document somebody has open, the same account every room
+        // writes as before there was anything else to be (see
+        // `Engine::save_engram_joined`'s own doc comment on `scope`). By the
+        // time this runs, the session has already normalized its own text
+        // under the same scope (see `CollabSession::save_attempt`), so this
+        // pass is ordinarily a no-op; passing it again here rather than
+        // skipping it is what keeps `save_into_overlay` one function with one
+        // contract for both its callers.
+        self.save_into_overlay(view, p, &desc, &source, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// The overlay arm of a save: the whole document into the view's own
@@ -896,9 +914,10 @@ impl Engine {
     ///
     /// A save of what was read lands byte-identical but for one deliberate
     /// rewrite: a cross-domain link spelled with an alias or a non-canonical
-    /// local name is normalized to the canonical one before it is stored, the
-    /// same funnel every other write's final text passes through. The
-    /// receipt's `checksum` is of the bytes that actually landed.
+    /// local name is normalized to the canonical one before it is stored,
+    /// wherever `scope` may see it, the same funnel every other write's final
+    /// text passes through. The receipt's `checksum` is of the bytes that
+    /// actually landed.
     ///
     /// Everything a caller must decide BEFORE this is deliberately not here:
     /// whose view it is, whether the document parses, whether the path is
@@ -910,6 +929,7 @@ impl Engine {
         p: &SaveParams,
         desc: &EngramDescriptor,
         source: &ContentSource,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let who = view.writing_actor()?;
         // Written directly rather than through `apply_source_edit`, and
@@ -935,7 +955,9 @@ impl Engine {
                 &found,
             )));
         }
-        let (content, domain_names_normalized) = self.normalize_domain_spellings(&p.content).await;
+        let (content, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&p.content, scope)
+            .await?;
         let warning = view.write(desc.domain_id, &desc.path, &content).await?;
         // Where the draft now answers, derived exactly as the row's own
         // permalink is: an author who edited the frontmatter's permalink
@@ -974,6 +996,12 @@ impl Engine {
     /// PATH rather than by identifier: the engram is gone from the index, so
     /// there is nothing left to resolve. No CAS token either, for the same
     /// reason - there is no stored version to compare against.
+    ///
+    /// Deliberately exempt from domain-spelling normalization: this restores
+    /// the exact prior bytes a room held after an external deletion, a
+    /// recovery of what was already there rather than a new authoring act,
+    /// and `content` is what the caller already normalized (or chose not to)
+    /// on its way in.
     ///
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].

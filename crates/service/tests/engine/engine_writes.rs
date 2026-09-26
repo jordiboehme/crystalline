@@ -7,11 +7,13 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::SearchOrder;
 use crystalline_index::TursoStore;
+use crystalline_service::DomainAccess;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::{
     DeleteParams, EditParams, ReadParams, RetireParams, SaveParams, SearchParams, SplitParams,
 };
+use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -2534,5 +2536,81 @@ async fn save_engram_normalizes_cross_domain_links_too() {
     assert_eq!(saved["domain_names_normalized"], 1, "{saved}");
 
     let stored = std::fs::read_to_string(tmp.path().join("eng-knowledge/target.md")).unwrap();
+    assert!(stored.contains("[[eng:x]]"), "{stored}");
+}
+
+fn user(account: &str) -> Scope {
+    Scope::User {
+        account: account.to_string(),
+        admin: false,
+    }
+}
+
+/// A caller who cannot see `eng-knowledge` writes `[[eng-knowledge:x]]` and
+/// `[[engineering:y]]` (its alias) into a domain they CAN write, and gets
+/// back exactly what writing `[[nobody:x]]` would: the text unchanged, byte
+/// for byte, and no `domain_names_normalized` key at all. Rewriting either
+/// spelling would tell a stranger both that `eng-knowledge` exists and what
+/// its canonical name is - the same oracle `localize_visible` and
+/// `localized_for` exist to close for every other spelling a caller types.
+///
+/// The same body, written by a caller who CAN see it (`keeper`, who holds the
+/// domain), still normalizes ordinarily - the guard is about visibility, not
+/// about breaking normalization for everyone once one domain is private.
+#[tokio::test]
+async fn a_hidden_domain_is_never_normalized_into() {
+    let (tmp, engine) = normalize_fixture().await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "out"] {
+        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng-knowledge", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    let stranger = user("out");
+    let written = engine
+        .write_engram_as(
+            &write_params(
+                "platform",
+                "Stranger Link",
+                "[[eng-knowledge:x]] [[engineering:y]]",
+            ),
+            None,
+            &stranger,
+        )
+        .await
+        .unwrap();
+    assert!(
+        written.get("domain_names_normalized").is_none(),
+        "a caller who cannot see eng-knowledge gets no oracle about it: {written}"
+    );
+    let stored = std::fs::read_to_string(tmp.path().join("platform/stranger-link.md")).unwrap();
+    assert!(
+        stored.contains("[[eng-knowledge:x]] [[engineering:y]]"),
+        "unchanged, byte for byte, exactly as an unknown domain would be: {stored}"
+    );
+
+    // The domain's owner still gets the ordinary rewrite: the guard is about
+    // this caller's own visibility, not a global switch normalization is
+    // turned off by once any domain anywhere is private.
+    let keeper = user("keeper");
+    let seen = engine
+        .write_engram_as(
+            &write_params("platform", "Keeper Link", "[[eng-knowledge:x]]"),
+            None,
+            &keeper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen["domain_names_normalized"], 1, "{seen}");
+    let stored = std::fs::read_to_string(tmp.path().join("platform/keeper-link.md")).unwrap();
     assert!(stored.contains("[[eng:x]]"), "{stored}");
 }

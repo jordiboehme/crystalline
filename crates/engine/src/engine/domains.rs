@@ -450,13 +450,22 @@ impl Engine {
         let actor = self.actor_for(None, overlay.as_deref());
         let (desc, source) = view.resolve("manifest").await?;
         let edits: Vec<(String, String)> = changes.to_vec();
-        self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
-            let mut out = current.to_string();
-            for (key, value) in &edits {
-                out = set_frontmatter_field(&out, key, value);
-            }
-            Ok(out)
-        })
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            scope,
+            move |current| {
+                let mut out = current.to_string();
+                for (key, value) in &edits {
+                    out = set_frontmatter_field(&out, key, value);
+                }
+                Ok(out)
+            },
+        )
         .await?;
         self.refresh_routing_cache().await;
         let markdown = match overlay.as_deref() {

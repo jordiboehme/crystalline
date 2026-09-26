@@ -637,9 +637,16 @@ impl Engine {
             let actor = self.actor_for(None, overlay.as_deref());
             let (desc, source) = view.resolve("manifest").await?;
             let new = journal.new.clone();
-            self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
-                Ok(set_frontmatter_field(current, DOMAIN_NAME_KEY, &new))
-            })
+            self.apply_source_edit(
+                &desc,
+                &source,
+                &view,
+                None,
+                &actor,
+                None,
+                &scope,
+                move |current| Ok(set_frontmatter_field(current, DOMAIN_NAME_KEY, &new)),
+            )
             .await?;
             matches!(source, ContentSource::Virtual) && overlay.is_none()
         };
@@ -758,9 +765,16 @@ impl Engine {
             return Ok(0);
         }
         let actor = self.actor_for(None, view.actor());
-        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
-            Ok(respell_old(current, spellings, new).0)
-        })
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            scope,
+            |current| Ok(respell_old(current, spellings, new).0),
+        )
         .await?;
         Ok(references)
     }
