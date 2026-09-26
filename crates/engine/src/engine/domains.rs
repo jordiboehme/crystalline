@@ -16,6 +16,7 @@ impl Engine {
     ) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let domains = match self.scoped_domains(&p.domains, &hidden).await? {
             ScopedDomains::AsAsked => Some(p.domains.clone()).filter(|d| !d.is_empty()),
             ScopedDomains::Only(domains) => Some(domains),
@@ -735,6 +736,7 @@ impl Engine {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         self.domain_entry_scoped(&p.domain, &hidden)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
         let prefix = folder_prefix(&raw);

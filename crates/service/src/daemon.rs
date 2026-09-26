@@ -142,6 +142,27 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// A daemon's shared state over `engine` with nothing else running, for a
+    /// test that drives the control socket's handler directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(engine: Arc<Engine>) -> Shared {
+        let (shutdown_tx, _) = watch::channel(false);
+        let (sessions_tx, _) = watch::channel(0usize);
+        Shared {
+            engine,
+            pid: std::process::id(),
+            http_addr: None,
+            started: Instant::now(),
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            next_session: AtomicU64::new(1),
+            http_sessions: Arc::new(AtomicUsize::new(0)),
+            shutdown_tx,
+            sessions_tx,
+            idle_exit: None,
+            shutdown_reason: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Seconds since the daemon started.
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
@@ -3816,6 +3837,28 @@ mod tests {
         accumulate_tick(&mut dirty, WatchTick::Path(root.join("note.md")), &domains);
         assert!(!dirty["a"].full);
         assert!(dirty["a"].paths.contains("note.md"));
+    }
+
+    /// An edit of a domain's root MANIFEST reaches the targeted sync as the
+    /// exact relative path `MANIFEST.md`, which is what that pass looks for
+    /// to refresh the name the domain declares.
+    #[test]
+    fn a_root_manifest_edit_targets_the_manifest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("MANIFEST.md"), "---\ntype: manifest\n---\n").unwrap();
+        let domains = vec![("a".to_string(), root.clone())];
+        let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+        accumulate_tick(
+            &mut dirty,
+            WatchTick::Path(root.join("MANIFEST.md")),
+            &domains,
+        );
+        assert!(!dirty["a"].full);
+        assert_eq!(
+            dirty["a"].paths.iter().collect::<Vec<_>>(),
+            vec!["MANIFEST.md"]
+        );
     }
 
     #[test]

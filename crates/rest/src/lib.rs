@@ -30,6 +30,7 @@ mod auth;
 mod schemas;
 use crystalline_identity::auth_store;
 mod discovery;
+mod domain_path;
 mod domains;
 mod domains_admin;
 mod draft_links;
@@ -557,7 +558,27 @@ pub const ARCHIVE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// guarded the moment they are registered. Every route therefore belongs
 /// *above* the `.layer` call: axum only wraps what was declared before it, so a
 /// route added below would serve unguarded.
+///
+/// The routes sit behind one more step that runs BEFORE they are matched:
+/// `domain_path::localize_domain_path` spells a domain named in the path by
+/// its canonical name or an alias as its local name. A `Router::layer` runs
+/// after routing, when the path parameters are already captured, so the
+/// routes are served as a whole, as the fallback of an outer router that
+/// holds nothing else: the layer on that outer router runs once its fallback
+/// matched, which is before the routes inside have matched anything. A `nest`
+/// mounts the fallback under its prefix like any route.
 pub fn router(state: RestState) -> Router {
+    let routes = routes(state.clone());
+    Router::new()
+        .fallback_service(routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            domain_path::localize_domain_path,
+        ))
+}
+
+/// The routes [`router`] serves, guarded; see there.
+fn routes(state: RestState) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi_json))
         .route("/auth/login", post(auth::login))

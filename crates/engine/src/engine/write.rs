@@ -235,6 +235,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let source = self.content_source(&p.domain)?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
@@ -562,6 +563,7 @@ impl Engine {
             return None;
         }
         let rooms = self.collab_rooms()?;
+        let p = &self.localized_for(p, scope).await.ok()?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join)
             .await
             .ok()?;
@@ -647,6 +649,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,

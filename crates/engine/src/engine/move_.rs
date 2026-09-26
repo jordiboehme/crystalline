@@ -66,6 +66,7 @@ impl Engine {
         // Resolved once, before anything is written, and used twice below: to
         // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         let (src, src_source) = view.resolve(&p.identifier).await?;

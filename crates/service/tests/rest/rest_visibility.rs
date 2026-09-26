@@ -1863,3 +1863,119 @@ async fn the_drafts_route_never_returns_a_path_or_content() {
         "what it does carry is a name and a number: {body}"
     );
 }
+
+/// `open`, shared, beside `hush-lab`, private under `keeper`, whose MANIFEST
+/// declares `domain_name: team-secret` and whose registration carries the
+/// machine-local alias `old-secret`. The local name is one no other text in
+/// the fixture contains, so a body naming it is a body that leaked it.
+async fn a_private_domain_with_other_names() -> RestCtx {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            anonymous: Some(false),
+            ..AuthConfig::default()
+        }),
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    for (name, manifest_text) in [
+        ("open", manifest("open")),
+        (
+            "hush-lab",
+            crystalline_core::manifest_template("team-secret", "2026-01-01"),
+        ),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MANIFEST.md"), manifest_text).unwrap();
+        std::fs::write(
+            dir.join("notes.md"),
+            engram("Notes", "notes", "Plain notes."),
+        )
+        .unwrap();
+        let mut entry = DomainEntry::file(dir);
+        if name == "hush-lab" {
+            entry.aliases = vec!["old-secret".to_string()];
+        }
+        cfg.domains.insert(name.to_string(), entry);
+    }
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_origins_dir(root.join("origins"))
+            .with_token_store_dir(root.join("tokens"))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    for name in ["keeper", "out"] {
+        auth.add_user(name, name, None, Role::Editor, "s3cret")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("hush-lab", true, "keeper")
+        .await
+        .unwrap();
+    let addr = serve(engine, auth.clone());
+    RestCtx {
+        addr,
+        auth,
+        _tmp: tmp,
+    }
+}
+
+/// A caller who may not see a private domain gets, for its canonical name and
+/// for its alias, what a name nobody registered gets: the same status and the
+/// same body but for the name they typed, which is echoed back, and never the
+/// local name or a spelling they did not type. The owner reaches it by all
+/// three names.
+#[tokio::test]
+async fn an_alias_of_a_hidden_domain_answers_like_an_unknown_name() {
+    let ctx = a_private_domain_with_other_names().await;
+    let out = ctx.as_user("out").await;
+    let spellings = ["hush-lab", "team-secret", "old-secret", "never-registered"];
+
+    for route in ["tree", "manifest", "engrams/notes", "attachments"] {
+        let answer = |typed: &'static str| {
+            let out = out.clone();
+            async move {
+                let resp = out.get(&format!("/api/v1/domains/{typed}/{route}")).await;
+                (resp.status(), resp.text().await.unwrap())
+            }
+        };
+        let (unknown_status, unknown) = answer("never-registered").await;
+        assert_eq!(unknown_status, 404, "{route}: {unknown}");
+        for typed in ["team-secret", "old-secret"] {
+            let (status, body) = answer(typed).await;
+            assert_eq!(status, unknown_status, "{route} {typed}: {body}");
+            assert_eq!(
+                body.replace(typed, "<typed>"),
+                unknown.replace("never-registered", "<typed>"),
+                "{route}: {typed} answers like a name nobody registered"
+            );
+            for other in spellings.iter().filter(|s| **s != typed) {
+                assert!(
+                    !body.contains(other),
+                    "{route} {typed} names {other}: {body}"
+                );
+            }
+        }
+    }
+
+    let keeper = ctx.as_user("keeper").await;
+    for typed in ["hush-lab", "team-secret", "old-secret"] {
+        let tree = keeper
+            .get_json(&format!("/api/v1/domains/{typed}/tree"))
+            .await;
+        assert_eq!(tree["domain"], "hush-lab", "{typed}: {tree}");
+        keeper
+            .get_text(&format!("/api/v1/domains/{typed}/manifest"), 200)
+            .await;
+    }
+}

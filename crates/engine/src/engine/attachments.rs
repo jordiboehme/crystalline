@@ -869,6 +869,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         if !Self::RETIREMENT_STATUSES.contains(&p.status.as_str()) {
             return Err(EngineError::Invalid(format!(
                 "retire_engram accepts status deprecated, superseded or archived, got '{}'; \
@@ -1154,6 +1155,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         let actor = self.actor_for(client, overlay);

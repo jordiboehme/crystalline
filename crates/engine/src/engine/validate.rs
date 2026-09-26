@@ -16,6 +16,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;

@@ -511,7 +511,7 @@ pub async fn guard(
 }
 
 /// A header mode, then the session cookie, then anonymous, then nothing.
-async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
+pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
     if let Some(name) = &state.auth_cfg.trusted_header
         && let Some(raw) = headers.get(name)
         && let Ok(value) = raw.to_str()

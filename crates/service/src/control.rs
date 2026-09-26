@@ -65,6 +65,8 @@ pub async fn serve_ctl(stream: IpcStream, shared: Arc<Shared>) {
 /// Handle one ctl request, returning the response envelope and whether the
 /// daemon should shut down after replying.
 async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
+    let localized = localized_request(req, &shared.engine).await;
+    let req = localized.as_ref().unwrap_or(req);
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
     match cmd {
         "status" => {
@@ -779,6 +781,51 @@ fn folds_on_the_way_in(req: &Value) -> bool {
         && req.get("folds").is_some_and(Value::is_object)
 }
 
+/// The commands whose `domain` names a domain that already exists, so any of
+/// its names will do. `origin_add` is not one: the name it carries is the one
+/// a new registration takes, and mapping it through the table would let a new
+/// domain collide with the one an alias already points at.
+const DOMAIN_REFERENCE_COMMANDS: [&str; 17] = [
+    "sync",
+    "file_stamps",
+    "scaffold_manifest",
+    "domain_import",
+    "retag",
+    "domain_export",
+    "domain_remove",
+    "domain_review",
+    "origin_update",
+    "origin_status",
+    "origin_share",
+    "origin_withdraw",
+    "origin_changes",
+    "origin_discard",
+    "origin_resolve",
+    "provision",
+    "forget_domain",
+];
+
+/// `req` with its `domain` spelled as the local name, when it is a command
+/// that names an existing domain and names it by its canonical name or an
+/// alias; `None` when there is nothing to change. The control socket is the
+/// machine owner's, so every domain is visible to it.
+async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
+    let cmd = req.get("cmd").and_then(Value::as_str)?;
+    if !DOMAIN_REFERENCE_COMMANDS.contains(&cmd) {
+        return None;
+    }
+    let typed = req.get("domain").and_then(Value::as_str)?;
+    let local = engine
+        .localize_visible(typed, &std::collections::HashSet::new())
+        .await;
+    if local == typed {
+        return None;
+    }
+    let mut req = req.clone();
+    req["domain"] = Value::String(local);
+    Some(req)
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
@@ -790,6 +837,49 @@ fn envelope_err(message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command naming an existing domain takes its canonical name or an
+    /// alias: `sync` with `eng` syncs `eng-knowledge`, whose MANIFEST
+    /// declares that name.
+    #[tokio::test]
+    async fn a_command_names_a_domain_by_its_canonical_name_or_an_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng-knowledge");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            crystalline_core::manifest_template("eng", "2026-01-01"),
+        )
+        .unwrap();
+        let mut entry = crystalline_core::config::DomainEntry::file(root);
+        entry.aliases = vec!["old-eng".to_string()];
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert("eng-knowledge".to_string(), entry);
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg,
+                None,
+                Some(tmp.path().join("config.yaml")),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+
+        for spelling in ["eng", "old-eng"] {
+            let (reply, shutdown) =
+                handle(&json!({ "cmd": "sync", "domain": spelling }), &shared).await;
+            assert!(!shutdown);
+            assert_eq!(reply["ok"], true, "{spelling}: {reply}");
+            assert_eq!(
+                reply["data"]["reports"][0]["domain"], "eng-knowledge",
+                "{spelling}: {reply}"
+            );
+        }
+    }
 
     /// `origin_share`'s amend target is the parameter this guards: absent
     /// means "stack a new layer", a number means "amend that layer", and a

@@ -730,6 +730,105 @@ pub struct ProvisionParams {
     pub domain: Option<String>,
 }
 
+/// A params struct that names existing domains, so a caller may spell each
+/// one as its local name, its canonical name or an alias.
+///
+/// Only references to domains that already exist implement this. A name a
+/// registration introduces (`add_domain`'s `domain`, a rename's new name) is
+/// not a reference: mapping it through the table would let a new domain adopt
+/// or collide with the domain an alias already points at, so those params keep
+/// what the caller typed.
+pub trait DomainArgs {
+    /// Map every domain spelling this value carries to a local name.
+    fn localize_domains(&mut self, local: &dyn Fn(&str) -> String);
+}
+
+/// A `crystalline://` identifier with its domain segment localized; any other
+/// text unchanged, the permalink, a fragment and a glob byte for byte.
+pub fn localize_identifier(identifier: &str, local: &dyn Fn(&str) -> String) -> String {
+    let Some(rest) = identifier.strip_prefix(crystalline_core::address::SCHEME) else {
+        return identifier.to_string();
+    };
+    let (domain, tail) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    if domain.is_empty() {
+        return identifier.to_string();
+    }
+    format!(
+        "{}{}{tail}",
+        crystalline_core::address::SCHEME,
+        local(domain)
+    )
+}
+
+fn localize_one(value: &mut String, local: &dyn Fn(&str) -> String) {
+    *value = local(value);
+}
+
+fn localize_opt(value: &mut Option<String>, local: &dyn Fn(&str) -> String) {
+    if let Some(value) = value {
+        localize_one(value, local);
+    }
+}
+
+fn localize_all(values: &mut [String], local: &dyn Fn(&str) -> String) {
+    for value in values {
+        localize_one(value, local);
+    }
+}
+
+fn localize_id(identifier: &mut String, local: &dyn Fn(&str) -> String) {
+    *identifier = localize_identifier(identifier, local);
+}
+
+/// `DomainArgs` for a params struct, naming which fields hold a domain name
+/// (`one`, `opt`, `all`) and which hold an identifier (`id`, `id_opt`).
+macro_rules! domain_args {
+    ($ty:ty { $($kind:ident $field:ident),* $(,)? }) => {
+        impl DomainArgs for $ty {
+            fn localize_domains(&mut self, local: &dyn Fn(&str) -> String) {
+                $(domain_args!(@field $kind, self.$field, local);)*
+            }
+        }
+    };
+    (@field one, $value:expr, $local:ident) => { localize_one(&mut $value, $local) };
+    (@field opt, $value:expr, $local:ident) => { localize_opt(&mut $value, $local) };
+    (@field all, $value:expr, $local:ident) => { localize_all(&mut $value, $local) };
+    (@field id, $value:expr, $local:ident) => { localize_id(&mut $value, $local) };
+    (@field id_opt, $value:expr, $local:ident) => {
+        if let Some(identifier) = &mut $value {
+            localize_id(identifier, $local);
+        }
+    };
+}
+
+domain_args!(WriteParams { one domain });
+domain_args!(ReadParams { id identifier, opt domain });
+domain_args!(EditParams { id identifier, one domain });
+domain_args!(SaveParams { one domain, id identifier });
+domain_args!(RetireParams { one domain, id identifier, id_opt successor });
+domain_args!(SplitParams { one domain, id identifier });
+domain_args!(MoveParams { id identifier, one domain, opt destination_domain });
+domain_args!(DeleteParams { id identifier, one domain });
+domain_args!(SearchParams { all domains });
+domain_args!(ContextParams { id anchor, all domains });
+domain_args!(RecentParams { all domains });
+domain_args!(BrowseParams { one domain });
+domain_args!(ValidateParams { one domain, id_opt identifier });
+domain_args!(InferParams { one domain });
+domain_args!(VocabularyParams { opt domain });
+domain_args!(EvolveParams { all domains });
+domain_args!(RemoveDomainParams { one domain });
+domain_args!(ShareChangesParams { one domain });
+domain_args!(DiscardChangesParams { one domain });
+domain_args!(UpdateDomainParams { opt domain });
+domain_args!(OriginStatusParams { opt domain });
+domain_args!(ResolveConflictParams { one domain });
+domain_args!(WithdrawProposalParams { one domain });
+domain_args!(ProvisionParams { opt domain });
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +862,79 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(real.domains, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The table a test localizes through: `eng` and `old-eng` both mean
+    /// `eng-knowledge`, anything else stays as typed.
+    fn eng(spelling: &str) -> String {
+        match spelling {
+            "eng" | "old-eng" => "eng-knowledge".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_identifier_keeps_everything_but_its_domain_segment() {
+        assert_eq!(
+            localize_identifier("crystalline://eng/runbook#Steps", &eng),
+            "crystalline://eng-knowledge/runbook#Steps"
+        );
+        assert_eq!(
+            localize_identifier("crystalline://old-eng/ops/*", &eng),
+            "crystalline://eng-knowledge/ops/*"
+        );
+        assert_eq!(
+            localize_identifier("crystalline://eng", &eng),
+            "crystalline://eng-knowledge"
+        );
+        // Unknown spellings, bare permalinks and an empty domain stay as typed.
+        assert_eq!(
+            localize_identifier("crystalline://nobody/x", &eng),
+            "crystalline://nobody/x"
+        );
+        assert_eq!(localize_identifier("eng/runbook", &eng), "eng/runbook");
+        assert_eq!(
+            localize_identifier("crystalline:///x", &eng),
+            "crystalline:///x"
+        );
+    }
+
+    #[test]
+    fn params_localize_every_domain_they_name() {
+        let mut read = ReadParams {
+            identifier: "crystalline://eng/runbook".to_string(),
+            domain: Some("old-eng".to_string()),
+            ..ReadParams::default()
+        };
+        read.localize_domains(&eng);
+        assert_eq!(read.identifier, "crystalline://eng-knowledge/runbook");
+        assert_eq!(read.domain.as_deref(), Some("eng-knowledge"));
+
+        let mut search: SearchParams =
+            serde_json::from_value(json!({ "domains": ["eng", "nobody"] })).unwrap();
+        search.localize_domains(&eng);
+        assert_eq!(search.domains, vec!["eng-knowledge", "nobody"]);
+
+        let mut moved: MoveParams = serde_json::from_value(json!({
+            "identifier": "runbook",
+            "domain": "eng",
+            "destination": "ops",
+            "destination_domain": "old-eng",
+        }))
+        .unwrap();
+        moved.localize_domains(&eng);
+        assert_eq!(moved.domain, "eng-knowledge");
+        assert_eq!(moved.destination_domain.as_deref(), Some("eng-knowledge"));
+        // The destination is a folder, never a domain.
+        assert_eq!(moved.destination, "ops");
+
+        let mut context: ContextParams = serde_json::from_value(json!({
+            "anchor": "crystalline://old-eng/ops/*",
+            "domains": ["eng"],
+        }))
+        .unwrap();
+        context.localize_domains(&eng);
+        assert_eq!(context.anchor, "crystalline://eng-knowledge/ops/*");
+        assert_eq!(context.domains, vec!["eng-knowledge"]);
     }
 }

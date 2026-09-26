@@ -100,6 +100,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))

@@ -77,6 +77,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,

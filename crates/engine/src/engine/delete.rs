@@ -38,6 +38,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         if let Some(path) = attachment_identifier(&p.identifier) {
@@ -269,6 +270,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         if let Some(path) = attachment_identifier(&p.identifier) {
             if p.expected_checksum.is_some() {
                 return Err(EngineError::Invalid(format!(

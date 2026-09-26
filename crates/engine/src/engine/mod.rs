@@ -907,11 +907,19 @@ pub struct Engine {
     // local name. Rebuilt from the registrations when `names_stale` is set and
     // read everywhere else, so a lookup never touches the store. Never held
     // while `store` or `config` is taken: the Arc is cloned out first. See
-    // `Engine::name_table`.
-    names: std::sync::RwLock<Arc<crystalline_core::names::NameTable>>,
+    // `Engine::name_table`. Stored with the generation of the build that made
+    // it, so a slower build that started earlier never overwrites a newer one.
+    names: std::sync::RwLock<(u64, Arc<crystalline_core::names::NameTable>)>,
+    // The ticket every table build takes before it reads its inputs; see
+    // `names` above.
+    names_generation: std::sync::atomic::AtomicU64,
     // Set when a registration or a declared name may have changed; the next
     // `Engine::name_table` rebuilds. Starts `true`, so the first lookup builds.
     names_stale: std::sync::atomic::AtomicBool,
+    // Whether `virtual_domain_names` below has been read from the store at
+    // least once. A verb's first lookup reads it when nothing else has (a
+    // one-shot command, a REST request before any MCP connection).
+    virtual_names_loaded: std::sync::atomic::AtomicBool,
     // Each virtual domain's declared valid `domain_name`, keyed by local name.
     // A virtual MANIFEST lives in the database, so the sync table build cannot
     // read it; `Engine::refresh_names` reads it in the same pass that caches
@@ -1641,8 +1649,10 @@ impl Engine {
             github_tokens: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
-            names: std::sync::RwLock::new(Arc::default()),
+            names: std::sync::RwLock::new((0, Arc::default())),
+            names_generation: std::sync::atomic::AtomicU64::new(0),
             names_stale: std::sync::atomic::AtomicBool::new(true),
+            virtual_names_loaded: std::sync::atomic::AtomicBool::new(false),
             virtual_domain_names: std::sync::RwLock::new(BTreeMap::new()),
             #[cfg(any(test, feature = "testing"))]
             spelling_replaces: std::sync::atomic::AtomicU64::new(0),
@@ -3533,9 +3543,7 @@ impl Engine {
     /// deliberately does neither. Keep the two together: they read the same
     /// file the same way and only differ in what they do with the answer.
     fn reread_config(&self) -> Option<GlobalConfig> {
-        let path = self.config_file_path()?;
-        let file = overlay::load_file(&path).ok()?;
-        Some(self.overlay.apply(&file))
+        reread_config_at(self.config_file_path(), &self.overlay)
     }
 
     /// The configuration file this engine reads and persists to: its
@@ -3551,7 +3559,35 @@ impl Engine {
             None => crystalline_core::config::global_config_path().ok(),
         }
     }
+}
 
+/// [`Engine::reread_config`] over its two inputs, so the read can run where the
+/// engine cannot be borrowed (the blocking pool).
+fn reread_config_at(path: Option<PathBuf>, overlay: &EnvOverlay) -> Option<GlobalConfig> {
+    let file = overlay::load_file(&path?).ok()?;
+    Some(overlay.apply(&file))
+}
+
+/// [`Engine::registered_domain_entries`] over its three tiers: the startup
+/// snapshot, then the discovered overlay, then what the file says now, each
+/// adding only the names the tiers before it lack.
+fn union_registrations(
+    mut entries: IndexMap<String, DomainEntry>,
+    discovered: &HashMap<String, DomainEntry>,
+    fresh: Option<GlobalConfig>,
+) -> IndexMap<String, DomainEntry> {
+    for (name, entry) in discovered {
+        entries.entry(name.clone()).or_insert_with(|| entry.clone());
+    }
+    if let Some(fresh) = fresh {
+        for (name, entry) in fresh.domains {
+            entries.entry(name).or_insert(entry);
+        }
+    }
+    entries
+}
+
+impl Engine {
     /// The file domains a diagnostic read covers, as `(name, root)` pairs:
     /// everything [`Engine::sync_targets`] would sync, plus every file domain
     /// the config file names right now, so a domain registered after this
@@ -3635,16 +3671,9 @@ impl Engine {
     /// hit, until the daemon restarted - which is what Fluid's home screen and
     /// the `list_domains` tool showed a user who had just added one.
     fn registered_domain_entries(&self) -> IndexMap<String, DomainEntry> {
-        let mut entries = self.config.read().unwrap().domains.clone();
-        for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-            entries.entry(name.clone()).or_insert_with(|| entry.clone());
-        }
-        if let Some(fresh) = self.reread_config() {
-            for (name, entry) in fresh.domains {
-                entries.entry(name).or_insert(entry);
-            }
-        }
-        entries
+        let snapshot = self.config.read().unwrap().domains.clone();
+        let discovered = self.discovered_domains.read().unwrap().clone();
+        union_registrations(snapshot, &discovered, self.reread_config())
     }
 
     /// [`Engine::registered_domain_names`] for the one caller that may not

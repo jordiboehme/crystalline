@@ -1777,6 +1777,23 @@ impl McpServer {
         }
     }
 
+    /// `p` with every domain it names spelled as a local name, for this
+    /// caller. First thing in every handler whose params name an existing
+    /// domain, because the checks a handler makes before the engine runs
+    /// (writability, joins, a hidden-domain refusal) key on the local name
+    /// too. A spelling of a domain this caller may not see stays as typed,
+    /// so it is refused in the caller's own words.
+    async fn localized<P: DomainArgs + Clone>(
+        &self,
+        p: P,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<P, ErrorData> {
+        self.engine
+            .localized_for(&p, &self.scope_of(ctx))
+            .await
+            .map_err(to_error)
+    }
+
     /// The gate every write verb passes before it touches a domain, answering
     /// the same two refusals the REST write routes answer and in the same
     /// order.
@@ -1995,10 +2012,11 @@ impl McpServer {
     )]
     async fn write_engram(
         &self,
-        Parameters(mut p): Parameters<WriteParams>,
+        Parameters(p): Parameters<WriteParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let mut p = self.localized(p, &ctx).await?;
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
         // sanitizes away counts as none reported. Belt and braces rather than
@@ -2230,6 +2248,7 @@ impl McpServer {
         Parameters(p): Parameters<ReadParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let scope = self.scope_of(&ctx);
         // A link presented here binds it to this account and opens the draft
         // for this holder, so the read below answers the draft it names and a
@@ -2284,10 +2303,11 @@ impl McpServer {
     )]
     async fn edit_engram(
         &self,
-        Parameters(mut p): Parameters<EditParams>,
+        Parameters(p): Parameters<EditParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let mut p = self.localized(p, &ctx).await?;
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
         // sanitizes away counts as none reported. Belt and braces rather than
@@ -2382,6 +2402,7 @@ impl McpServer {
         Parameters(p): Parameters<MoveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let scope = self.scope_of(&ctx);
         // Both ends, because a move writes at both: a caller who may write only
         // one of the two could otherwise carry knowledge out of a private
@@ -2435,6 +2456,7 @@ impl McpServer {
         Parameters(p): Parameters<SplitParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         // One domain, because a split writes twice inside it: the new engram
         // lands in the source's domain, so the source's gate is the whole gate.
         let scope = self.scope_of(&ctx);
@@ -2469,6 +2491,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         // Before the confirmation round, for the reason `edit_engram` states.
         let scope = self.scope_of(&ctx);
         if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
@@ -2518,6 +2541,7 @@ impl McpServer {
         Parameters(p): Parameters<SearchParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .search_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2540,6 +2564,7 @@ impl McpServer {
         Parameters(p): Parameters<ContextParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .build_context(&p, &self.scope_of(&ctx))
             .await
@@ -2562,6 +2587,7 @@ impl McpServer {
         Parameters(p): Parameters<RecentParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .recent_activity(&p, &self.scope_of(&ctx))
             .await
@@ -2602,6 +2628,7 @@ impl McpServer {
         Parameters(p): Parameters<BrowseParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .browse_domain(&p, &self.scope_of(&ctx))
             .await
@@ -2624,6 +2651,7 @@ impl McpServer {
         Parameters(p): Parameters<ValidateParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .validate_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2642,6 +2670,7 @@ impl McpServer {
         Parameters(p): Parameters<InferParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .infer_schema(&p, &self.scope_of(&ctx))
             .await
@@ -2660,6 +2689,7 @@ impl McpServer {
         Parameters(p): Parameters<VocabularyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .vocabulary(&p, &self.scope_of(&ctx))
             .await
@@ -2678,6 +2708,7 @@ impl McpServer {
         Parameters(p): Parameters<EvolveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .evolve_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2873,6 +2904,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
         }
@@ -2938,6 +2970,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3031,6 +3064,7 @@ impl McpServer {
         Parameters(p): Parameters<UpdateDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
@@ -3061,6 +3095,7 @@ impl McpServer {
         Parameters(p): Parameters<OriginStatusParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("origin_status", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
@@ -3095,6 +3130,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3179,6 +3215,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3251,6 +3288,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("discard_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3339,6 +3377,7 @@ impl McpServer {
         Parameters(p): Parameters<ProvisionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let action = match p.action.as_str() {
             "status" => ProvisionAction::Status,
             "apply" => ProvisionAction::Apply,
@@ -4252,14 +4291,16 @@ impl ServerHandler for McpServer {
                 // attachment path a caller can reach cold. A domain it may not
                 // see is refused exactly as an unregistered one - the same
                 // bytes, from the engine's own line - before the file is
-                // touched.
-                self.engine
-                    .require_domain(&url.domain, &self.scope_of(&context))
-                    .await
-                    .map_err(to_error)?;
+                // touched. The domain may be spelled by any of its names; one
+                // this caller may not see keeps the spelling they sent.
                 let scope = self.scope_of(&context);
                 let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
-                let (bytes, row) = DomainView::for_read(&self.engine, &url.domain, &hidden, &scope)
+                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
+                self.engine
+                    .require_domain(&domain, &scope)
+                    .await
+                    .map_err(to_error)?;
+                let (bytes, row) = DomainView::for_read(&self.engine, &domain, &hidden, &scope)
                     .map_err(to_error)?
                     .attachment_bytes(path)
                     .await

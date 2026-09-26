@@ -193,6 +193,13 @@ impl Engine {
             .get("created")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // A MANIFEST engram that was already in the index (another instance
+        // over the same index wrote it) may declare a name, and a virtual
+        // domain's declared name is only read by a refresh. A new one was
+        // refreshed by the scaffold.
+        if !manifest_created {
+            self.refresh_names().await;
+        }
 
         Ok(json!({
             "domain": name,
