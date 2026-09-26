@@ -12,9 +12,9 @@
  * font still refuses "?" and the block stays its only use.
  *
  * The numbers each kind is built to are named in a table above its
- * recipe: `BLOCK` for the block, `BOARD` for the hoverboard and `LUMPS`
- * (with `SQUASH`) for the cloud. Round parts use few facets, as in every
- * batch.
+ * recipe: `BLOCK` for the block, `BOARD` for the hoverboard, and `BODY`
+ * and `TAIL` for the cloud, whose tail balls (`TAIL_BALLS`) are walked
+ * out once from `TAIL`. Round parts use few facets, as in every batch.
  */
 
 import type { HeroKind } from "../../../world/types";
@@ -40,8 +40,8 @@ const BLOCK_RIVET: Rgb = [0.3, 0.18, 0.05];
 /** The mark's white, which breathes. */
 const MARK_WHITE: Rgb = [0.95, 0.95, 0.9];
 
-/** The mark's drop shadow: the rivets' dark brown. */
-const MARK_SHADOW: Rgb = [0.3, 0.18, 0.05];
+/** The mark's drop shadow: the rivets' own dark brown. */
+const MARK_SHADOW: Rgb = BLOCK_RIVET;
 
 /**
  * The block's mark (C12): a chunky "?" two pixels thick (`#`) with a
@@ -64,12 +64,16 @@ export const QUESTION_MARK: readonly string[] = [
 
 /**
  * The block's measures, in metres from its centre, the same on all six
- * faces: the edge-coloured core reaches `face`, a gold plate lies on each
- * face out to `plate` and stops `inset` from the core's edges, so a band
- * of the edge colour frames every face, and a dark rivet `2 * rivet` on a
- * side sits `rivetIn` in from each corner of every plate. The rivets and
- * the marks stand `DECAL_LIFT` proud of the plates, out to the 0.3 half
- * width, the top and the lift exactly. The mark's pixels are `px` square.
+ * faces:
+ * - `face`: how far the edge-coloured core reaches;
+ * - `plate`: how far the gold plate on each face stands out;
+ * - `inset`: how far each plate stops short of the core's edges, so a band
+ *   of the edge colour that wide frames every face;
+ * - `rivet`: half the side of a dark corner rivet, and `rivetIn`: how far
+ *   a rivet's centre sits in from its plate's corner;
+ * - `px`: the side of one of the mark's square pixels.
+ * The rivets and the marks stand `DECAL_LIFT` proud of the plates, out to
+ * the 0.3 half width, the top and the lift exactly.
  */
 export const BLOCK = {
   face: 0.28,
@@ -180,103 +184,92 @@ const BOARD_YELLOW: Rgb = [0.98, 0.85, 0.1];
  * The hoverboard's measures, in metres. The deck is `thick` thick and
  * `inset` narrower on each side than the footprint, whose last `inset`
  * the edge panels fill. Along its length it is flat out to `flat` from the
- * centre, then ramps up to a short level `shelf` just before each round
- * end, and each round end rises a last `tipRise` to the top: the kick.
- * Each round end is a fan of `slices` slabs about its half circle's
- * centre, each ending in a chord, so the ends read round from above and
- * every slab's gentle rise is the same. The foot pads sit at `pad` from
- * the middle, `padA` long and `padD` wide in half measures, `padH` thick.
+ * centre, then ramps up (the kick) to a level shelf, on which each round
+ * end sits: a disc of the deck's half width and `sides` facets, centred
+ * where the shelf ends. The disc is `seat` thinner than the shelf at top
+ * and bottom, so the half of it over the shelf is hidden inside the deck
+ * and no face of the two shares a plane. A foot pad `padH` thick lies on
+ * each shelf, `padA` long and `padD` wide in half measures, and ends
+ * exactly at the top. The edge panels follow the deck's profile, `edge`
+ * inside its top and bottom.
  */
 const BOARD = {
   thick: 0.035,
   inset: 0.015,
-  flat: 0.24,
-  shelf: 0.03,
-  tipRise: 0.015,
-  slices: 6,
-  pad: 0.14,
-  padA: 0.075,
+  flat: 0.12,
+  sides: 16,
+  seat: 0.001,
+  padA: 0.05,
   padD: 0.07,
   padH: 0.004,
+  edge: 0.004,
 } as const;
 
 /**
- * The hoverboard: a deck profile along `a` with a kick at each end,
- * extruded across `d` (the middle in one piece, each round end a fan of
- * slabs whose tips follow a half circle), two black foot pads on its flat
- * and edge panels along both sides of the flat, lime towards `+a` and
- * yellow towards `-a`. Level at its lift.
+ * The hoverboard: a deck profile along `a`, flat in the middle and
+ * kicking up to a level shelf at each end, extruded across `d`; a round
+ * disc on each shelf for the rounded end; a black foot pad on each shelf;
+ * and edge panels along both sides that follow the deck, lime towards
+ * `+a` and yellow towards `-a`. Level at its lift.
  */
-const hoverboard: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+const hoverboard: HeroRecipe = ({ k, s, variant, kind }) => {
   const { hw, d1, lift, top } = heroHalf(kind, variant);
   const t = BOARD.thick;
   const w = d1 - BOARD.inset;
-  // Where the round ends start: the centre of each end's half circle.
+  // Where each disc is centred, and where the shelf under its inner half
+  // starts: the ramp ends there.
   const c = hw - w;
-  const ramp = c - BOARD.shelf;
-  // The shelf's underside: the kick less the round end's last rise.
-  const shelf = top - t - BOARD.tipRise;
+  const ramp = c - w;
+  // The shelf's underside: the pads on it end at the top.
+  const shelf = top - BOARD.padH - t;
   const pink = s.tinted(BOARD_PINK);
-  // The underside's height at `x` along the middle piece.
   const under = (x: number): number =>
     lift +
     (shelf - lift) *
       Math.min(1, Math.max(0, Math.abs(x) - BOARD.flat) / (ramp - BOARD.flat));
-  const xs = [-c, -ramp, -BOARD.flat, BOARD.flat, ramp, c];
+  // The deck's outline over `xs`, from `lo` over its underside to `hi`.
+  const profile = (xs: readonly number[], lo: number, hi: number) => [
+    ...xs.map((x): [number, number] => [x, under(x) + lo]),
+    ...xs.map((x): [number, number] => [x, under(x) + hi]).reverse(),
+  ];
   k.extrude(
-    [
-      ...xs.map((x): [number, number] => [x, under(x)]),
-      ...xs.map((x): [number, number] => [x, under(x) + t]).reverse(),
-    ],
+    profile([-c, -ramp, -BOARD.flat, BOARD.flat, ramp, c], 0, t),
     -w,
     w,
     pink,
   );
-  // The round ends: slabs fanned about the half circle's centre, each
-  // ending in a chord of the circle and rising `tipRise` along its axis.
-  // Their inner corners reach back over the shelf, which is level.
-  const step = Math.PI / BOARD.slices;
-  const apothem = w * Math.cos(step / 2);
-  const chord = w * Math.sin(step / 2);
-  const tip = top - t;
-  for (const sign of [1, -1])
-    for (let i = 0; i < BOARD.slices; i++) {
-      const theta = -Math.PI / 2 + (i + 0.5) * step;
-      kitAt(
-        yawed(ORIGIN, sign * c, 0, sign > 0 ? theta : Math.PI + theta),
-      ).extrude(
-        [
-          [0, shelf],
-          [apothem, tip],
-          [apothem, tip + t],
-          [0, shelf + t],
-        ],
-        -chord,
-        chord,
-        pink,
-      );
-    }
   const pad = s.tinted(BOARD_PAD);
-  for (const a of [-BOARD.pad, BOARD.pad])
+  const padAt = (c + ramp) / 2;
+  for (const a of [-c, c])
+    k.cylinder(
+      a,
+      0,
+      shelf + BOARD.seat,
+      shelf + t - BOARD.seat,
+      w,
+      BOARD.sides,
+      pink,
+    );
+  for (const a of [-padAt, padAt])
     k.box(
       a - BOARD.padA,
       a + BOARD.padA,
       -BOARD.padD,
       BOARD.padD,
-      lift + t,
-      lift + t + BOARD.padH,
+      shelf + t,
+      top,
       pad,
     );
   const lime = s.tinted(BOARD_LIME);
   const yellow = s.tinted(BOARD_YELLOW);
-  const h0 = lift + BOARD.padH;
-  const h1 = lift + t - BOARD.padH;
+  const lo = BOARD.edge;
+  const hi = t - BOARD.edge;
   for (const [e0, e1] of [
     [w - BOARD.inset, d1],
     [-d1, -w + BOARD.inset],
   ] as const) {
-    k.box(0, BOARD.flat, e0, e1, h0, h1, lime);
-    k.box(-BOARD.flat, 0, e0, e1, h0, h1, yellow);
+    k.extrude(profile([0, BOARD.flat, ramp, c], lo, hi), e0, e1, lime);
+    k.extrude(profile([-c, -ramp, -BOARD.flat, 0], lo, hi), e0, e1, yellow);
   }
 };
 
@@ -289,94 +282,162 @@ const CLOUD_TOP: Rgb = [0.98, 0.92, 0.55];
 /** The cloud's warmer orange-yellow underside. */
 const CLOUD_UNDER: Rgb = [0.9, 0.6, 0.15];
 
-/** How much flatter than round a lump is: its half height over its radius. */
-const SQUASH = 0.85;
+/**
+ * How flat a body lump's underside is: the height of its lower half over
+ * its radius. Every body lump's underside rests on the lift, so the body
+ * has one flat bottom.
+ */
+const FLAT_UNDER = 0.35;
 
 /**
- * The cloud's lumps: `[a, d, r, rise]`, the lump's centre over the lift by
- * `SQUASH * r + rise`, so every lump's underside is at or over the lift and
- * the main one's is exactly on it. The body, about 1.3 m long and 0.9 m
- * wide, runs from the front (`+d`) back to about `d` -0.35, with two
- * smaller puffs on its top; the last nine lumps are the tail, about 0.6 m
- * long, shrinking, rising and swinging to `+a` towards the back (`-d`).
+ * The body's lumps: `[a, d, r, up]`, each a squashed ball of radius `r`
+ * whose lower half is `FLAT_UNDER * r` high and whose rounded upper half
+ * is `up` high. They overlap heavily, so the body reads as one broad, low
+ * puff about 1.35 m long, 0.85 m wide and 0.45 m tall, highest in its
+ * middle.
  */
-const LUMPS: readonly (readonly [number, number, number, number])[] = [
-  [0, 0.3, 0.3, 0],
-  [0.18, 0.6, 0.24, 0.02],
-  [-0.18, 0.58, 0.23, 0.02],
-  [0, 0.74, 0.2, 0.03],
-  [0.2, 0.08, 0.24, 0.02],
-  [-0.2, 0.1, 0.24, 0.02],
-  [0, -0.12, 0.24, 0.03],
-  [0.08, 0.45, 0.18, 0.2],
-  [-0.1, 0.12, 0.18, 0.17],
-  [0.04, -0.36, 0.16, 0.06],
-  [0.05, -0.43, 0.15, 0.07],
-  [0.08, -0.49, 0.13, 0.1],
-  [0.11, -0.56, 0.12, 0.14],
-  [0.15, -0.62, 0.105, 0.19],
-  [0.19, -0.69, 0.09, 0.25],
-  [0.23, -0.76, 0.08, 0.31],
-  [0.29, -0.82, 0.065, 0.38],
-  [0.34, -0.89, 0.05, 0.46],
+const BODY: readonly (readonly [number, number, number, number])[] = [
+  [0, 0.22, 0.3, 0.32],
+  [0, 0.62, 0.28, 0.27],
+  [0, -0.16, 0.27, 0.26],
+  [0.22, 0.44, 0.22, 0.24],
+  [-0.22, 0.4, 0.22, 0.25],
+  [0.22, 0.02, 0.22, 0.23],
+  [-0.22, 0.04, 0.22, 0.24],
 ];
 
-/** A lump from this radius up carries a pale crown; the tail's do not. */
-const CAPPED = 0.17;
+/**
+ * The tail: a chain of `count` small squashed balls overlapping so closely
+ * (each `spacing` of its radius on from the last) that it reads as one
+ * wisp, tapering from `r0` at the body's back (`start`, on the lift) to
+ * `r1` at its tip over `length` metres. It heads to `-d`, turning by
+ * `turn` radians towards `+a` and rising by `rise` as it goes, so it curls
+ * up and to one side. A tail ball's halves are each `squash` of its radius
+ * high.
+ */
+const TAIL = {
+  start: [0.02, -0.28],
+  length: 0.6,
+  count: 32,
+  r0: 0.2,
+  r1: 0.03,
+  turn: (100 * Math.PI) / 180,
+  rise: 0.45,
+  squash: 0.75,
+} as const;
 
 /**
- * The ring angles of a lump, in degrees from its equator, bottom to top:
- * the underside's warm band ends at `WARM_TO`, the pale crown of a big
- * lump starts at `PALE_FROM`.
+ * The tail's balls, `[a, d, r, base]` (`base` over the lift), walked out
+ * along the tail once: the radius shrinks geometrically, so a step of
+ * the arc, proportional to the radius, keeps the overlap the same
+ * everywhere.
  */
-const RINGS = [-90, -55, -20, 15, 45, 70, 90] as const;
-
-/** The ring where the warm underside gives way to gold. */
-const WARM_TO = -20;
-
-/** The ring where a big lump's gold gives way to its pale crown. */
-const PALE_FROM = 45;
-
-/** The facets around a big lump, and around a small one (under `CAPPED`). */
-const LUMP_SIDES = { big: 10, small: 6 } as const;
+const TAIL_BALLS: readonly (readonly [number, number, number, number])[] =
+  (() => {
+    const q = TAIL.r1 / TAIL.r0;
+    const out: [number, number, number, number][] = [];
+    let [a, d] = TAIL.start;
+    let prev = 0;
+    for (let i = 0; i < TAIL.count; i++) {
+      const f = i / (TAIL.count - 1);
+      const arc = (TAIL.length * (1 - q ** f)) / (1 - q);
+      // Walk from the last ball's arc to this one's in small steps.
+      const steps = 8;
+      for (let j = 1; j <= steps; j++) {
+        const s0 = prev + ((arc - prev) * (j - 0.5)) / steps;
+        const heading = TAIL.turn * (s0 / TAIL.length) ** 1.5;
+        a += (Math.sin(heading) * (arc - prev)) / steps;
+        d -= (Math.cos(heading) * (arc - prev)) / steps;
+      }
+      prev = arc;
+      out.push([
+        a,
+        d,
+        TAIL.r0 * q ** f,
+        TAIL.rise * (arc / TAIL.length) ** 2.2,
+      ]);
+    }
+    return out;
+  })();
 
 /**
- * One lump: a squashed ball of rings at `RINGS`, its underside warm, its
- * middle gold and, on a big lump, its crown pale. The bands share their
- * rings, so they meet without a seam.
+ * How a ball of the cloud is faceted: `sides` facets around, and the ring
+ * angles of its lower and upper halves in degrees, bottom to top. From
+ * `pale` up, a ball wears the pale crown; a tail ball (`pale` null) has
+ * none. A body ball is rounder, a tail ball plainer, so the tail's many
+ * balls stay within the triangle aim.
  */
-function lump(
-  k: Kit,
-  s: Surfaces,
-  a: number,
-  d: number,
-  h: number,
-  r: number,
-): void {
-  const v = SQUASH * r;
-  const ring = (deg: number): [number, number] => {
-    const t = (deg * Math.PI) / 180;
-    return [Math.abs(deg) === 90 ? 0 : r * Math.cos(t), h + v * Math.sin(t)];
-  };
-  const big = r >= CAPPED;
-  const sides = big ? LUMP_SIDES.big : LUMP_SIDES.small;
-  const band = (lo: number, hi: number): [number, number][] =>
-    RINGS.filter((g) => g >= lo && g <= hi).map(ring);
-  k.lathe(a, d, band(-90, WARM_TO), sides, s.tinted(CLOUD_UNDER));
-  const gold = s.tinted(CLOUD_GOLD);
-  if (big) {
-    k.lathe(a, d, band(WARM_TO, PALE_FROM), sides, gold);
-    k.lathe(a, d, band(PALE_FROM, 90), sides, s.tinted(CLOUD_TOP));
-  } else {
-    k.lathe(a, d, band(WARM_TO, 90), sides, gold);
-  }
+interface BallShape {
+  sides: number;
+  lower: readonly number[];
+  upper: readonly number[];
+  pale: number | null;
 }
 
-/** The flying cloud: `LUMPS` over its lift, the tail at the back. */
+/** A body ball: 9 facets, three rings on top, a pale crown from 55 degrees. */
+const BODY_BALL: BallShape = {
+  sides: 9,
+  lower: [-90, -45, 0],
+  upper: [0, 30, 55, 90],
+  pale: 55,
+};
+
+/** A tail ball: 5 facets, one ring in each half, all gold over its warm underside. */
+const TAIL_BALL: BallShape = {
+  sides: 5,
+  lower: [-90, -40, 0],
+  upper: [0, 50, 90],
+  pale: null,
+};
+
+/**
+ * One ball of the cloud: radius `r` around the vertical axis at `(a, d)`,
+ * its underside at `base`, a lower half `low` high in the warm underside
+ * colour and a rounded upper half `up` high in gold, with a pale crown if
+ * its shape has one. The bands share their rings, so they meet without a
+ * seam.
+ */
+function ball(
+  k: Kit,
+  s: Surfaces,
+  [a, d, r]: readonly [number, number, number],
+  base: number,
+  low: number,
+  up: number,
+  shape: BallShape,
+): void {
+  const h = base + low;
+  const ring = (deg: number): [number, number] => {
+    const t = (deg * Math.PI) / 180;
+    const x = Math.abs(deg) === 90 ? 0 : r * Math.cos(t);
+    return [x, h + (deg < 0 ? low : up) * Math.sin(t)];
+  };
+  k.lathe(a, d, shape.lower.map(ring), shape.sides, s.tinted(CLOUD_UNDER));
+  const upper = shape.upper.map(ring);
+  const cut = shape.pale === null ? -1 : shape.upper.indexOf(shape.pale);
+  if (cut < 0) {
+    k.lathe(a, d, upper, shape.sides, s.tinted(CLOUD_GOLD));
+    return;
+  }
+  k.lathe(a, d, upper.slice(0, cut + 1), shape.sides, s.tinted(CLOUD_GOLD));
+  k.lathe(a, d, upper.slice(cut), shape.sides, s.tinted(CLOUD_TOP));
+}
+
+/** The flying cloud: the body's flat-bottomed puff on its lift, the tail at the back. */
 const flyingCloud: HeroRecipe = ({ k, s, variant, kind }) => {
   const { lift } = heroHalf(kind, variant);
-  for (const [a, d, r, rise] of LUMPS)
-    lump(k, s, a, d, lift + SQUASH * r + rise, r);
+  for (const [a, d, r, up] of BODY)
+    ball(k, s, [a, d, r], lift, FLAT_UNDER * r, up, BODY_BALL);
+  for (const [a, d, r, rise] of TAIL_BALLS)
+    ball(
+      k,
+      s,
+      [a, d, r],
+      lift + rise,
+      TAIL.squash * r,
+      TAIL.squash * r,
+      TAIL_BALL,
+    );
 };
 
 /** The floating kinds' recipes. */

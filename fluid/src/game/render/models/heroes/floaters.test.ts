@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { heroLift } from "../../../world/footprints";
 import { FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { partsOf, toLocal, type Part } from "../../modelChecks";
@@ -58,14 +59,19 @@ describe("floating hero models", () => {
   });
 
   it("lifts both ends of the board by the same kick", () => {
-    // Mutation caught: one kick missing or the deck tilted.
+    // Mutation caught: one kick missing or the deck tilted, and a middle
+    // with no deck (the empty set's -Infinity would pass the kick check).
     const pts = partsOf("hoverboard").flatMap(local);
     const end = (sign: number) =>
       Math.max(...pts.filter((q) => sign * q[0] > 0.4).map((q) => q[2]));
     expect(end(1)).toBeCloseTo(end(-1), 4);
-    const mid = Math.max(
-      ...pts.filter((q) => Math.abs(q[0]) < 0.2).map((q) => q[2]),
-    );
+    const middle = pts.filter((q) => Math.abs(q[0]) < 0.2).map((q) => q[2]);
+    expect(middle.length).toBeGreaterThan(0);
+    // The deck's middle lies on the lift, and it is a thin flat deck.
+    const lift = heroLift("hoverboard");
+    expect(Math.min(...middle)).toBeCloseTo(lift, 6);
+    expect(Math.max(...middle)).toBeLessThan(lift + 0.05);
+    const mid = Math.max(...middle);
     expect(end(1)).toBeGreaterThan(mid + 0.03);
   });
 
