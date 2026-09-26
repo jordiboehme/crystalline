@@ -28,6 +28,14 @@
  * disposed in its cleanup. The HUD is written by the session straight into
  * the DOM (`useHud`); the CRT reader is mounted while a terminal is read,
  * and closing it hands the keys back to the session.
+ *
+ * Typing `idclev` opens the level select over the station (`LevelSelect`):
+ * the session says so through `onLevels`, which only this route passes, so
+ * the look demo and the model gallery ignore the word. The select lists
+ * the domains, marks the one in the URL, and on Enter or a click asks the
+ * session to `jump` to that domain's bridge, a journey like any other that
+ * replaces the URL when it lands. Esc hands the keys back through
+ * `closeLevels`.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -39,6 +47,7 @@ import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
 import { createSession, type Session } from "./session";
 import { DeviceRefusal } from "./ui/DeviceRefusal";
+import { LevelSelect } from "./ui/LevelSelect";
 import { StationView } from "./ui/StationView";
 import { useHud } from "./ui/useHud";
 import type { PlaceAddress } from "./world/types";
@@ -82,6 +91,7 @@ export default function GameRoute() {
   const [refusal] = useState<Refusal | null>(() =>
     refusalReason(detectEnvironment(hasWebGL2)),
   );
+  const [levels, setLevels] = useState(false);
 
   useEffect(() => {
     navigateRef.current = navigate;
@@ -106,6 +116,7 @@ export default function GameRoute() {
       },
       openFluid,
       forceRgba8: false,
+      onLevels: setLevels,
     });
     sessionRef.current = session;
     const first = addressRef.current;
@@ -134,16 +145,30 @@ export default function GameRoute() {
     const current = sessionRef.current?.current;
     if (current) openFluid(engramRoute(current.domain, current.permalink));
   }, []);
+  const closeLevels = useCallback(() => {
+    sessionRef.current?.closeLevels();
+  }, []);
+  // The jump is the session's own journey (C10): it replaces the URL once
+  // the bridge lands, and the navigate callback above moves
+  // `requestedRef` with it, so the params effect does not travel twice.
+  const jump = useCallback((name: string) => {
+    sessionRef.current?.jump(name);
+  }, []);
 
   if (refusal !== null) return <DeviceRefusal />;
   return (
-    <StationView
-      canvasRef={canvasRef}
-      view={view}
-      connector={connector}
-      reader={reader}
-      onCloseReader={closeReader}
-      onOpenFluid={readerOpenFluid}
-    />
+    <>
+      <StationView
+        canvasRef={canvasRef}
+        view={view}
+        connector={connector}
+        reader={reader}
+        onCloseReader={closeReader}
+        onOpenFluid={readerOpenFluid}
+      />
+      {levels && (
+        <LevelSelect current={domain} onJump={jump} onClose={closeLevels} />
+      )}
+    </>
   );
 }

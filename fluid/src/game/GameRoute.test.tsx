@@ -11,7 +11,14 @@
  * stops asking the server anything once it is unmounted.
  */
 
-import { act, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { StrictMode, useEffect } from "react";
 import {
   MemoryRouter,
@@ -38,6 +45,7 @@ import {
   meResponse,
   userFixture,
 } from "../test/harness";
+import { INVERT_KEY } from "./session";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -282,6 +290,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/**
+ * Types a word on the window by `KeyboardEvent.code`, then waits inside
+ * `act` long enough for the loop to tick over it, so the session's
+ * `onLevels` state update lands inside `act`.
+ */
+async function typeWord(word: string) {
+  await act(async () => {
+    for (const ch of word) {
+      const code = `Key${ch.toUpperCase()}`;
+      window.dispatchEvent(new KeyboardEvent("keydown", { code, key: ch }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code, key: ch }));
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  });
+}
+
+const LEVELS = { name: "Jump to a domain" } as const;
+
 describe("GameRoute", () => {
   it("refuses a device without WebGL2", async () => {
     serve();
@@ -461,4 +487,107 @@ describe("GameRoute", () => {
     }
     expect(actWarnings()).toEqual([]);
   });
+
+  it("opens the level select on idclev and jumps to a domain's bridge", async () => {
+    gl.available = true;
+    window.localStorage.clear();
+    serve({
+      "/domains/eng/engrams/manifest": () => detailResponse("manifest", "eng"),
+      "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
+    });
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+
+    await typeWord("idclev");
+    const dialog = await screen.findByRole("dialog", LEVELS);
+    const row = await within(dialog).findByRole("option", { selected: true });
+    expect(row.firstElementChild?.textContent).toBe("eng");
+    expect(within(row).getByText("HERE")).toBeInTheDocument();
+    // The word's I was taken back.
+    expect(window.localStorage.getItem(INVERT_KEY)).not.toBe("1");
+
+    const field = within(dialog).getByRole("textbox", { name: "Domain name" });
+    fireEvent.change(field, { target: { value: "EN" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
+    await waitFor(() => {
+      expect(lastRoom()).toBe("manifest");
+    });
+    await settle(500);
+    expect(location).toBe("/game/d/eng/e/manifest");
+    expect(made.navigations).toEqual([
+      "/game/d/eng/e/alpha",
+      "/game/d/eng/e/manifest",
+    ]);
+    expect(
+      asked().filter((p) => p === "/domains/eng/engrams/manifest"),
+    ).toHaveLength(1);
+    view.unmount();
+    expect(actWarnings()).toEqual([]);
+  });
+
+  it("closes the level select on Esc and stays in the room", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+
+    await typeWord("idclev");
+    const dialog = await screen.findByRole("dialog", LEVELS);
+    const field = within(dialog).getByRole("textbox", { name: "Domain name" });
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
+    await settle(300);
+    expect(lastRoom()).toBe("alpha");
+    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(asked()).not.toContain("/domains/eng/engrams/manifest");
+
+    // The word opens it again.
+    await typeWord("idclev");
+    expect(await screen.findByRole("dialog", LEVELS)).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it("closes the level select when the URL changes under it", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+    await typeWord("idclev");
+    await screen.findByRole("dialog", LEVELS);
+
+    go("/game/d/eng/e/beta");
+    expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
+    await waitFor(() => {
+      expect(lastRoom()).toBe("beta");
+    });
+    await settle(500);
+    view.unmount();
+  });
+
+  it.each(["/game/dev", "/game/dev/gallery"])(
+    "ignores the word on %s",
+    async (path) => {
+      gl.available = true;
+      window.localStorage.clear();
+      serve();
+      const view = renderAt(path);
+      await settle(300);
+      await typeWord("idclev");
+      await settle(200);
+      expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
+      // The word's I stays a plain toggle there: nothing takes it back.
+      expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
+      view.unmount();
+    },
+  );
 });
