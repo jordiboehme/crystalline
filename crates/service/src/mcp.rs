@@ -2855,6 +2855,19 @@ impl McpServer {
         // listed whatever is declared and refuses its mutating actions instead
         // - so nothing is announced; see [`McpServer::listen`].
         let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
+            // Caught here rather than left to the engine's own url building:
+            // the same shared check the JSON API's create and domain-name
+            // peek use (crates/remote/src/github/mod.rs), so a malformed
+            // `repo` or `path` is refused with one classification wherever
+            // it is caught, before anything is asked of the forge.
+            if let Err(e) = crystalline_remote::validate_repo(repo) {
+                return Err(to_error(e.into()));
+            }
+            if let Some(path) = p.path.as_deref()
+                && let Err(e) = crystalline_remote::validate_repo_path(path)
+            {
+                return Err(to_error(e.into()));
+            }
             self.engine
                 .origin_add_with_progress(
                     repo,

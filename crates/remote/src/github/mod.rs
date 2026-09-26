@@ -813,6 +813,72 @@ fn split_repo(repo: &str) -> Result<(&str, &str), RemoteError> {
     })
 }
 
+/// Whether `segment` is one GitHub allows in an owner or a repository name:
+/// letters, digits, `-`, `_` and `.`, never empty and never `.` or `..` on
+/// their own (a real name is never exactly that, and refusing it here closes
+/// the one segment `..` could otherwise smuggle through the character
+/// allowlist).
+fn valid_repo_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Validate a caller-supplied `repo` as `owner/name` before it reaches this
+/// module's own url building (`split_repo` above splits on the first `/`
+/// only, and [`URL_COMPONENT`] keeps `.` unescaped), so every surface that
+/// takes a repository from a caller - the JSON API's team-domain create and
+/// domain-name peek, the `add_domain` MCP tool, the CLI's `domain add
+/// --origin` - answers a caller-fault refusal for `a/b/../../user` rather
+/// than letting it reach a GitHub API path that normalizes across a segment
+/// nobody named. Exactly one slash, and each side a single valid segment.
+///
+/// [`RemoteError::Refused`] is every caller-fault classifier's own class
+/// (`crate::error`'s doc comment; `mcp::to_error` and the JSON API's
+/// `From<EngineError>` both answer it 422/`invalid_params`), so a caller
+/// converts this with a plain `.map_err` rather than matching variants of
+/// its own.
+pub fn validate_repo(repo: &str) -> Result<(), RemoteError> {
+    let mut segments = repo.split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some(owner), Some(name), None)
+            if valid_repo_segment(owner) && valid_repo_segment(name) =>
+        {
+            Ok(())
+        }
+        _ => Err(RemoteError::Refused(format!(
+            "'{repo}' is not a valid repository: expected owner/name, letters, digits, '-', \
+             '_' and '.' only in each, and exactly one slash"
+        ))),
+    }
+}
+
+/// Validate a caller-supplied repository-relative `path` before it reaches
+/// this module's own url building: no leading slash (which would read as
+/// absolute once joined onto the `contents/` route), no backslash or `%`
+/// character (a caller's escape attempt this module's own percent-encoding
+/// would otherwise re-encode rather than refuse), and no segment that is
+/// empty, `.` or `..` (each a way to say "no real path component" rather
+/// than name one, `..` being the one that climbs out of the subtree this
+/// surface may read).
+pub fn validate_repo_path(path: &str) -> Result<(), RemoteError> {
+    let bad_segment = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
+    let bad = path.starts_with('/')
+        || path.contains('\\')
+        || path.contains('%')
+        || path.split('/').any(bad_segment);
+    if bad {
+        return Err(RemoteError::Refused(format!(
+            "'{path}' is not a valid path within the repository: no leading slash, no \
+             backslash, no '%' character, and no '.', '..' or empty segment"
+        )));
+    }
+    Ok(())
+}
+
 /// The lowercased marker GitHub's SAML refusal body carries: "Resource
 /// protected by organization SAML enforcement. You must grant your OAuth
 /// token access to this organization."
@@ -1329,5 +1395,55 @@ mod tests {
             Some("acme-enterprise")
         );
         assert_eq!(org_from_sso_url("https://github.com/settings"), None);
+    }
+
+    /// Every surface that takes a repository from a caller shares this one
+    /// check, so its rules are pinned here rather than through any one of
+    /// them: exactly one slash, both sides a real GitHub-legal segment.
+    #[test]
+    fn validate_repo_accepts_owner_name_and_refuses_everything_else() {
+        for good in ["acme/kb", "my.repo/name", "a-b_c/d.e", ".github/actions"] {
+            assert!(validate_repo(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "acme/kb/../../secret",
+            "acme",
+            "acme/kb/extra",
+            "../acme/kb",
+            "acme/..",
+            "ac me/kb",
+            "acme/.",
+            "/kb",
+            "acme/",
+            "",
+        ] {
+            assert!(validate_repo(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The path validator rejects every way N1 named to say "no real path
+    /// component" - an empty or a `.`/`..` segment - and every way a caller
+    /// could try to smuggle one past a naive check: a leading slash, a raw
+    /// backslash and a literal `%` (which this module's own encoder would
+    /// otherwise re-encode rather than treat as already-escaped).
+    #[test]
+    fn validate_repo_path_rejects_traversal_and_smuggled_separators() {
+        for good in ["domains/eng", "a", "a.b/c-d_e"] {
+            assert!(validate_repo_path(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "/etc/passwd",
+            "../../secret",
+            "domains/../../secret",
+            "a\\b",
+            "a%b",
+            "a/./b",
+            "a//b",
+            ".",
+            "..",
+            "",
+        ] {
+            assert!(validate_repo_path(bad).is_err(), "{bad:?}");
+        }
     }
 }

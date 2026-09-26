@@ -400,7 +400,17 @@ async fn a_malformed_repo_or_path_is_refused_before_the_connection_is_asked_abou
         assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
     }
 
-    for path in ["/etc/passwd", "../../secret", "domains/../../secret"] {
+    for path in [
+        "/etc/passwd",
+        "../../secret",
+        "domains/../../secret",
+        "a\\b",
+        "%2e%2e",
+        "domains%2f..%2fsecret",
+        "a/./b",
+        "a//b",
+        ".",
+    ] {
         let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
             .json(&serde_json::json!({"mode": "github", "repo": "acme/kb", "path": path}))
             .send()
@@ -518,16 +528,31 @@ async fn github_domain_name_peek_refuses_a_malformed_repo_or_path() {
         assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
     }
 
-    let resp = as_session(
-        fx.addr,
-        reqwest::Method::GET,
-        "/api/v1/github/domain-name?repo=acme/kb&path=../../secret",
-        &admin,
-    )
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(resp.status(), 422);
+    for path in [
+        "../../secret",
+        // Percent-decodes once (the query string layer, ahead of this
+        // handler) to `a\b`, a backslash - `validate_repo_path` must reject
+        // the decoded value, not only a literal `..`.
+        "a%5Cb",
+        // Decodes once to `a%b`: a literal `%` character reaching the
+        // validator, the shape a caller could otherwise use to smuggle a
+        // second round of percent-decoding past this check and into
+        // whatever reads the forge's answer.
+        "a%25b",
+        "a/./b",
+        "a//b",
+    ] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo=acme/kb&path={path}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "path {path:?} must be refused");
+    }
 }
 
 /// With `branch` omitted, the peek asks the forge for the repository's
@@ -552,10 +577,12 @@ async fn github_domain_name_peek_reports_an_unreadable_repository() {
     .unwrap();
     let status = resp.status();
     let text = resp.text().await.unwrap();
-    assert!(
-        status != 200 && status != 401 && status != 403,
-        "an unreadable repository must not answer as if it were read: {status} {text}"
-    );
+    // `default_branch_refusal` (crates/engine/src/engine/mod.rs) maps
+    // anything but a credential/authorization failure to
+    // `RemoteError::Refused`, which the generic `From<EngineError>`
+    // conversion answers 422: a caller-fault refusal naming the branch flag,
+    // never a 500 or a silent success.
+    assert_eq!(status, 422, "{text}");
 }
 
 /// The peek reads the MANIFEST through the forge exactly as a nameless team

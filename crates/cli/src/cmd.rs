@@ -803,6 +803,20 @@ pub(crate) fn parse_origin_spec(spec: &str) -> Result<(String, Option<String>)> 
     crystalline_service::parse_origin_spec(spec).map_err(|e| anyhow!("--origin {e}"))
 }
 
+/// Validates the `owner/name` [`parse_origin_spec`] read out of `--origin`,
+/// through the same check the JSON API's team-domain create and
+/// domain-name peek use and the `add_domain` MCP tool checks before it asks
+/// the engine (`crystalline_remote::validate_repo`), so a malformed repo
+/// answers the same one refusal wherever a caller catches it.
+pub(crate) fn validate_origin_repo(repo: &str) -> Result<()> {
+    crystalline_remote::validate_repo(repo).map_err(|e| anyhow!("--origin {e}"))
+}
+
+/// [`validate_origin_repo`], for the optional subpath half of `--origin`.
+pub(crate) fn validate_origin_path(path: &str) -> Result<()> {
+    crystalline_remote::validate_repo_path(path).map_err(|e| anyhow!("--origin {e}"))
+}
+
 /// Resolves `path` to an absolute path against the current directory,
 /// without requiring it to exist (`std::fs::canonicalize` refuses a path
 /// that is not there yet, which is exactly the common case for a team

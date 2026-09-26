@@ -2764,57 +2764,18 @@ fn github_not_ready_conflict() -> ApiError {
     )
 }
 
-/// Whether `segment` is one GitHub allows in an owner or a repository name:
-/// letters, digits, `-`, `_` and `.`, never empty and never `.` or `..` on
-/// their own (a real name is never exactly that, and refusing it here closes
-/// the one segment `..` could otherwise smuggle through the character
-/// allowlist).
-fn valid_github_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment != "."
-        && segment != ".."
-        && segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
-/// Validate `repo` as `owner/name` before it reaches the forge: both this
-/// surface's github-mode create and the domain-name peek pass it straight
-/// into a GitHub API path (`crates/remote/src/github/mod.rs`'s `split_repo`
-/// takes the first `/` and nothing else, and percent-encoding a segment
-/// keeps `.` unescaped), so an unchecked `repo=a/b/../../user` would reach
-/// the forge as a path GitHub itself then normalizes across a segment this
-/// request never named. Exactly one slash, and each side a single valid
-/// segment; nothing here reaches the network, so a bad `repo` is refused
-/// before either surface asks the forge anything.
+/// [`crystalline_remote::validate_repo`], mapped to this surface's 422: the
+/// validation itself is shared with the `add_domain` MCP tool and the CLI's
+/// `domain add --origin` (`crates/remote/src/github/mod.rs`), so a bad
+/// `repo` reads the same refusal wherever it is caught, and only the status
+/// mapping is this surface's own.
 fn validate_github_repo(repo: &str) -> Result<(), ApiError> {
-    let mut segments = repo.split('/');
-    match (segments.next(), segments.next(), segments.next()) {
-        (Some(owner), Some(name), None)
-            if valid_github_segment(owner) && valid_github_segment(name) =>
-        {
-            Ok(())
-        }
-        _ => Err(ApiError::unprocessable(format!(
-            "'{repo}' is not a valid repository: expected owner/name, letters, digits, '-', \
-             '_' and '.' only in each, and exactly one slash"
-        ))),
-    }
+    crystalline_remote::validate_repo(repo).map_err(|e| ApiError::unprocessable(e.to_string()))
 }
 
-/// Validate a repository-relative `path` before it reaches the forge: no
-/// leading slash (which would read as absolute once joined onto the
-/// `contents/` route) and no `..` segment (which would climb out of the
-/// subtree this surface may read).
+/// [`crystalline_remote::validate_repo_path`], mapped to this surface's 422.
 fn validate_github_path(path: &str) -> Result<(), ApiError> {
-    let bad = path.starts_with('/') || path.split('/').any(|segment| segment == "..");
-    if bad {
-        return Err(ApiError::unprocessable(format!(
-            "'{path}' is not a valid path within the repository: no leading slash and no '..' \
-             segment"
-        )));
-    }
-    Ok(())
+    crystalline_remote::validate_repo_path(path).map_err(|e| ApiError::unprocessable(e.to_string()))
 }
 
 /// What `POST /domains/{domain}/rename` takes.

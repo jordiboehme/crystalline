@@ -10,7 +10,9 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::daemon::http_router;
+use crystalline_service::engine::RenameStep;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
@@ -1744,6 +1746,177 @@ async fn a_rename_onto_a_hidden_domains_canonical_name_never_names_it() {
     assert_eq!(body["previous"], "mine");
     assert_eq!(body["shadows"], serde_json::json!([]), "{body}");
     assert!(body.get("note").is_none(), "{body}");
+}
+
+/// A name a hidden domain already holds answers the generic "'{new}' cannot
+/// be used as a name here", never "already a domain here": the specific
+/// wording would confirm a domain the caller cannot see is registered under
+/// exactly that name (N2). `scrap` is a plain file domain closed to `root`
+/// alone; `eddy`, an instance editor with no membership on it, renames his
+/// own private domain `mine` onto `scrap`'s own local name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_name_hidden_from_the_caller_answers_generically() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    fx.auth
+        .set_domain_visibility("scrap", true, "root")
+        .await
+        .unwrap();
+    fx.engine.domain_add_virtual("mine").await.unwrap();
+    fx.auth
+        .set_domain_visibility("mine", true, "eddy")
+        .await
+        .unwrap();
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/mine/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "scrap"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 409, "{text}");
+    assert!(
+        text.contains("'scrap' cannot be used as a name here"),
+        "{text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("already a domain here"),
+        "the specific wording would confirm scrap is registered here: {text}"
+    );
+}
+
+/// The leftovers refusal - state a removed domain left under the new name -
+/// names the state-directory path only for a caller who may already learn
+/// server layout (an instance admin or the machine owner); a non-admin
+/// owner of a private domain, the other caller who reaches a rename, gets a
+/// generic refusal instead (N3). Both answer 409; only the wording differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leftovers_refusal_hides_a_server_path_from_a_non_admin_but_not_from_an_admin() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // State a removed domain named `taken` would have left behind under
+    // `origins/`, the first place `refuse_leftovers` looks once the index
+    // itself holds nothing under that name.
+    std::fs::create_dir_all(fx._tmp.path().join("state/origins/taken")).unwrap();
+
+    fx.engine.domain_add_virtual("mine").await.unwrap();
+    fx.auth
+        .set_domain_visibility("mine", true, "eddy")
+        .await
+        .unwrap();
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/mine/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "taken"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 409, "{text}");
+    assert!(
+        !text.contains("origins") && !text.contains(fx._tmp.path().to_str().unwrap()),
+        "a non-admin owner learned a server path: {text}"
+    );
+
+    // The admin leg, a different domain onto the same leftover name: the
+    // refusal is the same 409, and this time the path is exactly what it
+    // is for - fixing the leftover by hand.
+    fx.engine.domain_add_virtual("second").await.unwrap();
+    let admin_resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/second/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "taken"}))
+    .send()
+    .await
+    .unwrap();
+    let admin_status = admin_resp.status();
+    let admin_text = admin_resp.text().await.unwrap();
+    assert_eq!(admin_status, 409, "{admin_text}");
+    assert!(
+        admin_text.contains("origins") && admin_text.contains("taken"),
+        "an admin should read the path this refusal is about: {admin_text}"
+    );
+}
+
+/// While one rename holds the engine's single slot, a different caller's own
+/// rename request is refused with the "still running" message; when the
+/// rename in progress touches a domain hidden from that caller, the message
+/// names neither domain, the same class of leak the taken-name refusal is
+/// guarded against, and one the review flagged as reachable through the same
+/// slot outside this diff's original fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_in_progress_on_a_hidden_domain_is_reported_without_naming_it() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // `vault`, a private virtual domain closed to `root` alone - hidden from
+    // `eddy`.
+    fx.engine.domain_add_virtual("vault").await.unwrap();
+    fx.auth
+        .set_domain_visibility("vault", true, "root")
+        .await
+        .unwrap();
+
+    // `mine`, a virtual domain `eddy` owns privately, so his own request
+    // clears every gate ahead of the one-rename slot.
+    fx.engine.domain_add_virtual("mine").await.unwrap();
+    fx.auth
+        .set_domain_visibility("mine", true, "eddy")
+        .await
+        .unwrap();
+
+    let hold = fx.engine.hold_rename_after(RenameStep::IndexRow);
+    let engine = fx.engine.clone();
+    let renamer = tokio::spawn(async move {
+        engine
+            .rename_domain("vault", "vaultnew", false, &Scope::Unrestricted)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), hold.reached())
+        .await
+        .expect("the held rename reaches its checkpoint");
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/mine/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "minenew"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 409, "{text}");
+    assert!(
+        !text.contains("vault"),
+        "a rename in flight named a domain eddy may not see: {text}"
+    );
+    assert!(text.contains("a rename is still running"), "{text}");
+
+    hold.release();
+    renamer
+        .await
+        .expect("the held rename task did not panic")
+        .expect("the held rename itself succeeds once released");
 }
 
 /// A server fixture with one virtual domain (`docs`), its `MANIFEST.md`

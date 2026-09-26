@@ -4725,6 +4725,25 @@ async fn add_domain_declaring_provisioning_announces_nothing() {
     );
 }
 
+/// `add_domain` validates a `repo` before anything reaches the engine's own
+/// url building: the same check the JSON API's team-domain create and
+/// domain-name peek use and the CLI's `domain add --origin` checks before
+/// it dispatches (`crystalline_remote::validate_repo`,
+/// crates/remote/src/github/mod.rs), so a malformed repo answers a
+/// caller-fault refusal on this surface too rather than a request that
+/// reaches `origin_add_with_progress` and a GitHub API path built from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_refuses_a_malformed_repo_before_the_engine() {
+    let h = Harness::new(&[]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({"repo": "acme/kb/../../secret"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("not a valid repository"), "{err}");
+}
+
 // --- tool schema sanitizer: advertised-shape sweep ---------------------------
 
 /// The JSON Schema `format` values these tools may advertise on purpose,

@@ -4019,6 +4019,10 @@ async fn domain_add_origin_dispatch(
         );
     }
     let (repo, subpath) = cmd::parse_origin_spec(&origin_spec)?;
+    cmd::validate_origin_repo(&repo)?;
+    if let Some(subpath) = subpath.as_deref() {
+        cmd::validate_origin_path(subpath)?;
+    }
     let folder = match path {
         Some(p) => Some(cmd::absolute_path(&p)?),
         None => None,

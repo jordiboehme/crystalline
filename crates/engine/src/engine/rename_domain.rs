@@ -130,6 +130,18 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let hidden = self.hidden_for(scope).await?;
+        // Privacy alone, never `hidden_for`'s extra "an index row this
+        // instance has no registration for" names: the still-running and
+        // unfinished-journal refusals below name a rename OTHER THAN this
+        // one, and its domain can be a genuinely registered one that reads
+        // as orphaned for exactly the moment a paused rename holds it -
+        // the index row already renamed, the configuration not yet caught
+        // up. `hidden_for`'s extra set would call that domain hidden from
+        // every caller, admin included, and swap in the generic wording
+        // for a transient sync state rather than for an actual privacy
+        // rule. Privacy is the only thing worth hiding one of a rename's
+        // own domains over.
+        let privacy_hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         let table = self.name_table_now().await;
         let old = names::localize_in(&table, old, &hidden);
         let old = old.as_str();
@@ -149,7 +161,7 @@ impl Engine {
             )));
         }
 
-        let _slot = self.take_rename_slot(old, new, local_only)?;
+        let _slot = self.take_rename_slot(old, new, local_only, &privacy_hidden)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let state_dir = self.journal_state_dir()?;
@@ -165,12 +177,22 @@ impl Engine {
                 }
                 return Ok(report);
             }
-            return Err(EngineError::Conflict(format!(
-                "the rename of '{}' to '{}' has not finished; {}, then rename again",
-                journal.old,
-                journal.new,
-                finish_hint(&journal)
-            )));
+            // A journal a crash left behind for a DIFFERENT rename: naming
+            // its domains would tell this caller about a rename of a domain
+            // it may not even see, the same class of leak as the taken-name
+            // refusal above.
+            return Err(EngineError::Conflict(
+                if privacy_hidden.contains(&journal.old) || privacy_hidden.contains(&journal.new) {
+                    "a rename is still finishing; try again in a moment".to_string()
+                } else {
+                    format!(
+                        "the rename of '{}' to '{}' has not finished; {}, then rename again",
+                        journal.old,
+                        journal.new,
+                        finish_hint(&journal)
+                    )
+                },
+            ));
         }
 
         let entry = self.domain_entry(old)?;
@@ -334,7 +356,15 @@ impl Engine {
         let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? else {
             return Ok(None);
         };
-        let _slot = self.take_rename_slot(&journal.old, &journal.new, journal.local_only)?;
+        // No caller to protect here - this runs before the daemon serves
+        // anyone - so nothing is hidden and a refusal (there is no live
+        // caller to read one) would carry the full detail regardless.
+        let _slot = self.take_rename_slot(
+            &journal.old,
+            &journal.new,
+            journal.local_only,
+            &HashSet::new(),
+        )?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let _origins = self.lock_both_origins(&journal.old, &journal.new).await;
@@ -1101,14 +1131,31 @@ impl Engine {
     }
 
     /// Take the one-rename slot, or say which rename holds it.
-    fn take_rename_slot(&self, old: &str, new: &str, local_only: bool) -> Result<RenameSlot<'_>> {
+    ///
+    /// `hidden` is this caller's hidden set (empty for the crash-recovery
+    /// callers, which have no caller to protect against): a rename already
+    /// running names its two domains in the refusal only when neither is
+    /// hidden from `hidden`, for the same reason the taken-name refusal
+    /// above does not name a hidden holder.
+    fn take_rename_slot(
+        &self,
+        old: &str,
+        new: &str,
+        local_only: bool,
+        hidden: &HashSet<String>,
+    ) -> Result<RenameSlot<'_>> {
         let mut slot = self.rename_slot.lock().unwrap();
         if let Some((running, to, local)) = slot.as_ref() {
-            return Err(EngineError::Conflict(format!(
-                "the rename of '{running}' to '{to}' is still running; try again once it is \
-                 done. If it stops before it is done, {}",
-                finish_hint_for(running, to, *local)
-            )));
+            let message = if hidden.contains(running) || hidden.contains(to) {
+                "a rename is still running; try again once it is done".to_string()
+            } else {
+                format!(
+                    "the rename of '{running}' to '{to}' is still running; try again once it is \
+                     done. If it stops before it is done, {}",
+                    finish_hint_for(running, to, *local)
+                )
+            };
+            return Err(EngineError::Conflict(message));
         }
         *slot = Some((old.to_string(), new.to_string(), local_only));
         Ok(RenameSlot {
