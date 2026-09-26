@@ -106,12 +106,48 @@ pub(crate) struct RenameJournal {
     /// so Relink, Config and recovery read the spellings from here, never
     /// from the table.
     pub old_spellings: Vec<String>,
-    /// The name the domain's MANIFEST declared before step one, if any: what
-    /// the Config step records as the canonical name last seen.
+    /// The old spellings that reached this domain through the name table
+    /// before step one: the ones the relink step respells. A declared name
+    /// another domain's local name shadows, a contested one and an alias the
+    /// table dropped name some other domain or none, and links spelled with
+    /// them are not this domain's to rewrite.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relink_spellings: Vec<String>,
+    /// The name the domain's MANIFEST declares once the rename is done, if
+    /// any: what the Config step records as the canonical name last seen. The
+    /// name it declared before step one for a rename of this machine's name
+    /// only, and `new` for a full rename whose MANIFEST write lands in the
+    /// folder or the database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical: Option<String>,
+    /// Who asked for a full rename, `None` for the machine owner. The
+    /// MANIFEST and relink steps write as this caller, so a review-mode
+    /// domain takes the edit into this caller's draft, also when the rename
+    /// is finished after a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<RenameCaller>,
+    /// The domains the caller could write when the rename started, sorted:
+    /// the relink step respells links in these and lists the ones it finds
+    /// anywhere else. Kept here because a daemon finishing the rename at
+    /// startup has no way to ask what the caller may write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
+    /// Whether the MANIFEST step writes into the caller's draft (the domain
+    /// reviews changes) rather than into the folder or the database.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manifest_draft: bool,
     /// The steps completed so far, in order.
     pub done: Vec<RenameStep>,
+}
+
+/// The signed-in account a full rename acts for, as the journal keeps it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RenameCaller {
+    /// The login name.
+    pub account: String,
+    /// Whether that account held the instance admin role.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 impl RenameJournal {

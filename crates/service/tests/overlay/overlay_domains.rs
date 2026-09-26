@@ -7541,3 +7541,35 @@ async fn a_draft_manifest_edit_reports_the_dropped_heading_and_the_findings() {
         MANIFEST
     );
 }
+
+/// A full rename of a reviewing domain writes the new `domain_name` into the
+/// renaming actor's draft of the MANIFEST, which counts as written: the
+/// report says it is a draft, the rename goes on, and the folder still says
+/// what the team reviewed.
+#[tokio::test]
+async fn a_full_rename_of_a_reviewing_domain_writes_the_manifest_as_a_draft() {
+    let f = review_fixture().await;
+    let report = f
+        .engine
+        .rename_domain("team", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["domain"], "platform", "{report}");
+    assert_eq!(report["manifest_written"], true, "{report}");
+    assert_eq!(report["manifest_draft"], true, "{report}");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("team/MANIFEST.md")).unwrap(),
+        MANIFEST,
+        "the folder is untouched"
+    );
+    let held = f.held("platform", "owner").await;
+    let draft = held
+        .iter()
+        .find(|(path, _, _)| path == "MANIFEST.md")
+        .unwrap_or_else(|| panic!("the owner holds a MANIFEST draft: {held:?}"));
+    assert!(draft.1.contains("domain_name: platform"), "{}", draft.1);
+    let cfg: GlobalConfig =
+        crystalline_core::config::load_yaml(&f.root.join("config.yaml")).unwrap();
+    assert!(cfg.domains.contains_key("platform"), "{:?}", cfg.domains);
+    assert!(!cfg.domains.contains_key("team"));
+}

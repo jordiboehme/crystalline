@@ -6,7 +6,9 @@
 use crystalline_core::manifest::domain_name_at;
 
 use super::*;
-use crate::rename::{RENAME_WAIT, RenameJournal, RenameStep, WriteTicket, move_state_dir};
+use crate::rename::{
+    RENAME_WAIT, RenameCaller, RenameJournal, RenameStep, WriteTicket, move_state_dir,
+};
 
 /// Frees the one-rename slot when the rename that took it ends, however it
 /// ends.
@@ -20,7 +22,50 @@ impl Drop for RenameSlot<'_> {
     }
 }
 
+/// What the MANIFEST and relink steps of a full rename did in this run, for
+/// the report.
+#[derive(Default)]
+struct RenameOutcome {
+    /// Per domain, in name order: the engrams rewritten and the references
+    /// respelled in them.
+    rewritten: BTreeMap<String, (usize, usize)>,
+    /// The links the relink step found and did not respell.
+    left_behind: Vec<Value>,
+}
+
 impl Engine {
+    /// Rename a domain everywhere: the MANIFEST's `domain_name`, this
+    /// machine's name (recorded as chosen), and every link that spells any
+    /// former name (the local name, the canonical name, every alias) in the
+    /// domains this caller can write. A team domain takes the rewrites as
+    /// local changes for its next share, a reviewing domain as the caller's
+    /// drafts, the MANIFEST included; no proposal is opened. Links in domains
+    /// the caller can only read are left as they are and listed under
+    /// `left_behind`; every former name stays an alias here, so they keep
+    /// resolving on this machine.
+    ///
+    /// `local_only` is [`Engine::rename_domain_local`] with the name recorded
+    /// as chosen: MANIFEST and content untouched.
+    ///
+    /// Refused before any step for everything the local rename refuses, and
+    /// when the MANIFEST cannot be written here, which names `--local`.
+    ///
+    /// The report: `{ domain, previous, local_only, manifest_written,
+    /// manifest_draft, rewritten: [{domain, engrams, references}],
+    /// left_behind: [{domain, path, references}], aliases, shadows, moved }`,
+    /// plus a `note` when something is shadowed. A local rename answers the
+    /// same shape, with nothing written and nothing rewritten.
+    pub async fn rename_domain(
+        &self,
+        domain: &str,
+        new: &str,
+        local_only: bool,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.rename_domain_as(domain, new, NameOrigin::Explicit, local_only, scope)
+            .await
+    }
+
     /// Rename a domain on this machine only: its local name, and every store
     /// keyed by it (the index row, the visibility records, the `origins/` and
     /// `overlays/` state folders, the provision receipt and the
@@ -43,13 +88,24 @@ impl Engine {
     /// or keeps as an alias is allowed; the report names that domain under
     /// `shadows`.
     ///
-    /// The report: `{ domain, previous, local_only, aliases, moved,
-    /// shadows }`, plus a `note` when something is shadowed.
+    /// The report is [`Engine::rename_domain`]'s.
     pub async fn rename_domain_local(
         &self,
         old: &str,
         new: &str,
         origin: NameOrigin,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.rename_domain_as(old, new, origin, true, scope).await
+    }
+
+    /// The one rename both entry points reach.
+    async fn rename_domain_as(
+        &self,
+        old: &str,
+        new: &str,
+        origin: NameOrigin,
+        local_only: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if self.read_only {
@@ -81,10 +137,15 @@ impl Engine {
         let state_dir = self.journal_state_dir()?;
         if let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? {
             // The same rename a crash stopped: finish it rather than refuse.
-            if journal.old == old && journal.new == new {
+            // The pause starts where `finish_rename` needs it.
+            if journal.old == old && journal.new == new && journal.local_only == local_only {
                 let _origins = self.lock_both_origins(old, new).await;
-                self.rename_pause.pause(&[old, new]);
-                return self.finish_rename(journal, &state_dir, true).await;
+                self.close_editors(old).await;
+                let mut report = self.finish_rename(journal, &state_dir, true).await?;
+                if let Value::Object(map) = &mut report {
+                    map.entry("shadows").or_insert_with(|| json!([]));
+                }
+                return Ok(report);
             }
             return Err(EngineError::Conflict(format!(
                 "a rename of '{}' is still finishing; try again in a moment",
@@ -98,6 +159,11 @@ impl Engine {
                 "'{new}' is already a domain here; pick another name or rename that domain first"
             )));
         }
+        let manifest_draft = if local_only {
+            false
+        } else {
+            self.refuse_unwritable_manifest(old, new).await?
+        };
         self.refuse_shared_index(old).await?;
         self.refuse_leftovers(new, &state_dir).await?;
 
@@ -128,6 +194,20 @@ impl Engine {
         old_spellings.extend(canonical.iter().cloned());
         old_spellings.extend(entry.aliases.iter().cloned());
         let old_spellings = distinct_without(old_spellings, new);
+        // Only a spelling that reaches this domain today is this domain's to
+        // respell: a declared name another local name shadows, a contested
+        // one or an alias the table dropped belongs to some other domain or
+        // to none.
+        let (relink_spellings, writable) = if local_only {
+            (Vec::new(), Vec::new())
+        } else {
+            let reaching: Vec<String> = old_spellings
+                .iter()
+                .filter(|s| table.resolve(s) == Some(old))
+                .cloned()
+                .collect();
+            (reaching, self.writable_domains(scope).await?)
+        };
 
         // Rooms save their last text while the domain is still registered
         // under its old name, and a join names the domain it was opened in.
@@ -135,17 +215,17 @@ impl Engine {
         // room's last save is a write into the domain, and once the domain is
         // paused that write would wait on the very rename that is waiting for
         // it. So a rename the drain then refuses has already closed the
-        // editors, and its refusal says so.
-        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
-            Some(sessions) => sessions.dispose_domain(old).await,
-            None => 0,
-        };
-        let joins_ended = self.joins.end_domain(old);
+        // editors, and its refusal says so. A full rename closes them before
+        // its MANIFEST and relink steps too, so those edits reach the file
+        // rather than a room that is about to close.
+        let closed_editors = self.close_editors(old).await;
 
-        self.rename_pause.pause(&[old, new]);
-        if !self.rename_pause.drained(old, RENAME_WAIT).await {
-            self.rename_pause.resume(&[old, new]);
-            let closed = if rooms_closed + joins_ended > 0 {
+        // A rename of this machine's name only pauses before its journal, so
+        // a busy domain refuses with nothing started. A full rename pauses
+        // after its MANIFEST and relink steps, which write into the domain
+        // like any other edit and would otherwise wait on its own pause.
+        if local_only && !self.pause_and_drain(old, new).await {
+            let closed = if closed_editors {
                 " Its open editors were closed and reopen on the next edit."
             } else {
                 ""
@@ -159,10 +239,20 @@ impl Engine {
             version: 1,
             old: old.to_string(),
             new: new.to_string(),
-            local_only: true,
+            local_only,
             origin,
             old_spellings,
-            canonical,
+            relink_spellings,
+            // What the MANIFEST says once the rename is done: the new name,
+            // unless the write is a draft the folder does not carry yet.
+            canonical: if local_only || manifest_draft {
+                canonical
+            } else {
+                Some(new.to_string())
+            },
+            caller: rename_caller(scope),
+            writable,
+            manifest_draft,
             done: Vec::new(),
         };
         if let Err(e) = journal.save(&state_dir) {
@@ -207,7 +297,9 @@ impl Engine {
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let _origins = self.lock_both_origins(&journal.old, &journal.new).await;
-        self.rename_pause.pause(&[&journal.old, &journal.new]);
+        // No pause here: `finish_rename` pauses the domain before the first
+        // step that moves it, after the MANIFEST and relink steps a full
+        // rename may still owe.
         tracing::info!(
             "finishing the rename of domain '{}' to '{}' that an earlier run left half done",
             journal.old,
@@ -236,8 +328,9 @@ impl Engine {
             Ok(None) => {}
             Err(err) => tracing::error!(
                 "a domain rename an earlier run left half done could not be finished ({err}); \
-                 that domain stays paused until the next start: every read of it waits 30 s \
-                 before it is answered, and every write to it is refused"
+                 the next start tries again. If it stopped after its MANIFEST and link steps, \
+                 that domain stays paused until then: every read of it waits 30 s before it is \
+                 answered, and every write to it is refused"
             ),
         }
     }
@@ -371,19 +464,39 @@ impl Engine {
     ) -> Result<Value> {
         let (old, new) = (journal.old.clone(), journal.new.clone());
         let mut moved: Vec<&'static str> = Vec::new();
+        let mut outcome = RenameOutcome::default();
         for &step in journal.steps() {
+            let moves = !matches!(step, RenameStep::Manifest | RenameStep::Relink);
+            // The domain is paused before the first step that moves it, and
+            // not before: the MANIFEST and relink steps of a full rename
+            // write into the domain like any edit, and would wait on the
+            // pause. A rename that paused earlier (every local one) or a
+            // domain a stopped rename left paused goes straight on.
+            if moves
+                && !self.rename_pause.is_paused(&old)
+                && !self.pause_and_drain(&old, &new).await
+            {
+                return Err(EngineError::Conflict(format!(
+                    "domain '{old}' is busy with a write that has not finished, so the rename to \
+                     '{new}' is waiting after its MANIFEST and link steps; send the same rename \
+                     again in a moment to finish it (the next daemon start also finishes it)"
+                )));
+            }
             if !journal.done.contains(&step) {
                 // From the index row step until the configuration is written,
                 // no spelling push; the MANIFEST and relink steps of a full
                 // rename come before that window.
-                if !matches!(step, RenameStep::Manifest | RenameStep::Relink) {
+                if moves {
                     self.names_frozen
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 if step == RenameStep::Config {
                     self.rekey_in_memory(&old, &new);
                 }
-                if let Err(e) = self.run_rename_step(step, &journal, state_dir).await {
+                if let Err(e) = self
+                    .run_rename_step(step, &journal, state_dir, &mut outcome)
+                    .await
+                {
                     return Err(self.rename_stopped(&journal, step, e));
                 }
                 journal.done.push(step);
@@ -428,13 +541,273 @@ impl Engine {
                 "the sync after renaming '{old}' to '{new}' failed; the next sync catches up"
             );
         }
+        let rewritten: Vec<Value> = outcome
+            .rewritten
+            .iter()
+            .map(|(domain, (engrams, references))| {
+                json!({ "domain": domain, "engrams": engrams, "references": references })
+            })
+            .collect();
         Ok(json!({
             "domain": new,
             "previous": old,
             "local_only": journal.local_only,
+            "manifest_written": journal.done.contains(&RenameStep::Manifest),
+            "manifest_draft": journal.manifest_draft,
+            "rewritten": rewritten,
+            "left_behind": outcome.left_behind,
             "aliases": entry.aliases,
             "moved": moved,
         }))
+    }
+
+    /// Pause `old` and `new` and wait for the writes already running in
+    /// `old` to finish. False, with the pause lifted again, when they do not
+    /// finish in time.
+    async fn pause_and_drain(&self, old: &str, new: &str) -> bool {
+        self.rename_pause.pause(&[old, new]);
+        if self.rename_pause.drained(old, RENAME_WAIT).await {
+            return true;
+        }
+        self.rename_pause.resume(&[old, new]);
+        false
+    }
+
+    /// Close every co-editing room and end every join in `old`; each room
+    /// saves its last text first. Whether there was anything to close.
+    async fn close_editors(&self, old: &str) -> bool {
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(old).await,
+            None => 0,
+        };
+        let joins_ended = self.joins.end_domain(old);
+        rooms_closed + joins_ended > 0
+    }
+
+    /// The MANIFEST step: `domain_name: <new>` into the domain's MANIFEST,
+    /// through the same edit path a policy change takes, so a team domain
+    /// records a local change and a reviewing domain the caller's draft.
+    /// Setting the key to the value it already has changes nothing, so the
+    /// step is safe to run twice.
+    async fn rename_manifest(&self, journal: &RenameJournal) -> Result<()> {
+        let scope = caller_scope(journal.caller.as_ref());
+        let virtual_domain = {
+            let view = DomainView::for_write(self, &journal.old, &scope).await?;
+            let overlay = view.actor().map(str::to_string);
+            let actor = self.actor_for(None, overlay.as_deref());
+            let (desc, source) = view.resolve("manifest").await?;
+            let new = journal.new.clone();
+            self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
+                Ok(set_frontmatter_field(current, DOMAIN_NAME_KEY, &new))
+            })
+            .await?;
+            matches!(source, ContentSource::Virtual) && overlay.is_none()
+        };
+        // A virtual domain's declared name is cached from its MANIFEST row;
+        // the cache has to carry the new one before the config step re-keys
+        // it.
+        if virtual_domain {
+            self.refresh_routing_cache().await;
+        }
+        Ok(())
+    }
+
+    /// The relink step: every engram that spells one of the old names that
+    /// reached this domain (the journal's `relink_spellings`) as a link's
+    /// domain or in a `crystalline://` URL. In a domain the caller
+    /// could write when the rename started, the spellings become the new
+    /// name, through the ordinary edit path (a local change in a team domain,
+    /// the caller's draft in a reviewing one). Anywhere the caller can see
+    /// but not write, the engram is listed and left alone; a domain the
+    /// caller cannot see is passed over without a word. A rewrite that fails
+    /// is listed with its reason rather than stopping the rename, which
+    /// could otherwise never finish. An engram already rewritten spells none
+    /// of the old names, so the step is safe to run twice.
+    async fn rename_relink(
+        &self,
+        journal: &RenameJournal,
+        outcome: &mut RenameOutcome,
+    ) -> Result<()> {
+        let scope = caller_scope(journal.caller.as_ref());
+        let spellings = journal.relink_spellings.as_slice();
+        if spellings.is_empty() {
+            return Ok(());
+        }
+        let found = {
+            let store = self.store.lock().await;
+            store.engrams_referencing_domains(spellings).await?
+        };
+        if found.is_empty() {
+            return Ok(());
+        }
+        let hidden = self.hidden_for(&scope).await?;
+        let new = journal.new.as_str();
+        for (domain, path) in found {
+            if hidden.contains(&domain) {
+                continue;
+            }
+            if journal.writable.binary_search(&domain).is_err() {
+                let references = match self.base_text(&domain, &path).await {
+                    Ok(Some((_, _, text))) => respell_old(&text, spellings, new).1,
+                    _ => 0,
+                };
+                if references > 0 {
+                    outcome
+                        .left_behind
+                        .push(json!({ "domain": domain, "path": path, "references": references }));
+                }
+                continue;
+            }
+            match self
+                .relink_one(&domain, &path, &scope, spellings, new)
+                .await
+            {
+                Ok(0) => {}
+                Ok(references) => {
+                    let counts = outcome.rewritten.entry(domain).or_default();
+                    counts.0 += 1;
+                    counts.1 += references;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        domain = domain.as_str(),
+                        path = path.as_str(),
+                        "the rename to '{new}' could not respell the links in this engram: {e}"
+                    );
+                    let references = match self.base_text(&domain, &path).await {
+                        Ok(Some((_, _, text))) => respell_old(&text, spellings, new).1,
+                        _ => 0,
+                    };
+                    outcome.left_behind.push(json!({
+                        "domain": domain,
+                        "path": path,
+                        "references": references,
+                        "reason": e.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Respell one engram's links for the relink step, answering how many
+    /// changed. The count is taken on the text this caller's write would
+    /// change (their draft in a reviewing domain, else the domain's own), and
+    /// nothing is written when it is zero.
+    async fn relink_one(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+        spellings: &[String],
+        new: &str,
+    ) -> Result<usize> {
+        let view = DomainView::for_write(self, domain, scope).await?;
+        let Some(desc) = self.descriptor_at(domain, path).await? else {
+            return Ok(0);
+        };
+        let source = self.content_source(domain)?;
+        let Some(text) = view.text_at(&source, &desc).await? else {
+            return Ok(0);
+        };
+        let references = respell_old(&text, spellings, new).1;
+        if references == 0 {
+            return Ok(0);
+        }
+        let actor = self.actor_for(None, view.actor());
+        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
+            Ok(respell_old(current, spellings, new).0)
+        })
+        .await?;
+        Ok(references)
+    }
+
+    /// The base row at `path` in `domain`, if the index holds one.
+    async fn descriptor_at(&self, domain: &str, path: &str) -> Result<Option<EngramDescriptor>> {
+        let store = self.store.lock().await;
+        Ok(store
+            .list_engrams(domain, Some(path), None)
+            .await?
+            .into_iter()
+            .find(|found| found.path == path))
+    }
+
+    /// The domain's own text at `path` (never a draft), with its descriptor
+    /// and source, or `None` when nothing stands there.
+    async fn base_text(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<(EngramDescriptor, ContentSource, String)>> {
+        let Some(desc) = self.descriptor_at(domain, path).await? else {
+            return Ok(None);
+        };
+        let source = self.content_source(domain)?;
+        let text = self.load_content(&source, &desc).await?;
+        Ok(Some((desc, source, text)))
+    }
+
+    /// Refuse a full rename whose MANIFEST cannot be written here, before any
+    /// step, naming `--local`. A reviewing domain takes the write as the
+    /// caller's draft, which counts as written: answers whether that is the
+    /// case. A file domain is asked by writing and removing a file beside
+    /// its MANIFEST, since permission bits do not say who may write.
+    async fn refuse_unwritable_manifest(&self, old: &str, new: &str) -> Result<bool> {
+        let refusal = |why: String| {
+            EngineError::Invalid(format!(
+                "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
+                 {new} --local` or pick This machine only in Rename on the domain page, which \
+                 leaves the MANIFEST and the links as they are"
+            ))
+        };
+        if self.reviews_changes(old) {
+            return Ok(true);
+        }
+        let (desc, source) = match self.resolve_in("manifest", old).await {
+            Ok(found) => found,
+            Err(EngineError::NotFound(_)) => {
+                return Err(refusal(format!(
+                    "domain '{old}' has no MANIFEST to write the new name into"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if let ContentSource::File { root } = &source {
+            let abs = join_rel(root, &desc.path);
+            let name = abs
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let probe = abs.with_file_name(format!("{name}.tmp.{}.probe", std::process::id()));
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    return Err(refusal(format!(
+                        "the MANIFEST of domain '{old}' cannot be written here ({}: {e})",
+                        abs.display()
+                    )));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every registered domain `scope` may see and write, sorted.
+    async fn writable_domains(&self, scope: &crate::scope::Scope) -> Result<Vec<String>> {
+        let hidden = self.hidden_for(scope).await?;
+        let mut writable = Vec::new();
+        for name in self.registered_domain_entries_now().await.keys() {
+            if hidden.contains(name) {
+                continue;
+            }
+            if self.write_right(scope, name).await? >= crate::scope::DomainRight::Write {
+                writable.push(name.clone());
+            }
+        }
+        writable.sort();
+        Ok(writable)
     }
 
     /// A step failed: the journal stays and the domain stays paused, since
@@ -504,9 +877,12 @@ impl Engine {
         step: RenameStep,
         journal: &RenameJournal,
         state_dir: &Path,
+        outcome: &mut RenameOutcome,
     ) -> Result<()> {
         let (old, new) = (journal.old.as_str(), journal.new.as_str());
         match step {
+            RenameStep::Manifest => self.rename_manifest(journal).await?,
+            RenameStep::Relink => self.rename_relink(journal, outcome).await?,
             RenameStep::IndexRow => {
                 let store = self.store.lock().await;
                 store.rename_domain_row(old, new).await?;
@@ -542,13 +918,6 @@ impl Engine {
                 }
             }
             RenameStep::Config => self.rename_config(journal)?,
-            RenameStep::Manifest | RenameStep::Relink => {
-                return Err(EngineError::Internal(format!(
-                    "this version cannot finish the {} step of a rename; run the version that \
-                     started it",
-                    step.name()
-                )));
-            }
         }
         Ok(())
     }
@@ -786,6 +1155,40 @@ fn renaming_conflict(name: String) -> EngineError {
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::Internal(e.to_string())
+}
+
+/// The caller a full rename's journal keeps: `None` for the machine owner.
+fn rename_caller(scope: &crate::scope::Scope) -> Option<RenameCaller> {
+    match scope {
+        crate::scope::Scope::User { account, admin } => Some(RenameCaller {
+            account: account.clone(),
+            admin: *admin,
+        }),
+        // Anonymous never owns a domain, so it never reaches a rename.
+        crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => None,
+    }
+}
+
+/// The scope the journal's caller stands for.
+fn caller_scope(caller: Option<&RenameCaller>) -> crate::scope::Scope {
+    match caller {
+        Some(caller) => crate::scope::Scope::User {
+            account: caller.account.clone(),
+            admin: caller.admin,
+        },
+        None => crate::scope::Scope::Unrestricted,
+    }
+}
+
+/// `text` with every link domain and `crystalline://` domain that is one of
+/// `spellings` respelled as `new`, and how many were.
+fn respell_old(text: &str, spellings: &[String], new: &str) -> (String, usize) {
+    crystalline_core::relink::respell_domains(text, &|domain: &str| {
+        spellings
+            .iter()
+            .any(|s| s == domain)
+            .then(|| new.to_string())
+    })
 }
 
 /// `names` in their first order, each once, without `new`.

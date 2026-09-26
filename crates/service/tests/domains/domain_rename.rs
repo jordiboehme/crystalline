@@ -18,7 +18,7 @@ use crystalline_index::{Store, TursoStore};
 use crystalline_service::engine::{Engine, EngineError, RenameStep};
 use crystalline_service::overlay::EnvOverlay;
 use crystalline_service::params::*;
-use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::rest::{AuthStore, MemberLevel, Role};
 use crystalline_service::{DomainAccess, Scope};
 use tokio::sync::Mutex;
 
@@ -994,3 +994,675 @@ both_backends!(
     stale_records_under_the_new_name_are_forgotten,
     stale_records_under_the_new_name_are_forgotten_body
 );
+
+// --- the full rename: MANIFEST, relink, report ---------------------------------
+
+/// A MANIFEST that declares `domain_name: <name>`.
+fn manifest_named(title: &str, name: &str) -> String {
+    manifest(title).replacen(
+        "status: current\n",
+        &format!("status: current\ndomain_name: {name}\n"),
+        1,
+    )
+}
+
+/// The full-rename machine: [`machine_tagged`], with `eng` declaring
+/// `domain_name: eng-team` and keeping the alias `engineering` here, three
+/// engrams `a`, `b` and `c` in it, and `ops`'s pager linking to each under a
+/// different spelling: the local name, the canonical name and the alias.
+struct Full {
+    m: Machine,
+    canonical: String,
+    alias: String,
+}
+
+async fn full_machine(store: Arc<Mutex<dyn Store>>, tag: &str) -> Full {
+    let m = machine_tagged(store, tag).await;
+    let (canonical, alias) = (format!("eng-team{tag}"), format!("engineering{tag}"));
+    std::fs::write(
+        m.root.join("eng/MANIFEST.md"),
+        manifest_named("Eng", &canonical),
+    )
+    .unwrap();
+    for t in ["a", "b", "c"] {
+        std::fs::write(
+            m.root.join(format!("eng/{t}.md")),
+            engram(&t.to_uppercase(), t, "an engineering note"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        m.root.join("ops/pager.md"),
+        engram(
+            "Pager",
+            "pager",
+            &format!(
+                "See [[{}:a]], then [[{canonical}:b]], then crystalline://{alias}/c before paging.",
+                m.eng
+            ),
+        ),
+    )
+    .unwrap();
+    let mut cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    cfg.domains.get_mut(&m.eng).unwrap().aliases = vec![alias.clone()];
+    crystalline_core::config::save_yaml(&m.config_path(), &cfg).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    Full {
+        m,
+        canonical,
+        alias,
+    }
+}
+
+fn sorted(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names
+}
+
+/// Everything a finished full rename of `eng` to `platform` leaves behind.
+async fn assert_fully_renamed(f: &Full, engine: &Engine) {
+    let m = &f.m;
+    let manifest_text = std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap();
+    assert!(
+        manifest_text.contains(&format!("domain_name: {}\n", m.platform)),
+        "{manifest_text}"
+    );
+    assert!(!manifest_text.contains(&f.canonical), "{manifest_text}");
+
+    let pager = std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap();
+    for rewritten in [
+        format!("[[{}:a]]", m.platform),
+        format!("[[{}:b]]", m.platform),
+        format!("crystalline://{}/c", m.platform),
+    ] {
+        assert!(pager.contains(&rewritten), "{rewritten} in {pager}");
+    }
+    for old in [&m.eng, &f.canonical, &f.alias] {
+        assert!(
+            !pager.contains(&format!("[[{old}:")) && !pager.contains(&format!("//{old}/")),
+            "no {old} left in {pager}"
+        );
+    }
+
+    let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    assert!(
+        !cfg.domains.contains_key(&m.eng),
+        "{:?}",
+        cfg.domains.keys()
+    );
+    let entry = cfg.domains.get(&m.platform).expect("platform registered");
+    assert_eq!(entry.name_origin, Some(NameOrigin::Explicit));
+    assert_eq!(
+        sorted(entry.aliases.clone()),
+        sorted(vec![m.eng.clone(), f.canonical.clone(), f.alias.clone()]),
+        "the old local name, the previous canonical and the alias"
+    );
+    assert!(!m.journal().exists(), "the journal is gone");
+    assert!(!engine.is_renaming(&m.eng) && !engine.is_renaming(&m.platform));
+
+    // The rewritten links reach the renamed domain.
+    let read = engine
+        .read_engram(&read_params("pager", &m.ops), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let links = read["links"].as_array().unwrap();
+    assert!(!links.is_empty(), "{read}");
+    for link in links {
+        assert_eq!(link["target"]["domain"], m.platform, "{read}");
+        assert_eq!(link["resolved"], true, "{read}");
+    }
+    // Every old spelling still reaches the domain.
+    for old in [&m.eng, &f.canonical, &f.alias] {
+        assert_eq!(
+            engine.local_domain_name(old).await.as_deref(),
+            Some(m.platform.as_str()),
+            "{old}"
+        );
+    }
+}
+
+async fn a_full_rename_rewrites_links_in_every_writable_domain_body(store: Arc<Mutex<dyn Store>>) {
+    let f = full_machine(store, "").await;
+    let engine = f.m.engine(true).await;
+
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["domain"], "platform", "{report}");
+    assert_eq!(report["previous"], "eng", "{report}");
+    assert_eq!(report["local_only"], false, "{report}");
+    assert_eq!(report["manifest_written"], true, "{report}");
+    assert_eq!(report["manifest_draft"], false, "{report}");
+    assert_eq!(
+        report["rewritten"],
+        serde_json::json!([{ "domain": "ops", "engrams": 1, "references": 3 }]),
+        "{report}"
+    );
+    assert_eq!(report["left_behind"], serde_json::json!([]), "{report}");
+    assert_eq!(report["shadows"], serde_json::json!([]), "{report}");
+    let aliases: Vec<String> = serde_json::from_value(report["aliases"].clone()).unwrap();
+    assert_eq!(
+        sorted(aliases),
+        sorted(vec![
+            "eng".to_string(),
+            "eng-team".to_string(),
+            "engineering".to_string()
+        ]),
+        "{report}"
+    );
+
+    assert_fully_renamed(&f, &engine).await;
+
+    // A restart finds nothing to finish, and a sync changes nothing.
+    let restarted = f.m.engine(false).await;
+    assert!(restarted.recover_rename_journal().await.unwrap().is_none());
+    restarted.sync(None).await.unwrap();
+    assert_fully_renamed(&f, &restarted).await;
+}
+both_backends!(
+    a_full_rename_rewrites_links_in_every_writable_domain,
+    a_full_rename_rewrites_links_in_every_writable_domain_body
+);
+
+/// `--local` through the same entry point: the MANIFEST and the content stay
+/// as they are, and the report has the full rename's shape.
+async fn a_local_rename_through_rename_domain_leaves_manifest_and_links_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let f = full_machine(store, "").await;
+    let engine = f.m.engine(true).await;
+    let manifest_before = std::fs::read_to_string(f.m.root.join("eng/MANIFEST.md")).unwrap();
+    let pager_before = std::fs::read_to_string(f.m.root.join("ops/pager.md")).unwrap();
+
+    let report = engine
+        .rename_domain("eng", "platform", true, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["local_only"], true, "{report}");
+    assert_eq!(report["manifest_written"], false, "{report}");
+    assert_eq!(report["manifest_draft"], false, "{report}");
+    assert_eq!(report["rewritten"], serde_json::json!([]), "{report}");
+    assert_eq!(report["left_behind"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(f.m.root.join("eng/MANIFEST.md")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.m.root.join("ops/pager.md")).unwrap(),
+        pager_before
+    );
+    let cfg = crystalline_service::overlay::load_file(&f.m.config_path()).unwrap();
+    assert_eq!(
+        cfg.domains.get("platform").unwrap().name_origin,
+        Some(NameOrigin::Explicit)
+    );
+}
+both_backends!(
+    a_local_rename_through_rename_domain_leaves_manifest_and_links,
+    a_local_rename_through_rename_domain_leaves_manifest_and_links_body
+);
+
+/// Two private domains of bob's beside the full-rename machine, `archive`
+/// (ada is a viewer) and `vault` (ada cannot see it), each with an `old.md`
+/// linking to `eng` by its canonical name. Answers that engram's text.
+async fn add_archive_and_vault(f: &Full) -> String {
+    let m = &f.m;
+    let old_link = engram(
+        "Old",
+        "old",
+        &format!("The old runbook was [[{}:a]].", f.canonical),
+    );
+    let mut cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    for name in ["archive", "vault"] {
+        let dir = m.root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MANIFEST.md"), manifest(name)).unwrap();
+        std::fs::write(dir.join("old.md"), &old_link).unwrap();
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::file(dir.clone()));
+    }
+    crystalline_core::config::save_yaml(&m.config_path(), &cfg).unwrap();
+    let auth = AuthStore::open(&m.state().join("web-auth.db"))
+        .await
+        .unwrap();
+    auth.add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    for name in ["archive", "vault"] {
+        auth.set_domain_visibility(name, true, "bob").await.unwrap();
+    }
+    auth.upsert_domain_member("archive", "ada", MemberLevel::Viewer, "bob")
+        .await
+        .unwrap();
+    m.engine(true).await.sync(None).await.unwrap();
+    old_link
+}
+
+fn ada() -> Scope {
+    Scope::User {
+        account: "ada".into(),
+        admin: false,
+    }
+}
+
+/// A caller who owns `eng`, writes `ops`, only reads `archive` and cannot see
+/// `vault`: `ops` is rewritten, `archive`'s link is left as it is and listed,
+/// and `vault` is named nowhere. The link left behind still resolves, through
+/// the previous canonical name the rename kept as an alias.
+async fn a_link_in_a_read_only_domain_is_left_behind_and_listed_body(store: Arc<Mutex<dyn Store>>) {
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    let old_link = add_archive_and_vault(&f).await;
+    let engine = m.engine(true).await;
+
+    let report = engine
+        .rename_domain("eng", "platform", false, &ada())
+        .await
+        .unwrap();
+    assert_eq!(
+        report["rewritten"],
+        serde_json::json!([{ "domain": "ops", "engrams": 1, "references": 3 }]),
+        "{report}"
+    );
+    assert_eq!(
+        report["left_behind"],
+        serde_json::json!([{ "domain": "archive", "path": "old.md", "references": 1 }]),
+        "{report}"
+    );
+    assert!(!report.to_string().contains("vault"), "{report}");
+    for name in ["archive", "vault"] {
+        assert_eq!(
+            std::fs::read_to_string(m.root.join(name).join("old.md")).unwrap(),
+            old_link,
+            "{name} is untouched"
+        );
+    }
+    let pager = std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap();
+    assert!(pager.contains("[[platform:a]]"), "{pager}");
+    let old = engine
+        .read_engram(&read_params("old", "archive"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let links = old["links"].as_array().unwrap();
+    assert_eq!(links.len(), 1, "{old}");
+    assert_eq!(links[0]["resolved"], true, "{old}");
+}
+both_backends!(
+    a_link_in_a_read_only_domain_is_left_behind_and_listed,
+    a_link_in_a_read_only_domain_is_left_behind_and_listed_body
+);
+
+/// A rename a crash stopped after its MANIFEST step is finished at startup,
+/// where no accounts resolver is installed and every domain would read as
+/// writable: the relink still respells only where the caller could write.
+async fn a_recovered_relink_writes_only_where_the_caller_could_body(store: Arc<Mutex<dyn Store>>) {
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    let old_link = add_archive_and_vault(&f).await;
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::Manifest));
+    engine
+        .rename_domain("eng", "platform", false, &ada())
+        .await
+        .expect_err("the failpoint stops the rename");
+    drop(engine);
+
+    let restarted = m.engine(false).await;
+    restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("a journal was left to finish");
+    for name in ["archive", "vault"] {
+        assert_eq!(
+            std::fs::read_to_string(m.root.join(name).join("old.md")).unwrap(),
+            old_link,
+            "{name} is untouched"
+        );
+    }
+    let pager = std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap();
+    assert!(pager.contains("[[platform:a]]"), "{pager}");
+}
+both_backends!(
+    a_recovered_relink_writes_only_where_the_caller_could,
+    a_recovered_relink_writes_only_where_the_caller_could_body
+);
+
+/// A spelling that does not reach `eng` today is not `eng`'s to respell: a
+/// declared `domain_name` the local name `ops` shadows, and an alias the
+/// table dropped because `ops` holds it. A link `[[ops:pager]]` keeps its
+/// text and still reaches `ops` after the full rename.
+async fn a_spelling_another_domain_holds_is_never_respelled_body(store: Arc<Mutex<dyn Store>>) {
+    for case in ["declared", "alias"] {
+        let m = machine_tagged(store.clone(), &format!("-{case}")).await;
+        if case == "declared" {
+            std::fs::write(
+                m.root.join("eng/MANIFEST.md"),
+                manifest_named("Eng", &m.ops),
+            )
+            .unwrap();
+        } else {
+            let mut cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+            cfg.domains.get_mut(&m.eng).unwrap().aliases = vec![m.ops.clone()];
+            crystalline_core::config::save_yaml(&m.config_path(), &cfg).unwrap();
+        }
+        let runbook = engram(
+            "Runbook",
+            "runbook",
+            &format!("Page with [[{}:pager]].", m.ops),
+        );
+        std::fs::write(m.root.join("ops/runbook.md"), &runbook).unwrap();
+        let engine = m.engine(true).await;
+        engine.sync(None).await.unwrap();
+
+        let report = engine
+            .rename_domain(&m.eng, &m.platform, false, &Scope::Unrestricted)
+            .await
+            .unwrap();
+        assert_eq!(
+            report["rewritten"],
+            serde_json::json!([{ "domain": m.ops, "engrams": 1, "references": 1 }]),
+            "{case}: only the pager's link to eng: {report}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(m.root.join("ops/runbook.md")).unwrap(),
+            runbook,
+            "{case}"
+        );
+        let read = engine
+            .read_engram(&read_params("runbook", &m.ops), &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let links = read["links"].as_array().unwrap();
+        assert_eq!(links.len(), 1, "{case}: {read}");
+        assert_eq!(links[0]["target"]["domain"], m.ops, "{case}: {read}");
+        assert_eq!(links[0]["resolved"], true, "{case}: {read}");
+    }
+}
+both_backends!(
+    a_spelling_another_domain_holds_is_never_respelled,
+    a_spelling_another_domain_holds_is_never_respelled_body
+);
+
+/// A MANIFEST this machine cannot write refuses the full rename before any
+/// step and names `--local`, and nothing changes. A caller who does not own
+/// the domain is refused as forbidden, full or `--local`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unwritable_manifest_refuses_and_names_local() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    let engine = m.engine(true).await;
+    let config_before = std::fs::read_to_string(m.config_path()).unwrap();
+    let manifest_before = std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap();
+
+    let eng_dir = m.root.join("eng");
+    std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Running as root writes into a read-only folder anyway: nothing to test.
+    let probe = eng_dir.join("probe");
+    if std::fs::write(&probe, "x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: a read-only folder is writable here (running as root?)");
+        return;
+    }
+    let result = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await;
+    std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    match result.unwrap_err() {
+        EngineError::Invalid(msg) => assert!(
+            msg.contains("--local") && msg.contains("This machine only"),
+            "{msg}"
+        ),
+        other => panic!("expected invalid, got {other:?}"),
+    }
+    assert!(!m.journal().exists(), "no step started");
+    assert_eq!(
+        std::fs::read_to_string(m.config_path()).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        manifest_before
+    );
+    assert!(!engine.is_renaming("eng"));
+
+    // `ops` is shared: ada writes it and does not own it.
+    let ada = Scope::User {
+        account: "ada".into(),
+        admin: false,
+    };
+    for local_only in [false, true] {
+        match engine
+            .rename_domain("ops", "runbooks", local_only, &ada)
+            .await
+            .unwrap_err()
+        {
+            EngineError::Forbidden(_) => {}
+            other => panic!("expected forbidden (local_only {local_only}), got {other:?}"),
+        }
+    }
+    assert!(!m.journal().exists());
+}
+
+/// Open issue 8: a full rename onto another domain's canonical name goes
+/// through and names that domain under `shadows`; onto another domain's
+/// local name it is refused.
+async fn a_full_rename_onto_a_canonical_shadows_and_onto_a_local_name_refuses_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    std::fs::write(
+        m.root.join("ops/MANIFEST.md"),
+        manifest_named("Ops", "platform"),
+    )
+    .unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+
+    let msg = conflict(
+        engine
+            .rename_domain("eng", "ops", false, &Scope::Unrestricted)
+            .await
+            .unwrap_err(),
+    );
+    assert!(msg.contains("'ops' is already a domain here"), "{msg}");
+    assert!(!m.journal().exists());
+
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["shadows"], serde_json::json!(["ops"]), "{report}");
+    assert_eq!(
+        engine.local_domain_name("platform").await.as_deref(),
+        Some("platform")
+    );
+    // The respelled links reach the renamed domain, not `ops`, which holds
+    // no `a`, `b` or `c`.
+    let read = engine
+        .read_engram(&read_params("pager", "ops"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let links = read["links"].as_array().unwrap();
+    assert!(!links.is_empty(), "{read}");
+    for link in links {
+        assert_eq!(link["target"]["domain"], "platform", "{read}");
+        assert_eq!(link["resolved"], true, "{read}");
+    }
+}
+both_backends!(
+    a_full_rename_onto_a_canonical_shadows_and_onto_a_local_name_refuses,
+    a_full_rename_onto_a_canonical_shadows_and_onto_a_local_name_refuses_body
+);
+
+/// A crash after the MANIFEST step and after the relink step: a new engine
+/// over the same state finishes the rename and reaches the end state of a
+/// rename nothing interrupted, including the previous canonical among the
+/// aliases although the MANIFEST no longer names it. Each step is crashed
+/// once after the journal recorded it and once with its effect landed and
+/// the journal not yet saying so.
+async fn a_full_rename_a_crash_stopped_is_finished_body(store: Arc<Mutex<dyn Store>>) {
+    for (step, unrecorded) in [RenameStep::Manifest, RenameStep::Relink]
+        .iter()
+        .flat_map(|step| [(*step, false), (*step, true)])
+    {
+        let tag = format!("-{step:?}{}", if unrecorded { "-u" } else { "" }).to_lowercase();
+        let f = full_machine(store.clone(), &tag).await;
+        let m = &f.m;
+        let engine = m.engine(true).await;
+
+        engine.fail_rename_after(Some(step));
+        let err = engine
+            .rename_domain(&m.eng, &m.platform, false, &Scope::Unrestricted)
+            .await
+            .expect_err("the failpoint stops the rename");
+        assert!(format!("{err}").contains("rename"), "{step:?}: {err}");
+        assert!(m.journal().is_file(), "{step:?}: the journal stays");
+        // The failpoint fired right after its own step: the MANIFEST is
+        // written either way, the links only once the relink step ran.
+        let manifest_text = std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap();
+        assert!(
+            manifest_text.contains(&format!("domain_name: {}\n", m.platform)),
+            "{step:?}: {manifest_text}"
+        );
+        let pager = std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap();
+        assert_eq!(
+            pager.contains(&format!("[[{}:a]]", m.eng)),
+            step == RenameStep::Manifest,
+            "{step:?}: {pager}"
+        );
+        let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+        assert!(
+            cfg.domains.contains_key(&m.eng),
+            "{step:?}: the config is written last"
+        );
+        drop(engine);
+        if unrecorded {
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(m.journal()).unwrap()).unwrap();
+            let done = journal["done"].as_array_mut().unwrap();
+            assert_eq!(done.last(), Some(&serde_json::json!(step.name())));
+            done.pop();
+            std::fs::write(m.journal(), serde_json::to_vec(&journal).unwrap()).unwrap();
+        }
+
+        let restarted = m.engine(false).await;
+        let recovered = restarted
+            .recover_rename_journal()
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{step:?}: a journal was left to finish"));
+        assert_eq!(recovered["domain"], m.platform, "{step:?}: {recovered}");
+        assert_eq!(recovered["manifest_written"], true, "{step:?}: {recovered}");
+        restarted.sync(None).await.unwrap();
+        assert_fully_renamed(&f, &restarted).await;
+    }
+}
+both_backends!(
+    a_full_rename_a_crash_stopped_is_finished,
+    a_full_rename_a_crash_stopped_is_finished_body
+);
+
+/// After a full rename the REST paths under the old local name and the
+/// previous canonical name answer the renamed domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_rest_paths_answer_the_renamed_domain() {
+    use crystalline_core::config::{AuthConfig, ResponseFormat, ServiceConfig};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let eng_dir = root.join("eng");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(
+        eng_dir.join("MANIFEST.md"),
+        manifest_named("Eng", "eng-team"),
+    )
+    .unwrap();
+    std::fs::write(
+        eng_dir.join("a.md"),
+        engram("A", "a", "an engineering note"),
+    )
+    .unwrap();
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            anonymous: Some(true),
+            ..AuthConfig::default()
+        }),
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::file(eng_dir.clone()));
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg,
+            None,
+            Some(config_path),
+        )
+        .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    // Spawned, as a request handler would run it: the rename is `Send`.
+    let renamer = engine.clone();
+    tokio::spawn(async move {
+        renamer
+            .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    let router = crystalline_service::daemon::http_router(
+        engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let mut bodies = Vec::new();
+    for spelling in ["platform", "eng", "eng-team"] {
+        let resp = client
+            .get(format!(
+                "http://{addr}/api/v1/domains/{spelling}/tree?depth=2"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 200, "{spelling}: {text}");
+        assert!(text.contains("a.md"), "{spelling}: {text}");
+        bodies.push(text);
+    }
+    assert_eq!(bodies[0], bodies[1], "eng answers the renamed domain");
+    assert_eq!(bodies[0], bodies[2], "eng-team answers the renamed domain");
+}
