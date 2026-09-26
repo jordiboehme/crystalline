@@ -29,7 +29,8 @@ describe("the prop catalogue", () => {
   it("lists every kind once, as PROP_CATALOGUE does", () => {
     expect(new Set(PROP_KINDS).size).toBe(PROP_KINDS.length);
     expect([...PROP_KINDS].sort()).toEqual(Object.keys(PROP_CATALOGUE).sort());
-    expect(PROP_KINDS).toHaveLength(44);
+    // 44 regular kinds and the five rare kinds of 2.6d (C10).
+    expect(PROP_KINDS).toHaveLength(49);
   });
 
   it("marks tall only the floor kinds whose every variant stands TALL_MIN or more", () => {
@@ -56,10 +57,12 @@ describe("the prop catalogue", () => {
       expect(PROP_CATALOGUE[k].wallBacked).toBe(false);
   });
 
-  it("gives every kind 2 or 3 variants, the sign plate 6", () => {
+  it("gives every kind 2 or 3 variants, the sign plate 6 and a rare kind 1 or 2", () => {
     for (const k of PROP_KINDS) {
       const n = PROP_CATALOGUE[k].variants;
       if (k === "sign-plate") expect(n).toBe(6);
+      // The rare kinds carry the variants the spec gives them (2.6d C3).
+      else if (PROP_CATALOGUE[k].rare) expect([1, 2], k).toContain(n);
       else expect([2, 3]).toContain(n);
     }
   });
@@ -125,6 +128,8 @@ describe("the prop catalogue", () => {
       "first-aid",
       "intercom",
       "keycard-reader",
+      // The rare poster: a person reads it (2.6d C11).
+      "saucer-poster",
       "sign-plate",
       "wall-monitor",
     ]);

@@ -10,7 +10,10 @@
  * the GPU. So a recipe is a pure function of kind, variant and look.
  *
  * The recipes live by anchor in `wall.ts`, `floor.ts` and `ceiling.ts`,
- * and share the envelopes of `common.ts`. The prop test builds every kind
+ * and the rare kinds (2.6d C10) in `marked.ts` (the marked crate and the
+ * gravity console) and `rare.ts` (the canister cluster, the poster and the
+ * designer tower); all share the envelopes, the blink banks (`PROP_BANK`)
+ * and the blockout of `common.ts`. The prop test builds every kind
  * and variant, places it at every turn the way the GPU does and checks
  * the envelope, the winding, the triangle budget and that nothing glows
  * in mid-air.
@@ -25,6 +28,8 @@ import { surfaces, type KitAt } from "../common";
 import { CEILING_RECIPES } from "./ceiling";
 import type { PropContext, PropRecipe } from "./common";
 import { FLOOR_RECIPES } from "./floor";
+import { MARKED_RECIPES } from "./marked";
+import { RARE_RECIPES } from "./rare";
 import { WALL_RECIPES } from "./wall";
 
 export {
@@ -32,6 +37,7 @@ export {
   CEILING_OUT,
   CEILING_SETBACK,
   FLOOR_TOP,
+  PROP_BANK,
   RUN_BAND,
   RUN_REACH,
   SPAN_HALF,
@@ -44,6 +50,8 @@ export {
 } from "./common";
 export { CEILING_RECIPES } from "./ceiling";
 export { FLOOR_RECIPES } from "./floor";
+export { MARKED_RECIPES } from "./marked";
+export { RARE_RECIPES } from "./rare";
 export { WALL_RECIPES } from "./wall";
 
 /** Every kind's recipe, whatever its anchor. */
@@ -51,6 +59,8 @@ const RECIPES = {
   ...WALL_RECIPES,
   ...FLOOR_RECIPES,
   ...CEILING_RECIPES,
+  ...MARKED_RECIPES,
+  ...RARE_RECIPES,
 } satisfies Record<PropKind, PropRecipe>;
 
 /**

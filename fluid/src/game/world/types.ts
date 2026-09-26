@@ -277,7 +277,9 @@ export type WallPropKind =
   | "tool-board"
   | "conduit-cabinet"
   | "stowage-net"
-  | "pipe-riser";
+  | "pipe-riser"
+  // rare kinds (2.6d C10)
+  | "saucer-poster";
 
 /** The kinds of prop that stand on the floor and collide with the player. */
 export type FloorPropKind =
@@ -302,7 +304,12 @@ export type FloorPropKind =
   | "crate-stack"
   | "drum-rack"
   | "gas-rack"
-  | "potted-tree";
+  | "potted-tree"
+  // rare kinds (2.6d C10)
+  | "ooze-canisters"
+  | "designer-tower"
+  | "gravity-console"
+  | "marked-crate";
 
 /** The kinds of prop that hang from the ceiling, out of the player's way. */
 export type CeilingPropKind =

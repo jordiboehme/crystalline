@@ -16,6 +16,7 @@ import { DECAL_LIFT, frameAt, type Kit } from "../../kit";
 import { LAYER } from "../../layers";
 import type { Rgb } from "../../looks";
 import { PICTOGRAM, SIGN_PICTOGRAMS } from "../../text";
+import type { RarePropKind } from "../../../world/props";
 import type { WallPropKind } from "../../../world/types";
 import { discOutline, shade, tiltedBar, yawed } from "../common";
 import { RUN_BAND, type PropRecipe } from "./common";
@@ -898,4 +899,4 @@ export const WALL_RECIPES = {
   "conduit-cabinet": conduitCabinet,
   "stowage-net": stowageNet,
   "pipe-riser": pipeRiser,
-} satisfies Record<WallPropKind, PropRecipe>;
+} satisfies Record<Exclude<WallPropKind, RarePropKind>, PropRecipe>;

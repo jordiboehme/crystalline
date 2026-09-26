@@ -72,6 +72,7 @@ import type {
   Decor,
   DecorKind,
   Fixture,
+  FloorPropKind,
   Hero,
   HeroKind,
   LightZone,
@@ -363,7 +364,10 @@ const GALLERY_LIGHT = 210;
  *   their kind. Bays 3 and 4 hold one of every prop kind and variant
  *   (`galleryProps`): wall and ceiling kinds on their walls, floor kinds on
  *   their floor, a run kind's variant as a 2-segment run, and a span kind's
- *   variant as a segment hung over row 6.
+ *   variant as a segment hung over row 6. The rare floor kinds stand in the
+ *   hall instead, at `GALLERY_HALL_PROPS` (2.6d C19): the canisters, the
+ *   console and the marked crates east of the specimen tank, the designer
+ *   tower beside the west terminal.
  * - **Light.** One steady zone per block of four by four cells, so every
  *   floor cell is lit and nothing flickers while a model is looked at.
  *
@@ -741,6 +745,33 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
 }
 
 /**
+ * The gallery's rare floor props (2.6d C19), each at a fixed point, as
+ * `[kind, variant, x, y, turn]` in cell units. Bays 3 and 4 offer 44 floor
+ * cells, 41 of them used by the regular floor kinds and one closed by the
+ * rare poster's keep-clear, so the six rare kind-variants would overflow
+ * them: they stand in the hall instead. The canisters, the console and the
+ * marked crates stand in two rows east of the specimen tank, turn 2,
+ * facing the entrance, each off every lane, fixture and piece of furniture;
+ * the designer tower stands where its own rule puts it (C13), the
+ * wall-side spot of cell (0, 13) backed to the west wall, its north side
+ * `TOWER_DESK_GAP` from the border with the terminal's cell (0, 12).
+ */
+export const GALLERY_HALL_PROPS = [
+  ["ooze-canisters", 0, 10.5, 10.5, 2],
+  ["ooze-canisters", 1, 12.5, 10.5, 2],
+  ["gravity-console", 0, 14.5, 10.5, 2],
+  ["marked-crate", 0, 10.5, 12.5, 2],
+  ["marked-crate", 1, 12.5, 12.5, 2],
+  ["designer-tower", 0, 0.1325, 13.0875, 1],
+] as const satisfies readonly (readonly [
+  FloorPropKind,
+  number,
+  number,
+  number,
+  number,
+])[];
+
+/**
  * One of every prop kind and variant (ruling 13's six sign-plate pictograms
  * included), hand-placed in bays 3 and 4 rather than drawn from a palette:
  *
@@ -752,7 +783,7 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
  *   (`duct`, `ceiling-tray`) the same way; a ceiling prop may share an edge
  *   with a wall prop, since the two hang at different heights, exactly as
  *   the dressing pass allows;
- * - floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
+ * - regular floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
  *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0, then row 7 of bay 3 and of
  *   bay 4 in the same columns: the four tall kinds Task 1 adds push the
  *   count past what rows 1, 3 and 5 hold. A row-7 cell is left out when its
@@ -762,6 +793,9 @@ function edgeQueue(runsIn: readonly WallSlot[][]): {
  *   because they sit next to a bay's doorway, which the real dressing pass
  *   always keeps floor props off; rows 0, 2, 4 and 6 stay walkable, row 6
  *   running the length of each bay beside rows 5 and 7.
+ * - the rare floor kinds (2.6d C19) not in the bays but at their fixed
+ *   points in the hall (`GALLERY_HALL_PROPS`); the rare poster takes the
+ *   next bay edge like every other wall kind;
  * - span kinds (`span-duct`, `span-tray`) over row 6: each kind and variant
  *   takes the next of four fixed first cells, `bay3.x0 + 1`, `bay3.x0 + 4`,
  *   `bay4.x0 + 1` and `bay4.x0 + 4`, anchored at `(x + 1, 6.5)`, turn 0.
@@ -898,6 +932,7 @@ function galleryProps(
   const floor: Prop[] = [];
   for (const kind of kindsOf("floor")) {
     const entry = PROP_CATALOGUE[kind];
+    if (entry.rare) continue;
     for (let variant = 0; variant < entry.variants; variant++) {
       const cell = cells[ci++];
       if (cell === undefined) {
@@ -914,6 +949,17 @@ function galleryProps(
       });
     }
   }
+  // The rare floor kinds at their fixed points in the hall (2.6d C19).
+  for (const [kind, variant, x, y, turn] of GALLERY_HALL_PROPS)
+    floor.push({
+      kind,
+      variant,
+      anchor: "floor",
+      x,
+      y,
+      turn,
+      seed: seedFor(roomSeed, "prop", Math.floor(x), Math.floor(y), "floor"),
+    });
 
   return [...wall, ...floor, ...ceiling].sort(PROP_ORDER);
 }

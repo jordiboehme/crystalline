@@ -4,6 +4,7 @@ import { propFootprint } from "../world/footprints";
 import {
   PROP_CATALOGUE,
   PROP_KINDS,
+  RARE_PROP_KINDS,
   SPAN_HALF,
   TALL_MIN,
   WALL_PROP_DEPTH,
@@ -12,12 +13,13 @@ import {
 import { turnForSide, wallAnchor } from "../world/sites";
 import type { PropKind, Side } from "../world/types";
 import { CELL } from "../world/units";
-import { createBuilder, type MeshData, type V3 } from "./geometry";
+import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
   floatingGlow,
   inBox,
+  looseParts,
   placeMesh,
   placeParts,
   positions,
@@ -34,6 +36,7 @@ import {
   CEILING_OUT,
   CEILING_SETBACK,
   FLOOR_TOP,
+  PROP_BANK,
   RUN_BAND,
   RUN_REACH,
   SPAN_REACH,
@@ -291,5 +294,29 @@ describe("prop models", () => {
         ).toBeGreaterThanOrEqual(2);
       }
     }
+  });
+
+  it("puts blink-flagged parts exactly in the kinds whose bank blinks (2.6d C15)", () => {
+    // Mutation caught: the ooze drawn steady, or a blink part on a steady kind.
+    for (const kind of PROP_KINDS)
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
+        const { parts } = buildRecorded(kind, v);
+        expect(
+          parts.some((p) => p.flag >= FLAG.blink),
+          `${kind} ${String(v)}`,
+        ).toBe(PROP_BANK[kind] !== "steady");
+      }
+  });
+
+  it("rests every part of every rare kind on the floor, its wall or another part (2.6d C14)", () => {
+    // Mutation caught: the puddle's glow film built clear of its stain, or
+    // a crack floating off its canister.
+    for (const kind of RARE_PROP_KINDS)
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
+        const { parts } = buildRecorded(kind, v);
+        const wall =
+          PROP_CATALOGUE[kind].anchor === "wall" ? frameAt([0, 0, 0], 0) : null;
+        expect(looseParts(parts, wall), `${kind} ${String(v)}`).toEqual([]);
+      }
   });
 });

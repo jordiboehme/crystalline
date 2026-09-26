@@ -18,7 +18,8 @@
  * `hero:<kind>:<variant>`), so a hero's mesh never shares a cache entry
  * with a prop's. Their slot is their kind's blink bank (`HERO_BANK`,
  * `bankSlot`, H11), which the fragment shader reads for their blinking
- * lights; a prop's slot is 0, the steady bank.
+ * lights. A prop's slot is its kind's bank (`PROP_BANK`, 2.6d C15), 0 for
+ * every steady kind.
  *
  * Curios are the third family (C1), in a key space of their own
  * (`curioKey`, `curio:<kind>:<variant>`). An instance's height is the
@@ -31,13 +32,14 @@ import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
 import { CURIO_BANK } from "./models/curios/common";
 import { HERO_BANK } from "./models/heroes/common";
+import { PROP_BANK } from "./models/props/common";
 
 /**
  * Floats per instance: the anchor in world metres (x, y, z), the quarter
  * turns and the slot. The first three feed the shader's `aInstanceOffset`
  * (location 6), the last two its `aInstanceTurn` (location 7). The slot is
- * the instance's blink bank (`bankSlot`, H11): a hero's or a curio's
- * kind's bank, and 0, the steady bank, for every prop.
+ * the instance's blink bank (`bankSlot`, H11): its kind's bank, whether
+ * it is a hero, a curio or a prop (`PROP_BANK`, 0 for a steady prop).
  */
 export const INSTANCE_FLOATS = 5;
 
@@ -164,7 +166,8 @@ function grouped<K>(
  * The room's props as instance groups, one per distinct kind and variant,
  * sorted by key so the draw order is the same every time. Each instance is
  * `x * CELL`, the anchor height (the ceiling for a ceiling prop, else the
- * floor), `y * CELL`, the turn and a zero slot (the steady bank). A room
+ * floor), `y * CELL`, the turn and its kind's blink bank slot
+ * (`bankSlot(PROP_BANK[kind])`, 2.6d C15: 0 for every steady kind). A room
  * without props gives no groups. A pure function: the same room gives
  * equal arrays.
  */
@@ -179,7 +182,7 @@ export function propInstances(room: RoomSpec): PropGroup[] {
         p.anchor === "ceiling" ? room.ceiling : 0,
         p.y * CELL,
         p.turn,
-        0,
+        bankSlot(PROP_BANK[p.kind]),
       ],
     })),
   ).map((g) => ({ ...g, family: "prop" as const }));

@@ -38,7 +38,8 @@ import {
   turnForSide,
   wallAnchor,
 } from "./sites";
-import { galleryRoom, heroHallRoom, row } from "./canned";
+import { spotView } from "../dev/spots";
+import { GALLERY_HALL_PROPS, galleryRoom, heroHallRoom, row } from "./canned";
 import type {
   Box,
   DecorKind,
@@ -297,9 +298,13 @@ describe("galleryRoom", () => {
     }
   });
 
-  it("centres every floor prop on rows 1, 3, 5 or 7 of bays 3 and 4, turn 0", () => {
+  it("centres every floor prop but the rare kinds on rows 1, 3, 5 or 7 of bays 3 and 4, turn 0", () => {
     const propBays = room.bays.slice(2, 4);
-    const floorProps = room.props.filter((p) => p.anchor === "floor");
+    // The rare floor kinds stand at fixed points in the hall instead
+    // (`GALLERY_HALL_PROPS`, 2.6d C19): the bays hold too few cells for them.
+    const floorProps = room.props.filter(
+      (p) => p.anchor === "floor" && !PROP_CATALOGUE[p.kind].rare,
+    );
     expect(floorProps.length).toBeGreaterThan(0);
     for (const p of floorProps) {
       expect(p.turn).toBe(0);
@@ -316,9 +321,13 @@ describe("galleryRoom", () => {
     }
   });
 
-  it("puts the gallery's floor props on rows 1, 3, 5 and then 7 of bays 3 and 4, never before a keep-clear wall prop", () => {
+  it("puts the gallery's floor props but the rare kinds on rows 1, 3, 5 and then 7 of bays 3 and 4, never before a keep-clear wall prop", () => {
     const propBays = room.bays.slice(2, 4);
-    const floor = room.props.filter((p) => p.anchor === "floor");
+    // The rare floor kinds stand at fixed points in the hall instead
+    // (`GALLERY_HALL_PROPS`, 2.6d C19): the bays hold too few cells for them.
+    const floor = room.props.filter(
+      (p) => p.anchor === "floor" && !PROP_CATALOGUE[p.kind].rare,
+    );
     const kinds = new Map(
       room.props
         .filter((p) => p.anchor === "wall")
@@ -348,6 +357,33 @@ describe("galleryRoom", () => {
     expect(floor.filter((p) => Math.floor(p.y) === 7).length).toBeGreaterThan(
       0,
     );
+  });
+
+  it("stands every rare floor prop at its hall point, off every lane and every other box (2.6d C19)", () => {
+    // Mutation caught: a rare kind left in the bays' loop (the bays run out
+    // of cells), or a hall point moved into a lane.
+    const rare = room.props.filter(
+      (p) => p.anchor === "floor" && PROP_CATALOGUE[p.kind].rare,
+    );
+    expect(
+      rare.map((p) => [p.kind, p.variant, p.x, p.y, p.turn]).sort(),
+    ).toEqual(GALLERY_HALL_PROPS.map((r) => [...r]).sort());
+    const lanes = dressingSites(room).lanes;
+    for (const p of rare) {
+      const box = propFootprint(p);
+      if (box === null) throw new Error("a floor prop has a box");
+      expect(
+        lanes.some((l) => overlaps(box, l)),
+        p.kind,
+      ).toBe(false);
+      expect(
+        spotView(
+          room,
+          `prop:${p.kind}:${String(room.props.filter((q) => q.kind === p.kind).indexOf(p))}`,
+        ),
+        p.kind,
+      ).not.toBeNull();
+    }
   });
 
   it("is the same room every time", () => {

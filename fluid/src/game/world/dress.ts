@@ -26,6 +26,12 @@
  *    pictogram). Each is recorded in `used` and `wallKinds`; a mandatory
  *    prop whose edges are all reserved is left out, as it is today when
  *    they are taken.
+ * 2b. The rare poster (2.6d C11), when `rare.poster` is drawn: the first
+ *    edge, in the order of its own seed (token `rare-poster-<side>`), that
+ *    is free, unreserved, not in `used` and not an edge of a corner-zone
+ *    cell. It is recorded in `used` and `wallKinds`, so step 4 skips its
+ *    edge and step 5, since it is keep-clear, closes the wall-side spot in
+ *    front of it. A room with no such edge hangs none.
  * 3. Wall runs, when the palette has one: `createRng(seedFor(roomSeed,
  *    "prop-runs", "wall"))` draws the count (1 or 2), with 1 the long wall,
  *    then the variant the whole run shares; one segment per long-wall edge
@@ -55,7 +61,7 @@
  *    extra goes to the first spot of step 5 in floor-seed order that
  *    accepts it, a wall-backed one (the ladder) only to a wall-side spot
  *    whose backing is `bare`. The loose cables' count is kept for step
- *    10.
+ *    12.
  * 7. Corner zones: each zone takes `1` prop on a bridge, otherwise `1 +
  *    (seedFor(roomSeed, "prop-zone", key) % 2)`. Its remaining spots are
  *    walked in seed order, each drawing a kind weighted over the palette's
@@ -91,7 +97,26 @@
  *    props outside the band it can bind: an inner cell on the band's south
  *    or east edge touches a corner-zone cell diagonally, and a member there
  *    is dropped when a corner-zone prop stands within 1.0 m of it.
- * 10. Ceiling, anchored at wall points like a wall prop: the ceiling run
+ * 10. The rare floor props (2.6d C13), on what steps 5 to 9 left, each
+ *     only when its draw of `rare` is taken: the canister cluster on the
+ *     first corner-zone or open wall-side spot, the gravity console on the
+ *     first open wall-side spot, and the designer tower on the first open
+ *     wall-side spot one step along its wall from a desk fixture on the
+ *     same wall (`deskSides`: a terminal, or a machine of
+ *     `DESK_MACHINES`), each in the order of the spot's own seed (tokens
+ *     `rare-canisters`, `rare-console`, `rare-tower`) and accepted by the
+ *     rules of step 5. The canisters and the console stand as any zone or
+ *     wall-side floor prop does, carrying the rare token's seed; the tower
+ *     backs onto its wall and is pushed along it until its near side is
+ *     `TOWER_DESK_GAP` from the cell border on the desk's side. A kind that
+ *     finds no spot is left out.
+ * 11. The mark (2.6d C12), when `rare.mark.take` is drawn: the candidates
+ *     so far that `markedVariant` accepts (a large crate or a crate stack,
+ *     `MARK_FROM`), sorted by seed, then `y`, then `x`; the one at
+ *     `floor(roll * n)` becomes a `marked-crate` of its marked variant and
+ *     keeps its position, turn and seed. Every marked footprint lies inside
+ *     the one it replaces, so nothing checked for the old prop changes.
+ * 12. Ceiling, anchored at wall points like a wall prop: the ceiling run
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
  *     `ceiling-<side>` (also skipping a reserved edge like a used one);
  *     under each ceiling tray segment a cable loop when `createRng` of the
@@ -112,12 +137,12 @@
  *     and the loose cables of step 6 on the hall's wall edges that carry
  *     neither a fixture nor a ceiling segment nor the beacon and are not
  *     reserved, in the order of their own seeds (token `loose-<side>`).
- * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
+ * 13. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
  *     everything else optional. A group, the span line, takes the place of
  *     its first member in this order and is kept whole or not at all;
  *     later candidates fill what it leaves.
- * 12. The output: `x` and `y` rounded to three decimals (done as each prop
+ * 14. The output: `x` and `y` rounded to three decimals (done as each prop
  *     is made, so acceptance measures exactly the prop that is returned;
  *     a cluster member's cell centre needs no rounding), sorted by
  *     `PROP_ORDER`.
@@ -137,7 +162,14 @@
  * never by a position in a list, and every draw comes from the rng of that
  * one prop's seed, so adding a fixture only changes the props near it.
  * That locality holds only below the cap: near `PROP_CAP` a new fixture can
- * change which props the cap drops anywhere in the room.
+ * change which props the cap drops anywhere in the room. The rare props
+ * are less local (2.6d C10): the room draws them once, from
+ * `seedFor(roomSeed, "prop-rare", "draw")` (`rareDraws`), and each takes
+ * the first candidate in the order of its own token's seed, so a new
+ * fixture that takes or clears that candidate moves the rare prop to the
+ * next one anywhere in the room, as a condition extra moves (ruling 12).
+ * The mark picks by its roll among the eligible crates, so a crate added
+ * or lost anywhere can move it.
  *
  * This is the generator side: it imports `props.ts`, `sites.ts`,
  * `heroes.ts`, `footprints.ts`, `types.ts`, `units.ts` and the seeds, and
@@ -153,15 +185,20 @@ import {
   CLUSTER_MAX,
   CLUSTER_MIN,
   CLUSTER_SHARE,
+  DESK_MACHINES,
   EXTINGUISHER_EVERY,
   EXTRAS,
   FILLER,
   LOOP_SHARE,
+  MARK_FROM,
+  MARK_SHARE,
   PALETTES,
   PROP_CAP,
   PROP_CATALOGUE,
+  RARE_SHARES,
   SPAN_CELLS,
   SPAN_SHARE,
+  TOWER_DESK_GAP,
   WALL_PROP_DEPTH,
   WALL_SHARE,
 } from "./props";
@@ -311,15 +348,111 @@ function isFloorKind(kind: PropKind): kind is FloorPropKind {
 }
 
 /**
+ * What a room's rare step places (2.6d C9, C10): the poster, the canister
+ * cluster, the designer tower and the gravity console (`panel`), each
+ * `true` when its draw took, and the mark, whether it took and the roll
+ * that picks its crate. `rareDraws` draws them from the room's seed; the
+ * dev switch and the tests pass their own.
+ */
+export interface RareDraws {
+  poster: boolean;
+  canisters: boolean;
+  tower: boolean;
+  panel: boolean;
+  mark: { take: boolean; roll: number };
+}
+
+/** Rare draws that place nothing: the room is dressed as without the rare step. */
+export const NO_RARE: RareDraws = {
+  poster: false,
+  canisters: false,
+  tower: false,
+  panel: false,
+  mark: { take: false, roll: 0 },
+};
+
+/**
+ * A room's rare draws (2.6d C9, C10), from one stream of its own,
+ * `seedFor(room.seed, "prop-rare", "draw")`, always all of them in this
+ * order: the poster, the canisters, the tower and the console at their
+ * archetype's `RARE_SHARES`, then the mark's chance at `MARK_SHARE` and
+ * its roll. A kind whose share is 0 never takes.
+ */
+export function rareDraws(
+  room: Pick<RoomBase, "seed" | "archetype">,
+): RareDraws {
+  const rng = createRng(seedFor(room.seed, "prop-rare", "draw"));
+  const a = room.archetype;
+  const poster = rng.chance(RARE_SHARES["saucer-poster"][a]);
+  const canisters = rng.chance(RARE_SHARES["ooze-canisters"][a]);
+  const tower = rng.chance(RARE_SHARES["designer-tower"][a]);
+  const panel = rng.chance(RARE_SHARES["gravity-console"][a]);
+  const take = rng.chance(MARK_SHARE[a]);
+  return { poster, canisters, tower, panel, mark: { take, roll: rng.next() } };
+}
+
+/**
+ * The `marked-crate` variant the mark would turn this prop into (2.6d
+ * C12, `MARK_FROM`): 0 for a large crate (variant 1 or 2), 1 for either
+ * crate stack. Null for every other prop, the small crate (variant 0)
+ * included, since the marked crate's 1.0 m box would overhang its 0.8 m
+ * one.
+ */
+export function markedVariant(p: Prop): number | null {
+  if (p.anchor !== "floor") return null;
+  if (p.kind === "crate" || p.kind === "crate-stack") {
+    const from = MARK_FROM[p.kind];
+    return (from.variants as readonly number[]).includes(p.variant)
+      ? from.to
+      : null;
+  }
+  return null;
+}
+
+/**
+ * The wall-side cells a designer tower may stand in (2.6d C13): for every
+ * desk fixture (a terminal, or a machine of `DESK_MACHINES`), the two
+ * cells one step along its wall from its slot, keyed `"cx,cy,side"` with
+ * the fixture's wall side. The value is the along-wall direction from that
+ * cell towards the desk: +1 when the desk lies at the higher x (a north or
+ * south wall) or y (an east or west wall), -1 when it lies at the lower. A
+ * cell between two desks keeps the later fixture's direction.
+ */
+export function deskSides(
+  room: Pick<RoomBase, "fixtures">,
+): Map<string, 1 | -1> {
+  const out = new Map<string, 1 | -1>();
+  for (const f of room.fixtures) {
+    const desk =
+      f.kind === "terminal" ||
+      (f.kind === "machine" &&
+        (DESK_MACHINES as readonly string[]).includes(f.machine));
+    if (!desk) continue;
+    const { x, y, side } = f.slot;
+    const along = side === "n" || side === "s";
+    for (const step of [-1, 1] as const) {
+      const cx = along ? x + step : x;
+      const cy = along ? y : y + step;
+      // The desk lies back towards the fixture's own cell.
+      out.set(`${String(cx)},${String(cy)},${side}`, step === 1 ? -1 : 1);
+    }
+  }
+  return out;
+}
+
+/**
  * Every prop the pass would place in a room, before the cap, each marked
- * mandatory or optional: steps 1 to 10 of the module doc. The room's own
+ * mandatory or optional: steps 1 to 12 of the module doc. The room's own
  * heroes are always kept clear of (`heroReserve(room.heroes)`, H3); the
  * caller's `reserved` is merged with it, and keeps floor props, wall props,
  * runs, loops, span lines and loose cables out of what else is claimed.
+ * `rare` is the rare step's draws (2.6d C10), the room's own `rareDraws`
+ * unless the caller forces them.
  */
 export function dressCandidates(
   room: RoomBase,
   reserved: Reserved = NO_RESERVE,
+  rare: RareDraws = rareDraws(room),
 ): Candidate[] {
   const reserve = mergeReserved(heroReserve(room.heroes), reserved);
   const sites = dressingSites(room);
@@ -387,7 +520,30 @@ export function dressCandidates(
       if (e !== undefined) onWall("extinguisher", e, true);
     }
 
-  // Steps 3 and 10: a run along one or two long walls, one segment per edge.
+  // Step 2b (2.6d C11): the rare poster, on the first free, unreserved,
+  // unused edge by its own seed that is no corner-zone cell's edge, before
+  // the optional wall props, which then skip it.
+  const zoneCells = new Set(
+    sites.zones.flatMap((z) => z.spots.map((s) => cellKey(s.cx, s.cy))),
+  );
+  if (rare.poster) {
+    const posterSeed = (e: WallSlot) =>
+      propSeed(e.x, e.y, `rare-poster-${e.side}`);
+    const e = sites.runs
+      .flat()
+      .filter((x) => open(x) && !zoneCells.has(cellKey(x.x, x.y)))
+      .sort(
+        (a, b) => posterSeed(a) - posterSeed(b) || a.y - b.y || a.x - b.x,
+      )[0];
+    if (e !== undefined) {
+      const seed = posterSeed(e);
+      used.add(edgeKey(e));
+      wallKinds.set(edgeKey(e), "saucer-poster");
+      out.push({ prop: atWall("saucer-poster", e, 0, seed), mandatory: false });
+    }
+  }
+
+  // Steps 3 and 12: a run along one or two long walls, one segment per edge.
   const runOf = (kind: PropKind, which: "wall" | "ceiling", token: string) => {
     const rng = createRng(seedFor(room.seed, "prop-runs", which));
     const count = rng.int(1, 2);
@@ -441,7 +597,12 @@ export function dressCandidates(
   const bySeed = (a: FloorSpot, b: FloorSpot) =>
     floorSeed(a) - floorSeed(b) || a.cy - b.cy || a.cx - b.cx;
   const free = (s: FloorSpot) => !floorCells.has(cellKey(s.cx, s.cy));
-  const onFloor = (kind: FloorPropKind, s: FloorSpot, rng: Rng): Prop => {
+  const onFloor = (
+    kind: FloorPropKind,
+    s: FloorSpot,
+    rng: Rng,
+    seed = floorSeed(s),
+  ): Prop => {
     const variant = variantOf(kind, rng);
     let x = s.cx + 0.5;
     let y = s.cy + 0.5;
@@ -458,7 +619,6 @@ export function dressCandidates(
       else if (s.wall === "w") x = s.cx + off;
       else x = s.cx + 1 - off;
     }
-    const seed = floorSeed(s);
     return {
       kind,
       variant,
@@ -466,6 +626,37 @@ export function dressCandidates(
       x: round3(x),
       y: round3(y),
       turn,
+      seed,
+    };
+  };
+  // The designer tower (2.6d C13): backed to its wall like any wall-side
+  // prop, and pushed along it so its near side stands TOWER_DESK_GAP from
+  // the cell border on the desk's side (`toward`, from `deskSides`).
+  const besideDesk = (s: FloorSpot, toward: 1 | -1, seed: number): Prop => {
+    const size = FOOTPRINTS.prop["designer-tower"][0];
+    const wall = s.wall;
+    if (size === undefined || wall === null)
+      throw new Error("the tower backs onto a wall");
+    const out =
+      ((backing(s) === "screen" ? SCREEN_GAP : WALL_GAP) + size.depth / 2) /
+      CELL;
+    const shift = (TOWER_DESK_GAP + size.width / 2) / CELL;
+    const alongPos = toward === 1 ? 1 - shift : shift;
+    let x = s.cx + 0.5;
+    let y = s.cy + 0.5;
+    if (wall === "n" || wall === "s") x = s.cx + alongPos;
+    else y = s.cy + alongPos;
+    if (wall === "n") y = s.cy + out;
+    else if (wall === "s") y = s.cy + 1 - out;
+    else if (wall === "w") x = s.cx + out;
+    else x = s.cx + 1 - out;
+    return {
+      kind: "designer-tower",
+      variant: 0,
+      anchor: "floor",
+      x: round3(x),
+      y: round3(y),
+      turn: turnForSide(wall),
       seed,
     };
   };
@@ -569,7 +760,70 @@ export function dressCandidates(
     }
   }
 
-  // Step 10: the ceiling.
+  // Step 10 (2.6d C13): the rare floor props, each on the first spot by its
+  // own token's seed that `place` accepts, on what the steps before left.
+  const rareOn = (
+    token: string,
+    spots: readonly FloorSpot[],
+    make: (s: FloorSpot, rng: Rng, seed: number) => Prop,
+  ) => {
+    const seedOf = (s: FloorSpot) => propSeed(s.cx, s.cy, token);
+    for (const s of [...spots].sort(
+      (a, b) => seedOf(a) - seedOf(b) || a.cy - b.cy || a.cx - b.cx,
+    )) {
+      if (!free(s)) continue;
+      const seed = seedOf(s);
+      if (place(make(s, createRng(seed), seed), s)) return;
+    }
+  };
+  const openSide = () => sites.wallSide.filter((s) => backing(s) !== "clear");
+  if (rare.canisters)
+    rareOn(
+      "rare-canisters",
+      [...sites.zones.flatMap((z) => z.spots), ...openSide()],
+      (s, rng, seed) => onFloor("ooze-canisters", s, rng, seed),
+    );
+  if (rare.panel)
+    rareOn("rare-console", openSide(), (s, rng, seed) =>
+      onFloor("gravity-console", s, rng, seed),
+    );
+  if (rare.tower) {
+    const desks = deskSides(room);
+    const toward = (s: FloorSpot) =>
+      s.wall === null
+        ? undefined
+        : desks.get(`${String(s.cx)},${String(s.cy)},${s.wall}`);
+    rareOn(
+      "rare-tower",
+      openSide().filter((s) => toward(s) !== undefined),
+      (s, _rng, seed) => besideDesk(s, toward(s) ?? 1, seed),
+    );
+  }
+
+  // Step 11 (2.6d C12): the mark, on one accepted large crate or crate
+  // stack, picked by the roll among them in seed order.
+  if (rare.mark.take) {
+    const eligible = out
+      .filter((c) => markedVariant(c.prop) !== null)
+      .sort(
+        (a, b) =>
+          a.prop.seed - b.prop.seed ||
+          a.prop.y - b.prop.y ||
+          a.prop.x - b.prop.x,
+      );
+    const pick =
+      eligible[
+        Math.min(
+          eligible.length - 1,
+          Math.floor(rare.mark.roll * eligible.length),
+        )
+      ];
+    const variant = pick === undefined ? null : markedVariant(pick.prop);
+    if (pick !== undefined && variant !== null)
+      pick.prop = { ...pick.prop, kind: "marked-crate", variant };
+  }
+
+  // Step 12: the ceiling.
   const carriers = new Set<string>();
   if (palette.ceilingRun !== null) {
     const tray = palette.ceilingRun === "ceiling-tray";
@@ -672,11 +926,15 @@ export function dressCandidates(
  * (`capProps`) and sorted by `PROP_ORDER`. See the module doc for the pass.
  * The room's heroes are kept clear of whatever the caller passes
  * (`dressCandidates`); `reserved` adds to them, and the generator passes
- * none.
+ * none. `rare` forces the rare step's draws (2.6d C10); left out, the room
+ * draws its own (`rareDraws`), as the generator does.
  */
 export function dressRoom(
   room: RoomBase,
   reserved: Reserved = NO_RESERVE,
+  rare?: RareDraws,
 ): Prop[] {
-  return capProps(dressCandidates(room, reserved), PROP_CAP).sort(PROP_ORDER);
+  return capProps(dressCandidates(room, reserved, rare), PROP_CAP).sort(
+    PROP_ORDER,
+  );
 }

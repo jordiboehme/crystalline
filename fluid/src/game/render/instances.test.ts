@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_WORKSHOP, galleryRoom } from "../world/canned";
 import { generateRoom } from "../world/generate";
-import type { Hero } from "../world/types";
+import type { Hero, Prop } from "../world/types";
 import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
 import {
@@ -16,6 +16,7 @@ import {
 } from "./instances";
 import { turnMat2Columns } from "./kit";
 import { HERO_BANK } from "./models/heroes/common";
+import { PROP_BANK } from "./models/props/common";
 import { SCENE_VS } from "./shaders";
 
 const workshop = generateRoom(CANNED_WORKSHOP);
@@ -44,7 +45,7 @@ describe("propInstances", () => {
     for (const g of groups) expect(g.key).toBe(propKey(g.kind, g.variant));
   });
 
-  it("writes each prop's anchor in metres, its turn and a zero slot", () => {
+  it("writes each prop's anchor in metres, its turn and its kind's bank slot", () => {
     const groups = propInstances(workshop);
     const seen = new Map<string, number>();
     for (const p of workshop.props) {
@@ -61,12 +62,34 @@ describe("propInstances", () => {
         p.anchor === "ceiling" ? workshop.ceiling : 0,
         p.y * CELL,
         p.turn,
-        0,
+        bankSlot(PROP_BANK[p.kind]),
       ];
       for (let k = 0; k < INSTANCE_FLOATS; k++) {
         expect(floats[k]).toBeCloseTo(expected[k] ?? NaN, 5);
       }
     }
+  });
+
+  it("gives a blinking prop its kind's bank slot and a crate the steady slot (2.6d C15)", () => {
+    // Mutation caught: every prop written at slot 0, so the ooze never
+    // breathes, or the bank read for the wrong kind.
+    const at = { anchor: "floor", x: 3.5, y: 3.5, turn: 0, seed: 1 } as const;
+    const room = {
+      ...workshop,
+      props: [
+        { ...at, kind: "ooze-canisters", variant: 0 },
+        { ...at, kind: "crate", variant: 0, x: 5.5 },
+      ] satisfies Prop[],
+    };
+    const groups = propInstances(room);
+    const slotOf = (kind: string) => {
+      const g = groups.find((x) => x.kind === kind);
+      if (g === undefined) throw new Error(`no ${kind} group`);
+      return g.data[4];
+    };
+    expect(bankSlot("breathe")).not.toBe(0);
+    expect(slotOf("ooze-canisters")).toBe(bankSlot("breathe"));
+    expect(slotOf("crate")).toBe(0);
   });
 
   it("gives nothing for a room without props", () => {
@@ -122,7 +145,9 @@ describe("instanceGroups", () => {
       propInstances(room).every(
         (g) =>
           g.family === "prop" &&
-          g.data.every((_, i) => i % 5 !== 4 || g.data[i] === 0),
+          g.data.every(
+            (_, i) => i % 5 !== 4 || g.data[i] === bankSlot(PROP_BANK[g.kind]),
+          ),
       ),
     ).toBe(true);
   });

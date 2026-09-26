@@ -13,6 +13,7 @@
  */
 
 import { FOOTPRINTS, type FloorSize } from "../../../world/footprints";
+import type { RarePropKind } from "../../../world/props";
 import type { FloorPropKind } from "../../../world/types";
 import { profileAlong, tiltedBar, yawed } from "../common";
 import { frameAt, type Kit } from "../../kit";
@@ -1162,4 +1163,4 @@ export const FLOOR_RECIPES = {
   "drum-rack": drumRack,
   "gas-rack": gasRack,
   "potted-tree": pottedTree,
-} satisfies Record<FloorPropKind, PropRecipe>;
+} satisfies Record<Exclude<FloorPropKind, RarePropKind>, PropRecipe>;

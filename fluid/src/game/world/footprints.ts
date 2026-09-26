@@ -217,6 +217,19 @@ export const FOOTPRINTS: Footprints = {
       { width: 0.9, depth: 0.9 },
       { width: 1.0, depth: 1.0 },
     ],
+    // The rare kinds (2.6d C3). The canister cluster's box holds its
+    // puddle; each marked crate lies inside every crate it may replace
+    // (`MARK_FROM`, C12).
+    "ooze-canisters": [
+      { width: 1.0, depth: 0.8 },
+      { width: 0.8, depth: 0.7 },
+    ],
+    "designer-tower": [{ width: 0.25, depth: 0.43 }],
+    "gravity-console": [{ width: 0.6, depth: 0.5 }],
+    "marked-crate": [
+      { width: 1.0, depth: 0.8 },
+      { width: 1.2, depth: 1.1 },
+    ],
   },
   hero: {
     turret: [{ width: 0.9, depth: 0.9 }],

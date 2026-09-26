@@ -11,8 +11,9 @@
  *   never picks, whether it is a wide wall kind that reaches `WIDE_REACH` on
  *   both sides of its anchor, whether it keeps clear (a person reads or uses
  *   it, so nothing may stand in front of it), whether it is a ceiling span
- *   that crosses the hall rather than hugging a wall, and whether it is a
- *   tall floor kind (`TALL_MIN` or more in every variant, E5);
+ *   that crosses the hall rather than hugging a wall, whether it is a
+ *   tall floor kind (`TALL_MIN` or more in every variant, E5), and whether
+ *   it is a rare kind;
  * - `PALETTES`, the weighted picks each archetype draws free wall edges,
  *   floor spots, mid-hall clusters and runs from, plus `FILLER`, a low
  *   weight given to a few utility kinds in every archetype's wall palette
@@ -32,8 +33,16 @@
  *   `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants
  *   (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
  *
- * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
- * pictograms (ruling 13).
+ * - the rare kinds (2.6d C9 to C13): `RARE_PROP_KINDS` (the poster, the
+ *   canister cluster, the designer tower, the gravity console and the
+ *   marked crate), each drawn per room at `RARE_SHARES` or `MARK_SHARE` by
+ *   the rare step of `dress.ts` and never by a palette, the filler or the
+ *   extras, so a rare prop never reshuffles a weighted pick; `MARK_FROM`
+ *   (which crates the mark may relabel), `TOWER_DESK_GAP` and
+ *   `DESK_MACHINES` (where the tower stands).
+ *
+ * Every regular kind gets 2 variants, the crate 3 and the sign plate 6,
+ * its six pictograms (ruling 13). A rare kind has 1 or 2.
  *
  * This is a leaf of the generator side: it imports only `types.ts`, so
  * `sites.ts` and `dress.ts` can read it without reaching `move.ts` or
@@ -44,6 +53,7 @@ import type {
   Archetype,
   Condition,
   FloorPropKind,
+  MachineKind,
   PropAnchor,
   PropKind,
   WallPropKind,
@@ -52,7 +62,7 @@ import type {
 /** One entry of the catalogue: what a kind is and how it may be placed. */
 export interface PropEntry {
   anchor: PropAnchor;
-  /** How many variants the models build: 2, 3 for the crate, 6 for the sign plate. */
+  /** How many variants the models build: 2, 3 for the crate, 6 for the sign plate, 1 or 2 for a rare kind. */
   variants: number;
   /** A horizontal run, emitted one segment per wall edge (ruling 3). */
   run: boolean;
@@ -84,6 +94,12 @@ export interface PropEntry {
    * geometry.
    */
   tall: boolean;
+  /**
+   * A rare kind (2.6d C10): placed only by the rare step of `dress.ts`,
+   * from the room's own rare draws, never by a palette, the filler or the
+   * extras. `RARE_PROP_KINDS` lists exactly these kinds.
+   */
+  rare: boolean;
 }
 
 /** An archetype's weighted picks and density knobs. */
@@ -155,6 +171,7 @@ export const PROP_KINDS: readonly PropKind[] = [
   "conduit-cabinet",
   "stowage-net",
   "pipe-riser",
+  "saucer-poster",
   // floor
   "crate",
   "barrel",
@@ -176,6 +193,10 @@ export const PROP_KINDS: readonly PropKind[] = [
   "drum-rack",
   "gas-rack",
   "potted-tree",
+  "ooze-canisters",
+  "designer-tower",
+  "gravity-console",
+  "marked-crate",
   // ceiling
   "duct",
   "ceiling-tray",
@@ -201,6 +222,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   extinguisher: {
     anchor: "wall",
@@ -212,6 +234,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   "first-aid": {
     anchor: "wall",
@@ -223,6 +246,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   intercom: {
     anchor: "wall",
@@ -234,6 +258,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   "keycard-reader": {
     anchor: "wall",
@@ -245,6 +270,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   "vent-grille": {
     anchor: "wall",
@@ -256,6 +282,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "sign-plate": {
     anchor: "wall",
@@ -267,6 +294,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   "breaker-box": {
     anchor: "wall",
@@ -278,6 +306,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "wall-monitor": {
     anchor: "wall",
@@ -289,6 +318,7 @@ export const PROP_CATALOGUE = {
     keepClear: true,
     span: false,
     tall: false,
+    rare: false,
   },
   "padded-panel": {
     anchor: "wall",
@@ -300,6 +330,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "light-strip": {
     anchor: "wall",
@@ -311,6 +342,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "cable-tray": {
     anchor: "wall",
@@ -322,6 +354,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "pipe-bundle": {
     anchor: "wall",
@@ -333,6 +366,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "tool-board": {
     anchor: "wall",
@@ -344,6 +378,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "conduit-cabinet": {
     anchor: "wall",
@@ -355,6 +390,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "stowage-net": {
     anchor: "wall",
@@ -366,6 +402,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "pipe-riser": {
     anchor: "wall",
@@ -377,6 +414,19 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
+  },
+  "saucer-poster": {
+    anchor: "wall",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: true,
   },
   crate: {
     anchor: "floor",
@@ -388,6 +438,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   barrel: {
     anchor: "floor",
@@ -399,6 +450,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   trolley: {
     anchor: "floor",
@@ -410,6 +462,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   stool: {
     anchor: "floor",
@@ -421,6 +474,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "filing-cabinet": {
     anchor: "floor",
@@ -432,6 +486,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "storage-shelf": {
     anchor: "floor",
@@ -443,6 +498,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   planter: {
     anchor: "floor",
@@ -454,6 +510,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   bench: {
     anchor: "floor",
@@ -465,6 +522,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "specimen-shelf": {
     anchor: "floor",
@@ -476,6 +534,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   "fume-cabinet": {
     anchor: "floor",
@@ -487,6 +546,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   "traffic-cone": {
     anchor: "floor",
@@ -498,6 +558,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   ladder: {
     anchor: "floor",
@@ -509,6 +570,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "tool-cart": {
     anchor: "floor",
@@ -520,6 +582,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "toppled-crate": {
     anchor: "floor",
@@ -531,6 +594,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "debris-pile": {
     anchor: "floor",
@@ -542,6 +606,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "cable-coil": {
     anchor: "floor",
@@ -553,6 +618,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "crate-stack": {
     anchor: "floor",
@@ -564,6 +630,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   "drum-rack": {
     anchor: "floor",
@@ -575,6 +642,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   "gas-rack": {
     anchor: "floor",
@@ -586,6 +654,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
   },
   "potted-tree": {
     anchor: "floor",
@@ -597,6 +666,55 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: true,
+    rare: false,
+  },
+  "ooze-canisters": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "designer-tower": {
+    anchor: "floor",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "gravity-console": {
+    anchor: "floor",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "marked-crate": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
   },
   duct: {
     anchor: "ceiling",
@@ -608,6 +726,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "ceiling-tray": {
     anchor: "ceiling",
@@ -619,6 +738,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "cable-loop": {
     anchor: "ceiling",
@@ -630,6 +750,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   beacon: {
     anchor: "ceiling",
@@ -641,6 +762,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "loose-cable": {
     anchor: "ceiling",
@@ -652,6 +774,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: false,
     tall: false,
+    rare: false,
   },
   "span-duct": {
     anchor: "ceiling",
@@ -663,6 +786,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: true,
     tall: false,
+    rare: false,
   },
   "span-tray": {
     anchor: "ceiling",
@@ -674,6 +798,7 @@ export const PROP_CATALOGUE = {
     keepClear: false,
     span: true,
     tall: false,
+    rare: false,
   },
 } satisfies Record<PropKind, PropEntry>;
 
@@ -949,3 +1074,86 @@ export const SPAN_HALF = 0.35;
  * carry one and the rest stay clear overhead.
  */
 export const SPAN_SHARE = 2 / 3;
+
+/**
+ * The rare kinds (2.6d C10): placed only by the rare step of `dress.ts`,
+ * from their own draws, never by a palette, the filler or the extras.
+ */
+export const RARE_PROP_KINDS = [
+  "saucer-poster",
+  "ooze-canisters",
+  "designer-tower",
+  "gravity-console",
+  "marked-crate",
+] as const satisfies readonly PropKind[];
+
+/** A rare prop kind. */
+export type RarePropKind = (typeof RARE_PROP_KINDS)[number];
+
+/**
+ * Each drawn rare kind's chance per room, by archetype (2.6d C9). The
+ * first numbers; the discovery pass (2.6f) raises them.
+ */
+export const RARE_SHARES = {
+  "saucer-poster": {
+    bridge: 1 / 16,
+    council: 1 / 16,
+    engineering: 1 / 16,
+    archive: 1 / 8,
+    lab: 1 / 8,
+  },
+  "ooze-canisters": {
+    bridge: 0,
+    council: 0,
+    engineering: 1 / 10,
+    archive: 1 / 8,
+    lab: 1 / 10,
+  },
+  "designer-tower": {
+    bridge: 1 / 12,
+    council: 1 / 12,
+    engineering: 1 / 12,
+    archive: 1 / 12,
+    lab: 1 / 12,
+  },
+  "gravity-console": {
+    bridge: 0,
+    council: 0,
+    engineering: 1 / 10,
+    archive: 0,
+    lab: 1 / 10,
+  },
+} as const satisfies Record<
+  Exclude<RarePropKind, "marked-crate">,
+  Record<Archetype, number>
+>;
+
+/** Chance a room marks one of its crates (2.6d C9, C12), by archetype. */
+export const MARK_SHARE = {
+  bridge: 1 / 10,
+  council: 1 / 10,
+  engineering: 1 / 6,
+  archive: 1 / 10,
+  lab: 1 / 10,
+} as const satisfies Record<Archetype, number>;
+
+/**
+ * Which placed crates the mark may turn into a `marked-crate`, and into
+ * which variant (2.6d C12): a large crate (1.2 by 1.2) into the lone
+ * marked crate (1.0 by 0.8), either crate stack (1.2 by 1.2, 1.3 by 1.1)
+ * into the marked stack (1.2 by 1.1). Each marked footprint lies inside
+ * every footprint it replaces, so no check made for the old prop is lost.
+ */
+export const MARK_FROM = {
+  crate: { variants: [1, 2], to: 0 },
+  "crate-stack": { variants: [0, 1], to: 1 },
+} as const;
+
+/** How far the tower's near side stands from the cell border on its desk's side, in metres (2.6d C13). */
+export const TOWER_DESK_GAP = 0.05;
+
+/** The machines with a desk top a tower may stand beside, as a terminal (2.6d C13). */
+export const DESK_MACHINES = [
+  "workbench",
+  "lab-bench",
+] as const satisfies readonly MachineKind[];

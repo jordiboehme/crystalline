@@ -14,10 +14,14 @@ import {
   PROP_ORDER,
   SCREEN_GAP,
   WALL_GAP,
+  NO_RARE,
   capProps,
   dressCandidates,
   dressRoom,
+  markedVariant,
+  rareDraws,
   type Candidate,
+  type RareDraws,
 } from "./dress";
 import dressSource from "./dress.ts?raw";
 import {
@@ -45,12 +49,18 @@ import {
   CLUSTER_INNER,
   CLUSTER_MAX,
   CLUSTER_MIN,
+  DESK_MACHINES,
   EXTRAS,
+  FILLER,
   LANE_DEPTH,
   LANE_WIDTH,
+  MARK_SHARE,
   PALETTES,
   PROP_CATALOGUE,
   PROP_CAP,
+  PROP_KINDS,
+  RARE_PROP_KINDS,
+  RARE_SHARES,
   SPAN_CELLS,
   USE_LANE_DEPTH,
 } from "./props";
@@ -566,6 +576,15 @@ describe("floor props", () => {
           e: (cx + 1) * CELL - box.x1,
         }[side];
         const kind = kinds.get(edgeKey({ x: cx, y: cy, side }));
+        if (p.kind === "marked-crate") {
+          // The mark keeps the relabelled crate's position, and its box lies
+          // inside the crate's, so it stands at least that gap off its wall
+          // (2.6d C12).
+          expect(gap).toBeGreaterThanOrEqual(
+            (kind === undefined ? WALL_GAP : SCREEN_GAP) - 1e-9,
+          );
+          continue;
+        }
         if (kind !== undefined) {
           expect(gap).toBeCloseTo(SCREEN_GAP, 2);
           expect(PROP_CATALOGUE[kind].keepClear).toBe(false);
@@ -1035,7 +1054,14 @@ describe("mid-hall clusters", () => {
       );
       for (const p of floorProps(room))
         if (p.x >= band.x0 && p.x < band.x1 && p.y >= band.y0 && p.y < band.y1)
-          expect(kinds.has(p.kind), `${name} ${p.kind}`).toBe(true);
+          // The mark relabels one accepted crate or crate stack, a cluster
+          // member among them, as a marked crate (2.6d C12).
+          expect(
+            kinds.has(p.kind) ||
+              (p.kind === "marked-crate" &&
+                (kinds.has("crate") || kinds.has("crate-stack"))),
+            `${name} ${p.kind}`,
+          ).toBe(true);
     }
   });
 
@@ -1779,6 +1805,262 @@ describe("the generator side's imports (ruling 20)", () => {
     expect(generateSource).not.toMatch(
       /\b(?:from|import)\s*\(?\s*["'](?:\.\/(?:move|interact|malfunction)|\.\.\/render(?:\/[^"']*)?)["']/,
     );
+  });
+});
+
+/** Whether `count` of `n` draws lies within 4 standard deviations of a share `p`. */
+const within = (count: number, n: number, p: number) =>
+  Math.abs(count - n * p) <= 4 * Math.sqrt(n * p * (1 - p));
+
+describe("rare props (2.6d C9 to C13)", () => {
+  const SWEEP = [...ALL, ...BRIDGES];
+  const cellOf = (p: Prop) =>
+    p.anchor === "floor"
+      ? [Math.floor(p.x), Math.floor(p.y)]
+      : [edgeOf(p).x, edgeOf(p).y];
+
+  it("keeps every rare kind out of every palette, the filler and the extras (2.6d C10)", () => {
+    // Mutation caught: a rare kind added to a palette, where it would
+    // reshuffle every weighted pick of every room.
+    const rare = new Set<string>(RARE_PROP_KINDS);
+    expect(PROP_KINDS.filter((k) => PROP_CATALOGUE[k].rare).sort()).toEqual(
+      [...RARE_PROP_KINDS].sort(),
+    );
+    for (const [a, p] of Object.entries(PALETTES))
+      for (const [k] of [...p.wall, ...p.floor, ...p.cluster])
+        expect(rare.has(k), `${a} ${k}`).toBe(false);
+    for (const [k] of FILLER) expect(rare.has(k), k).toBe(false);
+    for (const rules of Object.values(EXTRAS))
+      for (const r of rules) expect(rare.has(r.kind), r.kind).toBe(false);
+  });
+
+  it("draws each rare kind at its archetype's share (2.6d C9)", () => {
+    const n = 4000;
+    for (const [a, type] of Object.entries(ARCHETYPE_TYPES)) {
+      const arch = a as Archetype;
+      const room = generateRoom({ ...CANNED_WORKSHOP, type });
+      const c = { poster: 0, canisters: 0, tower: 0, panel: 0, mark: 0 };
+      for (let i = 0; i < n; i++) {
+        const d = rareDraws({ ...room, seed: seedFor("rare-rate", a, i) });
+        if (d.poster) c.poster++;
+        if (d.canisters) c.canisters++;
+        if (d.tower) c.tower++;
+        if (d.panel) c.panel++;
+        if (d.mark.take) c.mark++;
+      }
+      expect(
+        within(c.poster, n, RARE_SHARES["saucer-poster"][arch]),
+        `${a} poster`,
+      ).toBe(true);
+      expect(
+        within(c.canisters, n, RARE_SHARES["ooze-canisters"][arch]),
+        `${a} canisters`,
+      ).toBe(true);
+      expect(
+        within(c.tower, n, RARE_SHARES["designer-tower"][arch]),
+        `${a} tower`,
+      ).toBe(true);
+      expect(
+        within(c.panel, n, RARE_SHARES["gravity-console"][arch]),
+        `${a} console`,
+      ).toBe(true);
+      expect(within(c.mark, n, MARK_SHARE[arch]), `${a} mark`).toBe(true);
+    }
+  });
+
+  it("hangs a forced poster only on a free edge no prop, fixture or hero holds, with nothing standing in front (2.6d C11, Review Focus 3)", () => {
+    // Mutation caught: the poster step not checking `used` (it lands on a
+    // sign's edge), not keep-clear (a floor prop stands before it), or
+    // taking a corner-zone cell's edge.
+    // The canned rooms share three seeds between them, so the poster's
+    // first edge by seed is nearly the same in every archetype and
+    // condition of one place; the reseeded workshops (`SEEDS`) give it
+    // sixty more seeds, which is what reaches a corner-zone cell's edge.
+    const rooms = [
+      ...SWEEP,
+      ...SEEDS.map((room, k) => ({
+        name: `seed ${String(k)}`,
+        condition: room.condition,
+        room,
+      })),
+    ];
+    let hung = 0;
+    for (const { name, condition, room } of rooms) {
+      const plain = dressRoom(room, NO_RESERVE, NO_RARE);
+      const props = dressRoom(room, NO_RESERVE, { ...NO_RARE, poster: true });
+      const posters = props.filter((p) => p.kind === "saucer-poster");
+      expect(posters.length, name).toBeLessThanOrEqual(1);
+      const p = posters[0];
+      if (p === undefined) {
+        expect(props, name).toEqual(plain);
+        continue;
+      }
+      hung++;
+      const e = edgeOf(p);
+      const k = edgeKey(e);
+      const sites = dressingSites(room);
+      expect(sites.free.has(k), name).toBe(true);
+      expect(heroReserve(room.heroes).edges.has(k), name).toBe(false);
+      expect(
+        room.fixtures.some((f) => edgeKey(f.slot) === k),
+        name,
+      ).toBe(false);
+      expect(
+        sites.zones.some((z) =>
+          z.spots.some((s) => s.cx === e.x && s.cy === e.y),
+        ),
+        name,
+      ).toBe(false);
+      const sameEdge = props.filter(
+        (q) =>
+          q !== p &&
+          q.anchor === "wall" &&
+          !PROP_CATALOGUE[q.kind].run &&
+          edgeKey(edgeOf(q)) === k,
+      );
+      expect(sameEdge, name).toEqual([]);
+      expect(
+        props.some(
+          (q) =>
+            q.anchor === "floor" &&
+            Math.floor(q.x) === e.x &&
+            Math.floor(q.y) === e.y,
+        ),
+        name,
+      ).toBe(false);
+      // Everything else is as it was, except on its own edge and in its
+      // cell. Only in a clean room: elsewhere a condition extra whose first
+      // spot the poster's keep-clear closed moves on to its next spot
+      // anywhere in the room (ruling 12, 2.6d C10).
+      if (condition !== "clean") continue;
+      const key = (q: Prop) => JSON.stringify(q);
+      const before = new Set(plain.map(key));
+      const after = new Set(props.map(key));
+      for (const q of [
+        ...plain.filter((x) => !after.has(key(x))),
+        ...props.filter((x) => !before.has(key(x))),
+      ])
+        expect(cellOf(q), `${name} ${q.kind}`).toEqual([e.x, e.y]);
+    }
+    // Most rooms keep an open edge after their mandatory props. If this
+    // bound fails, report the count before changing it.
+    expect(hung).toBeGreaterThan(rooms.length / 2);
+  });
+
+  it("marks at most one eligible crate, inside the footprint it replaces, and changes nothing else (2.6d C12, Review Focus 4)", () => {
+    // Mutation caught: the small crate (variant 0) marked, whose 0.8 m box
+    // the 1.0 m mark overhangs, or a second crate marked.
+    let marked = 0;
+    for (const { name, room } of SWEEP) {
+      const plain = dressRoom(room, NO_RESERVE, NO_RARE);
+      const eligible = plain.filter((p) => markedVariant(p) !== null);
+      for (const roll of [0, 0.5, 0.999]) {
+        const props = dressRoom(room, NO_RESERVE, {
+          ...NO_RARE,
+          mark: { take: true, roll },
+        });
+        expect(props.length, name).toBe(plain.length);
+        expect(blockersFor({ ...room, props }).length, name).toBe(
+          blockersFor({ ...room, props: plain }).length,
+        );
+        const bySeed = new Map(plain.map((p) => [p.seed, p]));
+        const changed = props.filter(
+          (p) => JSON.stringify(p) !== JSON.stringify(bySeed.get(p.seed)),
+        );
+        expect(changed.length, name).toBe(eligible.length > 0 ? 1 : 0);
+        const m = changed[0];
+        if (m === undefined) continue;
+        marked++;
+        const was = bySeed.get(m.seed);
+        if (was === undefined)
+          throw new Error(`${name}: no prop under the mark`);
+        expect(m.kind, name).toBe("marked-crate");
+        expect(m.variant, name).toBe(markedVariant(was));
+        expect({ ...m, kind: was.kind, variant: was.variant }, name).toEqual(
+          was,
+        );
+        const inner = propFootprint(m);
+        const outer = propFootprint(was);
+        if (inner === null || outer === null)
+          throw new Error("floor props have boxes");
+        expect(
+          inner.x0 >= outer.x0 - 1e-9 &&
+            inner.x1 <= outer.x1 + 1e-9 &&
+            inner.z0 >= outer.z0 - 1e-9 &&
+            inner.z1 <= outer.z1 + 1e-9,
+          name,
+        ).toBe(true);
+        expect(was.kind === "crate" ? [1, 2] : [0, 1], name).toContain(
+          was.variant,
+        );
+      }
+    }
+    expect(marked).toBeGreaterThan(0);
+  });
+
+  it("places each rare floor prop only where it fits, and the tower only beside a desk on its wall (2.6d C13, Review Focus 5)", () => {
+    // Mutation caught: the tower step not reading `deskSides` (a tower by a
+    // bare wall or in a corner), or a rare prop placed without `place`.
+    const rooms = [
+      ...SWEEP,
+      ...Object.entries(DEGENERATE_PLACES).map(([name, p]) => ({
+        name,
+        room: generateRoom(p),
+      })),
+    ];
+    const isDesk = (f: Fixture) =>
+      f.kind === "terminal" ||
+      (f.kind === "machine" &&
+        (DESK_MACHINES as readonly string[]).includes(f.machine));
+    const forced: RareDraws = {
+      ...NO_RARE,
+      canisters: true,
+      tower: true,
+      panel: true,
+    };
+    let towers = 0;
+    for (const { name, room } of rooms) {
+      const props = dressRoom(room, NO_RESERVE, forced);
+      expectFloorInvariants(name, { ...room, props });
+      for (const t of props.filter((p) => p.kind === "designer-tower")) {
+        towers++;
+        const side = SIDE_OF_TURN[t.turn];
+        const cx = Math.floor(t.x);
+        const cy = Math.floor(t.y);
+        const along = side === "n" || side === "s";
+        const desk = room.fixtures.find(
+          (f) =>
+            isDesk(f) &&
+            f.slot.side === side &&
+            (along
+              ? f.slot.y === cy && Math.abs(f.slot.x - cx) === 1
+              : f.slot.x === cx && Math.abs(f.slot.y - cy) === 1),
+        );
+        expect(
+          desk,
+          `${name} tower at ${String(cx)},${String(cy)}`,
+        ).toBeDefined();
+      }
+      const deskless = {
+        ...room,
+        fixtures: room.fixtures.filter((f) => !isDesk(f)),
+      };
+      expect(() => dressRoom(deskless, NO_RESERVE, forced), name).not.toThrow();
+      expect(
+        dressRoom(deskless, NO_RESERVE, forced).some(
+          (p) => p.kind === "designer-tower",
+        ),
+        name,
+      ).toBe(false);
+    }
+    expect(towers).toBeGreaterThan(0);
+    // The canned bridge's desk cells are all taken: the tower falls back.
+    const bridge = generateRoom(CANNED_BRIDGE);
+    expect(
+      dressRoom(bridge, NO_RESERVE, forced).some(
+        (p) => p.kind === "designer-tower",
+      ),
+    ).toBe(false);
   });
 });
 
