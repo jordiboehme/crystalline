@@ -23,13 +23,13 @@
  * stand in yet, the notice stays over the dark screen.
  *
  * Each tick, in order: the typed keys for the level cheat's word, the look
- * and command keys, movement, what the player
- * faces and E at it, the doors, the faults of the broken ways, the HUD
- * prompt, the ways out of the room, warming the cache for the places
- * behind the doors the player walks up to, the room's light specials and
- * the blink banks (`render/blink.ts`, H11). The blink state is made once
- * per session, not per room: a hero blinks the same way wherever it
- * stands. Its gains go to the renderer as `draw`'s sixth argument.
+ * and command keys, movement, what the player faces and E at it, the doors,
+ * the faults of the broken ways, the HUD prompt, the ways out of the room,
+ * warming the cache for the places behind the doors the player walks up to,
+ * the room's light specials and the blink banks (`render/blink.ts`, H11).
+ * The blink state is made once per session, not per room: a hero blinks the
+ * same way wherever it stands. Its gains go to the renderer as `draw`'s
+ * sixth argument.
  *
  * Malfunctions belong to one visit of a room. A travel that settles as
  * missing (404) or denied (403) marks the way it went through as failed
@@ -582,8 +582,9 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Leaves whatever the session was doing for a new place: closes the CRT
-   * reader and the level select, drops the load in flight (a new generation, the old one
-   * aborted) and takes the connector down if it was up.
+   * reader and the level select, drops the load in flight (a new
+   * generation, the old one aborted) and takes the connector down if it
+   * was up.
    */
   const leave = (): number => {
     closeReader();
@@ -710,6 +711,12 @@ export function createSession(opts: SessionOptions): Session {
     opts.onLevels(true);
   };
 
+  /**
+   * Closes the level select, for the host's Esc or a new place (`leave`):
+   * forgets the half-typed word and every key the overlay took (C4), gives
+   * the session the keys back as `closeReader` does, and tells the host.
+   * Does nothing when the select is not open.
+   */
   const closeLevels = () => {
     if (disposed || !levelsOpen) return;
     levelsOpen = false;

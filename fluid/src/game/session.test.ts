@@ -1044,11 +1044,20 @@ describe("the level cheat", () => {
   // Review Focus 2.
   it("ignores every key typed while the level select is open", () => {
     const session = onBridge();
+    // In front of the Scope, so an E that got through would read it. The
+    // walk's momentum runs out before the select opens.
+    walkToScope();
+    frames(20);
+    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
     type("idclev");
     frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    expect(hud.reader).not.toHaveBeenCalled();
     const still = eyeAt();
     const pitch = lastCamera().pitch;
+    const yaw = lastCamera().yaw;
     const rooms = renderer.setRoom.mock.calls.length;
+    hud.status.mockClear();
     for (const code of [
       "KeyW",
       "KeyA",
@@ -1070,11 +1079,18 @@ describe("the level cheat", () => {
     expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
     expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
     expect(lastCamera().pitch).toBeCloseTo(pitch, 6);
+    expect(lastCamera().yaw).toBeCloseTo(yaw, 6);
     expect(levels).toHaveBeenCalledTimes(1);
     expect(window.localStorage.getItem(INVERT_KEY)).toBe("0");
     expect(openFluid).not.toHaveBeenCalled();
     expect(hud.reader).not.toHaveBeenCalled();
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
+    // Digit1 would switch to the day shift look; the status still names
+    // the look the select opened over.
+    expect(hud.status).toHaveBeenCalled();
+    for (const [text] of hud.status.mock.calls) {
+      expect(text).toContain("APERTURE GRID");
+    }
 
     // Closed: nothing typed inside comes back as a command or a step.
     session.closeLevels();
