@@ -812,7 +812,8 @@ async fn refusals_name_the_next_step_body(store: Arc<Mutex<dyn Store>>) {
             .unwrap_err(),
     );
     assert!(
-        msg.contains("a rename of 'eng' is still finishing; try again in a moment"),
+        msg.contains("the rename of 'eng' to 'platform' is still running")
+            && msg.contains("send that same rename again or restart the daemon"),
         "{msg}"
     );
     hold.release();
@@ -1563,6 +1564,27 @@ async fn a_full_rename_a_crash_stopped_is_finished_body(store: Arc<Mutex<dyn Sto
             .unwrap_or_else(|| panic!("{step:?}: a journal was left to finish"));
         assert_eq!(recovered["domain"], m.platform, "{step:?}: {recovered}");
         assert_eq!(recovered["manifest_written"], true, "{step:?}: {recovered}");
+        // The relink counts travel in the journal: a recovery after a
+        // recorded relink step reports what the first run respelled. After
+        // an unrecorded one the step runs again and finds nothing left.
+        let references = if step == RenameStep::Relink && unrecorded {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{ "domain": m.ops, "engrams": 1, "references": 3 }])
+        };
+        assert_eq!(recovered["rewritten"], references, "{step:?}: {recovered}");
+        assert_eq!(
+            recovered["moved"],
+            serde_json::json!([
+                "index_row",
+                "auth_tables",
+                "origins_dir",
+                "overlays_dir",
+                "provision_receipt",
+                "config"
+            ]),
+            "{step:?}: {recovered}"
+        );
         restarted.sync(None).await.unwrap();
         assert_fully_renamed(&f, &restarted).await;
     }
@@ -1570,6 +1592,172 @@ async fn a_full_rename_a_crash_stopped_is_finished_body(store: Arc<Mutex<dyn Sto
 both_backends!(
     a_full_rename_a_crash_stopped_is_finished,
     a_full_rename_a_crash_stopped_is_finished_body
+);
+
+/// A write still running in the domain once the MANIFEST and relink steps are
+/// done: the drain gives up, the rename answers a conflict that names how to
+/// finish it, keeps its journal and lifts the pause. Another rename is
+/// refused naming the pending one; sending the same rename again finishes it
+/// and reports the relink counts of the first run.
+async fn a_busy_domain_after_relink_answers_a_conflict_and_a_resend_finishes_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let f = full_machine(store, "").await;
+    let m = &f.m;
+    let engine = m.engine(true).await;
+    engine.set_rename_drain_wait(Some(Duration::from_millis(300)));
+    let hold = engine.hold_rename_after(RenameStep::Relink);
+    let renamer = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), hold.reached())
+        .await
+        .expect("the rename reaches its hold after the relink step");
+    let write_hold = engine.hold_next_write();
+    let writer = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .write_engram(&write_params(
+                    "eng",
+                    "Beta",
+                    "written while the rename waits",
+                ))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), write_hold.reached())
+        .await
+        .expect("the write is counted and held");
+    hold.release();
+
+    let msg = conflict(renamer.await.unwrap().unwrap_err());
+    assert!(
+        msg.contains("domain 'eng' is busy with a write that has not finished")
+            && msg
+                .contains("send the same rename again (`crystalline domain rename eng platform`)")
+            && msg.contains("restart the daemon"),
+        "{msg}"
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(m.journal()).unwrap()).unwrap();
+    assert_eq!(
+        journal["done"],
+        serde_json::json!(["manifest", "relink"]),
+        "{journal}"
+    );
+    assert!(
+        !engine.is_renaming("eng") && !engine.is_renaming("platform"),
+        "the pause is lifted"
+    );
+    let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("eng"), "the config is untouched");
+
+    write_hold.release();
+    let written = writer.await.unwrap().unwrap();
+    assert_eq!(written["domain"], "eng", "{written}");
+
+    let msg = conflict(
+        engine
+            .rename_domain("ops", "runbooks", false, &Scope::Unrestricted)
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        msg.contains("the rename of 'eng' to 'platform' has not finished")
+            && msg.contains("`crystalline domain rename eng platform`")
+            && msg.contains("restart the daemon"),
+        "{msg}"
+    );
+
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], true, "{report}");
+    assert_eq!(
+        report["rewritten"],
+        serde_json::json!([{ "domain": "ops", "engrams": 1, "references": 3 }]),
+        "the counts of the first run: {report}"
+    );
+    assert_fully_renamed(&f, &engine).await;
+    assert!(m.root.join("eng/beta.md").is_file());
+}
+both_backends!(
+    a_busy_domain_after_relink_answers_a_conflict_and_a_resend_finishes,
+    a_busy_domain_after_relink_answers_a_conflict_and_a_resend_finishes_body
+);
+
+/// The relink step writes through the ordinary edit path: in a reviewing
+/// domain the respelled engram becomes the caller's draft and the file
+/// stays as the team reviewed it; in a virtual domain the row is respelled.
+async fn relink_drafts_in_a_reviewing_domain_and_rewrites_a_virtual_one_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    let mut cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    cfg.domains.get_mut("ops").unwrap().review =
+        Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    crystalline_core::config::save_yaml(&m.config_path(), &cfg).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    engine
+        .write_engram(&write_params("notes", "Links", "See [[eng:alpha]] first."))
+        .await
+        .unwrap();
+    let pager_before = std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap();
+
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        report["rewritten"],
+        serde_json::json!([
+            { "domain": "notes", "engrams": 1, "references": 1 },
+            { "domain": "ops", "engrams": 1, "references": 1 }
+        ]),
+        "{report}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("ops/pager.md")).unwrap(),
+        pager_before,
+        "the reviewed file is untouched"
+    );
+    let drafts = {
+        let store = m.store.lock().await;
+        let id = store.domain_id("ops").await.unwrap().unwrap();
+        store.overlay_entries(id, "owner").await.unwrap()
+    };
+    let pager = drafts
+        .iter()
+        .find(|e| e.path == "pager.md")
+        .unwrap_or_else(|| panic!("the owner holds a draft of the pager"));
+    assert!(
+        pager.content.contains("[[platform:alpha]]"),
+        "{}",
+        pager.content
+    );
+
+    let links = engine
+        .read_engram(&read_params("links", "notes"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let content = links["content"].as_str().unwrap();
+    assert!(content.contains("[[platform:alpha]]"), "{content}");
+    assert!(!content.contains("[[eng:alpha]]"), "{content}");
+}
+both_backends!(
+    relink_drafts_in_a_reviewing_domain_and_rewrites_a_virtual_one,
+    relink_drafts_in_a_reviewing_domain_and_rewrites_a_virtual_one_body
 );
 
 /// After a full rename the REST paths under the old local name and the

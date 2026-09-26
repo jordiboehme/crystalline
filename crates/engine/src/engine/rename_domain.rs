@@ -7,13 +7,14 @@ use crystalline_core::manifest::domain_name_at;
 
 use super::*;
 use crate::rename::{
-    RENAME_WAIT, RenameCaller, RenameJournal, RenameStep, WriteTicket, move_state_dir,
+    LeftBehind, RENAME_WAIT, RelinkCount, RelinkReport, RenameCaller, RenameJournal, RenameStep,
+    WriteTicket, move_state_dir,
 };
 
 /// Frees the one-rename slot when the rename that took it ends, however it
 /// ends.
 struct RenameSlot<'a> {
-    slot: &'a std::sync::Mutex<Option<String>>,
+    slot: &'a std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl Drop for RenameSlot<'_> {
@@ -22,15 +23,32 @@ impl Drop for RenameSlot<'_> {
     }
 }
 
-/// What the MANIFEST and relink steps of a full rename did in this run, for
-/// the report.
+/// What the relink step of a full rename did while it ran; the journal keeps
+/// it as a [`RelinkReport`] once the step is done.
 #[derive(Default)]
 struct RenameOutcome {
     /// Per domain, in name order: the engrams rewritten and the references
     /// respelled in them.
     rewritten: BTreeMap<String, (usize, usize)>,
     /// The links the relink step found and did not respell.
-    left_behind: Vec<Value>,
+    left_behind: Vec<LeftBehind>,
+}
+
+impl RenameOutcome {
+    fn into_report(self) -> RelinkReport {
+        RelinkReport {
+            rewritten: self
+                .rewritten
+                .into_iter()
+                .map(|(domain, (engrams, references))| RelinkCount {
+                    domain,
+                    engrams,
+                    references,
+                })
+                .collect(),
+            left_behind: self.left_behind,
+        }
+    }
 }
 
 impl Engine {
@@ -131,7 +149,7 @@ impl Engine {
             )));
         }
 
-        let _slot = self.take_rename_slot(old)?;
+        let _slot = self.take_rename_slot(old, new)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let state_dir = self.journal_state_dir()?;
@@ -148,8 +166,10 @@ impl Engine {
                 return Ok(report);
             }
             return Err(EngineError::Conflict(format!(
-                "a rename of '{}' is still finishing; try again in a moment",
-                journal.old
+                "the rename of '{}' to '{}' has not finished; {}, then rename again",
+                journal.old,
+                journal.new,
+                finish_hint(&journal)
             )));
         }
 
@@ -253,6 +273,7 @@ impl Engine {
             caller: rename_caller(scope),
             writable,
             manifest_draft,
+            relinked: None,
             done: Vec::new(),
         };
         if let Err(e) = journal.save(&state_dir) {
@@ -293,7 +314,7 @@ impl Engine {
         let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? else {
             return Ok(None);
         };
-        let _slot = self.take_rename_slot(&journal.old)?;
+        let _slot = self.take_rename_slot(&journal.old, &journal.new)?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         let _origins = self.lock_both_origins(&journal.old, &journal.new).await;
@@ -356,6 +377,13 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn fail_rename_after(&self, step: Option<RenameStep>) {
         *self.rename_fail_after.lock().unwrap() = step;
+    }
+
+    /// Wait `limit` instead of 30 s for the writes running in a domain a
+    /// rename is about to move; `None` restores the real limit.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_rename_drain_wait(&self, limit: Option<std::time::Duration>) {
+        *self.rename_drain_wait.lock().unwrap() = limit;
     }
 
     /// Hold the next rename right after `step` until the answered hold is
@@ -464,7 +492,6 @@ impl Engine {
     ) -> Result<Value> {
         let (old, new) = (journal.old.clone(), journal.new.clone());
         let mut moved: Vec<&'static str> = Vec::new();
-        let mut outcome = RenameOutcome::default();
         for &step in journal.steps() {
             let moves = !matches!(step, RenameStep::Manifest | RenameStep::Relink);
             // The domain is paused before the first step that moves it, and
@@ -478,8 +505,8 @@ impl Engine {
             {
                 return Err(EngineError::Conflict(format!(
                     "domain '{old}' is busy with a write that has not finished, so the rename to \
-                     '{new}' is waiting after its MANIFEST and link steps; send the same rename \
-                     again in a moment to finish it (the next daemon start also finishes it)"
+                     '{new}' is waiting after its MANIFEST and link steps; {}",
+                    finish_hint(&journal)
                 )));
             }
             if !journal.done.contains(&step) {
@@ -493,18 +520,29 @@ impl Engine {
                 if step == RenameStep::Config {
                     self.rekey_in_memory(&old, &new);
                 }
+                let mut outcome = RenameOutcome::default();
                 if let Err(e) = self
                     .run_rename_step(step, &journal, state_dir, &mut outcome)
                     .await
                 {
                     return Err(self.rename_stopped(&journal, step, e));
                 }
+                // The relink counts go into the journal with the step, so a
+                // rename finished by a resend or at the next start reports
+                // them too.
+                if step == RenameStep::Relink {
+                    journal.relinked = Some(outcome.into_report());
+                }
                 journal.done.push(step);
                 journal
                     .save(state_dir)
                     .map_err(|e| self.rename_stopped(&journal, step, io_error(e)))?;
             }
-            moved.push(step.name());
+            // `moved` names the stores the rename moved; the MANIFEST and
+            // relink steps move none and report under their own keys.
+            if moves {
+                moved.push(step.name());
+            }
             #[cfg(any(test, feature = "testing"))]
             self.rename_checkpoint(step).await?;
         }
@@ -541,21 +579,15 @@ impl Engine {
                 "the sync after renaming '{old}' to '{new}' failed; the next sync catches up"
             );
         }
-        let rewritten: Vec<Value> = outcome
-            .rewritten
-            .iter()
-            .map(|(domain, (engrams, references))| {
-                json!({ "domain": domain, "engrams": engrams, "references": references })
-            })
-            .collect();
+        let relinked = journal.relinked.clone().unwrap_or_default();
         Ok(json!({
             "domain": new,
             "previous": old,
             "local_only": journal.local_only,
             "manifest_written": journal.done.contains(&RenameStep::Manifest),
             "manifest_draft": journal.manifest_draft,
-            "rewritten": rewritten,
-            "left_behind": outcome.left_behind,
+            "rewritten": relinked.rewritten,
+            "left_behind": relinked.left_behind,
             "aliases": entry.aliases,
             "moved": moved,
         }))
@@ -566,7 +598,15 @@ impl Engine {
     /// finish in time.
     async fn pause_and_drain(&self, old: &str, new: &str) -> bool {
         self.rename_pause.pause(&[old, new]);
-        if self.rename_pause.drained(old, RENAME_WAIT).await {
+        #[cfg(any(test, feature = "testing"))]
+        let limit = self
+            .rename_drain_wait
+            .lock()
+            .unwrap()
+            .unwrap_or(RENAME_WAIT);
+        #[cfg(not(any(test, feature = "testing")))]
+        let limit = RENAME_WAIT;
+        if self.rename_pause.drained(old, limit).await {
             return true;
         }
         self.rename_pause.resume(&[old, new]);
@@ -652,9 +692,12 @@ impl Engine {
                     _ => 0,
                 };
                 if references > 0 {
-                    outcome
-                        .left_behind
-                        .push(json!({ "domain": domain, "path": path, "references": references }));
+                    outcome.left_behind.push(LeftBehind {
+                        domain,
+                        path,
+                        references,
+                        reason: None,
+                    });
                 }
                 continue;
             }
@@ -678,12 +721,12 @@ impl Engine {
                         Ok(Some((_, _, text))) => respell_old(&text, spellings, new).1,
                         _ => 0,
                     };
-                    outcome.left_behind.push(json!({
-                        "domain": domain,
-                        "path": path,
-                        "references": references,
-                        "reason": e.to_string(),
-                    }));
+                    outcome.left_behind.push(LeftBehind {
+                        domain,
+                        path,
+                        references,
+                        reason: Some(e.to_string()),
+                    });
                 }
             }
         }
@@ -1020,14 +1063,16 @@ impl Engine {
     }
 
     /// Take the one-rename slot, or say which rename holds it.
-    fn take_rename_slot(&self, old: &str) -> Result<RenameSlot<'_>> {
+    fn take_rename_slot(&self, old: &str, new: &str) -> Result<RenameSlot<'_>> {
         let mut slot = self.rename_slot.lock().unwrap();
-        if let Some(running) = slot.as_deref() {
+        if let Some((running, to)) = slot.as_ref() {
             return Err(EngineError::Conflict(format!(
-                "a rename of '{running}' is still finishing; try again in a moment"
+                "the rename of '{running}' to '{to}' is still running; try again once it is \
+                 done. If it stops before it is done, send that same rename again or restart \
+                 the daemon to finish it"
             )));
         }
-        *slot = Some(old.to_string());
+        *slot = Some((old.to_string(), new.to_string()));
         Ok(RenameSlot {
             slot: &self.rename_slot,
         })
@@ -1155,6 +1200,18 @@ fn renaming_conflict(name: String) -> EngineError {
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::Internal(e.to_string())
+}
+
+/// How to finish the rename `journal` records: the same rename sent again,
+/// or a daemon restart, which finishes it before serving.
+fn finish_hint(journal: &RenameJournal) -> String {
+    format!(
+        "send the same rename again (`crystalline domain rename {} {}{}`) to finish it, or \
+         restart the daemon, which finishes it before serving",
+        journal.old,
+        journal.new,
+        if journal.local_only { " --local" } else { "" }
+    )
 }
 
 /// The caller a full rename's journal keeps: `None` for the machine owner.

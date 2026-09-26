@@ -136,8 +136,40 @@ pub(crate) struct RenameJournal {
     /// reviews changes) rather than into the folder or the database.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manifest_draft: bool,
+    /// What the relink step did, recorded with the step so a rename finished
+    /// by a later call or at the next start reports the whole of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relinked: Option<RelinkReport>,
     /// The steps completed so far, in order.
     pub done: Vec<RenameStep>,
+}
+
+/// What a full rename's relink step respelled and what it left alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RelinkReport {
+    /// Per domain, in name order.
+    pub rewritten: Vec<RelinkCount>,
+    /// The engrams it found and did not respell.
+    pub left_behind: Vec<LeftBehind>,
+}
+
+/// The engrams and references the relink step respelled in one domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RelinkCount {
+    pub domain: String,
+    pub engrams: usize,
+    pub references: usize,
+}
+
+/// One engram whose links the relink step did not respell: in a domain the
+/// caller could only read, or one whose rewrite failed (`reason`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct LeftBehind {
+    pub domain: String,
+    pub path: String,
+    pub references: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The signed-in account a full rename acts for, as the journal keeps it.

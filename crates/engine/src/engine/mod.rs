@@ -995,9 +995,10 @@ pub struct Engine {
     // and a rename waits for the writes already running. See
     // [`crate::rename::RenamePause`] and `Engine::rename_domain_local`.
     rename_pause: crate::rename::RenamePause,
-    // The one rename this engine runs at a time, by the local name it
-    // renames; a second one is refused while it is taken.
-    rename_slot: std::sync::Mutex<Option<String>>,
+    // The one rename this engine runs at a time, as the local name it
+    // renames and the name it gets; a second one is refused while it is
+    // taken.
+    rename_slot: std::sync::Mutex<Option<(String, String)>>,
     // Set while a rename is between its index row step and its config step:
     // a spelling push then would drop the alias the index row step left for
     // the old name, since the configuration does not list it yet. A refresh
@@ -1012,6 +1013,10 @@ pub struct Engine {
     #[cfg(any(test, feature = "testing"))]
     rename_hold:
         std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
+    // How long a rename waits for the writes running in a domain before it
+    // gives up, when a test wants less than the real limit.
+    #[cfg(any(test, feature = "testing"))]
+    rename_drain_wait: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 /// One drafted engram, as the share-link surface hands it to the account a
@@ -1700,6 +1705,8 @@ impl Engine {
             write_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_hold: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            rename_drain_wait: std::sync::Mutex::new(None),
         }
     }
 
