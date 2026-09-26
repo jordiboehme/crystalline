@@ -31,10 +31,19 @@
  * dressing rather than only in the hero hall's own curios. It takes
  * priority over `?hero=` when both are given, and the HUD names it
  * `CURIO <KIND>` once it lands; an unknown kind is ignored, same as an
- * absent `?curio=`. `?at=prop:<kind>:<n>[:back]`, read only alongside
- * `?hero=` or `?curio=`, frames the forced hero or curio close instead of
- * showing the room from its entrance (`spotView`, the same pattern the
- * model gallery's `?at=` reads).
+ * absent `?curio=`.
+ *
+ * `?prop=<kind>` (2.6d C20) does the same for a rare prop kind, the poster,
+ * the canisters, the tower, the console or the marked crate
+ * (`roomWithForcedProp`), so one can be judged in a real room although it
+ * lands in few rooms of its own. It ranks below `?curio=` and `?hero=`, and
+ * the HUD names it `PROP <KIND>` once it lands; an unknown kind is
+ * ignored, same as an absent `?prop=`.
+ *
+ * `?at=prop:<kind>:<n>[:back|:side|:quarter|:close]`, read only alongside
+ * `?hero=`, `?curio=` or `?prop=`, frames the forced thing instead of
+ * showing the room from its entrance (`spotView`, the same pattern and
+ * views the model gallery's `?at=` reads).
  *
  * The screen is `ui/StationView.tsx`, shared with the game route and the
  * model gallery, and its HUD is `ui/Hud.tsx`, the game's own: its text lines are written
@@ -55,6 +64,7 @@ import { useHud } from "../ui/useHud";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../world/canned";
 import { CURIO_KINDS } from "../world/curios";
 import { HERO_KINDS } from "../world/heroes";
+import { RARE_PROP_KINDS, type RarePropKind } from "../world/props";
 import type { CurioKind, HeroKind, PlaceInput } from "../world/types";
 import { startDemo } from "./demo";
 
@@ -108,6 +118,14 @@ function curioFor(params: URLSearchParams): CurioKind | undefined {
     : undefined;
 }
 
+/** The rare prop kind `?prop=` names, or undefined for an absent or unknown one. */
+function propFor(params: URLSearchParams): RarePropKind | undefined {
+  const raw = params.get("prop");
+  return raw !== null && (RARE_PROP_KINDS as readonly string[]).includes(raw)
+    ? (raw as RarePropKind)
+    : undefined;
+}
+
 /**
  * The demo screen. The refusal is decided once, in a lazy state
  * initialiser: the lazy route only renders in a browser, where `window` is
@@ -133,6 +151,7 @@ export default function LookDemo() {
     const params = new URLSearchParams(window.location.search);
     const hero = heroFor(params);
     const curio = curioFor(params);
+    const prop = propFor(params);
     const at = params.get("at") ?? undefined;
     const { session, stop } = startDemo(canvas, sink, {
       forceRgba8: params.get("bloom") === "rgba8",
@@ -141,6 +160,7 @@ export default function LookDemo() {
       props: params.get("props") !== "0",
       ...(hero === undefined ? {} : { hero }),
       ...(curio === undefined ? {} : { curio }),
+      ...(prop === undefined ? {} : { prop }),
       ...(at === undefined ? {} : { at }),
     });
     sessionRef.current = session;

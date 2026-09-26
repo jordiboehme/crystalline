@@ -1,8 +1,9 @@
 /**
  * The block-pixel font and the pixel pictures built from it: titles and
  * demos on the arcade cabinets' attract screens and marquees (H14), the
- * pocket console's two screen pictures (C16), and the small "<=>" mark on
- * the back of the beige laptop's lid (C17).
+ * pocket console's two screen pictures (C16), the small "<=>" mark on
+ * the back of the beige laptop's lid (C17), and the 2.6d props' marks
+ * (`marks.ts`, 2.6d C16).
  *
  * A picture is a list of rows of characters, row 0 at the top, one
  * character per pixel; `.` is dark, any other character names a colour the
@@ -11,9 +12,11 @@
  * `k.panel` quad (two triangles) per horizontal run of equal characters,
  * so a lit bar of pixels costs the same as one pixel and no texture layer
  * or text key is needed. That merge is what keeps a cabinet's text inside
- * the hero triangle budget. `fit` centres a picture in a box with square
- * pixels, and `blinkPicture` draws one as blinking pixels, a group per
- * column quarter: the one way a screen that swaps two pictures is drawn.
+ * the hero triangle budget. `pixelBoxes` lays the same runs as thin boxes
+ * instead, for a mark too small to float a panel over its face. `fit`
+ * centres a picture in a box with square pixels, and `blinkPicture` draws
+ * one as blinking pixels, a group per column quarter: the one way a screen
+ * that swaps two pictures is drawn.
  */
 
 import type { Surface } from "../../geometry";
@@ -22,12 +25,20 @@ import type { Rgb } from "../../looks";
 import type { Surfaces } from "../common";
 
 /**
- * The block-pixel font: `A` to `Z`, `0` to `9`, the space, a one-pixel
- * period and the three marks `<`, `=` and `>` (the laptop's "<=>", C17),
- * each glyph 5 rows of 3 cells from the top, `#` lit and `.` dark (the
- * period glyph's own single lit cell sits at its bottom middle). It is the
- * smallest grid a capital letter still reads in, the size an old attract
- * screen used, and every on-screen title of the station is set in it.
+ * The block-pixel font: `A` to `Z`, `a` to `z`, `0` to `9`, the space, a
+ * one-pixel period and the three marks `<`, `=` and `>` (the laptop's
+ * "<=>", C17), each glyph 5 rows of 3 cells from the top, `#` lit and `.`
+ * dark (the period glyph's own single lit cell sits at its bottom
+ * middle). It is the smallest grid a capital letter still reads in, the
+ * size an old attract screen used, and every on-screen title of the
+ * station is set in it.
+ *
+ * The lower case (2.6d, for a badge whose original wordmark is lower
+ * case) shares one x-height: a short letter fills rows 2 to 4, an
+ * ascender climbs to row 0, `i` and `j` carry their dot in row 0 over a
+ * dark row 1, and a letter with a tail (`g`, `p`, `q`, `y`, and `j`'s
+ * hook) sits a row higher with its tail in row 4, since the grid has no
+ * room below the baseline. No lower-case glyph is its capital's shape.
  */
 export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   A: [".#.", "#.#", "###", "#.#", "#.#"],
@@ -56,6 +67,32 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   X: ["#.#", "#.#", ".#.", "#.#", "#.#"],
   Y: ["#.#", "#.#", ".#.", ".#.", ".#."],
   Z: ["###", "..#", ".#.", "#..", "###"],
+  a: ["...", "...", ".##", "#.#", ".##"],
+  b: ["#..", "#..", "##.", "#.#", "##."],
+  c: ["...", "...", ".##", "#..", ".##"],
+  d: ["..#", "..#", ".##", "#.#", ".##"],
+  e: ["...", "...", ".##", "###", ".##"],
+  f: [".##", ".#.", "###", ".#.", ".#."],
+  g: ["...", ".##", "#.#", ".##", "##."],
+  h: ["#..", "#..", "##.", "#.#", "#.#"],
+  i: [".#.", "...", ".#.", ".#.", ".#."],
+  j: ["..#", "...", "..#", "..#", "##."],
+  k: ["#..", "#..", "#.#", "##.", "#.#"],
+  l: ["#..", "#..", "#..", "#..", ".##"],
+  m: ["...", "...", "###", "###", "#.#"],
+  n: ["...", "...", "##.", "#.#", "#.#"],
+  o: ["...", "...", ".#.", "#.#", ".#."],
+  p: ["...", "##.", "#.#", "##.", "#.."],
+  q: ["...", ".##", "#.#", ".##", "..#"],
+  r: ["...", "...", ".##", "#..", "#.."],
+  s: ["...", "...", ".##", ".#.", "##."],
+  t: [".#.", ".#.", "###", ".#.", ".##"],
+  u: ["...", "...", "#.#", "#.#", ".##"],
+  v: ["...", "...", "#.#", "#.#", ".#."],
+  w: ["...", "...", "#.#", "###", "###"],
+  x: ["...", "...", "#.#", ".#.", "#.#"],
+  y: ["...", "#.#", "#.#", ".##", "##."],
+  z: ["...", "...", "###", ".#.", "###"],
   "0": ["###", "#.#", "#.#", "#.#", "###"],
   "1": [".#.", "##.", ".#.", ".#.", "###"],
   "2": ["##.", "..#", ".#.", "#..", "###"],
@@ -115,8 +152,8 @@ export function pixelRuns(rows: readonly string[]): PixelRun[] {
 /**
  * A text's 5 rows in the block-pixel font: its glyphs side by side with
  * one dark column between each two, so `"AB"` is 5 rows of 7. Throws on a
- * character the font lacks (lower case included): a title that cannot be
- * drawn is a bug, not something to skip silently.
+ * character the font lacks: a title that cannot be drawn is a bug, not
+ * something to skip silently.
  */
 export function textRows(text: string): string[] {
   const glyphs = [...text].map((c) => {
@@ -153,6 +190,40 @@ export function pixelPanel(
       a0 + r.col * px,
       a0 + (r.col + r.len) * px,
       d,
+      h1 - (r.row + 1) * px,
+      h1 - r.row * px,
+      s,
+    );
+  }
+}
+
+/**
+ * Draws a pixel picture as thin boxes standing on a face at depth `d0`:
+ * the same runs `pixelPanel` lays, each one `k.box` from `d0` out to `d1`
+ * (`surfaceOf` gives a run's surface, `null` leaves it dark), with the
+ * same `a0`, `h1` and `px` placing. For a mark smaller than about 3 cm,
+ * on a curio or on the designer tower (2.6d C16), where a panel lifted
+ * `DECAL_LIFT` off its face would stand as far out as the mark is tall:
+ * a box 1.5 mm proud sits on its face and reads as printed on it.
+ */
+export function pixelBoxes(
+  k: Kit,
+  rows: readonly string[],
+  a0: number,
+  h1: number,
+  px: number,
+  d0: number,
+  d1: number,
+  surfaceOf: (ch: string) => Surface | null,
+): void {
+  for (const r of runsOf(rows)) {
+    const s = surfaceOf(r.ch);
+    if (s === null) continue;
+    k.box(
+      a0 + r.col * px,
+      a0 + (r.col + r.len) * px,
+      d0,
+      d1,
       h1 - (r.row + 1) * px,
       h1 - r.row * px,
       s,

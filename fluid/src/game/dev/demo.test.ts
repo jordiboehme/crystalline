@@ -10,8 +10,13 @@ import { CANNED_BRIDGE, CANNED_WORKSHOP } from "../world/canned";
 import { CURIO_KINDS } from "../world/curios";
 import { heroBlocker, propFootprint } from "../world/footprints";
 import { generateRoom } from "../world/generate";
+import { RARE_PROP_KINDS } from "../world/props";
 import { overlaps } from "../world/sites";
-import { roomWithForcedCurio, roomWithForcedHero } from "./demo";
+import {
+  roomWithForcedCurio,
+  roomWithForcedHero,
+  roomWithForcedProp,
+} from "./demo";
 
 describe("roomWithForcedHero", () => {
   it("places the turret in a workshop, reporting it placed", () => {
@@ -124,5 +129,32 @@ describe("roomWithForcedCurio", () => {
         ).toBe(true);
       }
     }
+  });
+});
+
+describe("roomWithForcedProp", () => {
+  it("forces every rare kind into the canned workshop, and leaves its heroes alone (2.6d C20, Review Focus 5)", () => {
+    // Mutation caught: a forced draw that never reaches the rare step, or
+    // the mark forced without its take.
+    const base = generateRoom(CANNED_WORKSHOP);
+    for (const kind of RARE_PROP_KINDS) {
+      const { room, placed } = roomWithForcedProp(CANNED_WORKSHOP, kind);
+      expect(placed, kind).toBe(kind);
+      expect(
+        room.props.filter((p) => p.kind === kind),
+        kind,
+      ).toHaveLength(1);
+      expect(room.heroes, kind).toEqual(base.heroes);
+    }
+  });
+
+  it("falls back to the room without it, never throwing, where the kind has no place", () => {
+    // The canned bridge's cells beside its two terminals are taken (Baselines).
+    expect(() =>
+      roomWithForcedProp(CANNED_BRIDGE, "designer-tower"),
+    ).not.toThrow();
+    expect(
+      roomWithForcedProp(CANNED_BRIDGE, "designer-tower").placed,
+    ).toBeNull();
   });
 });

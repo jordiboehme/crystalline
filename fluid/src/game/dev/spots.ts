@@ -9,11 +9,17 @@
  * the fixture's own footprint when it has one (`spotFor`). `prop:<kind>:<n>`
  * (H16) frames the n-th hero or prop of that kind instead: a spot in front
  * of its face, at a distance that frames it, from `frameSpot`, pitched
- * toward a lifted or low hero's middle (`framesPitched`, C16).
- * `prop:<kind>:<n>[:back]` (C18, 2.6b) frames the n-th curio of that kind
- * close and tilted down instead, when `kind` is neither a hero nor a prop
- * kind (the three families' names are disjoint, pinned in `world/curios.ts`).
- * All three give null for a bad spot: an unknown kind, no such ordinal, no
+ * toward a lifted or low hero's middle (`framesPitched`, C16). The same
+ * pattern frames the n-th curio of that kind close and tilted down
+ * instead (C18, 2.6b), when `kind` is neither a hero nor a prop kind (the
+ * three families' names are disjoint, pinned in `world/curios.ts`).
+ *
+ * The prop pattern takes an optional view suffix (`SpotView`, 2.6d C20),
+ * for judging a model from more than its front: `:back` from behind,
+ * `:side` from its right side, `:quarter` from halfway between its front
+ * and its right, and `:close` a hero or prop from nearer (`CLOSE_BASE`,
+ * `CLOSE_SCALE`; a curio frame is close already). All three patterns give
+ * null for a bad spot: an unknown kind or view, no such ordinal, no
  * ordinal at all, or a negative one.
  *
  * `spotView` is the seam that carries a curio's or hero's pitch along with
@@ -112,7 +118,19 @@ function spotFor(fixture: Fixture): RoomSpec["spawn"] {
   };
 }
 
-const PROP_SPOT = /^prop:([a-z-]+):(\d+)(:back)?$/;
+/**
+ * How a `?at=` spot looks at its thing: from the front (the default),
+ * behind, the right side, halfway between the front and the right, or
+ * close (2.6d C20).
+ */
+export type SpotView = "front" | "back" | "side" | "quarter" | "close";
+
+const PROP_SPOT = /^prop:([a-z-]+):(\d+)(?::(back|side|quarter|close))?$/;
+
+/** How far a close frame starts from a hero's or prop's face, in metres, before its size is added (2.6d C20). */
+export const CLOSE_BASE = 0.6;
+/** How much of the longer side a close frame adds. */
+export const CLOSE_SCALE = 0.25;
 
 /**
  * True when a circle of the player's radius at (x, z) overlaps the box: the
@@ -157,7 +175,7 @@ function onFloorAt(room: RoomSpec): (px: number, pz: number) => boolean {
  * The four directions a framing spot is tried from, front first: `front`
  * itself, then right, left and back (a quarter turn each), as `[x, z]`
  * unit vectors. `frameSpot` and `frameCurio` (C18) both search these in
- * order (`frameCurio` reorders back first with `:back`).
+ * order (`frameCurio` reorders them by its view).
  */
 function sidesOf(
   front: readonly [number, number],
@@ -171,16 +189,47 @@ function sidesOf(
 }
 
 /**
- * A spot that frames `box` from `front` (H16): the player stands in front of
- * the box's face, facing it, `FRAME_BASE + FRAME_SCALE * longer side` out,
- * stepping 0.25 m closer while the circle is off the floor or on a blocker,
- * down to `PLAYER_RADIUS + SPOT_CLEARANCE`; if no distance works, the other
- * three sides are tried (right, left, back). Null when none works.
+ * The direction a view starts from, as `[x, z]`: `front` turned to the
+ * view (the side is `sidesOf`'s right, the quarter halfway between the
+ * front and that right, normalised; `close` looks from the front).
+ */
+function viewDir(
+  front: readonly [number, number],
+  view: SpotView,
+): readonly [number, number] {
+  const right: readonly [number, number] = [-front[1], front[0]];
+  switch (view) {
+    case "back":
+      return [-front[0], -front[1]];
+    case "side":
+      return right;
+    case "quarter": {
+      const x = front[0] + right[0];
+      const z = front[1] + right[1];
+      const n = Math.hypot(x, z);
+      return [x / n, z / n];
+    }
+    default:
+      return front;
+  }
+}
+
+/**
+ * A spot that frames `box` from `dir` (H16, 2.6d C20): the player stands
+ * out along `dir` from the box's centre, facing it, past the box's half
+ * extent along `dir` (`|dir.x| * halfX + |dir.z| * halfZ`, exactly the
+ * half width or half depth on an axis direction) by `FRAME_BASE +
+ * FRAME_SCALE * longer side`, or by `CLOSE_BASE + CLOSE_SCALE * longer
+ * side` when `close`, stepping 0.25 m closer while the circle is off the
+ * floor or on a blocker, down to `PLAYER_RADIUS + SPOT_CLEARANCE`; if no
+ * distance works, the other three quarter turns of `dir` are tried
+ * (`sidesOf`: right, left, back). Null when none works.
  */
 function frameSpot(
   room: RoomSpec,
   box: Box,
-  front: readonly [number, number],
+  dir0: readonly [number, number],
+  close = false,
 ): RoomSpec["spawn"] | null {
   const blockers = blockersFor(room);
   const onFloor = onFloorAt(room);
@@ -189,9 +238,11 @@ function frameSpot(
   const halfX = (box.x1 - box.x0) / 2;
   const halfZ = (box.z1 - box.z0) / 2;
   const longer = Math.max(box.x1 - box.x0, box.z1 - box.z0);
-  for (const dir of sidesOf(front)) {
-    const half = dir[0] !== 0 ? halfX : halfZ;
-    let dist = FRAME_BASE + FRAME_SCALE * longer;
+  for (const dir of sidesOf(dir0)) {
+    const half = Math.abs(dir[0]) * halfX + Math.abs(dir[1]) * halfZ;
+    let dist = close
+      ? CLOSE_BASE + CLOSE_SCALE * longer
+      : FRAME_BASE + FRAME_SCALE * longer;
     for (;;) {
       const px = cx + dir[0] * (half + dist);
       const pz = cz + dir[1] * (half + dist);
@@ -499,8 +550,12 @@ export function heroSightClear(
 
 /**
  * A spot that frames curio `c` close and tilted down (C18), with a clear
- * sight line to it: along each of `sidesOf(c)`'s four directions (front,
- * right, left, back; back first when `back`), the distance from the curio's
+ * sight line to it: along each of `sidesOf(c)`'s four directions, in the
+ * order `view` gives (front, right, left, back for `front` and `close`,
+ * since a curio frame is close already; back, front, right, left for
+ * `back`; right, front, left, back for `side`; and for `quarter` the
+ * diagonal between the front and the right first, then front, right,
+ * left, back, 2.6d C20), the distance from the curio's
  * centre grows from `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`. Among
  * the spots whose player circle is on the floor and clear of every blocker,
  * the first one whose sight line (eye height to the curio's middle) crosses
@@ -514,7 +569,7 @@ export function heroSightClear(
 function frameCurio(
   room: RoomSpec,
   c: Curio,
-  back: boolean,
+  view: SpotView,
 ): { spawn: RoomSpec["spawn"]; pitch: number } | null {
   const blockers = blockersFor(room);
   const onFloor = onFloorAt(room);
@@ -523,14 +578,24 @@ function frameCurio(
   const cz = (box.z0 + box.z1) / 2;
   const front = HERO_FRONT[c.turn] ?? [0, -1];
   const all = sidesOf(front);
-  const order = back ? [3, 0, 1, 2] : [0, 1, 2, 3];
+  const pick = (order: readonly number[]) =>
+    order.flatMap((i) => {
+      const d = all[i];
+      return d === undefined ? [] : [d];
+    });
+  const dirs: readonly (readonly [number, number])[] =
+    view === "back"
+      ? pick([3, 0, 1, 2])
+      : view === "side"
+        ? pick([1, 0, 2, 3])
+        : view === "quarter"
+          ? [viewDir(front, "quarter"), ...all]
+          : all;
   const midY = curioMid(c);
   const target: Point3 = { x: cx, y: midY, z: cz };
   const occluders = occludersFor(room, c);
   let fallback: { spawn: RoomSpec["spawn"]; pitch: number } | null = null;
-  for (const i of order) {
-    const dir = all[i];
-    if (dir === undefined) continue;
+  for (const dir of dirs) {
     for (let step = 0; step <= CURIO_STEPS; step++) {
       const dist = CURIO_NEAR + step * CURIO_STEP;
       const px = cx + dir[0] * dist;
@@ -570,7 +635,9 @@ function frameCurio(
  * n-th hero of that kind (in `room.heroes` order) when `HERO_KINDS` holds
  * it, else the n-th prop of that kind (in `room.props` order) when
  * `PROP_KINDS` holds it, framed from its front (`frameSpot`,
- * `HERO_FRONT[turn]`): pitch 0, or for a lifted or low hero a pitch toward
+ * `HERO_FRONT[turn]`), or from the direction its view suffix names
+ * (`viewDir`: `:back`, `:side`, `:quarter`; `:close` from the front but
+ * nearer, 2.6d C20): pitch 0, or for a lifted or low hero a pitch toward
  * its middle (C16), clamped to `MAX_PITCH` (`framesPitched`, `pitchTo`); a
  * prop always keeps pitch 0. A wall or ceiling prop, which has no
  * `propFootprint`, is framed by the box of its own edge (`EDGE_PROP_SIZE`).
@@ -579,12 +646,14 @@ function frameCurio(
  * but the field pack is one kind where they do not (its variant 1 sorts
  * before variant 0 in the hero hall).
  *
- * `spotView(room, "prop:<kind>:<n>[:back]")` (C18, 2.6b), when `kind` is
+ * `spotView(room, "prop:<kind>:<n>")` (C18, 2.6b), when `kind` is
  * neither a hero nor a prop kind, is the n-th curio of that kind (in
  * `room.curios` order), framed close and tilted down (`frameCurio`), with a
- * real pitch; `:back` frames it from its `-front` side first. Null for a bad
- * spot: an unknown kind in every one of the three families, no such ordinal,
- * no ordinal at all, or a negative one. The gallery reads this from `?at=`;
+ * real pitch; a view suffix changes the order its sides are tried in
+ * (`:back` its `-front` side first, `:side` its right first, `:quarter`
+ * the diagonal between its front and its right first). Null for a bad
+ * spot: an unknown kind in every one of the three families, an unknown
+ * view, no such ordinal, no ordinal at all, or a negative one. The gallery reads this from `?at=`;
  * browser shots start every malfunction, every model or every curio there.
  * Development only, like everything in `dev/`.
  *
@@ -603,16 +672,19 @@ export function spotView(
   }
   const prop = PROP_SPOT.exec(spot);
   if (prop === null) return null;
-  const [, kind, n, back] = prop;
+  const [, kind, n, suffix] = prop;
   if (kind === undefined || n === undefined) return null;
   const i = Number(n);
+  const view = (suffix ?? "front") as SpotView;
+  const close = view === "close";
   if ((HERO_KINDS as readonly string[]).includes(kind)) {
     const h = room.heroes.filter((x) => x.kind === kind)[i];
     if (h === undefined) return null;
     const spawn = frameSpot(
       room,
       heroFootprint(h),
-      HERO_FRONT[heroTurn(h)] ?? [0, -1],
+      viewDir(HERO_FRONT[heroTurn(h)] ?? [0, -1], view),
+      close,
     );
     return spawn === null
       ? null
@@ -622,12 +694,17 @@ export function spotView(
     const p = room.props.filter((x) => x.kind === kind)[i];
     if (p === undefined) return null;
     const box = propFootprint(p) ?? footprint(edgeOf(p), EDGE_PROP_SIZE);
-    const spawn = frameSpot(room, box, HERO_FRONT[p.turn] ?? [0, -1]);
+    const spawn = frameSpot(
+      room,
+      box,
+      viewDir(HERO_FRONT[p.turn] ?? [0, -1], view),
+      close,
+    );
     return spawn === null ? null : { spawn, pitch: 0 };
   }
   const c = room.curios.filter((x) => x.kind === kind)[i];
   if (c === undefined) return null;
-  return frameCurio(room, c, back !== undefined);
+  return frameCurio(room, c, view);
 }
 
 /**

@@ -1,36 +1,46 @@
 /**
- * The readable-text guard (C12): the hero and curio recipes draw text as
- * block-pixel geometry, and the homage rule allows only the station's own
- * titles and the three approved exceptions. Every double-quoted literal
- * in a recipe file that holds a capital letter or one of the marks
- * `<`, `=`, `>` or `?` must be on the list, and so must every backtick
- * literal of the same shape in code (comments, which name constants in
- * backticks, are stripped first). Mutation caught: any new readable
- * string in a recipe (add `"FOO"` or a backtick `FOO` to a recipe and this
- * fails).
+ * The readable-text guard (C12, 2.6d C16): the hero, curio and prop
+ * recipes draw text as block-pixel geometry, and the homage rule allows
+ * only the station's own titles and the approved exceptions (2.6a to
+ * 2.6c), and the 2.6d marks of `marks.ts`. Every double-quoted literal of
+ * letters, digits, spaces, periods and the marks `<`, `=`, `>` and `?` in
+ * a recipe file or in `marks.ts` that holds a digit or one of those
+ * marks, or capitals and no lower case, must be on the list, and so must
+ * every backtick literal of the same shape in code (comments, which name
+ * constants in backticks, are stripped first). The 2.6d strings may be
+ * spelled in `marks.ts` alone, and no recipe hands `textRows` a literal
+ * with lower case in it, so the font's lower case is set from `marks.ts`
+ * alone. Mutation caught: any new readable string in a recipe (add
+ * `"FOO"`, `"42"` or a backtick `FOO` to a recipe and this fails).
  */
 
 import { describe, expect, it } from "vitest";
 
 /**
- * Every hero and curio recipe file, raw, by path: gathered by glob, so a
- * batch file a later task adds is scanned without anyone listing it.
- * `pixels.ts` is left out (its glyph keys are the font, not text drawn),
- * and so are the tests.
+ * Every hero, curio and prop recipe file and `marks.ts`, raw, by path:
+ * gathered by glob, so a batch file a later task adds is scanned without
+ * anyone listing it. `pixels.ts` is left out (its glyph keys are the font,
+ * not text drawn), and so are the tests.
  */
 const SOURCES = Object.fromEntries(
   Object.entries(
-    import.meta.glob<string>("./models/{heroes,curios}/*.ts", {
-      query: "?raw",
-      import: "default",
-      eager: true,
-    }),
+    import.meta.glob<string>(
+      ["./models/{heroes,curios,props}/*.ts", "./models/marks.ts"],
+      {
+        query: "?raw",
+        import: "default",
+        eager: true,
+      },
+    ),
   ).filter(
     ([path]) => !path.endsWith(".test.ts") && !path.endsWith("/pixels.ts"),
   ),
 );
 
-/** The station's own titles, then the approved exceptions (2.6a, 2.6b, 2.6c). */
+/**
+ * The station's own titles, then the approved exceptions (2.6a, 2.6b,
+ * 2.6c), then the 2.6d marks of `marks.ts` (C16).
+ */
 const READABLE = new Set([
   "TILEFALL",
   "ROCK RAIN",
@@ -43,28 +53,108 @@ const READABLE = new Set([
   "PUBLIC",
   "CALL",
   "BOX",
+  // The saucer poster's caption.
+  "I WANT TO BELIEVE",
+  // The capsule maker's word: capsule case, marked crate, gravity console.
+  "CAPSULE CORP.",
+  // The five capsules' numbers.
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  // The ooze canisters' letters.
+  "TCRI",
+  // The designer tower's badge and its clock-speed display.
+  "HIGHSCREEN",
+  "40",
+  // The gravity console's readout.
+  "300G",
+  // Both desk computers' badge.
+  "commodore 64",
+  // The reactor case's plaque.
+  "PROOF THAT TONY STARK HAS A HEART",
 ]);
+
+/** The 2.6d strings, which only `marks.ts` may spell (C16). */
+const MARKS_ONLY = [
+  "I WANT TO BELIEVE",
+  "CAPSULE CORP.",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "TCRI",
+  "HIGHSCREEN",
+  "40",
+  "300G",
+  "commodore 64",
+  "PROOF THAT TONY STARK HAS A HEART",
+];
+
+/** A source with its comments stripped: comments name constants in backticks (`CLUSTER`); only code draws. */
+const codeOf = (src: string): string =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
 describe("readable text in the recipes", () => {
   it("draws no string but the station's titles and the approved exceptions", () => {
-    // The folders hold the files the 2.6c tasks fill, at the least.
-    for (const name of ["floaters", "exhibits", "mechs", "street", "retro"])
+    // The folders hold the files the 2.6c and 2.6d tasks fill, at the least.
+    for (const name of [
+      "floaters",
+      "exhibits",
+      "mechs",
+      "street",
+      "retro",
+      "finds",
+      "desktop",
+      "critters",
+      "marked",
+      "rare",
+      "walker",
+      "marks",
+    ])
       expect(
         Object.keys(SOURCES).some((p) => p.endsWith(`/${name}.ts`)),
         name,
       ).toBe(true);
     for (const [name, src] of Object.entries(SOURCES)) {
-      // Comments name constants in backticks (`CLUSTER`); only code draws.
-      const code = src
-        .replace(/\/\*[\s\S]*?\*\//g, "")
-        .replace(/\/\/.*$/gm, "");
+      const code = codeOf(src);
       const found = [
-        ...code.matchAll(/"([A-Z0-9 .?<=>]+)"|`([A-Z0-9 .?<=>]+)`/g),
+        ...code.matchAll(/"([A-Za-z0-9 .?<=>]+)"|`([A-Za-z0-9 .?<=>]+)`/g),
       ]
         .map((m) => m[1] ?? m[2] ?? "")
-        .filter((t) => /[A-Z?<=>]/.test(t));
+        .filter(
+          (t) => /[0-9?<=>]/.test(t) || (/[A-Z]/.test(t) && !/[a-z]/.test(t)),
+        );
       for (const t of found)
         expect(READABLE.has(t), `${name}: ${t}`).toBe(true);
     }
+  });
+
+  it("keeps the 2.6d strings in marks.ts alone (2.6d C16)", () => {
+    // Mutation caught: a recipe spelling "TCRI" itself instead of reading
+    // MARKS, which the allowlist alone would let through.
+    for (const [name, src] of Object.entries(SOURCES)) {
+      if (name.endsWith("/marks.ts")) continue;
+      const code = codeOf(src);
+      for (const t of MARKS_ONLY)
+        expect(
+          code.includes(`"${t}"`) || code.includes(`\`${t}\``),
+          `${name}: ${t}`,
+        ).toBe(false);
+    }
+  });
+
+  it("hands textRows no literal of a recipe's own (2.6d C16)", () => {
+    // The font sets lower case too, which the filter above does not see
+    // (it passes lower-case and mixed-case literals, which name kinds,
+    // banks and parameters), so a lower-case word set straight into
+    // `textRows` would pass it. Mutation caught: `textRows("word")` or
+    // `textRows(`Word`)` in any recipe.
+    for (const [name, src] of Object.entries(SOURCES))
+      expect(/textRows\(\s*["'`][^"'`]*[a-z]/.test(codeOf(src)), name).toBe(
+        false,
+      );
   });
 });

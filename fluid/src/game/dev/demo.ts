@@ -52,11 +52,22 @@
  * without it, never throwing; the HUD's frame line names it once it lands
  * (`CURIO <KIND>`).
  *
- * `options.at`, read only together with `options.hero` or `options.curio`,
- * runs `spotView` on the room those build and, when it finds a spot, shows
- * the room there with that spot's pitch instead of at its entrance (C18,
- * 2.6b): the same close, tilted framing the gallery's `?at=` reads,
- * without leaving the look demo.
+ * `options.prop` forces a rare prop kind into the shown room the same way
+ * (2.6d C20), through the rare step's own forced draws
+ * (`roomWithForcedProp`, `forcedRareDraws`): a rare kind lands in few
+ * rooms of its own, so this is how one is shown standing in a real room.
+ * The room is dressed again with only that kind's rare draw taken, and its
+ * curios are placed again on the new props, as `options.hero` does. It
+ * overrides `options.props` too, and ranks below `options.curio` and
+ * `options.hero` when more than one is given. A kind that finds no place
+ * falls back to the room dressed without it, never throwing; the HUD's
+ * frame line names it once it lands (`PROP <KIND>`).
+ *
+ * `options.at`, read together with `options.hero`, `options.curio` or
+ * `options.prop`, runs `spotView` on the room those build and, when it
+ * finds a spot, shows the room there with that spot's pitch instead of at
+ * its entrance (C18, 2.6b): the same framing, view suffixes included, the
+ * gallery's `?at=` reads, without leaving the look demo.
  */
 
 import { createSession, type HudSink, type Session } from "../session";
@@ -68,7 +79,7 @@ import {
   type CurioSlot,
   type SlotDraw,
 } from "../world/curios";
-import { dressRoom } from "../world/dress";
+import { NO_RARE, dressRoom, type RareDraws } from "../world/dress";
 import { generateRoom } from "../world/generate";
 import {
   ANY_POOL,
@@ -77,7 +88,8 @@ import {
   placeHeroes,
   type HeroDraws,
 } from "../world/heroes";
-import { dressingSites } from "../world/sites";
+import type { RarePropKind } from "../world/props";
+import { NO_RESERVE, dressingSites } from "../world/sites";
 import type {
   Archetype,
   CurioKind,
@@ -252,6 +264,42 @@ export function roomWithForcedCurio(
 }
 
 /**
+ * The rare draws that force `kind` and nothing else (2.6d C20): its own
+ * draw taken, every other rare draw off, the mark at roll 0 for the marked
+ * crate (the first eligible crate in seed order).
+ */
+export function forcedRareDraws(kind: RarePropKind): RareDraws {
+  return {
+    ...NO_RARE,
+    poster: kind === "saucer-poster",
+    canisters: kind === "ooze-canisters",
+    tower: kind === "designer-tower",
+    panel: kind === "gravity-console",
+    mark: { take: kind === "marked-crate", roll: 0 },
+  };
+}
+
+/**
+ * The room `place` becomes with rare prop `kind` forced into it:
+ * `generateRoom`'s room, its props dressed again with `forcedRareDraws`, and
+ * its curios placed again on the new props, as `roomWithForcedHero` does.
+ * The heroes stay as drawn, and the dressing keeps clear of them as
+ * `generateRoom`'s does. `placed` is `kind` when it landed, else null.
+ */
+export function roomWithForcedProp(
+  place: PlaceInput,
+  kind: RarePropKind,
+): { room: RoomSpec; placed: RarePropKind | null } {
+  const built = generateRoom(place);
+  const withProps: RoomSpec = {
+    ...built,
+    props: dressRoom(built, NO_RESERVE, forcedRareDraws(kind)),
+  };
+  const placed = withProps.props.some((p) => p.kind === kind) ? kind : null;
+  return { room: { ...withProps, curios: placeCurios(withProps) }, placed };
+}
+
+/**
  * Starts the look demo on `canvas` and returns its cleanup and the session,
  * which the shell needs to close the CRT reader.
  *
@@ -272,11 +320,12 @@ export function roomWithForcedCurio(
  *
  * `options.curio` does the same for a curio kind (`roomWithForcedCurio`),
  * taking priority over `options.hero` when both are given: only one of them
- * is what a given shot is judging. `options.at`, read only alongside
- * `options.hero` or `options.curio`, runs `spotView` on the room `curio` or
- * `hero` built and shows it there instead of at the entrance, with that
- * spot's pitch; ignored otherwise, and ignored (with a spawn at the
- * entrance) when the spot does not resolve.
+ * is what a given shot is judging. `options.prop` does it for a rare prop
+ * kind (`roomWithForcedProp`), below both. `options.at`, read only
+ * alongside `options.hero`, `options.curio` or `options.prop`, runs
+ * `spotView` on the room they built and shows it there instead of at the
+ * entrance, with that spot's pitch; ignored otherwise, and ignored (with a
+ * spawn at the entrance) when the spot does not resolve.
  */
 export function startDemo(
   canvas: HTMLCanvasElement,
@@ -288,6 +337,7 @@ export function startDemo(
     props?: boolean;
     hero?: HeroKind;
     curio?: CurioKind;
+    prop?: RarePropKind;
     at?: string;
   },
 ): { session: Session; stop: () => void } {
@@ -295,12 +345,14 @@ export function startDemo(
   const withProps = options.props ?? true;
   const hero = options.hero;
   const curio = options.curio;
+  const prop = options.prop;
   const at = options.at;
   let retired = false;
   let placedHero: HeroKind | null = null;
   let placedCurio: CurioKind | null = null;
+  let placedProp: RarePropKind | null = null;
   const labelledHud: HudSink =
-    hero === undefined && curio === undefined
+    hero === undefined && curio === undefined && prop === undefined
       ? hud
       : {
           ...hud,
@@ -310,6 +362,7 @@ export function startDemo(
               placedCurio === null
                 ? null
                 : `CURIO ${placedCurio.toUpperCase()}`,
+              placedProp === null ? null : `PROP ${placedProp.toUpperCase()}`,
             ].filter((label): label is string => label !== null);
             hud.frame(
               labels.length === 0 ? text : `${text}  ${labels.join("  ")}`,
@@ -324,7 +377,7 @@ export function startDemo(
     openFluid: options.openFluid,
     forceRgba8: options.forceRgba8,
   });
-  /** Shows a room built by `hero` or `curio`, framed at `at` when it resolves. */
+  /** Shows a room built by `hero`, `curio` or `prop`, framed at `at` when it resolves. */
   const showBuilt = (room: RoomSpec) => {
     const spot = at === undefined ? null : spotView(room, at);
     session.showRoom(
@@ -340,6 +393,10 @@ export function startDemo(
     } else if (hero !== undefined) {
       const forced = roomWithForcedHero(p, hero);
       placedHero = forced.placed;
+      showBuilt(forced.room);
+    } else if (prop !== undefined) {
+      const forced = roomWithForcedProp(p, prop);
+      placedProp = forced.placed;
       showBuilt(forced.room);
     } else if (withProps) session.showCanned(p);
     else

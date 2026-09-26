@@ -32,6 +32,7 @@ import {
   HERO_FRONT,
   heroFootprint,
   heroLift,
+  heroTurn,
   propFootprint,
 } from "../world/footprints";
 import { generateRoom } from "../world/generate";
@@ -238,6 +239,48 @@ describe("prop spots (H16)", () => {
     if (box === null) throw new Error("a crate has a box");
     const { dot } = looksAt(gallery, "prop:crate:0", box);
     expect(dot).toBeGreaterThan(0.99);
+  });
+
+  it("frames a hero, a prop and a curio from the side, at three-quarter and close (2.6d C20)", () => {
+    // Mutation caught: the view suffix ignored (every view framed from the
+    // front), or the quarter direction left unnormalised.
+    const walker = hall.heroes.find((h) => h.kind === "slab-walker");
+    if (walker === undefined) throw new Error("the hall holds the walker");
+    const box = heroFootprint(walker);
+    const front = HERO_FRONT[heroTurn(walker)] ?? [0, -1];
+    const cosTo = (spot: string) => {
+      const view = spotView(hall, spot);
+      if (view === null) throw new Error(`no spot for ${spot}`);
+      const p = spawnPlayer({ ...hall, spawn: view.spawn });
+      const dx = p.x - (box.x0 + box.x1) / 2;
+      const dz = p.z - (box.z0 + box.z1) / 2;
+      return {
+        cos: (dx * front[0] + dz * front[1]) / Math.hypot(dx, dz),
+        dist: Math.hypot(dx, dz),
+      };
+    };
+    expect(cosTo("prop:slab-walker:0").cos).toBeCloseTo(1, 2);
+    expect(Math.abs(cosTo("prop:slab-walker:0:side").cos)).toBeLessThan(0.05);
+    expect(cosTo("prop:slab-walker:0:quarter").cos).toBeCloseTo(
+      Math.SQRT1_2,
+      1,
+    );
+    // An unnormalised diagonal keeps the bearing but stands the player
+    // about 1.4 times as far out.
+    expect(cosTo("prop:slab-walker:0:quarter").dist).toBeLessThan(
+      cosTo("prop:slab-walker:0").dist + 0.5,
+    );
+    expect(cosTo("prop:slab-walker:0:close").dist).toBeLessThan(
+      cosTo("prop:slab-walker:0").dist,
+    );
+    for (const view of ["", ":side", ":quarter", ":back"]) {
+      expect(spotView(hall, `prop:hover-drone:0${view}`), view).not.toBeNull();
+      expect(
+        spotView(gallery, `prop:ooze-canisters:0${view}`),
+        view,
+      ).not.toBeNull();
+    }
+    expect(spotView(hall, "prop:slab-walker:0:sideways")).toBeNull();
   });
 
   it("gives null for a kind the room lacks, past the last one, or a bad name", () => {
