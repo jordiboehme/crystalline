@@ -21,6 +21,7 @@ pub mod overlay_journal;
 pub mod params;
 #[doc(hidden)]
 pub mod poller;
+mod rename;
 #[doc(hidden)]
 pub mod review;
 #[doc(hidden)]

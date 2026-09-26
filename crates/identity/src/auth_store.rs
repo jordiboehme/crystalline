@@ -3931,6 +3931,75 @@ impl AuthStore {
         self.finish(result).await
     }
 
+    /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
+    /// its `domain_member` rows and its `overlay_grant` rows (the draft
+    /// share-links, revoked ones included, so the history stays with the
+    /// domain), in one transaction. For a domain rename, which has already
+    /// decided the name changes; this decides nothing.
+    ///
+    /// The renamed domain's records win. Rows already under `new` while `old`
+    /// still has records can only be stale ones - left by a removal that never
+    /// forgot them, since this call is one transaction and never leaves rows
+    /// under both names - so every one of them is dropped: a stale owner,
+    /// member or share-link must never gain access to the renamed domain.
+    /// Names compare byte for byte, so a rename that changes only the case
+    /// moves the rows too.
+    ///
+    /// Idempotent, for a rename completed again after a crash: with nothing
+    /// under `old` the call changes nothing, and in particular leaves the rows
+    /// under `new` alone, since those are the ones an earlier run moved.
+    pub async fn rename_domain(&self, old: &str, new: &str) -> Result<()> {
+        let old = normalize_domain(old)?;
+        let new = normalize_domain(new)?;
+        if old == new {
+            return Ok(());
+        }
+        let _guard = self.guard.lock().await;
+        let context = || format!("moving the records of domain '{old}' to '{new}'");
+        self.begin_immediate().await.with_context(context)?;
+        let names = vec![Value::Text(old.clone()), Value::Text(new.clone())];
+        let result = async {
+            let mut old_has_records = false;
+            for sql in [
+                "SELECT 1 FROM domain_acl WHERE domain = ?1",
+                "SELECT 1 FROM domain_member WHERE domain = ?1",
+                "SELECT 1 FROM overlay_grant WHERE domain = ?1",
+            ] {
+                if self
+                    .query_first(sql, vec![Value::Text(old.clone())])
+                    .await
+                    .with_context(context)?
+                    .is_some()
+                {
+                    old_has_records = true;
+                    break;
+                }
+            }
+            if !old_has_records {
+                return Ok(());
+            }
+            // Clear the stale rows first, then move: plain statements rather
+            // than an upsert clause, for the reason `set_domain_visibility`
+            // gives.
+            for sql in [
+                "DELETE FROM domain_acl WHERE domain = ?2",
+                "DELETE FROM domain_member WHERE domain = ?2",
+                "DELETE FROM overlay_grant WHERE domain = ?2",
+                "UPDATE domain_acl SET domain = ?2 WHERE domain = ?1",
+                "UPDATE domain_member SET domain = ?2 WHERE domain = ?1",
+                "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
+            ] {
+                self.conn
+                    .execute(sql, names.clone())
+                    .await
+                    .with_context(context)?;
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
     /// Hand a private domain to a different owner.
     ///
     /// The new owner must be an existing, enabled account, and the domain must
@@ -6716,6 +6785,183 @@ mod tests {
             .set_domain_visibility("lab", false, "keeper")
             .await
             .unwrap();
+    }
+
+    /// A domain rename carries every record the accounts database keeps under
+    /// the old name: the acl row with its owner, the membership rows and the
+    /// draft share-links. A second call finds nothing under the old name and is
+    /// fine, which is what a rename completed again after a crash does.
+    #[tokio::test]
+    async fn renaming_a_domain_moves_its_acl_members_and_grants() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("eng", true, "keeper")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("eng", "mem", MemberLevel::Viewer, "keeper")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("eng", "out", MemberLevel::Editor, "keeper")
+            .await
+            .unwrap();
+        let grant = store
+            .mint_overlay_grant("eng", "plan.md", "keeper", None)
+            .await
+            .unwrap();
+
+        store.rename_domain("eng", "platform").await.unwrap();
+
+        assert!(store.domain_visibility("eng").await.unwrap().is_none());
+        assert!(store.domain_members("eng").await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .domain_visibility("platform")
+                .await
+                .unwrap()
+                .map(|acl| acl.owner),
+            Some("keeper".to_string())
+        );
+        let mut members: Vec<(String, MemberLevel)> = store
+            .domain_members("platform")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.principal, m.level))
+            .collect();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            members,
+            vec![
+                ("mem".to_string(), MemberLevel::Viewer),
+                ("out".to_string(), MemberLevel::Editor),
+            ]
+        );
+        assert_eq!(
+            store.overlay_grant_domain(&grant.token).await.unwrap(),
+            Some("platform".to_string())
+        );
+        assert!(
+            store
+                .overlay_grants_of("keeper", "eng", "plan.md")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .rename_domain("eng", "platform")
+            .await
+            .expect("a second call finds nothing under the old name");
+        assert_eq!(store.domain_members("platform").await.unwrap().len(), 2);
+        store
+            .rename_domain("never", "seen")
+            .await
+            .expect("a domain with no records has nothing to move");
+    }
+
+    /// The renamed domain's records win over stale ones already under the new
+    /// name: the stale acl owner, every stale member (colliding or not) and
+    /// every stale share-link go, so none of them gains access to the renamed
+    /// domain. A second call leaves the moved rows alone.
+    #[tokio::test]
+    async fn renaming_onto_stale_records_keeps_the_renamed_domains_rows() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("eng", true, "keeper")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("eng", "mem", MemberLevel::Editor, "keeper")
+            .await
+            .unwrap();
+        let live = store
+            .mint_overlay_grant("eng", "plan.md", "keeper", None)
+            .await
+            .unwrap();
+        // Stale records under the new name, from a removal that never forgot
+        // them: another owner, a colliding and a non-colliding member, and a
+        // share-link.
+        store
+            .set_domain_visibility("platform", true, "out")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("platform", "mem", MemberLevel::Viewer, "out")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("platform", "keeper", MemberLevel::Manager, "out")
+            .await
+            .unwrap();
+        let stale = store
+            .mint_overlay_grant("platform", "old.md", "out", None)
+            .await
+            .unwrap();
+
+        store.rename_domain("eng", "platform").await.unwrap();
+        assert!(store.domain_visibility("eng").await.unwrap().is_none());
+        assert!(store.domain_members("eng").await.unwrap().is_empty());
+        renamed_records_won(&store, &live.token, &stale.token).await;
+
+        store
+            .rename_domain("eng", "platform")
+            .await
+            .expect("a second call finds nothing under the old name");
+        renamed_records_won(&store, &live.token, &stale.token).await;
+    }
+
+    /// What `renaming_onto_stale_records_keeps_the_renamed_domains_rows`
+    /// expects under `platform` after each call.
+    async fn renamed_records_won(store: &AuthStore, live: &str, stale: &str) {
+        assert_eq!(
+            store
+                .domain_visibility("platform")
+                .await
+                .unwrap()
+                .map(|acl| acl.owner),
+            Some("keeper".to_string()),
+            "the renamed domain's owner, not the stale one"
+        );
+        let members: Vec<(String, MemberLevel)> = store
+            .domain_members("platform")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.principal, m.level))
+            .collect();
+        assert_eq!(
+            members,
+            vec![("mem".to_string(), MemberLevel::Editor)],
+            "only the renamed domain's members, at their levels"
+        );
+        assert_eq!(
+            store.overlay_grant_domain(live).await.unwrap(),
+            Some("platform".to_string())
+        );
+        assert_eq!(
+            store.overlay_grant_domain(stale).await.unwrap(),
+            None,
+            "the stale share-link is gone"
+        );
+    }
+
+    /// A rename that changes only the case is a real rename: names are stored
+    /// as registered and compare byte for byte.
+    #[tokio::test]
+    async fn a_case_only_domain_rename_moves_the_records() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("Eng", true, "keeper")
+            .await
+            .unwrap();
+        store.rename_domain("Eng", "eng").await.unwrap();
+        assert!(store.domain_visibility("Eng").await.unwrap().is_none());
+        assert!(store.domain_visibility("eng").await.unwrap().is_some());
     }
 
     /// Privatizing a domain that is already private writes nothing: not the

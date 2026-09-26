@@ -1930,11 +1930,18 @@ pub trait Store: Send + Sync {
 
     /// Rename a domain row in place: `domain.name` becomes `new` and the id
     /// stays, so every engram and every bound reference stays attached. The
-    /// row's own spelling follows it (taking `new` from any domain that held
-    /// it as a canonical name or alias, since local names win), and every
-    /// `relation.to_domain` and `link.to_domain` equal to `old` becomes `new`.
-    /// When `new` was another domain's spelling, the references bound through
-    /// it are unbound; the caller runs the resolve passes afterwards.
+    /// row's own spelling follows it in the same transaction (taking `new`
+    /// from any domain that held it as a canonical name or alias, since local
+    /// names win), and `old` stays behind as an alias spelling of the same
+    /// row. `relation.to_domain` and `link.to_domain` keep the text as
+    /// written: a reference spelled `old` resolves through that alias, before
+    /// and after the rename, so no file reads as unresolved. When `new` was
+    /// another domain's spelling, the references bound through it are
+    /// unbound; the caller runs the resolve passes afterwards.
+    ///
+    /// The alias lasts until the next [`Store::replace_domain_spellings`] for
+    /// the row, which keeps only what its list names: the caller records `old`
+    /// among the domain's aliases before that runs.
     ///
     /// Idempotent, for a rename that is completed again after a crash: a row
     /// already named `new` with none named `old` is fine, and so is no row

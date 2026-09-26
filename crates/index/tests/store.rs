@@ -1257,9 +1257,11 @@ parity!(
 );
 
 /// A row rename moves the name in place: the id stays, so every engram and
-/// every bound reference stays attached, the own spelling follows, and the
-/// stored `to_domain` text follows too.
-async fn renaming_a_row_keeps_its_id_and_moves_to_domain_text(store: &dyn Store) {
+/// every bound reference stays attached, and the own spelling follows. The
+/// stored `to_domain` text is left as written: the old name stays behind as an
+/// alias spelling of the same row, so a reference spelled with it keeps
+/// resolving, and so does one written after the rename.
+async fn renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias(store: &dyn Store) {
     let eng_dir = tempfile::tempdir().unwrap();
     let ops_dir = tempfile::tempdir().unwrap();
     write(
@@ -1325,10 +1327,12 @@ async fn renaming_a_row_keeps_its_id_and_moves_to_domain_text(store: &dyn Store)
         store.domain_spellings().await.unwrap(),
         vec![
             ("dev".to_string(), dev),
+            ("eng".to_string(), eng),
             ("ops".to_string(), ops),
             ("platform".to_string(), eng),
         ],
-        "the own spelling moved with the row and took the name from the alias"
+        "the own spelling moved with the row and took the name from the alias, \
+         and the old name stayed behind as an alias of the same row"
     );
     assert!(
         !store.outbound_refs(pointer, None).await.unwrap()[0].resolved,
@@ -1345,9 +1349,34 @@ async fn renaming_a_row_keeps_its_id_and_moves_to_domain_text(store: &dyn Store)
     assert_eq!(out.len(), 2, "{out:?}");
     assert!(
         out.iter()
-            .all(|r| r.to_domain.as_deref() == Some("platform") && r.resolved),
-        "the relation and the link now say `platform` and stay bound: {out:?}"
+            .all(|r| r.to_domain.as_deref() == Some("eng") && r.resolved),
+        "the relation and the link still say `eng` as written and stay bound: {out:?}"
     );
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        reached(&slice, eng_runbook) && !reached(&slice, ops_runbook),
+        "and they still reach the renamed domain's runbook: {slice:?}"
+    );
+
+    // A reference written after the rename, spelled with the old name, binds
+    // through the alias to the renamed row.
+    write(
+        dev_dir.path(),
+        "later.md",
+        &engram("Later", "later", "engram", "", "See [[eng:runbook]].\n"),
+    );
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    store.resolve_pending_links(dev).await.unwrap();
+    let later = store.lookup_id("dev", "later").await.unwrap().unwrap();
+    let out = store.outbound_refs(later, None).await.unwrap();
+    assert!(
+        out.len() == 1 && out[0].resolved,
+        "a new `eng:` reference resolves through the alias: {out:?}"
+    );
+    assert!(reached(
+        &store.neighbors(&[later], 1, None).await.unwrap(),
+        eng_runbook
+    ));
     assert!(
         store
             .lookup_id("platform", "runbook")
@@ -1380,12 +1409,12 @@ async fn renaming_a_row_keeps_its_id_and_moves_to_domain_text(store: &dyn Store)
     assert_eq!(store.domain_id("ops").await.unwrap(), Some(ops));
 }
 parity!(
-    renaming_a_row_keeps_its_id_and_moves_to_domain_text_on_both_backends,
-    renaming_a_row_keeps_its_id_and_moves_to_domain_text
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias_on_both_backends,
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias
 );
 
 /// Names compare byte for byte, so a rename that only changes case is a real
-/// rename.
+/// rename, and the old spelling stays behind as an alias like any other.
 async fn a_case_only_row_rename_works(store: &dyn Store) {
     let id = store
         .upsert_domain("Eng", Some("/tmp/eng"), DomainKind::File)
@@ -1396,7 +1425,7 @@ async fn a_case_only_row_rename_works(store: &dyn Store) {
     assert_eq!(store.domain_id("Eng").await.unwrap(), None);
     assert_eq!(
         store.domain_spellings().await.unwrap(),
-        vec![("eng".to_string(), id)]
+        vec![("Eng".to_string(), id), ("eng".to_string(), id)]
     );
 }
 parity!(

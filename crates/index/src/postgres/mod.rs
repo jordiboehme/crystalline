@@ -1207,29 +1207,25 @@ impl Store for PostgresStore {
                         .execute(&mut *c)
                         .await
                         .map_err(IndexError::from)?;
-                    sqlx::query("DELETE FROM domain_spelling WHERE spelling=$1 AND domain_id=$2")
-                        .bind(old)
-                        .bind(id.0)
-                        .execute(&mut *c)
-                        .await
-                        .map_err(IndexError::from)?;
-                    take_spelling_for_rename(&mut *c, new, id).await?;
-                }
-                // Renamed already: make sure the own name is in place, and
-                // leave `old` alone - by now it may be an alias on purpose.
-                (None, Some(id)) => take_spelling_for_rename(&mut *c, new, id).await?,
-                (None, None) => {}
-            }
-            for sql in [
-                "UPDATE relation SET to_domain=$2 WHERE to_domain=$1",
-                "UPDATE link SET to_domain=$2 WHERE to_domain=$1",
-            ] {
-                sqlx::query(sql)
+                    // The old name stays an alias of the row, so every
+                    // reference spelled with it keeps resolving; one another
+                    // domain holds is left with that domain.
+                    sqlx::query(
+                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+                         ON CONFLICT(spelling) DO NOTHING",
+                    )
                     .bind(old)
-                    .bind(new)
+                    .bind(id.0)
                     .execute(&mut *c)
                     .await
                     .map_err(IndexError::from)?;
+                    take_spelling_for_rename(&mut *c, new, id).await?;
+                }
+                // Renamed already: make sure the own name is in place, and
+                // leave `old` alone - by now it may be an alias on purpose, or
+                // it was never this row's name and must not become one.
+                (None, Some(id)) => take_spelling_for_rename(&mut *c, new, id).await?,
+                (None, None) => {}
             }
             Ok(())
         })

@@ -50,6 +50,40 @@ impl Default for ProvisionReceipt {
     }
 }
 
+impl ProvisionReceipt {
+    /// Move everything the receipt records under domain `old` to `new`: the
+    /// `sources` entry and every harness file and MCP whose origin domain is
+    /// `old`. A harness record left on the old name would read as an orphan
+    /// to the next reconcile, which removes what it installed. Answers whether
+    /// anything moved; a second call answers `false`.
+    ///
+    /// Stamps already under `new` win over the old name's for the same key,
+    /// since they come from a later scan; the old name's other stamps join
+    /// them.
+    pub fn rename_domain(&mut self, old: &str, new: &str) -> bool {
+        if old == new {
+            return false;
+        }
+        let mut moved = false;
+        if let Some(sources) = self.sources.remove(old) {
+            let target = self.sources.entry(new.to_string()).or_default();
+            for (key, stamp) in sources.files {
+                target.files.entry(key).or_insert(stamp);
+            }
+            moved = true;
+        }
+        for harness in self.harnesses.values_mut() {
+            let files = harness.files.values_mut().map(|f| &mut f.domain);
+            let mcps = harness.mcps.values_mut().map(|m| &mut m.domain);
+            for domain in files.chain(mcps).filter(|d| *d == old) {
+                *domain = new.to_string();
+                moved = true;
+            }
+        }
+        moved
+    }
+}
+
 /// One domain's source stamps, keyed the same way a scan keys an
 /// [`crate::provision::model::ArtifactFile`]: `"<kind.id()>/<rel>"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -239,6 +273,101 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.ends_with('\n'));
         assert!(text.contains("\n  "));
+    }
+
+    fn stamp(text: &[u8]) -> SourceStamp {
+        SourceStamp {
+            mtime: 1_700_000_000,
+            size: text.len() as u64,
+            sha256: sha256_hex(text),
+        }
+    }
+
+    /// A receipt with sources under `eng` and `ops`, and one harness holding a
+    /// file and an MCP from each.
+    fn two_domain_receipt() -> ProvisionReceipt {
+        let mut receipt = ProvisionReceipt::default();
+        for domain in ["eng", "ops"] {
+            receipt.sources.insert(
+                domain.to_string(),
+                DomainSources {
+                    files: BTreeMap::from([(format!("skills/{domain}/SKILL.md"), stamp(b"x"))]),
+                },
+            );
+        }
+        let file = |domain: &str| InstalledFile {
+            domain: domain.to_string(),
+            sha256: sha256_hex(b"x"),
+        };
+        let mcp = |domain: &str| InstalledMcp {
+            domain: domain.to_string(),
+            sha256: sha256_hex(b"server"),
+        };
+        receipt.harnesses.insert(
+            "claude-code".to_string(),
+            HarnessState {
+                files: BTreeMap::from([
+                    ("skills/eng/SKILL.md".to_string(), file("eng")),
+                    ("skills/ops/SKILL.md".to_string(), file("ops")),
+                ]),
+                mcps: BTreeMap::from([
+                    ("eng-mcp".to_string(), mcp("eng")),
+                    ("ops-mcp".to_string(), mcp("ops")),
+                ]),
+            },
+        );
+        receipt
+    }
+
+    #[test]
+    fn renaming_a_domain_moves_its_sources_and_every_harness_record() {
+        let mut receipt = two_domain_receipt();
+        assert!(receipt.rename_domain("eng", "platform"));
+
+        assert!(!receipt.sources.contains_key("eng"));
+        assert!(
+            receipt.sources["platform"]
+                .files
+                .contains_key("skills/eng/SKILL.md")
+        );
+        assert!(receipt.sources.contains_key("ops"));
+        let harness = &receipt.harnesses["claude-code"];
+        assert_eq!(harness.files["skills/eng/SKILL.md"].domain, "platform");
+        assert_eq!(harness.mcps["eng-mcp"].domain, "platform");
+        assert_eq!(harness.files["skills/ops/SKILL.md"].domain, "ops");
+        assert_eq!(harness.mcps["ops-mcp"].domain, "ops");
+
+        assert!(
+            !receipt.rename_domain("eng", "platform"),
+            "a second call finds nothing under the old name"
+        );
+        assert!(!receipt.rename_domain("never", "seen"));
+        assert!(!receipt.rename_domain("ops", "ops"));
+    }
+
+    /// Stamps already under the new name win over the old name's for the same
+    /// key, since they are the later scan; the old name's other stamps join
+    /// them.
+    #[test]
+    fn renaming_onto_existing_sources_keeps_the_new_names_stamps() {
+        let mut receipt = two_domain_receipt();
+        receipt.sources.insert(
+            "platform".to_string(),
+            DomainSources {
+                files: BTreeMap::from([("skills/eng/SKILL.md".to_string(), stamp(b"newer"))]),
+            },
+        );
+        receipt
+            .sources
+            .get_mut("eng")
+            .unwrap()
+            .files
+            .insert("agents/extra.md".to_string(), stamp(b"extra"));
+        assert!(receipt.rename_domain("eng", "platform"));
+        assert!(!receipt.sources.contains_key("eng"));
+        let files = &receipt.sources["platform"].files;
+        assert_eq!(files["skills/eng/SKILL.md"], stamp(b"newer"));
+        assert_eq!(files["agents/extra.md"], stamp(b"extra"));
     }
 
     #[test]

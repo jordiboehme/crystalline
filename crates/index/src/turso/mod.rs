@@ -1280,29 +1280,23 @@ impl Store for TursoStore {
                             vec![Value::Integer(id.0), Value::Text(new.to_string())],
                         )
                         .await?;
+                    // The old name stays an alias of the row, so every
+                    // reference spelled with it keeps resolving; one another
+                    // domain holds is left with that domain.
                     self.conn
                         .execute(
-                            "DELETE FROM domain_spelling WHERE spelling=?1 AND domain_id=?2",
+                            "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                             ON CONFLICT(spelling) DO NOTHING",
                             vec![Value::Text(old.to_string()), Value::Integer(id.0)],
                         )
                         .await?;
                     self.take_spelling_for_rename(new, id).await?;
                 }
                 // Renamed already: make sure the own name is in place, and
-                // leave `old` alone - by now it may be an alias on purpose.
+                // leave `old` alone - by now it may be an alias on purpose, or
+                // it was never this row's name and must not become one.
                 (None, Some(id)) => self.take_spelling_for_rename(new, id).await?,
                 (None, None) => {}
-            }
-            for sql in [
-                "UPDATE relation SET to_domain=?2 WHERE to_domain=?1",
-                "UPDATE link SET to_domain=?2 WHERE to_domain=?1",
-            ] {
-                self.conn
-                    .execute(
-                        sql,
-                        vec![Value::Text(old.to_string()), Value::Text(new.to_string())],
-                    )
-                    .await?;
             }
             Ok(())
         })
