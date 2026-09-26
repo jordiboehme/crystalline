@@ -21,11 +21,12 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use crystalline_core::config::registration::{
-    Registration, RegistrationRequest, decide_registration, validate_domain_name,
+    Registration, RegistrationRequest, choose_domain_name, decide_registration, infer_name_origin,
+    needs_manifest_write_back, validate_domain_name,
 };
 use crystalline_core::config::{
-    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
-    ShareIdentityMode, VerifyConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, NameOrigin, OriginConfig,
+    ResponseFormat, ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section_reporting, insert_before_section, prepend_body,
@@ -35,8 +36,9 @@ use crystalline_core::emit::{
 use crystalline_core::relink::Relink;
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind, LinkTarget,
-    Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
+    CrystallineUrl, DOMAIN_NAME_KEY, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind,
+    LinkTarget, Manifest, YamlValue, domain_name_at, domain_name_of_source, is_lower_hyphen,
+    parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,

@@ -11,10 +11,10 @@
 //! spelling from each other on every refresh.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{DomainEntry, GlobalConfig, NameOrigin};
 use crystalline_index::{Store, TursoStore};
 use crystalline_service::Engine;
 use crystalline_service::Scope;
@@ -686,5 +686,256 @@ async fn a_local_name_registered_by_another_process_wins_at_once() {
     assert_eq!(
         engine.localize_visible("old-eng", &none).await,
         "eng-knowledge"
+    );
+}
+
+// --- registration write-back (Task 11) ---------------------------------------
+
+/// A folder holding a MANIFEST that declares `domain_name: declared`, not yet
+/// registered in any engine's config.
+fn declared_folder(dir: &Path, folder: &str, declared: &str) -> PathBuf {
+    let root = dir.join(folder);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        crystalline_core::manifest_template(declared, TODAY),
+    )
+    .unwrap();
+    root
+}
+
+/// A folder holding a MANIFEST with no `domain_name` line at all.
+fn bare_manifest_folder(dir: &Path, folder: &str, title: &str) -> PathBuf {
+    let root = dir.join(folder);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        format!(
+            "---\ntype: manifest\ntitle: {title}\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: {TODAY}\n---\n\n# {title}\n\n## Scope\n\n- x\n\n## When to Use\n\n- x\n"
+        ),
+    )
+    .unwrap();
+    root
+}
+
+/// A nameless add of a folder whose MANIFEST declares `domain_name: platform`
+/// adopts that name, records it `derived` and writes it into the saved
+/// config file (the MANIFEST itself already declared it, so no MANIFEST
+/// write happens).
+#[tokio::test]
+async fn nameless_add_adopts_the_manifest_name_as_derived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = declared_folder(tmp.path(), "some-folder", "platform");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine
+        .domain_add_local(None, Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["domain"], "platform");
+    assert_eq!(report["name_origin"], "derived");
+    assert_eq!(report["shadowed"], false);
+    assert!(report.get("note").is_none(), "{report}");
+
+    let cfg: GlobalConfig =
+        crystalline_core::config::load_yaml(&tmp.path().join("config.yaml")).unwrap();
+    assert_eq!(
+        cfg.domains["platform"].name_origin,
+        Some(NameOrigin::Derived)
+    );
+}
+
+/// The same MANIFEST-declared name, but `platform` is already registered
+/// elsewhere: the newcomer steps to `platform-2`, still `derived`, and the
+/// result reports the shadow with the one-sentence note. `platform` itself
+/// keeps resolving to the first domain.
+#[tokio::test]
+async fn nameless_add_steps_around_a_taken_manifest_name_and_reports_the_shadow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = file_domain(tmp.path(), "platform-folder", "platform", &[]);
+    let engine = engine(memory_store().await, tmp.path(), vec![("platform", first)]);
+    engine.sync(None).await.unwrap();
+
+    let folder = declared_folder(tmp.path(), "second-folder", "platform");
+    let report = engine
+        .domain_add_local(None, Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["domain"], "platform-2");
+    assert_eq!(report["name_origin"], "derived");
+    assert_eq!(report["shadowed"], true);
+    let note = report["note"].as_str().expect("a note is given");
+    assert!(note.contains("platform"), "{note}");
+    assert!(note.contains("platform-2"), "{note}");
+    assert_eq!(
+        engine.local_domain_name("platform").await.as_deref(),
+        Some("platform"),
+        "the local name always wins over a shadowed canonical claim"
+    );
+
+    // The second folder's own MANIFEST is untouched: it still declares
+    // `platform`, not the stepped `platform-2`.
+    let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: platform\n"), "{manifest}");
+}
+
+/// An explicit name for a folder whose MANIFEST already declares a different
+/// name registers under the explicit name, `explicit`, and never rewrites
+/// the MANIFEST's own declared name.
+#[tokio::test]
+async fn an_explicit_name_does_not_rewrite_a_declared_manifest_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = declared_folder(tmp.path(), "ops-folder", "platform");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine
+        .domain_add_local(Some("ops"), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["domain"], "ops");
+    assert_eq!(report["name_origin"], "explicit");
+    let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: platform"), "{manifest}");
+    assert!(!manifest.contains("domain_name: ops"), "{manifest}");
+}
+
+/// A nameless add of a folder whose MANIFEST declares no name at all falls
+/// back to the folder's basename, `derived`, and writes that name back into
+/// the MANIFEST that had none.
+#[tokio::test]
+async fn nameless_add_writes_the_basename_default_back_into_a_bare_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = bare_manifest_folder(tmp.path(), "My Notes", "My Notes");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine
+        .domain_add_local(None, Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["domain"], "my-notes");
+    assert_eq!(report["name_origin"], "derived");
+    let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: my-notes"), "{manifest}");
+}
+
+/// A brand-new folder with no MANIFEST at all gets one scaffolded that
+/// already carries the derived basename as its `domain_name` (Task 3a); the
+/// write-back path itself has nothing left to do.
+#[tokio::test]
+async fn a_fresh_folder_scaffold_already_carries_the_derived_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("Brand New");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine
+        .domain_add_local(None, Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["manifest_created"], true);
+    assert_eq!(report["name_origin"], "derived");
+    let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: brand-new"), "{manifest}");
+}
+
+/// A brand-new folder given an explicit name gets a scaffold that already
+/// carries it, recorded `explicit`.
+#[tokio::test]
+async fn a_fresh_folder_named_explicitly_scaffolds_with_that_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("fresh");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine
+        .domain_add_local(Some("fresh"), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(report["manifest_created"], true);
+    assert_eq!(report["name_origin"], "explicit");
+    let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: fresh"), "{manifest}");
+}
+
+/// `domain_add_virtual` records `explicit` and the MANIFEST engram declares
+/// the name - here entirely from the scaffold template, since a brand-new
+/// virtual domain's MANIFEST always carries it already.
+#[tokio::test]
+async fn virtual_add_records_explicit_and_declares_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let report = engine.domain_add_virtual("scratch").await.unwrap();
+
+    assert_eq!(report["name_origin"], "explicit");
+    assert_eq!(report["canonical_name"], "scratch");
+    assert_eq!(report["shadowed"], false);
+    let markdown = engine.manifest_markdown("scratch").await.unwrap();
+    assert!(markdown.contains("domain_name: scratch"), "{markdown}");
+
+    let cfg: GlobalConfig =
+        crystalline_core::config::load_yaml(&tmp.path().join("config.yaml")).unwrap();
+    assert_eq!(
+        cfg.domains["scratch"].name_origin,
+        Some(NameOrigin::Explicit)
+    );
+}
+
+/// Re-adding an already-adopted registration is a no-op on the MANIFEST: the
+/// first add writes `domain_name` back once, and the second, identical add
+/// changes not one byte, with `name_origin` unchanged.
+#[tokio::test]
+async fn readding_an_adopted_registration_writes_nothing_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = bare_manifest_folder(tmp.path(), "adopt-me", "Adopt Me");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    let first = engine
+        .domain_add_local(None, Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+    let name = first["domain"].as_str().unwrap().to_string();
+    let after_first = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert!(
+        after_first.contains(&format!("domain_name: {name}")),
+        "{after_first}"
+    );
+
+    let second = engine
+        .domain_add_local(Some(&name), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(second["adopted"], true);
+    assert_eq!(
+        second["name_origin"], first["name_origin"],
+        "name_origin kept"
+    );
+    let after_second = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert_eq!(after_first, after_second, "no second write");
+}
+
+/// Review Focus 5: an explicit name that looks like a bare YAML number
+/// (`1.0`) still round-trips as the string it is: the write-back writes it
+/// quoted, so the declared name reads back exactly as given.
+#[tokio::test]
+async fn a_numeric_looking_explicit_name_round_trips_as_a_string() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = bare_manifest_folder(tmp.path(), "versioned", "Versioned");
+    let engine = engine(memory_store().await, tmp.path(), vec![]);
+
+    engine
+        .domain_add_local(Some("1.0"), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    let source = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        crystalline_core::domain_name_of_source(&source).as_deref(),
+        Some("1.0"),
+        "{source}"
     );
 }

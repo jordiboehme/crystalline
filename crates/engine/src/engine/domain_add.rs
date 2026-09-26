@@ -70,22 +70,43 @@ impl Engine {
         let canonical = std::fs::canonicalize(&root)
             .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
 
-        // Decide the domain name and whether we adopt an existing registration.
-        let (domain_name, adopted) = match name {
+        // Decide the domain name, whether we adopt an existing registration,
+        // and how the name was arrived at. A caller-given name is always
+        // explicit; a name derived from the folder's MANIFEST or, failing
+        // that, its basename is derived. `taken` for the MANIFEST-declared
+        // name is the one rule every surface uses (F8): a registered local
+        // name, or any spelling the name table already resolves - not just
+        // another file domain at a different path, which is all
+        // `unique_domain_name`'s own fallback checks.
+        let (domain_name, adopted, origin) = match name {
             Some(n) => match decide_registration(
                 n,
                 cfg.domains.get(n),
                 &RegistrationRequest::File { root: &canonical },
             ) {
-                Registration::Adopt => (n.to_string(), true),
-                Registration::Register => (n.to_string(), false),
+                Registration::Adopt => (n.to_string(), true, NameOrigin::Explicit),
+                Registration::Register => (n.to_string(), false, NameOrigin::Explicit),
                 Registration::Conflict(msg) => return Err(EngineError::Conflict(msg)),
             },
             // No name: adopt an existing registration of this exact folder,
-            // else derive a fresh unique name from the folder basename.
+            // else the MANIFEST's own declared name (stepped if taken), else
+            // a fresh unique name derived from the folder basename.
             None => match existing_file_domain_at(&canonical, &cfg) {
-                Some(existing) => (existing.to_string(), true),
-                None => (unique_domain_name(&canonical, &cfg), false),
+                Some(existing) => (existing.to_string(), true, NameOrigin::Derived),
+                None => {
+                    let table = self.name_table_now().await;
+                    let manifest_name = domain_name_at(&canonical);
+                    let choice = choose_domain_name(
+                        None,
+                        manifest_name.as_deref(),
+                        || unique_domain_name(&canonical, &cfg),
+                        |candidate| {
+                            cfg.domains.contains_key(candidate)
+                                || table.resolve(candidate).is_some()
+                        },
+                    );
+                    (choice.name, false, choice.origin)
+                }
             },
         };
 
@@ -110,8 +131,10 @@ impl Engine {
         if !adopted {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard);
-            file.domains
-                .insert(domain_name.clone(), DomainEntry::file(canonical.clone()));
+            file.domains.insert(
+                domain_name.clone(),
+                DomainEntry::file(canonical.clone()).with_name_origin(origin),
+            );
             self.persist_config(&file)?;
             let effective = self.overlay.apply(&file);
             *file_guard = file;
@@ -125,20 +148,32 @@ impl Engine {
         }
 
         let sync = self.sync(Some(&domain_name)).await?;
+        // Best effort: a registration that already landed and synced must not
+        // be undone by a MANIFEST write that fails afterwards.
+        if let Err(e) = self.write_back_domain_name(&domain_name).await {
+            tracing::warn!(
+                domain = %domain_name,
+                error = %e,
+                "writing the domain name back into its MANIFEST failed"
+            );
+        }
+        self.refresh_names().await;
         if !self.request_embed()
             && let Err(e) = self.embed_pending().await
         {
             tracing::warn!("embedding after creating '{domain_name}' failed: {e}");
         }
 
-        Ok(json!({
+        let mut result = json!({
             "domain": domain_name,
             "root": canonical.display().to_string(),
             "kind": "file",
             "manifest_created": manifest_created,
             "adopted": adopted,
             "sync": sync,
-        }))
+        });
+        self.append_name_fields(&mut result, &domain_name).await?;
+        Ok(result)
     }
 
     /// Create a virtual (database-backed) domain, the DB half of `add_domain`.
@@ -174,11 +209,15 @@ impl Engine {
 
         // Register before scaffolding: `scaffold_virtual_manifest` reads the
         // content source, which requires the domain to already be registered.
+        // A domain added this way is always named on purpose: there is no
+        // repository or folder to derive a default from.
         if is_new {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard);
-            file.domains
-                .insert(name.to_string(), DomainEntry::virtual_domain());
+            file.domains.insert(
+                name.to_string(),
+                DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
+            );
             self.persist_config(&file)?;
             let effective = self.overlay.apply(&file);
             *file_guard = file;
@@ -200,13 +239,120 @@ impl Engine {
         if !manifest_created {
             self.refresh_names().await;
         }
+        // Best effort, for the same reason the local path's write-back is:
+        // the registration already landed and must not be undone by a
+        // MANIFEST write that fails afterwards. A no-op whenever the scaffold
+        // above already declared the name, which is the common case.
+        if let Err(e) = self.write_back_domain_name(name).await {
+            tracing::warn!(
+                domain = %name,
+                error = %e,
+                "writing the domain name back into its MANIFEST failed"
+            );
+        }
+        self.refresh_names().await;
 
-        Ok(json!({
+        let mut result = json!({
             "domain": name,
             "kind": "virtual",
             "manifest_created": manifest_created,
             "registered": is_new,
-        }))
+        });
+        self.append_name_fields(&mut result, name).await?;
+        Ok(result)
+    }
+
+    /// Write `domain_name: <local>` into the MANIFEST of `local` when it
+    /// declares none and [`needs_manifest_write_back`] says so, from a fresh
+    /// read of the registration and the MANIFEST as they stand now - not from
+    /// whatever a caller decided a moment ago, which is what makes this safe
+    /// to call unconditionally after every registration, adoption included.
+    ///
+    /// Goes through the ordinary source-edit path (`DomainView::for_write`
+    /// plus [`Engine::apply_source_edit`]), the way
+    /// [`Engine::set_manifest_policies`] writes a policy key: a team domain
+    /// gets a pending local change rather than a proposal, and a
+    /// review-mode domain gets a draft, which counts as written (open issue
+    /// 7). [`crate::scope::Scope::Unrestricted`] is the acting scope, the
+    /// same one every other write this engine makes on its own account uses
+    /// - there is no external caller here to carry a scope from.
+    ///
+    /// `local`'s `name_origin` is read fresh from the registration; a legacy
+    /// entry that predates the field (`None`) falls back to
+    /// [`infer_name_origin`], the same inference the upgrade catch-up uses,
+    /// so an old local or virtual domain re-added through this path still
+    /// gets its MANIFEST written rather than silently skipped.
+    ///
+    /// Returns whether it wrote. Never returns `Ok(true)` twice in a row for
+    /// an unchanged MANIFEST: the second call reads a `domain_name` the first
+    /// one just wrote and answers `Ok(false)`.
+    pub(crate) async fn write_back_domain_name(&self, local: &str) -> Result<bool> {
+        let entry = self.domain_entry(local)?;
+        let scope = crate::scope::Scope::Unrestricted;
+        let view = DomainView::for_write(self, local, &scope).await?;
+        let (desc, source) = view.resolve("manifest").await?;
+        let current = view.text_at(&source, &desc).await?.ok_or_else(|| {
+            EngineError::Internal(format!(
+                "the MANIFEST of '{local}' vanished between registering it and writing its \
+                 name back"
+            ))
+        })?;
+        let manifest_declares = domain_name_of_source(&current).is_some();
+        let origin = entry
+            .name_origin
+            .unwrap_or_else(|| infer_name_origin(local, &entry, false));
+        if !needs_manifest_write_back(&entry, origin, manifest_declares) {
+            return Ok(false);
+        }
+        let overlay = view.actor().map(str::to_string);
+        let actor = self.actor_for(None, overlay.as_deref());
+        let local_owned = local.to_string();
+        self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
+            Ok(set_frontmatter_field(
+                current,
+                DOMAIN_NAME_KEY,
+                &local_owned,
+            ))
+        })
+        .await?;
+        Ok(true)
+    }
+
+    /// Add the fields every registration result carries about the name it
+    /// landed on: `name_origin` (the registration's, `null` for a legacy
+    /// entry nothing has inferred yet), `canonical_name` and `aliases` (from
+    /// the name table), and `shadowed`. When `local`'s own canonical name is
+    /// shadowed - another domain's local name already owns it - a `note`
+    /// explains it in the one sentence every surface shows, so a caller who
+    /// registered by folder or by a bare name learns it without a second
+    /// call.
+    ///
+    /// Reads the name table as it stands: every caller has already run
+    /// `refresh_names` since its own write, so this costs no rebuild of its
+    /// own.
+    pub(crate) async fn append_name_fields(&self, result: &mut Value, local: &str) -> Result<()> {
+        let entry = self.domain_entry(local)?;
+        let table = self.name_table_now().await;
+        let canonical_name = table.canonical(local).unwrap_or(local).to_string();
+        let aliases = table.aliases(local).to_vec();
+        let shadowed = table.is_shadowed(local);
+        if let Value::Object(map) = result {
+            map.insert("name_origin".to_string(), json!(entry.name_origin));
+            map.insert("canonical_name".to_string(), json!(canonical_name));
+            map.insert("aliases".to_string(), json!(aliases));
+            map.insert("shadowed".to_string(), json!(shadowed));
+            if shadowed {
+                map.insert(
+                    "note".to_string(),
+                    json!(format!(
+                        "'{canonical_name}' is already a domain here, so this one is registered \
+                         as '{local}'; links that name '{canonical_name}' still reach the other \
+                         domain. Rename one of them to line them up."
+                    )),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// What a caller is told when they may see a domain and may not end it.
