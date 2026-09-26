@@ -73,8 +73,8 @@ const CRATE_WHITE: Rgb = [0.86, 0.87, 0.88];
 /** The crate's corner guards and edge ribs: a darker grey. */
 const GUARD_GREY: Rgb = [0.45, 0.47, 0.5];
 
-/** The marked crate's own size in metres: its half-width, half-depth and height. */
-const CRATE = { hw: 0.5, hd: 0.4, h: 0.8 } as const;
+/** The marked crate's own height in metres; its half-width and half-depth come from its variant 0 footprint (`halfSize`). */
+const CRATE_H = 0.8;
 
 /** How far the crate's body sits inside its footprint, in metres. */
 const CRATE_INSET = 0.015;
@@ -233,7 +233,8 @@ function mark(
  * sides.
  */
 function markedBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
-  const { hw, hd, h } = CRATE;
+  const { hw, hd } = halfSize("marked-crate", 0);
+  const h = CRATE_H;
   const bw = hw - CRATE_INSET;
   const bd = hd - CRATE_INSET;
   const white = s.tinted(CRATE_WHITE);
