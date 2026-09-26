@@ -4,22 +4,22 @@
  *
  * The fixture and decor tests (`models.test.ts`), the prop tests
  * (`propModels.test.ts`) and the hero tests (`heroModels.test.ts` and the
- * per-batch hero tests under `models/heroes/`) measure a built model the
- * same ways: the winding of every triangle against its stored normal,
- * points in a frame's local terms, points inside a floor box, whether a
- * catalogue surface sits on a real upward face and stays clear above it
- * (`upwardFaceAt`, `clearAbove` at a point, `clearAboveBox` over a whole
- * curio host surface), whether every part traces a path back to
- * the floor (or a hovering hero's lift, `heroLift`) or its wall through
- * the parts it touches (`touching`, `looseParts`), and whether every glowing part (a screen, a frame, a
- * portal, a signal light or a blinking one) touches a lit host or its
- * wall. A prop or hero mesh, built once at the origin, is turned and
- * placed the way the GPU places an instance (`placeMesh`, `placeParts`)
- * before it is measured. The glow check works on a list of recorded kit
- * calls (`Part`), which `recordingKitAt` records for a model built through
- * a kit factory, and which the fixture tests record for the movers too;
- * `heroAt`, `anchorOf` and `partsOf` are the one way every hero test
- * builds a hero and its recorded parts at the origin.
+ * per-batch hero tests under `models/heroes/`) measure a built model the same
+ * ways: the winding of every triangle against its stored normal, points in a
+ * frame's local terms, points inside a floor box, whether a catalogue surface
+ * sits on a real upward face and stays clear above it (`upwardFaceAt`,
+ * `clearAbove` at a point, `clearAboveBox` over a whole curio host surface),
+ * whether every part traces a path back to the floor (or a hovering hero's
+ * lift, `heroLift`) or its wall through the parts it touches (`touching`,
+ * `looseParts`), and whether every glowing part (a screen, a frame, a portal,
+ * a signal light or a blinking one) touches a lit host or its wall. A prop or
+ * hero mesh, built once at the origin, is turned and placed the way the GPU
+ * places an instance (`placeMesh`, `placeParts`) before it is measured. The
+ * glow check works on a list of recorded kit calls (`Part`), which
+ * `recordingKitAt` records for a model built through a kit factory, and which
+ * the fixture tests record for the movers too; `heroAt`, `anchorOf` and
+ * `partsOf` are the one way every hero test builds a hero and its recorded
+ * parts at the origin.
  */
 
 import type { Box, Hero, HeroKind } from "../world/types";

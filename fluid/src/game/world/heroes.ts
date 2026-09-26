@@ -57,9 +57,9 @@
  *    its roll from `ANY_POOL` less the kinds already placed and tries that
  *    kind, so it only fills a slot the steps before left empty.
  * 7. Trying a kind: nothing when the room's ceiling is under the kind's
- *    `heroMinCeiling` (C7); else its candidates by placement, in the
- *    order of their seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18; ties
- *    by the anchor's y, then x):
+ *    `heroMinCeiling` (C7); else its candidates by placement, in the order of
+ *    their seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18;
+ *    ties by the anchor's y, then x):
  *    - `wall` and `backed`: every free wall edge of the hall that is not
  *      beside a door, hatch or portal on its run (H5) and not a placed
  *      hero's edge, token `wall-<side>`, anchored at `wallAnchor`; a backed
@@ -535,8 +535,9 @@ export const HERO_CATALOGUE = {
 
 /**
  * Each archetype's weighted pool (H7); the turret, the slab, the question
- * block and the any-archetype kinds (`ANY_POOL`) are drawn apart. The pools are listed in catalogue order, and that order is part
- * of the seeded result, so do not reorder them.
+ * block and the any-archetype kinds (`ANY_POOL`) are drawn apart. The pools
+ * are listed in catalogue order, and that order is part of the seeded result,
+ * so do not reorder them.
  */
 export const HERO_POOLS = {
   bridge: [
