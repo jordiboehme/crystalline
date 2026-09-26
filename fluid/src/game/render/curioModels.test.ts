@@ -3,16 +3,23 @@
  * kind and variant is built once at the origin, placed at every turn at an
  * instance height of 0.9 m the way the GPU places it, and measured. It
  * stays inside its turned catalogue size and between its surface and its
- * top, reaches that top, sits on its surface, winds every triangle with
+ * top, reaches that top, sits on its surface (a hovering curio's lowest
+ * vertex is its lift over it, `curioLift`), winds every triangle with
  * its normal, stays under the triangle budget, glows only on its body, has
- * no part floating clear of its base or another part, and carries blink
+ * no part floating clear of its base or another part (held from its
+ * lift), and carries blink
  * parts exactly when its kind's bank (`CURIO_BANK`) blinks. What only a
  * kind's own recipe carries is the per-batch tests' job.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { CURIO_CATALOGUE, CURIO_KINDS, curioBox } from "../world/curios";
+import {
+  CURIO_CATALOGUE,
+  CURIO_KINDS,
+  curioBox,
+  curioLift,
+} from "../world/curios";
 import type { Curio, CurioKind } from "../world/types";
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
@@ -67,8 +74,10 @@ describe("curio models", () => {
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
 
-      it(`${kind} variant ${String(v)} rests on its base or another part`, () => {
-        expect(looseParts(parts, null)).toEqual([]);
+      it(`${kind} variant ${String(v)} rests on its base or another part, from its lift`, () => {
+        // Mutation caught: the drone's lift ignored here, so its whole
+        // shell counts as floating.
+        expect(looseParts(parts, null, curioLift(kind))).toEqual([]);
       });
 
       it(`${kind} variant ${String(v)} blinks exactly when its bank does`, () => {
@@ -101,10 +110,14 @@ describe("curio models", () => {
             }
           });
 
-          it("reaches its top and sits on its surface", () => {
+          it("reaches its top, and its lowest vertex is its lift over its surface", () => {
+            // Mutation caught: a curio that floats clear of its surface, or
+            // a drone part hanging below its lift.
             const ys = positions(placed).map((p) => p[1]);
             expect(Math.max(...ys)).toBeGreaterThanOrEqual(H + top - 1e-3);
-            expect(Math.abs(Math.min(...ys) - H)).toBeLessThanOrEqual(EPS);
+            expect(
+              Math.abs(Math.min(...ys) - (H + curioLift(kind))),
+            ).toBeLessThanOrEqual(EPS);
           });
 
           it("winds every triangle with its normal", () => {

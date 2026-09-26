@@ -37,13 +37,22 @@
  * - **C5. No blocker of their own.** Every surface lies inside its host's
  *   footprint, which already blocks the player, so a curio changes no
  *   reach.
- * - **C6. Four slots.** A room draws each of the `retro`, `gear`, `ball` and
- *   `under` slots once, rolling only over the kinds that fit it, so it
- *   holds at most one curio per slot.
+ * - **C6. Seven slots.** A room draws each of the `retro`, `gear`, `ball`,
+ *   `under`, `tech`, `radar` and `capsule` slots once, rolling only over
+ *   the kinds that fit it, so it holds at most one curio per slot. The two
+ *   computers and the space bricks share the retro slot, so the two
+ *   computers never stand in one generated room; the reactor case and the
+ *   drone share the tech slot. The radar and the capsule case each have a
+ *   slot of their own, so either can stand beside a ball.
  * - **C7. Rates.** Each slot's chance (`RETRO_SHARE`, `GEAR_SHARE`,
- *   `BALL_SHARE`, `UNDER_SHARE`) and its weighted pool (`RETRO_POOL`,
- *   `GEAR_POOLS` per archetype, `BALL_POOL`, `UNDER_POOL`); a drawn ball
- *   tries the hall's corners at `BALL_FLOOR`.
+ *   `BALL_SHARE`, `UNDER_SHARE`, `TECH_SHARE`, `RADAR_SHARE`,
+ *   `CAPSULE_SHARE`) and its weighted pool (`RETRO_POOLS` and
+ *   `GEAR_POOLS` and `TECH_POOLS` per archetype, `BALL_POOL`,
+ *   `UNDER_POOL`, `RADAR_POOL`, `CAPSULE_POOL`); a drawn ball tries the
+ *   hall's corners at `BALL_FLOOR`. The radar takes at
+ *   `RADAR_BESIDE_BALL` in a room that holds a star ball, and the capsule
+ *   case at `CAPSULE_BESIDE` in a room that holds a star ball or the
+ *   radar.
  * - **C8. The laptop is too big for a terminal end** and stands on the
  *   wider tops only; nothing is widened for it.
  * - **C9. Seeds by anchor.** A candidate's seed is made from its host's
@@ -54,29 +63,44 @@
  * - **C11. Goldens.** Only the `curios` key of a golden ever moves for them.
  * - **C12. Heights.** A curio's top stays under its surface's `clear` and
  *   `CURIO_CEILING_GAP` under the ceiling.
+ * - **The lift.** One curio hovers: the drone's mesh starts `CURIO_LIFT`
+ *   over its surface (`curioLift`). Its box still runs from the surface
+ *   to its top for the fit, the ceiling and the clash, so nothing stands
+ *   under it; framing aims at its middle (`curioMid`).
  *
  * The pass (`placeCurios`), in order:
  *
  * 1. **Draws.** `curioDraws(room)`: one stream of `seedFor(room.seed,
  *    "curio", "draw")` draws the retro slot's chance (`RETRO_SHARE`) and
  *    roll, the gear slot's (`GEAR_SHARE`), the ball slot's (`BALL_SHARE`)
- *    and its floor chance (`BALL_FLOOR`), then the under slot's
- *    (`UNDER_SHARE`). Everything is always drawn.
+ *    and its floor chance (`BALL_FLOOR`), the under slot's
+ *    (`UNDER_SHARE`) and the tech slot's (`TECH_SHARE`), then one uniform
+ *    and a roll each for the radar and the capsule case, the uniform
+ *    giving both the slot's own chance and its paired chance. Everything
+ *    is always drawn, and the later slots come after every earlier value,
+ *    so no earlier draw moves.
  * 2. **Surfaces.** `hostSurfaces(room)`, once.
- * 3. **Slots, in order: retro, gear, ball, under.** A slot that drew its
- *    chance takes its pool (`RETRO_POOL`, `GEAR_POOLS[room.archetype]`,
- *    `BALL_POOL`, `UNDER_POOL`, or only the kind its draw forces), keeps
- *    the kinds with a candidate that fits right now, picks one by
+ * 3. **Slots, in order: retro, gear, ball, under, tech, radar, capsule.**
+ *    A slot that takes (`slotTakes`: its own chance, or for the radar and
+ *    the capsule case their paired chance when a curio placed before it
+ *    in this pass is a partner, a star ball for the radar, a star ball or
+ *    the radar for the capsule case) takes its pool
+ *    (`RETRO_POOLS[room.archetype]`, `GEAR_POOLS[room.archetype]`,
+ *    `BALL_POOL`, `UNDER_POOL`, `TECH_POOLS[room.archetype]`,
+ *    `RADAR_POOL`, `CAPSULE_POOL`, or only the kind its draw forces),
+ *    keeps the kinds with a candidate that fits right now, picks one by
  *    `pickByRoll` and places it. A slot with no fitting kind stays empty.
  *    A floor ball that fits no corner falls back to the surfaces: the
  *    slot runs again with the same roll, so the ball rate stays
  *    `BALL_SHARE`. Nothing is drawn again.
  * 4. **Candidates of a kind.** A floor ball (the ball slot when it drew
  *    its floor chance) takes the hall's corners (`cornerSpots`); any other
- *    kind takes every host surface of one of its classes. A candidate's
- *    seed is `seedFor(room.seed, "curio", ...key)` of its surface, or
+ *    kind takes every host surface of one of its classes, and a
+ *    `floorOnly` kind only those of `h` 0. A candidate's seed is
+ *    `seedFor(room.seed, "curio", ...key)` of its surface, or
  *    `seedFor(room.seed, "curio", cx, cy, "floor")` for a corner (C9).
- *    They are tried in seed order, ties by their order in `hostSurfaces`
+ *    A kind that `prefers` a host tries that host's surfaces first; then
+ *    they are tried in seed order, ties by their order in `hostSurfaces`
  *    or among the corners.
  * 5. **A trial.** The candidate's own stream draws the variant (the pink
  *    gadget's cluster only in a lab or an engineering room), a turn roll
@@ -88,7 +112,7 @@
  *    curio, with its candidate's seed.
  * 6. **Fitting a surface** (`curioFits`, C12): the variant stands on the
  *    surface's class (`curioClasses`: the upright lit swords never on a
- *    shelf class top), its box lies inside the surface's box less
+ *    shelf class top), a `floorOnly` kind only at `h` 0, its box lies inside the surface's box less
  *    `CURIO_MARGIN`, its top is at most the surface's `clear`, and its top
  *    stays `CURIO_CEILING_GAP` under the ceiling.
  * 7. **Clashing** (`curiosClash`): two curios whose plan boxes, one grown
@@ -162,10 +186,19 @@ export const CURIO_KINDS: readonly CurioKind[] = [
   "catch-ball",
   "trap-box",
   "fuel-case",
+  "treasure-radar",
+  "capsule-case",
+  "reactor-case",
+  "hover-drone",
+  "breadbin-computer",
+  "slim-computer",
+  "space-bricks",
+  "soot-puffs",
 ];
 
-/** Which of a room's four draws a kind comes from (C6). */
-export type CurioSlot = "retro" | "gear" | "ball" | "under";
+/** Which of a room's seven draws a kind comes from (C6, 2.6d C5). */
+export type CurioSlot =
+  "retro" | "gear" | "ball" | "under" | "tech" | "radar" | "capsule";
 
 /** One variant's box in metres at turn 0: `width` along `a`, `depth` along `d`, `top` above its base. */
 export interface CurioSize {
@@ -190,11 +223,26 @@ export interface CurioEntry {
    */
   variantClasses?: readonly (readonly SurfaceClass[])[];
   facing: "fixed" | "front" | "any";
+  /**
+   * Set on a kind that stands only at floor level (2.6d C7): of its
+   * classes' surfaces it keeps those of `h` 0, in the pass
+   * (`candidatesOf`) and in the fit (`curioFits`) alike, so it never rides
+   * a trolley deck, a workbench's lower shelf or a bench's shelf.
+   */
+  floorOnly?: true;
+  /**
+   * A host name (`HostSurface.host`, such as `"terminal"`) whose surfaces
+   * the kind tries first (2.6d C8): its candidates on that host come
+   * before every other, each group in seed order. A kind without it tries
+   * every candidate in seed order alone.
+   */
+  prefers?: string;
 }
 
 /**
- * Every curio kind (C19): its slot (C6), its variant count and one size per
- * variant, the surface classes it stands on (C3) and its facing (C10). No
+ * Every curio kind (C19, 2.6d C3): its slot (C6), its variant count and one
+ * size per variant, the surface classes it stands on (C3), its facing
+ * (C10), and for the soot puffs `floorOnly` and for the drone `prefers`. No
  * size is wider or deeper than 0.65 m. The sword's three variants are the
  * blade lying in a small cradle, then the lit blade upright in its stand in
  * blue and in green (C13); the gadget's are one alone and a cluster; the
@@ -313,9 +361,70 @@ export const CURIO_CATALOGUE: Readonly<Record<CurioKind, CurioEntry>> = {
     classes: ["under"],
     sizes: [{ width: 0.4, depth: 0.28, top: 0.24 }],
   },
+  "treasure-radar": {
+    slot: "radar",
+    variants: 1,
+    facing: "front",
+    classes: ["desk", "bench", "table", "shelf"],
+    sizes: [{ width: 0.085, depth: 0.1, top: 0.03 }],
+  },
+  "capsule-case": {
+    slot: "capsule",
+    variants: 1,
+    facing: "front",
+    classes: ["desk", "bench", "table", "shelf"],
+    sizes: [{ width: 0.2, depth: 0.14, top: 0.155 }],
+  },
+  "reactor-case": {
+    slot: "tech",
+    variants: 1,
+    facing: "front",
+    classes: ["desk", "bench", "table", "shelf"],
+    sizes: [{ width: 0.16, depth: 0.16, top: 0.2 }],
+  },
+  "hover-drone": {
+    slot: "tech",
+    variants: 1,
+    facing: "front",
+    classes: ["desk", "bench", "table"],
+    prefers: "terminal",
+    sizes: [{ width: 0.18, depth: 0.18, top: 0.53 }],
+  },
+  "breadbin-computer": {
+    slot: "retro",
+    variants: 1,
+    facing: "fixed",
+    classes: ["desk", "bench", "table"],
+    sizes: [{ width: 0.4, depth: 0.21, top: 0.075 }],
+  },
+  "slim-computer": {
+    slot: "retro",
+    variants: 1,
+    facing: "fixed",
+    classes: ["desk", "bench", "table"],
+    sizes: [{ width: 0.41, depth: 0.25, top: 0.07 }],
+  },
+  "space-bricks": {
+    slot: "retro",
+    variants: 1,
+    facing: "front",
+    classes: ["desk", "bench", "table", "shelf"],
+    sizes: [{ width: 0.25, depth: 0.15, top: 0.09 }],
+  },
+  "soot-puffs": {
+    slot: "under",
+    variants: 2,
+    facing: "front",
+    classes: ["under"],
+    floorOnly: true,
+    sizes: [
+      { width: 0.22, depth: 0.14, top: 0.07 },
+      { width: 0.34, depth: 0.2, top: 0.08 },
+    ],
+  },
 };
 
-/** The retro slot's pool (C7): the laptop now and then, the rest rarer. Order is part of the seeded result. */
+/** The retro slot's base pool (C7): the laptop now and then, the rest rarer; `RETRO_POOLS` builds on it. Order is part of the seeded result. */
 export const RETRO_POOL = [
   ["beige-laptop", 4],
   ["pocket-console", 2],
@@ -361,10 +470,80 @@ export const BALL_POOL = [
   ["star-ball", 1],
   ["catch-ball", 1],
 ] as const satisfies readonly (readonly [CurioKind, number])[];
-/** The under slot's pool: the trap and the case alike. */
+/** The under slot's pool: the trap, the case and the puffs alike. */
 export const UNDER_POOL = [
   ["trap-box", 1],
   ["fuel-case", 1],
+  ["soot-puffs", 1],
+] as const satisfies readonly (readonly [CurioKind, number])[];
+
+/**
+ * The retro slot's pool per archetype (2.6d C6): `RETRO_POOL`, then the
+ * breadbin computer, the slim computer and the space bricks. The old kinds
+ * keep their order and weights, so a room where no new kind fits keeps its
+ * pick. Order is part of the seeded result.
+ */
+export const RETRO_POOLS = {
+  bridge: [
+    ...RETRO_POOL,
+    ["breadbin-computer", 2],
+    ["slim-computer", 2],
+    ["space-bricks", 2],
+  ],
+  council: [
+    ...RETRO_POOL,
+    ["breadbin-computer", 1],
+    ["slim-computer", 1],
+    ["space-bricks", 1],
+  ],
+  engineering: [
+    ...RETRO_POOL,
+    ["breadbin-computer", 1],
+    ["slim-computer", 1],
+    ["space-bricks", 1],
+  ],
+  archive: [
+    ...RETRO_POOL,
+    ["breadbin-computer", 2],
+    ["slim-computer", 2],
+    ["space-bricks", 1],
+  ],
+  lab: [
+    ...RETRO_POOL,
+    ["breadbin-computer", 1],
+    ["slim-computer", 1],
+    ["space-bricks", 2],
+  ],
+} as const satisfies Record<
+  Archetype,
+  readonly (readonly [CurioKind, number])[]
+>;
+
+/** The tech slot's pool per archetype (2.6d C5, C9): the reactor case in lab and engineering rooms, the drone everywhere. */
+export const TECH_POOLS = {
+  bridge: [["hover-drone", 1]],
+  council: [["hover-drone", 1]],
+  engineering: [
+    ["reactor-case", 2],
+    ["hover-drone", 1],
+  ],
+  archive: [["hover-drone", 1]],
+  lab: [
+    ["reactor-case", 2],
+    ["hover-drone", 1],
+  ],
+} as const satisfies Record<
+  Archetype,
+  readonly (readonly [CurioKind, number])[]
+>;
+
+/** The radar slot's pool (2.6d C5). */
+export const RADAR_POOL = [
+  ["treasure-radar", 1],
+] as const satisfies readonly (readonly [CurioKind, number])[];
+/** The capsule slot's pool (2.6d C5). */
+export const CAPSULE_POOL = [
+  ["capsule-case", 1],
 ] as const satisfies readonly (readonly [CurioKind, number])[];
 
 /** Chance a room draws a retro curio (C7). */
@@ -377,6 +556,32 @@ export const BALL_SHARE = 1 / 30;
 export const BALL_FLOOR = 1 / 4;
 /** Chance a room draws an under-desk curio (C7). */
 export const UNDER_SHARE = 1 / 10;
+/** Chance a room draws the tech slot (2.6d C9). */
+export const TECH_SHARE = 1 / 10;
+/** Chance a room draws the radar (2.6d C9)... */
+export const RADAR_SHARE = 1 / 24;
+/** ...and its chance in a room that holds a star ball (2.6d C5). */
+export const RADAR_BESIDE_BALL = 1 / 2;
+/** Chance a room draws the capsule case (2.6d C9)... */
+export const CAPSULE_SHARE = 1 / 24;
+/** ...and its chance in a room that holds a star ball or the radar (2.6d C5). */
+export const CAPSULE_BESIDE = 1 / 3;
+
+/**
+ * The curio that hovers (2.6d C4): its underside's height over the surface
+ * it hovers over, in metres. Its mesh is built at that height, the model
+ * test's float check starts from it, and its lowest vertex is exactly this
+ * height. The one exception to the float check among the curios; a test
+ * names it, so a second one is a conscious change.
+ */
+export const CURIO_LIFT = { "hover-drone": 0.35 } as const satisfies Partial<
+  Record<CurioKind, number>
+>;
+
+/** A curio kind's lift (`CURIO_LIFT`), 0 for every kind that stands on its surface. */
+export function curioLift(kind: CurioKind): number {
+  return (CURIO_LIFT as Partial<Record<CurioKind, number>>)[kind] ?? 0;
+}
 /** How far a curio's box keeps inside its surface's edges, in metres. */
 export const CURIO_MARGIN = 0.02;
 /** The least gap between two curios at the same height, in metres. */
@@ -891,6 +1096,15 @@ export function curioSize(c: Curio): CurioSize {
 }
 
 /**
+ * The height of a curio's middle, in metres: halfway from its lift to its
+ * top over its surface. What a frame aims at and a sight line ends on, so a
+ * hovering curio is looked at, not the gap under it.
+ */
+export function curioMid(c: Curio): number {
+  return c.h + (curioLift(c.kind) + curioSize(c).top) / 2;
+}
+
+/**
  * The surface classes curio `kind` of `variant` stands on: its
  * `variantClasses` entry when it has one, else its kind's `classes`.
  */
@@ -935,7 +1149,17 @@ export interface SlotDraw {
 }
 
 /**
- * A room's four slot draws (C6); the ball slot also carries its floor
+ * A paired slot's draw (2.6d C5): a `SlotDraw` whose `take` is its own
+ * share, plus `paired`, whether the same uniform fell under the slot's
+ * chance beside a partner. The slot then takes when `take`, or when
+ * `paired` and the room already holds its partner (`slotTakes`).
+ */
+export interface PairedDraw extends SlotDraw {
+  paired: boolean;
+}
+
+/**
+ * A room's slot draws (C6, 2.6d C5); the ball slot also carries its floor
  * chance (`BALL_FLOOR`).
  */
 export interface CurioDraws {
@@ -943,19 +1167,67 @@ export interface CurioDraws {
   gear: SlotDraw;
   ball: SlotDraw & { floor: boolean };
   under: SlotDraw;
+  /**
+   * The tech slot (the reactor case, the drone). Absent means not drawn,
+   * so a forced-draws literal without it takes no tech curio;
+   * `curioDraws` always sets it.
+   */
+  tech?: SlotDraw;
+  /**
+   * The radar slot, paired with a star ball. Absent means not drawn;
+   * `curioDraws` always sets it.
+   */
+  radar?: PairedDraw;
+  /**
+   * The capsule slot, paired with a star ball or the radar. Absent means
+   * not drawn; `curioDraws` always sets it.
+   */
+  capsule?: PairedDraw;
 }
 
-/** The slots in the order the pass fills them (C6). */
-const SLOTS: readonly CurioSlot[] = ["retro", "gear", "ball", "under"];
+/** The slots in the order the pass fills them (C6, 2.6d C5). */
+const SLOTS: readonly CurioSlot[] = [
+  "retro",
+  "gear",
+  "ball",
+  "under",
+  "tech",
+  "radar",
+  "capsule",
+];
+
+/**
+ * Whether a slot takes (2.6d C5): its draw's own chance, or, for the radar
+ * and the capsule case, the paired chance when the room already holds a
+ * partner among the curios placed before it in this pass: a star ball for
+ * the radar, a star ball or the radar for the capsule case.
+ */
+function slotTakes(
+  slot: CurioSlot,
+  draw: SlotDraw | PairedDraw,
+  placed: readonly Curio[],
+): boolean {
+  if (draw.take) return true;
+  if (!("paired" in draw) || !draw.paired) return false;
+  const holds = (k: CurioKind) => placed.some((c) => c.kind === k);
+  if (slot === "radar") return holds("star-ball");
+  if (slot === "capsule") return holds("star-ball") || holds("treasure-radar");
+  return false;
+}
 
 /**
  * A room's curio draws (the module doc's step 1): one stream of
  * `seedFor(room.seed, "curio", "draw")` draws, in this order, the retro
  * slot's chance of `RETRO_SHARE` and its roll, the gear slot's chance of
  * `GEAR_SHARE` and its roll, the ball slot's chance of `BALL_SHARE`, its
- * roll and its floor chance of `BALL_FLOOR`, then the under slot's chance
- * of `UNDER_SHARE` and its roll. Everything is drawn whether it is used or
- * not, so no draw ever moves another. No draw forces a kind.
+ * roll and its floor chance of `BALL_FLOOR`, the under slot's chance of
+ * `UNDER_SHARE` and its roll, the tech slot's chance of `TECH_SHARE` and
+ * its roll, then the radar's uniform and roll and the capsule case's
+ * uniform and roll (2.6d C5): each uniform gives its `take` below its
+ * share (`RADAR_SHARE`, `CAPSULE_SHARE`) and its `paired` below its chance
+ * beside a partner (`RADAR_BESIDE_BALL`, `CAPSULE_BESIDE`). Everything is
+ * drawn whether it is used or not, so no draw ever moves another. No draw
+ * forces a kind.
  */
 export function curioDraws(room: CurioBase): CurioDraws {
   const rng = createRng(seedFor(room.seed, "curio", "draw"));
@@ -969,11 +1241,24 @@ export function curioDraws(room: CurioBase): CurioDraws {
   const ballRoll = rng.next();
   const floor = rng.chance(BALL_FLOOR);
   const under = slot(UNDER_SHARE);
+  const tech = slot(TECH_SHARE);
+  // One uniform per paired slot: `take` below its share, `paired` below
+  // its chance beside a partner (2.6d C5). The same comparison as
+  // `rng.chance`, so the share means what it says.
+  const paired = (share: number, beside: number): PairedDraw => {
+    const u = rng.next();
+    return { take: u < share, paired: u < beside, roll: rng.next() };
+  };
+  const radar = paired(RADAR_SHARE, RADAR_BESIDE_BALL);
+  const capsule = paired(CAPSULE_SHARE, CAPSULE_BESIDE);
   return {
     retro,
     gear,
     ball: { take: ballTake, roll: ballRoll, floor },
     under,
+    tech,
+    radar,
+    capsule,
   };
 }
 
@@ -1058,8 +1343,9 @@ export function cornerSpots(
 
 /**
  * True when curio `c` stands on surface `s` of `room` (the module doc's
- * step 5, C12): its variant stands on the surface's class
- * (`curioClasses`), its box lies inside the surface's box shrunk by
+ * step 6, C12): its variant stands on the surface's class
+ * (`curioClasses`), a `floorOnly` kind only on a surface of `h` 0 (2.6d
+ * C7), its box lies inside the surface's box shrunk by
  * `CURIO_MARGIN` (less 2 mm, for the rounding of its centre to three
  * decimals of a cell), its top is at most the surface's `clear`, and the
  * surface's height plus its top stays `CURIO_CEILING_GAP` under the
@@ -1071,6 +1357,7 @@ export function curioFits(room: CurioBase, c: Curio, s: HostSurface): boolean {
   const top = curioSize(c).top;
   return (
     curioClasses(c.kind, c.variant).includes(s.cls) &&
+    (CURIO_CATALOGUE[c.kind].floorOnly !== true || s.h === 0) &&
     box.x0 >= inner.x0 &&
     box.x1 <= inner.x1 &&
     box.z0 >= inner.z0 &&
@@ -1181,9 +1468,11 @@ type CurioCandidate =
 
 /**
  * The candidates of `kind` in `room` (the module doc's step 4), in the
- * order they are tried: by seed, ties by their order in `surfaces` or
- * among the corners. A floor ball takes the corners (`corners`, worked out
- * once and only when asked), any other kind the surfaces of its classes.
+ * order they are tried: a kind's `prefers` host's surfaces first (2.6d
+ * C8), then by seed, ties by their order in `surfaces` or among the
+ * corners. A floor ball takes the corners (`corners`, worked out once and
+ * only when asked), any other kind the surfaces of its classes, a
+ * `floorOnly` kind only those of `h` 0 (2.6d C7).
  */
 function candidatesOf(
   room: CurioBase,
@@ -1192,6 +1481,7 @@ function candidatesOf(
   surfaces: readonly HostSurface[],
   corners: () => readonly { cx: number; cy: number; x: number; y: number }[],
 ): CurioCandidate[] {
+  const e = CURIO_CATALOGUE[kind];
   const out: CurioCandidate[] = floor
     ? corners().map((c, order) => ({
         seed: seedFor(room.seed, "curio", c.cx, c.cy, "floor"),
@@ -1201,7 +1491,7 @@ function candidatesOf(
         y: c.y,
       }))
     : surfaces.flatMap((s, order) =>
-        CURIO_CATALOGUE[kind].classes.includes(s.cls)
+        e.classes.includes(s.cls) && (e.floorOnly !== true || s.h === 0)
           ? [
               {
                 seed: seedFor(room.seed, "curio", s.key[0], s.key[1], s.key[2]),
@@ -1212,7 +1502,15 @@ function candidatesOf(
             ]
           : [],
       );
-  return out.sort((a, b) => a.seed - b.seed || a.order - b.order);
+  const first = (c: CurioCandidate) =>
+    e.prefers !== undefined &&
+    c.on === "surface" &&
+    c.surface.host === e.prefers
+      ? 0
+      : 1;
+  return out.sort(
+    (a, b) => first(a) - first(b) || a.seed - b.seed || a.order - b.order,
+  );
 }
 
 /**
@@ -1264,7 +1562,7 @@ function trial(
   return placed.some((p) => curiosClash(p, mine)) ? null : c;
 }
 
-/** A slot's pool: the kind its draw forces, or its own weighted pool (C7). */
+/** A slot's pool: the kind its draw forces, or its own weighted pool (C7, 2.6d C6, C9). */
 function poolOf(
   slot: CurioSlot,
   draw: SlotDraw,
@@ -1273,13 +1571,19 @@ function poolOf(
   if (draw.kind !== undefined) return [[draw.kind, 1]];
   switch (slot) {
     case "retro":
-      return RETRO_POOL;
+      return RETRO_POOLS[archetype];
     case "gear":
       return GEAR_POOLS[archetype];
     case "ball":
       return BALL_POOL;
     case "under":
       return UNDER_POOL;
+    case "tech":
+      return TECH_POOLS[archetype];
+    case "radar":
+      return RADAR_POOL;
+    case "capsule":
+      return CAPSULE_POOL;
   }
 }
 
@@ -1302,7 +1606,7 @@ export function placeCurios(
   const placed: Curio[] = [];
   for (const slot of SLOTS) {
     const draw = draws[slot];
-    if (!draw.take) continue;
+    if (draw === undefined || !slotTakes(slot, draw, placed)) continue;
     const pool = poolOf(slot, draw, room.archetype);
     let floor = slot === "ball" && draws.ball.floor;
     const tryPlace = (kind: CurioKind): Curio | null => {

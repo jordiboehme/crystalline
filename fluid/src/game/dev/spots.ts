@@ -25,6 +25,8 @@
 import { TERMINAL_OCCLUDERS } from "../render/models/terminal";
 import {
   curioBox,
+  curioLift,
+  curioMid,
   curioSize,
   hostSurfaces,
   type HostSurface,
@@ -292,7 +294,8 @@ function surfaceOf(
  * and hide a curio on a desk end from the far side.
  *
  * Every other curio in the room occludes too: its own plan box
- * (`curioBox`) from its surface height `h` up to its top (`h +
+ * (`curioBox`) from its lift over its surface (`h + curioLift(o.kind)`,
+ * so the gap under the hovering drone stays open) up to its top (`h +
  * curioSize(o).top`), so a sword standing in front of another on the same
  * bench, or a gadget in front of a cradle, moves the search on to a spot
  * that sees the framed curio itself. Only `c` is left out.
@@ -333,7 +336,11 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
     add(h, heroFootprint(h), HERO_CATALOGUE[h.kind].top, heroLift(h.kind));
   for (const o of room.curios) {
     if (o === c) continue;
-    out.push({ ...curioBox(o), y0: o.h, y1: o.h + curioSize(o).top });
+    out.push({
+      ...curioBox(o),
+      y0: o.h + curioLift(o.kind),
+      y1: o.h + curioSize(o).top,
+    });
   }
   return out;
 }
@@ -406,7 +413,7 @@ function sightClear(
 
 /**
  * True when the sight line from world point `from` at eye height to curio
- * `c`'s middle crosses no occluding volume (`occludersFor`): the exact
+ * `c`'s middle (`curioMid`, halfway from its lift to its top) crosses no occluding volume (`occludersFor`): the exact
  * predicate `frameCurio`'s own search applies at every candidate, exported
  * so `spots.test.ts` can check a forced curio's chosen spot with it
  * directly.
@@ -419,7 +426,7 @@ export function curioSightClear(
   const box = curioBox(c);
   const cx = (box.x0 + box.x1) / 2;
   const cz = (box.z0 + box.z1) / 2;
-  const midY = c.h + curioSize(c).top / 2;
+  const midY = curioMid(c);
   return sightClear(
     { x: from.x, y: EYE_HEIGHT, z: from.z },
     { x: cx, y: midY, z: cz },
@@ -499,8 +506,9 @@ export function heroSightClear(
  * the first one whose sight line (eye height to the curio's middle) crosses
  * no volume of `occludersFor` wins (`sightClear`); when none does, the
  * search's first standable spot wins instead, so the seam never gives up a
- * spot to stand on. Its pitch looks at the curio's middle (`c.h` plus half
- * its top height), clamped to `MAX_PITCH`. Null when no side and distance
+ * spot to stand on. Its pitch looks at the curio's middle (`curioMid`:
+ * halfway from its lift to its top, so a hovering curio is looked at, not
+ * the gap under it), clamped to `MAX_PITCH`. Null when no side and distance
  * stands the player at all.
  */
 function frameCurio(
@@ -516,8 +524,7 @@ function frameCurio(
   const front = HERO_FRONT[c.turn] ?? [0, -1];
   const all = sidesOf(front);
   const order = back ? [3, 0, 1, 2] : [0, 1, 2, 3];
-  const top = curioSize(c).top;
-  const midY = c.h + top / 2;
+  const midY = curioMid(c);
   const target: Point3 = { x: cx, y: midY, z: cz };
   const occluders = occludersFor(room, c);
   let fallback: { spawn: RoomSpec["spawn"]; pitch: number } | null = null;

@@ -93,8 +93,15 @@ describe("roomWithForcedCurio", () => {
   // construction) draws no table, no bench, no workbench, no hydroponics
   // trough and no hero with an under spot, so the laptop has no host
   // here. Its `engineering` dressing does draw a service trolley, though,
-  // whose deck top hosts both under-desk kinds now.
-  const NO_HOST_IN_WORKSHOP: readonly string[] = ["beige-laptop"];
+  // whose deck top hosts both under-desk kinds now. The two computers are
+  // as wide as the laptop, so they find no host either, and the soot puffs
+  // stand only at floor level, which the trolley's deck is not.
+  const NO_HOST_IN_WORKSHOP: readonly string[] = [
+    "beige-laptop",
+    "breadbin-computer",
+    "slim-computer",
+    "soot-puffs",
+  ];
 
   it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
     const base = generateRoom(CANNED_WORKSHOP);

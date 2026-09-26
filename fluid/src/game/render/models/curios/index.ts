@@ -11,12 +11,13 @@
  * slot is its kind's blink bank (`CURIO_BANK`), which its blinking lights
  * pulse with.
  *
- * The recipes live in three batch files on disjoint lists of kinds:
- * `gear.ts`, `retro.ts` and `keepsakes.ts`, all built on `common.ts`. The
+ * The recipes live in six batch files on disjoint lists of kinds:
+ * `gear.ts`, `retro.ts`, `keepsakes.ts`, `finds.ts`, `desktop.ts` and
+ * `critters.ts`, all built on `common.ts`. The
  * curio test (`curioModels.test.ts`) builds every kind and variant, places
  * it at every turn on a surface the way the GPU does and checks the
  * envelope (its turned size and its top), that it reaches its top and
- * sits on its surface, the winding, the triangle budget, that nothing
+ * sits on its surface (the hovering drone from its lift), the winding, the triangle budget, that nothing
  * glows in mid-air, that no part floats clear of its base or another part,
  * and that blinking parts appear exactly in the kinds whose bank blinks.
  */
@@ -28,6 +29,9 @@ import { createKit, frameAt } from "../../kit";
 import type { Look } from "../../looks";
 import { surfaces, type KitAt } from "../common";
 import type { CurioRecipe } from "./common";
+import { CRITTER_RECIPES } from "./critters";
+import { DESKTOP_RECIPES } from "./desktop";
+import { FIND_RECIPES } from "./finds";
 import { GEAR_RECIPES } from "./gear";
 import { KEEPSAKE_RECIPES } from "./keepsakes";
 import { RETRO_RECIPES } from "./retro";
@@ -37,6 +41,9 @@ const RECIPES = {
   ...GEAR_RECIPES,
   ...RETRO_RECIPES,
   ...KEEPSAKE_RECIPES,
+  ...FIND_RECIPES,
+  ...DESKTOP_RECIPES,
+  ...CRITTER_RECIPES,
 } satisfies Record<CurioKind, CurioRecipe>;
 
 /**

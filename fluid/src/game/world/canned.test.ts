@@ -437,7 +437,7 @@ describe("heroHallRoom", () => {
     expect(JSON.stringify(heroHallRoom())).toBe(JSON.stringify(hall));
   });
 
-  it("holds one of every curio kind and variant, each fitting its hero's surface", () => {
+  it("holds one of every curio kind and variant, each fitting its host's surface", () => {
     const counts = new Map<string, number>();
     for (const c of hall.curios) {
       const key = `${c.kind}:${String(c.variant)}`;
@@ -502,9 +502,11 @@ describe("heroHallRoom", () => {
       const along = new Set(points.map((p) => Math.round(p.along * 1e6)));
       expect(along.size, `${host}: along-axis centres`).toBe(points.length);
     }
-    // The mess table, the tube bench and the laser desk each carry more
-    // than one curio; a row of one (the gun bench) has nothing to compare.
-    expect(rowsChecked).toBe(3);
+    // The mess table, the tube bench, the laser desk, and the round
+    // table's place 0, place 2 and south under spot each carry more than
+    // one curio; a row of one (the gun bench, the round table's places 1
+    // and 3) has nothing to compare.
+    expect(rowsChecked).toBe(6);
   });
 });
 

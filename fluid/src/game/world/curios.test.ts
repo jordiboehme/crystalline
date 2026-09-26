@@ -21,20 +21,29 @@ import {
 import {
   BALL_FLOOR,
   BALL_SHARE,
+  CAPSULE_BESIDE,
+  CAPSULE_SHARE,
   CURIO_CATALOGUE,
   CURIO_CEILING_GAP,
   CURIO_KINDS,
+  CURIO_LIFT,
+  CURIO_MARGIN,
   CURIO_ORDER,
   DECOR_SURFACES,
   FIXTURE_SURFACES,
   GEAR_SHARE,
   PROP_SURFACES,
+  RADAR_BESIDE_BALL,
+  RADAR_SHARE,
+  RETRO_POOLS,
   RETRO_SHARE,
+  TECH_SHARE,
   UNDER_SHARE,
   cornerSpots,
   curioBox,
   curioDraws,
   curioFits,
+  curioLift,
   curioOn,
   curioSize,
   curiosClash,
@@ -120,6 +129,7 @@ describe("curio catalogue", () => {
       }
       expect(e.classes.length, k).toBeGreaterThan(0);
       expect(e.slot === "under", k).toBe(e.classes.includes("under"));
+      if (e.floorOnly) expect(e.classes, k).toEqual(["under"]);
       if (e.variantClasses !== undefined) {
         expect(e.variantClasses.length, k).toBe(e.variants);
         for (const vc of e.variantClasses)
@@ -455,8 +465,14 @@ const only = (kind: CurioKind): CurioDraws => {
     gear: draw("gear"),
     ball: { ...draw("ball"), floor: false },
     under: draw("under"),
+    tech: draw("tech"),
+    radar: { ...draw("radar"), paired: false },
+    capsule: { ...draw("capsule"), paired: false },
   };
 };
+/** An archetype's whole retro pool weight (`RETRO_POOLS`). */
+const retroTotal = (a: Archetype) =>
+  RETRO_POOLS[a].reduce((sum, [, w]) => sum + w, 0);
 /** A count's tolerance: 4 standard deviations of `n` draws at `p`. */
 const within = (count: number, n: number, p: number) =>
   Math.abs(count - n * p) <= 4 * Math.sqrt(n * p * (1 - p));
@@ -837,6 +853,10 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     const laptops = (rooms: readonly Made[], n: number) => {
       let placed = 0;
       let laptop = 0;
+      // The laptop's expected count: its weight of 4 over the archetype's
+      // whole retro pool, summed over the rooms that placed one, since
+      // every retro kind fits these wide tops.
+      let expected = 0;
       for (let i = 0; i < n; i++) {
         const made = rooms[i % rooms.length];
         if (made === undefined) throw new Error("rooms");
@@ -844,17 +864,19 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
         const got = placeCurios(b, retroOnly(curioDraws(b).retro.roll));
         placed += got.length;
         laptop += got.filter((c) => c.kind === "beige-laptop").length;
+        expected += got.length * (4 / retroTotal(made.archetype));
       }
-      return { placed, laptop };
+      return { placed, laptop, expected };
     };
     const wide = WORKSHOPS.filter(
       (m) => m.archetype === "council" || m.archetype === "lab",
     );
     const a = laptops(wide, 600);
     expect(a.placed).toBe(600);
-    expect(within(a.laptop, a.placed, 4 / 12), `laptops ${a.laptop}`).toBe(
-      true,
-    );
+    expect(
+      within(a.laptop, a.placed, a.expected / a.placed),
+      `laptops ${a.laptop}`,
+    ).toBe(true);
     const archive = laptops(
       WORKSHOPS.filter((m) => m.archetype === "archive"),
       600,
@@ -868,16 +890,20 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       (m) => m.archetype === "council" || m.archetype === "lab",
     );
     let laptops = 0;
+    // `RETRO_SHARE * 4 / total(archetype)` per room drawn, summed, with
+    // `total` the archetype's whole `RETRO_POOLS` weight (15 in a council
+    // room, 16 in a lab), so a later weight change cannot leave it stale.
+    let expected = 0;
     for (let i = 0; i < 600; i++) {
       const made = wide[i % wide.length];
       if (made === undefined) throw new Error("rooms");
       const got = placeCurios(reseed(made.room, "laptop", i));
       laptops += got.filter((c) => c.kind === "beige-laptop").length;
+      expected += (RETRO_SHARE * 4) / retroTotal(made.archetype);
     }
-    expect(
-      within(laptops, 600, (RETRO_SHARE * 4) / 12),
-      `laptops ${laptops}`,
-    ).toBe(true);
+    expect(within(laptops, 600, expected / 600), `laptops ${laptops}`).toBe(
+      true,
+    );
     let balls = 0;
     for (let i = 0; i < 1500; i++) {
       const made = WORKSHOPS[i % WORKSHOPS.length];
@@ -1120,12 +1146,20 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       gear: { take: false, roll: 0.7412930731661618 },
       ball: { take: false, roll: 0.29439340252429247, floor: true },
       under: { take: false, roll: 0.9774609189480543 },
+      // The three 2.6d slots, appended after every old value (2.6d C5).
+      tech: { take: true, roll: 0.32370482943952084 },
+      radar: { take: true, paired: true, roll: 0.41816116753034294 },
+      capsule: { take: false, paired: false, roll: 0.9839846724644303 },
     });
     expect(curioDraws(base(generateRoom(CANNED_BRIDGE)))).toEqual({
       retro: { take: false, roll: 0.9995579079259187 },
       gear: { take: false, roll: 0.5458925957791507 },
       ball: { take: false, roll: 0.42699357331730425, floor: false },
       under: { take: false, roll: 0.7664119158871472 },
+      // The three 2.6d slots, appended after every old value (2.6d C5).
+      tech: { take: false, roll: 0.264657162129879 },
+      radar: { take: false, paired: true, roll: 0.9681926046032459 },
+      capsule: { take: false, paired: false, roll: 0.3696695831604302 },
     });
   });
 
@@ -1183,6 +1217,215 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       curioFits(b, laptop, s),
     );
     expect(hosts.map((s) => s.host)).toEqual(["hero:mess-table"]);
+  });
+});
+
+describe("the 2.6d curios (2.6d C3 to C9)", () => {
+  const HUB_ROOMS = matrix(CANNED_HUB);
+
+  it("names exactly one hovering curio and its lift (2.6d C4)", () => {
+    // Mutation caught: a second floater added without a conscious change,
+    // or the drone's lift dropped.
+    expect(CURIO_LIFT).toEqual({ "hover-drone": 0.35 });
+    for (const kind of CURIO_KINDS) {
+      expect(curioLift(kind), kind).toBe(kind === "hover-drone" ? 0.35 : 0);
+      for (const s of CURIO_CATALOGUE[kind].sizes)
+        expect(s.top, kind).toBeGreaterThan(curioLift(kind));
+    }
+  });
+
+  it("fits the drone on a terminal's desk end (2.6d C3, Review Focus 2)", () => {
+    // Mutation caught: the drone's box widened to the spec's 0.2 m, which
+    // no terminal end holds.
+    const [end] = FIXTURE_SURFACES.terminal;
+    const [drone] = CURIO_CATALOGUE["hover-drone"].sizes;
+    if (end === undefined || drone === undefined) throw new Error("tables");
+    expect(end.a1 - end.a0 - 2 * CURIO_MARGIN).toBeGreaterThanOrEqual(
+      Math.max(drone.width, drone.depth) - 1e-9,
+    );
+  });
+
+  it("keeps the two computers in the one retro slot, never both in a room (2.6d C6, Review Focus 1)", () => {
+    // Mutation caught: either computer moved to another slot, or dropped
+    // from an archetype's retro pool.
+    const both = ["breadbin-computer", "slim-computer"] as const;
+    for (const kind of both) {
+      expect(CURIO_CATALOGUE[kind].slot, kind).toBe("retro");
+      for (const [a, pool] of Object.entries(RETRO_POOLS))
+        expect(
+          pool.some(([k]) => k === kind),
+          `${a} ${kind}`,
+        ).toBe(true);
+    }
+    const seen = { "breadbin-computer": 0, "slim-computer": 0 };
+    for (let i = 0; i < 3000; i++) {
+      const made = HUB_ROOMS[i % HUB_ROOMS.length];
+      if (made === undefined) throw new Error("rooms");
+      const got = placeCurios(reseed(made.room, "computers", i));
+      const here = got.filter(
+        (c) => c.kind === "breadbin-computer" || c.kind === "slim-computer",
+      );
+      expect(here.length, `${made.name} ${String(i)}`).toBeLessThanOrEqual(1);
+      for (const c of here) seen[c.kind as (typeof both)[number]]++;
+    }
+    expect(seen["breadbin-computer"]).toBeGreaterThan(0);
+    expect(seen["slim-computer"]).toBeGreaterThan(0);
+    for (const kind of both) {
+      const hub = base(generateRoom(CANNED_HUB));
+      expect(
+        placeCurios(hub, only(kind)).map((c) => c.kind),
+        kind,
+      ).toEqual([kind]);
+      const bridge = base(generateRoom(CANNED_BRIDGE));
+      expect(() => placeCurios(bridge, only(kind)), kind).not.toThrow();
+      expect(placeCurios(bridge, only(kind)), kind).toEqual([]);
+    }
+  });
+
+  it("stands the space bricks in the retro slot, a little more often in lab and bridge rooms (2.6d C6)", () => {
+    // Mutation caught: the bricks put in another slot, or their lab and
+    // bridge weight left at 1.
+    expect(CURIO_CATALOGUE["space-bricks"].slot).toBe("retro");
+    const weight = (a: Archetype) =>
+      RETRO_POOLS[a].find(([k]) => k === "space-bricks")?.[1] ?? 0;
+    expect(weight("lab")).toBeGreaterThan(weight("council"));
+    expect(weight("bridge")).toBeGreaterThan(weight("engineering"));
+  });
+
+  it("stands the soot puffs only on the floor under a host (2.6d C7)", () => {
+    // Mutation caught: `floorOnly` ignored, so the puffs ride a trolley
+    // deck or a workbench's lower shelf.
+    let placed = 0;
+    for (const { name, room } of ROOMS) {
+      for (const c of placeCurios(base(room), only("soot-puffs"))) {
+        expect(c.h, name).toBe(0);
+        placed++;
+      }
+    }
+    expect(placed).toBeGreaterThan(0);
+    // The workshop's only under hosts are its trolleys' decks.
+    expect(
+      placeCurios(base(generateRoom(CANNED_WORKSHOP)), only("soot-puffs")),
+    ).toEqual([]);
+  });
+
+  it("hovers the drone over a terminal's desk end first, where the room has one (2.6d C8, Review Focus 2)", () => {
+    // Mutation caught: the terminal preference dropped, so a lab bench's
+    // end wins by seed in some room.
+    let rooms = 0;
+    for (const { name, room } of WORKSHOPS) {
+      const b = base(room);
+      const [d] = placeCurios(b, only("hover-drone"));
+      if (d === undefined) throw new Error(`${name}: no drone`);
+      expect(hostsOf(hostSurfaces(b), d)[0]?.host, name).toBe("terminal");
+      expect(d.h, name).toBe(FIXTURE_SURFACES.terminal[0]?.h);
+      rooms++;
+    }
+    expect(rooms).toBeGreaterThan(0);
+  });
+
+  it("takes the radar beside a star ball and the capsule case beside either, at their paired chance (2.6d C5)", () => {
+    // Mutation caught: the pairing read from the wrong slot, or the
+    // paired chance ignored.
+    const hub = base(generateRoom(CANNED_HUB));
+    const draws = (ball: CurioKind | null, radar: boolean): CurioDraws => ({
+      retro: OFF,
+      gear: OFF,
+      ball:
+        ball === null
+          ? { ...OFF, floor: false }
+          : { take: true, roll: 0, kind: ball, floor: false },
+      under: OFF,
+      tech: OFF,
+      radar: { take: radar, paired: true, roll: 0 },
+      capsule: { take: false, paired: true, roll: 0 },
+    });
+    const kinds = (d: CurioDraws) =>
+      placeCurios(hub, d)
+        .map((c) => c.kind)
+        .sort();
+    expect(kinds(draws("star-ball", false))).toEqual([
+      "capsule-case",
+      "star-ball",
+      "treasure-radar",
+    ]);
+    expect(kinds(draws("catch-ball", false))).toEqual(["catch-ball"]);
+    expect(kinds(draws(null, false))).toEqual([]);
+    expect(kinds(draws(null, true))).toEqual([
+      "capsule-case",
+      "treasure-radar",
+    ]);
+  });
+
+  it("draws the new slots at their shares (2.6d C9)", () => {
+    // Mutation caught: a paired slot's `take` compared against its paired
+    // chance instead of its share, or `paired` against the share.
+    const room = generateRoom(CANNED_WORKSHOP);
+    const n = 5000;
+    const c = {
+      tech: 0,
+      radar: 0,
+      radarPaired: 0,
+      capsule: 0,
+      capsulePaired: 0,
+    };
+    for (let i = 0; i < n; i++) {
+      const d = curioDraws(reseed(room, "draws-d", i));
+      if (d.tech?.take) c.tech++;
+      if (d.radar?.take) c.radar++;
+      if (d.radar?.paired) c.radarPaired++;
+      if (d.capsule?.take) c.capsule++;
+      if (d.capsule?.paired) c.capsulePaired++;
+    }
+    expect(within(c.tech, n, TECH_SHARE), `tech ${c.tech}`).toBe(true);
+    expect(within(c.radar, n, RADAR_SHARE), `radar ${c.radar}`).toBe(true);
+    expect(
+      within(c.radarPaired, n, RADAR_BESIDE_BALL),
+      `paired ${c.radarPaired}`,
+    ).toBe(true);
+    expect(within(c.capsule, n, CAPSULE_SHARE), `capsule ${c.capsule}`).toBe(
+      true,
+    );
+    expect(
+      within(c.capsulePaired, n, CAPSULE_BESIDE),
+      `paired ${c.capsulePaired}`,
+    ).toBe(true);
+  });
+
+  it("places every new kind with a host in the hub and keeps every invariant with all seven slots forced", () => {
+    // Mutation caught: a new kind that finds no candidate in the hub (its
+    // classes emptied), or a new slot placing a curio that clashes with
+    // or stands off its surface.
+    const ALL: CurioDraws = {
+      ...ALL_FORCED,
+      tech: { take: true, roll: 0.5 },
+      radar: { take: true, paired: true, roll: 0.5 },
+      capsule: { take: true, paired: true, roll: 0.5 },
+    };
+    for (const { name, room } of ROOMS)
+      expectInvariants(base(room), placeCurios(base(room), ALL), name);
+    for (const kind of CURIO_KINDS.slice(CURIO_KINDS.indexOf("treasure-radar")))
+      expect(
+        placeCurios(base(generateRoom(CANNED_HUB)), only(kind)).length,
+        kind,
+      ).toBe(1);
+  });
+
+  it("logs each new kind's realized rate over 1000 hubs and 1000 workshops", () => {
+    // Mutation caught: the radar's pool emptied, so it never lands.
+    const counts = new Map<string, number>();
+    const pool = [...HUB_ROOMS, ...WORKSHOPS];
+    for (let i = 0; i < 2000; i++) {
+      const made = pool[i % pool.length];
+      if (made === undefined) throw new Error("rooms");
+      for (const c of placeCurios(reseed(made.room, "rate-d", i)))
+        counts.set(c.kind, (counts.get(c.kind) ?? 0) + 1);
+    }
+    const line = CURIO_KINDS.slice(CURIO_KINDS.indexOf("treasure-radar"))
+      .map((k) => `${k} ${String(counts.get(k) ?? 0)}`)
+      .join(", ");
+    console.info(`2.6d curios per 2000 rooms: ${line}`);
+    expect(counts.get("treasure-radar") ?? 0).toBeGreaterThan(0);
   });
 });
 

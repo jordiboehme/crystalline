@@ -31,9 +31,10 @@
  *
  * `heroHallRoom` (H15) is the gallery's second hand-built room, for the
  * `?hall=heroes` dev route: one of every hero kind and variant, hand-placed
- * in a 23 by 24 hall with no other fixture, no decor and no props, so
- * nothing competes with a hero for a screenshot. It holds one of every
- * curio kind and variant, hand-placed on the hero surfaces they fit
+ * in a 23 by 24 hall with no fixture but the placard, one round table that
+ * carries the 2.6d curios, and no props, so nothing competes with a hero
+ * for a screenshot. It holds one of every curio kind and variant,
+ * hand-placed on the hero and round-table surfaces they fit
  * (`heroHallCurios`, `row`), for the `?at=prop:<kind>:<n>` shots that frame
  * them close and tilted (`spotView` in `dev/spots.ts`). `row` lays each row
  * along its host's local `a` axis, the wall-parallel one, whatever its own
@@ -996,8 +997,9 @@ function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
  * `HERO_ORDER`, the order a generated room's own heroes keep.
  *
  * No fixture but the placard, which tells the visitor how to frame one hero
- * at a time (`?AT=PROP:KIND:N`); no decor and no props, so nothing but the
- * heroes themselves stands between the camera and what is being judged. One
+ * at a time (`?AT=PROP:KIND:N`); one round table at (20, 16.5), turn 0,
+ * that carries the 2.6d curios, and no props, so nothing but the heroes
+ * and that table stands between the camera and what is being judged. One
  * steady light zone per four by four block, as `galleryRoom`'s. The same
  * call gives the same room byte for byte.
  */
@@ -1095,7 +1097,15 @@ export function heroHallRoom(): RoomSpec {
         ],
       },
     ],
-    decor: [],
+    decor: [
+      {
+        kind: "round-table",
+        x: 20,
+        y: 16.5,
+        turn: 0,
+        seed: seedFor(seed, "decor", "round-table", 0),
+      },
+    ],
     scaffold: [],
     heroes,
     props: [],
@@ -1116,8 +1126,12 @@ export function heroHallRoom(): RoomSpec {
  * at its own host's turn shares that same split (`curioBox`'s width/depth
  * swap), so an item's extent along the row is always its `width`, regardless
  * of turn. `curioOn` places each item's centre at the cumulative offset
- * along `a`, centred on `d`. Every curio in a row takes the surface's own
- * turn. Laying along `a` rather than whichever axis a surface's box happens
+ * along `a`, centred on `d`. Every curio in a row takes `turn`, the
+ * surface's own by default; a turn of the same parity as the surface's
+ * (the round table's places, turned to face out from its centre) keeps
+ * each item's extent along the row equal to its width, and `row` throws
+ * when the two differ in parity, since a row turned across itself is a
+ * bug in this file. Laying along `a` rather than whichever axis a surface's box happens
  * to span more matters because a surface can be narrower along `a` than
  * along `d`, as the tube bench and the gun bench both are: a row run into
  * the room instead of along the wall would stand one item's box behind the
@@ -1134,8 +1148,15 @@ export function heroHallRoom(): RoomSpec {
 export function row(
   s: HostSurface,
   items: readonly { kind: CurioKind; variant: number; seed: number }[],
+  turn: number = s.turn,
 ): Curio[] {
-  const aIsX = (((Math.round(s.turn) % 4) + 4) % 4) % 2 === 0;
+  const parity = (t: number) => (((Math.round(t) % 4) + 4) % 4) % 2;
+  if (parity(turn) !== parity(s.turn)) {
+    throw new Error(
+      `row: turn ${String(turn)} runs across ${s.host}'s row (turn ${String(s.turn)})`,
+    );
+  }
+  const aIsX = parity(s.turn) === 0;
   const surfaceLen = aIsX ? s.box.x1 - s.box.x0 : s.box.z1 - s.box.z0;
   const budget = surfaceLen - 2 * CURIO_MARGIN;
   const extentOf = (kind: CurioKind, variant: number): number => {
@@ -1164,7 +1185,7 @@ export function row(
         aIsX ? frac : 0.5,
         aIsX ? 0.5 : frac,
         it.seed,
-        s.turn,
+        turn,
       ),
     );
     pos += len + 2 * CURIO_GAP;
@@ -1173,8 +1194,8 @@ export function row(
 }
 
 /**
- * The hero hall's curios (2.6b): one of every curio kind and variant,
- * hand-placed on the hero surfaces they fit (`hostSurfaces`, `curioOn` and
+ * The hero hall's curios (2.6b, 2.6d): one of every curio kind and
+ * variant, hand-placed on the hero and round-table surfaces they fit (`hostSurfaces`, `curioOn` and
  * `row`). `row` lays each row along its host's local `a` axis
  * (wall-parallel), and the tube bench and the gun bench are both narrower
  * along `a` than along `d`, so the rows are grouped to fit those budgets:
@@ -1191,7 +1212,15 @@ export function row(
  * - the gun bench's top: the sword lying in its cradle, alone (its `a`
  *   budget, 0.31 m, is too narrow for a second item);
  * - the laser desk's under spot: the trap;
- * - the gun bench's under spot: the fuel case.
+ * - the gun bench's under spot: the fuel case;
+ * - the space bricks at the end of the mess table's row (2.94 m of its
+ *   2.96 m budget);
+ * - the round table's four places (2.6d C19), each curio turned to face
+ *   out from the table's centre: place 0 (south, turn 2) the radar and
+ *   the capsule case side by side, place 1 (west, turn 3) the breadbin
+ *   computer, place 2 (north, turn 0) the reactor case and the drone side
+ *   by side, place 3 (east, turn 1) the slim computer, and the south under
+ *   spot (turn 2) both soot puff variants in a row.
  *
  * Every seed is `seedFor(seed, "curio", kind, variant)`, and the output is
  * sorted by `CURIO_ORDER`.
@@ -1208,15 +1237,23 @@ function heroHallCurios(seed: number, room: RoomSpec): Curio[] {
     variant,
     seed: seedFor(seed, "curio", kind, variant),
   });
-  const one = (token: string, kind: CurioKind, variant: number): Curio =>
-    curioOn(
-      at(token),
+  const one = (
+    token: string,
+    kind: CurioKind,
+    variant: number,
+    turn?: number,
+  ): Curio => {
+    const s = at(token);
+    return curioOn(
+      s,
       kind,
       variant,
       0.5,
       0.5,
       seedFor(seed, "curio", kind, variant),
+      turn ?? s.turn,
     );
+  };
 
   return [
     ...row(at("hero-mess-table-0"), [
@@ -1230,6 +1267,7 @@ function heroHallCurios(seed: number, room: RoomSpec): Curio[] {
       item("catch-ball", 0),
       item("light-sword", 1),
       item("light-sword", 2),
+      item("space-bricks", 0),
     ]),
     ...row(at("hero-laser-desk-0"), [
       item("green-pistol", 0),
@@ -1242,5 +1280,25 @@ function heroHallCurios(seed: number, room: RoomSpec): Curio[] {
     ...row(at("hero-gun-bench-0"), [item("light-sword", 0)]),
     one("hero-laser-desk-under-0", "trap-box", 0),
     one("hero-gun-bench-under-0", "fuel-case", 0),
+    // 2.6d C19: the round table's four places, each turned out from its
+    // centre (place 0 south, 1 west, 2 north, 3 east), and its south
+    // under spot.
+    ...row(
+      at("decor-round-table-0"),
+      [item("treasure-radar", 0), item("capsule-case", 0)],
+      2,
+    ),
+    one("decor-round-table-1", "breadbin-computer", 0, 3),
+    ...row(
+      at("decor-round-table-2"),
+      [item("reactor-case", 0), item("hover-drone", 0)],
+      0,
+    ),
+    one("decor-round-table-3", "slim-computer", 0, 1),
+    ...row(
+      at("decor-round-table-4"),
+      [item("soot-puffs", 0), item("soot-puffs", 1)],
+      2,
+    ),
   ].sort(CURIO_ORDER);
 }

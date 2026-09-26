@@ -437,7 +437,15 @@ export type CurioKind =
   | "star-ball"
   | "catch-ball"
   | "trap-box"
-  | "fuel-case";
+  | "fuel-case"
+  | "treasure-radar"
+  | "capsule-case"
+  | "reactor-case"
+  | "hover-drone"
+  | "breadbin-computer"
+  | "slim-computer"
+  | "space-bricks"
+  | "soot-puffs";
 
 /**
  * One curio (C1): `x` and `y` in `Decor`'s continuous cell units, the

@@ -1036,6 +1036,24 @@
   ],
   "curios": [
     {
+      "kind": "treasure-radar",
+      "variant": 0,
+      "x": 12.723,
+      "y": 5.109,
+      "h": 0.94,
+      "turn": 3,
+      "seed": 3711943900920747
+    },
+    {
+      "kind": "reactor-case",
+      "variant": 0,
+      "x": 0.193,
+      "y": 8.222,
+      "h": 0.78,
+      "turn": 0,
+      "seed": 2478011078854370
+    },
+    {
       "kind": "tape-drive",
       "variant": 0,
       "x": 0.187,

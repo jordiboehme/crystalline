@@ -65,6 +65,7 @@ import {
   CURIO_CATALOGUE,
   placeCurios,
   type CurioDraws,
+  type CurioSlot,
   type SlotDraw,
 } from "../world/curios";
 import { dressRoom } from "../world/dress";
@@ -210,17 +211,24 @@ export function roomWithForcedHero(
  * `pickByRoll`'s order, and a forced draw's pool is only `kind` anyway, so
  * the roll never matters), a floor ball's `floor` is false (it tries the
  * surfaces, not the hall's corners, since a forced kind is meant to be
- * judged sitting on something), and the other three slots take nothing.
+ * judged sitting on something), the two paired slots' `paired` is false
+ * (a forced radar or capsule case lands by its own draw, never by its
+ * partner), and the other six slots take nothing.
  */
 function forcedCurioDraws(kind: CurioKind): CurioDraws {
   const untaken: SlotDraw = { take: false, roll: 0 };
   const forced: SlotDraw = { take: true, roll: 0, kind };
   const slot = CURIO_CATALOGUE[kind].slot;
+  const pick = (mine: CurioSlot): SlotDraw =>
+    mine === slot ? forced : untaken;
   return {
-    retro: slot === "retro" ? forced : untaken,
-    gear: slot === "gear" ? forced : untaken,
-    ball: { ...(slot === "ball" ? forced : untaken), floor: false },
-    under: slot === "under" ? forced : untaken,
+    retro: pick("retro"),
+    gear: pick("gear"),
+    ball: { ...pick("ball"), floor: false },
+    under: pick("under"),
+    tech: pick("tech"),
+    radar: { ...pick("radar"), paired: false },
+    capsule: { ...pick("capsule"), paired: false },
   };
 }
 
