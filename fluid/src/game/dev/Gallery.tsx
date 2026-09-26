@@ -22,10 +22,13 @@
  * kind and variant, for judging them and for the `?at=` shots below.
  * `?at=prop:<kind>:<n>` (H16, see `spotView`) puts the player in front of
  * the n-th hero or prop of that kind in whichever room is shown, framed
- * from its front instead of just facing it; `?at=prop:<kind>:<n>[:back]`
- * (C18, 2.6b) now reaches curios too, framed close and tilted down (and
- * from behind with `:back`), which is why the room is shown through
- * `session.showRoom`'s `view` argument rather than only its `spawn`;
+ * from its front instead of just facing it. The same pattern reaches
+ * curios too (C18, 2.6b), framed close and tilted down, which is why the
+ * room is shown through `session.showRoom`'s `view` argument rather than
+ * only its `spawn`. An optional view suffix frames any of them from
+ * elsewhere (2.6d C20): `:back` from behind, `:side` from the right side,
+ * `:quarter` from halfway between the front and the right, and `:close`
+ * a hero or prop from nearer (`?at=prop:<kind>:<n>[:back|:side|:quarter|:close]`);
  * `?at=<kind>:<n>` still puts the player in front of the n-th fixture of
  * that kind, facing it, instead of the room's own entrance, to judge a
  * malfunctioning fixture without walking across the hall. `?fault=missing`

@@ -115,8 +115,9 @@ describe("block-pixel font", () => {
  * Every lower-case glyph, pinned row by row (2.6d, the computers' lower-case
  * badge). The letters share one x-height: a short letter fills rows 2 to 4,
  * an ascender climbs to row 0, a dotted letter carries its dot in row 0
- * over a dark row 1, and a letter with a tail sits a row higher, rows 1 to
- * 3, its tail in row 4 (the 5-row grid has no room below the baseline).
+ * over a dark row 1, and a letter with a tail sits a row higher on
+ * purpose, its bowl in rows 1 to 3 and its tail in row 4 (the 5-row grid
+ * has no room below the baseline).
  */
 const LOWER: Readonly<Record<string, readonly string[]>> = {
   a: ["...", "...", ".##", "#.#", ".##"],
@@ -144,7 +145,7 @@ const LOWER: Readonly<Record<string, readonly string[]>> = {
   w: ["...", "...", "#.#", "###", "###"],
   x: ["...", "...", "#.#", ".#.", "#.#"],
   y: ["...", "#.#", "#.#", ".##", "##."],
-  z: ["...", "...", "###", ".#.", "###"],
+  z: ["...", "...", "##.", ".#.", ".##"],
 };
 
 const ASCENDERS = "bdfhklt";
@@ -153,7 +154,14 @@ const TAILED = "gpqy";
 
 describe("the block-pixel font's lower case", () => {
   it("holds the whole lower-case alphabet", () => {
-    expect(Object.keys(LOWER).join("")).toBe("abcdefghijklmnopqrstuvwxyz");
+    // Mutation caught: a lower-case glyph missing from the font, or one
+    // the font has and this file does not pin.
+    expect(
+      Object.keys(PIXEL_FONT)
+        .filter((k) => /[a-z]/.test(k))
+        .sort()
+        .join(""),
+    ).toBe("abcdefghijklmnopqrstuvwxyz");
   });
 
   it.each(Object.keys(LOWER))(

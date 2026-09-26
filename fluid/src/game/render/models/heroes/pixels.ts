@@ -35,10 +35,12 @@ import type { Surfaces } from "../common";
  *
  * The lower case (2.6d, for a badge whose original wordmark is lower
  * case) shares one x-height: a short letter fills rows 2 to 4, an
- * ascender climbs to row 0, `i` and `j` carry their dot in row 0 over a
- * dark row 1, and a letter with a tail (`g`, `p`, `q`, `y`, and `j`'s
- * hook) sits a row higher with its tail in row 4, since the grid has no
- * room below the baseline. No lower-case glyph is its capital's shape.
+ * ascender climbs to row 0, and `i` and `j` carry their dot in row 0 over
+ * a dark row 1, their stems in rows 2 and 3 like the short letters, `j`
+ * hooking left in row 4. A letter with a tail (`g`, `p`, `q`, `y`) sits a
+ * row higher on purpose, its bowl in rows 1 to 3 and its tail in row 4,
+ * since the grid has no room below the baseline. `s` and `z` mirror each
+ * other. No lower-case glyph is its capital's shape.
  */
 export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   A: [".#.", "#.#", "###", "#.#", "#.#"],
@@ -92,7 +94,7 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   w: ["...", "...", "#.#", "###", "###"],
   x: ["...", "...", "#.#", ".#.", "#.#"],
   y: ["...", "#.#", "#.#", ".##", "##."],
-  z: ["...", "...", "###", ".#.", "###"],
+  z: ["...", "...", "##.", ".#.", ".##"],
   "0": ["###", "#.#", "#.#", "#.#", "###"],
   "1": [".#.", "##.", ".#.", ".#.", "###"],
   "2": ["##.", "..#", ".#.", "#..", "###"],

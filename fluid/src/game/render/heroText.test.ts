@@ -10,7 +10,9 @@
  * constants in backticks, are stripped first). The 2.6d strings may be
  * spelled in `marks.ts` alone, and no recipe hands `textRows` a literal
  * with lower case in it, so the font's lower case is set from `marks.ts`
- * alone. Mutation caught: any new readable string in a recipe (add
+ * alone. No recipe reads `PIXEL_FONT` itself either, so every glyph goes
+ * through `textRows`, whose calls `textCalls.test.ts` records while every
+ * recipe builds and holds to this same list. Mutation caught: any new readable string in a recipe (add
  * `"FOO"`, `"42"` or a backtick `FOO` to a recipe and this fails).
  */
 
@@ -144,6 +146,15 @@ describe("readable text in the recipes", () => {
           `${name}: ${t}`,
         ).toBe(false);
     }
+  });
+
+  it("reaches the font through textRows alone (2.6d C16)", () => {
+    // `textCalls.test.ts` records every string `textRows` sets while the
+    // recipes build; a recipe reading `PIXEL_FONT` itself would set glyphs
+    // around that record. Mutation caught: `PIXEL_FONT[c]` or an import of
+    // `PIXEL_FONT` in any recipe.
+    for (const [name, src] of Object.entries(SOURCES))
+      expect(/\bPIXEL_FONT\b/.test(codeOf(src)), name).toBe(false);
   });
 
   it("hands textRows no literal of a recipe's own (2.6d C16)", () => {

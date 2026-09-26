@@ -273,12 +273,43 @@ describe("prop spots (H16)", () => {
     expect(cosTo("prop:slab-walker:0:close").dist).toBeLessThan(
       cosTo("prop:slab-walker:0").dist,
     );
-    for (const view of ["", ":side", ":quarter", ":back"]) {
-      expect(spotView(hall, `prop:hover-drone:0${view}`), view).not.toBeNull();
-      expect(
-        spotView(gallery, `prop:ooze-canisters:0${view}`),
-        view,
-      ).not.toBeNull();
+    // The curio (`frameCurio`) and the floor prop (`frameSpot`) keep the
+    // bearings their views name: the spot's direction from the thing's
+    // centre, split into its front and its right. Mutation caught:
+    // `frameCurio` ignoring `:side` and `:quarter`.
+    const drone = hall.curios.find((c) => c.kind === "hover-drone");
+    const cans = gallery.props.find((p) => p.kind === "ooze-canisters");
+    const cansBox = cans === undefined ? null : propFootprint(cans);
+    if (drone === undefined || cans === undefined || cansBox === null)
+      throw new Error("the hall holds the drone, the gallery the canisters");
+    const things = [
+      [hall, "hover-drone", curioBox(drone), drone.turn],
+      [gallery, "ooze-canisters", cansBox, cans.turn],
+    ] as const;
+    for (const [room, kind, b, turn] of things) {
+      const f = HERO_FRONT[turn] ?? [0, -1];
+      const bearing = (view: string) => {
+        const v = spotView(room, `prop:${kind}:0${view}`);
+        if (v === null) throw new Error(`no spot for ${kind}${view}`);
+        const p = spawnPlayer({ ...room, spawn: v.spawn });
+        const dx = p.x - (b.x0 + b.x1) / 2;
+        const dz = p.z - (b.z0 + b.z1) / 2;
+        const n = Math.hypot(dx, dz);
+        return {
+          front: (dx * f[0] + dz * f[1]) / n,
+          right: (dx * -f[1] + dz * f[0]) / n,
+        };
+      };
+      expect(bearing("").front, kind).toBeGreaterThan(0.9);
+      expect(bearing(":side").right, `${kind}:side`).toBeGreaterThan(0.9);
+      const q = bearing(":quarter");
+      expect(Math.abs(q.front - Math.SQRT1_2), `${kind}:quarter`).toBeLessThan(
+        0.1,
+      );
+      expect(Math.abs(q.right - Math.SQRT1_2), `${kind}:quarter`).toBeLessThan(
+        0.1,
+      );
+      expect(bearing(":back").front, `${kind}:back`).toBeLessThan(-0.9);
     }
     expect(spotView(hall, "prop:slab-walker:0:sideways")).toBeNull();
   });
