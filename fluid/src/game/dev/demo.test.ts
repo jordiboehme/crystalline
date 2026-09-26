@@ -66,13 +66,10 @@ describe("roomWithForcedCurio", () => {
   // The workshop's terminals have desk ends, but they are too narrow for
   // the laptop (C8), and its default archetype and condition (engineering,
   // construction) draws no table, no bench, no workbench, no hydroponics
-  // trough and no hero with an under spot, so neither the laptop nor
-  // either under-desk kind has a host here.
-  const NO_HOST_IN_WORKSHOP: readonly string[] = [
-    "beige-laptop",
-    "trap-box",
-    "fuel-case",
-  ];
+  // trough and no hero with an under spot, so the laptop has no host
+  // here. Its `engineering` dressing does draw a service trolley, though,
+  // whose deck top hosts both under-desk kinds now.
+  const NO_HOST_IN_WORKSHOP: readonly string[] = ["beige-laptop"];
 
   it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
     const base = generateRoom(CANNED_WORKSHOP);

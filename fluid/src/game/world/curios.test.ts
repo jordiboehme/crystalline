@@ -334,7 +334,7 @@ describe("host surfaces", () => {
       }
   });
 
-  it("gives open tops OPEN_CLEAR and every shelf level less", () => {
+  it("gives open tops OPEN_CLEAR and every shelf level less, but for the trolley's own open under spot", () => {
     const all = hostSurfaces(galleryRoom());
     for (const s of all) {
       expect(s.clear, s.host).toBeGreaterThan(0);
@@ -342,7 +342,12 @@ describe("host surfaces", () => {
       // A desk, bench or table top is always open.
       if (s.cls === "desk" || s.cls === "bench" || s.cls === "table")
         expect(s.clear, s.host).toBe(OPEN_CLEAR);
-      if (s.cls === "under") expect(s.clear, s.host).toBeLessThan(OPEN_CLEAR);
+      // Every under spot is tucked beneath something with a real, closed
+      // gap, but the service trolley's own deck top: that curio rides the
+      // open deck, so it takes OPEN_CLEAR like a table top would.
+      if (s.cls === "under")
+        if (s.host === "prop:trolley") expect(s.clear, s.host).toBe(OPEN_CLEAR);
+        else expect(s.clear, s.host).toBeLessThan(OPEN_CLEAR);
     }
     // A shelf host's highest level is its open top; every level below is
     // closed by the one above it.
@@ -557,8 +562,9 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       for (const slot of ["retro", "gear"] as const)
         expect(slots.has(slot), `${name} ${slot}`).toBe(true);
       // The under slot needs an under spot (a workbench's lower shelf, a
-      // hydroponics trough, a round table, a bench or a hero's), which not
-      // every canned room draws, so it is checked only where one exists.
+      // hydroponics trough, a round table, a bench, a service trolley's
+      // deck or a hero's), which not every canned room draws, so it is
+      // checked only where one exists.
       const hasUnderHost = hostSurfaces(b).some((s) => s.cls === "under");
       expect(slots.has("under"), `${name} under`).toBe(hasUnderHost);
       expectInvariants(b, got, name);
@@ -884,20 +890,23 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(within(balls, 1500, BALL_SHARE), `balls ${balls}`).toBe(true);
   });
 
-  it("places an under curio in about 1 generated room in 19 across all archetypes", () => {
+  it("places an under curio in about 1 generated room in 11 across all archetypes", () => {
     // The realized rate, counted on what `generateRoom` actually placed,
     // over 1000 rooms: the three canned places in turn, each permalink its
     // own (so its own room seed), with 0 to 5 made-up tags (so the machine
     // mix, and with it the workbench and the hydroponics trough, varies),
     // in all five archetypes. The spec asks for 1 room in 10; the rate is
     // `UNDER_SHARE` times the share of rooms with a visible under host,
-    // which is about 0.97 in a council chamber (its round table and its
-    // benches) and about 0.4 elsewhere (a workbench, a hydroponics trough
-    // or a hero's under spot), so about 0.55 over all and 1 room in 19 in
-    // all. Two bands pin it: the host share within 0.45 to 0.70 (losing
-    // any one host family drops it to 0.40 or less), and the rooms that
-    // hold an under curio within 4 standard deviations of `UNDER_SHARE`
-    // of the hosted rooms, so the share and the fit cannot drift either.
+    // which is about 0.99 in a council chamber (its round table and its
+    // benches) and about 0.76 to 0.97 elsewhere (a workbench, a
+    // hydroponics trough, a hero's under spot or a service trolley, which
+    // a bridge, an engineering bay, an archive and a lab all draw but a
+    // council chamber never does), so about 0.89 overall and 1 room in
+    // about 11 in all. Two bands pin it: the host share within 0.80 to
+    // 0.95 (losing the trolley alone drops it to about 0.52), and the
+    // rooms that hold an under curio within 4 standard deviations of
+    // `UNDER_SHARE` of the hosted rooms, so the share and the fit cannot
+    // drift either.
     const n = 200;
     const rooms: Record<Archetype, { rooms: number; hosted: number }> = {
       bridge: { rooms: 0, hosted: 0 },
@@ -934,9 +943,11 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     }
     const total = n * 5;
     expect(hosted / total, `hosted ${String(hosted)}`).toBeGreaterThanOrEqual(
-      0.45,
+      0.8,
     );
-    expect(hosted / total, `hosted ${String(hosted)}`).toBeLessThanOrEqual(0.7);
+    expect(hosted / total, `hosted ${String(hosted)}`).toBeLessThanOrEqual(
+      0.95,
+    );
     expect(
       within(placed, hosted, UNDER_SHARE),
       `placed ${String(placed)} of ${String(hosted)} hosted`,
@@ -1227,12 +1238,13 @@ const PINNED: Curio[] = [
 /**
  * The forced engineering workshop's curios with the mess table at (3.5,
  * 7.5) turned 3: the laptop on the table's top (h 0.76), turned to face
- * the table's back (a free host's `fixed` curio faces front or back), and
- * the star ball and the lying sword on the two desk ends of the west
- * terminal at row 8. The under slot draws `trap-box` but places nothing:
- * this engineering room has no workbench, no hydroponics trough, no round
- * table and no bench, the mess table has no under spot, and a terminal
- * has none.
+ * the table's back (a free host's `fixed` curio faces front or back), the
+ * star ball and the lying sword on the two desk ends of the west terminal
+ * at row 8, and the trap on the service trolley's deck (v0, h 0.27) its
+ * `runbook` dressing draws at (8.472, 9.48). This engineering room has no
+ * workbench, no hydroponics trough, no round table and no bench, and the
+ * mess table has no under spot of its own, but the trolley is now a host
+ * for the under slot too.
  */
 const PINNED_ON_HERO: Curio[] = [
   {
@@ -1261,5 +1273,14 @@ const PINNED_ON_HERO: Curio[] = [
     h: 0.78,
     turn: 0,
     seed: 2159271467005853,
+  },
+  {
+    kind: "trap-box",
+    variant: 0,
+    x: 8.472,
+    y: 9.48,
+    h: 0.27,
+    turn: 0,
+    seed: 752718812128755,
   },
 ];

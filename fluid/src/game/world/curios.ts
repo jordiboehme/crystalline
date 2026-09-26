@@ -23,10 +23,14 @@
  *   mesh at run time. An `under` spot is catalogued only where a standing
  *   player can see it: under an open-fronted desk, table, bench or trough
  *   (the workbench's lower shelf, the hydroponics trough, the round
- *   table's rim, the bench's seat) and a hero's `under` spots. A terminal
- *   carries none: its knee space holds the swivel chair, between the wall
- *   and every spot a player can stand on, so a curio there could never be
- *   seen.
+ *   table's rim, the bench's seat) and a hero's `under` spots. The class
+ *   names the curio slot, not the geometry, so it is not always a spot
+ *   tucked beneath something: the service trolley's own deck top is an
+ *   `under` spot too, the trap and the case riding it in the open the way
+ *   a curio never does anywhere else in the catalogue. A terminal carries
+ *   no `under` spot at all: its knee space holds the swivel chair, between
+ *   the wall and every spot a player can stand on, so a curio there could
+ *   never be seen.
  * - **C4. One transform.** Every local point goes to the world through
  *   `turnedPoint` (`footprints.ts`), a wall host from its slot's wall
  *   anchor and a free host from its centre (`hostSurfaces`).
@@ -584,14 +588,34 @@ export const DECOR_SURFACES = {
  * The shelf levels, tops and under spots of the floor props that have any
  * (C3), per variant, local to the prop's centre: the storage shelf's open
  * top (v0) or its three levels, each `clear` up to the next level's
- * underside, and its top (v1), each filing cabinet's top, and the floor
- * under each bench's seat.
+ * underside, and its top (v1), each filing cabinet's top, the floor
+ * under each bench's seat, and the service trolley's own deck top.
  *
  * The bench (`render/models/props/floor.ts`'s `bench`) is a slab seat from
  * 0.42 m on two slab legs whose inner faces stand at `a` of +-0.59, open
  * along `d` on both sides (v0) or at the front, under a back panel that
  * starts over the seat (v1). The spot keeps between the legs and under
  * the seat, which runs +-0.23 along `d` on v0 and -0.105 to 0.28 on v1.
+ *
+ * The trolley (`render/models/props/floor.ts`'s `trolley`) stands its
+ * (single, in both variants) lower deck on four corner casters whose
+ * posts rise to `TROLLEY.caster + 0.16` = 0.23 m: the floor beneath it
+ * clears only 0.23 m, too low for the fuel case (0.24 m tall) and too far
+ * under the deck, past the casters, for a standing player to ever see the
+ * trap either. The ruling puts both curios on the deck instead, not
+ * under it. v0 has one deck, its top at 0.27 m (0.23 m plus the deck's
+ * own 0.04 m), open above with nothing of the trolley taller than its own
+ * handle, which rises only from the back edge (`-d`). v1 adds a second
+ * deck on four corner posts 0.3 m up: its lower deck top, at 0.27 m too,
+ * sits under the upper one with a real 0.26 m gap, clearing the case by
+ * only 0.02 m, and a sight line to a curio there must duck under the
+ * upper deck's own footprint from outside it, needing about 2.4 m of
+ * clear floor around the trolley before an eye-height line gets that low
+ * soon enough - the same reach that starved the under-the-deck spot this
+ * replaces. So v1 hosts on its upper deck instead, top at 0.57 m, open
+ * above like v0's. Both spots stop short of the back edge rather than
+ * dodge the handle's rails and its top bar there, which cross nearly the
+ * whole width at that one edge.
  */
 export const PROP_SURFACES = {
   "storage-shelf": [
@@ -672,6 +696,30 @@ export const PROP_SURFACES = {
         d1: 0.28,
         h: 0,
         clear: 0.41,
+        cls: "under",
+      },
+    ],
+  ],
+  trolley: [
+    [
+      {
+        a0: -0.4,
+        a1: 0.4,
+        d0: -0.15,
+        d1: 0.24,
+        h: 0.27,
+        clear: OPEN_CLEAR,
+        cls: "under",
+      },
+    ],
+    [
+      {
+        a0: -0.46,
+        a1: 0.46,
+        d0: -0.15,
+        d1: 0.27,
+        h: 0.57,
+        clear: OPEN_CLEAR,
         cls: "under",
       },
     ],

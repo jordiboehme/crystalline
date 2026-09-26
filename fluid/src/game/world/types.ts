@@ -388,8 +388,10 @@ export interface Hero {
 
 /**
  * What a surface is for (C3): a desk top, a bench top, a table, a shelf
- * level or cabinet top, or an `under` spot below a host's top (the floor
- * in its knee space, or a lower shelf).
+ * level or cabinet top, or an `under` spot for the trap and the case -
+ * ordinarily below a host's top (the floor in its knee space, or a lower
+ * shelf), but the service trolley's own deck top counts too: `under`
+ * names the curio slot, not the geometry.
  */
 export type SurfaceClass = "desk" | "bench" | "table" | "shelf" | "under";
 

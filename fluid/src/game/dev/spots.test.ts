@@ -577,12 +577,11 @@ describe("frameCurio's sight line on real rooms", () => {
 
   // A terminal carries no under spot (`world/curios.ts`'s
   // `FIXTURE_SURFACES.terminal`): its knee space holds the swivel chair,
-  // so no standing player could ever see past it. The bridge and the
-  // canned workshop, at their own default archetype and condition, draw no
-  // other host with an under spot, so a forced under-desk kind finds no
-  // host in these rooms: the slot stays empty and the room is drawn
-  // without it, exactly the "room with no host for the drawn kind" case
-  // (`placeCurios` never throws on it).
+  // so no standing player could ever see past it. The canned bridge, at
+  // its own default archetype and condition, draws no other host with an
+  // under spot, so a forced under-desk kind finds no host there: the slot
+  // stays empty and the room is drawn without it, exactly the "room with
+  // no host for the drawn kind" case (`placeCurios` never throws on it).
 
   it("draws no host at all for a forced trap-box in the canned bridge", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_BRIDGE, "trap-box");
@@ -590,16 +589,25 @@ describe("frameCurio's sight line on real rooms", () => {
     expect(room.curios.some((c) => c.kind === "trap-box")).toBe(false);
   });
 
-  it("draws no host at all for a forced trap-box in the canned workshop", () => {
+  // The canned workshop's `runbook` dressing draws a service trolley
+  // (`world/curios.ts`'s `PROP_SURFACES.trolley`), whose deck top now
+  // hosts both curios in the open, so a forced trap-box or fuel-case
+  // lands there instead of finding no host at all.
+
+  it("finds a clear spot for a forced trap-box on the canned workshop's trolley", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "trap-box");
-    expect(placed).toBeNull();
-    expect(room.curios.some((c) => c.kind === "trap-box")).toBe(false);
+    expect(placed).toBe("trap-box");
+    const c = room.curios.find((x) => x.kind === "trap-box");
+    if (c === undefined) throw new Error("no trap-box placed");
+    expect(curioSightClear(room, forcedSpot(room, "trap-box"), c)).toBe(true);
   });
 
-  it("draws no host at all for a forced fuel-case in the canned workshop", () => {
+  it("finds a clear spot for a forced fuel-case on the canned workshop's trolley", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "fuel-case");
-    expect(placed).toBeNull();
-    expect(room.curios.some((c) => c.kind === "fuel-case")).toBe(false);
+    expect(placed).toBe("fuel-case");
+    const c = room.curios.find((x) => x.kind === "fuel-case");
+    if (c === undefined) throw new Error("no fuel-case placed");
+    expect(curioSightClear(room, forcedSpot(room, "fuel-case"), c)).toBe(true);
   });
 });
 
@@ -615,9 +623,14 @@ describe("every catalogued under spot seen from a standing player", () => {
    * a workbench, the hydroponics trough) has them in no occluder, so its
    * spots must be seen from its open front or back: the standing spot's
    * offset from the curio runs more along the host's `d` than its `a`.
-   * The round table is open all round.
+   * The round table is open all round, and so is the service trolley: its
+   * curio rides the open deck top on four thin corner casters, nothing
+   * standing in the way of any side.
    */
-  const OPEN_ALL_ROUND: ReadonlySet<string> = new Set(["decor:round-table"]);
+  const OPEN_ALL_ROUND: ReadonlySet<string> = new Set([
+    "decor:round-table",
+    "prop:trolley",
+  ]);
   const ARCHETYPE_TYPES = [
     "manifest",
     "decision",
