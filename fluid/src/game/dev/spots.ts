@@ -8,17 +8,18 @@
  * is added) is `wallFacingSpawn`'s cell-centre spot, backed off clear of
  * the fixture's own footprint when it has one (`spotFor`). `prop:<kind>:<n>`
  * (H16) frames the n-th hero or prop of that kind instead: a spot in front
- * of its face, at a distance that frames it, from `frameSpot`.
+ * of its face, at a distance that frames it, from `frameSpot`, pitched
+ * toward a lifted or low hero's middle (`framesPitched`, C16).
  * `prop:<kind>:<n>[:back]` (C18, 2.6b) frames the n-th curio of that kind
  * close and tilted down instead, when `kind` is neither a hero nor a prop
  * kind (the three families' names are disjoint, pinned in `world/curios.ts`).
  * All three give null for a bad spot: an unknown kind, no such ordinal, no
  * ordinal at all, or a negative one.
  *
- * `spotView` is the seam that carries a curio's pitch along with its spawn;
- * `spotSpawn` is `spotView` with the pitch dropped, for every caller that
- * only ever wants the fixture, hero and prop spots it always gave (their
- * pitch is always 0).
+ * `spotView` is the seam that carries a curio's or hero's pitch along with
+ * its spawn; `spotSpawn` is `spotView` with the pitch dropped, for every
+ * caller that only ever wants the spawn. `heroSightClear` (C16) checks a
+ * hero's own sight line the same way `curioSightClear` checks a curio's.
  */
 
 import { TERMINAL_OCCLUDERS } from "../render/models/terminal";
@@ -34,6 +35,7 @@ import {
   footprint,
   footprintOf,
   heroFootprint,
+  heroLift,
   heroTurn,
   propFootprint,
   turnedBox,
@@ -49,7 +51,14 @@ import {
 } from "../world/move";
 import { PROP_KINDS } from "../world/props";
 import { edgeOf, wallAnchor } from "../world/sites";
-import type { Box, Curio, Fixture, RoomSpec } from "../world/types";
+import type {
+  Box,
+  Curio,
+  Fixture,
+  Hero,
+  HeroKind,
+  RoomSpec,
+} from "../world/types";
 import { CELL } from "../world/units";
 
 /**
@@ -264,9 +273,11 @@ function surfaceOf(
  * `decorFootprint`, `propFootprint`) stood up from the floor to
  * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
  * and the sight line never rises over the eye), and every hero's footprint
- * stood up to its own `HERO_CATALOGUE[kind].top`. A host's surfaces lie
- * inside its footprint, below that top, so they occlude as part of it and
- * need no volume of their own.
+ * stood from its own `heroLift` up to its `HERO_CATALOGUE[kind].top` (C16):
+ * a lifted hero's column starts at its lift, not the floor, so a sight line
+ * that passes under it counts as clear. A host's surfaces lie inside its
+ * footprint, below that top, so they occlude as part of it and need no
+ * volume of their own.
  *
  * The one host `c` stands on or under (`surfaceOf`) is neither solid nor
  * skipped: it gives only `ceilingVolume`, its footprint from `c`'s own
@@ -294,10 +305,10 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const own = surfaceOf(hostSurfaces(room), c);
   const ownAnchor: object | undefined = own?.anchorOf;
   const out: Volume[] = [];
-  const add = (anchor: object, fp: Box | null, top: number) => {
+  const add = (anchor: object, fp: Box | null, top: number, y0 = 0) => {
     if (fp === null) return;
     if (own === undefined || anchor !== ownAnchor) {
-      out.push({ ...fp, y0: 0, y1: top });
+      out.push({ ...fp, y0, y1: top });
       return;
     }
     const v = ceilingVolume(fp, own);
@@ -319,7 +330,7 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   for (const d of room.decor) add(d, decorFootprint(d), EYE_HEIGHT);
   for (const p of room.props) add(p, propFootprint(p), EYE_HEIGHT);
   for (const h of room.heroes)
-    add(h, heroFootprint(h), HERO_CATALOGUE[h.kind].top);
+    add(h, heroFootprint(h), HERO_CATALOGUE[h.kind].top, heroLift(h.kind));
   for (const o of room.curios) {
     if (o === c) continue;
     out.push({ ...curioBox(o), y0: o.h, y1: o.h + curioSize(o).top });
@@ -416,6 +427,69 @@ export function curioSightClear(
   );
 }
 
+/** A hero whose top is under this is low: framed pitched down to its middle (C16). */
+export const LOW_HERO_TOP = 1.0;
+
+/**
+ * Whether `?at=` frames a hero kind with a pitch (C16): a hovering one
+ * (`heroLift` over 0) or a low one (top under `LOW_HERO_TOP`). Every
+ * other hero keeps pitch 0, so the spots pinned before 2.6c hold.
+ */
+export function framesPitched(kind: HeroKind): boolean {
+  return heroLift(kind) > 0 || HERO_CATALOGUE[kind].top < LOW_HERO_TOP;
+}
+
+/** The pitch from a spawn to a hero's middle, clamped to `MAX_PITCH`. */
+function pitchTo(spawn: RoomSpec["spawn"], h: Hero): number {
+  const box = heroFootprint(h);
+  const px = (spawn.x + 0.5) * CELL;
+  const pz = (spawn.y + 0.5) * CELL;
+  const dist = Math.hypot(
+    (box.x0 + box.x1) / 2 - px,
+    (box.z0 + box.z1) / 2 - pz,
+  );
+  const mid = (heroLift(h.kind) + HERO_CATALOGUE[h.kind].top) / 2;
+  return Math.max(
+    -MAX_PITCH,
+    Math.min(MAX_PITCH, -Math.atan2(EYE_HEIGHT - mid, dist)),
+  );
+}
+
+/**
+ * Whether the eye at `from` (metres, at `EYE_HEIGHT`) sees hero `h`'s
+ * middle (its box's centre, halfway from its lift to its top): no other
+ * hero (from its lift to its top), fixture, decor piece or floor prop
+ * (from the floor to the eye) stands on the line. The hero hall's layout
+ * is held to it (C16).
+ */
+export function heroSightClear(
+  room: RoomSpec,
+  from: { x: number; z: number },
+  h: Hero,
+): boolean {
+  const box = heroFootprint(h);
+  const target: Point3 = {
+    x: (box.x0 + box.x1) / 2,
+    y: (heroLift(h.kind) + HERO_CATALOGUE[h.kind].top) / 2,
+    z: (box.z0 + box.z1) / 2,
+  };
+  const out: Volume[] = [];
+  const add = (fp: Box | null) => {
+    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
+  };
+  for (const f of room.fixtures) add(footprintOf(f));
+  for (const d of room.decor) add(decorFootprint(d));
+  for (const p of room.props) add(propFootprint(p));
+  for (const o of room.heroes)
+    if (o !== h)
+      out.push({
+        ...heroFootprint(o),
+        y0: heroLift(o.kind),
+        y1: HERO_CATALOGUE[o.kind].top,
+      });
+  return sightClear({ x: from.x, y: EYE_HEIGHT, z: from.z }, target, out);
+}
+
 /**
  * A spot that frames curio `c` close and tilted down (C18), with a clear
  * sight line to it: along each of `sidesOf(c)`'s four directions (front,
@@ -489,7 +563,9 @@ function frameCurio(
  * n-th hero of that kind (in `room.heroes` order) when `HERO_KINDS` holds
  * it, else the n-th prop of that kind (in `room.props` order) when
  * `PROP_KINDS` holds it, framed from its front (`frameSpot`,
- * `HERO_FRONT[turn]`), pitch 0: a wall or ceiling prop, which has no
+ * `HERO_FRONT[turn]`): pitch 0, or for a lifted or low hero a pitch toward
+ * its middle (C16), clamped to `MAX_PITCH` (`framesPitched`, `pitchTo`); a
+ * prop always keeps pitch 0. A wall or ceiling prop, which has no
  * `propFootprint`, is framed by the box of its own edge (`EDGE_PROP_SIZE`).
  * `n` is the ordinal a hero or prop of that kind holds in the room's own
  * order (`HERO_ORDER` for a hero), not its variant: the two usually line up,
@@ -506,8 +582,7 @@ function frameCurio(
  * Development only, like everything in `dev/`.
  *
  * `spotSpawn` is `spotView` with the pitch dropped, for every caller that
- * only ever reads the fixture, hero and prop spots (their pitch is always
- * 0).
+ * only ever reads the spawn.
  */
 export function spotView(
   room: RoomSpec,
@@ -532,7 +607,9 @@ export function spotView(
       heroFootprint(h),
       HERO_FRONT[heroTurn(h)] ?? [0, -1],
     );
-    return spawn === null ? null : { spawn, pitch: 0 };
+    return spawn === null
+      ? null
+      : { spawn, pitch: framesPitched(h.kind) ? pitchTo(spawn, h) : 0 };
   }
   if ((PROP_KINDS as readonly string[]).includes(kind)) {
     const p = room.props.filter((x) => x.kind === kind)[i];
@@ -548,8 +625,8 @@ export function spotView(
 
 /**
  * `spotView`'s spawn alone, pitch dropped: every caller that only ever
- * wanted the fixture, hero and prop spots (whose pitch is always 0) keeps
- * this signature.
+ * wanted the spawn (a fixture's or an unpitched prop's spot, whose pitch is
+ * always 0, or a lifted or low hero's own pitch, C16) keeps this signature.
  */
 export function spotSpawn(
   room: RoomSpec,

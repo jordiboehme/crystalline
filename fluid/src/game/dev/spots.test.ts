@@ -27,8 +27,14 @@ import {
   PROP_SURFACES,
   hostSurfaces,
 } from "../world/curios";
-import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
+import {
+  HERO_FRONT,
+  heroFootprint,
+  heroLift,
+  propFootprint,
+} from "../world/footprints";
 import { generateRoom } from "../world/generate";
+import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
 import {
@@ -56,6 +62,8 @@ import {
   SPOT_KINDS,
   circleOverlapsBox,
   curioSightClear,
+  framesPitched,
+  heroSightClear,
   spotSpawn,
   spotView,
 } from "./spots";
@@ -164,6 +172,62 @@ describe("prop spots (H16)", () => {
         h.kind,
       ).toBe(false);
     }
+  });
+
+  it("frames every hero of the hero hall with a clear sight line, pitched where it is lifted or low (Review Focus 5)", () => {
+    // Mutation caught: a hero standing between another and its frame spot
+    // (the 2.6b hall lesson), or the pitch missing or pointing the wrong way.
+    const counts = new Map<string, number>();
+    for (const h of hall.heroes) {
+      const n = counts.get(h.kind) ?? 0;
+      counts.set(h.kind, n + 1);
+      const view = spotView(hall, `prop:${h.kind}:${String(n)}`);
+      if (view === null) throw new Error(h.kind);
+      const from = {
+        x: (view.spawn.x + 0.5) * CELL,
+        z: (view.spawn.y + 0.5) * CELL,
+      };
+      expect(heroSightClear(hall, from, h), h.kind).toBe(true);
+      const mid = (heroLift(h.kind) + HERO_CATALOGUE[h.kind].top) / 2;
+      if (!framesPitched(h.kind)) expect(view.pitch, h.kind).toBe(0);
+      else if (mid > EYE_HEIGHT)
+        expect(view.pitch, h.kind).toBeGreaterThan(0.05);
+      else expect(view.pitch, h.kind).toBeLessThan(-0.05);
+      expect(Math.abs(view.pitch), h.kind).toBeLessThanOrEqual(
+        MAX_PITCH + 1e-9,
+      );
+    }
+    expect(HERO_KINDS.filter(framesPitched).sort()).toEqual([
+      "flying-cloud",
+      "hoverboard",
+      "question-block",
+      "thunder-hammer",
+    ]);
+  });
+
+  it("sees a hero hidden behind another as blocked", () => {
+    // Mutation caught: heroSightClear ignoring the other heroes.
+    const block: Hero = {
+      kind: "moon-rocket",
+      variant: 0,
+      x: 5,
+      y: 5,
+      turn: 2,
+      seed: 0,
+    };
+    const wallOf: Hero = {
+      kind: "spider-tank",
+      variant: 0,
+      x: 5,
+      y: 7,
+      turn: 0,
+      seed: 0,
+    };
+    const room = { ...hall, heroes: [block, wallOf], props: [], curios: [] };
+    expect(heroSightClear(room, { x: 11, z: 18 }, block)).toBe(false);
+    expect(
+      heroSightClear({ ...room, heroes: [block] }, { x: 11, z: 18 }, block),
+    ).toBe(true);
   });
 
   it("frames a floor prop of the gallery the same way", () => {
@@ -463,6 +527,29 @@ describe("frameCurio's sight line", () => {
     const player = spawnPlayer({ ...room, spawn: view.spawn });
     expect(player.x).toBeCloseTo(out(1.4).x, 6);
     expect(player.z).toBeCloseTo(out(1.4).z, 6);
+  });
+
+  it("lets a sight line pass under a hovering hero", () => {
+    // Mutation caught: occludersFor standing the block from the floor.
+    const c: Curio = {
+      kind: "star-ball",
+      variant: 0,
+      x: 5,
+      y: 5,
+      h: 0,
+      turn: 0,
+      seed: 0,
+    };
+    const over: Hero = {
+      kind: "question-block",
+      variant: 0,
+      x: 5,
+      y: 4.2,
+      turn: 0,
+      seed: 0,
+    };
+    const room = bareRoom([c], [over]);
+    expect(curioSightClear(room, { x: 10, z: 6 }, c)).toBe(true);
   });
 });
 
