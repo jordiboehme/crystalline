@@ -3,8 +3,8 @@
  * checks do not pin for the marked crate and the gravity console. Parts
  * are found by their lighting flag and their tint, in the recipe's own
  * local `(a, d, h)` terms. The crate carries the maker's round C and its
- * word on its front and its right side, on the top crate when it stands on
- * a stack. The console blinks its readout's pixels in one group and two
+ * word on all four of its sides, on the top crate when it stands on a
+ * stack. The console blinks its readout's pixels in one group and two
  * buttons in two more, slants its deck up to the back over a waist-high
  * pillar, and carries the dial's one needle above the pillar and the mark
  * on the pillar below the deck.
@@ -47,27 +47,42 @@ const span = (pts: readonly V3[], i: 0 | 1 | 2) => {
 };
 
 describe("the marked props' models", () => {
-  it("stencils the round C and the word on the crate's front and right side, on the top crate of the stack", () => {
-    // Mutation caught: the mark on one side only, or on the stack's base.
+  it("stencils the round C and the word on all four sides of the crate, on the top crate of the stack", () => {
+    // Mutation caught: a side left blank, or the mark on the stack's base.
     const runs = pixelRuns(textRows(MARKS.capsuleWord)).length;
+    const flat = (q: readonly V3[], i: 0 | 1) =>
+      span(q, i).hi - span(q, i).lo < 1e-6;
     for (const v of [0, 1]) {
       const marks = recorded("marked-crate", v).filter(
         (p) => p.tint?.join() === MARK_BLUE.join(),
       );
-      const faces = new Set<string>();
+      const faces = new Map<string, number>();
       for (const p of marks) {
         const q = local(p);
-        if (span(q, 1).hi - span(q, 1).lo < 1e-6 && span(q, 1).lo > 0)
-          faces.add("front");
-        else if (span(q, 0).hi - span(q, 0).lo < 1e-6 && span(q, 0).lo > 0)
-          faces.add("right");
-        else
-          throw new Error(`a mark part off both faces (variant ${String(v)})`);
+        const face =
+          flat(q, 1) && span(q, 1).lo > 0
+            ? "front"
+            : flat(q, 1) && span(q, 1).hi < 0
+              ? "back"
+              : flat(q, 0) && span(q, 0).lo > 0
+                ? "right"
+                : flat(q, 0) && span(q, 0).hi < 0
+                  ? "left"
+                  : null;
+        if (face === null)
+          throw new Error(`a mark part off every face (variant ${String(v)})`);
+        faces.set(face, (faces.get(face) ?? 0) + 1);
         if (v === 1)
           expect(span(q, 2).lo, "on the top crate").toBeGreaterThan(0.85);
       }
-      expect([...faces].sort(), String(v)).toEqual(["front", "right"]);
-      expect(marks.length, String(v)).toBeGreaterThanOrEqual(2 * runs);
+      expect([...faces.keys()].sort(), String(v)).toEqual([
+        "back",
+        "front",
+        "left",
+        "right",
+      ]);
+      for (const [face, n] of faces)
+        expect(n, `${face} ${String(v)}`).toBeGreaterThanOrEqual(runs);
     }
   });
 

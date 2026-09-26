@@ -8,8 +8,9 @@
  * - **Marked crate.** A sturdy pale grey cargo crate, 1.0 by 0.8 by 0.8 m,
  *   with dark grey corner guards up all four corners and edge ribs along
  *   the top and bottom edges of all four sides. The mark is stencilled
- *   large on its front (`+d`) and on its right side (`+a`), so a
- *   three-quarter view shows both. The rare step's mark relabels one
+ *   large on all four sides, as a cargo crate is marked, so whichever
+ *   way the crate turns and wherever it is seen from, a mark faces the
+ *   viewer. The rare step's mark relabels one
  *   accepted crate (C12): variant 0 stands alone, variant 1 tops a large
  *   plain crate in the look's machine colour, 1.2 by 1.1 by 0.85 m, the
  *   station's own crate body, so the stack is 1.65 m. No light.
@@ -228,8 +229,8 @@ function mark(
 
 /**
  * The marked crate standing at `h0`: the pale body, the four corner
- * guards, the eight edge ribs between them and the mark on the front and
- * the right side.
+ * guards, the eight edge ribs between them and the mark on all four
+ * sides.
  */
 function markedBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
   const { hw, hd, h } = CRATE;
@@ -271,10 +272,17 @@ function markedBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
       CRATE_WORD_PX,
       h0 + CRATE_WORD_TOP - (5 * CRATE_WORD_PX) / 2,
     );
-  markOn(k, bd);
-  // A quarter turn back, so the frame's `d` runs along `+a` and the right
-  // side reads the same way round as the front.
-  markOn(kitAt(yawed(ORIGIN, 0, 0, -Math.PI / 2)), bw);
+  // Each side in a frame turned so its `d` runs out of that side (the
+  // front, `+a`, the back, `-a`), so every mark reads the right way round
+  // from outside.
+  const sides = [
+    [0, bd],
+    [-Math.PI / 2, bw],
+    [Math.PI, bd],
+    [Math.PI / 2, bw],
+  ] as const;
+  for (const [yaw, face] of sides)
+    markOn(yaw === 0 ? k : kitAt(yawed(ORIGIN, 0, 0, yaw)), face);
 }
 
 /** The marked crate: alone, or on top of a large plain crate. */
