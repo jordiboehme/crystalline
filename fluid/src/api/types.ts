@@ -747,6 +747,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/rename": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rename a domain, everywhere or on this machine only.
+         * @description The caller's write gate on the domain, then the engine's own rule for who may rename it - an instance admin, or a private domain's owner. `local_only: true` touches only this machine's own records; a full rename also writes the MANIFEST and respells links in every domain the caller can write, leaving one they can only read as it is and listing it under `left_behind`.
+         */
+        post: operations["rename_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/retire": {
         parameters: {
             query?: never;
@@ -1102,6 +1122,26 @@ export interface paths {
          *     has to be reproducible.
          */
         get: operations["get_evolve_queue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/github/domain-name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Peek at the domain_name a repository's MANIFEST declares.
+         * @description Admin only, read-only: never registers anything. Reads the MANIFEST at `path` (the repository root when absent) on `branch` (the repository's default when absent) through the forge and reports its `domain_name` (`null` when it declares none, is missing or cannot be read) alongside `default_name`, the repository's own name segment a nameless create falls back to.
+         */
+        get: operations["github_domain_name"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2943,6 +2983,22 @@ export interface components {
              */
             token_endpoint_auth_method: string;
         };
+        /** @description The new name, and whether the rename stays on this machine only. */
+        RenameBody: {
+            /**
+             * @description Rename on this machine only: the MANIFEST and every link stay as
+             *     they are, and only this machine's own records move. Defaults to
+             *     `false`, a full rename that also writes the MANIFEST and respells
+             *     links in every domain the caller can write.
+             * @example false
+             */
+            local_only?: boolean;
+            /**
+             * @description The domain's new name.
+             * @example engineering
+             */
+            name: string;
+        };
         /** @description How to settle the conflict: keep `mine`, take `theirs`, or write `merged` content of your own. `content` belongs to `merged` and to nothing else. */
         ResolveBody: {
             /**
@@ -4318,7 +4374,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description An unknown mode, a name that could escape the domains root, or a field that does not belong to the mode asked for. */
+            /** @description An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, or a field that does not belong to the mode asked for. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -6977,6 +7033,98 @@ export interface operations {
             };
         };
     };
+    rename_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The domain's current name. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RenameBody"];
+            };
+        };
+        responses: {
+            /** @description The engine's own rename report, unchanged. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "aliases": [
+                     *         "eng"
+                     *       ],
+                     *       "domain": "engineering",
+                     *       "left_behind": [],
+                     *       "local_only": false,
+                     *       "manifest_draft": false,
+                     *       "manifest_written": true,
+                     *       "moved": [
+                     *         "index_row",
+                     *         "auth_tables",
+                     *         "config"
+                     *       ],
+                     *       "previous": "eng",
+                     *       "rewritten": [],
+                     *       "shadows": []
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller may not write the domain, may write it but is neither its owner nor an instance admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The new name is already a domain here, another rename is still running, the domain is defined by an environment variable, or the index is shared with another live instance. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The new name is invalid, or (a full rename only) the MANIFEST cannot be written here - the detail says "This machine only" runs the rename instead. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     retire_engram: {
         parameters: {
             query?: never;
@@ -8245,6 +8393,85 @@ export interface operations {
                 };
             };
             /** @description `families` or `rules` names something the catalog does not have. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    github_domain_name: {
+        parameters: {
+            query?: {
+                /**
+                 * @description owner/name. Required; absent or empty answers 422, the same one
+                 *     requesting a team-domain create without it does.
+                 * @example acme/knowledge
+                 */
+                repo?: string;
+                /**
+                 * @description Branch to read from; defaults to the repository's default branch.
+                 * @example main
+                 */
+                branch?: string;
+                /**
+                 * @description Subfolder within the repository the domain would root at.
+                 * @example domains/eng
+                 */
+                path?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the MANIFEST declares, and the fallback. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "default_name": "knowledge",
+                     *       "domain_name": "engineering"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is not connected on this instance - the detail points at the settings screen. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description `repo` is missing or empty. */
             422: {
                 headers: {
                     [name: string]: unknown;

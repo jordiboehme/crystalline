@@ -103,7 +103,10 @@ async fn serve(opts: Options) -> Fixture {
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
             .with_read_only(opts.read_only)
             .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo"))),
+            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
+            // Where a rename keeps its journal; every other write route in
+            // this suite never reaches it.
+            .with_state_dir(root.join("state")),
     );
     engine.sync(None).await.unwrap();
     // A deterministic embedder, so the neighbours advisory on create and save
@@ -1470,6 +1473,204 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
     );
 }
 
+// --- POST /domains/{domain}/rename ------------------------------------------
+
+/// A full rename answers the engine's own report, unchanged; a name already
+/// taken is a conflict rather than a malformed request. The generic
+/// `EngineError` -> `ApiError` conversion folds `Conflict` into the same 422
+/// class as `Invalid`, which the handler overrides for exactly this reason
+/// (F11): a taken name, a running rename, an environment-defined domain and a
+/// shared index are all `Conflict`, and all four answer 409 through the one
+/// override rather than through four separate matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_is_renamed_and_a_taken_name_is_a_conflict() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domain"], "engineering");
+    assert_eq!(body["previous"], "eng");
+    assert_eq!(body["local_only"], false);
+    assert_eq!(body["manifest_written"], true);
+
+    // The renamed domain answers under its new name; the old one is now an
+    // alias rather than a second, live registration.
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listing.contains("\"engineering\""), "{listing}");
+
+    // `scrap` renamed onto the name `engineering` now holds: 409, not the
+    // generic 422 a malformed request gets.
+    let dup = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(dup.status(), 409, "{}", dup.text().await.unwrap());
+}
+
+/// An invalid new name is a 422 (F11), an unregistered domain is a 404, and a
+/// caller who may write the shared domain but does not own it - not an
+/// instance admin, and `eng` is shared, so nobody but an admin holds
+/// `DomainRight::Own` on it - is refused with the engine's own 403, worded by
+/// [`crystalline_service::engine::Engine::rename_domain`] rather than by the
+/// REST-layer write gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_name_a_missing_domain_and_a_non_owner_are_refused_honestly() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let bad_name = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "a b"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bad_name.status(), 422);
+    let problem: serde_json::Value = bad_name.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("'a b' cannot name a domain"),
+        "{problem}"
+    );
+
+    let missing = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/ghost/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "somewhere"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    // `eddy` may write `eng` (an instance editor on a shared domain), but
+    // does not own it - only an instance admin does, on a shared domain -
+    // so the engine's own rule refuses past the REST write gate.
+    let forbidden = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &editor,
+    )
+    .json(&serde_json::json!({"name": "engineering"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(forbidden.status(), 403);
+}
+
+/// A full rename whose MANIFEST cannot be written here (F11's ruling names
+/// the unix read-only folder as the test): a 422 that names `--local`, never
+/// a 409 or a wedged rename. `local_only: true` beside it needs no write at
+/// all and goes through on the very same folder.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwritable_manifest_is_a_422_naming_local_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eng_dir = fx._tmp.path().join("eng");
+
+    std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Running as root writes into a read-only folder anyway: nothing to test.
+    let probe = eng_dir.join("probe");
+    if std::fs::write(&probe, "x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: a read-only folder is writable here (running as root?)");
+        return;
+    }
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("--local") && detail.contains("This machine only"),
+        "{detail}"
+    );
+
+    // `local_only: true` writes nothing outside the configuration, so the
+    // same read-only folder does not stop it.
+    let local = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering", "local_only": true}))
+    .send()
+    .await
+    .unwrap();
+    std::fs::set_permissions(&eng_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(local.status(), 200, "{}", local.text().await.unwrap());
+}
+
+/// A read-only instance refuses a rename before it reads anything about the
+/// domain, exactly like every other mutation on this surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_a_rename() {
+    let fx = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
 /// A server fixture with one virtual domain (`docs`), its `MANIFEST.md`
 /// scaffolded straight into the database rather than onto disk - the virtual
 /// counterpart of `serve`'s file-domain manifest, so the round trip below
@@ -2478,6 +2679,20 @@ fn write_ops() -> Vec<WriteOp> {
             body: Some(serde_json::json!({"key": "nobody is holding this"})),
             min_role: Role::Viewer,
             read_only_exempt: true,
+        },
+        // Last of every row, and for the reason no other row is allowed to
+        // be: the admin leg really renames `eng`, so no row after this one
+        // may address it by that name again. Admin rather than editor, for
+        // the same reason the visibility, review and membership rows above
+        // are: the gate past the write check is `Engine::rename_domain`'s
+        // own, which needs `DomainRight::Own`, and on a SHARED domain
+        // nobody holds that but an instance admin.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/rename",
+            body: Some(serde_json::json!({"name": "eng-renamed"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
         },
     ]
 }

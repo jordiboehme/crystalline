@@ -195,9 +195,10 @@ pub struct CreateDomainBody {
         ),
         (
             status = 422,
-            description = "An unknown mode, a name that could escape the \
-                           domains root, or a field that does not belong to \
-                           the mode asked for.",
+            description = "An unknown mode, no name for a local or virtual \
+                           domain (github alone may omit it), a name that \
+                           could escape the domains root, or a field that \
+                           does not belong to the mode asked for.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -252,10 +253,7 @@ pub async fn create(
             // the refusal names the screen that fixes it instead of arriving
             // as a generic remote failure.
             if !state.engine.github_ready().await {
-                return Err(ApiError::conflict(
-                    "GitHub is not connected on this instance: connect it under \
-                     Settings > GitHub, then register the team domain",
-                ));
+                return Err(github_not_ready_conflict());
             }
             state
                 .engine
@@ -2747,6 +2745,265 @@ pub async fn set_visibility(
         .await
         .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The 409 every github-mode route on this surface answers when no
+/// credential is on file: the create handler above and the domain-name
+/// peek below share the exact wording, so a client that recognizes one
+/// recognizes the other.
+fn github_not_ready_conflict() -> ApiError {
+    ApiError::conflict(
+        "GitHub is not connected on this instance: connect it under \
+         Settings > GitHub, then register the team domain",
+    )
+}
+
+/// What `POST /domains/{domain}/rename` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "The new name, and whether the rename stays on this \
+                        machine only.")]
+pub struct RenameBody {
+    /// The domain's new name.
+    #[schema(example = "engineering")]
+    pub name: String,
+    /// Rename on this machine only: the MANIFEST and every link stay as
+    /// they are, and only this machine's own records move. Defaults to
+    /// `false`, a full rename that also writes the MANIFEST and respells
+    /// links in every domain the caller can write.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub local_only: bool,
+}
+
+/// `POST /domains/{domain}/rename` - rename a domain: this machine's own
+/// name for it always, and everywhere else too unless `local_only` asks to
+/// keep the change local.
+///
+/// A full rename (`local_only: false`, the default) writes the MANIFEST's
+/// `domain_name` and respells every link that named an old spelling in the
+/// domains the caller can write; a domain the caller can see but not write
+/// is left alone and listed under `left_behind`. `local_only: true` moves
+/// only this machine's own records - the index row, the accounts database,
+/// the `origins/` and `overlays/` state, the provision receipt and the
+/// configuration - and touches neither the MANIFEST nor any engram.
+///
+/// The gate here is [`require_domain_write`], which answers the 404 a
+/// hidden or unregistered domain gets and the 403 a viewer or a stranger to
+/// a private domain gets; [`Engine::rename_domain`] then applies its own,
+/// stricter rule - an instance admin, or a private domain's owner - and a
+/// caller who clears the write gate but not that one is refused with the
+/// same 403, worded by the engine. The engine takes its own lock for the
+/// whole rename; this handler holds none, since a second one here would
+/// deadlock against it.
+///
+/// The response is the engine's own report, unchanged: `{ domain, previous,
+/// local_only, manifest_written, manifest_draft, rewritten, left_behind,
+/// aliases, shadows, moved }`, plus a `note` when the new name was another
+/// domain's canonical name or alias.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/rename",
+    tag = "domains",
+    operation_id = "rename_domain",
+    summary = "Rename a domain, everywhere or on this machine only.",
+    description = "The caller's write gate on the domain, then the \
+                   engine's own rule for who may rename it - an instance \
+                   admin, or a private domain's owner. `local_only: true` \
+                   touches only this machine's own records; a full rename \
+                   also writes the MANIFEST and respells links in every \
+                   domain the caller can write, leaving one they can only \
+                   read as it is and listing it under `left_behind`.",
+    params(("domain" = String, Path, description = "The domain's current name.")),
+    request_body = RenameBody,
+    responses(
+        (
+            status = 200,
+            description = "The engine's own rename report, unchanged.",
+            body = Object,
+            example = json!({
+                "domain": "engineering",
+                "previous": "eng",
+                "local_only": false,
+                "manifest_written": true,
+                "manifest_draft": false,
+                "rewritten": [],
+                "left_behind": [],
+                "aliases": ["eng"],
+                "shadows": [],
+                "moved": ["index_row", "auth_tables", "config"]
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may not write the domain, may write it \
+                           but is neither its owner nor an instance admin, \
+                           the request did not echo its CSRF token, this \
+                           instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The new name is already a domain here, another \
+                           rename is still running, the domain is defined \
+                           by an environment variable, or the index is \
+                           shared with another live instance.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The new name is invalid, or (a full rename only) \
+                           the MANIFEST cannot be written here - the detail \
+                           says \"This machine only\" runs the rename \
+                           instead.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn rename(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<RenameBody>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_read_only(&state)?;
+    require_domain_write(&state, &identity, &domain).await?;
+    let scope = identity.scope();
+    match state
+        .engine
+        .rename_domain(&domain, &body.name, body.local_only, &scope)
+        .await
+    {
+        Ok(report) => Ok(Json(report)),
+        // A 409 on this surface, as on create: the request is well formed
+        // and the caller may make it, the resource just cannot take it
+        // right now. The generic conversion folds `Conflict` into the
+        // malformed-request 422 alongside `Invalid`, which is right for
+        // most callers of it but wrong here (F11): every other variant
+        // `Engine::rename_domain` raises classifies correctly through it -
+        // `Invalid` as 422, `Forbidden` as 403 (the non-owner refusal),
+        // `ReadOnly` as 403.
+        Err(EngineError::Conflict(detail)) => Err(ApiError::conflict(detail)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The query string `GET /github/domain-name` takes.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct GithubDomainNameQuery {
+    /// owner/name. Required; absent or empty answers 422, the same one
+    /// requesting a team-domain create without it does.
+    #[serde(default)]
+    #[param(example = "acme/knowledge")]
+    pub repo: Option<String>,
+    /// Branch to read from; defaults to the repository's default branch.
+    #[serde(default)]
+    #[param(example = "main")]
+    pub branch: Option<String>,
+    /// Subfolder within the repository the domain would root at.
+    #[serde(default)]
+    #[param(example = "domains/eng")]
+    pub path: Option<String>,
+}
+
+/// `GET /github/domain-name` - peek at the `domain_name` a repository's
+/// MANIFEST declares, without registering anything.
+///
+/// Reads `MANIFEST.md` at `path` (the repository root when absent) on
+/// `branch` (the repository's default when absent) through the forge, the
+/// same read a nameless `POST /domains` (mode `github`) does before it
+/// downloads anything. `domain_name` is `null` when the MANIFEST declares
+/// none, is missing or cannot be read; `default_name` is what a nameless
+/// create falls back to, so a client can show it as a placeholder either
+/// way.
+///
+/// Admin only, the same gate a team-domain create answers to, and a pure
+/// read: served on a read-only instance.
+#[utoipa::path(
+    get,
+    path = "/api/v1/github/domain-name",
+    tag = "domains",
+    operation_id = "github_domain_name",
+    summary = "Peek at the domain_name a repository's MANIFEST declares.",
+    description = "Admin only, read-only: never registers anything. Reads \
+                   the MANIFEST at `path` (the repository root when \
+                   absent) on `branch` (the repository's default when \
+                   absent) through the forge and reports its `domain_name` \
+                   (`null` when it declares none, is missing or cannot be \
+                   read) alongside `default_name`, the repository's own \
+                   name segment a nameless create falls back to.",
+    params(GithubDomainNameQuery),
+    responses(
+        (
+            status = 200,
+            description = "What the MANIFEST declares, and the fallback.",
+            body = Object,
+            example = json!({ "domain_name": "engineering", "default_name": "knowledge" }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is not connected on this instance - the \
+                           detail points at the settings screen.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "`repo` is missing or empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn github_domain_name(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiQuery(query): ApiQuery<GithubDomainNameQuery>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    let repo = query
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| ApiError::unprocessable("repo is required, as owner/name"))?;
+    if !state.engine.github_ready().await {
+        return Err(github_not_ready_conflict());
+    }
+    let report = state
+        .engine
+        .github_domain_name_preview(repo, query.path.as_deref(), query.branch.as_deref())
+        .await?;
+    Ok(Json(report))
 }
 
 #[cfg(test)]

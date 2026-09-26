@@ -368,6 +368,144 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
     assert_eq!(nonsense.status(), 422);
 }
 
+/// The GitHub domain-name peek is admin only, refuses a missing `repo` with
+/// the same 422 a nameless team-domain create's own repo check answers, and
+/// is a 409 pointing at the settings screen when no credential is on file -
+/// the same gate and the same wording a team-domain create answers to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_needs_admin_and_a_connection() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let missing_repo = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing_repo.status(), 422);
+
+    let forbidden = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(forbidden.status(), 403);
+
+    let not_ready = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(not_ready.status(), 409);
+    let problem: serde_json::Value = not_ready.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("settings"),
+        "the refusal points at the fix: {problem}"
+    );
+}
+
+/// The peek reads the MANIFEST through the forge exactly as a nameless team
+/// create does, and registers nothing: a repository whose MANIFEST declares
+/// `domain_name` reports it beside the repository's own default, and one
+/// that declares none reports `null` there instead - and either way, nothing
+/// is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_reads_the_manifest_without_registering() {
+    const KB_MANIFEST_NAMED: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: engineering\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+    let (fx, _mock) = serve_team_with_mock_manifest(false, KB_MANIFEST_NAMED).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let named = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(named.status(), 200, "{}", named.text().await.unwrap());
+    let body: serde_json::Value = named.json().await.unwrap();
+    assert_eq!(body["domain_name"], "engineering");
+    assert_eq!(body["default_name"], "kb");
+
+    // A path and a branch travel through unchanged; the mock forge only
+    // seeded `main`, so a different branch answers with nothing to read
+    // rather than a stack trace.
+    let other_branch = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb&branch=topic",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        other_branch.status(),
+        200,
+        "{}",
+        other_branch.text().await.unwrap()
+    );
+    assert_eq!(
+        other_branch.json::<serde_json::Value>().await.unwrap()["domain_name"],
+        serde_json::Value::Null
+    );
+
+    // Nothing was ever registered: the peek reads, it never writes.
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !listing.contains("engineering") && !listing.contains("\"kb\""),
+        "the peek registered something: {listing}"
+    );
+
+    // `KB_MANIFEST` (used by the team fixtures below) declares no
+    // `domain_name`: the peek answers `null`, never the repository's own
+    // name in that slot - `default_name` is the one that carries it.
+    let (fx2, _mock2) = serve_team_with_mock_manifest(false, KB_MANIFEST).await;
+    let admin2 = login(fx2.addr, "root", "rootpw").await;
+    let undeclared = as_session(
+        fx2.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin2,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(undeclared.status(), 200);
+    let body2: serde_json::Value = undeclared.json().await.unwrap();
+    assert_eq!(body2["domain_name"], serde_json::Value::Null);
+    assert_eq!(body2["default_name"], "kb");
+}
+
 /// A team domain registers under the name the validator handed back, not the
 /// raw one the body carried: `origin_add` uses what it is given verbatim as
 /// the config key AND as the folder segment under the domains root, so a

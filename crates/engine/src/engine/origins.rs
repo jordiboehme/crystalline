@@ -395,6 +395,42 @@ impl Engine {
         }
     }
 
+    /// Peeks at the `domain_name` a repository's MANIFEST declares, without
+    /// registering anything: `{ domain_name, default_name }`. `domain_name`
+    /// is `None` when the MANIFEST at `path` (the repository root when
+    /// `path` is `None`) on `branch` (the repository's default when
+    /// `branch` is `None`) declares none, is missing or cannot be read;
+    /// `default_name` is the repository's own name segment, the fallback a
+    /// nameless [`Engine::origin_add`] lands on when the MANIFEST declares
+    /// none either.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with the credential error a caller who has not connected GitHub
+    /// answers - a surface that wants the friendlier settings-screen wording
+    /// asks [`Engine::github_ready`] first, exactly as a nameless
+    /// [`Engine::origin_add`] does.
+    pub async fn github_domain_name_preview(
+        &self,
+        repo: &str,
+        path: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let provider = self.resolve_origin_provider()?;
+        let branch_name = self
+            .origin_branch_or_default(provider.as_ref(), repo, branch)
+            .await?;
+        let domain_name = self
+            .origin_manifest_name(provider.as_ref(), repo, path, &branch_name)
+            .await;
+        Ok(json!({
+            "domain_name": domain_name,
+            "default_name": origin::default_domain_name(repo),
+        }))
+    }
+
     /// What a connect finds holding `name`, with every local refusal decided
     /// here and no network call: an env-defined domain (named by its
     /// variable), a domain connected to something else, a virtual domain, and

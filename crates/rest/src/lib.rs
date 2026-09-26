@@ -143,6 +143,8 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::rename,
+        domains_admin::github_domain_name,
         domains_admin::set_review_mode,
         domains_admin::drafts,
         domains_admin::set_visibility,
@@ -241,6 +243,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::PolicyView,
         domains::SetPoliciesBody,
         domains_admin::CreateDomainBody,
+        domains_admin::RenameBody,
         domains_admin::FoldArg,
         domains_admin::ReviewBody,
         domains_admin::ReviewModeArg,
@@ -647,6 +650,10 @@ fn routes(state: RestState) -> Router {
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
+        // The domain's write gate, then the engine's own owner-or-admin
+        // rule: see [`domains_admin::rename`]. Refused on a read-only
+        // instance like every other mutation here.
+        .route("/domains/{domain}/rename", post(domains_admin::rename))
         // Whether a domain is private, and the two directions are gated
         // differently. PRIVATIZING is admin only: it hands the domain to the
         // caller, so a shared domain would otherwise be seized by whoever
@@ -853,6 +860,13 @@ fn routes(state: RestState) -> Router {
         )
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // The same admin gate a team-domain create answers to, and a pure
+        // read: a peek at a repository's MANIFEST that never registers
+        // anything. See [`domains_admin::github_domain_name`].
+        .route(
+            "/github/domain-name",
+            get(domains_admin::github_domain_name),
+        )
         // The self-service half of the same surface, and the one settings
         // path that is not admin-only: an account's OWN GitHub identity, the
         // credential its shares go out on when this instance shares
