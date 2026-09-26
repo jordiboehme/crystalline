@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { GLOWING, partsOf, toLocal, type Part } from "../../modelChecks";
-import { HAMMER_HEAD, ROCKET } from "./exhibits";
+import { FLOOR_CRACK, HAMMER, HAMMER_HEAD, ROCKET } from "./exhibits";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
@@ -90,7 +90,8 @@ describe("exhibit hero models", () => {
   });
 
   it("gives the hammer the screen prop's head and lays its crack flat round it", () => {
-    // Mutation caught: the old oversized head, or a crack standing up.
+    // Mutation caught: a head larger than `HAMMER_HEAD`, or a crack rising
+    // above `HAMMER.crack.h`.
     const parts = partsOf("thunder-hammer");
     const head = parts.find((p) => p.method === "bevelBox");
     if (head === undefined) throw new Error("no head");
@@ -99,10 +100,14 @@ describe("exhibit hero models", () => {
     expect(extent(pts, 1)).toBeCloseTo(HAMMER_HEAD.side, 4);
     expect(extent(pts, 2)).toBeCloseTo(HAMMER_HEAD.side, 4);
     const cracks = parts.filter(
-      (p) =>
-        p.method === "box" && Math.max(...local(p).map((q) => q[2])) < 0.006,
+      (p) => p.tint !== null && p.tint.every((c, i) => c === FLOOR_CRACK[i]),
     );
     expect(cracks.length).toBeGreaterThanOrEqual(6);
-    for (const c of cracks) expect(c.flag).toBe(FLAG.lit);
+    for (const c of cracks) {
+      expect(c.flag).toBe(FLAG.lit);
+      expect(Math.max(...local(c).map((q) => q[2]))).toBeLessThanOrEqual(
+        HAMMER.crack.h + 1e-6,
+      );
+    }
   });
 });

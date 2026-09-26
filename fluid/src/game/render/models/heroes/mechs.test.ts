@@ -10,12 +10,13 @@ import { describe, expect, it } from "vitest";
 import { FLAG, blinkFlag, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { partsOf, toLocal, type Part } from "../../modelChecks";
-import { TANK_LENSES } from "./mechs";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
 const lo = (p: Part) => Math.min(...local(p).map((q) => q[2]));
 const hi = (p: Part) => Math.max(...local(p).map((q) => q[2]));
+const extent = (pts: V3[], i: 0 | 1 | 2) =>
+  Math.max(...pts.map((q) => q[i])) - Math.min(...pts.map((q) => q[i]));
 
 describe("mech hero models", () => {
   it("sweeps the head's single horn forward and up, over two eyes", () => {
@@ -34,18 +35,21 @@ describe("mech hero models", () => {
   });
 
   it("stands the tank on four wheels and makes its lower lens the largest", () => {
-    // Mutation caught: a leg off the floor, or the lenses the wrong way round.
+    // Mutation caught: a leg off the floor, the lenses the wrong way round,
+    // or a recipe that ignores `r` (measured from the built glow discs, not
+    // read off the table, so a fixed radius cannot pass).
     const wheels = partsOf("spider-tank").filter(
       (p) => p.method === "extrude" && lo(p) < 1e-4,
     );
     expect(wheels).toHaveLength(4);
-    expect(TANK_LENSES).toHaveLength(3);
-    const lowest = [...TANK_LENSES].sort((x, y) => x.h - y.h)[0];
-    for (const l of TANK_LENSES)
-      if (l !== lowest) expect(lowest?.r ?? 0).toBeGreaterThan(l.r);
-    expect(
-      partsOf("spider-tank").filter((p) => p.flag >= FLAG.blink),
-    ).toHaveLength(3);
+    const lenses = partsOf("spider-tank").filter((p) => p.flag >= FLAG.blink);
+    expect(lenses).toHaveLength(3);
+    const radius = (p: Part) => extent(local(p), 0) / 2;
+    const height = (p: Part) => (lo(p) + hi(p)) / 2;
+    const lowest = [...lenses].sort((x, y) => height(x) - height(y))[0];
+    if (lowest === undefined) throw new Error("no lens");
+    for (const l of lenses)
+      if (l !== lowest) expect(radius(lowest)).toBeGreaterThan(radius(l));
   });
 
   it("hangs the garden robot's arms almost to the floor and gives it one eye", () => {

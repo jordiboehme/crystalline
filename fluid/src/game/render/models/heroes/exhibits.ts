@@ -391,7 +391,7 @@ const LEATHER: Rgb = [0.3, 0.18, 0.1];
 const WRAP: Rgb = [0.2, 0.12, 0.07];
 
 /** The crack in the floor: near black. */
-const FLOOR_CRACK: Rgb = [0.15, 0.14, 0.14];
+export const FLOOR_CRACK: Rgb = [0.15, 0.14, 0.14];
 
 /** The dent under the head: a dark scorched grey. */
 const FLOOR_DENT: Rgb = [0.28, 0.27, 0.26];
@@ -426,7 +426,7 @@ const FLOOR_DENT: Rgb = [0.28, 0.27, 0.26];
  *   starts, `forkAt` along it, turned `forkTurn` away (to alternate
  *   sides), and narrows over `forkSteps`.
  */
-const HAMMER = {
+export const HAMMER = {
   bevel: 0.015,
   bands: [-0.06, 0.06],
   bandHalf: 0.004,
