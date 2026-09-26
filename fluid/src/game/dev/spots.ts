@@ -18,7 +18,8 @@
  * for judging a model from more than its front: `:back` from behind,
  * `:side` from its right side, `:quarter` from halfway between its front
  * and its right, and `:close` a hero or prop from nearer (`CLOSE_BASE`,
- * `CLOSE_SCALE`; a curio frame is close already). All three patterns give
+ * `CLOSE_SCALE`) and a curio from the nearest side that sees it
+ * (`CURIO_CLOSE_NEAR`). All three patterns give
  * null for a bad spot: an unknown kind or view, no such ordinal, no
  * ordinal at all, or a negative one.
  *
@@ -270,8 +271,12 @@ export const CURIO_FAR = 3.0;
 /** The curio-framing search's step, in metres (C18). */
 export const CURIO_STEP = 0.1;
 
-/** How many `CURIO_STEP` steps `frameCurio` tries, from `CURIO_NEAR` to `CURIO_FAR` inclusive. */
-const CURIO_STEPS = Math.round((CURIO_FAR - CURIO_NEAR) / CURIO_STEP);
+/**
+ * The closest a `:close` curio frame starts from the curio's centre, in
+ * metres (2.6d): nearer than `CURIO_NEAR`, for judging a small desk curio's
+ * marks, and searched round all four sides for the nearest spot.
+ */
+export const CURIO_CLOSE_NEAR = 0.4;
 
 /** An axis-aligned 3D box: `Box` (world x/z) plus a floor-to-ceiling height range. */
 interface Volume extends Box {
@@ -551,15 +556,18 @@ export function heroSightClear(
 /**
  * A spot that frames curio `c` close and tilted down (C18), with a clear
  * sight line to it: along each of `sidesOf(c)`'s four directions, in the
- * order `view` gives (front, right, left, back for `front` and `close`,
- * since a curio frame is close already; back, front, right, left for
- * `back`; right, front, left, back for `side`; and for `quarter` the
- * diagonal between the front and the right first, then front, right,
- * left, back, 2.6d C20), the distance from the curio's
- * centre grows from `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`. Among
- * the spots whose player circle is on the floor and clear of every blocker,
- * the first one whose sight line (eye height to the curio's middle) crosses
- * no volume of `occludersFor` wins (`sightClear`); when none does, the
+ * order `view` gives (front, right, left, back for `front` and `close`;
+ * back, front, right, left for `back`; right, front, left, back for
+ * `side`; and for `quarter` the diagonal between the front and the right
+ * first, then front, right, left, back, 2.6d C20), the distance from the
+ * curio's centre grows from `CURIO_NEAR` by `CURIO_STEP` up to
+ * `CURIO_FAR`. Among the spots whose player circle is on the floor and
+ * clear of every blocker, the first one whose sight line (eye height to
+ * the curio's middle) crosses no volume of `occludersFor` wins
+ * (`sightClear`). `close` starts at `CURIO_CLOSE_NEAR` instead, takes each
+ * side's first such spot and keeps the nearest of the four, so a curio at
+ * a long table's end is seen from the end rather than across the table
+ * (2.6d). When none sees the curio, the
  * search's first standable spot wins instead, so the seam never gives up a
  * spot to stand on. Its pitch looks at the curio's middle (`curioMid`:
  * halfway from its lift to its top, so a hovering curio is looked at, not
@@ -595,9 +603,15 @@ function frameCurio(
   const target: Point3 = { x: cx, y: midY, z: cz };
   const occluders = occludersFor(room, c);
   let fallback: { spawn: RoomSpec["spawn"]; pitch: number } | null = null;
+  const near = view === "close" ? CURIO_CLOSE_NEAR : CURIO_NEAR;
+  const steps = Math.round((CURIO_FAR - near) / CURIO_STEP);
+  let closest: {
+    found: { spawn: RoomSpec["spawn"]; pitch: number };
+    dist: number;
+  } | null = null;
   for (const dir of dirs) {
-    for (let step = 0; step <= CURIO_STEPS; step++) {
-      const dist = CURIO_NEAR + step * CURIO_STEP;
+    for (let step = 0; step <= steps; step++) {
+      const dist = near + step * CURIO_STEP;
       const px = cx + dir[0] * dist;
       const pz = cz + dir[1] * dist;
       if (
@@ -620,10 +634,13 @@ function frameCurio(
       };
       fallback ??= found;
       const eye: Point3 = { x: px, y: EYE_HEIGHT, z: pz };
-      if (sightClear(eye, target, occluders)) return found;
+      if (!sightClear(eye, target, occluders)) continue;
+      if (view !== "close") return found;
+      if (closest === null || dist < closest.dist) closest = { found, dist };
+      break;
     }
   }
-  return fallback;
+  return closest?.found ?? fallback;
 }
 
 /**

@@ -10,7 +10,8 @@
  * space, the period and `<`, `=`, `>`, so a badge is set as the original
  * sets it: in capitals, or in lower case where the original's wordmark is
  * lower case, and a number in numerals. A mark that is no text (the round
- * C, the signature, the planet badge) is a picture: rows of characters,
+ * C, the signature, the planet badge, the computers' maker's logo) is a
+ * picture: rows of characters,
  * row 0 at the top, `.` dark, drawn with `pixelPanel` or `pixelBoxes`.
  *
  * Comments here name props by their shape, never an original.
@@ -73,4 +74,19 @@ export const SPACE_BADGE: readonly string[] = [
   ".ppop..",
   "..op...",
   ".o.....",
+];
+
+/**
+ * The desk computers' maker's logo, left of the word on the breadbin's
+ * badge: `#` a thick C open to the right, with two short flags in its
+ * mouth, the upper one along the C's top end and the lower one along its
+ * bottom end, each cut on a slant towards the middle, and the mouth open
+ * between them. Symmetric top to bottom.
+ */
+export const COMPUTER_LOGO: readonly string[] = [
+  ".##.##",
+  "#...#.",
+  "#.....",
+  "#...#.",
+  ".##.##",
 ];

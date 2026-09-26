@@ -117,14 +117,16 @@ describe("block-pixel font", () => {
  * an ascender climbs to row 0, a dotted letter carries its dot in row 0
  * over a dark row 1, and a letter with a tail sits a row higher on
  * purpose, its bowl in rows 1 to 3 and its tail in row 4 (the 5-row grid
- * has no room below the baseline).
+ * has no room below the baseline). `e` and `m` stand a row taller, rows
+ * 1 to 4, since three rows by three columns cannot draw the bar of an
+ * `e` or the three legs of an `m`: at x-height they read as blocks.
  */
 const LOWER: Readonly<Record<string, readonly string[]>> = {
   a: ["...", "...", ".##", "#.#", ".##"],
   b: ["#..", "#..", "##.", "#.#", "##."],
   c: ["...", "...", ".##", "#..", ".##"],
   d: ["..#", "..#", ".##", "#.#", ".##"],
-  e: ["...", "...", ".##", "###", ".##"],
+  e: ["...", ".##", "###", "#..", ".##"],
   f: [".##", ".#.", "###", ".#.", ".#."],
   g: ["...", ".##", "#.#", ".##", "##."],
   h: ["#..", "#..", "##.", "#.#", "#.#"],
@@ -132,9 +134,9 @@ const LOWER: Readonly<Record<string, readonly string[]>> = {
   j: ["..#", "...", "..#", "..#", "##."],
   k: ["#..", "#..", "#.#", "##.", "#.#"],
   l: ["#..", "#..", "#..", "#..", ".##"],
-  m: ["...", "...", "###", "###", "#.#"],
+  m: ["...", "###", "###", "#.#", "#.#"],
   n: ["...", "...", "##.", "#.#", "#.#"],
-  o: ["...", "...", ".#.", "#.#", ".#."],
+  o: ["...", "...", "###", "#.#", "###"],
   p: ["...", "##.", "#.#", "##.", "#.."],
   q: ["...", ".##", "#.#", ".##", "..#"],
   r: ["...", "...", ".##", "#..", "#.."],
@@ -151,6 +153,7 @@ const LOWER: Readonly<Record<string, readonly string[]>> = {
 const ASCENDERS = "bdfhklt";
 const DOTTED = "ij";
 const TAILED = "gpqy";
+const TALL = "em";
 
 describe("the block-pixel font's lower case", () => {
   it("holds the whole lower-case alphabet", () => {
@@ -183,6 +186,8 @@ describe("the block-pixel font's lower case", () => {
         expect(lit(0) && !lit(1) && lit(2) && lit(4), c).toBe(true);
       } else if (TAILED.includes(c)) {
         expect(!lit(0) && lit(1) && lit(4), c).toBe(true);
+      } else if (TALL.includes(c)) {
+        expect(!lit(0) && lit(1) && lit(2) && lit(4), c).toBe(true);
       } else {
         expect(!lit(0) && !lit(1) && lit(2) && lit(4), c).toBe(true);
       }

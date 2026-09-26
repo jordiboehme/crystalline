@@ -39,8 +39,11 @@ import type { Surfaces } from "../common";
  * a dark row 1, their stems in rows 2 and 3 like the short letters, `j`
  * hooking left in row 4. A letter with a tail (`g`, `p`, `q`, `y`) sits a
  * row higher on purpose, its bowl in rows 1 to 3 and its tail in row 4,
- * since the grid has no room below the baseline. `s` and `z` mirror each
- * other. No lower-case glyph is its capital's shape.
+ * since the grid has no room below the baseline. `e` and `m` stand a row
+ * taller too, rows 1 to 4, since three rows by three columns cannot draw
+ * the bar of an `e` or the three legs of an `m`: at x-height both read as
+ * solid blocks. `o` is a square ring. `s` and `z` mirror each other. No
+ * lower-case glyph is its capital's shape.
  */
 export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   A: [".#.", "#.#", "###", "#.#", "#.#"],
@@ -73,7 +76,7 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   b: ["#..", "#..", "##.", "#.#", "##."],
   c: ["...", "...", ".##", "#..", ".##"],
   d: ["..#", "..#", ".##", "#.#", ".##"],
-  e: ["...", "...", ".##", "###", ".##"],
+  e: ["...", ".##", "###", "#..", ".##"],
   f: [".##", ".#.", "###", ".#.", ".#."],
   g: ["...", ".##", "#.#", ".##", "##."],
   h: ["#..", "#..", "##.", "#.#", "#.#"],
@@ -81,9 +84,9 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   j: ["..#", "...", "..#", "..#", "##."],
   k: ["#..", "#..", "#.#", "##.", "#.#"],
   l: ["#..", "#..", "#..", "#..", ".##"],
-  m: ["...", "...", "###", "###", "#.#"],
+  m: ["...", "###", "###", "#.#", "#.#"],
   n: ["...", "...", "##.", "#.#", "#.#"],
-  o: ["...", "...", ".#.", "#.#", ".#."],
+  o: ["...", "...", "###", "#.#", "###"],
   p: ["...", "##.", "#.#", "##.", "#.."],
   q: ["...", ".##", "#.#", ".##", "..#"],
   r: ["...", "...", ".##", "#..", "#.."],

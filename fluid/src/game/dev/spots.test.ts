@@ -326,6 +326,33 @@ describe("spotView (C18)", () => {
   const hall = heroHallRoom();
   const gallery = galleryRoom();
 
+  it("frames every curio of the hero hall at least as near from :close, and the one at a table's end nearer (2.6d)", () => {
+    // Mutation caught: `:close` framing a curio from the front distance
+    // like every other view, or from farther than the front.
+    const counts = new Map<string, number>();
+    let nearer = 0;
+    for (const c of hall.curios) {
+      const n = counts.get(c.kind) ?? 0;
+      counts.set(c.kind, n + 1);
+      const box = curioBox(c);
+      const dist = (view: string) => {
+        const v = spotView(hall, `prop:${c.kind}:${String(n)}${view}`);
+        if (v === null) throw new Error(`no spot for ${c.kind}${view}`);
+        const p = spawnPlayer({ ...hall, spawn: v.spawn });
+        return Math.hypot(
+          p.x - (box.x0 + box.x1) / 2,
+          p.z - (box.z0 + box.z1) / 2,
+        );
+      };
+      const front = dist("");
+      const close = dist(":close");
+      expect(close, c.kind).toBeLessThanOrEqual(front + 1e-6);
+      if (close < front - 0.25) nearer++;
+    }
+    expect(counts.size).toBeGreaterThan(0);
+    expect(nearer).toBeGreaterThan(0);
+  });
+
   it("frames every curio of the hero hall close and tilted down", () => {
     const blockers = blockersFor(hall);
     const counts = new Map<string, number>();

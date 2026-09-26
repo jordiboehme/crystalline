@@ -29,6 +29,7 @@ import {
   FIGURE_RED,
   FUNCTION_GREY,
   KEY_BROWN,
+  LOGO_TINT,
   POWER_RED,
   RAINBOW,
   SHIP_BRICKS,
@@ -128,9 +129,13 @@ describe("the desktop models", () => {
       expect(tops[i]).toBeLessThan(tops[i - 1] ?? 0);
     const stripes = RAINBOW.flatMap((c) => tinted(bread, c)).flatMap(local);
     const text = tinted(bread, BADGE_TEXT["breadbin-computer"]).map(local);
+    // Mutation caught: the badge's letters dropped, which would leave the
+    // side checks below with nothing to hold.
     expect(text.length).toBeGreaterThan(0);
     const left = text.filter((q) => span(q, 0).hi < span(stripes, 0).lo);
     const right = text.filter((q) => span(q, 0).lo > span(stripes, 0).hi);
+    // Mutation caught: the word or the number moved to the stripes' other
+    // side, so one side holds no letters.
     expect(left.length).toBeGreaterThan(0);
     expect(right.length).toBeGreaterThan(0);
     expect(left.length + right.length).toBe(text.length);
@@ -154,6 +159,8 @@ describe("the desktop models", () => {
   it("sets the badge's text as the font's runs on both computers", () => {
     // Mutation caught: a badge that is a plain bar, not the text.
     const runs = pixelRuns(textRows(MARKS.computerBadge)).length;
+    // Mutation caught: a badge line too short to hold a word, which would
+    // let a bar of a few runs pass the count below.
     expect(runs).toBeGreaterThan(20);
     for (const kind of ["breadbin-computer", "slim-computer"] as const) {
       const text = recorded(kind).filter(
@@ -162,6 +169,17 @@ describe("the desktop models", () => {
       );
       expect(text.length, kind).toBe(runs);
     }
+  });
+
+  it("puts the maker's logo left of the word on the breadbin's badge, and none on the slim one", () => {
+    // Mutation caught: the logo dropped, drawn after the word, or put on
+    // the slim computer, whose original badge carries none.
+    const bread = recorded("breadbin-computer");
+    const logo = tinted(bread, LOGO_TINT).flatMap(local);
+    expect(logo.length).toBeGreaterThan(0);
+    const text = tinted(bread, BADGE_TEXT["breadbin-computer"]).flatMap(local);
+    expect(span(logo, 0).hi).toBeLessThan(span(text, 0).lo);
+    expect(tinted(recorded("slim-computer"), LOGO_TINT)).toHaveLength(0);
   });
 
   it("makes the slim computer lower and deeper than the breadbin", () => {
@@ -175,7 +193,7 @@ describe("the desktop models", () => {
   it("puts studs on every brick's top face, and one red figure with its badge beside the ship", () => {
     // Mutation caught: a brick without studs, or the figure missing its badge.
     expect(SHIP_BRICKS.length).toBeGreaterThanOrEqual(6);
-    expect(SHIP_BRICKS.length).toBeLessThanOrEqual(8);
+    expect(SHIP_BRICKS.length).toBeLessThanOrEqual(10);
     const parts = recorded("space-bricks");
     const studs = parts.filter((p) => p.method === "lathe");
     expect(studs.length).toBeGreaterThan(0);
@@ -194,14 +212,44 @@ describe("the desktop models", () => {
       });
       expect(on.length, JSON.stringify(b)).toBeGreaterThan(0);
     }
+    // Mutation caught: the figure dropped, or its chest badge dropped.
     expect(parts.some((p) => p.tint?.join() === FIGURE_RED.join())).toBe(true);
     expect(parts.some((p) => p.tint?.join() === BADGE_YELLOW.join())).toBe(
       true,
     );
+    // Mutation caught: the canopy or a clear stud drawn glowing or as a
+    // signal light; the toy has no light at all.
     expect(parts.some((p) => p.flag !== FLAG.lit)).toBe(false);
   });
 
-  it("stands the figure beside the ship on the desk, about four centimetres tall, its badge on its chest", () => {
+  it("stacks the ship in three layers and studs the baseplate on its full grid", () => {
+    // Mutation caught: a flat one-layer ship, or a baseplate whose studs
+    // are thinned out to a sparse grid.
+    const layers = new Set(SHIP_BRICKS.map((b) => b.h0.toFixed(5)));
+    expect(layers.size).toBeGreaterThanOrEqual(3);
+    const parts = recorded("space-bricks");
+    const plate = parts.find((p) => p.method === "box");
+    if (plate === undefined) throw new Error("a baseplate");
+    const plateTop = span(local(plate), 2).hi;
+    const plateStuds = parts
+      .filter(
+        (p) =>
+          p.method === "lathe" &&
+          Math.abs(span(local(p), 2).lo - plateTop) < 1e-6,
+      )
+      .map((p) => [span(local(p), 0).mid, span(local(p), 1).mid] as const);
+    expect(plateStuds.length).toBeGreaterThanOrEqual(60);
+    const pitch = Math.min(
+      ...plateStuds.flatMap(([a, d], i) =>
+        plateStuds.slice(i + 1).map(([b, e]) => Math.hypot(a - b, d - e)),
+      ),
+    );
+    // One stud pitch: the narrowest brick is one stud wide.
+    const studPitch = Math.min(...SHIP_BRICKS.map((b) => b.a1 - b.a0));
+    expect(pitch).toBeLessThanOrEqual(studPitch + 1e-9);
+  });
+
+  it("stands the figure beside the ship on the desk, six centimetres tall at the toy's scale, its badge on its chest", () => {
     // Mutation caught: a figure inside the ship, off the desk, a giant,
     // or its badge on its back.
     const parts = recorded("space-bricks");
@@ -210,8 +258,8 @@ describe("the desktop models", () => {
     const shipEnd = Math.max(...SHIP_BRICKS.map((b) => b.a1));
     expect(span(red, 0).lo).toBeGreaterThan(shipEnd);
     expect(span(red, 2).lo).toBeCloseTo(0, 6);
-    expect(span(red, 2).hi).toBeGreaterThan(0.02);
-    expect(span(red, 2).hi).toBeLessThan(0.045);
+    expect(span(red, 2).hi).toBeGreaterThan(0.05);
+    expect(span(red, 2).hi).toBeLessThan(0.065);
     const badge = tinted(parts, BADGE_YELLOW).flatMap(local);
     expect(badge.length).toBeGreaterThan(0);
     expect(span(badge, 1).lo).toBeGreaterThan(span(red, 1).mid);

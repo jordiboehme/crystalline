@@ -1,12 +1,18 @@
 /**
  * The approved marks (2.6d C16): every string sets in the block-pixel
- * font, and the three pictures keep the shapes their recipes rely on.
+ * font, and the four pictures keep the shapes their recipes rely on.
  */
 
 import { describe, expect, it } from "vitest";
 
 import { textRows } from "./heroes/pixels";
-import { CAPSULE_LOGO, MARKS, SIGNATURE, SPACE_BADGE } from "./marks";
+import {
+  CAPSULE_LOGO,
+  COMPUTER_LOGO,
+  MARKS,
+  SIGNATURE,
+  SPACE_BADGE,
+} from "./marks";
 
 const strings = (): string[] =>
   Object.values(MARKS).flatMap((v): string[] =>
@@ -56,5 +62,21 @@ describe("the approved marks", () => {
     expect(SPACE_BADGE.join("").includes("p")).toBe(true);
     expect(SPACE_BADGE.join("").includes("o")).toBe(true);
     expect(SPACE_BADGE.some((r) => /p.*o|o.*p/.test(r))).toBe(true);
+  });
+
+  it("draws the computers' logo as a C open to the right with a flag at each end of its mouth", () => {
+    // Mutation caught: the C closed, the mouth filled, a flag dropped, or
+    // the logo lopsided top to bottom.
+    expect(COMPUTER_LOGO).toHaveLength(5);
+    for (const row of COMPUTER_LOGO) expect(row).toHaveLength(6);
+    expect([...COMPUTER_LOGO].reverse()).toEqual(COMPUTER_LOGO);
+    const mid = COMPUTER_LOGO[2] ?? "";
+    expect(mid[0]).toBe("#");
+    expect(mid.slice(1).includes("#")).toBe(false);
+    for (const y of [1, 2, 3]) expect(COMPUTER_LOGO[y]?.[0]).toBe("#");
+    for (const y of [0, 1, 3, 4])
+      expect(COMPUTER_LOGO[y]?.slice(3).includes("#"), `row ${String(y)}`).toBe(
+        true,
+      );
   });
 });
