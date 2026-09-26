@@ -638,7 +638,7 @@ export const HERO_FLOOR_TOP = 2.2;
 
 /**
  * The kinds that need a higher ceiling than `LOWEST_CEILING` (C7), in
- * metres: only the garden robot (3.44 m tall, Jordi 2026-09-26). The pass
+ * metres: only the garden robot (3.44 m tall). The pass
  * skips a kind whose ceiling the room does not reach.
  */
 export const HERO_MIN_CEILING = {

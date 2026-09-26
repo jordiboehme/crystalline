@@ -17,7 +17,7 @@ const local = (p: Part): V3[] =>
 
 describe("street hero models", () => {
   it("builds the bike at the original's size: 2.95 long, 0.83 wide, the windscreen at 1.17", () => {
-    // Mutation caught: the old 2.6 m spec length.
+    // Mutation caught: a bike shorter than `BIKE.length`.
     const pts = partsOf("red-bike").flatMap(local);
     const as = pts.map((q) => q[0]);
     expect(Math.max(...as) - Math.min(...as)).toBeCloseTo(BIKE.length, 2);

@@ -84,9 +84,8 @@ const TAIL_LIGHT: Rgb = [0.95, 0.1, 0.08];
  * The bike's overall size, in metres: `length` nose to tail along `a`,
  * `width` across its widest shell parts along `d`, and `screenTop`, the
  * top of its windscreen and so of the bike. These are the original's
- * sourced measures (Jordi, 2026-09-26); the bike's headlight and tail
- * light, standing a few millimetres proud of its nose and tail, give the
- * full length.
+ * sourced measures; the bike's headlight and tail light, standing a few
+ * millimetres proud of its nose and tail, give the full length.
  */
 export const BIKE = { length: 2.95, width: 0.83, screenTop: 1.17 } as const;
 
@@ -355,7 +354,7 @@ const redBike: HeroRecipe = ({ k, kitAt, s }) => {
     d0 + P.discT,
     s.tinted(BRAKE_STEEL),
   );
-  k.box(0.88, 0.95, d0 - 0.01, d0 + 0.02, 0.4, 0.46, dark);
+  k.box(0.88, 0.95, d0 - 0.01, d0 + 0.02, 0.3, 0.36, dark);
   const [fa, fh] = P.forkTop;
   for (const d of [-1, 1])
     k.extrude(
@@ -627,10 +626,9 @@ export interface SignWord {
 
 /**
  * The words on the police box's sign band: one of the three approved
- * exceptions to the no-markings rule (Jordi, 2026-09-26), with the core
- * wall's nameplate and the block's mark. These four words only, set in
- * the station's block pixels; every identifier and test round them stays
- * generic.
+ * exceptions to the no-markings rule, with the core wall's nameplate and
+ * the block's mark. These four words only, set in the station's block
+ * pixels; every identifier and test round them stays generic.
  */
 export const BOX_SIGN = {
   left: "POLICE",

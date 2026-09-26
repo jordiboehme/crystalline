@@ -433,7 +433,7 @@ export const LOW_HERO_TOP = 1.0;
 /**
  * Whether `?at=` frames a hero kind with a pitch (C16): a hovering one
  * (`heroLift` over 0) or a low one (top under `LOW_HERO_TOP`). Every
- * other hero keeps pitch 0, so the spots pinned before 2.6c hold.
+ * other hero keeps pitch 0.
  */
 export function framesPitched(kind: HeroKind): boolean {
   return heroLift(kind) > 0 || HERO_CATALOGUE[kind].top < LOW_HERO_TOP;

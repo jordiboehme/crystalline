@@ -190,8 +190,9 @@ export function propInstances(room: RoomSpec): PropGroup[] {
  * sorted by key. Each instance is `x * CELL`, 0 (the instance stands on the
  * floor; a hovering hero's mesh is built at its lift, `heroLift`, C4, so the
  * three floaters hover without a height of their own here), `y * CELL`, the
- * turn and its kind's blink bank slot (`bankSlot(HERO_BANK[kind])`). A room without heroes gives no groups. A
- * pure function: the same room gives equal arrays.
+ * turn and its kind's blink bank slot (`bankSlot(HERO_BANK[kind])`). A room
+ * without heroes gives no groups. A pure function: the same room gives
+ * equal arrays.
  */
 export function heroInstances(room: RoomSpec): HeroGroup[] {
   return grouped(
