@@ -20,9 +20,10 @@ use std::path::Path;
 /// on a case-insensitive filesystem. A rename of one folder to a spelling the
 /// filesystem folds onto that same folder (a change of case, or of Unicode
 /// normalization on APFS; same device and inode) goes through a temporary
-/// sibling `<old>.renaming`, so the spelling really changes and the second
+/// sibling `.<old>.renaming` (the leading dot keeps it clear of every
+/// domain name), so the spelling really changes and the second
 /// half never sees its target as already present; a leftover
-/// `<old>.renaming` from an interrupted run is carried on to `new`. A
+/// `.<old>.renaming` from an interrupted run is carried on to `new`. A
 /// DIFFERENT folder the filesystem folds onto `new` counts as present.
 ///
 /// On Windows a folder that holds an open file (the overlay journal, or one
@@ -47,7 +48,9 @@ pub(crate) fn move_state_dir(parent: &Path, old: &str, new: &str) -> io::Result<
             ),
         )
     };
-    let temp = format!("{old}.renaming");
+    // A leading dot, which `validate_domain_name` refuses, so no domain's
+    // own folder can ever carry this name.
+    let temp = format!(".{old}.renaming");
     // One folder under two spellings: a change of case, or any other spelling
     // the filesystem folds onto the same folder (APFS also ignores Unicode
     // normalization). It moves through the temporary name, and a replay that
@@ -66,7 +69,10 @@ pub(crate) fn move_state_dir(parent: &Path, old: &str, new: &str) -> io::Result<
             (false, staged) => staged,
         };
         if staged {
-            if has(new) {
+            // With the folder moved aside, anything that answers to `new` is
+            // a different folder, the exact spelling or one the filesystem
+            // folds onto it, and renaming onto it could replace it.
+            if has(new) || parent.join(new).symlink_metadata().is_ok() {
                 return Err(both());
             }
             std::fs::rename(parent.join(&temp), parent.join(new))?;
@@ -168,6 +174,52 @@ mod tests {
 
         move_state_dir(&origins, "eng", "platform").expect("a second call is fine");
         assert_eq!(listing(&origins), vec!["platform".to_string()]);
+    }
+
+    /// `eng.renaming` is a valid domain name, so a folder of that name is
+    /// another domain's state, never a leftover of this move: renaming `eng`,
+    /// which has no folder here, leaves it alone.
+    #[test]
+    fn another_domains_folder_named_like_a_leftover_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        std::fs::create_dir(parent.join("eng.renaming")).unwrap();
+        std::fs::write(parent.join("eng.renaming/file"), "theirs").unwrap();
+
+        move_state_dir(parent, "eng", "platform").unwrap();
+        move_state_dir(parent, "eng", "Eng").unwrap();
+        assert_eq!(listing(parent), vec!["eng.renaming".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(parent.join("eng.renaming/file")).unwrap(),
+            "theirs"
+        );
+    }
+
+    /// With the folder moved aside to its temporary name, a different folder
+    /// the filesystem folds onto `new` is refused rather than replaced. Skips
+    /// (early return, message on stderr) where case does not fold.
+    #[test]
+    fn a_replay_onto_a_folder_folded_onto_the_target_is_refused_where_case_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        if !folds_case(parent) {
+            eprintln!("skipped: {} is case-sensitive", parent.display());
+            return;
+        }
+        std::fs::create_dir(parent.join(".Notes.renaming")).unwrap();
+        std::fs::write(parent.join(".Notes.renaming/file"), "kept").unwrap();
+        std::fs::create_dir(parent.join("NOTES")).unwrap();
+
+        let err = move_state_dir(parent, "Notes", "notes").unwrap_err();
+        assert!(
+            err.to_string().contains("both Notes and notes exist"),
+            "{err}"
+        );
+        assert_eq!(
+            listing(parent),
+            vec![".Notes.renaming".to_string(), "NOTES".to_string()],
+            "nothing moved and the empty folder was not replaced"
+        );
     }
 
     #[test]
@@ -305,7 +357,7 @@ mod tests {
         // A replay after the first half: only the temporary name is left.
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path();
-        std::fs::create_dir(parent.join(format!("{composed}.renaming"))).unwrap();
+        std::fs::create_dir(parent.join(format!(".{composed}.renaming"))).unwrap();
         move_state_dir(parent, composed, decomposed).unwrap();
         assert_eq!(listing(parent), vec![decomposed.to_string()]);
     }
@@ -338,8 +390,8 @@ mod tests {
     fn an_interrupted_case_only_move_is_finished_from_the_temporary_name() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path();
-        std::fs::create_dir(parent.join("Notes.renaming")).unwrap();
-        std::fs::write(parent.join("Notes.renaming/file"), "kept").unwrap();
+        std::fs::create_dir(parent.join(".Notes.renaming")).unwrap();
+        std::fs::write(parent.join(".Notes.renaming/file"), "kept").unwrap();
 
         move_state_dir(parent, "Notes", "notes").unwrap();
         assert_eq!(listing(parent), vec!["notes".to_string()]);

@@ -57,9 +57,10 @@ impl ProvisionReceipt {
     /// to the next reconcile, which removes what it installed. Answers whether
     /// anything moved; a second call answers `false`.
     ///
-    /// Stamps already under `new` win over the old name's for the same key,
-    /// since they come from a later scan; the old name's other stamps join
-    /// them.
+    /// Stamps already under `new` win over the old name's for the same key
+    /// and the old name's other stamps join them. Which one is kept does not
+    /// matter for correctness: a stamp is only a cache of the last scan, and a
+    /// wrong one merely makes the next reconcile rehash that file.
     pub fn rename_domain(&mut self, old: &str, new: &str) -> bool {
         if old == new {
             return false;
