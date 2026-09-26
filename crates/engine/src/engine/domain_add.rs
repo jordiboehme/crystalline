@@ -267,21 +267,18 @@ impl Engine {
     /// read of the registration and the MANIFEST as they stand now - not from
     /// whatever a caller decided a moment ago, which is what makes this safe
     /// to call unconditionally after every registration, adoption included.
+    /// A team domain (`entry.origin` set) never qualifies, whatever its
+    /// name's origin: the owner adds the name upstream by hand, so this
+    /// never plants a pending local change that would block review mode or
+    /// conflict with what the owner adds later (Jordi's ruling 2026-09-26).
     ///
     /// Goes through the ordinary source-edit path (`DomainView::for_write`
     /// plus [`Engine::apply_source_edit`]), the way
-    /// [`Engine::set_manifest_policies`] writes a policy key: a team domain
-    /// gets a pending local change rather than a proposal, and a
-    /// review-mode domain gets a draft, which counts as written (open issue
-    /// 7). [`crate::scope::Scope::Unrestricted`] is the acting scope, the
-    /// same one every other write this engine makes on its own account uses
-    /// - there is no external caller here to carry a scope from.
-    ///
-    /// `local`'s `name_origin` is read fresh from the registration; a legacy
-    /// entry that predates the field (`None`) falls back to
-    /// [`infer_name_origin`], the same inference the upgrade catch-up uses,
-    /// so an old local or virtual domain re-added through this path still
-    /// gets its MANIFEST written rather than silently skipped.
+    /// [`Engine::set_manifest_policies`] writes a policy key: a review-mode
+    /// domain gets a draft, which counts as written (open issue 7).
+    /// [`crate::scope::Scope::Unrestricted`] is the acting scope, the same
+    /// one every other write this engine makes on its own account uses -
+    /// there is no external caller here to carry a scope from.
     ///
     /// Returns whether it wrote. Never returns `Ok(true)` twice in a row for
     /// an unchanged MANIFEST: the second call reads a `domain_name` the first
@@ -298,10 +295,7 @@ impl Engine {
             ))
         })?;
         let manifest_declares = domain_name_of_source(&current).is_some();
-        let origin = entry
-            .name_origin
-            .unwrap_or_else(|| infer_name_origin(local, &entry, false));
-        if !needs_manifest_write_back(&entry, origin, manifest_declares) {
+        if !needs_manifest_write_back(&entry, manifest_declares) {
             return Ok(false);
         }
         let overlay = view.actor().map(str::to_string);

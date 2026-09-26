@@ -456,7 +456,7 @@ pub(crate) fn domain_add_register(
                     config::save_yaml(&loaded.path, &cfg).map_err(|e| {
                         anyhow!("failed to save config {}: {e}", loaded.path.display())
                     })?;
-                    write_back_manifest_name_if_needed(&entry, NameOrigin::Explicit, &abs, name);
+                    write_back_manifest_name_if_needed(&entry, &abs, name);
                     Ok((name.to_string(), abs, false, None))
                 }
             }
@@ -496,7 +496,7 @@ pub(crate) fn domain_add_register(
                     config::save_yaml(&loaded.path, &cfg).map_err(|e| {
                         anyhow!("failed to save config {}: {e}", loaded.path.display())
                     })?;
-                    write_back_manifest_name_if_needed(&entry, choice.origin, &abs, &choice.name);
+                    write_back_manifest_name_if_needed(&entry, &abs, &choice.name);
                     Ok((choice.name, abs, false, choice.shadowed_canonical))
                 }
             }
@@ -515,14 +515,9 @@ pub(crate) fn domain_add_register(
 /// engine's own `write_back_domain_name` makes and for the same reason - the
 /// registration already saved, and answering with an error here would tell
 /// the caller their `domain add` failed when it did not.
-fn write_back_manifest_name_if_needed(
-    entry: &DomainEntry,
-    origin: NameOrigin,
-    root: &Path,
-    name: &str,
-) {
+fn write_back_manifest_name_if_needed(entry: &DomainEntry, root: &Path, name: &str) {
     let manifest_declares = crystalline_core::domain_name_at(root).is_some();
-    if !needs_manifest_write_back(entry, origin, manifest_declares) {
+    if !needs_manifest_write_back(entry, manifest_declares) {
         return;
     }
     if let Err(e) = write_back_manifest_name(root, name) {

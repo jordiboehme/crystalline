@@ -145,38 +145,6 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/draft-links/leave",
 ];
 
-/// Puts a freshly connected team domain's MANIFEST back the way the team has
-/// it, for a fixture whose subject is not the name.
-///
-/// Connecting under an explicit name writes `domain_name` into a MANIFEST
-/// that declares none, as a pending local change the next share carries. A
-/// fixture that goes on to enable review, or counts a share's files, would
-/// otherwise be about that line instead of its own subject; this drops it
-/// through the engine's own discard path, the one a person would use.
-pub async fn discard_name_write_back(
-    eng: &crystalline_service::Engine,
-    domain: &str,
-    root: &std::path::Path,
-) {
-    let current = std::fs::read(root.join("MANIFEST.md")).unwrap();
-    let discarded = eng
-        .discard_local_changes(
-            domain,
-            &[crystalline_remote::ops::DiscardTarget {
-                path: "MANIFEST.md".to_string(),
-                sha256: Some(sha256_hex(&current)),
-            }],
-            &crystalline_service::engine::ShareActor::Owner,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        discarded["restored"],
-        serde_json::json!(["MANIFEST.md"]),
-        "the name write-back is the one change a fresh connect leaves: {discarded}"
-    );
-}
-
 /// The lowercase hex SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();

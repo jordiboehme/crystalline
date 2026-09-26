@@ -307,13 +307,14 @@ impl Engine {
 
         progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
-        // A name the caller gave is written into a MANIFEST that declares
-        // none, through the ordinary edit path, so in a team domain it is a
-        // pending local change the next share carries and never a proposal
-        // of its own. A derived name never is: one the MANIFEST gave is
-        // already there, and a repository default must not be pushed into
-        // the team's file (the guard in `write_back_domain_name` says the
-        // same). Best effort: the connect has landed and must not be undone
+        // Every domain this connect reaches is a team domain (its `origin`
+        // is set above), so `write_back_domain_name`'s own guard always
+        // answers `Ok(false)` here, whatever `name_origin` is: a team domain
+        // never gets `domain_name` written into its MANIFEST automatically
+        // (Jordi's ruling 2026-09-26). The call stays, at the cost of one
+        // no-op MANIFEST read, so this path keeps going through the same
+        // guard as every other write-back rather than special-casing
+        // itself. Best effort: the connect has landed and must not be undone
         // by a MANIFEST write that fails afterwards.
         if name_origin == NameOrigin::Explicit
             && let Err(e) = self.write_back_domain_name(&domain_name).await

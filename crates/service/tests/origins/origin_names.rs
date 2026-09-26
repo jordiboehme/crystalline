@@ -293,11 +293,13 @@ async fn the_repo_default_name_still_adopts_an_origin_less_domain_in_place() {
     );
 }
 
-/// An explicit name is written into a MANIFEST that declares none, as an
-/// ordinary pending local change the next share carries - never a proposal
-/// of its own.
+/// Ruling 2026-09-26 (option A): a team domain never gets `domain_name`
+/// written into its MANIFEST automatically, whatever `name_origin` is. An
+/// explicit name at connect lands in the config only; the MANIFEST that
+/// declares none stays exactly as the team has it, with no pending local
+/// change and no proposal.
 #[tokio::test]
-async fn an_explicit_name_is_written_back_as_a_pending_local_change() {
+async fn an_explicit_name_at_connect_leaves_the_manifest_untouched() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = forge(&[("MANIFEST.md", bare_manifest())]);
     let r = rig(tmp.path(), mock.clone(), &[]).await;
@@ -316,14 +318,16 @@ async fn an_explicit_name_is_written_back_as_a_pending_local_change() {
     );
     let root = r.domains_root.join("platform");
     let text = std::fs::read_to_string(root.join("MANIFEST.md")).unwrap();
+    assert_eq!(text, String::from_utf8(bare_manifest()).unwrap(), "{text}");
     assert_eq!(
         crystalline_core::manifest::domain_name_of_source(&text).as_deref(),
-        Some("platform"),
-        "{text}"
+        None,
+        "the owner adds the name upstream by hand: {text}"
     );
     assert_eq!(
         change_paths(&r.eng, "platform").await,
-        vec!["MANIFEST.md".to_string()]
+        Vec::<String>::new(),
+        "no pending local change"
     );
     assert!(
         !mock
@@ -461,12 +465,13 @@ async fn a_nameless_connect_is_not_answered_by_an_explicitly_named_connection() 
     assert_eq!(entry.origin.unwrap().branch(), "main");
 }
 
-/// Pinned consequence of the explicit name's write-back, awaiting a ruling:
-/// the MANIFEST change it leaves is an unshared folder change, so turning on
-/// review right after a named connect is refused until it is shared or
-/// discarded.
+/// Ruling 2026-09-26 (option A): a team domain never gets `domain_name`
+/// written into its MANIFEST automatically, whatever its name's origin. So
+/// an explicit name at connect leaves the MANIFEST exactly as the team has
+/// it - no pending local change - and review mode is available immediately,
+/// with nothing to discard first.
 #[tokio::test]
-async fn review_mode_right_after_a_named_connect_waits_on_the_name_write_back() {
+async fn review_mode_right_after_a_named_connect_starts_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = forge(&[("MANIFEST.md", bare_manifest())]);
     let r = rig(tmp.path(), mock, &[]).await;
@@ -475,20 +480,17 @@ async fn review_mode_right_after_a_named_connect_waits_on_the_name_write_back() 
         .await
         .unwrap();
 
-    let err = r
+    let changes = r
         .eng
-        .set_review_mode(
-            "platform",
-            Some(crystalline_core::config::ReviewMode::Overlay),
-            crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
-            &crystalline_service::Scope::Unrestricted,
-        )
+        .local_changes("platform", &ShareActor::Owner)
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("MANIFEST.md"), "{err}");
+        .unwrap();
+    assert_eq!(
+        changes["changes"].as_array().map(Vec::len),
+        Some(0),
+        "an explicit name leaves no pending change: {changes}"
+    );
 
-    crate::support::discard_name_write_back(&r.eng, "platform", &r.domains_root.join("platform"))
-        .await;
     r.eng
         .set_review_mode(
             "platform",
@@ -497,15 +499,15 @@ async fn review_mode_right_after_a_named_connect_waits_on_the_name_write_back() 
             &crystalline_service::Scope::Unrestricted,
         )
         .await
-        .expect("with the write-back put back, review starts");
+        .expect("nothing pending to block review mode");
 }
 
-/// Pinned consequence of the explicit name's write-back, awaiting a ruling:
-/// the `domain_name` line sits in the MANIFEST's frontmatter where a team
-/// edit to that frontmatter lands too, so a pull of such an edit before the
-/// name was shared meets it as a conflict.
+/// Ruling 2026-09-26 (option A) resolved what used to be a pinned conflict
+/// here: with no automatic write-back, nothing of ours sits over the
+/// MANIFEST's frontmatter after a named connect, so a later upstream edit to
+/// it pulls in clean instead of conflicting.
 #[tokio::test]
-async fn an_upstream_manifest_edit_before_the_name_is_shared_conflicts() {
+async fn an_upstream_manifest_edit_after_a_named_connect_pulls_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = forge(&[("MANIFEST.md", bare_manifest())]);
     let r = rig(tmp.path(), mock.clone(), &[]).await;
@@ -528,9 +530,15 @@ async fn an_upstream_manifest_edit_before_the_name_is_shared_conflicts() {
         .origin_update(Some("platform"), &crystalline_service::Scope::Unrestricted)
         .await
         .unwrap();
-    let conflicts = pulled["domains"][0]["conflicts"].clone();
-    assert_eq!(conflicts.as_array().map(Vec::len), Some(1), "{pulled}");
-    assert_eq!(conflicts[0]["path"], "MANIFEST.md", "{pulled}");
+    assert_eq!(
+        pulled["domains"][0]["conflicts"].as_array().map(Vec::len),
+        Some(0),
+        "{pulled}"
+    );
+    let manifest =
+        std::fs::read_to_string(r.domains_root.join("platform").join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("sharing: direct"), "{manifest}");
+    assert!(!manifest.contains("domain_name"), "{manifest}");
 }
 
 /// The same repository and branch already connected here under an explicit

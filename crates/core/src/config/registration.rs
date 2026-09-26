@@ -319,20 +319,15 @@ pub fn choose_domain_name(
 }
 
 /// Whether a registration should write `domain_name` into the MANIFEST.
-/// Never when the MANIFEST already declares one (`manifest_declares`).
-/// Otherwise written for every explicitly named domain and for a plain
-/// local file or virtual domain (no `origin`), but skipped for a team
-/// domain (`entry.origin` set) whose name was only defaulted from the
-/// repository - the point of that default is exactly to need no write.
-pub fn needs_manifest_write_back(
-    entry: &DomainEntry,
-    origin: NameOrigin,
-    manifest_declares: bool,
-) -> bool {
-    if manifest_declares {
-        return false;
-    }
-    !(entry.origin.is_some() && origin == NameOrigin::Derived)
+/// Never when the MANIFEST already declares one (`manifest_declares`), and
+/// never for a team domain (`entry.origin` set) whatever its name's origin -
+/// explicit or derived. The owner adds the name upstream by hand; an
+/// automatic write would plant a pending local change that blocks review
+/// mode and conflicts once the owner adds the name upstream (Jordi's ruling
+/// 2026-09-26, option A). Otherwise written for every plain local file or
+/// virtual domain (no `origin`), whatever its name's origin.
+pub fn needs_manifest_write_back(entry: &DomainEntry, manifest_declares: bool) -> bool {
+    !manifest_declares && entry.origin.is_none()
 }
 
 #[cfg(test)]
@@ -458,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_skips_only_a_repo_defaulted_team_domain() {
+    fn write_back_skips_every_team_domain_explicit_or_derived() {
         let team = DomainEntry {
             origin: Some(OriginConfig {
                 repo: "acme/eng".into(),
@@ -468,31 +463,18 @@ mod tests {
             }),
             ..DomainEntry::file("/x")
         };
-        assert!(!needs_manifest_write_back(
-            &team,
-            NameOrigin::Derived,
-            false
-        ));
-        assert!(needs_manifest_write_back(
-            &team,
-            NameOrigin::Explicit,
-            false
-        ));
-        assert!(needs_manifest_write_back(
-            &DomainEntry::file("/x"),
-            NameOrigin::Derived,
-            false
-        ));
+        assert!(!needs_manifest_write_back(&team, false));
+        let team_explicit = DomainEntry {
+            name_origin: Some(NameOrigin::Explicit),
+            ..team
+        };
+        assert!(!needs_manifest_write_back(&team_explicit, false));
+        assert!(needs_manifest_write_back(&DomainEntry::file("/x"), false));
         assert!(needs_manifest_write_back(
             &DomainEntry::virtual_domain(),
-            NameOrigin::Derived,
             false
         ));
-        assert!(!needs_manifest_write_back(
-            &DomainEntry::file("/x"),
-            NameOrigin::Explicit,
-            true
-        ));
+        assert!(!needs_manifest_write_back(&DomainEntry::file("/x"), true));
     }
 
     #[test]
