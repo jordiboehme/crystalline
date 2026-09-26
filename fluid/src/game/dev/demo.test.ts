@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { CANNED_BRIDGE, CANNED_WORKSHOP } from "../world/canned";
 import { CURIO_KINDS } from "../world/curios";
 import { heroBlocker, propFootprint } from "../world/footprints";
+import { generateRoom } from "../world/generate";
 import { overlaps } from "../world/sites";
 import { roomWithForcedCurio, roomWithForcedHero } from "./demo";
 
@@ -73,9 +74,12 @@ describe("roomWithForcedCurio", () => {
     "fuel-case",
   ];
 
-  it("forces every curio kind into the workshop where it has a host", () => {
+  it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
+    const base = generateRoom(CANNED_WORKSHOP);
     for (const kind of CURIO_KINDS) {
       const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, kind);
+      expect(room.heroes, kind).toEqual(base.heroes);
+      expect(room.props, kind).toEqual(base.props);
       if (NO_HOST_IN_WORKSHOP.includes(kind)) {
         expect(placed, kind).toBeNull();
         expect(

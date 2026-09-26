@@ -884,7 +884,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(within(balls, 1500, BALL_SHARE), `balls ${balls}`).toBe(true);
   });
 
-  it("places an under curio in about 1 generated room in 19, in every archetype", () => {
+  it("places an under curio in about 1 generated room in 19 across all archetypes", () => {
     // The realized rate, counted on what `generateRoom` actually placed,
     // over 1000 rooms: the three canned places in turn, each permalink its
     // own (so its own room seed), with 0 to 5 made-up tags (so the machine
