@@ -97,7 +97,7 @@ impl Engine {
             .collect();
 
         let mut local_spellings = Vec::new();
-        for (domain, path, counts, in_draft) in self.local_spelling_counts(&table).await? {
+        for (domain, path, counts, in_draft) in self.local_spelling_counts(&table, &busy).await? {
             for (spelling, (canonical, count)) in counts {
                 let mut entry = json!({
                     "domain": domain,
@@ -144,9 +144,10 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let table = self.name_table_now().await;
+        let busy: HashSet<String> = self.names_being_renamed().into_iter().collect();
         let scope = crate::scope::Scope::Unrestricted;
         let mut fixed: u64 = 0;
-        for (domain, path, _, in_draft) in self.local_spelling_counts(&table).await? {
+        for (domain, path, _, in_draft) in self.local_spelling_counts(&table, &busy).await? {
             // Already respelled in the owner's draft: nothing to write again.
             if in_draft {
                 continue;
@@ -228,11 +229,14 @@ impl Engine {
     /// (canonical, count), in_draft)`, sorted by domain, then path. The count
     /// is taken with the same rewrite [`Engine::fix_local_spellings`]
     /// applies, so the report and the fix never disagree. `in_draft` says the
-    /// fix already sits in the owner's review draft.
+    /// fix already sits in the owner's review draft. `busy` is every name a
+    /// rename holds ([`Engine::names_being_renamed`]), read once by the
+    /// caller.
     #[allow(clippy::type_complexity)]
     async fn local_spelling_counts(
         &self,
         table: &NameTable,
+        busy: &HashSet<String>,
     ) -> Result<Vec<(String, String, BTreeMap<String, (String, usize)>, bool)>> {
         let spellings: Vec<String> = table
             .spellings()
@@ -254,7 +258,7 @@ impl Engine {
             };
             let counts = count_respellings(&text, table);
             if !counts.is_empty() {
-                let in_draft = self.draft_holds_fix(&domain, &path, table).await;
+                let in_draft = self.draft_holds_fix(&domain, &path, table, busy).await;
                 out.push((domain, path, counts, in_draft));
             }
         }
@@ -263,9 +267,17 @@ impl Engine {
 
     /// Whether `path` in a domain that reviews changes has an owner's draft
     /// that spells no local-only name any more: the fix is written and waits
-    /// for review. Anything that cannot be read answers `false`.
-    async fn draft_holds_fix(&self, domain: &str, path: &str, table: &NameTable) -> bool {
-        if !self.reviews_changes(domain) {
+    /// for review. Anything that cannot be read answers `false`, and so does
+    /// a domain a rename holds: reading the draft takes a write ticket, which
+    /// waits up to 30 s on a paused domain, once per engram.
+    async fn draft_holds_fix(
+        &self,
+        domain: &str,
+        path: &str,
+        table: &NameTable,
+        busy: &HashSet<String>,
+    ) -> bool {
+        if !self.reviews_changes(domain) || self.is_renaming(domain) || busy.contains(domain) {
             return false;
         }
         let scope = crate::scope::Scope::Unrestricted;

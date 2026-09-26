@@ -2179,7 +2179,12 @@ async fn sync_dispatch(
     // adopts nothing. The adoption cannot fail the sync that landed: its own
     // failure is a warning. The JSON stays the report array it always was; a
     // person reads what was renamed.
-    let names = match crystalline_service::adopt_domain_names_direct(store, config.as_deref()).await
+    let names = match crystalline_service::adopt_domain_names_direct(
+        store,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await
     {
         Ok(names) => names,
         Err(e) => {

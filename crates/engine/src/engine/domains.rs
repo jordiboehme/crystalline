@@ -119,8 +119,9 @@ impl Engine {
     /// `shadowed` from the name table (see [`crystalline_core::names::NameTable`]),
     /// and `renaming`, whether a rename has this domain paused right now (see
     /// [`Engine::is_renaming`]). `shadowed` is a bool and never names the other
-    /// domain that holds the canonical name - a caller who may not see that
-    /// other domain must not learn of it this way either. `renaming` is always
+    /// domain that holds the canonical name, and it is `false` when that
+    /// domain is hidden from the caller - a caller who may not see that other
+    /// domain must not learn of it this way either. `renaming` is always
     /// present, `false` when nothing is paused, so a list-shaped rendering of
     /// this array keeps one uniform set of columns.
     ///
@@ -206,7 +207,15 @@ impl Engine {
                 "canonical_name": table.canonical(name).unwrap_or(name),
                 "aliases": table.aliases(name),
                 "name_origin": entry.name_origin,
-                "shadowed": table.is_shadowed(name),
+                // Only when the domain holding the name is one this caller
+                // may see: for a hidden holder the name reaches nothing this
+                // caller can read, and a `true` would tell them a domain of
+                // that name exists here.
+                "shadowed": table.is_shadowed(name)
+                    && table
+                        .canonical(name)
+                        .and_then(|canonical| table.resolve(canonical))
+                        .is_some_and(|holder| !hidden.contains(holder)),
                 "renaming": self.is_renaming(name),
             });
             // What THIS caller is holding in a domain that reviews changes, so
@@ -455,7 +464,7 @@ impl Engine {
             };
             if spec.kind == crystalline_core::PolicyKind::Text {
                 return Err(EngineError::Invalid(format!(
-                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename on the domain page or `crystalline domain rename {domain} <new>`"
+                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
                 )));
             }
             if !spec.accepts(value) {

@@ -59,6 +59,16 @@ impl Engine {
         if self.read_only || self.config_path.is_none() {
             return Ok(json!([]));
         }
+        // An adoption renames this machine's state folders and configuration
+        // keys: only the process that holds the state directory does it.
+        if !self.holds_state_dir() {
+            tracing::info!(
+                "domain names are not lined up with their MANIFESTs here: this command does not \
+                 hold this machine's state directory; the daemon, or a plain `crystalline sync`, \
+                 does it"
+            );
+            return Ok(json!([]));
+        }
         let mut report: Vec<Value> = Vec::new();
         let planned = {
             let _admin = self.domain_admin().await;

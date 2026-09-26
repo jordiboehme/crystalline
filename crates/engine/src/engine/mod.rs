@@ -1012,6 +1012,12 @@ pub struct Engine {
     // the old name, since the configuration does not list it yet. A refresh
     // in that window only marks the table stale.
     names_frozen: std::sync::atomic::AtomicBool,
+    // Whether this process holds the ownership of the state directory (the
+    // lock a daemon holds for its whole life). True for every engine but the
+    // one-shot standalone command's, which takes the lock only for the
+    // moment it needs it: a rename journal is run, and a MANIFEST name
+    // adopted, only while it is held, so no two processes do either at once.
+    holds_state_dir: std::sync::atomic::AtomicBool,
     // The rename test seams: a failure after one step, and a hold after one.
     #[cfg(any(test, feature = "testing"))]
     rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
@@ -1710,6 +1716,7 @@ impl Engine {
             rename_slot: std::sync::Mutex::new(None),
             adoption_failures: std::sync::Mutex::new(HashMap::new()),
             names_frozen: std::sync::atomic::AtomicBool::new(false),
+            holds_state_dir: std::sync::atomic::AtomicBool::new(true),
             #[cfg(any(test, feature = "testing"))]
             rename_fail_after: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
@@ -4809,6 +4816,10 @@ pub async fn open_standalone(
     let mut engine = Engine::new(store, file, None, Some(path))
         .with_read_only(read_only)
         .with_env_overlay(overlay);
+    // A one-shot command does not hold the state directory the way a daemon
+    // does; the service's opener sets this while it takes the lock for a
+    // recovery.
+    engine.set_holds_state_dir(false);
     // The daemonless engine is told where this machine's state directory is,
     // rather than leaving [`Engine::journal_state_dir`] to resolve it. Both
     // halves matter. In production it is the same path either way, and saying
@@ -4821,10 +4832,10 @@ pub async fn open_standalone(
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);
     }
-    // A rename a stopped daemon or command left half done is finished before
-    // this command reads a name. One that cannot be finished keeps its domain
-    // paused and is said once; the command still runs for everything else.
-    engine.finish_leftover_rename().await;
+    // A rename a stopped daemon or command left half done is NOT finished
+    // here: that needs the ownership of the state directory a daemon holds,
+    // which lives above this crate. The service's standalone opener takes it
+    // and then calls [`Engine::finish_leftover_rename`].
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

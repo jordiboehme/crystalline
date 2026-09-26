@@ -7,8 +7,8 @@ use crystalline_core::manifest::domain_name_at;
 
 use super::*;
 use crate::rename::{
-    LeftBehind, RENAME_WAIT, RelinkCount, RelinkReport, RenameCaller, RenameJournal, RenameStep,
-    WriteTicket, move_state_dir,
+    LeftBehind, RENAME_WAIT, RelinkCount, RelinkReport, RenameCaller, RenameJournal, RenameOwner,
+    RenameStep, WriteTicket, move_state_dir,
 };
 
 /// Frees the one-rename slot when the rename that took it ends, however it
@@ -129,6 +129,18 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A rename moves this machine's state folders and writes its
+        // configuration under a journal in the state directory: only the
+        // process that holds that directory runs one, so no two processes
+        // move the same folders or run one journal at once.
+        if !self.holds_state_dir() {
+            return Err(EngineError::Conflict(
+                "another Crystalline process (the daemon) holds this machine's state directory, \
+                 which a rename needs; rename through it, or stop it with `crystalline ctl \
+                 shutdown` and rename again"
+                    .to_string(),
+            ));
+        }
         let hidden = self.hidden_for(scope).await?;
         // Privacy alone, never `hidden_for`'s extra "an index row this
         // instance has no registration for" names: the still-running and
@@ -169,6 +181,22 @@ impl Engine {
             // The same rename a crash stopped: finish it rather than refuse.
             // The pause starts where `finish_rename` needs it.
             if journal.old == old && journal.new == new && journal.local_only == local_only {
+                // Finished only against the index it was started on: a
+                // command that opened another one (`--db`, `--config`)
+                // would move this machine's state and configuration while
+                // the index the rename belongs to keeps the old name.
+                if let Some(why) = self.foreign_journal(&journal, &state_dir).await? {
+                    return Err(EngineError::Conflict(format!(
+                        "the rename of '{old}' to '{new}' that has not finished belongs to \
+                         another index{}; {}",
+                        if may_see_server_paths(scope) {
+                            format!(" ({why})")
+                        } else {
+                            String::new()
+                        },
+                        finish_elsewhere_hint(&journal)
+                    )));
+                }
                 let _origins = self.lock_both_origins(old, new).await;
                 self.close_editors(old).await;
                 let mut report = self.finish_rename(journal, &state_dir, true).await?;
@@ -220,6 +248,8 @@ impl Engine {
         };
         self.refuse_shared_index(old).await?;
         self.refuse_leftovers(new, &state_dir, scope).await?;
+        // What the journal belongs to, read before anything is paused.
+        let owner = self.rename_owner(&state_dir).await?;
 
         // An origin pull or share of this domain finishes first, and none
         // starts until the rename is done, under either name: the lock is
@@ -316,6 +346,7 @@ impl Engine {
             writable,
             manifest_draft,
             relinked: None,
+            owner: Some(owner),
             done: Vec::new(),
         };
         if let Err(e) = journal.save(&state_dir) {
@@ -343,7 +374,9 @@ impl Engine {
     /// Finish a rename a crash left behind: every step the journal does not
     /// list as done, then the configuration, then the journal goes. Called
     /// before serving and before the first sync, by the daemon and by both
-    /// standalone openers. No journal: `Ok(None)`.
+    /// standalone openers. No journal: `Ok(None)`. A journal that belongs to
+    /// another index, configuration or state directory than this engine's
+    /// is left alone with a warning, also `Ok(None)`.
     ///
     /// Runs on a read-only instance too: the rename was started by a
     /// writable one, and a half-renamed domain serves nothing correctly.
@@ -356,6 +389,28 @@ impl Engine {
         let Some(journal) = RenameJournal::load(&state_dir).map_err(io_error)? else {
             return Ok(None);
         };
+        if !self.holds_state_dir() {
+            tracing::warn!(
+                "the rename of domain '{}' to '{}' that an earlier run left half done is left \
+                 to the process that holds this machine's state directory",
+                journal.old,
+                journal.new
+            );
+            return Ok(None);
+        }
+        // A journal another index's rename left behind is not this engine's
+        // to finish: its steps would move this machine's state folders and
+        // configuration while the index it belongs to keeps the old name.
+        if let Some(why) = self.foreign_journal(&journal, &state_dir).await? {
+            tracing::warn!(
+                "the rename of domain '{}' to '{}' that an earlier run left half done is left \
+                 alone here: {why}. To finish it, {}",
+                journal.old,
+                journal.new,
+                finish_elsewhere_hint(&journal)
+            );
+            return Ok(None);
+        }
         // No caller to protect here - this runs before the daemon serves
         // anyone - so nothing is hidden and a refusal (there is no live
         // caller to read one) would carry the full detail regardless.
@@ -386,7 +441,8 @@ impl Engine {
 
     /// [`Engine::recover_rename_journal`] for an opener: the daemon, the
     /// embedded MCP stack and the standalone command engine call it before
-    /// anything reads a name. The outcome is logged rather than returned: a
+    /// anything reads a name, each only while it holds the ownership of the
+    /// state directory, so no two processes run one journal. The outcome is logged rather than returned: a
     /// rename that cannot be finished keeps its one domain paused and says
     /// why, and every other domain is served.
     pub async fn finish_leftover_rename(&self) {
@@ -404,6 +460,66 @@ impl Engine {
                  answered, and every write to it is refused"
             ),
         }
+    }
+
+    /// Say whether this process holds the ownership of the state directory
+    /// right now. Every engine starts out holding it; the standalone command
+    /// engine starts without it, and its opener sets it while it has taken
+    /// the lock. A rename journal is run, and MANIFEST names adopted, only
+    /// while it is held.
+    pub fn set_holds_state_dir(&self, held: bool) {
+        self.holds_state_dir
+            .store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this process holds the ownership of the state directory.
+    pub(crate) fn holds_state_dir(&self) -> bool {
+        self.holds_state_dir
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a rename journal is waiting in this engine's state directory,
+    /// whoever it belongs to. Cheap: a standalone opener asks this before it
+    /// takes the ownership lock a recovery needs.
+    pub fn has_leftover_rename(&self) -> bool {
+        self.journal_state_dir()
+            .is_ok_and(|dir| RenameJournal::path(&dir).exists())
+    }
+
+    /// The index, configuration and state directory this engine runs
+    /// against, as a journal it writes records them.
+    async fn rename_owner(&self, state_dir: &Path) -> Result<RenameOwner> {
+        let info = {
+            let store = self.store.lock().await;
+            store.store_info().await?
+        };
+        Ok(RenameOwner::new(
+            info.db_path.as_deref(),
+            self.config_path.as_deref(),
+            state_dir,
+        ))
+    }
+
+    /// `None` when `journal` belongs to the index, configuration and state
+    /// directory this engine opened; otherwise why it does not.
+    async fn foreign_journal(
+        &self,
+        journal: &RenameJournal,
+        state_dir: &Path,
+    ) -> Result<Option<String>> {
+        let here = self.rename_owner(state_dir).await?;
+        Ok(match &journal.owner {
+            Some(owner) if *owner == here => None,
+            Some(owner) => Some(format!(
+                "it belongs to {}, and this command opened {}",
+                owner.describe(),
+                here.describe()
+            )),
+            None => Some(format!(
+                "it does not say which index it belongs to, and this command opened {}",
+                here.describe()
+            )),
+        })
     }
 
     /// Whether `domain` is being renamed right now, under its old name or its
@@ -867,7 +983,7 @@ impl Engine {
         let refusal = |why: String| {
             EngineError::Invalid(format!(
                 "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
-                 {new} --local` or pick This machine only in Rename on the domain page, which \
+                 {new} --local` or pick This machine only in Rename domain on the domain page, which \
                  leaves the MANIFEST and the links as they are"
             ))
         };
@@ -1322,6 +1438,19 @@ fn may_see_server_paths(scope: &crate::scope::Scope) -> bool {
 /// or a daemon restart, which finishes it before serving.
 fn finish_hint(journal: &RenameJournal) -> String {
     finish_hint_for(&journal.old, &journal.new, journal.local_only)
+}
+
+/// How to finish a rename whose journal belongs to another index than the
+/// one this command opened: the same command, against the index it belongs
+/// to.
+fn finish_elsewhere_hint(journal: &RenameJournal) -> String {
+    format!(
+        "run `crystalline domain rename {} {}{}` without --db and --config, or restart the \
+         daemon, which finishes it before serving",
+        journal.old,
+        journal.new,
+        if journal.local_only { " --local" } else { "" }
+    )
 }
 
 /// [`finish_hint`] for the rename of `old` to `new`, `--local` when

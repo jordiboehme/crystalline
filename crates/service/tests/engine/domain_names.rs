@@ -1012,6 +1012,55 @@ async fn a_derived_name_follows_a_new_manifest_name() {
     );
 }
 
+/// An engine that does not hold this machine's state directory (a one-shot
+/// command while the daemon runs) adopts no name and renames nothing: an
+/// adoption moves the machine's state and configuration, which only the
+/// holder does. Holding it again, the same engine adopts.
+#[tokio::test]
+async fn an_engine_without_the_state_directory_adopts_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root.clone()).with_name_origin(NameOrigin::Derived),
+        )],
+    );
+    sync_and_adopt(&engine).await;
+    declare(&root, "platform");
+
+    engine.set_holds_state_dir(false);
+    let report = sync_and_adopt(&engine).await;
+    assert_eq!(report, serde_json::json!([]), "{report}");
+    let cfg = saved(tmp.path());
+    assert!(
+        cfg.domains.contains_key("eng") && !cfg.domains.contains_key("platform"),
+        "{:?}",
+        cfg.domains.keys()
+    );
+    let refused = engine
+        .rename_domain_local(
+            "eng",
+            "platform",
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a rename needs the state directory");
+    assert!(
+        refused
+            .to_string()
+            .contains("holds this machine's state directory"),
+        "{refused}"
+    );
+
+    engine.set_holds_state_dir(true);
+    sync_and_adopt(&engine).await;
+    assert!(saved(tmp.path()).domains.contains_key("platform"));
+}
+
 /// An explicit local name is kept; the declared name resolves to it.
 #[tokio::test]
 async fn an_explicit_name_is_kept_and_the_canonical_resolves_to_it() {
@@ -1412,4 +1461,84 @@ async fn list_domains_reports_a_shadowed_domain() {
     let holder_row = domain_row(&listed, "ops");
     assert_eq!(holder_row["canonical_name"], "ops", "{holder_row}");
     assert_eq!(holder_row["shadowed"], false, "{holder_row}");
+}
+
+/// The same pair, with the domain holding the name private to its owner: a
+/// caller who cannot see it reads `shadowed: false` on the claiming domain,
+/// since `true` would tell them a domain of that name exists here, while the
+/// machine owner and the holder's owner, who see both, still read `true`.
+#[tokio::test]
+async fn list_domains_says_shadowed_only_when_the_caller_sees_the_holder() {
+    use crystalline_service::DomainAccess;
+    use crystalline_service::rest::{AuthStore, Role};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ops = bare_manifest_folder(tmp.path(), "ops", "Ops");
+    let eng = declared_folder(tmp.path(), "eng", "ops");
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![
+            ("ops", DomainEntry::file(ops)),
+            ("eng", DomainEntry::file(eng)),
+        ],
+    );
+    let auth = AuthStore::open(&tmp.path().join("web-auth.db"))
+        .await
+        .unwrap();
+    for (login, role) in [("ada", Role::Editor), ("bob", Role::Editor)] {
+        auth.add_user(login, login, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("ops", true, "ada")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(Arc::new(auth))));
+    engine.sync(None).await.unwrap();
+
+    let listed_as = |scope: Scope| {
+        let engine = &engine;
+        async move {
+            engine
+                .list_domains(
+                    &ListDomainsParams {
+                        include_routing: false,
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let bob = listed_as(Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    })
+    .await;
+    assert!(
+        bob["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["name"] != "ops"),
+        "bob does not see the private holder: {bob}"
+    );
+    let row = domain_row(&bob, "eng");
+    assert_eq!(row["canonical_name"], "ops", "{row}");
+    assert_eq!(
+        row["shadowed"], false,
+        "a hidden holder is never hinted at: {row}"
+    );
+
+    let machine = listed_as(Scope::Unrestricted).await;
+    assert_eq!(domain_row(&machine, "eng")["shadowed"], true, "{machine}");
+
+    let owner = listed_as(Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    })
+    .await;
+    assert_eq!(domain_row(&owner, "eng")["shadowed"], true, "{owner}");
 }

@@ -242,7 +242,7 @@ describe("the rename dialog", () => {
         throw new ApiProblem(
           422,
           "invalid",
-          "domain 'eng' has no MANIFEST to write the new name into; to rename it on this machine only, run `crystalline domain rename eng engineering --local` or pick This machine only in Rename on the domain page, which leaves the MANIFEST and the links as they are",
+          "domain 'eng' has no MANIFEST to write the new name into; to rename it on this machine only, run `crystalline domain rename eng engineering --local` or pick This machine only in Rename domain on the domain page, which leaves the MANIFEST and the links as they are",
         );
       },
     });

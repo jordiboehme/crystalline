@@ -777,7 +777,36 @@ async fn open_standalone_reporting(
     if bypassed {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
+    finish_leftover_rename_owned(&engine).await;
     Ok(engine)
+}
+
+/// Finish a rename an earlier run left half done, from a standalone opener,
+/// only while this process holds the ownership of the state directory a
+/// daemon holds for its whole life ([`acquire_ownership`]): the journal lives
+/// in that directory, and two processes running it at once would move the
+/// same state folders and write the same configuration, on either backend.
+/// The engine itself then runs a journal only against the index it belongs
+/// to. No journal: nothing is locked. The lock held by someone else: the
+/// rename is left to that process and a log line says so.
+async fn finish_leftover_rename_owned(engine: &Engine) {
+    if !engine.has_leftover_rename() {
+        return;
+    }
+    match acquire_ownership() {
+        Ok(ownership) => {
+            engine.set_holds_state_dir(true);
+            engine.finish_leftover_rename().await;
+            engine.set_holds_state_dir(false);
+            drop(ownership);
+        }
+        Err(_) => tracing::warn!(
+            "a domain rename an earlier run left half done is not finished by this command: \
+             another Crystalline process (the daemon) holds this machine's state directory, \
+             and it finishes the rename itself; if it does not, stop it with `crystalline ctl \
+             shutdown` and run this again"
+        ),
+    }
 }
 
 /// The local name `spelling` means, once an engine is open: a canonical name
@@ -1191,9 +1220,17 @@ pub async fn domain_rename(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine
+    // A rename runs only while this process holds the state directory, as a
+    // daemon does; the engine refuses it otherwise, in words that name the
+    // holder.
+    let ownership = acquire_ownership().ok();
+    engine.set_holds_state_dir(ownership.is_some());
+    let report = engine
         .rename_domain(domain, new, local_only, &Scope::Unrestricted)
-        .await?)
+        .await;
+    engine.set_holds_state_dir(false);
+    drop(ownership);
+    Ok(report?)
 }
 
 /// The socket request one `domain_review` call sends.
@@ -1330,10 +1367,33 @@ pub async fn origin_add(
 /// ([`Engine::adopt_domain_names`]), over the store that sync opened: the
 /// daemon's ctl `sync` runs the same adoption after its own sync. A failure
 /// is logged and answered as an empty list; the sync has landed.
+///
+/// An adoption renames this machine's state folders and configuration keys,
+/// so it runs only where a daemon's would: never against an index `--db` or
+/// `--config` named instead of the daemon's, and only while this process
+/// holds the ownership of the state directory. Either way a skipped adoption
+/// says so in a log line and answers an empty list.
 pub async fn adopt_domain_names_direct(
     store: Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+    db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
+    if !use_daemon(db, config_path) {
+        tracing::info!(
+            "domain names are not lined up with their MANIFESTs after this sync: --db or \
+             --config named the index, and an adoption would rename this machine's own state \
+             and configuration; a sync without them does it"
+        );
+        return Ok(Value::Array(Vec::new()));
+    }
+    let Ok(ownership) = acquire_ownership() else {
+        tracing::warn!(
+            "domain names are not lined up with their MANIFESTs after this sync: another \
+             Crystalline process (the daemon) holds this machine's state directory, and it \
+             lines them up after its own next sync"
+        );
+        return Ok(Value::Array(Vec::new()));
+    };
     let loaded = overlay::load(config_path)?;
     let read_only = loaded.effective.read_only();
     let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
@@ -1343,7 +1403,9 @@ pub async fn adopt_domain_names_direct(
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);
     }
-    Ok(engine.adopt_domain_names_after("the sync").await)
+    let adopted = engine.adopt_domain_names_after("the sync").await;
+    drop(ownership);
+    Ok(adopted)
 }
 
 /// Bring one origin-connected domain (or every one) up to date: over the
@@ -1832,6 +1894,9 @@ pub async fn virtual_routing_bullets(
         effective: config.clone(),
         overlay: overlay::EnvOverlay::default(),
     };
+    // No rename recovery here: this read-only render takes no ownership of
+    // the state directory, so a rename left half done waits for the next
+    // opener that does.
     match open_standalone(loaded, &db_path, false).await {
         Ok(engine) => engine.virtual_routing_bullets().await,
         Err(_) => std::collections::BTreeMap::new(),

@@ -1170,8 +1170,22 @@ fn a_standalone_command_finishes_a_half_done_rename_first() {
 }
 
 /// The journal a rename of `eng` to `platform` leaves when it stops right
-/// after writing it, before its first step.
+/// after writing it, before its first step: started against this env's own
+/// index, configuration and state directory, which every opener below has
+/// to agree on to finish it.
 fn plant_rename_journal(env: &Env) {
+    let index = std::fs::canonicalize(env.state_dir().join("index.db"))
+        .unwrap()
+        .display()
+        .to_string();
+    plant_rename_journal_for(env, &index);
+}
+
+/// [`plant_rename_journal`] for the index its store names `index`.
+fn plant_rename_journal_for(env: &Env, index: &str) {
+    // A Postgres index leaves no file here, so the directory may be new.
+    std::fs::create_dir_all(env.state_dir()).unwrap();
+    let canonical = |p: PathBuf| std::fs::canonicalize(p).unwrap().display().to_string();
     std::fs::write(
         env.state_dir().join("rename-journal.json"),
         serde_json::to_vec(&json!({
@@ -1181,11 +1195,218 @@ fn plant_rename_journal(env: &Env) {
             "local_only": true,
             "origin": "explicit",
             "old_spellings": ["eng"],
+            "owner": {
+                "index": index,
+                "config": canonical(env.config_path()),
+                "state_dir": canonical(env.state_dir()),
+            },
             "done": [],
         }))
         .unwrap(),
     )
     .unwrap();
+}
+
+/// A command that names another index with `--db` leaves a rename journal of
+/// this machine's own index alone: nothing moves, the configuration keeps the
+/// old name, and a warning names the command that finishes it for real. The
+/// plain command afterward, against the index the journal belongs to,
+/// finishes it.
+#[test]
+fn a_standalone_command_on_another_index_leaves_the_rename_alone() {
+    let env = Env::new("renoth");
+    env.setup_domain("eng");
+    let origins = env.state_dir().join("origins");
+    std::fs::create_dir_all(origins.join("eng")).unwrap();
+    plant_rename_journal(&env);
+    let other = env.dir.join("other.db");
+    let other = other.to_str().unwrap();
+
+    let (ok, out, err) = env.run_full(&["--json", "--db", other, "search", "seed"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        err.contains("left alone here") && err.contains("crystalline domain rename eng platform"),
+        "the warning names the rename and how to finish it: {err}"
+    );
+    assert!(env.state_dir().join("rename-journal.json").is_file());
+    assert!(origins.join("eng").is_dir() && !origins.join("platform").exists());
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("eng") && !cfg.domains.contains_key("platform"));
+
+    let (ok, out) = env.run(&["--json", "search", "seed"]);
+    assert!(ok, "{out}");
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    assert!(origins.join("platform").is_dir());
+}
+
+/// Two processes on one Postgres index never both run a rename journal:
+/// Postgres has no file lock to keep a second opener out, so the ownership
+/// of the state directory the journal lives in is what serializes them. A
+/// standalone command while another process holds it leaves the journal
+/// alone; once that process is gone, the same command finishes it. Skipped
+/// with a note unless `CRYSTALLINE_TEST_POSTGRES_URL` is set and `psql` runs.
+#[test]
+fn two_openers_of_one_postgres_index_never_both_run_a_rename() {
+    let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+        eprintln!("note: skipping the postgres leg (CRYSTALLINE_TEST_POSTGRES_URL is unset)");
+        return;
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("renpg_{nanos}");
+    let psql = |sql: &str| {
+        Command::new("psql")
+            .args(["-v", "ON_ERROR_STOP=1", "-q", "-d", &url, "-c", sql])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !psql(&format!("CREATE SCHEMA {schema}")) {
+        eprintln!("note: skipping the postgres leg (psql could not create a schema)");
+        return;
+    }
+    struct DropSchema<'a>(&'a dyn Fn(&str) -> bool, String);
+    impl Drop for DropSchema<'_> {
+        fn drop(&mut self) {
+            (self.0)(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.1));
+        }
+    }
+    let _cleanup = DropSchema(&psql, schema.clone());
+
+    let env = Env::new("renpg");
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let db_url = format!("{url}{sep}options=-c%20search_path%3D{schema},public");
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.config_path(),
+        format!(
+            "database:\n  backend: postgres\n  url: \"{db_url}\"\nservice:\n  response_format: json\n"
+        ),
+    )
+    .unwrap();
+    env.setup_domain("eng");
+    // The store names a Postgres index by host and database, no credentials
+    // and no query.
+    let after_scheme = url.split("://").nth(1).unwrap();
+    let host_db = after_scheme
+        .rsplit_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(after_scheme);
+    let host_db = host_db.split(['?', '#']).next().unwrap();
+    plant_rename_journal_for(&env, host_db);
+    let config_path = env.config_path();
+    let config_arg = config_path.to_str().unwrap();
+
+    let wedge = Wedge::spawn(&env);
+    let (ok, out, err) = env.run_full(&["--json", "search", "seed", "--config", config_arg]);
+    assert!(ok, "{out}{err}");
+    assert!(err.contains("not finished by this command"), "{err}");
+    assert!(env.state_dir().join("rename-journal.json").is_file());
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("eng") && !cfg.domains.contains_key("platform"));
+    drop(wedge);
+
+    let (ok, out, err) = env.run_full(&["--json", "search", "seed", "--config", config_arg]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        !env.state_dir().join("rename-journal.json").exists(),
+        "{err}"
+    );
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+}
+
+/// A sync that names its index with `--config` does not line a domain's
+/// name up with a new MANIFEST name: an adoption renames this machine's own
+/// state and configuration, which only a sync of the machine's own index may
+/// do. The plain sync afterward does it.
+#[test]
+fn a_sync_with_an_override_adopts_no_name() {
+    let env = Env::new("adoptov");
+    env.setup_domain("ops");
+    let dir = env.dir.join("kb-plat");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: Plat\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Plat\n",
+    )
+    .unwrap();
+    let (ok, out, err) = env.run_full(&["domain", "add", "--path", dir.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    let manifest = std::fs::read_to_string(dir.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: kb-plat"), "{manifest}");
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        manifest.replace("domain_name: kb-plat", "domain_name: platform"),
+    )
+    .unwrap();
+
+    let config_path = env.config_path();
+    let (ok, out, err) = env.run_full(&["sync", "--config", config_path.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(
+        cfg.domains.contains_key("kb-plat") && !cfg.domains.contains_key("platform"),
+        "{:?}",
+        cfg.domains.keys()
+    );
+
+    let (ok, out, err) = env.run_full(&["sync"]);
+    assert!(ok, "{out}{err}");
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(
+        cfg.domains.contains_key("platform") && !cfg.domains.contains_key("kb-plat"),
+        "{out}{err} {:?}",
+        cfg.domains.keys()
+    );
+}
+
+/// A standalone command reaching past a process that holds this machine's
+/// state directory (here the wedge's lock, as a daemon holds it) does not
+/// run the rename journal, even against the index the journal belongs to:
+/// that process finishes it, and two processes never run one journal.
+#[test]
+fn a_standalone_command_leaves_the_rename_to_the_lock_holder() {
+    let env = Env::new("renlck");
+    env.setup_domain("eng");
+    plant_rename_journal(&env);
+    let index = env.state_dir().join("index.db");
+    let index = index.to_str().unwrap().to_string();
+
+    let wedge = Wedge::spawn(&env);
+    let (ok, out, err) = env.run_full(&["--json", "--db", &index, "search", "seed"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        err.contains("not finished by this command"),
+        "the command says why it left the rename: {err}"
+    );
+    assert!(env.state_dir().join("rename-journal.json").is_file());
+    // Nor does sending the same rename again: that would run the journal
+    // beside the holder, which finishes it itself.
+    let (ok, out, err) = env.run_full(&[
+        "--db", &index, "domain", "rename", "eng", "platform", "--local",
+    ]);
+    assert!(!ok, "a resend beside the holder is refused: {out}{err}");
+    assert!(
+        err.contains("holds this machine's state directory"),
+        "the refusal names the holder: {err}"
+    );
+    assert!(env.state_dir().join("rename-journal.json").is_file());
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("eng") && !cfg.domains.contains_key("platform"));
+    drop(wedge);
+
+    // The holder gone, the same command against the same index finishes it.
+    let (ok, out, err) = env.run_full(&["--json", "--db", &index, "search", "seed"]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        !env.state_dir().join("rename-journal.json").exists(),
+        "{err}"
+    );
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
 }
 
 fn finishes_a_half_done_rename_before_serving(tag: &str, spawn: fn(&Env) -> Mcp) {

@@ -476,6 +476,144 @@ both_backends!(
     a_leftover_journal_is_completed_before_the_first_sync_body
 );
 
+/// A journal records the index, configuration and state directory it was
+/// started against, and an engine that opened another index leaves it alone:
+/// no step runs, the state folders and the configuration stay where they
+/// are, and a resend of the same rename is refused rather than finished
+/// there. Put back to its own index, the same journal is finished as usual.
+async fn a_journal_for_another_index_is_left_alone_body(store: Arc<Mutex<dyn Store>>) {
+    let m = machine(store).await;
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the failpoint stops the rename");
+    drop(engine);
+
+    let own: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(m.journal()).unwrap()).unwrap();
+    let state = std::fs::canonicalize(m.state()).unwrap();
+    assert_eq!(
+        own["owner"]["state_dir"],
+        state.display().to_string(),
+        "{own}"
+    );
+    assert_eq!(
+        own["owner"]["config"],
+        std::fs::canonicalize(m.config_path())
+            .unwrap()
+            .display()
+            .to_string(),
+        "{own}"
+    );
+    let mut foreign = own.clone();
+    foreign["owner"]["index"] = serde_json::json!("/elsewhere/other-index.db");
+    std::fs::write(m.journal(), serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+    let other = m.engine(false).await;
+    assert!(
+        other.recover_rename_journal().await.unwrap().is_none(),
+        "a journal of another index is not finished here"
+    );
+    assert!(m.journal().is_file(), "the journal stays for its own index");
+    assert!(m.state().join("origins").join(&m.eng).is_dir());
+    assert!(!m.state().join("origins").join(&m.platform).exists());
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&m.config_path()).unwrap();
+    assert!(
+        cfg.domains.contains_key(&m.eng) && !cfg.domains.contains_key(&m.platform),
+        "{:?}",
+        cfg.domains.keys()
+    );
+    let err = other
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a resend against another index is refused");
+    let text = conflict(err);
+    assert!(
+        text.contains("belongs to another index") && text.contains("without --db and --config"),
+        "{text}"
+    );
+    assert!(m.journal().is_file());
+    drop(other);
+
+    std::fs::write(m.journal(), serde_json::to_vec(&own).unwrap()).unwrap();
+    let restarted = m.engine(false).await;
+    let recovered = restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("its own index finishes it");
+    assert_eq!(recovered["domain"], m.platform, "{recovered}");
+    assert!(!m.journal().exists());
+}
+both_backends!(
+    a_journal_for_another_index_is_left_alone,
+    a_journal_for_another_index_is_left_alone_body
+);
+
+/// An engine that does not hold this machine's state directory never runs a
+/// journal: recovery leaves it and a resend of the same rename is refused,
+/// so a one-shot command and the daemon holding the directory never run one
+/// journal at once. Holding it, the same engine finishes the rename.
+async fn a_journal_waits_for_the_state_directory_holder_body(store: Arc<Mutex<dyn Store>>) {
+    let m = machine(store).await;
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the failpoint stops the rename");
+    drop(engine);
+
+    let standalone = m.engine(false).await;
+    standalone.set_holds_state_dir(false);
+    assert!(standalone.recover_rename_journal().await.unwrap().is_none());
+    let err = standalone
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a resend without the state directory is refused");
+    assert!(
+        conflict(err).contains("holds this machine's state directory"),
+        "the refusal names the holder"
+    );
+    assert!(m.journal().is_file());
+    assert!(m.state().join("origins").join(&m.eng).is_dir());
+
+    standalone.set_holds_state_dir(true);
+    let recovered = standalone
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("the holder finishes it");
+    assert_eq!(recovered["domain"], m.platform, "{recovered}");
+    assert!(!m.journal().exists());
+}
+both_backends!(
+    a_journal_waits_for_the_state_directory_holder,
+    a_journal_waits_for_the_state_directory_holder_body
+);
+
 /// A write that arrives while the domain is paused waits for the rename and
 /// then lands in the renamed domain, under the name it was sent with.
 async fn a_write_during_a_rename_waits_and_then_lands_in_the_new_name_body(

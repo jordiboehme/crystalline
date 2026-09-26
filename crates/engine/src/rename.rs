@@ -140,8 +140,64 @@ pub(crate) struct RenameJournal {
     /// by a later call or at the next start reports the whole of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relinked: Option<RelinkReport>,
+    /// The index, configuration and state directory the rename was started
+    /// against. A journal lives in the state directory, but the index a
+    /// command opens can be another one (`--db`, `--config`), and running the
+    /// journal's steps there would move this machine's state and
+    /// configuration while the index it belongs to keeps the old name. Only
+    /// an engine that opened the same three runs it. A journal without one is
+    /// run by nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<RenameOwner>,
     /// The steps completed so far, in order.
     pub done: Vec<RenameStep>,
+}
+
+/// What a rename journal belongs to: the index, the configuration file and
+/// the state directory of the engine that started it, each path in its
+/// canonical form so two spellings of one file compare equal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RenameOwner {
+    /// The index as its store names it: the database file, or the Postgres
+    /// host and database without credentials. `None` for an in-memory store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    /// The configuration file the engine persists to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The state directory the journal lives in.
+    pub state_dir: String,
+}
+
+impl RenameOwner {
+    /// The owner for an engine over `index` (as its store names it), `config`
+    /// and `state_dir`.
+    pub(crate) fn new(index: Option<&str>, config: Option<&Path>, state_dir: &Path) -> RenameOwner {
+        RenameOwner {
+            index: index.map(|i| canonical_text(Path::new(i))),
+            config: config.map(canonical_text),
+            state_dir: canonical_text(state_dir),
+        }
+    }
+
+    /// The three, for a log line or a refusal.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "index {}, configuration {}, state directory {}",
+            self.index.as_deref().unwrap_or("in memory"),
+            self.config.as_deref().unwrap_or("none"),
+            self.state_dir
+        )
+    }
+}
+
+/// `path` in its canonical form when it exists, as given otherwise (a
+/// Postgres location, or a file not created yet).
+fn canonical_text(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// What a full rename's relink step respelled and what it left alone.
