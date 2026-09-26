@@ -657,6 +657,14 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
 /// `trunk` at `root`, with `github.enabled`. Written through the core's own
 /// serializer so the path is valid YAML on every platform.
 fn already_connected_team_config(config: &Path, root: &Path) {
+    already_connected_team_config_named(config, root, "eng");
+}
+
+/// [`already_connected_team_config`], registered under `local_name` instead
+/// of the fixed `eng` - for the nameless `domain add --origin` scenario,
+/// where the domain the retry must match is whatever name the engine
+/// derives from the repository, not a name this test gets to pick.
+fn already_connected_team_config_named(config: &Path, root: &Path, local_name: &str) {
     use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig, OriginConfig};
     let mut cfg = GlobalConfig::default();
     let mut entry = DomainEntry::file(std::fs::canonicalize(root).unwrap());
@@ -666,7 +674,7 @@ fn already_connected_team_config(config: &Path, root: &Path) {
         branch: Some("trunk".to_string()),
         poll_secs: None,
     });
-    cfg.domains.insert("eng".to_string(), entry);
+    cfg.domains.insert(local_name.to_string(), entry);
     cfg.github = Some(GitHubConfig {
         enabled: Some(true),
         ..Default::default()
@@ -748,6 +756,77 @@ fn domain_add_origin_on_an_already_connected_domain_refuses_private_and_does_not
     isolate(&mut cmd, home.path());
     let out = cmd
         .args(["domain", "members", "eng", "list", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(listed.contains("is shared"), "{listed}");
+}
+
+/// The same refusal, with no name given: `domain add --origin` derives one
+/// from the repository (`acme/kb` -> `kb`), and the domain already
+/// registered under exactly that derived name must not be mistaken for a
+/// fresh one `--private` may close, even though nothing was typed for
+/// `domain_add_dispatch` to compare against ahead of the connect.
+#[test]
+fn domain_add_origin_with_no_name_on_an_already_connected_domain_refuses_private_and_does_not_close_it()
+ {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "kb"])
+        .assert()
+        .success();
+    already_connected_team_config_named(&config, &root, "kb");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "users",
+        "add",
+        "ada",
+        "--role",
+        "editor",
+        "--password-stdin",
+    ])
+    .write_stdin("s3cret\n")
+    .assert()
+    .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "domain",
+        "add",
+        "--origin",
+        "acme/kb",
+        "--branch",
+        "trunk",
+        "--private",
+        "--owner",
+        "ada",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("domain visibility"));
+
+    // The refusal ran before any close: the domain is still shared.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["domain", "members", "kb", "list", "--config"])
         .arg(&config)
         .output()
         .unwrap();

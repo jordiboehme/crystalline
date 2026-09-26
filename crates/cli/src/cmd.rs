@@ -11,8 +11,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crystalline_core::config::{
-    self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
-    registration::{Registration, RegistrationRequest, decide_registration, validate_domain_name},
+    self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig, NameOrigin,
+    registration::{
+        Registration, RegistrationRequest, canonical_root, choose_domain_name, decide_registration,
+        derive_domain_name, needs_manifest_write_back, validate_domain_name,
+    },
 };
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
@@ -337,85 +340,277 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
 // --- domain add --------------------------------------------------------------
 
 /// Register a domain in the global config. Refuses without a MANIFEST.md.
-/// Returns the canonicalized domain root; indexing is a separate step (see
-/// [`sync_domain_direct`]) so the daemon-dispatch decision stays in `main.rs`,
-/// alongside `sync` and `reindex`'s own dispatch.
+/// Indexing is a separate step (see [`sync_domain_direct`]) so the
+/// daemon-dispatch decision stays in `main.rs`, alongside `sync` and
+/// `reindex`'s own dispatch.
 ///
-/// An absent `path` defaults to `<domains_root>/<name>` through
-/// [`crystalline_service::default_domain_folder`], the same placement rule
-/// the MCP `add_domain` tool's local-domain path uses (`Engine::domain_add_local`),
-/// so both entry points agree on where an unrooted domain ends up. The
-/// default path still needs a pre-scaffolded `MANIFEST.md`, exactly like an
-/// explicit path does - `domain add` never auto-creates one, `domain init`
-/// does.
+/// Returns the name it registered under, the canonicalized domain root,
+/// whether an existing registration was adopted rather than written, and -
+/// when a MANIFEST-declared name collided with one already registered
+/// elsewhere and had to step to a fresh one - that shadowed canonical name,
+/// for the caller to mention.
 ///
-/// Returns the canonical root and whether an existing registration of this
-/// name and folder was adopted rather than written. A name registered to
-/// another folder, or as a virtual domain, is refused naming it; there is no
-/// way to replace a registration here, since `domain remove` then `domain
-/// add` says what it means.
+/// **`name` given**: today's flow. An absent `path` defaults to
+/// `<domains_root>/<name>` through [`crystalline_service::default_domain_folder`],
+/// the same placement rule the MCP `add_domain` tool's local-domain path uses
+/// (`Engine::domain_add_local`), so both entry points agree on where an
+/// unrooted domain ends up. A name already registered to this folder is
+/// adopted as it is (origin, provision and review untouched, `name_origin`
+/// included); one registered elsewhere, or as a virtual domain, is refused
+/// naming what holds it; only a new name is checked against the naming
+/// rules and recorded `name_origin: explicit` - so a name registered before
+/// that field existed can still be re-added.
+///
+/// **`name` absent**: `path` is required - there is neither a repository nor
+/// a given name to place a default folder under. The folder's existing
+/// registration is adopted by its canonical root, whichever name it holds;
+/// otherwise the name comes from
+/// [`crystalline_core::config::registration::choose_domain_name`]: the
+/// MANIFEST's own `domain_name` (stepped with a numeric suffix when
+/// something else here already answers to it), else the folder's basename
+/// run through [`crystalline_core::config::registration::derive_domain_name`] -
+/// checked, either way, against every name and MANIFEST-declared spelling
+/// this machine's config already holds ([`build_name_table`]), one shared
+/// "taken" rule with the engine's own registration.
+///
+/// **The MANIFEST write-back only ever happens for a genuinely new
+/// registration** (the `Register` arm of each branch above, never `Adopt`):
+/// there the entry is always fresh - no origin, no review - and the name
+/// has just been validated or derived, so [`needs_manifest_write_back`]
+/// can only ever say yes when the MANIFEST does not already declare it. An
+/// ADOPTED entry is left alone even when it declares no name and would
+/// otherwise qualify: it may be a team domain (writing there directly would
+/// bypass the pull it shares changes through) or a review-mode domain
+/// (a raw write bypasses the draft it is owed) or simply a grandfathered
+/// name this path never validated (writing it into the MANIFEST could plant
+/// an invalid `domain_name`). The engine's own `write_back_domain_name`
+/// affords itself the broader, unconditional best effort because it always
+/// goes through `apply_source_edit`, which already routes a team or
+/// review-mode domain to a draft; this path has no engine and writes raw
+/// bytes, so it only ever does that to an entry it just created itself.
+/// Best effort even there: a MANIFEST write that fails after the
+/// registration already landed is logged, not propagated, since undoing a
+/// registration that already saved would tell the caller their `domain add`
+/// failed when it did not.
 pub(crate) fn domain_add_register(
-    name: &str,
+    name: Option<&str>,
     path: Option<&Path>,
     config_override: Option<&Path>,
-) -> Result<(PathBuf, bool)> {
+) -> Result<(String, PathBuf, bool, Option<String>)> {
     // Mutate the file truth and save it back to the resolved path; the
-    // environment overlay is never written. An env-defined domain of the same
-    // name is refused: it is managed by its variable, not the config file.
+    // environment overlay is never written.
     let loaded = load(config_override)?;
-    if let Some(env) = loaded.overlay.env_domain(name) {
-        bail!(
-            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-            env.var
-        );
-    }
 
-    // The decision comes first: a name already registered to this folder is
-    // adopted as it is (origin, provision and review untouched), one
-    // registered elsewhere is refused naming what holds it, and only a new
-    // name is checked against the naming rules - so a name registered before
-    // the rules existed can still be re-added.
-    let existing = loaded.file.domains.get(name).cloned();
-    if existing.is_none() {
-        validate_domain_name(name).map_err(|e| anyhow!(e))?;
-    }
+    match name {
+        Some(name) => {
+            // An env-defined domain of the same name is refused: it is
+            // managed by its variable, not the config file.
+            if let Some(env) = loaded.overlay.env_domain(name) {
+                bail!(
+                    "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                );
+            }
 
-    let root = match path {
-        Some(p) => p.to_path_buf(),
-        None => crystalline_service::default_domain_folder(&loaded.effective.domains_root(), name),
-    };
+            // The decision comes first: a name already registered to this
+            // folder is adopted as it is, one registered elsewhere is
+            // refused naming what holds it, and only a new name is checked
+            // against the naming rules - so a name registered before the
+            // rules existed can still be re-added.
+            let existing = loaded.file.domains.get(name).cloned();
+            if existing.is_none() {
+                validate_domain_name(name)
+                    .map_err(|e| anyhow!("{e}, or point at a folder with --path <dir>"))?;
+            }
 
-    let manifest = root.join("MANIFEST.md");
-    if !manifest.exists() {
-        bail!(
-            "no MANIFEST.md at {}. Run: crystalline domain init {}",
-            root.display(),
-            root.display()
-        );
-    }
-    let abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let root = match path {
+                Some(p) => p.to_path_buf(),
+                None => crystalline_service::default_domain_folder(
+                    &loaded.effective.domains_root(),
+                    name,
+                ),
+            };
 
-    match decide_registration(
-        name,
-        existing.as_ref(),
-        &RegistrationRequest::File { root: &abs },
-    ) {
-        Registration::Adopt => Ok((abs, true)),
-        Registration::Conflict(message) => bail!("{message}"),
-        Registration::Register => {
-            let mut cfg = loaded.file;
-            cfg.domains
-                .insert(name.to_string(), DomainEntry::file(abs.clone()));
-            config::save_yaml(&loaded.path, &cfg)
-                .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
-            Ok((abs, false))
+            let manifest = root.join("MANIFEST.md");
+            if !manifest.exists() {
+                bail!(
+                    "no MANIFEST.md at {}. Run: crystalline domain init {}",
+                    root.display(),
+                    root.display()
+                );
+            }
+            let abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+
+            match decide_registration(
+                name,
+                existing.as_ref(),
+                &RegistrationRequest::File { root: &abs },
+            ) {
+                Registration::Adopt => Ok((name.to_string(), abs, true, None)),
+                Registration::Conflict(message) => bail!("{message}"),
+                Registration::Register => {
+                    let entry =
+                        DomainEntry::file(abs.clone()).with_name_origin(NameOrigin::Explicit);
+                    let mut cfg = loaded.file;
+                    cfg.domains.insert(name.to_string(), entry.clone());
+                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
+                        anyhow!("failed to save config {}: {e}", loaded.path.display())
+                    })?;
+                    write_back_manifest_name_if_needed(&entry, NameOrigin::Explicit, &abs, name);
+                    Ok((name.to_string(), abs, false, None))
+                }
+            }
+        }
+        None => {
+            let path =
+                path.ok_or_else(|| anyhow!("name the domain, or point at its folder with --path"))?;
+
+            let manifest = path.join("MANIFEST.md");
+            if !manifest.exists() {
+                bail!(
+                    "no MANIFEST.md at {}. Run: crystalline domain init {}",
+                    path.display(),
+                    path.display()
+                );
+            }
+            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+            match existing_file_domain_at(&abs, &loaded.file) {
+                Some(existing_name) => Ok((existing_name, abs, true, None)),
+                None => {
+                    let table = build_name_table(&loaded);
+                    let manifest_name = crystalline_core::domain_name_at(&abs);
+                    let basename = abs
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| abs.display().to_string());
+                    let choice = choose_domain_name(
+                        None,
+                        manifest_name.as_deref(),
+                        || derive_domain_name(&basename, |c| table.resolve(c).is_some()),
+                        |c| table.resolve(c).is_some(),
+                    );
+                    let entry = DomainEntry::file(abs.clone()).with_name_origin(choice.origin);
+                    let mut cfg = loaded.file;
+                    cfg.domains.insert(choice.name.clone(), entry.clone());
+                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
+                        anyhow!("failed to save config {}: {e}", loaded.path.display())
+                    })?;
+                    write_back_manifest_name_if_needed(&entry, choice.origin, &abs, &choice.name);
+                    Ok((choice.name, abs, false, choice.shadowed_canonical))
+                }
+            }
         }
     }
+}
+
+/// Declares `name` in `<root>/MANIFEST.md` when [`needs_manifest_write_back`]
+/// says a fresh registration should - `entry` is always a brand-new entry at
+/// this call site (never an adopted one, see [`domain_add_register`]'s own
+/// doc comment for why that split matters), so this is really only ever a
+/// no-op when the MANIFEST already declares `name`.
+///
+/// Best effort: a MANIFEST write that fails after the registration already
+/// landed is logged to stderr rather than propagated, the same trade-off the
+/// engine's own `write_back_domain_name` makes and for the same reason - the
+/// registration already saved, and answering with an error here would tell
+/// the caller their `domain add` failed when it did not.
+fn write_back_manifest_name_if_needed(
+    entry: &DomainEntry,
+    origin: NameOrigin,
+    root: &Path,
+    name: &str,
+) {
+    let manifest_declares = crystalline_core::domain_name_at(root).is_some();
+    if !needs_manifest_write_back(entry, origin, manifest_declares) {
+        return;
+    }
+    if let Err(e) = write_back_manifest_name(root, name) {
+        eprintln!(
+            "warning: writing the domain name back into the MANIFEST of '{name}' failed: {e}"
+        );
+    }
+}
+
+/// The name of the file domain already rooted at `canonical`, if any: the
+/// idempotency hook so pointing `domain add --path` at the same folder twice
+/// adopts the existing registration - whatever name it holds - rather than
+/// adding a second one over the same files. Never a write-back candidate
+/// (see [`domain_add_register`]'s doc comment), so only the name is needed.
+fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
+    cfg.domains.iter().find_map(|(name, entry)| {
+        (canonical_root(entry).as_deref() == Some(canonical)).then(|| name.clone())
+    })
+}
+
+/// The name table a fresh registration must not collide with: every domain
+/// this machine's file config and its effective (env-overlaid) config
+/// currently hold, each carrying its own file domain's declared canonical
+/// name - read straight off its MANIFEST, since this path has no index to
+/// ask - and its recorded aliases. Mirrors the engine's own `build_table`
+/// (`crates/engine/src/engine/names.rs`), so a check here and one
+/// `Engine::domain_add_local` runs agree on what "taken" means: a spelling
+/// already resolving to a registered domain - as its local name, its
+/// canonical name, or an alias - is taken, not merely a name that happens
+/// to be a config key somewhere.
+///
+/// A virtual domain contributes only its local name: its canonical name
+/// lives in the database, which this path never opens.
+fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> crystalline_core::NameTable {
+    let mut inputs: Vec<crystalline_core::NameInput> = Vec::new();
+    for cfg in [&loaded.file, &loaded.effective] {
+        for (local, entry) in &cfg.domains {
+            inputs.push(crystalline_core::NameInput {
+                local: local.clone(),
+                canonical: entry
+                    .file_path()
+                    .and_then(|root| crystalline_core::domain_name_at(&root)),
+                aliases: entry.aliases.clone(),
+            });
+        }
+    }
+    crystalline_core::NameTable::build(&inputs)
+}
+
+/// Rewrite `<root>/MANIFEST.md` to declare `domain_name: <name>`; a no-op
+/// when it already reads that way.
+fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
+    let manifest = root.join("MANIFEST.md");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
+    let updated = crystalline_core::emit::set_frontmatter_field(
+        &text,
+        crystalline_core::DOMAIN_NAME_KEY,
+        name,
+    );
+    if updated != text {
+        std::fs::write(&manifest, updated)
+            .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
+    }
+    Ok(())
+}
+
+/// The one sentence shown when a MANIFEST-declared name is already
+/// somebody else's here: `canonical` is the name the MANIFEST asked for,
+/// `local` is the name this registration actually landed on after stepping.
+/// Worded like the engine's own `Engine::append_name_fields` note, so a
+/// person sees the same collision explained the same way whichever surface
+/// registered the domain.
+fn shadowed_note(canonical: &str, local: &str) -> String {
+    format!(
+        "'{canonical}' is already a domain here, so this one is registered as '{local}'; links \
+         that name '{canonical}' still reach the other domain. Rename one of them to line them \
+         up."
+    )
 }
 
 /// Register a virtual domain in the global config (database-backed, no path).
 /// Returns the MANIFEST markdown to scaffold into the database and whether an
 /// existing registration of this name was adopted rather than written.
+///
+/// A virtual domain always needs a name - there is no folder or repository
+/// to derive one from - so a fresh registration is always
+/// `name_origin: explicit`.
 pub(crate) fn domain_add_register_virtual(
     name: &str,
     config_override: Option<&Path>,
@@ -441,8 +636,10 @@ pub(crate) fn domain_add_register_virtual(
     };
     if !adopted {
         let mut cfg = loaded.file;
-        cfg.domains
-            .insert(name.to_string(), DomainEntry::virtual_domain());
+        cfg.domains.insert(
+            name.to_string(),
+            DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
+        );
         config::save_yaml(&loaded.path, &cfg)
             .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     }
@@ -525,25 +722,29 @@ pub(crate) async fn sync_domain_direct(
         .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))
 }
 
-/// Print `domain add`'s combined registration-and-index output.
+/// Print `domain add`'s combined registration-and-index output. `shadowed`
+/// is the MANIFEST-declared canonical name a nameless add had to step away
+/// from because it was already taken here, when that happened.
 pub(crate) fn print_domain_add(
     name: &str,
     path: &Path,
     adopted: bool,
+    shadowed: Option<&str>,
     report: &crystalline_index::SyncReport,
     json: bool,
 ) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "registered": name,
-                "path": path.display().to_string(),
-                "adopted": adopted,
-                "synced": true,
-                "sync": report,
-            })
-        );
+        let mut value = serde_json::json!({
+            "registered": name,
+            "path": path.display().to_string(),
+            "adopted": adopted,
+            "synced": true,
+            "sync": report,
+        });
+        if let Some(shadowed) = shadowed {
+            value["note"] = serde_json::json!(shadowed_note(shadowed, name));
+        }
+        println!("{value}");
     } else {
         if adopted {
             println!(
@@ -553,22 +754,33 @@ pub(crate) fn print_domain_add(
         } else {
             println!("Registered domain '{name}' at {}", path.display());
         }
+        if let Some(shadowed) = shadowed {
+            println!("{}", shadowed_note(shadowed, name));
+        }
         print_report(report);
     }
 }
 
-/// Print `domain add --no-sync`'s registration-only output.
-pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, adopted: bool, json: bool) {
+/// Print `domain add --no-sync`'s registration-only output. `shadowed` is
+/// [`print_domain_add`]'s note input, unchanged.
+pub(crate) fn print_domain_add_no_sync(
+    name: &str,
+    path: &Path,
+    adopted: bool,
+    shadowed: Option<&str>,
+    json: bool,
+) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "registered": name,
-                "path": path.display().to_string(),
-                "adopted": adopted,
-                "synced": false,
-            })
-        );
+        let mut value = serde_json::json!({
+            "registered": name,
+            "path": path.display().to_string(),
+            "adopted": adopted,
+            "synced": false,
+        });
+        if let Some(shadowed) = shadowed {
+            value["note"] = serde_json::json!(shadowed_note(shadowed, name));
+        }
+        println!("{value}");
     } else {
         if adopted {
             println!(
@@ -577,6 +789,9 @@ pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, adopted: bool, j
             );
         } else {
             println!("Registered domain '{name}' at {}", path.display());
+        }
+        if let Some(shadowed) = shadowed {
+            println!("{}", shadowed_note(shadowed, name));
         }
         println!("Not synced (--no-sync); run: crystalline sync --domain {name}");
     }
