@@ -1,7 +1,7 @@
 /**
  * Dev-only spawn points: places the player in front of a gallery fixture,
- * hero, prop or curio, so the controller's browser shots start every
- * malfunction, or every model, already facing it.
+ * hero, prop or curio, so browser shots start every malfunction, or
+ * every model, already facing it.
  *
  * Three patterns. `<kind>:<n>` (`SPOT_KINDS` pins the fixture kinds it
  * accepts to `Fixture["kind"]`, so a new kind is a type error here until it
@@ -218,18 +218,17 @@ interface Volume extends Box {
 }
 
 /**
- * The volume of `c`'s own host that occludes it (fix round 4, the
- * controller's host rule): the host's footprint `fp` from `c`'s own
- * surface's ceiling (`s.h + s.clear`, the free height the surface promises
- * a curio standing on it) up to `EYE_HEIGHT`, or null when that ceiling is
- * already at or over the eye. The same rule for every host, fixture, decor,
- * prop or hero: under a hero's or a workbench's top it is the slab above
- * the curio, over a shelf's lower level it is the level above it, and over
- * an open top (`OPEN_CLEAR`, 1.3 m past a top well under a metre) it is
- * nothing, since no sight line from the eye reaches that high. The null
- * case matters: `segmentHitsBox` sorts each axis's two plane hits, so an
- * inverted volume would count as a real box over the eye rather than as
- * none.
+ * The volume of `c`'s own host that occludes it (the host rule): the host's
+ * footprint `fp` from `c`'s own surface's ceiling (`s.h + s.clear`, the free
+ * height the surface promises a curio standing on it) up to `EYE_HEIGHT`, or
+ * null when that ceiling is already at or over the eye. The same rule for
+ * every host, fixture, decor, prop or hero: under a hero's or a workbench's
+ * top it is the slab above the curio, over a shelf's lower level it is the
+ * level above it, and over an open top (`OPEN_CLEAR`, 1.3 m past a top well
+ * under a metre) it is nothing, since no sight line from the eye reaches
+ * that high. The null case matters: `segmentHitsBox` sorts each axis's two
+ * plane hits, so an inverted volume would count as a real box over the eye
+ * rather than as none.
  */
 function ceilingVolume(fp: Box, s: HostSurface): Volume | null {
   const y0 = s.h + s.clear;
@@ -260,9 +259,8 @@ function surfaceOf(
 }
 
 /**
- * Every solid volume in `room` a curio-framing sight line must not cross
- * (2.6b's browser-shots review, item 4, and its fix rounds): every
- * fixture's, decor piece's and floor prop's footprint (`footprintOf`,
+ * Every solid volume in `room` a curio-framing sight line must not cross:
+ * every fixture's, decor piece's and floor prop's footprint (`footprintOf`,
  * `decorFootprint`, `propFootprint`) stood up from the floor to
  * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
  * and the sight line never rises over the eye), and every hero's footprint
@@ -272,22 +270,25 @@ function surfaceOf(
  *
  * The one host `c` stands on or under (`surfaceOf`) is neither solid nor
  * skipped: it gives only `ceilingVolume`, its footprint from `c`'s own
- * surface's ceiling up to the eye (fix round 4, one rule for fixture and
- * hero hosts alike). Round 1 skipped that host wholesale, so the top of a
- * bench counted as glass over the case below it and the search passed a
- * spot that saw only the bench. A `"terminal"` host adds, on top of the
- * rule, every part `TERMINAL_OCCLUDERS` names (`render/models/terminal.ts`'s
- * own box and cylinder calls, fix round 2), turned into a world volume
- * (`turnedBox`, the fixture's own `wallAnchor`): its desk ends are open
- * tops, so the rule alone leaves the terminal empty, while the pedestals,
- * the keyboard deck, the CRT and the chair are drawn there and hide a
- * curio on a desk end from the far side.
+ * surface's ceiling up to the eye, one rule for fixture, decor, prop and
+ * hero hosts alike. Skipping the host whole would count the top of a
+ * bench as glass over the case below it. A `"terminal"` host adds, on top
+ * of the rule, every part `TERMINAL_OCCLUDERS` names
+ * (`render/models/terminal.ts`'s own box and cylinder calls), turned into
+ * a world volume (`turnedBox`, the fixture's own `wallAnchor`): its desk
+ * ends are open tops, so the rule alone leaves the terminal empty, while
+ * the pedestals, the keyboard deck, the CRT and the chair are drawn there
+ * and hide a curio on a desk end from the far side.
  *
- * Every other curio in the room occludes too (fix round 5): its own plan
- * box (`curioBox`) from its surface height `h` up to its top (`h +
+ * Every other curio in the room occludes too: its own plan box
+ * (`curioBox`) from its surface height `h` up to its top (`h +
  * curioSize(o).top`), so a sword standing in front of another on the same
  * bench, or a gadget in front of a cradle, moves the search on to a spot
  * that sees the framed curio itself. Only `c` is left out.
+ *
+ * The legs and end slabs a host stands on below an under spot (a bench's,
+ * a workbench's, the hydroponics trough's) are in no volume, so a sight
+ * line through a host's end counts as clear.
  */
 function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const own = surfaceOf(hostSurfaces(room), c);
@@ -397,7 +398,7 @@ function sightClear(
  * `c`'s middle crosses no occluding volume (`occludersFor`): the exact
  * predicate `frameCurio`'s own search applies at every candidate, exported
  * so `spots.test.ts` can check a forced curio's chosen spot with it
- * directly (2.6b's browser-shots review, item 4).
+ * directly.
  */
 export function curioSightClear(
   room: RoomSpec,
@@ -417,17 +418,16 @@ export function curioSightClear(
 
 /**
  * A spot that frames curio `c` close and tilted down (C18), with a clear
- * sight line to it (2.6b's browser-shots review, item 4): along each of
- * `sidesOf(c)`'s four directions (front, right, left, back; back first
- * when `back`), the distance from the curio's centre grows from
- * `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`. Among the spots whose
- * player circle is on the floor and clear of every blocker, the first one
- * whose sight line (eye height to the curio's middle) crosses no volume of
- * `occludersFor` wins (`sightClear`); when none does, the search's first
- * standable spot wins instead, exactly as it did before this ruling, so
- * the seam never gives up a spot it used to find. Its pitch looks at the
- * curio's middle (`c.h` plus half its top height), clamped to `MAX_PITCH`.
- * Null when no side and distance stands the player at all.
+ * sight line to it: along each of `sidesOf(c)`'s four directions (front,
+ * right, left, back; back first when `back`), the distance from the curio's
+ * centre grows from `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`. Among
+ * the spots whose player circle is on the floor and clear of every blocker,
+ * the first one whose sight line (eye height to the curio's middle) crosses
+ * no volume of `occludersFor` wins (`sightClear`); when none does, the
+ * search's first standable spot wins instead, so the seam never gives up a
+ * spot to stand on. Its pitch looks at the curio's middle (`c.h` plus half
+ * its top height), clamped to `MAX_PITCH`. Null when no side and distance
+ * stands the player at all.
  */
 function frameCurio(
   room: RoomSpec,
@@ -482,29 +482,28 @@ function frameCurio(
 
 /**
  * Dev-only spawn points, with a pitch, for judging a fixture, hero, prop or
- * curio up close. `spotView(room, "<kind>:<n>")` is the n-th fixture of
- * that kind (in `room.fixtures` order, from 0) seen from its own cell,
- * facing its wall and backed off clear of its own footprint when it has
- * one (`spotFor`), pitch 0. `spotView(room, "prop:<kind>:<n>")` (H16) is
- * the n-th hero of that kind (in `room.heroes` order) when `HERO_KINDS`
- * holds it, else the n-th prop of that kind (in `room.props` order) when
+ * curio up close. `spotView(room, "<kind>:<n>")` is the n-th fixture of that
+ * kind (in `room.fixtures` order, from 0) seen from its own cell, facing its
+ * wall and backed off clear of its own footprint when it has one
+ * (`spotFor`), pitch 0. `spotView(room, "prop:<kind>:<n>")` (H16) is the
+ * n-th hero of that kind (in `room.heroes` order) when `HERO_KINDS` holds
+ * it, else the n-th prop of that kind (in `room.props` order) when
  * `PROP_KINDS` holds it, framed from its front (`frameSpot`,
  * `HERO_FRONT[turn]`), pitch 0: a wall or ceiling prop, which has no
  * `propFootprint`, is framed by the box of its own edge (`EDGE_PROP_SIZE`).
  * `n` is the ordinal a hero or prop of that kind holds in the room's own
- * order (`HERO_ORDER` for a hero), not its variant: the two usually line
- * up, but the field pack is one kind where they do not (its variant 1
- * sorts before variant 0 in the hero hall).
+ * order (`HERO_ORDER` for a hero), not its variant: the two usually line up,
+ * but the field pack is one kind where they do not (its variant 1 sorts
+ * before variant 0 in the hero hall).
  *
  * `spotView(room, "prop:<kind>:<n>[:back]")` (C18, 2.6b), when `kind` is
  * neither a hero nor a prop kind, is the n-th curio of that kind (in
- * `room.curios` order), framed close and tilted down (`frameCurio`), with
- * a real pitch; `:back` frames it from its `-front` side first. Null for a
- * bad spot: an unknown kind in every one of the three families, no such
- * ordinal, no ordinal at all, or a negative one. The gallery reads this
- * from `?at=`; the controller's browser shots start every malfunction,
- * every model or every curio there. Development only, like everything in
- * `dev/`.
+ * `room.curios` order), framed close and tilted down (`frameCurio`), with a
+ * real pitch; `:back` frames it from its `-front` side first. Null for a bad
+ * spot: an unknown kind in every one of the three families, no such ordinal,
+ * no ordinal at all, or a negative one. The gallery reads this from `?at=`;
+ * browser shots start every malfunction, every model or every curio there.
+ * Development only, like everything in `dev/`.
  *
  * `spotSpawn` is `spotView` with the pitch dropped, for every caller that
  * only ever reads the fixture, hero and prop spots (their pitch is always

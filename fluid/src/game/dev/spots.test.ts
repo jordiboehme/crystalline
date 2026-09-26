@@ -296,7 +296,7 @@ describe("spotView (C18)", () => {
   });
 });
 
-describe("frameCurio's sight line (browser-shots review item 4)", () => {
+describe("frameCurio's sight line", () => {
   /**
    * A bare 10 by 10 floor, one curio at its centre and, unless overridden,
    * nothing else: enough of a `RoomSpec` for `spotView`'s curio branch,
@@ -371,12 +371,13 @@ describe("frameCurio's sight line (browser-shots review item 4)", () => {
       true,
     );
 
-    // The front side's own first candidate (the pre-fix answer) is not
-    // where the player ends up, and is indeed blocked by the panel.
+    // The front side's own first candidate, which a search with no sight
+    // line check would pick, is not where the player ends up, and is
+    // indeed blocked by the panel.
     expect(curioSightClear(room, { x: 10, z: 9.2 }, curio)).toBe(false);
   });
 
-  it("moves the spot on when another curio stands on the first candidate's sight line (fix round 5)", () => {
+  it("moves the spot on when another curio stands on the first candidate's sight line", () => {
     // A star ball at cell (5, 5) (world 10, 10), turn 0 (front north, -z).
     const ball: Curio = {
       kind: "star-ball",
@@ -419,12 +420,12 @@ describe("frameCurio's sight line (browser-shots review item 4)", () => {
     expect(curioSightClear(room, player, ball)).toBe(true);
   });
 
-  it("hides a curio under its host's top from a line through the top, and frames it from the first spot that sees under the edge (fix round 4)", () => {
+  it("hides a curio under its host's top from a line through the top, and frames it from the first spot that sees under the edge", () => {
     // A gun bench backed against a north wall edge (its front is +z), with
     // the fuel case on its under spot: a shelf at h 0.31 with 0.52 of free
     // height, so the host rule (`occludersFor`) stands the bench's whole
-    // 1.9 by 0.9 m footprint up from 0.83 to the eye. The bench's own top
-    // is no longer glass, as it was while the host was skipped wholesale.
+    // 1.9 by 0.9 m footprint up from 0.83 to the eye, so the bench's own
+    // top hides the case from a line through it.
     const a = wallAnchor({ x: 5, y: 2, side: "n" });
     const bench: Hero = {
       kind: "gun-bench",
@@ -465,7 +466,7 @@ describe("frameCurio's sight line (browser-shots review item 4)", () => {
   });
 });
 
-describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)", () => {
+describe("frameCurio's sight line in the hero hall and the gallery", () => {
   /**
    * Every curio of `room` with its within-kind ordinal, the `n` of
    * `?at=prop:<kind>:<n>`: the gallery holds two lit swords.
@@ -498,14 +499,10 @@ describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)
   });
 
   /**
-   * Post-breaker, "rows along the wall": `row` (`world/canned.ts`) now lays
-   * a hero surface's curios along the host's local `a` axis rather than
-   * whichever world axis its box happened to span more, and the hall's
-   * rows were regrouped to fit that budget. The two curios round 5 pinned
-   * as hidden (light-sword 0 behind pink-gadget 0 on the gun bench,
-   * light-sword 1 behind light-sword 2 on the tube bench, both standing
-   * one behind the other on the only line a player could stand) no longer
-   * stand behind anything: every curio in the hall now has a clear spot.
+   * `row` (`world/canned.ts`) lays a hero surface's curios along the host's
+   * local `a` axis, so no curio of the hall stands behind another on the
+   * only line a player can stand, and every curio of both rooms has a
+   * clear spot.
    */
   it("frames every curio of both rooms from a spot with a clear sight line, other curios included", () => {
     for (const room of [heroHallRoom(), galleryRoom()]) {
@@ -525,8 +522,8 @@ describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)
 
   it("frames the hero hall's fuel case and trap from past the edge of their hosts' tops", () => {
     // Pinned apart from the sweep above, since these two are the ones the
-    // host rule moves: both stand under a hero's top, which the old
-    // wholesale skip treated as glass. The distances are the first
+    // host rule moves: both stand under a hero's top, which hides them
+    // from every spot closer to the host. The distances are the first
     // `CURIO_STEP` past each top's edge line (the fuel case's is derived
     // in the gun-bench case above).
     const hall = heroHallRoom();
@@ -550,7 +547,7 @@ describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)
   });
 });
 
-describe("frameCurio's sight line on real rooms (browser-shots review item 4)", () => {
+describe("frameCurio's sight line on real rooms", () => {
   /** The forced curio's own spot, the world point `spotView` sent the player to. */
   function forcedSpot(room: RoomSpec, kind: string) {
     const view = spotView(room, `prop:${kind}:0`);
@@ -578,19 +575,14 @@ describe("frameCurio's sight line on real rooms (browser-shots review item 4)", 
     expect(curioSightClear(room, forcedSpot(room, "fuel-case"), c)).toBe(true);
   });
 
-  // Fix round 3: a terminal carries no under spot any more (`world/
-  // curios.ts`'s `FIXTURE_SURFACES.terminal`), since its knee space is
-  // where the model draws the swivel chair and no standing player could
-  // ever see past it (round 2's finding, kept in that module's own doc).
-  // The bridge and the canned workshop, at their own default archetype and
-  // condition, draw neither a workbench (the under slot's only other
-  // fixture host) nor a hero whose own `under` spot is occupied, so the
-  // forced under-desk kind now finds no host anywhere in these rooms: the
-  // slot stays empty and the room is drawn without it, exactly the "room
-  // with no host for the drawn kind" case (`placeCurios` never throws on
-  // it). These three tests replace round 2's "documented limit" ones,
-  // which pinned a curio that occlusion made unseeable; that curio is no
-  // longer placed at all, so there is nothing left to frame.
+  // A terminal carries no under spot (`world/curios.ts`'s
+  // `FIXTURE_SURFACES.terminal`): its knee space holds the swivel chair,
+  // so no standing player could ever see past it. The bridge and the
+  // canned workshop, at their own default archetype and condition, draw no
+  // other host with an under spot, so a forced under-desk kind finds no
+  // host in these rooms: the slot stays empty and the room is drawn
+  // without it, exactly the "room with no host for the drawn kind" case
+  // (`placeCurios` never throws on it).
 
   it("draws no host at all for a forced trap-box in the canned bridge", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_BRIDGE, "trap-box");

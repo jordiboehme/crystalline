@@ -81,15 +81,14 @@ export interface TerminalPart {
 
 /**
  * The terminal's own solid parts, read from `buildTerminal`'s own box and
- * cylinder calls (2.6b's browser-shots review, item 4): the two pedestals
- * (the desk's own support, floor to `DESK_H0`), the keyboard deck, the CRT
- * housing and the swivel chair (one bounding box over its foot, column,
- * seat and back, out to `CHAIR_FOOT_R` and up to `CHAIR_TOP`) - everything
- * the model builds solid, except the desk top itself (already a curio
- * host surface, `world/curios.ts`'s `FIXTURE_SURFACES.terminal`) and the
- * open knee space between the pedestals, which the chair itself fills, is
- * why a terminal carries no curio host there any more (fix round 3): no
- * standing player can ever see past the chair into it. `dev/spots.ts`'s
+ * cylinder calls: the two pedestals (the desk's own support, floor to
+ * `DESK_H0`), the keyboard deck, the CRT housing and the swivel chair (one
+ * bounding box over its foot, column, seat and back, out to `CHAIR_FOOT_R`
+ * and up to `CHAIR_TOP`) - everything the model builds solid, except the
+ * desk top itself (already a curio host surface, `world/curios.ts`'s
+ * `FIXTURE_SURFACES.terminal`). The chair fills the open knee space
+ * between the pedestals, so no standing player can see past it into that
+ * space, which is why a terminal carries no under spot. `dev/spots.ts`'s
  * curio-framing sight-line check turns these parts into occluding volumes
  * the way `hostSurfaces` turns a `SurfaceSpec` into a world box, so a
  * chair pulled up to the desk, or the monitor and keyboard on top of it,

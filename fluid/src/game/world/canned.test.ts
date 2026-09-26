@@ -467,8 +467,8 @@ describe("heroHallRoom", () => {
   });
 
   it("lays every row along its host's local a axis: a curio row's centres differ only there, never along d", () => {
-    // Post-breaker ("rows along the wall"): `row` lays a surface's curios
-    // along the host's own wall-parallel `a` axis (world x at an even
+    // `row` lays a surface's curios along the host's own wall-parallel `a`
+    // axis (world x at an even
     // turn, world z at an odd one, `turnedPoint` in `footprints.ts`), never
     // along `d`, the axis running from the wall into the room. Grouped by
     // the surface's own token (`key[2]`), since `hostOf` recomputes
@@ -538,10 +538,10 @@ describe("galleryRoom curios", () => {
           .filter((c) => hostOf(room, c)?.host === host)
           .map((c) => c.h),
       );
-    // terminal: its desk end only (fix round 3: no under spot any more).
+    // terminal: its desk end only (a terminal has no under spot).
     expect(heights("terminal").size).toBe(1);
-    // machine:workbench: top and shelf (the shelf now carries both
-    // under-desk curios, the trap and the fuel case, side by side).
+    // machine:workbench: top and shelf (the shelf carries both under-desk
+    // curios, the trap and the fuel case, side by side).
     expect(heights("machine:workbench").size).toBe(2);
     // prop:storage-shelf: a v1 level and the v0 top.
     expect(heights("prop:storage-shelf").size).toBe(2);

@@ -23,23 +23,22 @@
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
  * model gallery: one of every model the station draws, machines in bays 1
  * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
- * judged without an engram that happens to need it. Task 7 (2.6b) adds one
- * curio on the first host of every non-hero host kind it carries
- * (`galleryCurios`), so a curio can be judged sitting on a terminal, a
- * machine, a piece of decor and a floor prop alike. A terminal carries no
- * under spot (fix round 3), so both under-desk curios sit in a row on the
- * workbench's lower shelf instead.
+ * judged without an engram that happens to need it. It holds one curio on
+ * the first host of every non-hero host kind it carries (`galleryCurios`),
+ * so a curio can be judged sitting on a terminal, a machine, a piece of
+ * decor and a floor prop alike; both under-desk curios sit in a row on the
+ * workbench's lower shelf.
  *
  * `heroHallRoom` (H15) is the gallery's second hand-built room, for the
  * `?hall=heroes` dev route: one of every hero kind and variant, hand-placed
  * in a 23 by 24 hall with no other fixture, no decor and no props, so
- * nothing competes with a hero for a screenshot. Task 7 (2.6b) adds one of
- * every curio kind and variant, hand-placed on the hero surfaces they fit
+ * nothing competes with a hero for a screenshot. It holds one of every
+ * curio kind and variant, hand-placed on the hero surfaces they fit
  * (`heroHallCurios`, `row`), for the `?at=prop:<kind>:<n>` shots that frame
  * them close and tilted (`spotView` in `dev/spots.ts`). `row` lays each row
  * along its host's local `a` axis, the wall-parallel one, whatever its own
- * length against the surface's `d` axis; the tube bench and the gun bench
- * regroup around that budget (post-breaker, "rows along the wall").
+ * length against the surface's `d` axis, and the rows are grouped to fit
+ * that budget.
  */
 
 import { seedFor } from "../core/seed";
@@ -581,17 +580,15 @@ export function galleryRoom(): RoomSpec {
 }
 
 /**
- * The gallery's curios (2.6b, task 7): one curio on the first host surface
+ * The gallery's curios (2.6b): one curio on the first host surface
  * of every non-hero host kind the gallery carries (`hostSurfaces`,
  * `curioOn`), at the surface's own centre (`u = v = 0.5`): the terminal's
  * first desk end, the workbench's top, one end of the lab bench, the lab
  * island, the round table's first spot, the lower level of the second
  * storage shelf (v1, at `h` 1.08) and the top of the first (v0), and the
  * tops of both filing cabinets (v0 and v1, told apart by their different
- * `h`). A terminal carries no under spot (fix round 3), so both under-desk
- * curios (the trap and the fuel case) sit side by side in a row
- * (`row`) on the workbench's lower shelf instead, its only surface left
- * of that class.
+ * `h`). Both under-desk curios (the trap and the fuel case) sit side by
+ * side in a row (`row`) on the workbench's lower shelf.
  *
  * The lab bench's top is `cls: "bench"`, and neither ball kind
  * (`CURIO_CATALOGUE["star-ball"|"catch-ball"].classes`) nor the pink
@@ -607,10 +604,9 @@ export function galleryRoom(): RoomSpec {
  * surface (the filing cabinet's top, `j` always 0), since two instances of
  * the same prop kind then share both; the anchor ints tell them apart,
  * since no two hosts stand at the same point. The row's two items share
- * one surface (`machine:workbench`'s under spot, `j` 1, the same host and
- * `j` the standalone fuel case used before this round), so `j` alone no
- * longer tells them apart; each seed adds the curio's own kind as a fifth
- * token instead. No host is added beyond what the gallery already
+ * one surface (`machine:workbench`'s under spot, `j` 1), so `j` alone
+ * does not tell them apart; each seed adds the curio's own kind as a
+ * fifth token instead. No host is added beyond what the gallery already
  * carries.
  */
 function galleryCurios(seed: number, room: RoomSpec): Curio[] {
@@ -1092,27 +1088,26 @@ export function heroHallRoom(): RoomSpec {
 /**
  * Lays `items` along surface `s`'s wall-parallel axis, the host's own local
  * `a` axis (`turnedPoint` in `footprints.ts`), whatever its own length
- * against the surface's `d` axis (the one running from the wall out into
- * the room): at an even turn `a` is world x and `d` is world z, at an odd
- * turn the two swap (`turnedPoint`'s `front`/`along` split), and a curio
- * placed at its own host's turn shares that same split (`curioBox`'s
- * width/depth swap), so an item's extent along the row is always its
- * `width`, regardless of turn. `curioOn` places each item's centre at the
- * cumulative offset along `a`, centred on `d`. Every curio in a row takes
- * the surface's own turn. Laying along `a` rather than whichever axis a
- * surface's box happens to span more (the bug this replaces) matters
- * because a surface can be narrower along `a` than along `d`, as the tube
- * bench and the gun bench both are: the old rule ran a row into the room
- * instead of along the wall, standing one item's box behind the next on the
- * only line a player can stand, so the one behind was never visible. Throws,
- * naming the host and the kind, when an item does not fit the row's own
- * budget (`surfaceLen - 2 * CURIO_MARGIN`), whether because the item alone
- * is too big for the surface or because the items before it in the row
- * already used the space: a hand-built row is trusted arithmetic (H15's own
- * "fits by the Baselines numbers"), so a row that does not fit is a bug in
- * this file, never a silent overlap. Exported for `canned.test.ts`'s own
- * direct test of the throw; `heroHallCurios` is its only production
- * caller.
+ * against the surface's `d` axis (the one running from the wall out into the
+ * room): at an even turn `a` is world x and `d` is world z, at an odd turn
+ * the two swap (`turnedPoint`'s `front`/`along` split), and a curio placed
+ * at its own host's turn shares that same split (`curioBox`'s width/depth
+ * swap), so an item's extent along the row is always its `width`, regardless
+ * of turn. `curioOn` places each item's centre at the cumulative offset
+ * along `a`, centred on `d`. Every curio in a row takes the surface's own
+ * turn. Laying along `a` rather than whichever axis a surface's box happens
+ * to span more matters because a surface can be narrower along `a` than
+ * along `d`, as the tube bench and the gun bench both are: a row run into
+ * the room instead of along the wall would stand one item's box behind the
+ * next on the only line a player can stand, so the one behind would never be
+ * visible. Throws, naming the host and the kind, when an item does not fit
+ * the row's own budget (`surfaceLen - 2 * CURIO_MARGIN`), whether because
+ * the item alone is too big for the surface or because the items before it
+ * in the row already used the space: a hand-built row is trusted arithmetic
+ * (H15's own "fits by the Baselines numbers"), so a row that does not fit is
+ * a bug in this file, never a silent overlap. Exported for
+ * `canned.test.ts`'s own direct test of the throw; `heroHallCurios` is its
+ * only production caller.
  */
 export function row(
   s: HostSurface,
@@ -1156,30 +1151,23 @@ export function row(
 }
 
 /**
- * The hero hall's curios (2.6b, task 7; regrouped post-breaker, "rows along
- * the wall"): one of every curio kind and variant, hand-placed on the hero
- * surfaces they fit (`hostSurfaces`, `curioOn` and `row`). `row` now lays
- * each row along its host's local `a` axis (wall-parallel) rather than
- * whichever world axis happened to be longer, so the tube bench and the
- * gun bench, both narrower along `a` than along `d`, no longer fit the
- * original grouping: the lit sword's two variants plus the gadget's
- * cluster overflowed the tube bench's `a` budget, and the cradled sword
- * plus the small gadget overflowed the gun bench's. Regrouped so every row
- * fits:
+ * The hero hall's curios (2.6b): one of every curio kind and variant,
+ * hand-placed on the hero surfaces they fit (`hostSurfaces`, `curioOn` and
+ * `row`). `row` lays each row along its host's local `a` axis
+ * (wall-parallel), and the tube bench and the gun bench are both narrower
+ * along `a` than along `d`, so the rows are grouped to fit those budgets:
  *
  * - the mess table's top, in a row: the laptop, the tape drive, the tape
  *   player, both video tapes, the pocket console, both balls and the lit
  *   sword's two upright variants (1 and 2), since every sword variant
  *   stands on a table too (C19's classes) and the mess table's `a` budget
  *   (its length) is by far the roomiest in the hall;
- * - the laser desk's top: the pistol, then the meter (unchanged, its own
- *   row already ran along `a`: its surface happens to be longer along `a`
- *   than along `d`);
+ * - the laser desk's top: the pistol, then the meter (its surface is longer
+ *   along `a` than along `d`);
  * - the tube bench's top: the gadget's two variants, side by side (a
  *   "bench" surface, which both include, C19's classes);
  * - the gun bench's top: the sword lying in its cradle, alone (its `a`
- *   budget, 0.31 m, is too narrow for a second item once the row runs
- *   along `a` rather than into the room);
+ *   budget, 0.31 m, is too narrow for a second item);
  * - the laser desk's under spot: the trap;
  * - the gun bench's under spot: the fuel case.
  *

@@ -135,12 +135,11 @@ describe("curio catalogue", () => {
     expect(end.a1 - end.a0).toBeLessThan(Math.min(laptop.width, laptop.depth));
   });
 
-  it("carries no under spot on a terminal (fix round 3)", () => {
+  it("carries no under spot on a terminal", () => {
     // The model draws the swivel chair in the terminal's knee space
-    // (`render/models/terminal.ts`'s `TERMINAL_OCCLUDERS`), so no standing
-    // player could ever see a curio placed there (round 2's finding). An
-    // under-desk curio's only hosts are the workbench's lower shelf and a
-    // hero's own `under` spots.
+    // (`render/models/terminal.ts`'s `TERMINAL_OCCLUDERS`), between the
+    // wall and every spot a player can stand on, so no standing player
+    // could ever see a curio placed there.
     const terminal: readonly SurfaceSpec[] = FIXTURE_SURFACES.terminal;
     expect(terminal.some((s) => s.cls === "under")).toBe(false);
   });
@@ -557,8 +556,8 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       const slots = new Set(got.map((c) => CURIO_CATALOGUE[c.kind].slot));
       for (const slot of ["retro", "gear"] as const)
         expect(slots.has(slot), `${name} ${slot}`).toBe(true);
-      // The under slot needs a workbench's lower shelf or a hero's under
-      // spot (fix round 3: a terminal carries none any more), which not
+      // The under slot needs an under spot (a workbench's lower shelf, a
+      // hydroponics trough, a round table, a bench or a hero's), which not
       // every canned room draws, so it is checked only where one exists.
       const hasUnderHost = hostSurfaces(b).some((s) => s.cls === "under");
       expect(slots.has("under"), `${name} under`).toBe(hasUnderHost);
@@ -567,10 +566,10 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     }
   });
 
-  it("never stands an under-slot curio on a terminal, across a sweep of generated rooms (fix round 3)", () => {
+  it("never stands an under-slot curio on a terminal, across a sweep of generated rooms", () => {
     // A wide sweep: every room `ROOMS` already varies by archetype and
-    // condition, plus the gallery and the hero hall (the two rooms with a
-    // workbench and hero under spots, hand-built rather than generated),
+    // condition, plus the gallery (a workbench and a round table) and the
+    // hero hall (hero under spots), both hand-built,
     // reseeded a few times each and at a few rolls, so the under slot's
     // pool picks both kinds and its candidates come up in different
     // orders (`candidatesOf`'s seed order depends on `room.seed`).
@@ -790,9 +789,9 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     const slots = new Set(got.map((c) => CURIO_CATALOGUE[c.kind].slot));
     for (const slot of ["gear", "ball"] as const)
       expect(slots.has(slot), slot).toBe(true);
-    // The bridge draws no workbench and no hero under spot (fix round 3:
-    // a terminal carries no under spot any more), so the under slot is
-    // exactly the "nothing fits" case this test is named for.
+    // The canned bridge draws no host with an under spot (a terminal has
+    // none), so the under slot is exactly the "nothing fits" case this test
+    // is named for.
     expect(hostSurfaces(bridge).some((s) => s.cls === "under")).toBe(false);
     expect(slots.has("under")).toBe(false);
     expectInvariants(bridge, got, "bridge");
@@ -951,9 +950,8 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     const surfaces = hostSurfaces(base(generateRoom(CANNED_WORKSHOP)));
     const desk = surfaces.find((s) => s.cls === "desk");
     if (desk === undefined) throw new Error("surfaces");
-    // No terminal carries an under spot any more (fix round 3), so the
-    // "cannot stand" probe below borrows the gallery's workbench shelf,
-    // the only surviving under-class surface.
+    // The workshop has no under spot, so the "cannot stand" probe below
+    // borrows the gallery's first one, its workbench's lower shelf.
     const under = hostSurfaces(galleryRoom()).find((s) => s.cls === "under");
     if (under === undefined) throw new Error("no under surface");
     const c = curioOn(desk, "pocket-console", 0, 0, 1, 7);
@@ -974,7 +972,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(curioOn(shelf, "light-sword", 0, 0.5, 0.5, 1).h).toBe(shelf.h);
   });
 
-  it("stands an upright lit sword on no shelf class top (controller ruling)", () => {
+  it("stands an upright lit sword on no shelf class top", () => {
     // Default ceilings, archive rooms full of shelves and cabinets.
     let upright = 0;
     let lyingOnShelf = 0;
@@ -1231,9 +1229,10 @@ const PINNED: Curio[] = [
  * 7.5) turned 3: the laptop on the table's top (h 0.76), turned to face
  * the table's back (a free host's `fixed` curio faces front or back), and
  * the star ball and the lying sword on the two desk ends of the west
- * terminal at row 8. The under slot draws `trap-box` but places nothing
- * (fix round 3, the same reason as `PINNED`): no workbench, an empty mess
- * table under spot, and the terminal's own under spot is gone.
+ * terminal at row 8. The under slot draws `trap-box` but places nothing:
+ * this engineering room has no workbench, no hydroponics trough, no round
+ * table and no bench, the mess table has no under spot, and a terminal
+ * has none.
  */
 const PINNED_ON_HERO: Curio[] = [
   {
