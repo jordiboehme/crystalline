@@ -14,7 +14,9 @@
  * cache loads in a frame or two, and an overlay that flashes up for that
  * long reads as a glitch rather than a journey. The minimum is kept by the
  * HUD sink (`useHud`), which delays hiding it; this component only draws
- * what it is given. The label is the engram's title, drawn as a text node.
+ * what it is given. The label is the engram's title, drawn as a text node,
+ * except for the level select's jump, which names the domain instead (the
+ * session's `go` call takes a label of its own there, C10).
  */
 
 import type { LookId } from "../render/looks";

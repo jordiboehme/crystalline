@@ -1147,9 +1147,10 @@ describe("the level cheat", () => {
 
     session.jump("eng");
     expect(levels).toHaveBeenLastCalledWith(false);
+    // The connector names the domain, not the bridge's permalink (C10).
     expect(hud.connector).toHaveBeenLastCalledWith(
       true,
-      "manifest",
+      "eng",
       expect.any(String),
     );
     await vi.waitFor(() => {
@@ -1158,6 +1159,13 @@ describe("the level cheat", () => {
     expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng/e/manifest");
     expect(session.current).toEqual({ domain: "eng", permalink: "manifest" });
     expect(roomsSet()).toEqual(["alpha", "manifest"]);
+    // The connector's closing call names the domain too, not just the
+    // opening one.
+    expect(hud.connector).toHaveBeenCalledWith(
+      false,
+      "eng",
+      expect.any(String),
+    );
   });
 
   it("closes the select on a go from outside and on dispose", () => {

@@ -221,7 +221,9 @@ export type PlaceLoader = (
  * A running station.
  *
  * - `go` travels to a place: loads it and, once it lands, enters it, placed
- *   by `arrival` (see `arrivalSpawn`) or at the entrance.
+ *   by `arrival` (see `arrivalSpawn`) or at the entrance. The connector's
+ *   label is `labelFor`'s, unless `label` is given, which shows that
+ *   instead (`jump`'s domain name, C10).
  * - `showCanned` shows a place already in hand, with no load. Showing the
  *   place already shown again (the demo's R key) keeps the player where
  *   they stand and the doors as they are.
@@ -238,7 +240,8 @@ export type PlaceLoader = (
  * - `closeReader` tells the session the CRT reader was closed, which gives
  *   it the keys back.
  * - `jump` goes to a domain's bridge (`bridgeAddress`), the level select's
- *   jump: a `go` from outside, so the player enters at the entrance.
+ *   jump: a `go` from outside, so the player enters at the entrance. The
+ *   connector names the domain, not the bridge's permalink (C10).
  * - `closeLevels` tells the session the level select was closed, which
  *   gives it the keys back.
  * - `dispose` stops everything and frees the GPU objects. It takes the
@@ -246,11 +249,14 @@ export type PlaceLoader = (
  * - `current` is the place the player is in, null before the first one.
  */
 export interface Session {
-  go(address: PlaceAddress, arrival?: Arrival | null): void;
+  go(address: PlaceAddress, arrival?: Arrival | null, label?: string): void;
   showCanned(place: PlaceInput): void;
   showRoom(room: RoomSpec, view?: { pitch: number }): void;
   closeReader(): void;
-  /** Goes to a domain's bridge (`bridgeAddress`): the level select's jump. */
+  /**
+   * Goes to a domain's bridge (`bridgeAddress`): the level select's jump.
+   * The connector names the domain, not the bridge's permalink (C10).
+   */
   jump(domain: string): void;
   /** The level select was closed: gives the session the keys back. */
   closeLevels(): void;
@@ -437,7 +443,8 @@ export function createSession(opts: SessionOptions): Session {
   /**
    * The label the connector shows for a place: its title, when the room the
    * player is in knows it (a relation, a wikilink or an inbound reference
-   * that leads there), else its permalink.
+   * that leads there), else its permalink. `go`'s own `label` argument wins
+   * over this (the level select's jump, C10).
    */
   const labelFor = (address: PlaceAddress): string => {
     if (place !== null) {
@@ -526,14 +533,14 @@ export function createSession(opts: SessionOptions): Session {
 
   const settle = (
     gen: number,
-    address: PlaceAddress,
     arrival: Arrival | null,
     loaded: LoadedPlace,
+    label: string,
   ) => {
     if (disposed || gen !== generation) return;
     loading = false;
     controller = null;
-    hud.connector(false, labelFor(address), lookId);
+    hud.connector(false, label, lookId);
     if (loaded.kind !== "place") {
       fail(FAILED[loaded.kind]);
       // Only a missing or denied target breaks the way the travel went
@@ -600,7 +607,11 @@ export function createSession(opts: SessionOptions): Session {
     return gen;
   };
 
-  const go = (address: PlaceAddress, arrival: Arrival | null = null) => {
+  const go = (
+    address: PlaceAddress,
+    arrival: Arrival | null = null,
+    label?: string,
+  ) => {
     if (disposed) return;
     const gen = leave();
     const loader: PlaceLoader | null =
@@ -612,22 +623,22 @@ export function createSession(opts: SessionOptions): Session {
       fail(FAILED.offline);
       return;
     }
-    const label = labelFor(address);
+    const shown = label ?? labelFor(address);
     loading = true;
-    loadingLabel = label;
-    hud.connector(true, label, lookId);
+    loadingLabel = shown;
+    hud.connector(true, shown, lookId);
     const abort = new AbortController();
     controller = abort;
     loader(address, abort.signal).then(
       (loaded) => {
-        settle(gen, address, arrival, loaded);
+        settle(gen, arrival, loaded, shown);
       },
       (error: unknown) => {
         if (disposed || gen !== generation) return;
         loading = false;
         controller = null;
         travelling = null;
-        hud.connector(false, label, lookId);
+        hud.connector(false, shown, lookId);
         if (!isAbort(error)) fail(LOAD_ERROR);
       },
     );
@@ -993,7 +1004,7 @@ export function createSession(opts: SessionOptions): Session {
     showRoom,
     closeReader,
     jump(domain) {
-      go(bridgeAddress(domain));
+      go(bridgeAddress(domain), null, domain);
     },
     closeLevels,
     dispose() {
