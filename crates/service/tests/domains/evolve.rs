@@ -2891,7 +2891,8 @@ async fn v110_sweep(engine: &Engine, scope: &Scope) -> Value {
 
 /// A hand-edited `[[eng-knowledge:target]]` - the local name, never the
 /// canonical `eng` - draws exactly one `V110` finding naming both spellings
-/// and pointing at `edit_engram`.
+/// through the real `edit_engram` interface: `operation find_replace`,
+/// `find_text` and `content`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v110_fires_on_a_link_spelled_with_the_local_name() {
     let (_tmp, engine) = v110_fixture(false).await;
@@ -2906,10 +2907,44 @@ async fn v110_fires_on_a_link_spelled_with_the_local_name() {
     let evidence = row["evidence"].as_str().unwrap();
     assert!(evidence.contains("eng-knowledge"), "{evidence}");
     assert!(evidence.contains("`eng`"), "{evidence}");
-    let fix = row["fix"].as_str().unwrap();
-    assert!(fix.contains("edit_engram"), "{fix}");
-    assert!(fix.contains("eng-knowledge:target"), "{fix}");
-    assert!(fix.contains("eng:target"), "{fix}");
+    assert_eq!(
+        row["fix"],
+        "edit_engram with operation find_replace, find_text \"[[eng-knowledge:target]]\" and \
+         content \"[[eng:target]]\"",
+        "the fix names the real edit_engram interface, never old_string/new_string: {row}"
+    );
+}
+
+/// Applying exactly the fix the finding names - `edit_engram operation
+/// find_replace`, the `find_text`/`content` pair the row printed - through
+/// the real tool clears the finding: the repair the sweep hands an agent is
+/// not just plausible-looking prose, it is the literal call that fixes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applying_the_v110_fix_verbatim_clears_the_finding() {
+    let (_tmp, engine) = v110_fixture(false).await;
+    let before = v110_sweep(&engine, &Scope::Unrestricted).await;
+    let row = &before["queue"][0];
+    assert_eq!(row["rule"], "V110", "{before}");
+
+    engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "link-holder".to_string(),
+                domain: "eng-knowledge".to_string(),
+                operation: "find_replace".to_string(),
+                find_text: Some("[[eng-knowledge:target]]".to_string()),
+                content: Some("[[eng:target]]".to_string()),
+                ..EditParams::default()
+            },
+            None,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    let after = v110_sweep(&engine, &Scope::Unrestricted).await;
+    assert_eq!(after["total"], 0, "{after}");
+    assert!(after["queue"].as_array().unwrap().is_empty(), "{after}");
 }
 
 /// Same hand-edited file, but `eng`'s canonical claim is now shadowed by a
@@ -3033,4 +3068,102 @@ async fn a_hidden_domain_is_never_named_by_a_v110_finding() {
     assert_eq!(seen["total"], 1, "{seen}");
     assert_eq!(seen["queue"][0]["rule"], "V110");
     assert_eq!(seen["queue"][0]["permalink"], "cross-ref");
+}
+
+// ---------------------------------------------------------------------------
+// F5 - known_domains covers every visible spelling (Task 19, fix round 1)
+// ---------------------------------------------------------------------------
+
+/// `eng-knowledge` declares `domain_name: eng` and carries the machine-local
+/// alias `engineering`, and holds one real target engram. `ops` names that
+/// target by the canonical name, by the alias, and once more by the
+/// canonical name against a title that does not exist - the case a sweep's
+/// `known_domains` has to get right on every spelling, not only the local
+/// one.
+async fn f5_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let eng_dir = root.join("eng-knowledge");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(
+        eng_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-07-25"),
+    )
+    .unwrap();
+    std::fs::write(
+        eng_dir.join("target.md"),
+        "---\ntype: engram\ntitle: Target\npermalink: target\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe shared target every spelling below points at.\n\n- [context] planted for the F5 fixture\n",
+    )
+    .unwrap();
+    let mut eng_entry = DomainEntry::file(eng_dir);
+    eng_entry.aliases = vec!["engineering".to_string()];
+    cfg.domains.insert("eng-knowledge".to_string(), eng_entry);
+
+    let ops_dir = root.join("ops");
+    std::fs::create_dir_all(&ops_dir).unwrap();
+    std::fs::write(
+        ops_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("ops", "2026-07-25"),
+    )
+    .unwrap();
+    std::fs::write(
+        ops_dir.join("cross-refs.md"),
+        "---\ntype: engram\ntitle: Cross refs\npermalink: cross-refs\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng:target]] (canonical) and [[engineering:target]] (alias), plus one broken [[eng:No Such Title]].\n\n- [context] planted for the F5 fixture\n",
+    )
+    .unwrap();
+    cfg.domains
+        .insert("ops".to_string(), DomainEntry::file(ops_dir));
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// `known_domains` now carries every visible spelling of every domain
+/// (`sweep_domain_names`, built from the name table), not only local names,
+/// so `V102` stops calling a target spelled by a domain's canonical name or
+/// a machine-local alias unregistered. A link spelled either way and
+/// pointing at a real target resolves at sync time and draws no `V102` at
+/// all; a link spelled the canonical way but pointing at nothing still
+/// draws `V102` (the reference is genuinely broken), but never with the
+/// "not a registered domain" evidence a missing spelling would wrongly give
+/// it - `eng` is registered, only the title inside it is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f5_known_domains_covers_every_spelling_so_v102_never_calls_it_unregistered() {
+    let (_tmp, engine) = f5_fixture().await;
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["ops".to_string()],
+                rules: vec!["V102".to_string()],
+                today: Some("2026-07-26".to_string()),
+                limit: Some(10),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    let queue = v["queue"].as_array().unwrap();
+    assert_eq!(
+        queue.len(),
+        1,
+        "the two resolving links (canonical name and alias) draw no V102 at all: {v}"
+    );
+    let evidence = queue[0]["evidence"].as_str().unwrap();
+    assert!(
+        !evidence.contains("is not a registered domain"),
+        "eng is a domain's canonical name and must be recognized as registered: {evidence}"
+    );
 }

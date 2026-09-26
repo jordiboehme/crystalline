@@ -458,7 +458,7 @@ pub const RULES: [RuleInfo; 24] = [
         family: Family::Structure,
         base: 40,
         summary: "domain spelled by a local-only name",
-        instruction: "The link's domain prefix is a name only this machine uses - a local config key or a machine-local alias - rather than the domain's canonical name. Rewrite it with edit_engram, replacing the written prefix with the domain's canonical name, so the reference reads the same on every machine that has this domain.",
+        instruction: "The link's domain prefix is a name only this machine uses - a local config key or a machine-local alias - rather than the domain's canonical name. Rewrite it with edit_engram operation find_replace, find_text the link as written and content the same link with the prefix replaced by the domain's canonical name, so the reference reads the same on every machine that has this domain.",
     },
     RuleInfo {
         id: "V201",
@@ -536,8 +536,11 @@ pub fn is_pair_scoped(rule: &str) -> bool {
 ///   **sets**, so the parts are sorted and deduplicated before joining:
 ///   reordering the links in a body must not re-raise an acknowledged finding,
 ///   while a new member must;
-/// - `V007` and `V008` name **one attachment path**, so the first part is the
-///   whole scope;
+/// - `V007` and `V008` name **one attachment path**, and `V110` names **one
+///   spelling**, so the first part is the whole scope: two different
+///   local-only spellings on one engram are acknowledged separately, and
+///   acknowledging one leaves an ack for the other reading as stale rather
+///   than silently covering it;
 /// - `V109` names **a pair**, the permalink and the file path in that order:
 ///   an acknowledgment of a deliberate custom permalink holds exactly as long
 ///   as neither changes, and re-filing the engram or renaming the permalink
@@ -553,7 +556,7 @@ fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
         }
-        "V007" | "V008" => parts.into_iter().next().unwrap_or_default(),
+        "V007" | "V008" | "V110" => parts.into_iter().next().unwrap_or_default(),
         "V109" => parts.join(SCOPE_SEPARATOR),
         _ => String::new(),
     }
@@ -2086,6 +2089,11 @@ fn permalink_off_its_folder(fact: &EngramFacts) -> Option<Finding> {
 /// Mechanical, always: the reference already resolves through the local
 /// name (local names always win), so rewriting the prefix to the canonical
 /// spelling changes nothing the archive claims.
+///
+/// Scoped by the spelling alone ([`scope_for`]'s one-path arm, shared with
+/// `V007`/`V008`): an engram naming two different local-only domains draws
+/// two findings, and acknowledging one leaves the other's ack reading stale
+/// rather than silently covering it too.
 fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
     if input.respell.is_empty() {
         return;
@@ -2126,11 +2134,12 @@ fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut Sw
                         reference.raw, reference.spelling
                     ),
                     format!(
-                        "edit_engram old_string \"[[{}]]\" new_string \"[[{new_raw}]]\"",
+                        "edit_engram with operation find_replace, find_text \"[[{}]]\" and content \"[[{new_raw}]]\"",
                         reference.raw
                     ),
                 )
-                .at_line((reference.line > 0).then_some(reference.line)),
+                .at_line((reference.line > 0).then_some(reference.line))
+                .scoped([reference.spelling.clone()]),
         );
     }
 }

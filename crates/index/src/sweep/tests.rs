@@ -2450,11 +2450,11 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
             "{rule} scopes a set"
         );
     }
-    for rule in ["V007", "V008"] {
+    for rule in ["V007", "V008", "V110"] {
         assert_eq!(
             scope_for(rule, vec!["assets/deck.png".to_string()]),
             "assets/deck.png",
-            "{rule} scopes one path"
+            "{rule} scopes one item"
         );
     }
     for rule in [
@@ -2474,7 +2474,8 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
     let scoped = [
-        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V109", "V201", "V202", "V301",
+        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V109", "V110", "V201", "V202",
+        "V301",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
@@ -2739,12 +2740,61 @@ fn v110_fires_when_respell_names_a_spelled_references_prefix() {
         "`[[eng-knowledge:a]]` names domain `eng-knowledge`, a name only this machine uses; \
          the domain's name is `eng`"
     );
+    assert_eq!(
+        finding.fix,
+        "edit_engram with operation find_replace, find_text \"[[eng-knowledge:a]]\" and content \
+         \"[[eng:a]]\"",
+        "the fix names the real edit_engram interface (operation, find_text, content)"
+    );
+    assert_eq!(
+        finding.scope, "eng-knowledge",
+        "scoped by the spelling alone, like V007 and V008"
+    );
+}
+
+/// Two different local-only spellings on one engram draw two findings, and
+/// an acknowledgment given for one spelling reads as stale on the other
+/// rather than silently covering it: `V110`'s scope is the spelling alone,
+/// not a set of every spelling the engram carries.
+#[test]
+fn v110_scopes_by_the_spelling_so_two_local_only_spellings_are_acknowledged_separately() {
+    let mut f = fact(1, "link-holder");
+    f.acks = vec![ack(
+        "V110",
+        Some("eng-knowledge"),
+        "the old spelling is fine to keep for now",
+    )];
+    let mut sweep = input(vec![f]);
+    sweep.respell = vec![
+        ("eng-knowledge".to_string(), "eng".to_string()),
+        ("old-alias".to_string(), "eng".to_string()),
+    ];
+    sweep.spelled_refs = vec![
+        spelled(1, "eng-knowledge", "a"),
+        spelled(1, "old-alias", "b"),
+    ];
+
+    let report = detect(&sweep);
+    let findings: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V110")
+        .collect();
+    assert_eq!(
+        findings.len(),
+        1,
+        "the eng-knowledge finding is suppressed by its own ack; old-alias is not: {:?}",
+        fired(&report)
+    );
+    let remaining = findings[0];
+    assert_eq!(remaining.scope, "old-alias");
     assert!(
-        finding.fix.contains("edit_engram")
-            && finding.fix.contains("eng-knowledge:a")
-            && finding.fix.contains("eng:a"),
-        "the fix names edit_engram and both spellings: {}",
-        finding.fix
+        remaining.ack_stale,
+        "an ack scoped to a different spelling reads as stale rather than silently matching"
+    );
+    assert_eq!(
+        report.acknowledged.structure, 1,
+        "exactly the eng-knowledge finding was counted as suppressed"
     );
 }
 
