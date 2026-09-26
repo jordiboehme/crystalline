@@ -348,7 +348,7 @@ const GALLERY_LIGHT = 210;
 /**
  * The model gallery: a room built by hand rather than generated, holding one
  * of everything the station draws, for judging the models in the dev-only
- * route `/game/dev/gallery`.
+ * route `/π/dev/gallery`.
  *
  * - **Hall.** Seventeen by sixteen cells, sized by `planLayout` from
  *   `GALLERY_NEED`. On the north wall a door of each style that opens
@@ -966,7 +966,7 @@ function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
 /**
  * The hero hall (H15): a room built by hand rather than generated, holding
  * one of every hero kind and variant, for judging them in the dev-only
- * route `/game/dev/gallery?hall=heroes` and for the `?at=prop:<kind>:<n>`
+ * route `/π/dev/gallery?hall=heroes` and for the `?at=prop:<kind>:<n>`
  * spots that frame each one (`spotSpawn` in `dev/spots.ts`).
  *
  * `planLayout(HERO_HALL_NEED)` gives a 23 by 24 hall with no bays and its

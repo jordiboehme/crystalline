@@ -1,5 +1,5 @@
 /**
- * The game route: `/game/d/<domain>/e/<permalink>`, the station room of one
+ * The game route: `/π/d/<domain>/e/<permalink>`, the station room of one
  * engram, and every room the player walks on to from there.
  *
  * Development only until milestone 4 gives it a way in: the route that

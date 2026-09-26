@@ -281,7 +281,7 @@ describe("go", () => {
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(1);
     });
-    expect(navigate).toHaveBeenCalledWith("/game/d/eng/e/alpha");
+    expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/alpha");
     expect(roomsSet()).toEqual(["alpha"]);
     expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
     expect(hud.connector).toHaveBeenLastCalledWith(
@@ -303,7 +303,7 @@ describe("go", () => {
     alpha.resolve(detailResponse("alpha", "Alpha"));
     await flush();
     expect(navigate).toHaveBeenCalledTimes(1);
-    expect(navigate).toHaveBeenCalledWith("/game/d/eng/e/beta");
+    expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/beta");
     expect(roomsSet()).toEqual(["beta"]);
     expect(session.current).toEqual({ domain: "eng", permalink: "beta" });
   });
@@ -429,7 +429,14 @@ describe("go", () => {
 
   it("does not navigate to the address the URL already shows", async () => {
     serve();
-    window.history.replaceState(null, "", "/game/d/eng/e/alpha");
+    // Set with the raw character rather than its encoding: jsdom's own URL
+    // parser normalizes it to `%CF%80` in `window.location.pathname` exactly
+    // as a real browser would, which is the fact `gameEngramRoute` is built
+    // to agree with (see `paths.ts`). If it built from the raw character
+    // instead, this comparison in `session.ts` would never see the two
+    // sides as equal, and `navigate` would fire below when it must not.
+    window.history.replaceState(null, "", "/π/d/eng/e/alpha");
+    expect(window.location.pathname).toBe("/%CF%80/d/eng/e/alpha");
     const session = start();
     session.go({ domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
@@ -565,7 +572,7 @@ describe("a room the renderer refuses", () => {
     });
     expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
     expect(navigate).toHaveBeenCalledTimes(1);
-    expect(navigate).toHaveBeenLastCalledWith("/game/d/eng/e/alpha");
+    expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng/e/alpha");
     // The player stands where they stood, in Alpha, and still walks there.
     frames(3);
     expect(eyeAt()[0]).toBeCloseTo(before[0], 6);
@@ -1148,7 +1155,7 @@ describe("the level cheat", () => {
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(2);
     });
-    expect(navigate).toHaveBeenLastCalledWith("/game/d/eng/e/manifest");
+    expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng/e/manifest");
     expect(session.current).toEqual({ domain: "eng", permalink: "manifest" });
     expect(roomsSet()).toEqual(["alpha", "manifest"]);
   });

@@ -309,9 +309,19 @@ async function typeWord(word: string) {
 const LEVELS = { name: "Jump to a domain" } as const;
 
 describe("GameRoute", () => {
+  it("mounts on the raw π prefix too, not only its encoding", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/π/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    view.unmount();
+  });
+
   it("refuses a device without WebGL2", async () => {
     serve();
-    renderAt("/game/d/eng/e/alpha");
+    renderAt("/%CF%80/d/eng/e/alpha");
     expect(
       await screen.findByText("?DEVICE NOT PRESENT ERROR"),
     ).toBeInTheDocument();
@@ -321,7 +331,7 @@ describe("GameRoute", () => {
   it("loads the place in its URL and follows the URL", async () => {
     gl.available = true;
     serve();
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
 
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
@@ -330,7 +340,7 @@ describe("GameRoute", () => {
     // The connector's minimum is up and hidden before the next journey.
     await settle(500);
 
-    go("/game/d/eng/e/beta");
+    go("/%CF%80/d/eng/e/beta");
     await waitFor(() => {
       expect(lastRoom()).toBe("beta");
     });
@@ -338,7 +348,7 @@ describe("GameRoute", () => {
     expect(
       asked().filter((p) => p === "/domains/eng/engrams/beta"),
     ).toHaveLength(1);
-    expect(location).toBe("/game/d/eng/e/beta");
+    expect(location).toBe("/%CF%80/d/eng/e/beta");
     view.unmount();
     expect(actWarnings()).toEqual([]);
   });
@@ -347,7 +357,7 @@ describe("GameRoute", () => {
     gl.available = true;
     const held = deferred<unknown>();
     serve({ "/domains/eng/engrams/alpha": () => held.promise });
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(asked()).toContain("/domains/eng/engrams/alpha");
     });
@@ -369,13 +379,13 @@ describe("GameRoute", () => {
     gl.available = true;
     const held = deferred<unknown>();
     serve({ "/domains/eng/engrams/beta": () => held.promise });
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
     await settle(500);
 
-    go("/game/d/eng/e/beta");
+    go("/%CF%80/d/eng/e/beta");
     await waitFor(() => {
       expect(asked()).toContain("/domains/eng/engrams/beta");
     });
@@ -386,8 +396,8 @@ describe("GameRoute", () => {
 
     // Beta's load was dropped: the player is in alpha, and so is the URL.
     expect(lastRoom()).toBe("alpha");
-    expect(location).toBe("/game/d/eng/e/alpha");
-    expect(made.navigations).not.toContain("/game/d/eng/e/beta");
+    expect(location).toBe("/%CF%80/d/eng/e/alpha");
+    expect(made.navigations).not.toContain("/%CF%80/d/eng/e/beta");
     view.unmount();
   });
 
@@ -400,13 +410,13 @@ describe("GameRoute", () => {
         return detailResponse("beta", "Beta");
       },
     });
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
     await settle(500);
 
-    go("/game/d/eng/e/beta");
+    go("/%CF%80/d/eng/e/beta");
     await waitFor(() => {
       expect(asked()).toContain("/domains/eng/engrams/beta");
     });
@@ -432,18 +442,18 @@ describe("GameRoute", () => {
       "/domains/eng/engrams/old-alpha": () => detailResponse("alpha", "Alpha"),
       "/domains/eng/inbound/old-alpha": () => EMPTY_INBOUND,
     });
-    const view = renderAt("/game/d/eng/e/old-alpha");
+    const view = renderAt("/%CF%80/d/eng/e/old-alpha");
     await waitFor(() => {
       expect(asked()).toContain("/domains/eng/engrams/old-alpha");
     });
     await settle(500);
     expect(asked()).not.toContain("/domains/eng/engrams/alpha");
 
-    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(location).toBe("/%CF%80/d/eng/e/alpha");
     expect(lastRoom()).toBe("alpha");
 
     // A URL the session did not put there is still followed.
-    go("/game/d/eng/e/beta");
+    go("/%CF%80/d/eng/e/beta");
     await waitFor(() => {
       expect(lastRoom()).toBe("beta");
     });
@@ -453,7 +463,7 @@ describe("GameRoute", () => {
   it("runs exactly one live session under StrictMode's double mount", async () => {
     gl.available = true;
     serve();
-    const view = renderAt("/game/d/eng/e/alpha", true);
+    const view = renderAt("/%CF%80/d/eng/e/alpha", true);
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
@@ -477,8 +487,8 @@ describe("GameRoute", () => {
     });
     // One room, entered once, and the URL replaced once.
     expect(made.renderers.at(-1)?.setRoom).toHaveBeenCalledTimes(1);
-    expect(made.navigations).toEqual(["/game/d/eng/e/alpha"]);
-    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(made.navigations).toEqual(["/%CF%80/d/eng/e/alpha"]);
+    expect(location).toBe("/%CF%80/d/eng/e/alpha");
 
     view.unmount();
     expect(made.sessions.every((s) => s.disposed)).toBe(true);
@@ -495,7 +505,7 @@ describe("GameRoute", () => {
       "/domains/eng/engrams/manifest": () => detailResponse("manifest", "eng"),
       "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
     });
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
@@ -517,10 +527,10 @@ describe("GameRoute", () => {
       expect(lastRoom()).toBe("manifest");
     });
     await settle(500);
-    expect(location).toBe("/game/d/eng/e/manifest");
+    expect(location).toBe("/%CF%80/d/eng/e/manifest");
     expect(made.navigations).toEqual([
-      "/game/d/eng/e/alpha",
-      "/game/d/eng/e/manifest",
+      "/%CF%80/d/eng/e/alpha",
+      "/%CF%80/d/eng/e/manifest",
     ]);
     expect(
       asked().filter((p) => p === "/domains/eng/engrams/manifest"),
@@ -532,7 +542,7 @@ describe("GameRoute", () => {
   it("closes the level select on Esc and stays in the room", async () => {
     gl.available = true;
     serve();
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
@@ -545,7 +555,7 @@ describe("GameRoute", () => {
     expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
     await settle(300);
     expect(lastRoom()).toBe("alpha");
-    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(location).toBe("/%CF%80/d/eng/e/alpha");
     expect(asked()).not.toContain("/domains/eng/engrams/manifest");
 
     // The word opens it again.
@@ -557,7 +567,7 @@ describe("GameRoute", () => {
   it("closes the level select when the URL changes under it", async () => {
     gl.available = true;
     serve();
-    const view = renderAt("/game/d/eng/e/alpha");
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
@@ -565,7 +575,7 @@ describe("GameRoute", () => {
     await typeWord("idclev");
     await screen.findByRole("dialog", LEVELS);
 
-    go("/game/d/eng/e/beta");
+    go("/%CF%80/d/eng/e/beta");
     expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
     await waitFor(() => {
       expect(lastRoom()).toBe("beta");
@@ -574,7 +584,7 @@ describe("GameRoute", () => {
     view.unmount();
   });
 
-  it.each(["/game/dev", "/game/dev/gallery"])(
+  it.each(["/%CF%80/dev", "/%CF%80/dev/gallery"])(
     "ignores the word on %s",
     async (path) => {
       gl.available = true;

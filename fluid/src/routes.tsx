@@ -96,21 +96,24 @@ const LookDemo = import.meta.env.DEV
   : null;
 
 /**
- * The station itself, one engram's room at `/game/d/<domain>/e/<permalink>`,
+ * The station itself, one engram's room at `/π/d/<domain>/e/<permalink>`,
  * and only in development until the game gets a way in of its own.
  *
  * Gated the way the look demo is, so a production build has neither the
  * chunk nor the route. It sits inside `RequireAuth`, since every room is an
  * engram the account reads, and outside `Layout`, full screen. The splat
  * carries the permalink with its slashes, as the reading screen's route
- * does, so the two addresses convert by adding or dropping `/game`.
+ * does, so the two addresses convert by adding or dropping the `π` prefix.
+ * That prefix is the Unicode character itself, deliberately hard to type:
+ * the game is an Easter egg, meant to be reached from the C64 screen rather
+ * than typed in, and there is no `/game` alias into it any more.
  */
 const GameRoute = import.meta.env.DEV
   ? lazy(() => import("./game/GameRoute"))
   : null;
 
 /**
- * The model gallery at `/game/dev/gallery`: one room with every model the
+ * The model gallery at `/π/dev/gallery`: one room with every model the
  * station draws, for judging them. A development tool, like the look demo,
  * and gated the same way for good.
  */
@@ -172,7 +175,7 @@ export function AppRoutes() {
         */}
         {LookDemo === null ? null : (
           <Route
-            path="/game/dev"
+            path="/π/dev"
             element={
               <Suspense fallback={null}>
                 <LookDemo />
@@ -185,7 +188,7 @@ export function AppRoutes() {
         */}
         {Gallery === null ? null : (
           <Route
-            path="/game/dev/gallery"
+            path="/π/dev/gallery"
             element={
               <Suspense fallback={null}>
                 <Gallery />
@@ -195,7 +198,7 @@ export function AppRoutes() {
         )}
         {GameRoute === null ? null : (
           <Route
-            path="/game/d/:domain/e/*"
+            path="/π/d/:domain/e/*"
             element={
               <Suspense fallback={null}>
                 <GameRoute />
