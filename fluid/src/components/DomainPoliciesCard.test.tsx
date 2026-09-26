@@ -202,6 +202,88 @@ describe("the domain policies card", () => {
     ).toBeNull();
   });
 
+  it("opens the rename dialog from a 'Change name' button beside domain_name, for the owner", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+
+    await userEvent.click(
+      within(domainName).getByRole("button", { name: "Change name" }),
+    );
+
+    // The one dialog the page already owns, not a second one this card
+    // mounts for itself: same title, same fields, as the header's own
+    // "Rename domain" opens.
+    const dialog = await screen.findByRole("dialog", { name: "Rename domain" });
+    expect(within(dialog).getByLabelText("New name")).toBeVisible();
+  });
+
+  it("withholds 'Change name' from a caller with neither the owner nor the admin right", async () => {
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+      "/domains/eng/members": () => ({
+        owner: "somebody-else",
+        visibility: "shared",
+        members: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+
+    expect(
+      within(domainName).queryByRole("button", { name: "Change name" }),
+    ).toBeNull();
+  });
+
+  it("disables 'Change name' with the read-only reason on a read-only instance", async () => {
+    serve({
+      "/auth/me": () =>
+        meResponse({ user: userFixture({ role: "admin" }), read_only: true }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    const button = within(domainName).getByRole("button", {
+      name: "Change name",
+    });
+
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleDescription(
+      "This instance is read only, so nothing here can be changed.",
+    );
+  });
+
+  it("disables 'Change name' with the renaming reason while a rename runs", async () => {
+    serve({
+      "/domains": () => ({
+        ...domainsResponse(),
+        domains: domainsResponse().domains.map((entry) => ({
+          ...entry,
+          renaming: true,
+        })),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    const button = await within(domainName).findByRole("button", {
+      name: "Change name",
+    });
+
+    await waitFor(() => {
+      expect(button).toHaveAttribute("aria-disabled", "true");
+    });
+    expect(button).toHaveAccessibleDescription(
+      "A rename of this domain is already running.",
+    );
+  });
+
   it("says nothing about a declaration the registry knows, whatever holds", async () => {
     serve({
       "/domains/eng/manifest": () =>

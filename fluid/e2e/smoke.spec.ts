@@ -180,6 +180,25 @@ test("the Rename dialog opens from the domain page and can be cancelled", async 
   ).toBeVisible();
 });
 
+test("the same rename dialog also opens from the policies card's 'Change name'", async ({
+  page,
+}) => {
+  await page.goto(`/d/${DOMAIN}`);
+
+  // A second launcher for the one dialog above, not a second dialog: the
+  // accessible name is distinct from the header's own "Rename domain" so
+  // this test can address it on its own.
+  const policies = page.getByRole("region", { name: "Domain policies" });
+  await policies.getByRole("button", { name: "Change name" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Rename domain" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("New name")).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+});
+
 test("an undeclared MANIFEST section explains itself and can be started", async ({
   page,
 }) => {

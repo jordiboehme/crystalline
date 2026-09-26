@@ -152,6 +152,60 @@ export async function disconnectGithub(): Promise<GithubStatus> {
 }
 
 /**
+ * What a peek at a GitHub repository's MANIFEST reports, before anything is
+ * registered.
+ */
+export interface GithubDomainNamePeek {
+  /**
+   * The MANIFEST's own `domain_name`, or null when it declares none, is
+   * missing, or could not be read - the create dialog falls back to
+   * {@link GithubDomainNamePeek.defaultName} in every one of those cases,
+   * exactly as a nameless create itself does.
+   */
+  domainName: string | null;
+  /** The repository's own name segment, the fallback a nameless create takes. */
+  defaultName: string;
+}
+
+/**
+ * Peek at the name a repository's MANIFEST declares, without registering
+ * anything: `GET /api/v1/github/domain-name`, admin only and read-only, the
+ * same gate a `github`-mode create is under.
+ *
+ * Not typed from the generated `components`: the route's 200 schema is an
+ * open object in the OpenAPI snapshot (an example, no shape), so this reads
+ * the two fields it actually promises the way the engine's own untyped JSON
+ * answers elsewhere in this file are read.
+ */
+export async function fetchGithubDomainNamePeek({
+  repo,
+  branch,
+  path,
+}: {
+  repo: string;
+  branch: string;
+  path: string;
+}): Promise<GithubDomainNamePeek> {
+  const query = new URLSearchParams({ repo });
+  // Left out when empty, the way every other optional field on this surface
+  // is: an absent field is "the repository's own default", and an empty one
+  // would be this app answering for it.
+  if (branch !== "") {
+    query.set("branch", branch);
+  }
+  if (path !== "") {
+    query.set("path", path);
+  }
+  const record = asObject(
+    await api<unknown>(`/github/domain-name?${query.toString()}`),
+  );
+  return {
+    domainName: asString(record?.domain_name),
+    defaultName: asString(record?.default_name) ?? "",
+  };
+}
+
+/**
  * One account's own GitHub identity, as the profile card renders and polls it.
  *
  * The instance connection's personal counterpart, and the same promise holds:

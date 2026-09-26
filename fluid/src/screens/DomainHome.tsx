@@ -220,7 +220,7 @@ function DomainPage({
    * domain this page is now showing.
    *
    * Taken into this component's OWN state, once, rather than read from the
-   * cache on every render - a second earlier version of this did the
+   * cache on every render - an earlier version of this did the
    * latter (a plain `getQueryData` call in the render body, cleared from an
    * effect keyed on a domain change) and that has a real gap: `DomainPage`
    * is not the only screen a reader reaches a renamed domain's engrams
@@ -242,9 +242,12 @@ function DomainPage({
    * component instance's own first render, and takes whatever the cache
    * says for the domain that render shows. From then on the cache is never
    * consulted again by this instance - a later effect (below) empties its
-   * slot outright, unconditionally, the first time this domain is ever
-   * shown, so no OTHER mount - a fresh one after a folder/engram/editor
-   * detour, or a plain revisit - can find anything left to replay.
+   * slot outright, unconditionally, on every commit that shows a new domain
+   * value: its own dependency array reruns it exactly then, whether that
+   * commit is a fresh mount or this very instance's own `domain` prop
+   * changing in place, so no OTHER mount - a fresh one after a
+   * folder/engram/editor detour, or a plain revisit - can find anything left
+   * to replay.
    *
    * `renamedFor` carries the domain the state was captured for alongside
    * the report, because ONE thing an initializer cannot do is fire again
@@ -570,7 +573,8 @@ function DomainPage({
 
       {/*
         A rename this reader just made, on the address it landed on: the
-        summary the report carried over the navigation's own state, since
+        summary in `renamedFor.report`, seeded above from the query cache the
+        rename dialog filled (see this component's own module doc), since
         there is nothing left to read it back from - the address that
         answered it is gone the moment the hop lands.
       */}
@@ -763,6 +767,10 @@ function DomainPage({
             domain={domain}
             policies={manifest.data.sections.policies}
             branch={syncStatus.data?.branch ?? null}
+            onRename={() => {
+              setRenamingOpen(true);
+            }}
+            renaming={isRenaming}
           />
         )}
 
