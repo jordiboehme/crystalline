@@ -121,8 +121,17 @@ export default function EngramPage() {
    * dialog hands the counts over in the navigation state, since the dialog
    * that could have said so is gone by the time this page renders.
    */
-  const moved =
-    (useLocation().state as Partial<MovedState> | null)?.moved ?? null;
+  const location = useLocation();
+  const arrival = location.state as
+    (Partial<MovedState> & { followedFrom?: string }) | null;
+  const moved = arrival?.moved ?? null;
+  /**
+   * The permalink this page was at when the stream said it moved here, set
+   * by the follow below: the text is the same engram's, so the old address's
+   * payload stands in while the new one loads, and the page (and the live
+   * region that is about to announce the move) stays mounted through it.
+   */
+  const followedFrom = arrival?.followedFrom ?? null;
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
   // What the chip beside the title opened: the diff, the share dialog about
@@ -156,6 +165,12 @@ export default function EngramPage() {
   const detail = useQuery({
     queryKey: engramDetailKey(domain, permalink),
     queryFn: () => fetchEngramDetail(domain, permalink),
+    placeholderData: (previous, previousQuery) =>
+      followedFrom !== null &&
+      previousQuery?.queryKey[1] === domain &&
+      previousQuery.queryKey[2] === followedFrom
+        ? previous
+        : undefined,
   });
   const graph = useQuery({
     queryKey: graphKey(domain, permalink, NEIGHBORHOOD_DEPTH),
@@ -171,9 +186,35 @@ export default function EngramPage() {
   const recent = useRecentChange(domain, permalink);
   useEffect(() => {
     if (recent?.kind === "moved_away" && recent.to) {
-      void navigate(engramRoute(domain, recent.to), { replace: true });
+      void navigate(engramRoute(domain, recent.to), {
+        replace: true,
+        state: { followedFrom: permalink },
+      });
     }
   }, [recent, domain, permalink, navigate]);
+  /*
+   * The stream's frame for the reader's own move through the dialog, which
+   * the "Moved" line above already says with its counts: that one frame is
+   * swallowed, and only while this history entry is the one the dialog
+   * landed on. Every later change, whoever made it, has its line.
+   */
+  const [ownMove, setOwnMove] = useState<{ at: string; key: string } | null>(
+    null,
+  );
+  const ownMoveNow =
+    moved !== null &&
+    recent?.kind === "moved_here" &&
+    ownMove?.at !== location.key
+      ? { at: location.key, key: changeKey(recent) }
+      : ownMove;
+  if (ownMoveNow !== ownMove) {
+    setOwnMove(ownMoveNow);
+  }
+  const swallowed =
+    recent !== null &&
+    ownMoveNow !== null &&
+    ownMoveNow.at === location.key &&
+    ownMoveNow.key === changeKey(recent);
   useScrollKeeper({
     address: `${domain}/${permalink}`,
     fetching: detail.isFetching,
@@ -617,20 +658,16 @@ export default function EngramPage() {
       )}
       {/*
         What the stream last said about this page, for a minute. The region
-        is always there, so a screen reader hears the text arrive in it;
-        keyed on the address, so a page the reader comes back to after the
-        minute does not flash a change that is already old.
+        is always there and never keyed, so a screen reader hears the text
+        arrive in a region it already knows, a followed move included.
 
-        Nothing on the reader's own move through the dialog: the "Moved"
-        line above already says it, with the counts. Nothing at the old
-        address either, which is about to follow the move.
+        Nothing for the frame of the reader's own move through the dialog
+        (swallowed above), and nothing at the old address, which is about to
+        follow the move.
       */}
       <RecentChangeLine
-        key={`${domain}/${permalink}`}
         change={
-          moved === null && recent && recent.kind !== "moved_away"
-            ? recent
-            : null
+          recent && recent.kind !== "moved_away" && !swallowed ? recent : null
         }
       />
 
@@ -963,8 +1000,20 @@ function RecentChangeLine({ change }: { change: RecentChange | null }) {
   const shownKey = change ? changeKey(change) : null;
   /** The change whose minute is over, by its key: a newer one shows again. */
   const [expired, setExpired] = useState(() =>
-    change && Date.now() - change.at >= RECENT_CHANGE_MS ? shownKey : null,
+    change && isOver(change) ? shownKey : null,
   );
+  /*
+   * A change the line has not shown before, which after a followed link can
+   * be one whose minute is already over (the page stays mounted across
+   * addresses, and so does this region, so a screen reader keeps hearing
+   * the one it already knows). Settled during render, not in an effect, so
+   * an old change never paints for a frame.
+   */
+  const [seen, setSeen] = useState(shownKey);
+  if (shownKey !== seen) {
+    setSeen(shownKey);
+    setExpired(change && isOver(change) ? shownKey : null);
+  }
   useEffect(() => {
     if (!change) return undefined;
     const over = changeKey(change);
@@ -994,6 +1043,11 @@ function RecentChangeLine({ change }: { change: RecentChange | null }) {
       {text}
     </p>
   );
+}
+
+/** Whether a change's minute on the line is already over. */
+function isOver(change: RecentChange): boolean {
+  return Date.now() - change.at >= RECENT_CHANGE_MS;
 }
 
 function changeKey(change: RecentChange): string {

@@ -1811,6 +1811,7 @@ describe("the reading page follows the stream", () => {
       </MemoryRouter>,
     );
     await screen.findByRole("heading", { name: "Alpha" });
+    const region = line();
     // Everything the line ever said on the way: the old address must not
     // say "Updated" for the commit before it follows the move.
     const said: string[] = [];
@@ -1867,6 +1868,9 @@ describe("the reading page follows the stream", () => {
       expect(line()).toHaveTextContent("Moved here a moment ago by ada");
     });
     observer.disconnect();
+    // The region the screen reader already knew, announcing the move: not a
+    // new one mounted with its text already in it.
+    expect(line()).toBe(region);
     expect(said.length).toBeGreaterThan(0);
     expect(said.every((text) => text.startsWith("Moved here"))).toBe(true);
     expect(screen.getByTestId("navigation")).toHaveTextContent(
@@ -1918,6 +1922,109 @@ describe("the reading page follows the stream", () => {
     );
     // Give the frame every chance to have drawn something.
     await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(line().textContent).toBe("");
+    // Only that one frame: somebody else's change afterwards has its line.
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({
+          permalink: "topics/alpha",
+          path: "topics/alpha.md",
+          actor: "bob",
+          checksum: "later1",
+        }),
+        "1:2",
+      );
+    });
+    await waitFor(() => {
+      expect(line()).toHaveTextContent("Updated a moment ago by bob");
+    });
+  });
+
+  it("never flashes a change whose minute passed before the reader got there", async () => {
+    // The page and its region stay mounted across a link to another engram,
+    // so the new page's old change must be settled before it paints.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    serve({
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "decision",
+            path: "alpha.md",
+          },
+          {
+            permalink: "gamma",
+            title: "Gamma",
+            type: "engram",
+            path: "gamma.md",
+          },
+        ],
+      }),
+      "/domains/eng/engrams/gamma": () =>
+        detailResponse({
+          permalink: "gamma",
+          title: "Gamma",
+          path: "gamma.md",
+          content: "# Gamma\n\nOther prose.\n",
+        }),
+      "/domains/eng/inbound/gamma": (path: string) => inboundResponse(path),
+    });
+    // Gamma first, so its page is in the cache and the way back to it
+    // renders at once, with no skeleton in between to remount the line.
+    renderApp(engramRoute("eng", "gamma"));
+    await screen.findByText(/Other prose/);
+    await userEvent.click(
+      within(
+        screen.getByRole("navigation", { name: /engrams|domain/i }),
+      ).getByRole("link", { name: "Alpha" }),
+    );
+    await screen.findByRole("heading", { name: "Alpha" });
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({ permalink: "gamma", path: "gamma.md", checksum: "g1" }),
+        "1:1",
+      );
+    });
+    act(() => {
+      vi.advanceTimersByTime(61_000);
+    });
+    const said: string[] = [];
+    // Read off the records: a flash that was cleared again before the
+    // observer ran still left its text in them.
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        const inRegion =
+          (record.target instanceof Element
+            ? record.target
+            : record.target.parentElement
+          )?.closest('[aria-label="Recent change"]') != null;
+        if (!inRegion) continue;
+        for (const node of record.addedNodes) {
+          if (node.textContent) said.push(node.textContent);
+        }
+        if (record.oldValue) said.push(record.oldValue);
+      }
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      characterDataOldValue: true,
+    });
+    await userEvent.click(
+      within(
+        screen.getByRole("navigation", { name: /engrams|domain/i }),
+      ).getByRole("link", { name: "Gamma" }),
+    );
+    await screen.findByText(/Other prose/);
+    observer.disconnect();
+    expect(said).toEqual([]);
     expect(line().textContent).toBe("");
   });
 });
