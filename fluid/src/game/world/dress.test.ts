@@ -1957,6 +1957,7 @@ describe("rare props (2.6d C9 to C13)", () => {
     // Mutation caught: the small crate (variant 0) marked, whose 0.8 m box
     // the 1.0 m mark overhangs, or a second crate marked.
     let marked = 0;
+    let shifted = 0;
     for (const { name, room } of SWEEP) {
       const plain = dressRoom(room, NO_RESERVE, NO_RARE);
       const eligible = plain.filter((p) => markedVariant(p) !== null);
@@ -1987,27 +1988,46 @@ describe("rare props (2.6d C9 to C13)", () => {
         expect(m.anchor, name).toBe(was.anchor);
         const inner = propFootprint(m);
         const outer = propFootprint(was);
-        const unshifted = propFootprint({
-          ...was,
-          kind: m.kind,
-          variant: m.variant,
-        });
-        if (inner === null || outer === null || unshifted === null)
+        if (inner === null || outer === null)
           throw new Error("floor props have boxes");
-        // A wall-side mark shifts its centre back along its turn by up to
-        // half the depth it loses there (2.6d C12 fix), pinned exactly at
-        // dress.test.ts's WALL_GAP test; every other mark, and every mark
-        // whose depth barely changes, keeps its exact x and y.
-        const dxBound =
-          Math.abs(outer.x1 - outer.x0 - (unshifted.x1 - unshifted.x0)) /
-          2 /
-          CELL;
-        const dzBound =
-          Math.abs(outer.z1 - outer.z0 - (unshifted.z1 - unshifted.z0)) /
-          2 /
-          CELL;
-        expect(Math.abs(m.x - was.x), name).toBeLessThanOrEqual(dxBound + 1e-9);
-        expect(Math.abs(m.y - was.y), name).toBeLessThanOrEqual(dzBound + 1e-9);
+        // A wall-side mark shifts its centre back along its turn by half
+        // the depth it loses there, so its own back still meets the wall
+        // at the gap the crate it replaced stood at, instead of drifting
+        // away from it (2.6d C12 fix). The WALL_GAP test already pins
+        // that every wall-side floor prop's turn matches its spot's wall
+        // (`turnForSide`), so this same cell/side lookup can only find a
+        // real wall: a cluster or corner-zone crate's cell is excluded
+        // from `wallSide` by construction and never matches here, so it
+        // falls to the exact-position check below. A mark whose depth
+        // does not shrink on the wall's axis (a crate-stack v1, already
+        // as deep as the marked stack) shifts nothing either.
+        const spot = dressingSites(room).wallSide.find(
+          (s) => s.cx === Math.floor(was.x) && s.cy === Math.floor(was.y),
+        );
+        const side = spot?.wall ?? null;
+        const shrankZ = outer.z1 - outer.z0 > inner.z1 - inner.z0 + 1e-9;
+        const shrankX = outer.x1 - outer.x0 > inner.x1 - inner.x0 + 1e-9;
+        if (side === "n" && shrankZ) {
+          shifted++;
+          expect(m.x, name).toBe(was.x);
+          expect(inner.z0, name).toBeCloseTo(outer.z0, 6);
+        } else if (side === "s" && shrankZ) {
+          shifted++;
+          expect(m.x, name).toBe(was.x);
+          expect(inner.z1, name).toBeCloseTo(outer.z1, 6);
+        } else if (side === "w" && shrankX) {
+          shifted++;
+          expect(m.y, name).toBe(was.y);
+          expect(inner.x0, name).toBeCloseTo(outer.x0, 6);
+        } else if (side === "e" && shrankX) {
+          shifted++;
+          expect(m.y, name).toBe(was.y);
+          expect(inner.x1, name).toBeCloseTo(outer.x1, 6);
+        } else {
+          expect({ ...m, kind: was.kind, variant: was.variant }, name).toEqual(
+            was,
+          );
+        }
         expect(
           inner.x0 >= outer.x0 - 1e-9 &&
             inner.x1 <= outer.x1 + 1e-9 &&
@@ -2021,6 +2041,7 @@ describe("rare props (2.6d C9 to C13)", () => {
       }
     }
     expect(marked).toBeGreaterThan(0);
+    expect(shifted).toBeGreaterThan(0);
   });
 
   it("places each rare floor prop only where it fits, and the tower only beside a desk on its wall (2.6d C13, Review Focus 5)", () => {
