@@ -486,7 +486,9 @@ CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain
 // `clear_domain` still delete by hand for symmetry with Turso. Written to
 // replay (`IF NOT EXISTS`), because the ledger stamp is a separate statement.
 // `idx_contradiction_pair_domain` carries the order columns as its Turso twin
-// does, so the two schemas stay the same.
+// does, so the two schemas stay the same, and the two `engram_b` indexes serve
+// the second half of `delete_engram`'s `engram_a=$1 OR engram_b=$1` beside the
+// primary keys that serve the first.
 const SCHEMA_V16: &str = r#"
 CREATE TABLE IF NOT EXISTS contradiction_pair (
     domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -515,7 +517,8 @@ CREATE TABLE IF NOT EXISTS contradiction (
     period BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
 );
-CREATE INDEX IF NOT EXISTS idx_contradiction_engrams ON contradiction(engram_a, engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_engram_b ON contradiction(engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
 CREATE INDEX IF NOT EXISTS idx_contradiction_domain ON contradiction(domain_id, model);
 "#;
 

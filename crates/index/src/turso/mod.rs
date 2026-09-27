@@ -985,6 +985,18 @@ pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a
      WHERE cn.domain_id=?1 AND cn.model=?2 AND (cn.score_ab >= ?3 OR cn.score_ba >= ?3) \
      ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
 
+/// One engram's line rows, deleted by [`Store::delete_engram`]: the primary
+/// key serves `engram_a`, `idx_contradiction_engram_b` serves `engram_b`.
+#[doc(hidden)]
+pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
+    "DELETE FROM contradiction WHERE engram_a=?1 OR engram_b=?1";
+
+/// One engram's pair rows, deleted by [`Store::delete_engram`]: the primary
+/// key serves `engram_a`, `idx_contradiction_pair_engram_b` serves `engram_b`.
+#[doc(hidden)]
+pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1";
+
 /// The address lookup behind [`Store::find_engram`].
 ///
 /// A permalink hit wins over a title hit; among title hits the byte-lower path
@@ -1599,8 +1611,8 @@ impl Store for TursoStore {
             // `clear_domain` only, never in `delete_children`, which every
             // upsert runs: a full reindex would erase every score.
             for sql in [
-                "DELETE FROM contradiction WHERE engram_a=?1 OR engram_b=?1",
-                "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1",
+                DELETE_ENGRAM_CONTRADICTIONS_SQL,
+                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
             ] {
                 self.conn.execute(sql, vec![Value::Integer(id)]).await?;
             }

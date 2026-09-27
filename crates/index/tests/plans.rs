@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, twenty-four entries, each named by the function that issues it, so a
+//! One place, twenty-six entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -579,6 +579,32 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             turso_must_seek: &["idx_contradiction_domain"],
             postgres_must_seek: &["idx_contradiction_domain"],
+        },
+        // The two per-engram deletes: the primary key serves `engram_a`, the
+        // `engram_b` index the other half of the OR, so neither half scans.
+        HotStatement {
+            issued_by: "Store::delete_engram (contradiction)",
+            turso: || crystalline_index::turso::DELETE_ENGRAM_CONTRADICTIONS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::DELETE_ENGRAM_CONTRADICTIONS_SQL.to_string(),
+            literals: &["5"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_engram_b"],
+            postgres_must_seek: &["idx_contradiction_engram_b"],
+        },
+        HotStatement {
+            issued_by: "Store::delete_engram (contradiction_pair)",
+            turso: || crystalline_index::turso::DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL.to_string(),
+            postgres: || {
+                crystalline_index::postgres::DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL.to_string()
+            },
+            literals: &["5"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_pair_engram_b"],
+            postgres_must_seek: &["idx_contradiction_pair_engram_b"],
         },
     ]
 }

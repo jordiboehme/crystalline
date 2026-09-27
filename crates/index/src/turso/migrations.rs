@@ -581,6 +581,10 @@ CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 // key so it also serves the read's `ORDER BY engram_a, engram_b`; on
 // `(domain_id, model)` alone the planner scans the primary key for the
 // order instead, which `tests/plans.rs` rejects.
+//
+// `delete_engram` deletes by `engram_a=?1 OR engram_b=?1` on both tables.
+// Each primary key leads with `engram_a` and serves one half of the OR; the
+// two `engram_b` indexes serve the other, so a delete never walks a table.
 const SCHEMA_V17: &str = r#"
 CREATE TABLE contradiction_pair (
     domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -609,7 +613,8 @@ CREATE TABLE contradiction (
     period INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
 );
-CREATE INDEX idx_contradiction_engrams ON contradiction(engram_a, engram_b);
+CREATE INDEX idx_contradiction_engram_b ON contradiction(engram_b);
+CREATE INDEX idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
 CREATE INDEX idx_contradiction_domain ON contradiction(domain_id, model);
 "#;
 
