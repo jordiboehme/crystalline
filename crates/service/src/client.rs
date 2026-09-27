@@ -632,7 +632,7 @@ async fn build_embedded(
         .with_embed_channel(embed_tx)
         .with_read_only(read_only)
         .with_env_overlay(loaded.overlay.clone())
-        .with_machine_owner(machine_owner_for_engine());
+        .with_machine_owner_lookup(machine_owner_for_engine());
     // Told where the state directory is, as the daemon and the standalone
     // opener are; see `open_standalone`.
     if let Ok(state) = crystalline_core::config::state_dir() {
@@ -792,7 +792,7 @@ async fn open_standalone_finishing(
                 bypassed
             ))
         })?
-        .with_machine_owner(machine_owner_for_engine());
+        .with_machine_owner_lookup(machine_owner_for_engine());
     if bypassed {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
@@ -1296,7 +1296,12 @@ fn refuse_rename_off_this_machine(
 ) -> anyhow::Result<()> {
     let state_dir = crystalline_core::config::state_dir()?;
     let opened = crystalline_engine::RenameOwner::for_opened(loaded, db_path, &state_dir);
-    let home = machine_rename_owner()?;
+    let home = machine_rename_owner().map_err(|e| {
+        anyhow::anyhow!(
+            "this machine's own index and configuration cannot be named ({e:#}), so renames are \
+             off until its configuration loads again. Nothing was renamed"
+        )
+    })?;
     let differences = opened.differences_from(&home);
     if differences.is_empty() {
         return Ok(());
@@ -1313,22 +1318,20 @@ fn refuse_rename_off_this_machine(
 pub use crystalline_engine::machine_rename_owner;
 
 /// [`machine_rename_owner`] for an opener to hand its engine
-/// ([`Engine::with_machine_owner`]): the daemon, the embedded stack and the
-/// standalone opener. When this machine's own index cannot be named (its
-/// default configuration does not load, say) the engine is told nothing and
-/// behaves as before, and a warning says that renames and name adoption are
-/// not checked against it.
-pub(crate) fn machine_owner_for_engine() -> Option<crystalline_engine::RenameOwner> {
-    match machine_rename_owner() {
-        Ok(owner) => Some(owner),
-        Err(e) => {
-            tracing::warn!(
-                "this machine's own index could not be named ({e:#}); a rename and the lining \
-                 up of domain names are not checked against it"
-            );
-            None
-        }
+/// ([`Engine::with_machine_owner_lookup`]): the daemon, the embedded stack,
+/// the standalone opener and the direct adoption. A lookup that fails (this
+/// machine's default configuration does not load, say) is handed on as it
+/// is, so the engine refuses a rename and skips a name adoption rather than
+/// running either unchecked; a warning says so once here.
+pub(crate) fn machine_owner_for_engine() -> anyhow::Result<crystalline_engine::RenameOwner> {
+    let lookup = machine_rename_owner();
+    if let Err(e) = &lookup {
+        tracing::warn!(
+            "this machine's own index could not be named ({e:#}); renames and the lining up \
+             of domain names are off until its configuration loads"
+        );
     }
+    lookup
 }
 
 /// Delete this machine's pending rename journal, leaving every step it
@@ -1522,7 +1525,7 @@ pub async fn adopt_domain_names_direct(
     let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
         .with_read_only(read_only)
         .with_env_overlay(loaded.overlay)
-        .with_machine_owner(machine_owner_for_engine());
+        .with_machine_owner_lookup(machine_owner_for_engine());
     // Where a rename keeps its journal, as every other opener says.
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);

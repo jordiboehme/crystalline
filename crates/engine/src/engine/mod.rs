@@ -1022,8 +1022,9 @@ pub struct Engine {
     // plain command opens them, when the opener said so
     // ([`Engine::with_machine_owner`]). A rename and a name adoption move
     // this machine's state folders and configuration, so they run only when
-    // the engine opened exactly these; with none set nothing is compared.
-    machine_owner: Option<crate::rename::RenameOwner>,
+    // the engine opened exactly these; with none set (an engine built by a
+    // test) nothing is compared, and with a lookup that failed nothing runs.
+    machine_owner: Option<crate::rename::MachineOwner>,
     // The rename test seams: a failure after one step, and a hold after one.
     #[cfg(any(test, feature = "testing"))]
     rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
@@ -2252,7 +2253,23 @@ impl Engine {
     /// the engine opened exactly those, never over an index `--db` or
     /// `--config` named instead. An engine without it compares nothing.
     pub fn with_machine_owner(mut self, owner: Option<crate::rename::RenameOwner>) -> Engine {
-        self.machine_owner = owner;
+        self.machine_owner = owner.map(crate::rename::MachineOwner::Known);
+        self
+    }
+
+    /// [`Engine::with_machine_owner`] for a production opener, from the
+    /// lookup itself ([`crate::machine_rename_owner`]). A lookup that failed
+    /// is kept as such, never as "nothing told": a rename is then refused
+    /// with the reason, and a name adoption and the finishing of a rename
+    /// journal are skipped, until this machine's own index can be named.
+    pub fn with_machine_owner_lookup(
+        mut self,
+        lookup: anyhow::Result<crate::rename::RenameOwner>,
+    ) -> Engine {
+        self.machine_owner = Some(match lookup {
+            Ok(owner) => crate::rename::MachineOwner::Known(owner),
+            Err(e) => crate::rename::MachineOwner::Unknown(format!("{e:#}")),
+        });
         self
     }
 

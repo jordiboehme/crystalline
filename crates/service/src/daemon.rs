@@ -399,7 +399,7 @@ pub async fn run_serve(
         .with_read_only(read_only)
         .with_instance_id(instance_id)
         .with_env_overlay(loaded.overlay.clone())
-        .with_machine_owner(crate::client::machine_owner_for_engine());
+        .with_machine_owner_lookup(crate::client::machine_owner_for_engine());
     // Told where the state directory is, as the standalone opener is: the
     // same path the engine resolves on its own in a release build, and under
     // the test seam (which refuses to guess one) the isolated directory a

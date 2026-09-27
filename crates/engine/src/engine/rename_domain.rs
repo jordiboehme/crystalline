@@ -141,6 +141,19 @@ impl Engine {
                     .to_string(),
             ));
         }
+        // Nor while this machine's own index cannot be named: nothing could
+        // tell whether the engine opened it.
+        if let Some(crate::rename::MachineOwner::Unknown(reason)) = &self.machine_owner {
+            return Err(EngineError::Conflict(format!(
+                "this machine's own index and configuration cannot be named ({}), so renames \
+                 are off until its configuration loads again. Nothing was renamed",
+                if may_see_server_paths(scope) {
+                    reason.as_str()
+                } else {
+                    "its configuration does not load"
+                }
+            )));
+        }
         // Not over an index `--db` or `--config` named instead of this
         // machine's own: the steps would move this machine's state folders
         // and write its configuration while its own index keeps the old
@@ -428,7 +441,7 @@ impl Engine {
             );
             return Ok(None);
         }
-        if let Some(machine) = &self.machine_owner
+        if let Some(crate::rename::MachineOwner::Known(machine)) = &self.machine_owner
             && journal.owner.as_ref() != Some(machine)
         {
             tracing::warn!(
@@ -557,12 +570,19 @@ impl Engine {
     }
 
     /// Why the index, configuration or state directory this engine opened
-    /// are not this machine's own, naming each part that differs; `None`
-    /// when they are, or when the opener named no machine owner
-    /// ([`Engine::with_machine_owner`]).
+    /// are not this machine's own, naming each part that differs, or why
+    /// this machine's own could not be named at all; `None` when they are
+    /// this machine's own, or when the opener named no machine owner
+    /// ([`Engine::with_machine_owner`], an engine a test builds).
     pub(crate) async fn off_machine(&self) -> Result<Option<String>> {
-        let Some(machine) = &self.machine_owner else {
-            return Ok(None);
+        let machine = match &self.machine_owner {
+            None => return Ok(None),
+            Some(crate::rename::MachineOwner::Unknown(reason)) => {
+                return Ok(Some(format!(
+                    "this machine's own index and configuration cannot be named ({reason})"
+                )));
+            }
+            Some(crate::rename::MachineOwner::Known(machine)) => machine,
         };
         let state_dir = self.journal_state_dir()?;
         let here = self.rename_owner(&state_dir).await?;

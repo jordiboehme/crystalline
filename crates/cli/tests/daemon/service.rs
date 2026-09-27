@@ -1809,6 +1809,48 @@ fn a_daemon_on_another_index_refuses_a_rename_and_lines_up_no_names() {
     let _ = child.wait();
 }
 
+/// A daemon that cannot name this machine's own index (its default
+/// configuration does not load, and it was started on another one with
+/// `--config`) refuses a rename and says why, and nothing moves: an unknown
+/// answer never falls back to renaming unchecked.
+#[test]
+fn a_daemon_that_cannot_name_this_machines_index_refuses_a_rename() {
+    let env = env_with_movable_state("svunk");
+    let good = env.dir.join("good.yaml");
+    std::fs::copy(env.config_path(), &good).unwrap();
+    std::fs::write(env.config_path(), "domains: [this is not a mapping\n").unwrap();
+    let log = env.dir.join("serve.log");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--config"])
+        .arg(&good)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+    let before = rename_state_snapshot(&env, &[&good]);
+
+    let (ok, out, err) = env.run_full(&["domain", "rename", "eng", "platform", "--local"]);
+    assert!(!ok, "the rename is refused: {out}{err}");
+    assert!(
+        err.contains("cannot be named") && err.contains("Nothing was renamed"),
+        "{err}"
+    );
+    assert!(
+        rename_state_snapshot(&env, &[&good]) == before,
+        "nothing moved"
+    );
+    assert!(!env.state_dir().join("rename-journal.json").exists());
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(text.contains("could not be named"), "{text}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
 /// The embedded MCP stack on another index than this machine's own lines no
 /// names up after its first sync either.
 #[test]

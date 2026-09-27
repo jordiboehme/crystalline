@@ -250,6 +250,20 @@ pub fn machine_rename_owner() -> anyhow::Result<RenameOwner> {
     Ok(RenameOwner::for_opened(&loaded, &db_path, &state_dir))
 }
 
+/// What an opener told an engine about this machine's own index,
+/// configuration and state directory ([`crate::engine::Engine::with_machine_owner_lookup`]).
+#[derive(Debug, Clone)]
+pub enum MachineOwner {
+    /// Named: a rename and a name adoption run only when the engine opened
+    /// exactly these.
+    Known(RenameOwner),
+    /// The lookup failed, for the reason given (this machine's default
+    /// configuration does not load, say). Nothing can be compared, so a
+    /// rename is refused, a name adoption and the finishing of a rename
+    /// journal are skipped, until the lookup works again.
+    Unknown(String),
+}
+
 /// A rename journal as it waits in a state directory, for a caller outside
 /// the engine: `doctor` names it, and a command that opened another index
 /// than this machine's own can tell whether it is that journal's to finish.

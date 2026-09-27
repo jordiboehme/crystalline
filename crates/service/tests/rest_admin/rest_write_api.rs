@@ -35,6 +35,9 @@ struct Options {
 enum MachineOwner {
     AnotherIndex,
     ThisIndex,
+    /// The lookup failed, as it does when this machine's default
+    /// configuration does not load.
+    Unknown,
 }
 
 struct Fixture {
@@ -112,29 +115,34 @@ async fn serve(opts: Options) -> Fixture {
     // without the token-store dir the `DELETE /settings/github` row would
     // resolve to `TokenStore::Keyring` and delete the developer's REAL keychain
     // GitHub token. The override confines the whole matrix to the temp dir.
-    let engine = Arc::new(
-        Engine::new(
-            Arc::new(Mutex::new(store)),
-            cfg,
-            None,
-            Some(config_path.clone()),
-        )
-        .with_read_only(opts.read_only)
-        .with_token_store_dir(root.join("tokens"))
-        .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
-        // Where a rename keeps its journal; every other write route in
-        // this suite never reaches it.
-        .with_state_dir(root.join("state"))
-        .with_machine_owner(opts.machine_owner.map(|which| {
-            // The in-memory store names no index; this machine's own is
-            // a file somewhere else, or none at all like the store's.
-            let index = match which {
-                MachineOwner::AnotherIndex => Some("/elsewhere/index.db"),
-                MachineOwner::ThisIndex => None,
-            };
-            crystalline_service::RenameOwner::new(index, Some(&config_path), &root.join("state"))
-        })),
-    );
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    )
+    .with_read_only(opts.read_only)
+    .with_token_store_dir(root.join("tokens"))
+    .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
+    // Where a rename keeps its journal; every other write route in
+    // this suite never reaches it.
+    .with_state_dir(root.join("state"));
+    // The in-memory store names no index; this machine's own is a file
+    // somewhere else, or none at all like the store's, or a lookup that
+    // failed, handed on through the production builder as an opener does.
+    let owner = |index: Option<&str>| {
+        crystalline_service::RenameOwner::new(index, Some(&config_path), &root.join("state"))
+    };
+    let engine = Arc::new(match opts.machine_owner {
+        None => engine,
+        Some(MachineOwner::AnotherIndex) => {
+            engine.with_machine_owner(Some(owner(Some("/elsewhere/index.db"))))
+        }
+        Some(MachineOwner::ThisIndex) => engine.with_machine_owner(Some(owner(None))),
+        Some(MachineOwner::Unknown) => engine.with_machine_owner_lookup(Err(anyhow::anyhow!(
+            "failed to load config /home/a/config.yaml: expected a mapping"
+        ))),
+    });
     engine.sync(None).await.unwrap();
     // A deterministic embedder, so the neighbours advisory on create and save
     // is assertable at all: without a provider the probe returns empty before
@@ -1766,6 +1774,46 @@ async fn an_instance_on_another_index_refuses_a_rename_and_lines_up_no_names() {
         serde_json::json!([])
     );
     assert!(registered(&config_path));
+}
+
+/// An instance whose opener could not name this machine's own index (its
+/// default configuration does not load) refuses every rename, saying why,
+/// moves nothing, and lines no name up: an unknown answer never falls back
+/// to renaming unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_that_cannot_name_this_machines_index_refuses_a_rename() {
+    let fx = serve(Options {
+        machine_owner: Some(MachineOwner::Unknown),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering", "local_only": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("cannot be named")
+            && body.contains("expected a mapping")
+            && body.contains("Nothing was renamed"),
+        "{body}"
+    );
+    let config_path = fx._tmp.path().join("config.yaml");
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(cfg.domains.contains_key("eng"));
+    assert!(!fx._tmp.path().join("state/rename-journal.json").exists());
+    assert_eq!(
+        fx.engine.adopt_domain_names().await.unwrap(),
+        serde_json::json!([])
+    );
 }
 
 /// The same rename on an instance whose engine opened exactly this
