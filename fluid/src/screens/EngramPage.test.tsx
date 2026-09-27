@@ -21,7 +21,13 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation, useNavigationType } from "react-router";
+import type { NavigateFunction } from "react-router";
+import {
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -1881,6 +1887,61 @@ describe("the reading page follows the stream", () => {
         "topics",
       ),
     ).toBeInTheDocument();
+  });
+
+  describe("keeps the old text on screen only while following a move", () => {
+    let go: NavigateFunction = () => undefined;
+    function Go() {
+      go = useNavigate();
+      return null;
+    }
+
+    /** The reading page of alpha, with beta's detail never answering. */
+    async function onAlphaWithBetaPending() {
+      serve({
+        "/domains/eng/engrams/beta": () => new Promise<never>(() => undefined),
+      });
+      render(
+        <MemoryRouter initialEntries={[engramRoute("eng", "alpha")]}>
+          <App />
+          <Go />
+        </MemoryRouter>,
+      );
+      await screen.findByRole("heading", { name: "Alpha" });
+      await waitFor(() => {
+        expect(document.body.textContent).toContain("Body prose");
+      });
+    }
+
+    it("a plain link to another engram shows its loading state, never the page it left", async () => {
+      // Catches the placeholder handed to any address change: beta's page
+      // would stand there with alpha's text under beta's address.
+      await onAlphaWithBetaPending();
+      act(() => {
+        void go(engramRoute("eng", "beta"));
+      });
+      expect(
+        await screen.findByRole("status", { name: "Loading the engram" }),
+      ).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain("Body prose");
+      expect(screen.queryByRole("heading", { name: "Alpha" })).toBeNull();
+    });
+
+    it("a follow that names another old address does not borrow this one's text", async () => {
+      // Catches the placeholder keyed on "any follow" rather than on the
+      // address the follow came from.
+      await onAlphaWithBetaPending();
+      act(() => {
+        void go(engramRoute("eng", "beta"), {
+          replace: true,
+          state: { followedFrom: "gamma" },
+        });
+      });
+      expect(
+        await screen.findByRole("status", { name: "Loading the engram" }),
+      ).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain("Body prose");
+    });
   });
 
   it("says the reader's own move once, with the dialog's counts", async () => {
