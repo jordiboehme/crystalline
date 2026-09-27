@@ -19,6 +19,8 @@ mod alias;
 pub mod embed;
 mod error;
 mod factory;
+#[cfg(feature = "local-embeddings")]
+mod hub;
 pub mod nli;
 #[cfg(feature = "postgres")]
 pub mod postgres;

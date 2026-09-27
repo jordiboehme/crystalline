@@ -8,6 +8,8 @@
 //! `local-embeddings` feature.
 
 pub mod candidates;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
 pub mod models;
 pub mod period;
 mod stub;
@@ -55,6 +57,49 @@ pub trait ContradictionScorer: Send + Sync {
     fn model_repo(&self) -> &str;
 }
 
+/// The classifier row that means "contradiction", read from the checkpoint's
+/// `id2label` and never assumed: label order differs between checkpoints. A
+/// checkpoint without the label (a binary entailment model) is refused with
+/// its label list.
+pub(crate) fn contradiction_index(
+    id2label: &std::collections::BTreeMap<u32, String>,
+) -> Result<usize> {
+    match id2label
+        .iter()
+        .find(|(_, l)| l.eq_ignore_ascii_case("contradiction"))
+    {
+        Some((i, _)) => Ok(*i as usize),
+        None => Err(crate::error::IndexError::Invalid(format!(
+            "the checkpoint's labels carry no 'contradiction' entry: {}",
+            id2label
+                .iter()
+                .map(|(i, l)| format!("{i}={l}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Load `model`, downloading it on first use. A build without the
+/// `local-embeddings` feature refuses with [`NLI_FEATURE_MISSING`].
+#[cfg(feature = "local-embeddings")]
+pub async fn load_scorer(
+    model: &'static NliModel,
+) -> Result<std::sync::Arc<dyn ContradictionScorer>> {
+    Ok(std::sync::Arc::new(local::LocalNli::load(model).await?))
+}
+
+/// Load `model`, downloading it on first use. A build without the
+/// `local-embeddings` feature refuses with [`NLI_FEATURE_MISSING`].
+#[cfg(not(feature = "local-embeddings"))]
+pub async fn load_scorer(
+    _model: &'static NliModel,
+) -> Result<std::sync::Arc<dyn ContradictionScorer>> {
+    Err(crate::error::IndexError::Unsupported(
+        NLI_FEATURE_MISSING.to_string(),
+    ))
+}
+
 /// How the two reading orders of a line pair combine into one score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderAggregation {
@@ -78,6 +123,47 @@ impl OrderAggregation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_contradiction_label_is_read_never_assumed() {
+        let labels: std::collections::BTreeMap<u32, String> = [
+            (0, "entailment".to_string()),
+            (1, "neutral".to_string()),
+            (2, "contradiction".to_string()),
+        ]
+        .into();
+        assert_eq!(contradiction_index(&labels).unwrap(), 2);
+        let shouting: std::collections::BTreeMap<u32, String> = [
+            (0, "CONTRADICTION".to_string()),
+            (1, "ENTAILMENT".to_string()),
+            (2, "NEUTRAL".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            contradiction_index(&shouting).unwrap(),
+            0,
+            "case-insensitive"
+        );
+        let binary: std::collections::BTreeMap<u32, String> = [
+            (0, "entailment".to_string()),
+            (1, "not_entailment".to_string()),
+        ]
+        .into();
+        let err = contradiction_index(&binary).unwrap_err().to_string();
+        assert!(
+            err.contains("0=entailment, 1=not_entailment"),
+            "the refusal lists the labels: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "local-embeddings"))]
+    #[tokio::test]
+    async fn a_build_without_the_feature_refuses_every_profile() {
+        for model in &NLI_MODELS {
+            let err = load_scorer(model).await.err().expect("refused").to_string();
+            assert!(err.ends_with(NLI_FEATURE_MISSING), "{err}");
+        }
+    }
 
     #[test]
     fn the_two_aggregations_combine_both_orders() {
