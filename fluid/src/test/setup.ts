@@ -8,6 +8,8 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, configure } from "@testing-library/react";
 import { afterEach } from "vitest";
 
+import { FakeBroadcastChannel, FakeLocks } from "../events/testSupport";
+
 afterEach(() => {
   cleanup();
 });
@@ -113,3 +115,18 @@ if (!("ResizeObserver" in globalThis)) {
     writable: true,
   });
 }
+
+// The change stream elects one tab per browser through Web Locks and passes
+// frames on over a `BroadcastChannel`. jsdom has no Web Locks, and Node's
+// own `BroadcastChannel` reaches across worker threads and keeps a process
+// alive while one is open, so every test file gets in-memory stand-ins of
+// both: one fake browser per file, whose only tab is the one under test.
+Object.defineProperty(navigator, "locks", {
+  configurable: true,
+  value: new FakeLocks(),
+});
+Object.defineProperty(globalThis, "BroadcastChannel", {
+  configurable: true,
+  writable: true,
+  value: FakeBroadcastChannel,
+});

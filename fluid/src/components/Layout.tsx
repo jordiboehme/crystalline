@@ -804,9 +804,9 @@ export function Layout() {
   }, [toggleFullWidth]);
 
   return (
-    // One change stream per tab, opened here because this is the
-    // authenticated shell: it mounts once, after login, and never on the
-    // login or setup screens.
+    // This tab's part in the browser's one change stream, taken here because
+    // this is the authenticated shell: it mounts once, after login, and
+    // never on the login or setup screens.
     <ChangeStreamProvider>
       {/*
         The width context goes around the whole frame rather than around the

@@ -1002,7 +1002,7 @@ describe("the engram editor", () => {
     const detailsBefore = details();
     const treesBefore = trees().length;
     expect(detailsBefore).toBe(1);
-    expect(FakeEventSource.instances, "one stream per tab").toHaveLength(1);
+    expect(FakeEventSource.instances, "one stream").toHaveLength(1);
     const source = FakeEventSource.instances[0];
     if (!source) throw new Error("no stream was opened");
     // The session cookie has to ride along, or the stream answers 401.

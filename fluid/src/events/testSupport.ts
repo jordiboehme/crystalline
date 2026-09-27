@@ -57,3 +57,116 @@ export class FakeEventSource {
 export function fakeStreamFactory(url: string): EventSource {
   return new FakeEventSource(url) as unknown as EventSource;
 }
+
+/**
+ * The tabs of one fake browser: channels of one bus hear each other, the
+ * way every tab of a profile hears a `BroadcastChannel` of the same name.
+ */
+export class FakeChannelBus {
+  readonly channels = new Set<FakeBroadcastChannel>();
+}
+
+const defaultBus = new FakeChannelBus();
+
+/**
+ * A `BroadcastChannel` that delivers on a microtask to every other open
+ * channel of its name on its bus, never to itself, as the real one does.
+ */
+export class FakeBroadcastChannel {
+  readonly name: string;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  closed = false;
+  private readonly bus: FakeChannelBus;
+  constructor(name: string, bus: FakeChannelBus = defaultBus) {
+    this.name = name;
+    this.bus = bus;
+    bus.channels.add(this);
+  }
+  postMessage(message: unknown) {
+    if (this.closed) throw new Error("posted on a closed channel");
+    const data = structuredClone(message);
+    for (const other of this.bus.channels) {
+      if (other === this || other.name !== this.name) continue;
+      queueMicrotask(() => {
+        if (!other.closed) {
+          other.onmessage?.(new MessageEvent("message", { data }));
+        }
+      });
+    }
+  }
+  close() {
+    this.closed = true;
+    this.bus.channels.delete(this);
+  }
+  addEventListener() {
+    throw new Error("the fake channel carries onmessage only");
+  }
+}
+
+interface Waiting {
+  run: () => void;
+}
+
+/**
+ * Web Locks, in memory: one holder per name, the rest queued in order,
+ * `ifAvailable` answered with `null` when the lock is held, a queued
+ * request withdrawn by its signal. The holder keeps the lock until the
+ * promise its callback returned settles.
+ */
+export class FakeLocks {
+  private readonly held = new Set<string>();
+  private readonly queues = new Map<string, Waiting[]>();
+
+  /** Whether anybody holds `name` right now. */
+  isHeld(name: string): boolean {
+    return this.held.has(name);
+  }
+
+  request(
+    name: string,
+    options: { ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: unknown) => Promise<void> | void,
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const release = () => {
+        this.held.delete(name);
+        const next = this.queues.get(name)?.shift();
+        next?.run();
+      };
+      const run = () => {
+        this.held.add(name);
+        void Promise.resolve()
+          .then(() => callback({ name }))
+          .then(
+            (value) => {
+              release();
+              resolve(value);
+            },
+            (error: unknown) => {
+              release();
+              reject(error instanceof Error ? error : new Error(String(error)));
+            },
+          );
+      };
+      if (!this.held.has(name)) {
+        run();
+      } else if (options.ifAvailable) {
+        void Promise.resolve()
+          .then(() => callback(null))
+          .then(resolve, reject);
+      } else {
+        const queue = this.queues.get(name) ?? [];
+        const entry: Waiting = { run };
+        queue.push(entry);
+        this.queues.set(name, queue);
+        options.signal?.addEventListener("abort", () => {
+          const at = queue.indexOf(entry);
+          if (at >= 0) {
+            queue.splice(at, 1);
+            reject(new DOMException("aborted", "AbortError"));
+          }
+        });
+      }
+    });
+  }
+}

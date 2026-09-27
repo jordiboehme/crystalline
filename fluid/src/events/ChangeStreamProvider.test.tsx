@@ -6,46 +6,89 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem } from "../api/client";
 import { ME_QUERY_KEY } from "../auth/keys";
-import type { SessionProbe } from "./ChangeStreamProvider";
 import {
   ChangeStreamProvider,
   subscribeToChanges,
 } from "./ChangeStreamProvider";
+import { CLAIM_MS, LEADER_TIMEOUT_MS } from "./election";
+import type { HubDeps, SessionProbe } from "./hub";
+import { ChangeHub, STREAM_NAME } from "./hub";
 import { IgnoredEngramsContext, useIgnoredEngram } from "./ignored";
 import { useRecentChange } from "./recent";
-import { FakeEventSource, fakeStreamFactory } from "./testSupport";
+import {
+  FakeBroadcastChannel,
+  FakeChannelBus,
+  FakeEventSource,
+  FakeLocks,
+  fakeStreamFactory,
+} from "./testSupport";
 
 /** A probe that answers "still signed in as ada". */
 const signedIn: SessionProbe = () =>
   Promise.resolve({ user: { name: "ada" }, anonymous: false });
 
-function tree(
-  client: QueryClient,
-  children: ReactNode,
-  sessionProbe: SessionProbe,
-) {
+/**
+ * One fake browser: its tabs share a lock manager (or none) and a channel
+ * bus. Each `tab` is that tab's hub.
+ */
+function browser({ locks = true }: { locks?: boolean } = {}) {
+  const bus = new FakeChannelBus();
+  const lockManager = locks ? new FakeLocks() : null;
+  return {
+    bus,
+    locks: lockManager,
+    tab(deps: HubDeps = {}): ChangeHub {
+      return new ChangeHub({
+        streamFactory: fakeStreamFactory,
+        sessionProbe: signedIn,
+        locks: lockManager,
+        channel: (name) => new FakeBroadcastChannel(name, bus),
+        random: () => 0.5,
+        ...deps,
+      });
+    },
+  };
+}
+
+/** A lone tab, the shape most cases here need. */
+function lone(deps: HubDeps = {}): ChangeHub {
+  return browser().tab(deps);
+}
+
+function tree(client: QueryClient, children: ReactNode, hub: ChangeHub) {
   return (
     <QueryClientProvider client={client}>
-      <ChangeStreamProvider
-        streamFactory={fakeStreamFactory}
-        sessionProbe={sessionProbe}
-      >
-        {children}
-      </ChangeStreamProvider>
+      <ChangeStreamProvider hub={hub}>{children}</ChangeStreamProvider>
     </QueryClientProvider>
   );
 }
 
-function mount(
+/** Let promise continuations run (a lock grant, a probe), clock untouched. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  });
+}
+
+/** Move the clock inside act, microtasks included. */
+async function advance(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+  await settle();
+}
+
+async function mount(
   client: QueryClient,
   children: ReactNode = <div />,
-  sessionProbe: SessionProbe = signedIn,
+  hub: ChangeHub = lone(),
 ) {
-  const view = render(tree(client, children, sessionProbe));
+  const view = render(tree(client, children, hub));
+  await settle();
   return {
     ...view,
     rerenderWith: (next: ReactNode) => {
-      view.rerender(tree(client, next, sessionProbe));
+      view.rerender(tree(client, next, hub));
     },
   };
 }
@@ -66,11 +109,9 @@ const engram = (permalink: string, kind = "modified") => ({
   draft_of: null,
 });
 
-/** The first source the mounted provider opened. */
+/** The first source any tab opened. */
 function theSource(): FakeEventSource {
-  const source = FakeEventSource.instances[0];
-  if (!source) throw new Error("no source was opened");
-  return source;
+  return sourceAt(0);
 }
 
 /** The `index`th source, which must exist. */
@@ -80,56 +121,68 @@ function sourceAt(index: number): FakeEventSource {
   return source;
 }
 
-/** Let a settled probe's continuation run, without moving the clock. */
-async function settle(): Promise<void> {
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(0);
-  });
+/** The sources still open, across every tab. */
+function openSources(): FakeEventSource[] {
+  return FakeEventSource.instances.filter((source) => source.readyState !== 2);
 }
 
-/** Move the clock inside act, microtasks included. */
-async function advance(ms: number): Promise<void> {
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(ms);
-  });
-}
-
-describe("the change stream", () => {
-  let client: QueryClient;
-  let invalidate: ReturnType<typeof vi.fn>;
-  /** The filters of every `invalidateQueries` call, in order. */
+/** A query client whose invalidations are recorded rather than run. */
+function recordingClient() {
+  const client = new QueryClient();
+  const invalidate = vi.fn().mockResolvedValue(undefined);
+  client.invalidateQueries = invalidate as QueryClient["invalidateQueries"];
   const filters = () =>
     invalidate.mock.calls.map(
       (call) => call[0] as InvalidateQueryFilters | undefined,
     );
-  const invalidatedKeys = () =>
-    filters().map((filter) => JSON.stringify(filter?.queryKey));
+  return {
+    client,
+    invalidate,
+    filters,
+    keys: () => filters().map((filter) => JSON.stringify(filter?.queryKey)),
+    /** How often everything was invalidated at once. */
+    resets: () =>
+      invalidate.mock.calls.filter((call) => call.length === 0).length,
+  };
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  FakeEventSource.instances = [];
+});
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+describe("the change stream in one tab", () => {
+  let client: QueryClient;
+  let invalidate: ReturnType<typeof vi.fn>;
+  let filters: () => (InvalidateQueryFilters | undefined)[];
+  let invalidatedKeys: () => string[];
 
   beforeEach(() => {
-    vi.useFakeTimers();
-    FakeEventSource.instances = [];
-    client = new QueryClient();
-    invalidate = vi.fn().mockResolvedValue(undefined);
-    client.invalidateQueries = invalidate as QueryClient["invalidateQueries"];
-  });
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    vi.useRealTimers();
+    const recording = recordingClient();
+    client = recording.client;
+    invalidate = recording.invalidate;
+    filters = recording.filters;
+    invalidatedKeys = recording.keys;
   });
 
-  it("opens one source per mount with credentials and closes it on unmount", () => {
-    const view = mount(client);
+  it("opens one source per mount and closes it on unmount", async () => {
+    const view = await mount(client);
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(theSource().url).toBe("/api/v1/events");
     view.unmount();
     expect(theSource().readyState).toBe(2);
   });
 
-  it("an unmount inside the window drops the pending invalidations", () => {
+  it("an unmount inside the window drops the pending invalidations", async () => {
     // Catches a cleanup that leaves the coalescing timer running: a late
     // invalidation from a provider that is gone.
-    const view = mount(client);
+    const view = await mount(client);
     act(() => {
       theSource().emit("engram", engram("alpha"), "1:1");
     });
@@ -140,8 +193,8 @@ describe("the change stream", () => {
     expect(invalidate).not.toHaveBeenCalled();
   });
 
-  it("coalesces five frames inside the window into one invalidation per distinct key", () => {
-    mount(client);
+  it("coalesces five frames inside the window into one invalidation per distinct key", async () => {
+    await mount(client);
     const source = theSource();
     act(() => {
       for (let i = 0; i < 5; i++) {
@@ -158,8 +211,8 @@ describe("the change stream", () => {
     expect(keys).toContain(JSON.stringify(["domain-tree", "eng"]));
   });
 
-  it("a reset flushes the pending set and invalidates everything at once", () => {
-    mount(client);
+  it("a reset flushes the pending set and invalidates everything at once", async () => {
+    await mount(client);
     const source = theSource();
     act(() => {
       source.emit("engram", engram("alpha"), "1:1");
@@ -185,9 +238,17 @@ describe("the change stream", () => {
     );
   });
 
+  it("the first source to open resets nothing: there was no gap before it", async () => {
+    await mount(client);
+    act(() => {
+      theSource().open();
+    });
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it("a source that reconnects on its own is left to the browser", async () => {
     const probe = vi.fn(signedIn);
-    mount(client, <div />, probe);
+    await mount(client, <div />, lone({ sessionProbe: probe }));
     act(() => {
       theSource().fail(0);
     });
@@ -197,16 +258,19 @@ describe("the change stream", () => {
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
-  it("a source closed by a 502 during a restart asks the probe and reopens with backoff, then resets (ruling C1b)", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(0.5);
+  it("a source closed by a 502 during a restart asks the probe and reopens with backoff, then resets", async () => {
+    // A closed source is not proof the session ended: a proxy's 502 closes
+    // it too. The probe decides, and a new source cannot send the last id
+    // it saw, so it resets once it opens.
     const seen: string[] = [];
-    const unsubscribe = subscribeToChanges((event) => seen.push(event.event));
     // The daemon is still down at the first probe and up at the second.
     const probe = vi
       .fn<SessionProbe>()
       .mockRejectedValueOnce(new ApiProblem(502, "bad gateway", ""))
       .mockImplementation(signedIn);
-    mount(client, <div />, probe);
+    const hub = lone({ sessionProbe: probe });
+    const unsubscribe = hub.subscribe((event) => seen.push(event.event));
+    await mount(client, <div />, hub);
     act(() => {
       theSource().fail(2);
     });
@@ -234,9 +298,6 @@ describe("the change stream", () => {
     act(() => {
       next.open();
     });
-    // The new source cannot send the last id it saw, so the gap is covered
-    // the way the server covers a lost id: a reset, for the pages and for
-    // every subscriber.
     expect(invalidate).toHaveBeenCalledWith();
     expect(seen).toEqual(["reset"]);
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
@@ -252,8 +313,7 @@ describe("the change stream", () => {
   });
 
   it("the stream cap's 503 backs off 1, 2, 4 seconds and starts over once a source opens", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(0.5);
-    mount(client);
+    await mount(client);
     const refuse = async (index: number, wait: number) => {
       act(() => {
         sourceAt(index).fail(2);
@@ -281,7 +341,7 @@ describe("the change stream", () => {
     const probe = vi
       .fn<SessionProbe>()
       .mockRejectedValue(new ApiProblem(401, "unauthorized", ""));
-    mount(client, <div />, probe);
+    await mount(client, <div />, lone({ sessionProbe: probe }));
     act(() => {
       theSource().fail(2);
     });
@@ -304,7 +364,11 @@ describe("the change stream", () => {
       cleanup();
       invalidate.mockClear();
       FakeEventSource.instances = [];
-      mount(client, <div />, () => Promise.resolve(answer));
+      await mount(
+        client,
+        <div />,
+        lone({ sessionProbe: () => Promise.resolve(answer) }),
+      );
       act(() => {
         theSource().fail(2);
       });
@@ -319,13 +383,15 @@ describe("the change stream", () => {
 
   it("an unmount while the probe is out or the backoff runs never opens a source", async () => {
     let answer: (value: unknown) => void = () => undefined;
-    const view = mount(
+    const view = await mount(
       client,
       <div />,
-      () =>
-        new Promise((resolve) => {
-          answer = resolve;
-        }),
+      lone({
+        sessionProbe: () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      }),
     );
     act(() => {
       theSource().fail(2);
@@ -340,7 +406,7 @@ describe("the change stream", () => {
     ).toHaveLength(1);
 
     FakeEventSource.instances = [];
-    const second = mount(client);
+    const second = await mount(client);
     act(() => {
       theSource().fail(2);
     });
@@ -356,13 +422,15 @@ describe("the change stream", () => {
     // not even an ended session re-asks who is signed in.
     FakeEventSource.instances = [];
     let refuse: (reason: unknown) => void = () => undefined;
-    const third = mount(
+    const third = await mount(
       client,
       <div />,
-      () =>
-        new Promise((_resolve, reject) => {
-          refuse = reject;
-        }),
+      lone({
+        sessionProbe: () =>
+          new Promise((_resolve, reject) => {
+            refuse = reject;
+          }),
+      }),
     );
     act(() => {
       theSource().fail(2);
@@ -373,11 +441,10 @@ describe("the change stream", () => {
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
   });
 
-  it("an ignored engram keeps its detail and graph keys while the rest of the row still fires", () => {
-    mount(client, <Editor />);
-    const source = theSource();
+  it("an ignored engram keeps its detail and graph keys while the rest of the row still fires", async () => {
+    await mount(client, <Editor />);
     act(() => {
-      source.emit("engram", engram("alpha"), "1:1");
+      theSource().emit("engram", engram("alpha"), "1:1");
       vi.advanceTimersByTime(250);
     });
     const keys = invalidatedKeys();
@@ -387,10 +454,10 @@ describe("the change stream", () => {
     void IgnoredEngramsContext;
   });
 
-  it("the exemption ends with the editor: a closed editor's engram refetches again", () => {
+  it("the exemption ends with the editor: a closed editor's engram refetches again", async () => {
     // Catches a registration that is never released, which would leave the
     // engram's detail stale on the reading page for the life of the tab.
-    const view = mount(client, <Editor />);
+    const view = await mount(client, <Editor />);
     view.rerenderWith(<div />);
     act(() => {
       theSource().emit("engram", engram("alpha"), "1:1");
@@ -404,8 +471,8 @@ describe("the change stream", () => {
     );
   });
 
-  it("two registrations of one engram hold it until both are gone", () => {
-    const view = mount(
+  it("two registrations of one engram hold it until both are gone", async () => {
+    const view = await mount(
       client,
       <>
         <Editor />
@@ -430,10 +497,10 @@ describe("the change stream", () => {
     );
   });
 
-  it("an editor that opens inside the window is exempt from the frame that came just before it", () => {
+  it("an editor that opens inside the window is exempt from the frame that came just before it", async () => {
     // Catches the exemption decided when a frame is queued rather than when
     // the window flushes.
-    const view = mount(client);
+    const view = await mount(client);
     act(() => {
       theSource().emit("engram", engram("alpha"), "1:1");
     });
@@ -447,14 +514,14 @@ describe("the change stream", () => {
     expect(keys).toContain(JSON.stringify(["domain-tree", "eng"]));
   });
 
-  it("an engram frame lands in the recent store the reading page reads", () => {
+  it("an engram frame lands in the recent store the reading page reads", async () => {
     // Catches the provider no longer noting frames: the status line and the
     // follow on a move would never appear.
     function Line() {
       const recent = useRecentChange("eng", "alpha");
       return <p>{recent ? `${recent.kind} ${recent.actor ?? ""}` : "none"}</p>;
     }
-    const view = mount(client, <Line />);
+    const view = await mount(client, <Line />);
     expect(view.container.textContent).toBe("none");
     act(() => {
       theSource().emit("engram", { ...engram("alpha"), actor: "ada" }, "1:1");
@@ -462,11 +529,11 @@ describe("the change stream", () => {
     expect(view.container.textContent).toBe("updated ada");
   });
 
-  it("a domain event's engram and graph prefixes pass over an ignored engram and reach every other one", () => {
+  it("a domain event's engram and graph prefixes pass over an ignored engram and reach every other one", async () => {
     // Catches a domain event (a pull collapsed past the threshold, a
     // MANIFEST save) refetching the open editor's detail under its room:
     // the exemption stands while the registration does, whatever the event.
-    mount(client, <Editor />);
+    await mount(client, <Editor />);
     act(() => {
       theSource().emit("domain", { domain: "eng", actor: null }, "1:1");
       vi.advanceTimersByTime(250);
@@ -487,12 +554,55 @@ describe("the change stream", () => {
     expect(invalidatedKeys()).toContain(JSON.stringify(["domain-tree", "eng"]));
   });
 
-  it("subscribeToChanges shares the one source: every frame reaches a listener registered outside the provider (Jordi, 2026-09-27, Section J (m))", () => {
+  it("a listener that throws neither stops the others nor the invalidation", async () => {
+    // Catches one subscriber's bug taking the page's own refresh down with
+    // it.
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const seen: string[] = [];
+    const hub = lone();
+    const first = hub.subscribe(() => {
+      throw new Error("boom");
+    });
+    const second = hub.subscribe((event) => seen.push(event.event));
+    await mount(client, <div />, hub);
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+      vi.advanceTimersByTime(250);
+    });
+    expect(seen).toEqual(["engram"]);
+    expect(invalidatedKeys()).toContain(
+      JSON.stringify(["engram", "eng", "alpha"]),
+    );
+    first();
+    second();
+    error.mockRestore();
+  });
+});
+
+describe("subscribeToChanges", () => {
+  it("shares this tab's one source with the shell: every frame reaches a listener registered outside the provider (Jordi, 2026-09-27)", async () => {
+    // The module's own hub, on the setup's fake Web Locks and channel.
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const { client } = recordingClient();
     const seen: string[] = [];
     const unsubscribe = subscribeToChanges((event) => seen.push(event.event));
-    mount(client);
+    await settle();
+    expect(FakeEventSource.instances, "a listener alone opens it").toHaveLength(
+      1,
+    );
+    const view = render(
+      <QueryClientProvider client={client}>
+        <ChangeStreamProvider>
+          <div />
+        </ChangeStreamProvider>
+      </QueryClientProvider>,
+    );
+    await settle();
     expect(FakeEventSource.instances, "no second connection").toHaveLength(1);
     const source = theSource();
+    expect(source.withCredentials, "the session cookie rides along").toBe(true);
     act(() => {
       source.emit("engram", engram("alpha"), "1:1");
       source.emit("domain", { domain: "eng", actor: null }, "1:2");
@@ -506,30 +616,229 @@ describe("the change stream", () => {
       "engram",
       "domain",
     ]);
+    view.unmount();
+    await settle();
+    expect(source.readyState, "nobody wants it any more").toBe(2);
   });
+});
 
-  it("a listener that throws neither stops the others nor the invalidation", () => {
-    // Catches one subscriber's bug (the game's, later) taking the page's own
-    // refresh down with it.
-    const error = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
+describe("one stream per browser", () => {
+  it("two tabs share one source, and every frame reaches both", async () => {
+    const fake = browser();
+    const first = recordingClient();
+    const second = recordingClient();
     const seen: string[] = [];
-    const first = subscribeToChanges(() => {
-      throw new Error("boom");
-    });
-    const second = subscribeToChanges((event) => seen.push(event.event));
-    mount(client);
+    const hubA = fake.tab();
+    const hubB = fake.tab();
+    await mount(first.client, <div />, hubA);
+    const unsubscribe = hubB.subscribe((event) => seen.push(`${event.event}`));
+    await mount(second.client, <div />, hubB);
+    expect(FakeEventSource.instances, "one connection for both").toHaveLength(
+      1,
+    );
     act(() => {
       theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    await settle();
+    act(() => {
       vi.advanceTimersByTime(250);
     });
-    expect(seen).toEqual(["engram"]);
-    expect(invalidatedKeys()).toContain(
-      JSON.stringify(["engram", "eng", "alpha"]),
+    for (const tab of [first, second]) {
+      expect(tab.keys()).toContain(JSON.stringify(["engram", "eng", "alpha"]));
+      expect(tab.keys()).toContain(JSON.stringify(["domain-tree", "eng"]));
+    }
+    expect(seen, "a listener in the tab without the source").toEqual([
+      "engram",
+    ]);
+    unsubscribe();
+  });
+
+  it("a tab with a listener and no shell follows the leader, and leads when it is alone", async () => {
+    const fake = browser();
+    const shell = recordingClient();
+    const view = await mount(shell.client, <div />, fake.tab());
+    const seen: string[] = [];
+    const unsubscribe = fake.tab().subscribe((event) => seen.push(event.event));
+    await settle();
+    act(() => {
+      theSource().emit("domain", { domain: "eng", actor: null }, "1:1");
+    });
+    await settle();
+    expect(seen).toEqual(["domain"]);
+    view.unmount();
+    await settle();
+    expect(openSources(), "the listener's tab took over").toHaveLength(1);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    unsubscribe();
+  });
+
+  it("when the leading tab closes another takes over, and every tab resets once", async () => {
+    const fake = browser();
+    const tabs = [recordingClient(), recordingClient(), recordingClient()];
+    const hubs = tabs.map(() => fake.tab());
+    const resets = hubs.map(() => 0);
+    const leaves = hubs.map((hub, index) =>
+      hub.subscribe((event) => {
+        if (event.event === "reset") resets[index] = (resets[index] ?? 0) + 1;
+      }),
     );
-    first();
-    second();
-    error.mockRestore();
+    const views = [];
+    for (const [index, tab] of tabs.entries()) {
+      views.push(await mount(tab.client, <div />, hubs[index]));
+    }
+    expect(FakeEventSource.instances).toHaveLength(1);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(
+      tabs.map((tab) => tab.resets()),
+      "the first leader had no gap",
+    ).toEqual([0, 0, 0]);
+
+    views[0]?.unmount();
+    leaves[0]?.();
+    await settle();
+    expect(theSource().readyState, "the old leader's source is gone").toBe(2);
+    expect(openSources(), "exactly one source again").toHaveLength(1);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    act(() => {
+      sourceAt(1).open();
+    });
+    await settle();
+    expect(
+      tabs.slice(1).map((tab) => tab.resets()),
+      "each surviving tab refetches once",
+    ).toEqual([1, 1]);
+    expect(resets.slice(1), "and each tab's listeners hear one reset").toEqual([
+      1, 1,
+    ]);
+    for (const leave of leaves.slice(1)) leave();
+  });
+
+  it("an ended session reaches every tab, and none of them reopens", async () => {
+    const fake = browser();
+    const unauthorized = () =>
+      Promise.reject(new ApiProblem(401, "unauthorized", ""));
+    const first = recordingClient();
+    const second = recordingClient();
+    await mount(
+      first.client,
+      <div />,
+      fake.tab({ sessionProbe: unauthorized }),
+    );
+    const secondHub = fake.tab({ sessionProbe: unauthorized });
+    await mount(second.client, <div />, secondHub);
+    act(() => {
+      theSource().fail(2);
+    });
+    await settle();
+    for (const tab of [first, second]) {
+      expect(tab.invalidate).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+    }
+    await advance(120_000);
+    expect(
+      FakeEventSource.instances,
+      "no tab takes the lock to hear a 401 again",
+    ).toHaveLength(1);
+    expect(fake.locks?.isHeld(STREAM_NAME)).toBe(false);
+    // A listener added while the session is over does not bring it back.
+    const leave = secondHub.subscribe(() => undefined);
+    await advance(60_000);
+    expect(FakeEventSource.instances, "still out of the running").toHaveLength(
+      1,
+    );
+    // The shell mounting again is a new sign-in: that tab takes part again.
+    await mount(recordingClient().client, <div />, secondHub);
+    expect(FakeEventSource.instances, "back after a sign-in").toHaveLength(2);
+    leave();
+  });
+
+  it("unmounting every tab lets go of the lock, the channels and the source", async () => {
+    const fake = browser();
+    const views = [
+      await mount(recordingClient().client, <div />, fake.tab()),
+      await mount(recordingClient().client, <div />, fake.tab()),
+    ];
+    expect(fake.locks?.isHeld(STREAM_NAME)).toBe(true);
+    for (const view of views) view.unmount();
+    await settle();
+    expect(fake.locks?.isHeld(STREAM_NAME)).toBe(false);
+    expect(fake.bus.channels.size).toBe(0);
+    expect(openSources()).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  describe("without Web Locks", () => {
+    it("elects one leader over the channel, hands over when it leaves, and resets once", async () => {
+      const fake = browser({ locks: false });
+      const first = recordingClient();
+      const second = recordingClient();
+      const viewA = await mount(
+        first.client,
+        <div />,
+        fake.tab({ random: () => 0.1 }),
+      );
+      await advance(CLAIM_MS);
+      expect(FakeEventSource.instances, "a lone tab leads").toHaveLength(1);
+      await mount(second.client, <div />, fake.tab({ random: () => 0.2 }));
+      await advance(CLAIM_MS);
+      await advance(LEADER_TIMEOUT_MS * 2);
+      expect(FakeEventSource.instances, "the second tab follows").toHaveLength(
+        1,
+      );
+      act(() => {
+        theSource().emit("engram", engram("alpha"), "1:1");
+      });
+      await settle();
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      expect(second.keys()).toContain(
+        JSON.stringify(["engram", "eng", "alpha"]),
+      );
+
+      viewA.unmount();
+      await settle();
+      await advance(CLAIM_MS);
+      expect(openSources(), "the follower took over").toHaveLength(1);
+      expect(FakeEventSource.instances).toHaveLength(2);
+      act(() => {
+        sourceAt(1).open();
+      });
+      await settle();
+      expect(second.resets()).toBe(1);
+    });
+
+    it("takes over from a leader that went silent without saying so", async () => {
+      // A closed tab runs no cleanup: its heartbeats just stop.
+      const fake = browser({ locks: false });
+      await mount(
+        recordingClient().client,
+        <div />,
+        fake.tab({ random: () => 0.1 }),
+      );
+      await advance(CLAIM_MS);
+      const [leaderElection] = [...fake.bus.channels].filter((channel) =>
+        channel.name.endsWith(":election"),
+      );
+      if (!leaderElection) throw new Error("no election channel");
+      const second = recordingClient();
+      await mount(second.client, <div />, fake.tab({ random: () => 0.2 }));
+      await advance(CLAIM_MS);
+      await advance(LEADER_TIMEOUT_MS);
+      expect(FakeEventSource.instances).toHaveLength(1);
+      leaderElection.postMessage = () => undefined;
+      await advance(LEADER_TIMEOUT_MS + CLAIM_MS);
+      expect(
+        FakeEventSource.instances,
+        "the follower claimed the silent leader's place",
+      ).toHaveLength(2);
+      act(() => {
+        sourceAt(1).open();
+      });
+      await settle();
+      expect(second.resets()).toBe(1);
+    });
   });
 });
