@@ -84,11 +84,17 @@ describe("the approved marks", () => {
   });
 
   it("draws the hammer's runes as one band of separate marks, none a letter (2.6f C14, C15)", () => {
-    // Mutation caught: the band a solid bar, rows of unequal width, or a
-    // letter-shaped glyph from the font pasted in as one of the runes.
-    expect(HAMMER_RUNES.length).toBeGreaterThanOrEqual(3);
+    // Mutation caught: the band a solid bar, rows of unequal width, a
+    // colour key other than the one ink (a stray character `lit` would
+    // still count as lit), or a letter-shaped glyph from the font pasted
+    // in as one of the runes.
+    expect(HAMMER_RUNES).toHaveLength(5);
     const width = HAMMER_RUNES[0]?.length ?? 0;
-    for (const r of HAMMER_RUNES) expect(r).toHaveLength(width);
+    expect(width).toBe(14);
+    for (const r of HAMMER_RUNES) {
+      expect(r).toHaveLength(width);
+      expect(r).toMatch(/^[#.]+$/);
+    }
     const lit = (c: number) => HAMMER_RUNES.some((r) => r[c] !== ".");
     let gaps = 0;
     const marks: [number, number][] = [];
@@ -115,10 +121,15 @@ describe("the approved marks", () => {
   it("cuts the fuel case's trefoil into three blades around a filled centre (2.6f C14)", () => {
     // Mutation caught: a solid disc with no blades, a blade drawn straight
     // down (the case's own angles keep the lower blades either side, never
-    // beneath centre), or the shape losing its left-right mirror.
-    expect(TREFOIL_MARK.length % 2).toBe(1);
+    // beneath centre), the shape losing its left-right mirror, or a
+    // colour key other than the one ink.
+    expect(TREFOIL_MARK).toHaveLength(11);
     const width = TREFOIL_MARK[0]?.length ?? 0;
-    for (const r of TREFOIL_MARK) expect(r).toHaveLength(width);
+    expect(width).toBe(11);
+    for (const r of TREFOIL_MARK) {
+      expect(r).toHaveLength(width);
+      expect(r).toMatch(/^[#.]+$/);
+    }
     for (const r of TREFOIL_MARK) expect([...r].reverse().join(""), r).toBe(r);
     const midRow = Math.floor(TREFOIL_MARK.length / 2);
     const midCol = Math.floor(width / 2);

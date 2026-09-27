@@ -101,6 +101,7 @@ describe("block-pixel font", () => {
   it("draws the new glyph apart from every other glyph (2.6f C15)", () => {
     // Mutation caught: "&" drawn as an "8" or a "B", or a glyph not 5 rows
     // of 3.
+    expect(PIXEL_FONT["&"]).toEqual([".#.", "#.#", ".#.", "#.#", ".##"]);
     const g = PIXEL_FONT["&"];
     expect(g).toBeDefined();
     expect(g).toHaveLength(5);

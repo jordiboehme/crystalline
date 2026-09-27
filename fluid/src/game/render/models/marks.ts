@@ -25,7 +25,7 @@
 
 import type { Rgb } from "../looks";
 
-/** Every approved string of 2.6d, by the prop that draws it. */
+/** Every approved string of 2.6d and 2.6f, by the prop that draws it. */
 export const MARKS = {
   /** The saucer poster's caption, white on its dark lower band. */
   poster: "I WANT TO BELIEVE",
