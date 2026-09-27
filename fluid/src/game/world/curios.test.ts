@@ -20,8 +20,10 @@ import {
 } from "./canned";
 import {
   BALL_FLOOR,
+  BALL_POOL,
   BALL_SHARE,
   CAPSULE_BESIDE,
+  CAPSULE_POOL,
   CAPSULE_SHARE,
   CURIO_CATALOGUE,
   CURIO_CEILING_GAP,
@@ -35,6 +37,7 @@ import {
   GEAR_SHARE,
   PROP_SURFACES,
   RADAR_BESIDE_BALL,
+  RADAR_POOL,
   RADAR_SHARE,
   RETRO_POOLS,
   RETRO_SHARE,
@@ -84,9 +87,11 @@ import {
   dressingSites,
   edgeKey,
   edgeOf,
+  NO_NEAR,
   overlaps,
   wallAnchor,
   type CurioBase,
+  type Near,
 } from "./sites";
 import type {
   Archetype,
@@ -1284,6 +1289,88 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
     expect(placed).toBeGreaterThan(100);
     // The planner measured 81 percent.
     expect(inRaw / placed).toBeGreaterThan(0.7);
+  }, 30_000);
+
+  it("skips a neighbour's curio only on a collision, and drops a one-kind slot for a lower neighbour (2.6f C7, C8)", () => {
+    // Mutation caught: every pick moved when a neighbour's kind is merely
+    // among the fitting kinds, the skip ignored, or the solo rule reading
+    // `curios` instead of `curiosBelow`.
+    const near = (all: CurioKind[], below: CurioKind[] = []): Near => ({
+      ...NO_NEAR,
+      curios: new Set(all),
+      curiosBelow: new Set(below),
+    });
+    const poolOfKind = (kind: CurioKind, a: Archetype) =>
+      ({
+        retro: RETRO_POOLS[a],
+        gear: GEAR_POOLS[a],
+        ball: BALL_POOL,
+        under: UNDER_POOL,
+        tech: TECH_POOLS[a],
+        radar: RADAR_POOL,
+        capsule: CAPSULE_POOL,
+      })[CURIO_CATALOGUE[kind].slot];
+    let untouched = 0;
+    let moved = 0;
+    let radars = 0;
+    for (const made of ROOMS)
+      for (let i = 0; i < 10; i++) {
+        const b = reseed(made.room, "skip-f", made.name, i);
+        const plain = placeCurios(b);
+        const kinds = plain.map((c) => c.kind);
+        // A neighbour's kind the room did not place changes nothing.
+        const absent = CURIO_KINDS.find((k) => !kinds.includes(k));
+        if (absent !== undefined) {
+          expect(placeCurios(b, curioDraws(b), near([absent]))).toEqual(plain);
+          untouched++;
+        }
+        for (const c of plain) {
+          const pool = poolOfKind(c.kind, made.archetype);
+          if (pool.length < 2) continue;
+          const got = placeCurios(b, curioDraws(b), near([c.kind])).map(
+            (x) => x.kind,
+          );
+          if (got.includes(c.kind)) {
+            // A repeat only when no other kind of its slot fits here,
+            // beside the curios the earlier slots place: the room's own
+            // draws with only this slot forced to the other kind.
+            const slot = CURIO_CATALOGUE[c.kind].slot;
+            for (const [k] of pool)
+              if (k !== c.kind) {
+                const forced = {
+                  ...curioDraws(b),
+                  [slot]: {
+                    ...curioDraws(b)[slot],
+                    take: true,
+                    roll: 0,
+                    kind: k,
+                  },
+                };
+                expect(
+                  placeCurios(b, forced).map((x) => x.kind),
+                  `${made.name} ${k}`,
+                ).not.toContain(k);
+              }
+          } else moved++;
+        }
+        if (kinds.includes("treasure-radar")) {
+          radars++;
+          expect(
+            placeCurios(b, curioDraws(b), near([], ["treasure-radar"])).map(
+              (x) => x.kind,
+            ),
+          ).not.toContain("treasure-radar");
+          // Not below: the one-kind pool has nothing else, so the radar stays.
+          expect(
+            placeCurios(b, curioDraws(b), near(["treasure-radar"])).map(
+              (x) => x.kind,
+            ),
+          ).toContain("treasure-radar");
+        }
+      }
+    expect(untouched).toBeGreaterThan(50);
+    expect(moved).toBeGreaterThan(20);
+    expect(radars).toBeGreaterThan(0);
   }, 30_000);
 
   it("names exactly one hovering curio and its lift (2.6d C4)", () => {

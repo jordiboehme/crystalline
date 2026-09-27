@@ -712,10 +712,12 @@ describe("reserved boxes and edges", () => {
       turn: 0,
       seed: 1,
     };
+    // The same room with no hero of its own, handed the reserve instead:
+    // the workshop draws a hero of its own, which would reserve more.
     const room = { ...workshop, heroes: [h] };
     const reserve = heroReserve([h]);
     const props = dressRoom(room);
-    expect(props).toEqual(dressRoom(workshop, reserve));
+    expect(props).toEqual(dressRoom({ ...workshop, heroes: [] }, reserve));
     for (const p of props.filter((q) => q.anchor === "floor"))
       for (const b of reserve.boxes) expect(overlaps(boxOf(p), b)).toBe(false);
   });

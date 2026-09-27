@@ -367,12 +367,12 @@
   ],
   "heroes": [
     {
-      "kind": "hoverboard",
+      "kind": "flying-cloud",
       "variant": 0,
-      "x": 1.5,
-      "y": 10.5,
-      "turn": 1,
-      "seed": 451937118939874
+      "x": 5,
+      "y": 9.5,
+      "turn": 0,
+      "seed": 13372841297063
     }
   ],
   "props": [
@@ -803,6 +803,15 @@
       "kind": "crate",
       "variant": 1,
       "anchor": "floor",
+      "x": 4.5,
+      "y": 7.5,
+      "turn": 1,
+      "seed": 7554166841878963
+    },
+    {
+      "kind": "crate",
+      "variant": 1,
+      "anchor": "floor",
       "x": 5.5,
       "y": 7.5,
       "turn": 0,
@@ -834,33 +843,6 @@
       "y": 9.5,
       "turn": 1,
       "seed": 3802026275378677
-    },
-    {
-      "kind": "barrel",
-      "variant": 1,
-      "anchor": "floor",
-      "x": 3.5,
-      "y": 9.5,
-      "turn": 0,
-      "seed": 2591646911493658
-    },
-    {
-      "kind": "crate-stack",
-      "variant": 1,
-      "anchor": "floor",
-      "x": 4.5,
-      "y": 9.5,
-      "turn": 1,
-      "seed": 2585140044142125
-    },
-    {
-      "kind": "crate",
-      "variant": 2,
-      "anchor": "floor",
-      "x": 5.5,
-      "y": 9.5,
-      "turn": 3,
-      "seed": 6549289440701669
     },
     {
       "kind": "drum-rack",

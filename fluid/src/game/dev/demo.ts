@@ -27,8 +27,8 @@
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
  * own forced-draws path (`roomWithForcedHero`): a canned demo room draws at
- * most one hero of its own (the canned bridge a flying cloud, the hub a
- * hoverboard, the workshop none), so this is
+ * most one hero of its own (the canned bridge a photo console, the hub a
+ * hoverboard, the workshop a flying cloud), so this is
  * how the demo shows any kind standing in a real, generated room rather
  * than only in the hand-built hero hall. The question block is forced
  * through its own draw and the five any-archetype kinds through the draw
@@ -74,13 +74,14 @@ import { createSession, type HudSink, type Session } from "../session";
 import { CANNED_BRIDGE } from "../world/canned";
 import {
   CURIO_CATALOGUE,
+  curioDraws,
   placeCurios,
   type CurioDraws,
   type CurioSlot,
   type SlotDraw,
 } from "../world/curios";
 import { NO_RARE, dressRoom, type RareDraws } from "../world/dress";
-import { generateRoom } from "../world/generate";
+import { generateRoom, nearFor } from "../world/generate";
 import {
   ANY_POOL,
   HERO_POOLS,
@@ -196,8 +197,11 @@ function forcedHeroDraws(
  * its props re-dressed (`dressRoom`) to keep off what that hero reserves,
  * exactly as `generateRoom` dresses a room around the heroes it draws on
  * its own. Its curios are placed again (`placeCurios`) on the re-dressed
- * room, with the room's own draws, so no curio stands on a host that moved
- * or was dropped. The returned room keeps its own archetype throughout;
+ * room, with the room's own draws and neighbours (`nearFor`, 2.6f C9), so
+ * no curio stands on a host that moved or was dropped and a curio the
+ * room skips stays skipped. The forced hero itself never reads the
+ * neighbours, so it lands even where one draws it. The returned room
+ * keeps its own archetype throughout;
  * only the `placeHeroes` call sees the forced one. `placed` is `kind` when it
  * landed, else null: the caller reads it to decide whether to say so on
  * the HUD.
@@ -213,7 +217,13 @@ export function roomWithForcedHero(
   const placed = heroes.length > 0 ? kind : null;
   const withHeroes: RoomSpec = { ...built, heroes };
   const withProps: RoomSpec = { ...withHeroes, props: dressRoom(withHeroes) };
-  return { room: { ...withProps, curios: placeCurios(withProps) }, placed };
+  return {
+    room: {
+      ...withProps,
+      curios: placeCurios(withProps, curioDraws(withProps), nearFor(place)),
+    },
+    placed,
+  };
 }
 
 /**
@@ -282,7 +292,8 @@ export function forcedRareDraws(kind: RarePropKind): RareDraws {
 /**
  * The room `place` becomes with rare prop `kind` forced into it:
  * `generateRoom`'s room, its props dressed again with `forcedRareDraws`, and
- * its curios placed again on the new props, as `roomWithForcedHero` does.
+ * its curios placed again on the new props with the room's own draws and
+ * neighbours, as `roomWithForcedHero` does.
  * The heroes stay as drawn, and the dressing keeps clear of them as
  * `generateRoom`'s does. `placed` is `kind` when it landed, else null.
  */
@@ -296,7 +307,13 @@ export function roomWithForcedProp(
     props: dressRoom(built, NO_RESERVE, forcedRareDraws(kind)),
   };
   const placed = withProps.props.some((p) => p.kind === kind) ? kind : null;
-  return { room: { ...withProps, curios: placeCurios(withProps) }, placed };
+  return {
+    room: {
+      ...withProps,
+      curios: placeCurios(withProps, curioDraws(withProps), nearFor(place)),
+    },
+    placed,
+  };
 }
 
 /**

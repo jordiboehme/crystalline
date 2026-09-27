@@ -102,6 +102,11 @@
  * `dress.ts` to keep its own boxes and wall edges out of the set dressing;
  * see `Reserved`'s own doc comment for what each field keeps clear of.
  *
+ * `Near`, `NO_NEAR` and `skipNear` are what the hero and curio passes
+ * share for their neighbours (2.6f C7, C8): the kinds the rooms a room's
+ * ways lead to draw raw (`nearOf` in `neighbours.ts` fills them), and a
+ * weighted list less those kinds as far as the list allows.
+ *
  * This is the generator side: it imports `footprints.ts`, `lamps.ts`,
  * `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
  * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
@@ -126,7 +131,15 @@ import {
   SPAN_HALF,
   USE_LANE_DEPTH,
 } from "./props";
-import type { Box, Rect, RoomSpec, Side, WallSlot } from "./types";
+import type {
+  Box,
+  CurioKind,
+  HeroKind,
+  Rect,
+  RoomSpec,
+  Side,
+  WallSlot,
+} from "./types";
 import { CELL } from "./units";
 
 /**
@@ -371,6 +384,45 @@ export function pickByRoll<K>(
   }
   const last = picks.at(-1);
   return last === undefined ? null : last[0];
+}
+
+/**
+ * What a room knows of its neighbours' picks (2.6f C5 to C8): the raw hero
+ * (`rawHero`) and raw curios (`rawCurios`) of every room its doors,
+ * portals and hatches lead to, each from that room's own seed and
+ * archetype (`nearOf` in `neighbours.ts`). `heroes` and `curios` hold
+ * every neighbour's, which a pick skips on a collision (C7);
+ * `heroesBelow` and `curiosBelow` only those of a neighbour with a lower
+ * seed, which a solo draw reads (C8), so of two neighbours that both draw
+ * one, the lower keeps it.
+ */
+export interface Near {
+  heroes: ReadonlySet<HeroKind>;
+  heroesBelow: ReadonlySet<HeroKind>;
+  curios: ReadonlySet<CurioKind>;
+  curiosBelow: ReadonlySet<CurioKind>;
+}
+
+/** A room with no neighbour: nothing is skipped. Every forced seam and hand-built room passes it (2.6f C9). */
+export const NO_NEAR: Near = {
+  heroes: new Set(),
+  heroesBelow: new Set(),
+  curios: new Set(),
+  curiosBelow: new Set(),
+};
+
+/**
+ * A weighted list less the kinds in `skip`, as far as the list allows
+ * (2.6f C7): the entries whose kind is not in `skip`, or the whole list
+ * when that would leave none, so a pick never comes up empty because of
+ * its neighbours. Order and weights are kept.
+ */
+export function skipNear<K>(
+  picks: readonly (readonly [K, number])[],
+  skip: ReadonlySet<K>,
+): readonly (readonly [K, number])[] {
+  const left = picks.filter(([k]) => !skip.has(k));
+  return left.length > 0 ? left : picks;
 }
 
 /**

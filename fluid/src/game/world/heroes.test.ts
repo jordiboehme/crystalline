@@ -74,7 +74,11 @@ import {
   interiorBand,
   overlaps,
   wallAnchor,
+  NO_NEAR,
+  pickByRoll,
+  skipNear,
   type DressingSites,
+  type Near,
   type RoomBase,
   type SiteBase,
 } from "./sites";
@@ -753,6 +757,104 @@ describe("the hero pass", () => {
       picks: [{ take: true, roll: forcedPoolRoll(archetype, kind) }],
     };
   };
+
+  /** A `Near` of these heroes, for every neighbour, and those below. */
+  const nearOfKinds = (all: HeroKind[], below: HeroKind[] = []): Near => ({
+    ...NO_NEAR,
+    heroes: new Set(all),
+    heroesBelow: new Set(below),
+  });
+
+  it("re-picks on the same roll only when the raw pick is a neighbour's (2.6f C7)", () => {
+    // Mutation caught: every pick moved when a neighbour's kind is merely
+    // in the pool (not only on a collision), the re-pick drawing afresh
+    // instead of on the same roll, or the skip ignored.
+    let kept = 0;
+    let moved = 0;
+    let fellBack = 0;
+    for (const { archetype, base } of WORKSHOP_BASES)
+      for (const r of reseeded(base, 200)) {
+        const d = heroDraws(r);
+        const raw = rawHero(d, archetype);
+        if (raw === null) continue;
+        const plain = place(base, r);
+        const other = HERO_POOLS[archetype][0]?.[0];
+        if (other === undefined || other === raw) continue;
+        // A neighbour's kind that no pick of the plain pass rolls moves
+        // nothing. The workshop hall has one slot, so the pool slot rolls
+        // from the whole pool; a solo draw that finds no place hands its
+        // slot to that roll, so the raw hero alone is not enough.
+        expect(d.picks).toHaveLength(1);
+        if (
+          d.picks.some(
+            (p) =>
+              p.take && pickByRoll(p.roll, HERO_POOLS[archetype]) === other,
+          )
+        )
+          continue;
+        expect(placeHeroes(r, d, sitesOf(base), nearOfKinds([other]))).toEqual(
+          plain,
+        );
+        kept++;
+        // A placed pool pick that a neighbour draws: the same roll from
+        // the pool less that kind, or the raw kind when that finds no place.
+        const slot = d.picks[0];
+        const fromPool =
+          !d.slab && !d.turret && d.block !== true && slot?.take === true;
+        if (!fromPool || slot === undefined || plain[0]?.kind !== raw) continue;
+        const repick = pickByRoll(
+          slot.roll,
+          skipNear(HERO_POOLS[archetype], new Set([raw])),
+        );
+        if (repick === null) throw new Error(`${archetype}: an empty re-pick`);
+        const skipped = placeHeroes(r, d, sitesOf(base), nearOfKinds([raw]));
+        if (skipped[0]?.kind === raw) {
+          expect(
+            placeHeroes(r, alone(archetype, repick), sitesOf(base)),
+            repick,
+          ).toEqual([]);
+          fellBack++;
+        } else {
+          expect(skipped[0]?.kind, `${archetype} ${raw}`).toBe(repick);
+          moved++;
+        }
+      }
+    expect(kept).toBeGreaterThan(100);
+    expect(moved).toBeGreaterThan(50);
+    console.info(
+      `2.6f re-picks: ${String(moved)} moved, ${String(fellBack)} fell back to the raw kind`,
+    );
+  }, 30_000);
+
+  it("keeps halls filled when the neighbours draw every kind (Review Focus 3)", () => {
+    // Every pool kind and every any kind is a neighbour's, the turret a
+    // lower neighbour's: the picks fall back to the whole lists (C7).
+    // Mutation caught: an empty list after the skip leaving the slot
+    // empty, or a throw.
+    const everything = nearOfKinds(
+      [
+        ...new Set([
+          ...Object.values(HERO_POOLS).flatMap((p) => p.map(([k]) => k)),
+          ...ANY_POOL.map(([k]) => k),
+        ]),
+      ],
+      ["turret"],
+    );
+    let halls = 0;
+    let plainHeld = 0;
+    let nearHeld = 0;
+    for (const { base } of [...WORKSHOP_BASES, ...BRIDGE_BASES])
+      for (const r of reseeded(base, 100)) {
+        halls++;
+        if (place(base, r).length > 0) plainHeld++;
+        const got = placeHeroes(r, heroDraws(r), sitesOf(base), everything);
+        expectHeroInvariants(`${String(r.seed)}`, base, got, sitesOf(base));
+        if (got.length > 0) nearHeld++;
+        expect(got.some((h) => h.kind === "turret")).toBe(false);
+      }
+    expect(halls).toBe(1000);
+    expect(nearHeld).toBeGreaterThanOrEqual(plainHeld - 30);
+  }, 30_000);
 
   it("makes a room's draws from its seed and cap alone (2.6f C6)", () => {
     // Mutation caught: heroDrawsOf reading another stream, or heroDraws

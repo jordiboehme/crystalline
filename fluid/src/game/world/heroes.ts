@@ -42,21 +42,30 @@
  *    `HERO_SHARE` and a roll from `seedFor(seed, "hero", "pick", i)`; the
  *    any-archetype draw a chance of `ANY_SHARE` and a roll from
  *    `seedFor(seed, "hero", "any")`.
- * 2. The slab, when drawn: one candidate, at the hall's centre x with its
+ * 2. The slab, when drawn, unless a lower-seeded neighbour draws it (a
+ *    solo draw, 2.6f C8: `near.heroesBelow`): one candidate, at the hall's centre x with its
  *    south face on the hall's centre line, facing the entrance (turn 2,
  *    H9). It stands only where the centre is free: its box grown by
  *    `HERO_CLEAR` also keeps off every pipe run's box.
- * 3. The turret, when drawn and a slot is left: the cells of the hall's
+ * 3. The turret, when drawn and a slot is left, unless a lower-seeded
+ *    neighbour draws it (C8, as in step 2): the cells of the hall's
  *    corner zones that kept all four spots, centred on the cell and turned
  *    to face the hall's centre (H10).
- * 4. The question block, when drawn and a slot is left, as a band kind.
+ * 4. The question block, when drawn and a slot is left, unless a
+ *    lower-seeded neighbour draws it (C8, as in step 2), as a band kind.
  * 5. The pool slots, in order, while a slot is left: a slot that drew its
  *    chance picks by its roll from the archetype's pool (`HERO_POOLS`) less
- *    the kinds already placed, and tries that kind. A kind that finds no
- *    place leaves its slot empty; nothing is drawn again.
+ *    the kinds already placed, and tries that kind, re-picked on a
+ *    collision (2.6f C7): when a neighbour draws that kind raw
+ *    (`near.heroes`), the same roll picks again from the list less every
+ *    neighbour's kind (`skipNear`, the whole list when that leaves none),
+ *    and when the re-picked kind finds no place the raw kind is tried. A
+ *    kind that finds no place leaves its slot empty; nothing is drawn
+ *    again.
  * 6. The any-archetype draw, when it took and a slot is left: it picks by
  *    its roll from `ANY_POOL` less the kinds already placed and tries that
- *    kind, so it only fills a slot the steps before left empty.
+ *    kind, re-picked on a collision as in step 5, so it only fills a slot
+ *    the steps before left empty.
  * 7. Trying a kind: nothing when the room's ceiling is under the kind's
  *    `heroMinCeiling` (C7); else its candidates by placement, in the order of
  *    their seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18;
@@ -126,10 +135,13 @@ import {
   inside,
   interiorBand,
   overlaps,
+  NO_NEAR,
   pickByRoll,
   round3,
+  skipNear,
   wallAnchor,
   type DressingSites,
+  type Near,
   type Reserved,
   type SiteBase,
 } from "./sites";
@@ -953,13 +965,17 @@ export function faceCentre(hall: Rect, x: number, y: number): number {
  * them, no two of a kind, sorted by `HERO_ORDER` (see the module doc's
  * numbered pass). `draws` default to the room's own (`heroDraws`) and
  * `sites` to `dressingSites(room)`; the tests pass forced draws, and one
- * sites object per layout, since the sites never read the seed. The
- * generator passes neither.
+ * sites object per layout, since the sites never read the seed. `near`
+ * (2.6f C7, C8) is what the room's neighbours draw raw, which the pass
+ * skips; it defaults to `NO_NEAR`, which skips nothing, and the generator
+ * passes the room's own (`nearFor` in `generate.ts`) with its own draws
+ * and sites.
  */
 export function placeHeroes(
   room: SiteBase,
   draws: HeroDraws = heroDraws(room),
   sites: DressingSites = dressingSites(room),
+  near: Near = NO_NEAR,
 ): Hero[] {
   const hall = room.hall;
   const cap = heroCap(hall);
@@ -1128,36 +1144,62 @@ export function placeHeroes(
     return list.sort((a, b) => a.seed - b.seed || a.y - b.y || a.x - b.x);
   };
 
-  const tryPlace = (kind: HeroKind) => {
+  const tryPlace = (kind: HeroKind): boolean => {
     // The ceiling gate (C7): a kind the room's ceiling does not clear.
-    if (heroMinCeiling(kind) > room.ceiling + EPS) return;
+    if (heroMinCeiling(kind) > room.ceiling + EPS) return false;
     for (const c of candidates(kind)) {
       const h = c.make(createRng(c.seed));
       if (fits(h)) {
         out.push(h);
-        return;
+        return true;
       }
     }
+    return false;
   };
 
-  if (draws.slab && out.length < cap) tryPlace("black-slab");
-  if (draws.turret && out.length < cap) tryPlace("turret");
-  if (draws.block === true && out.length < cap) tryPlace("question-block");
+  // A pick (2.6f C7): the kind the roll gives from `left`; only when a
+  // neighbour draws that kind raw, the same roll picks again from `left`
+  // less every neighbour's kind, as far as `left` allows. When the
+  // re-picked kind finds no place, the raw one is tried, so the skip
+  // never empties a hall. Nothing is drawn again.
+  const pickAndPlace = (
+    roll: number,
+    left: readonly (readonly [HeroKind, number])[],
+  ) => {
+    const raw = pickByRoll(roll, left);
+    if (raw === null) return;
+    if (!near.heroes.has(raw)) {
+      tryPlace(raw);
+      return;
+    }
+    const kind = pickByRoll(roll, skipNear(left, near.heroes)) ?? raw;
+    if (!tryPlace(kind) && kind !== raw) tryPlace(raw);
+  };
+  // A solo draw (2.6f C8) is not tried when a neighbour with a lower seed
+  // draws the same kind raw; its slot goes on to the pools.
+  const solo = (kind: HeroKind) => !near.heroesBelow.has(kind);
+
+  if (draws.slab && out.length < cap && solo("black-slab"))
+    tryPlace("black-slab");
+  if (draws.turret && out.length < cap && solo("turret")) tryPlace("turret");
+  if (draws.block === true && out.length < cap && solo("question-block"))
+    tryPlace("question-block");
   const pool: readonly (readonly [HeroKind, number])[] =
     HERO_POOLS[room.archetype];
   for (const pick of draws.picks) {
     if (out.length >= cap) break;
     if (!pick.take) continue;
-    const left = pool.filter(([k]) => !out.some((h) => h.kind === k));
-    const kind = pickByRoll(pick.roll, left);
-    if (kind !== null) tryPlace(kind);
+    pickAndPlace(
+      pick.roll,
+      pool.filter(([k]) => !out.some((h) => h.kind === k)),
+    );
   }
   // The any-archetype draw (C9): only a slot the pools left empty.
   const any = draws.any;
-  if (any !== undefined && any.take && out.length < cap) {
-    const left = ANY_POOL.filter(([k]) => !out.some((h) => h.kind === k));
-    const kind = pickByRoll(any.roll, left);
-    if (kind !== null) tryPlace(kind);
-  }
+  if (any !== undefined && any.take && out.length < cap)
+    pickAndPlace(
+      any.roll,
+      ANY_POOL.filter(([k]) => !out.some((h) => h.kind === k)),
+    );
   return out.sort(HERO_ORDER);
 }

@@ -63,6 +63,10 @@
  * - **C11. Goldens.** Only the `curios` key of a golden ever moves for them.
  * - **C12. Heights.** A curio's top stays under its surface's `clear` and
  *   `CURIO_CEILING_GAP` under the ceiling.
+ * - **2.6f C7, C8.** The neighbours' skip: a pick that a room's
+ *   neighbours draw raw is made again from the other fitting kinds, and a
+ *   one-kind slot is dropped for a lower-seeded neighbour that draws it
+ *   (`Near` in `sites.ts`, step 3 below).
  * - **The lift.** One curio hovers: the drone's mesh starts `CURIO_LIFT`
  *   over its surface (`curioLift`). Its box still runs from the surface
  *   to its top for the fit, the ceiling and the clash, so nothing stands
@@ -94,7 +98,13 @@
  *    `BALL_POOL`, `UNDER_POOL`, `TECH_POOLS[room.archetype]`,
  *    `RADAR_POOL`, `CAPSULE_POOL`, or only the kind its draw forces),
  *    keeps the kinds with a candidate that fits right now, picks one by
- *    `pickByRoll` and places it. A slot with no fitting kind stays empty.
+ *    `pickByRoll` and places it, skipping its neighbours' kinds (2.6f C7,
+ *    C8): when a neighbour draws the picked kind raw (`near.curios`), the
+ *    same roll picks again from the fitting kinds less every neighbour's
+ *    (`skipNear`, all of them when that leaves none), and a slot whose
+ *    pool is one kind is not taken when a lower-seeded neighbour draws
+ *    that kind (`near.curiosBelow`). A forced draw reads neither. A slot
+ *    with no fitting kind stays empty.
  *    A floor ball that fits no corner falls back to the surfaces: the
  *    slot runs again with the same roll, so the ball rate stays
  *    `BALL_SHARE`. Nothing is drawn again.
@@ -157,11 +167,14 @@ import {
   edgeKey,
   edgeOf,
   grow,
+  NO_NEAR,
   overlaps,
   pickByRoll,
   round3,
+  skipNear,
   wallAnchor,
   type CurioBase,
+  type Near,
 } from "./sites";
 import type {
   Archetype,
@@ -1659,10 +1672,15 @@ function poolOf(
  * of them, and it never throws on a room with no host for a drawn kind:
  * that slot just stays empty. The fit filter and the placement share one
  * loop (`tryPlace`), so a kind that counted as fitting always lands.
+ * `near` is what the room's neighbours draw raw (2.6f C7, C8), which the
+ * pass skips outside a forced draw; it defaults to `NO_NEAR`, which skips
+ * nothing, and the generator and the forced-hero and forced-prop seams
+ * pass the room's own (`nearFor` in `generate.ts`).
  */
 export function placeCurios(
   room: CurioBase,
   draws: CurioDraws = curioDraws(room),
+  near: Near = NO_NEAR,
 ): Curio[] {
   const surfaces = hostSurfaces(room);
   let corners: ReturnType<typeof cornerSpots> | null = null;
@@ -1680,6 +1698,12 @@ export function placeCurios(
     )
       continue;
     const pool = poolOf(slot, draw, room.archetype);
+    // A forced draw (the dev seam) never reads its neighbours (2.6f C9).
+    const forced = draw.kind !== undefined;
+    // A one-kind pool is a solo draw (2.6f C8): not tried when a neighbour
+    // with a lower seed draws that kind raw.
+    const only = pool.length === 1 ? pool[0]?.[0] : undefined;
+    if (!forced && only !== undefined && near.curiosBelow.has(only)) continue;
     let floor = slot === "ball" && draws.ball.floor;
     const tryPlace = (kind: CurioKind): Curio | null => {
       for (const cand of candidatesOf(
@@ -1701,7 +1725,15 @@ export function placeCurios(
       floor = false;
       fitting = pool.filter(([kind]) => tryPlace(kind) !== null);
     }
-    const kind = pickByRoll(draw.roll, fitting);
+    // The kind the roll gives from the fitting kinds; only when a
+    // neighbour draws it raw, the same roll picks again from the fitting
+    // kinds less every neighbour's, as far as they allow (2.6f C7). Every
+    // fitting kind lands, so no fallback is needed.
+    const raw = pickByRoll(draw.roll, fitting);
+    const kind =
+      raw !== null && !forced && near.curios.has(raw)
+        ? pickByRoll(draw.roll, skipNear(fitting, near.curios))
+        : raw;
     if (kind === null) continue;
     const c = tryPlace(kind);
     if (c !== null) placed.push(c);

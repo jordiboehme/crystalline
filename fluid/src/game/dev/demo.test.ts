@@ -7,11 +7,17 @@
 import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_WORKSHOP } from "../world/canned";
-import { CURIO_KINDS } from "../world/curios";
+import {
+  CURIO_KINDS,
+  curioDrawsOf,
+  placeCurios,
+  rawCurios,
+} from "../world/curios";
 import { heroBlocker, propFootprint } from "../world/footprints";
-import { generateRoom } from "../world/generate";
+import { generateRoom, nearFor, roomSeed } from "../world/generate";
 import { RARE_PROP_KINDS } from "../world/props";
 import { overlaps } from "../world/sites";
+import type { PlaceInput } from "../world/types";
 import {
   roomWithForcedCurio,
   roomWithForcedHero,
@@ -156,5 +162,61 @@ describe("roomWithForcedProp", () => {
     expect(
       roomWithForcedProp(CANNED_BRIDGE, "designer-tower").placed,
     ).toBeNull();
+  });
+});
+
+describe("the neighbours in the seams (2.6f C9)", () => {
+  it("lands a forced kind that a neighbour draws, and keeps the room's own skip in the seams (Review Focus 5)", () => {
+    // boiler-room draws the hoverboard raw (2.6f baselines), so the
+    // workshop's own pick skips it; the forced seam must not. Mutation
+    // caught: a forced draw reading near, or a seam placing the curios
+    // again without the room's near.
+    expect(nearFor(CANNED_WORKSHOP).heroes.has("hoverboard")).toBe(true);
+    expect(roomWithForcedHero(CANNED_WORKSHOP, "hoverboard").placed).toBe(
+      "hoverboard",
+    );
+    // A lower-seeded hatch whose room draws the radar raw.
+    const mine = roomSeed("station", "pipe-shop");
+    let below: string | null = null;
+    for (let i = 0; i < 50000 && below === null; i++) {
+      const p = `radar-${String(i)}`;
+      const s = roomSeed("station", p);
+      if (
+        s < mine &&
+        rawCurios(curioDrawsOf(s), null).includes("treasure-radar")
+      )
+        below = p;
+    }
+    if (below === null) throw new Error("no lower radar neighbour in 50000");
+    const place: PlaceInput = {
+      ...CANNED_WORKSHOP,
+      inbound: [
+        ...CANNED_WORKSHOP.inbound,
+        {
+          address: { domain: "station", permalink: below },
+          title: below,
+          relType: "links_to",
+        },
+      ],
+      inboundTotal: CANNED_WORKSHOP.inboundTotal + 1,
+    };
+    expect(nearFor(place).curiosBelow.has("treasure-radar")).toBe(true);
+    const built = generateRoom(place);
+    {
+      // Without its neighbours the same room places a radar, so the line
+      // below is not vacuous (the extra hatch could have moved its host).
+      const { curios, ...rest } = built;
+      void curios;
+      expect(placeCurios(rest).map((c) => c.kind)).toContain("treasure-radar");
+    }
+    expect(built.curios.map((c) => c.kind)).not.toContain("treasure-radar");
+    expect(roomWithForcedCurio(place, "treasure-radar").placed).toBe(
+      "treasure-radar",
+    );
+    const { room } = roomWithForcedHero(place, "turret");
+    const { curios, ...rest } = room;
+    void curios;
+    expect(placeCurios(rest).map((c) => c.kind)).toContain("treasure-radar");
+    expect(room.curios.map((c) => c.kind)).not.toContain("treasure-radar");
   });
 });

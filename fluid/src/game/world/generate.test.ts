@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import bridgeGolden from "./golden/bridge.json?raw";
 import workshopGolden from "./golden/workshop.json?raw";
+import { createRng, seedFor } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import {
   MACHINE_KINDS,
@@ -9,9 +10,20 @@ import {
   conditionFor,
   doorStyleFor,
   generateRoom,
+  neighboursOf,
+  roomSeed,
 } from "./generate";
+import { HERO_POOLS, heroDrawsOf, placeHeroes, rawHero } from "./heroes";
 import { HALL_CAP, isFloor } from "./layout";
-import type { Fixture, PlaceInput, RoomSpec } from "./types";
+import { pickByRoll, skipNear } from "./sites";
+import type {
+  Archetype,
+  Fixture,
+  HeroKind,
+  PlaceInput,
+  PlaceReference,
+  RoomSpec,
+} from "./types";
 
 function kinds(fixtures: Fixture[]) {
   return fixtures.map((f) => f.kind).sort();
@@ -683,4 +695,255 @@ describe("generateRoom limits", () => {
       "VALID 2026-01-01 -",
     );
   });
+});
+
+describe("the neighbours (2.6f C5)", () => {
+  const way = (
+    permalink: string,
+    targetType?: string | null,
+  ): PlaceReference => ({
+    relType: "depends_on",
+    target: { domain: null, target: permalink },
+    resolved: true,
+    address: { domain: "station", permalink },
+    targetTitle: permalink,
+    targetSalience: null,
+    ...(targetType === undefined ? {} : { targetType }),
+  });
+
+  it("counts each neighbour once, never the room itself, and nothing a sealed way leads to (Review Focus 1)", () => {
+    // Mutation caught: a duplicate kept, the room's own address kept, the
+    // hatch's unknown type hiding the door's, a way without relType or
+    // address counted, or the order of the input lists mattering.
+    const hatch = (permalink: string) => ({
+      address: { domain: "station", permalink },
+      title: permalink,
+      relType: "links_to",
+    });
+    const place: PlaceInput = {
+      ...CANNED_WORKSHOP,
+      relations: [
+        way("pipe-shop", "runbook"),
+        way("valve-a", "guide"),
+        { ...way("valve-b", "runbook"), relType: null },
+        { ...way("valve-c"), resolved: false, address: null },
+      ],
+      links: [{ ...way("valve-a"), relType: null }],
+      inbound: [hatch("valve-a"), hatch("pipe-shop")],
+      inboundTotal: 2,
+    };
+    expect(place.permalink).toBe("pipe-shop");
+    const expected = [
+      { seed: roomSeed("station", "valve-a"), archetype: "lab" },
+    ];
+    expect(neighboursOf(place)).toEqual(expected);
+    expect(
+      neighboursOf({
+        ...place,
+        relations: [...place.relations].reverse(),
+        inbound: [...place.inbound].reverse(),
+      }),
+    ).toEqual(expected);
+  });
+
+  it("keeps an unknown type unknown and a null type null (Review Focus 2)", () => {
+    // Mutation caught: an absent type read as archetypeFor(null).
+    const place: PlaceInput = {
+      ...CANNED_WORKSHOP,
+      relations: [way("valve-a"), way("valve-b", null)],
+      links: [],
+      inbound: [],
+      inboundTotal: 0,
+    };
+    expect(neighboursOf(place).map((n) => n.archetype)).toEqual([
+      null,
+      archetypeFor(null),
+    ]);
+  });
+
+  it("seeds a room and its neighbours the same way", () => {
+    // Mutation caught: roomSeed drifting from generateRoom's own seed.
+    expect(generateRoom(CANNED_WORKSHOP).seed).toBe(
+      roomSeed("station", "pipe-shop"),
+    );
+  });
+
+  it("halves the heroes two neighbouring rooms share, over a station of rooms (2.6f C7, C8)", () => {
+    // A ring of 300 typed rooms, each with ways to i+1 and i+3 and
+    // hatches from i-1 and i-3. The planner forecast 6.0 percent of ways
+    // sharing a hero without the skip and 2.0 with it. Mutation caught:
+    // generateRoom not handing its near on, or the skip dropped.
+    const N = 300;
+    const TYPES = ["manifest", "decision", "runbook", "reference", "guide"];
+    const at = (i: number) => `ring-${String(((i % N) + N) % N)}`;
+    const typeOf = (i: number) =>
+      TYPES[createRng(seedFor("ring-type", ((i % N) + N) % N)).int(0, 4)] ??
+      "guide";
+    const placeOf = (i: number): PlaceInput => ({
+      ...CANNED_WORKSHOP,
+      permalink: at(i),
+      title: at(i),
+      type: typeOf(i),
+      relations: [1, 3].map((o) => way(at(i + o), typeOf(i + o))),
+      links: [],
+      inbound: [1, 3].map((o) => ({
+        address: { domain: "station", permalink: at(i - o) },
+        title: at(i - o),
+        relType: "depends_on",
+        type: typeOf(i - o),
+      })),
+      inboundTotal: 2,
+    });
+    const rooms = Array.from({ length: N }, (_, i) => generateRoom(placeOf(i)));
+    const plain = rooms.map((r) => {
+      const { heroes, props, curios, ...base } = r;
+      void heroes;
+      void props;
+      void curios;
+      return placeHeroes(base);
+    });
+    const shared = (list: readonly { kind: string }[][]) => {
+      let n = 0;
+      for (let i = 0; i < N; i++)
+        for (const o of [1, 3]) {
+          const a = list[i] ?? [];
+          const b = list[(i + o) % N] ?? [];
+          if (a.some((h) => b.some((g) => g.kind === h.kind))) n++;
+        }
+      return n;
+    };
+    const before = shared(plain);
+    const after = shared(rooms.map((r) => r.heroes));
+    console.info(
+      `2.6f ways sharing a hero: ${String(before)} -> ${String(after)} of ${String(2 * N)}`,
+    );
+    expect(before).toBeGreaterThan(15);
+    expect(after).toBeLessThanOrEqual(before / 2);
+    expect(after).toBeLessThanOrEqual(0.04 * 2 * N);
+  }, 30_000);
+  it("keeps a shared solo draw in the lower-seeded room only, and moves both rooms off a shared pool pick (Review Focus 4)", () => {
+    // Mutation caught: both rooms dropping the turret (no tie-break),
+    // both keeping it, or a shared pool pick kept.
+    const find = (want: (p: string) => boolean, skip: string[] = []) => {
+      for (let i = 0; i < 20000; i++) {
+        const p = `pair-${String(i)}`;
+        if (!skip.includes(p) && want(p)) return p;
+      }
+      throw new Error("no such permalink in 20000");
+    };
+    const rawOf = (p: string, a: Archetype | null) =>
+      rawHero(heroDrawsOf(roomSeed("station", p), 1), a);
+    const pair = (p: string, q: string, type: string): [RoomSpec, RoomSpec] => {
+      const one = (me: string, other: string): PlaceInput => ({
+        ...CANNED_WORKSHOP,
+        permalink: me,
+        title: me,
+        type,
+        relations: me === p ? [way(other, type)] : [],
+        links: [],
+        inbound:
+          me === q
+            ? [
+                {
+                  address: { domain: "station", permalink: other },
+                  title: other,
+                  relType: "depends_on",
+                  type,
+                },
+              ]
+            : [],
+        inboundTotal: me === q ? 1 : 0,
+      });
+      return [generateRoom(one(p, q)), generateRoom(one(q, p))];
+    };
+    const tp = find((x) => rawOf(x, null) === "turret");
+    const tq = find((x) => rawOf(x, null) === "turret", [tp]);
+    const [a, b] = pair(tp, tq, "guide");
+    // Each pair room's own layout takes a turret, so a failure below points
+    // at the tie-break and not at the layout.
+    for (const room of [a, b]) {
+      const { heroes, props, curios, ...rest } = room;
+      void heroes;
+      void props;
+      void curios;
+      expect(
+        placeHeroes(rest, { slab: false, turret: true, picks: [] }).map(
+          (h) => h.kind,
+        ),
+      ).toEqual(["turret"]);
+    }
+    const lower = a.seed < b.seed ? a : b;
+    const higher = lower === a ? b : a;
+    expect(lower.heroes.map((h) => h.kind)).toContain("turret");
+    expect(higher.heroes.map((h) => h.kind)).not.toContain("turret");
+    // Both pair rooms' own layouts must take the helper robot alone, so a
+    // failure below points at the skip and not at the layout. A room's
+    // decor and candidate order follow its seed, so not every permalink's
+    // layout does: the pair is the first of the raw helper robot rooms whose
+    // two layouts both take it.
+    const takesRobot = (room: RoomSpec) => {
+      const { heroes, props, curios, ...rest } = room;
+      void heroes;
+      void props;
+      void curios;
+      const at = HERO_POOLS.engineering.findIndex(
+        ([k]) => k === "helper-robot",
+      );
+      const w0 = HERO_POOLS.engineering
+        .slice(0, at)
+        .reduce((sum, [, w]) => sum + w, 0);
+      return (
+        placeHeroes(rest, {
+          slab: false,
+          turret: false,
+          picks: [{ take: true, roll: (w0 + 1.5) / 22 }],
+        })
+          .map((h) => h.kind)
+          .join() === "helper-robot"
+      );
+    };
+    const robots: string[] = [];
+    for (let i = 0; i < 20000 && robots.length < 40; i++)
+      if (rawOf(`pair-${String(i)}`, "engineering") === "helper-robot")
+        robots.push(`pair-${String(i)}`);
+    let pools: [RoomSpec, RoomSpec] | null = null;
+    search: for (const [i, pp] of robots.entries())
+      for (const pq of robots.slice(i + 1)) {
+        const both = pair(pp, pq, "runbook");
+        if (both.every(takesRobot)) {
+          pools = both;
+          break search;
+        }
+      }
+    if (pools === null)
+      throw new Error("no pool pair whose layouts both take the helper robot");
+    for (const room of pools) {
+      expect(room.heroes.length).toBeGreaterThan(0);
+      if (!room.heroes.some((h) => h.kind === "helper-robot")) continue;
+      // Kept only when its re-pick finds no place in this hall (C7).
+      const roll = heroDrawsOf(room.seed, 1).picks[0]?.roll ?? 0;
+      const repick = pickByRoll(
+        roll,
+        skipNear(HERO_POOLS.engineering, new Set<HeroKind>(["helper-robot"])),
+      );
+      const { heroes, props, curios, ...b } = room;
+      void heroes;
+      void props;
+      void curios;
+      const index = HERO_POOLS.engineering.findIndex(([k]) => k === repick);
+      expect(index).toBeGreaterThanOrEqual(0);
+      const before = HERO_POOLS.engineering
+        .slice(0, index)
+        .reduce((s, [, w]) => s + w, 0);
+      const w = HERO_POOLS.engineering[index]?.[1] ?? 0;
+      expect(
+        placeHeroes(b, {
+          slab: false,
+          turret: false,
+          picks: [{ take: true, roll: (before + w / 2) / 22 }],
+        }),
+        `${String(repick)} alone`,
+      ).toEqual([]);
+    }
+  }, 30_000);
 });

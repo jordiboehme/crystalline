@@ -35,7 +35,8 @@
  *
  * 8. Last, the heroes and the set dressing. The heroes (`placeHeroes`,
  *    `heroes.ts`) stand after the scaffold and before the dressing, which
- *    keeps off what they reserve (`heroReserve`). Then `dressRoom`
+ *    keeps off what they reserve (`heroReserve`), skipping, by `near`
+ *    (`nearFor`, 2.6f C5 to C8), what the rooms its ways lead to draw. Then `dressRoom`
  *    (`dress.ts`) reads the finished room, fixtures, furniture,
  *    scaffolding and heroes included, and adds its props. The dressing runs
  *    after everything else and only ever adds decoration, so a prop never
@@ -43,7 +44,8 @@
  *    so the dressing never has to work them out again.
  * 9. Last, the curios (`placeCurios`, `curios.ts`), after the dressing,
  *    since shelves and cabinets are props; they read everything and move
- *    nothing.
+ *    nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the
+ *    rooms its ways lead to draw.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -58,10 +60,16 @@ import {
   type SlotPref,
 } from "./layout";
 import { dressRoom } from "./dress";
-import { placeCurios } from "./curios";
+import { curioDraws, placeCurios } from "./curios";
 import { decorFootprint } from "./footprints";
-import { placeHeroes } from "./heroes";
-import type { CurioBase, RoomBase } from "./sites";
+import { heroDraws, placeHeroes } from "./heroes";
+import { nearOf, type Neighbour } from "./neighbours";
+import {
+  dressingSites,
+  type CurioBase,
+  type Near,
+  type RoomBase,
+} from "./sites";
 import { sectionsOf } from "./sections";
 import {
   HATCH_CAP,
@@ -460,9 +468,48 @@ function intersects(a: Box, b: Box) {
   return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
 }
 
+/** A room's seed: the generator's version, its domain and its permalink. What a neighbour's draws start from too (2.6f C5). */
+export function roomSeed(domain: string, permalink: string): number {
+  return seedFor(GAME_VERSION, domain, permalink);
+}
+
+/**
+ * The rooms a place's ways lead to (2.6f C5): every relation with a
+ * relation type and an address, every link with an address and every
+ * hatch, each address once, never the place's own, sorted by address. A
+ * neighbour's archetype comes from its type when the way carries one
+ * (`targetType`, a hatch's `type`), and is null when unknown; a type
+ * learnt from any way beats an unknown one.
+ */
+export function neighboursOf(place: PlaceInput): Neighbour[] {
+  const self = addressKey({ domain: place.domain, permalink: place.permalink });
+  const seen = new Map<string, Neighbour>();
+  const add = (a: PlaceAddress | null, type: string | null | undefined) => {
+    if (a === null) return;
+    const key = addressKey(a);
+    if (key === self) return;
+    const archetype = type === undefined ? null : archetypeFor(type);
+    const known = seen.get(key);
+    if (known === undefined || (known.archetype === null && archetype !== null))
+      seen.set(key, { seed: roomSeed(a.domain, a.permalink), archetype });
+  };
+  for (const r of place.relations)
+    if (r.relType !== null) add(r.address, r.targetType);
+  for (const l of place.links) add(l.address, l.targetType);
+  for (const h of place.inbound) add(h.address, h.type);
+  return [...seen.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, n]) => n);
+}
+
+/** What a place's neighbours draw raw (2.6f C6): `nearOf` its seed and `neighboursOf` it. */
+export function nearFor(place: PlaceInput): Near {
+  return nearOf(roomSeed(place.domain, place.permalink), neighboursOf(place));
+}
+
 /** The room a place becomes. See the module doc for the rules. */
 export function generateRoom(place: PlaceInput): RoomSpec {
-  const seed = seedFor(GAME_VERSION, place.domain, place.permalink);
+  const seed = roomSeed(place.domain, place.permalink);
   const salience = clamp(place.salience ?? 3, 0, 10);
   const condition = conditionFor(place.status);
   const archetype = archetypeFor(place.type);
@@ -623,7 +670,11 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   // The heroes stand before the dressing, which keeps off what they
   // reserve. They replace the empty list in place, so the keys (and the
   // goldens) read fixtures, decor, scaffold, heroes, props, curios, lights.
-  const room: RoomBase = { ...base, heroes: placeHeroes(base) };
+  const near = nearFor(place);
+  const room: RoomBase = {
+    ...base,
+    heroes: placeHeroes(base, heroDraws(base), dressingSites(base), near),
+  };
   // The curios come last, on the dressed room, since shelves and filing
   // cabinets are props; they read everything and move nothing.
   const dressed: CurioBase = { ...room, props: dressRoom(room) };
@@ -631,7 +682,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   return {
     ...head,
     props: dressed.props,
-    curios: placeCurios(dressed),
+    curios: placeCurios(dressed, curioDraws(dressed), near),
     lights,
     dropped: left,
     inboundMore: more,
