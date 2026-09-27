@@ -46,12 +46,16 @@
  * frames go to the renderer as `draw`'s fifth argument, never into the
  * door states that decide travel, and collision reads neither.
  *
- * Keys, by `KeyboardEvent.code`: W, A, S and D walk, the arrows turn and
- * look, E uses what the player faces, F opens the current engram in Fluid,
- * I inverts the vertical look (remembered in `localStorage` under
- * `INVERT_KEY`), and 1, 2 and 4 switch the look. While the CRT reader is
- * open it reads the keys itself: the session ignores its own commands and
- * all movement until the host calls `closeReader`.
+ * Keys, by `KeyboardEvent.code`, the classic layout plus WASD: Up and Down
+ * (or W and S) walk, Left and Right turn, and strafe while Alt is held,
+ * comma and period (or A and D) strafe, Shift held runs, Space uses what
+ * the player faces, F opens the current engram in Fluid, I inverts the
+ * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
+ * and 1, 2 and 4 switch the look. Only the mouse looks up and down. The
+ * browser's own meaning of Space, the arrows, comma, period and Alt is
+ * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
+ * reader is open it reads the keys itself: the session ignores its own
+ * commands and all movement until the host calls `closeReader`.
  *
  * Typed with no pause longer than a second, `idclev` opens the level select
  * when the host passed `onLevels` (the game route): the word's I toggle is
@@ -286,8 +290,38 @@ const FAILED: Record<Exclude<LoadedPlace["kind"], "place">, string> = {
 /** The notice for a load that failed in a way the server did not explain. */
 const LOAD_ERROR = "?LOAD ERROR";
 
-/** How much one tick of an arrow key looks up or down, in mouse pixels. */
-const ARROW_LOOK = 12;
+/**
+ * The movement keys by `KeyboardEvent.code`, the classic layout first and
+ * WASD beside it. The keys of one direction are ORed, so two held at once
+ * move no faster than one. Left and Right turn, and strafe instead while
+ * an Alt key is held (matched by code, so macOS Option's special
+ * characters do not matter). Up and Down walk; only the mouse looks up
+ * and down.
+ */
+const FORWARD_KEYS = ["ArrowUp", "KeyW"] as const;
+const BACK_KEYS = ["ArrowDown", "KeyS"] as const;
+const STRAFE_LEFT_KEYS = ["Comma", "KeyA"] as const;
+const STRAFE_RIGHT_KEYS = ["Period", "KeyD"] as const;
+const ALT_KEYS = ["AltLeft", "AltRight"] as const;
+/** Held, the run keys double the walk (`RUN_FACTOR`). */
+const RUN_KEYS = ["ShiftLeft", "ShiftRight"] as const;
+
+/**
+ * The game's keys whose browser default it cancels while no overlay has
+ * the keys and no Ctrl or Cmd is held: Space and the arrows scroll, Alt
+ * with Left goes back in the history and a lone Alt opens the menu bar.
+ * Letters are left alone.
+ */
+const CLAIMED_KEYS: ReadonlySet<string> = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Space",
+  "Comma",
+  "Period",
+  ...ALT_KEYS,
+]);
 
 /** The use key: doors, terminals, the hatch. */
 const USE_KEY = "Space";
@@ -402,6 +436,12 @@ export function createSession(opts: SessionOptions): Session {
     if (!modal()) input.requestLock();
   };
   canvas.addEventListener("click", onClick);
+  const onClaimedKey = (e: KeyboardEvent) => {
+    if (modal() || e.ctrlKey || e.metaKey || !CLAIMED_KEYS.has(e.code)) return;
+    e.preventDefault();
+  };
+  window.addEventListener("keydown", onClaimedKey);
+  window.addEventListener("keyup", onClaimedKey);
 
   // The notice shown when no timed one is up: a missing GPU wins over a
   // place that could not be entered.
@@ -811,8 +851,10 @@ export function createSession(opts: SessionOptions): Session {
     return true;
   };
 
-  const axis = (plus: string, minus: string) =>
-    (input.held(plus) ? 1 : 0) - (input.held(minus) ? 1 : 0);
+  const anyHeld = (codes: readonly string[]) =>
+    codes.some((code) => input.held(code));
+  const axis = (plus: boolean, minus: boolean) =>
+    (plus ? 1 : 0) - (minus ? 1 : 0);
 
   const tick = () => {
     ticks++;
@@ -865,19 +907,24 @@ export function createSession(opts: SessionOptions): Session {
 
     const look = modal() || loading ? { dx: 0, dy: 0 } : input.takeLook();
     const still = modal() || loading;
+    const alt = anyHeld(ALT_KEYS);
+    const left = input.held("ArrowLeft");
+    const right = input.held("ArrowRight");
     previous = player;
     player = stepPlayer(
       player,
       {
-        forward: still ? 0 : axis("KeyW", "KeyS"),
-        strafe: still ? 0 : axis("KeyD", "KeyA"),
-        turn: still ? 0 : axis("ArrowLeft", "ArrowRight"),
+        forward: still ? 0 : axis(anyHeld(FORWARD_KEYS), anyHeld(BACK_KEYS)),
+        strafe: still
+          ? 0
+          : axis(
+              anyHeld(STRAFE_RIGHT_KEYS) || (alt && right),
+              anyHeld(STRAFE_LEFT_KEYS) || (alt && left),
+            ),
+        turn: still || alt ? 0 : axis(left, right),
         lookDx: look.dx,
-        lookDy: lookDelta(
-          look.dy + (still ? 0 : axis("ArrowDown", "ArrowUp") * ARROW_LOOK),
-          inverted,
-        ),
-        run: !still && (input.held("ShiftLeft") || input.held("ShiftRight")),
+        lookDy: lookDelta(look.dy, inverted),
+        run: !still && anyHeld(RUN_KEYS),
       },
       room,
       blockers,
@@ -1025,6 +1072,8 @@ export function createSession(opts: SessionOptions): Session {
       ratioQuery?.removeEventListener("change", onRatioChange);
       ratioQuery = null;
       canvas.removeEventListener("click", onClick);
+      window.removeEventListener("keydown", onClaimedKey);
+      window.removeEventListener("keyup", onClaimedKey);
       canvas.removeEventListener("webglcontextlost", onLost);
       canvas.removeEventListener("webglcontextrestored", onRestored);
       input.dispose();

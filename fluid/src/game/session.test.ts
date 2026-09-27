@@ -153,6 +153,8 @@ let openFluid: ReturnType<typeof vi.fn<(path: string) => void>>;
 let sessions: Session[];
 let now: number;
 let pending: ((t: number) => void) | null;
+/** The canvas of the newest session `start` made. */
+let lastCanvas: HTMLCanvasElement | null = null;
 
 /** The hand-cranked clock the loop runs on. */
 const clock: Clock = {
@@ -195,8 +197,9 @@ function start(
       renderer,
       color: "rgba8",
     }));
+  lastCanvas = options.canvas ?? document.createElement("canvas");
   const session = createSession({
-    canvas: options.canvas ?? document.createElement("canvas"),
+    canvas: lastCanvas,
     client: options.client === undefined ? client : options.client,
     hud,
     navigate,
@@ -223,6 +226,19 @@ function lastCamera(): Camera {
   const call = renderer.draw.mock.calls.at(-1);
   if (call === undefined) throw new Error("nothing drawn");
   return call[0];
+}
+
+/**
+ * Moves the mouse `dy` pixels (negative is forward, which looks up) with
+ * the pointer locked to the newest session's canvas, then unlocks it.
+ */
+function mouseLook(dy: number) {
+  Object.defineProperty(document, "pointerLockElement", {
+    configurable: true,
+    get: () => lastCanvas,
+  });
+  document.dispatchEvent(new MouseEvent("mousemove", { movementY: dy }));
+  Reflect.deleteProperty(document, "pointerLockElement");
 }
 
 function key(type: "keydown" | "keyup", code: string, repeat = false) {
@@ -869,29 +885,26 @@ describe("keys", () => {
     const first = start({ client: null });
     first.showCanned(CANNED_BRIDGE);
     frames(1);
-    key("keydown", "ArrowUp");
+    mouseLook(-48);
     frames(4);
     expect(lastCamera().pitch).toBeGreaterThan(0);
-    key("keyup", "ArrowUp");
 
     key("keydown", "KeyI");
     frames(1);
     expect(hud.notice).toHaveBeenCalledWith("LOOK INVERTED");
     expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
     const before = lastCamera().pitch;
-    key("keydown", "ArrowUp");
+    mouseLook(-48);
     frames(4);
     expect(lastCamera().pitch).toBeLessThan(before);
-    key("keyup", "ArrowUp");
     first.dispose();
 
     const second = start({ client: null });
     second.showCanned(CANNED_BRIDGE);
     frames(1);
-    key("keydown", "ArrowUp");
+    mouseLook(-48);
     frames(4);
     expect(lastCamera().pitch).toBeLessThan(0);
-    key("keyup", "ArrowUp");
 
     key("keydown", "KeyI");
     frames(1);
@@ -907,10 +920,9 @@ describe("keys", () => {
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
-    key("keydown", "ArrowUp");
+    mouseLook(-48);
     frames(4);
     expect(lastCamera().pitch).toBeGreaterThan(0);
-    key("keyup", "ArrowUp");
   });
 });
 
@@ -921,16 +933,6 @@ describe("the classic controls", () => {
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     return session;
-  }
-
-  /** How far the player moves in `ticks` with `codes` held, then released. */
-  function moved(codes: string[], ticks: number): number {
-    const from = eyeAt();
-    for (const code of codes) key("keydown", code);
-    frames(ticks);
-    for (const code of codes) key("keyup", code);
-    const to = eyeAt();
-    return Math.hypot(to[0] - from[0], to[1] - from[1]);
   }
 
   it("uses on Space, and E does nothing", () => {
@@ -948,21 +950,139 @@ describe("the classic controls", () => {
     );
   });
 
-  it("runs at about twice the walk while Shift is held", () => {
-    // Each from the entrance, on a session of its own, so no wall ahead
-    // cuts a run short.
-    const from = (codes: string[]) => {
-      const session = onBridge();
-      const distance = moved(codes, 8);
-      session.dispose();
-      return distance;
+  /**
+   * What holding `codes` for `ticks` does on a session of its own, from a
+   * spot a few steps into the bridge's hall: how far the eye moved along x
+   * and z, how far the view turned, and the pitch it ends at.
+   */
+  function holding(codes: string[], ticks = 8) {
+    // The clock starts over for each, so every session runs the same
+    // ticks in the same frames and the distances compare exactly.
+    now = 0;
+    const session = onBridge();
+    key("keydown", "KeyW");
+    frames(6);
+    key("keyup", "KeyW");
+    frames(20);
+    const [x, z] = eyeAt();
+    const yaw = lastCamera().yaw;
+    for (const code of codes) key("keydown", code);
+    frames(ticks);
+    for (const code of codes) key("keyup", code);
+    const [x1, z1] = eyeAt();
+    const out = {
+      dx: x1 - x,
+      dz: z1 - z,
+      turned: lastCamera().yaw - yaw,
+      pitch: lastCamera().pitch,
     };
-    const walked = from(["KeyW"]);
-    const ran = from(["ShiftLeft", "KeyW"]);
-    const ranRight = from(["ShiftRight", "KeyW"]);
-    expect(walked).toBeGreaterThan(0.5);
-    expect(ran).toBeGreaterThan(1.8 * walked);
-    expect(ranRight).toBeGreaterThan(1.8 * walked);
+    session.dispose();
+    return out;
+  }
+
+  it("walks on Up and Down, as on W and S, and never pitches with them", () => {
+    const up = holding(["ArrowUp"]);
+    expect(up.dz).toBeLessThan(-0.5);
+    expect(up.dz).toBeCloseTo(holding(["KeyW"]).dz, 9);
+    expect(up.pitch).toBe(0);
+    const down = holding(["ArrowDown"]);
+    expect(down.dz).toBeGreaterThan(0.5);
+    expect(down.dz).toBeCloseTo(holding(["KeyS"]).dz, 9);
+    expect(down.pitch).toBe(0);
+  });
+
+  it("turns on Left and Right, and strafes on them while Alt is held", () => {
+    const left = holding(["ArrowLeft"]);
+    expect(left.turned).toBeGreaterThan(0.1);
+    expect(Math.abs(left.dx)).toBeLessThan(1e-9);
+    expect(holding(["ArrowRight"]).turned).toBeLessThan(-0.1);
+
+    for (const alt of ["AltLeft", "AltRight"]) {
+      const sideLeft = holding([alt, "ArrowLeft"]);
+      expect(sideLeft.turned).toBe(0);
+      expect(sideLeft.dx).toBeLessThan(-0.5);
+      expect(sideLeft.dx).toBeCloseTo(holding(["KeyA"]).dx, 9);
+      const sideRight = holding([alt, "ArrowRight"]);
+      expect(sideRight.turned).toBe(0);
+      expect(sideRight.dx).toBeGreaterThan(0.5);
+      expect(sideRight.dx).toBeCloseTo(holding(["KeyD"]).dx, 9);
+    }
+  });
+
+  it("strafes on comma and period, and no faster on two keys at once", () => {
+    const comma = holding(["Comma"]);
+    expect(comma.turned).toBe(0);
+    expect(comma.dx).toBeCloseTo(holding(["KeyA"]).dx, 9);
+    expect(comma.dx).toBeLessThan(-0.5);
+    const period = holding(["Period"]);
+    expect(period.dx).toBeCloseTo(holding(["KeyD"]).dx, 9);
+    expect(period.dx).toBeGreaterThan(0.5);
+    expect(holding(["KeyD", "Period"]).dx).toBeCloseTo(period.dx, 9);
+    expect(holding(["AltLeft", "ArrowRight", "KeyD"]).dx).toBeCloseTo(
+      period.dx,
+      9,
+    );
+  });
+
+  it("looks up and down with the mouse alone", () => {
+    onBridge();
+    mouseLook(-48);
+    frames(4);
+    expect(lastCamera().pitch).toBeGreaterThan(0);
+  });
+
+  /** Sends a cancelable key event and says whether it was prevented. */
+  function prevented(
+    type: "keydown" | "keyup",
+    code: string,
+    mods: KeyboardEventInit = {},
+  ): boolean {
+    const event = new KeyboardEvent(type, {
+      code,
+      cancelable: true,
+      ...mods,
+    });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  }
+
+  it("keeps the browser from scrolling or going back on the game's keys", () => {
+    const session = onBridge();
+    expect(prevented("keydown", "Space")).toBe(true);
+    expect(prevented("keydown", "ArrowUp")).toBe(true);
+    expect(prevented("keydown", "ArrowLeft", { altKey: true })).toBe(true);
+    expect(prevented("keydown", "AltLeft", { altKey: true })).toBe(true);
+    expect(prevented("keyup", "AltLeft")).toBe(true);
+    expect(prevented("keyup", "AltRight")).toBe(true);
+    expect(prevented("keydown", "Comma")).toBe(true);
+    expect(prevented("keydown", "Period")).toBe(true);
+    // Letters, and every browser shortcut with Ctrl or Cmd, stay the
+    // browser's.
+    expect(prevented("keydown", "KeyW")).toBe(false);
+    expect(prevented("keydown", "ArrowLeft", { ctrlKey: true })).toBe(false);
+    expect(prevented("keydown", "ArrowLeft", { metaKey: true })).toBe(false);
+    session.dispose();
+    expect(prevented("keydown", "Space")).toBe(false);
+  });
+
+  it("leaves every key to the level select while it is open", () => {
+    const session = start({ client: null, onLevels: () => {} });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    type("idclev");
+    frames(1);
+    expect(prevented("keydown", "Space")).toBe(false);
+    expect(prevented("keydown", "ArrowDown")).toBe(false);
+    expect(prevented("keyup", "AltLeft")).toBe(false);
+    session.closeLevels();
+    expect(prevented("keydown", "Space")).toBe(true);
+  });
+
+  it("runs at about twice the walk while Shift is held", () => {
+    const walked = holding(["KeyW"]).dz;
+    expect(walked).toBeLessThan(-0.5);
+    expect(holding(["ShiftLeft", "KeyW"]).dz).toBeLessThan(1.8 * walked);
+    expect(holding(["ShiftRight", "ArrowUp"]).dz).toBeLessThan(1.8 * walked);
   });
 });
 
@@ -993,10 +1113,9 @@ describe("the level cheat", () => {
 
     session.closeLevels();
     expect(levels).toHaveBeenLastCalledWith(false);
-    key("keydown", "ArrowUp");
+    mouseLook(-48);
     frames(4);
     expect(lastCamera().pitch).toBeGreaterThan(0);
-    key("keyup", "ArrowUp");
   });
 
   it("reads the word across ticks, letter by letter", () => {
