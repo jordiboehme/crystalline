@@ -409,6 +409,7 @@ impl Engine {
         let stats = store.domain_stats().await?;
         let coverage = store.embedding_coverage().await?;
         drop(store);
+        let contradictions = self.contradictions_status().await?;
         let active_embedded = coverage.embedded_for(&self.model_id);
         // Annotate each domain with its ownership relative to this instance so an
         // operator sees at a glance which domains this daemon hosts in a shared
@@ -467,6 +468,7 @@ impl Engine {
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
+            "contradictions": contradictions,
             "activity": activity,
         });
         let pruned: Vec<Value> = self

@@ -1864,7 +1864,7 @@ async fn hold_the_load(
         hold.as_secs()
     );
     let _ = tokio::task::spawn_blocking(move || std::thread::sleep(hold)).await;
-    Err(IndexError::Embedding(
+    Err(IndexError::Nli(
         "test hook: the held contradiction model load ended".to_string(),
     ))
 }

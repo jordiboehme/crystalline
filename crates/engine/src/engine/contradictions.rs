@@ -87,6 +87,51 @@ impl Engine {
         NliProfile::from_setting(cfg.evolve_contradictions()).map(nli_model)
     }
 
+    /// The `contradictions` block of `ctl status`: the configured profile,
+    /// its model's short id (`null` when off), the pairs left unscored after
+    /// the last pass (`null` until one ran - never `0`, which would read as
+    /// "nothing left" rather than "not counted yet", lesson 37/62), the
+    /// subset of those that are known-failing and parked, the pairs scored
+    /// for the model across the index, why the model could not be loaded, and
+    /// two flags status and doctor use to pick which reason to name (L1):
+    /// `load_failed` (the model itself never loaded, as against a batch that
+    /// failed while scoring) and `embedding_pending` (a settled domain still
+    /// has a possible candidate with no lead vector yet, so its pending count
+    /// of zero is not the whole story).
+    pub async fn contradictions_status(&self) -> Result<Value> {
+        let profile = self
+            .config
+            .read()
+            .unwrap()
+            .evolve_contradictions()
+            .to_string();
+        let model = self.contradiction_model();
+        let scored = match model {
+            Some(m) => {
+                let store = self.store.lock().await;
+                store.scored_pair_count(m.repo).await?
+            }
+            None => 0,
+        };
+        let state = self.contradiction_state.lock().unwrap();
+        let pending_pairs =
+            model.and_then(|_| state.pending.as_ref().map(|p| p.values().sum::<usize>()));
+        let failing_pairs =
+            model.and_then(|m| state.pending.as_ref().map(|_| failed_count(&state, m.repo)));
+        let load_failed = model.is_some_and(|m| state.load_failed == Some(m.repo));
+        let embedding_pending = state.settled.values().any(|s| s.coverage.is_some());
+        Ok(json!({
+            "profile": profile,
+            "model": model.map(|m| m.id),
+            "pending_pairs": pending_pairs,
+            "failing_pairs": failing_pairs,
+            "scored_pairs": scored,
+            "last_error": state.last_error,
+            "load_failed": load_failed,
+            "embedding_pending": embedding_pending,
+        }))
+    }
+
     /// Called by `configure` after every set or unset: a change of
     /// `evolve.contradictions` lifts a failed load (the one way, besides a
     /// daemon start, to ask for that model again), forgets the failed pairs

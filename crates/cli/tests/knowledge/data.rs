@@ -510,6 +510,10 @@ fn init_add_sync_status_end_to_end() {
     assert_eq!(status["fts_mode"], serde_json::json!("candidate-scan"));
     let engrams = status["domains"][0]["engrams"].as_i64().unwrap();
     assert_eq!(engrams, 2);
+    assert_eq!(
+        status["contradictions"]["profile"],
+        serde_json::json!("off")
+    );
 
     // domain list shows the engram count.
     let out = bin()

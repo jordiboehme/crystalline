@@ -321,7 +321,7 @@ async fn a_profile_switch_drops_the_old_scorer_before_loading_the_new_one() {
                 light_stub.clone()
             };
             if model.profile == NliProfile::Light && n == 1 {
-                ready(Err(IndexError::Embedding(
+                ready(Err(IndexError::Nli(
                     "the first light download failed".to_string(),
                 )))
             } else {
@@ -559,7 +559,7 @@ async fn a_failed_load_waits_for_a_setting_change_and_never_loops() {
         let attempts = attempts.clone();
         Arc::new(move |_model: &'static NliModel| {
             attempts.fetch_add(1, Ordering::SeqCst);
-            ready(Err(IndexError::Embedding("offline".to_string())))
+            ready(Err(IndexError::Nli("offline".to_string())))
         })
     };
     let (_tmp, engine) = engine_with(loader).await;
@@ -757,6 +757,12 @@ async fn a_chunk_the_provider_always_rejects_does_not_hold_the_pass() {
         "a domain that never reaches full coverage still settles"
     );
     assert!(!engine.contradictions_wanted());
+    // L7/lesson 62: 0 pending must not read as "fully checked" while the
+    // poisoned chunk still has no lead vector.
+    assert_eq!(
+        engine.contradictions_status().await.unwrap()["embedding_pending"],
+        true
+    );
 }
 
 /// Embeds like the topic provider, and rejects every batch while `closed`.
@@ -817,6 +823,11 @@ async fn a_lead_vector_that_arrives_later_walks_a_settled_domain_again() {
         scored(0, 0, 0),
         "Twenty has no lead vector yet"
     );
+    assert_eq!(
+        engine.contradictions_status().await.unwrap()["embedding_pending"],
+        true,
+        "0 pending while a candidate still lacks a lead vector"
+    );
     let walks = engine.contradiction_fact_walks();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
@@ -832,6 +843,11 @@ async fn a_lead_vector_that_arrives_later_walks_a_settled_domain_again() {
         "the vector arrived without a stamp change and the pair is scored"
     );
     assert_eq!(engine.contradiction_fact_walks(), walks + 1);
+    assert_eq!(
+        engine.contradictions_status().await.unwrap()["embedding_pending"],
+        false,
+        "every possible candidate has its vector now"
+    );
 }
 
 /// Fails every batch that names `marker`, and answers the rest like `inner`.
@@ -859,7 +875,7 @@ impl ContradictionScorer for FailsOn {
             .any(|(p, h)| p.contains(self.marker) || h.contains(self.marker))
         {
             self.failed.fetch_add(1, Ordering::SeqCst);
-            return Err(IndexError::Embedding("the batch failed".to_string()));
+            return Err(IndexError::Nli("the batch failed".to_string()));
         }
         self.inner.score(pairs)
     }
@@ -896,6 +912,19 @@ async fn a_failing_batch_sets_last_error_and_the_pass_scores_the_rest() {
             .is_some_and(|e| e.contains("the batch failed")),
         "{:?}",
         engine.contradiction_last_error()
+    );
+    // L1: a parked batch failure is "N pairs failing", never "the model
+    // could not be loaded" - the two share `last_error` but must render
+    // differently, so the block says which one this is.
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["pending_pairs"], 2);
+    assert_eq!(status["failing_pairs"], 2);
+    assert_eq!(status["load_failed"], false, "{status}");
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("the batch failed")),
+        "{status}"
     );
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
     assert!(
@@ -1319,6 +1348,76 @@ impl ContradictionScorer for Blocking {
     fn model_repo(&self) -> &str {
         full().repo
     }
+}
+
+/// Task 7: the `contradictions` block `ctl status` and the standalone
+/// fallback both carry. Off names no model and no pending; a fresh profile
+/// knows nothing until a walk runs (`pending_pairs` stays null, never 0, per
+/// L7); once a walk scores the pair, pending, failing and scored all read
+/// back correctly.
+#[tokio::test]
+async fn the_status_block_reports_profile_model_pending_and_scored_pairs() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    let off = engine.status_report().await.unwrap();
+    assert_eq!(off["contradictions"]["profile"], "off");
+    assert_eq!(off["contradictions"]["model"], serde_json::Value::Null);
+    assert_eq!(
+        off["contradictions"]["pending_pairs"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        off["contradictions"]["failing_pairs"],
+        serde_json::Value::Null
+    );
+    assert_eq!(off["contradictions"]["load_failed"], false);
+    assert_eq!(off["contradictions"]["embedding_pending"], false);
+    assert_eq!(off["contradictions"]["scored_pairs"], 0);
+
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    let before = engine.contradictions_status().await.unwrap();
+    assert_eq!(before["model"], full().id);
+    assert_eq!(
+        before["pending_pairs"],
+        serde_json::Value::Null,
+        "unknown until a pass ran"
+    );
+    engine.score_contradictions().await.unwrap();
+    let after = engine.status_report().await.unwrap();
+    assert_eq!(after["contradictions"]["pending_pairs"], 0);
+    assert_eq!(after["contradictions"]["failing_pairs"], 0);
+    assert_eq!(after["contradictions"]["scored_pairs"], 1);
+    assert_eq!(
+        after["contradictions"]["last_error"],
+        serde_json::Value::Null
+    );
+    assert_eq!(after["contradictions"]["load_failed"], false);
+}
+
+/// The error-label minor: a load failure's `last_error` is the pending count
+/// plus a message that never says "embedding error" (it is not an embedding
+/// model), and `load_failed` says which of the two failure shapes this is.
+#[tokio::test]
+async fn a_failed_load_is_reported_with_the_pending_count_and_never_as_an_embedding_error() {
+    let loader: ScorerLoader = Arc::new(|_model: &'static NliModel| {
+        ready(Err(IndexError::Nli(
+            "downloading model.safetensors: offline".to_string(),
+        )))
+    });
+    let (_tmp, engine) = engine_with(loader).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["pending_pairs"], 1);
+    assert_eq!(status["load_failed"], true, "{status}");
+    let err = status["last_error"].as_str().unwrap();
+    assert!(err.contains("offline"), "{err}");
+    assert!(!err.contains("embedding error"), "{err}");
 }
 
 #[tokio::test]

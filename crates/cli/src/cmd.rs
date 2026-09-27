@@ -2455,6 +2455,23 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
     let active_embedded = coverage.embedded_for(&active_model);
     let hybrid_available = coverage.has_active_embeddings(&active_model);
 
+    // The contradiction check as the config sets it. A direct read has no
+    // worker: pending, failing pairs, a failed load and an incomplete
+    // embedding pass are all things only a daemon's own pass has seen, so
+    // they read null/false here rather than a guess - `contradictions_lines`
+    // renders that as "not counted yet", never as `0` (lesson 37/62).
+    let contradiction_setting = cfg.evolve_contradictions().to_string();
+    let contradiction_model =
+        crystalline_index::nli::NliProfile::from_setting(&contradiction_setting)
+            .map(crystalline_index::nli::nli_model);
+    let scored_pairs = match contradiction_model {
+        Some(m) => store
+            .scored_pair_count(m.repo)
+            .await
+            .map_err(|e| anyhow!("could not count scored contradiction pairs: {e}"))?,
+        None => 0,
+    };
+
     Ok(serde_json::json!({
         "indexed": true,
         "fts_mode": info.fts_mode,
@@ -2470,7 +2487,66 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             "hybrid_available": hybrid_available,
             "models": coverage.models,
         },
+        "contradictions": {
+            "profile": contradiction_setting,
+            "model": contradiction_model.map(|m| m.id),
+            "pending_pairs": null,
+            "failing_pairs": null,
+            "scored_pairs": scored_pairs,
+            "last_error": null,
+            "load_failed": false,
+            "embedding_pending": false,
+        },
     }))
+}
+
+/// The one-line reason the contradiction check is not simply "N pairs
+/// pending": the model itself could not be loaded, a batch failed on some of
+/// the pending pairs and they are parked, or a settled domain still has a
+/// candidate waiting on its embedding. At most one reason, in that priority
+/// order - L1 asks for a single short phrase naming the reason, not a list -
+/// and `None` when nothing beyond an ordinary unfinished pass is going on.
+/// Shared by [`contradictions_lines`] and doctor's row so the two surfaces
+/// can never give a different diagnosis for the same state (lesson 36).
+pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String> {
+    if c["load_failed"].as_bool().unwrap_or(false) {
+        return c["last_error"]
+            .as_str()
+            .map(|e| format!("the model could not be loaded: {e}"));
+    }
+    if let Some(n) = c["failing_pairs"].as_u64().filter(|n| *n > 0) {
+        return c["last_error"]
+            .as_str()
+            .map(|e| format!("{n} pairs failing: {e}"));
+    }
+    if c["embedding_pending"].as_bool().unwrap_or(false) {
+        return Some("embedding not finished for some candidates".to_string());
+    }
+    None
+}
+
+/// The status lines about the contradiction check: one line, plus nothing
+/// when the report predates this block (an older daemon), rather than a
+/// guess. `pending_pairs` absent renders as "not counted yet", never `0`
+/// (lesson 37/62): a fresh daemon that has not walked yet and a standalone
+/// read with no worker both mean "unknown", not "nothing pending".
+pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
+    let Some(c) = data.get("contradictions") else {
+        return Vec::new();
+    };
+    let Some(model) = c["model"].as_str() else {
+        return vec!["Contradictions: off".to_string()];
+    };
+    let profile = c["profile"].as_str().unwrap_or_default();
+    let pending = match c["pending_pairs"].as_u64() {
+        Some(n) => format!("{n} pairs pending"),
+        None => "not counted yet".to_string(),
+    };
+    let mut line = format!("Contradictions: {profile} ({model}), {pending}");
+    if let Some(reason) = contradiction_wait_reason(c) {
+        line.push_str(&format!(", {reason}"));
+    }
+    vec![line]
 }
 
 /// Render a status report (the daemon's or the in-process one) as human
@@ -2549,6 +2625,9 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             "text"
         }
     );
+    for line in contradictions_lines(data) {
+        println!("{line}");
+    }
 
     // The rebuild markers, printed directly under the coverage figure they
     // qualify: a number read as normal in the middle of a rebuild is the
@@ -3936,5 +4015,110 @@ mod relative_time_tests {
         let five_minutes_from_now =
             (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
         assert_eq!(relative_time(&five_minutes_from_now), five_minutes_from_now);
+    }
+}
+
+#[cfg(test)]
+mod contradictions_status_tests {
+    use super::contradictions_lines;
+    use serde_json::json;
+
+    #[test]
+    fn off_is_one_line() {
+        let data = json!({ "contradictions": {
+            "profile": "off", "model": null, "pending_pairs": null,
+            "failing_pairs": null, "scored_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+        }});
+        assert_eq!(contradictions_lines(&data), vec!["Contradictions: off"]);
+    }
+
+    #[test]
+    fn a_profile_names_its_model_and_the_pending_pairs() {
+        let data = json!({ "contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 12, "failing_pairs": 0, "scored_pairs": 40,
+            "last_error": null, "load_failed": false, "embedding_pending": false,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec!["Contradictions: full (mdeberta-v3-base-xnli-2mil7), 12 pairs pending"]
+        );
+    }
+
+    /// L1's own example: parked failures are "N pairs failing: <error>", not
+    /// a load failure, even though both share `last_error`.
+    #[test]
+    fn failing_pairs_are_named_with_the_error_that_parked_them() {
+        let data = json!({ "contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 12, "failing_pairs": 2, "scored_pairs": 40,
+            "last_error": "the batch failed", "load_failed": false,
+            "embedding_pending": false,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec![
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 12 pairs pending, 2 pairs failing: the batch failed"
+            ]
+        );
+    }
+
+    /// A load failure is a different reason from a parked batch failure, even
+    /// though the pending count is known (the walk counted candidates before
+    /// it ever reached the model).
+    #[test]
+    fn a_load_failure_is_named_as_such_not_as_failing_pairs() {
+        let data = json!({ "contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 1, "failing_pairs": 0, "scored_pairs": 0,
+            "last_error": "contradiction model error: offline", "load_failed": true,
+            "embedding_pending": false,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec![
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 1 pairs pending, the model could not be loaded: contradiction model error: offline"
+            ]
+        );
+    }
+
+    /// L7/lesson 62: partial embedding coverage is named, so a bare "0 pairs
+    /// pending" never reads as "fully checked".
+    #[test]
+    fn embedding_pending_is_named_when_pending_is_zero() {
+        let data = json!({ "contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 0, "failing_pairs": 0, "scored_pairs": 3,
+            "last_error": null, "load_failed": false, "embedding_pending": true,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec![
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 0 pairs pending, embedding not finished for some candidates"
+            ]
+        );
+    }
+
+    /// L7: a daemon that has not walked yet (or a standalone read, which
+    /// never walks at all) says "not counted yet", never a bare `0` and never
+    /// a daemon-specific phrase that would be wrong for the daemon's own
+    /// fresh-start case.
+    #[test]
+    fn pending_not_yet_known_is_named_not_counted_yet() {
+        let data = json!({ "contradictions": {
+            "profile": "light", "model": "multilingual-minilmv2-l12-mnli-xnli",
+            "pending_pairs": null, "failing_pairs": null, "scored_pairs": 3,
+            "last_error": null, "load_failed": false, "embedding_pending": false,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec!["Contradictions: light (multilingual-minilmv2-l12-mnli-xnli), not counted yet"]
+        );
+    }
+
+    #[test]
+    fn an_older_daemon_without_the_block_prints_nothing() {
+        assert!(contradictions_lines(&json!({})).is_empty());
     }
 }

@@ -77,12 +77,27 @@ fn hub_repo(model: &'static NliModel) -> HubRepo<'static> {
     }
 }
 
+/// `hub.rs` is shared with the embedding loader and labels its own errors
+/// `Embedding`, correctly, for that path. The contradiction loader relabels
+/// them here rather than in `hub.rs`, so a download or cache-dir failure
+/// while loading an NLI model never renders as "embedding error" in status or
+/// doctor; the text underneath already names "contradiction model" and its
+/// repository (`hub_repo`'s `what`), so nothing is lost by the rename.
+fn as_nli(e: IndexError) -> IndexError {
+    match e {
+        IndexError::Embedding(m) => IndexError::Nli(m),
+        other => other,
+    }
+}
+
 impl LocalNli {
     /// Load `model`, downloading on first use. The fetch is awaited; the
     /// weight load runs on a blocking thread.
     pub async fn load(model: &'static NliModel) -> Result<LocalNli> {
-        let cache_dir = models_cache_dir()?;
-        let files = ensure_files(&cache_dir, &hub_repo(model)).await?;
+        let cache_dir = models_cache_dir().map_err(as_nli)?;
+        let files = ensure_files(&cache_dir, &hub_repo(model))
+            .await
+            .map_err(as_nli)?;
         match build_on_blocking(files, model).await {
             Ok(nli) => Ok(nli),
             Err(first) => {
@@ -90,7 +105,9 @@ impl LocalNli {
                     "crystalline: contradiction model failed to load ({first}); re-downloading once..."
                 );
                 wipe_repo_dir(&cache_dir, model.repo);
-                let files = ensure_files(&cache_dir, &hub_repo(model)).await?;
+                let files = ensure_files(&cache_dir, &hub_repo(model))
+                    .await
+                    .map_err(as_nli)?;
                 build_on_blocking(files, model).await
             }
         }
@@ -130,7 +147,7 @@ impl LocalNli {
         }
         self.tokenizer
             .encode_batch(inputs, true)
-            .map_err(|e| IndexError::Embedding(format!("tokenizing: {e}")))
+            .map_err(|e| IndexError::Nli(format!("tokenizing: {e}")))
     }
 
     /// The raw classifier logits of each `(premise, hypothesis)` pair, as one
@@ -174,7 +191,7 @@ impl LocalNli {
             };
             logits.to_vec2::<f32>()
         };
-        compute().map_err(|e| IndexError::Embedding(format!("inference: {e}")))
+        compute().map_err(|e| IndexError::Nli(format!("inference: {e}")))
     }
 }
 
@@ -195,19 +212,19 @@ impl ContradictionScorer for LocalNli {
 async fn build_on_blocking(files: HubFiles, model: &'static NliModel) -> Result<LocalNli> {
     tokio::task::spawn_blocking(move || build(&files, model))
         .await
-        .map_err(|e| IndexError::Embedding(format!("contradiction model load task failed: {e}")))?
+        .map_err(|e| IndexError::Nli(format!("contradiction model load task failed: {e}")))?
 }
 
 fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
     let config_text = read(files.config()?)?;
     let raw: serde_json::Value = serde_json::from_str(&config_text)
-        .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+        .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
     check_model_type(&raw, model)?;
     let labels = id2label(&raw)?;
     let contradiction = contradiction_index(&labels)?;
 
     let mut tokenizer = Tokenizer::from_file(files.tokenizer()?)
-        .map_err(|e| IndexError::Embedding(format!("loading tokenizer.json: {e}")))?;
+        .map_err(|e| IndexError::Nli(format!("loading tokenizer.json: {e}")))?;
     let tokenizer_config_text = match files.tokenizer_config() {
         Some(path) => read(path)?,
         None => "{}".to_string(),
@@ -226,7 +243,7 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
             strategy: TruncationStrategy::LongestFirst,
             ..TruncationParams::default()
         }))
-        .map_err(|e| IndexError::Embedding(format!("configuring truncation: {e}")))?;
+        .map_err(|e| IndexError::Nli(format!("configuring truncation: {e}")))?;
 
     let device = Device::Cpu;
     // Safety: a freshly verified download on the standard candle mmap path.
@@ -237,13 +254,13 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
             DType::F32,
             &device,
         )
-        .map_err(|e| IndexError::Embedding(format!("loading weights: {e}")))?
+        .map_err(|e| IndexError::Nli(format!("loading weights: {e}")))?
     };
-    let build_error = |e: candle_core::Error| IndexError::Embedding(format!("building model: {e}"));
+    let build_error = |e: candle_core::Error| IndexError::Nli(format!("building model: {e}"));
     let head = match model.architecture {
         NliArch::DebertaV2 => {
             let config: DebertaConfig = serde_json::from_str(&config_text)
-                .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+                .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
             Head::Deberta(Box::new(
                 DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
                     .map_err(build_error)?,
@@ -261,7 +278,7 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
                     .or_insert_with(|| serde_json::json!(1));
             }
             let config: XlmConfig = serde_json::from_value(filled)
-                .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+                .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
             Head::XlmRoberta(Box::new(
                 XLMRobertaForSequenceClassification::new(labels.len(), &config, vb)
                     .map_err(build_error)?,
@@ -283,7 +300,7 @@ fn check_model_type(config: &serde_json::Value, model: &NliModel) -> Result<()> 
     let want = model.architecture.model_type();
     match config.get("model_type").and_then(|v| v.as_str()) {
         Some(found) if found == want => Ok(()),
-        found => Err(IndexError::Embedding(format!(
+        found => Err(IndexError::Nli(format!(
             "the cached config.json for {} declares model_type {found:?}, expected \"{want}\"; the model cache holds the wrong files",
             model.repo
         ))),
@@ -330,7 +347,7 @@ fn cap_line(tokenizer: &Tokenizer, text: &str) -> Result<String> {
     let text = precut(text);
     let enc = tokenizer
         .encode(text, false)
-        .map_err(|e| IndexError::Embedding(format!("tokenizing: {e}")))?;
+        .map_err(|e| IndexError::Nli(format!("tokenizing: {e}")))?;
     if enc.get_ids().len() <= MAX_LINE_TOKENS {
         return Ok(text.to_string());
     }
@@ -452,6 +469,35 @@ mod tests {
             id2label(&bare).is_err(),
             "a checkpoint without id2label is refused"
         );
+    }
+
+    /// A Task 4 minor, fixed here: an NLI loader failure must never render as
+    /// "embedding error" in status or doctor, since the checkpoint is not an
+    /// embedding model. `check_model_type`'s refusal, and every error this
+    /// file constructs, carry the `Nli` variant instead.
+    #[test]
+    fn an_nli_failure_is_never_labeled_an_embedding_error() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"model_type": "deberta-v2"}"#).unwrap();
+        let err = check_model_type(&raw, nli_model(NliProfile::Light)).unwrap_err();
+        assert!(matches!(err, IndexError::Nli(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(!text.contains("embedding error"), "{text}");
+        assert!(text.starts_with("contradiction model error: "), "{text}");
+    }
+
+    /// `hub.rs`'s errors stay labeled `Embedding` there (the embedding loader
+    /// shares that module), so the NLI loader relabels them at its own call
+    /// boundary.
+    #[test]
+    fn as_nli_relabels_a_shared_hub_error_and_leaves_others_alone() {
+        let hub_err = IndexError::Embedding("downloading model.safetensors: offline".to_string());
+        let relabeled = as_nli(hub_err);
+        assert!(matches!(relabeled, IndexError::Nli(_)));
+        assert!(relabeled.to_string().contains("offline"), "{relabeled}");
+
+        let other = IndexError::Invalid("unrelated".to_string());
+        assert!(matches!(as_nli(other), IndexError::Invalid(_)));
     }
 
     /// Review focus 5, the half that runs without a download: the pad id is
