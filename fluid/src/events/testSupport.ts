@@ -33,6 +33,13 @@ export class FakeEventSource {
     this.readyState = 2;
   }
   // test drivers
+  /** The browser having connected: fires `open`. */
+  open() {
+    this.readyState = 1;
+    for (const listener of this.listeners.get("open") ?? []) {
+      listener(new MessageEvent<string>("open"));
+    }
+  }
   emit(type: string, data: unknown, id?: string) {
     const event = new MessageEvent<string>(type, {
       data: JSON.stringify(data),

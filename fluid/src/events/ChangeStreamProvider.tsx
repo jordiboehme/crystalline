@@ -4,10 +4,16 @@
  *
  * Mounted once by the shell, inside the auth provider and never on the
  * login or setup screens: a stream needs a session, and two streams per tab
- * would be two refetches per change. Reconnect is the browser's own: an
- * `EventSource` reopens after an error and sends `Last-Event-ID` itself, so
- * the only error this handles is the one it cannot recover from - a source
- * the server closed for good, which is a session that ended.
+ * would be two refetches per change. A dropped connection is the browser's
+ * own to reconnect: an `EventSource` reopens after a network error and sends
+ * `Last-Event-ID` itself. A source the browser closed for good (any answer
+ * that is not a 200 stream: a 401, a proxy's 502 during a restart, the
+ * stream cap's 503) is not taken as a session that ended. The provider asks
+ * the capability probe first; only a session that is gone sends the shell
+ * back to the login screen, and a live one gets a new source after a
+ * backoff of 1, 2, 4 ... 30 seconds with jitter, followed by a reset,
+ * since a new source cannot carry the last id it saw (controller ruling
+ * C1b, 2026-09-28).
  *
  * Bursts are coalesced: keys collect for 250 ms after the first frame and
  * one `invalidateQueries` fires per distinct key. A `reset` flushes the set
@@ -28,10 +34,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { ReactElement, ReactNode } from "react";
 import { useEffect, useMemo } from "react";
 
-import { API_BASE } from "../api/client";
+import { API_BASE, ApiProblem, api } from "../api/client";
 import type { ChangeEvent } from "../api/events";
 import { parseFrame } from "../api/events";
+import { asObject, asString } from "../api/json";
 import { ME_QUERY_KEY } from "../auth/keys";
+import { reconnectDelay } from "./backoff";
 import type { IgnoredEngrams } from "./ignored";
 import { IgnoredEngramsContext, createIgnoredEngrams } from "./ignored";
 import type { QueryKey } from "./invalidation";
@@ -86,12 +94,32 @@ function exempt(ignored: IgnoredEngrams, key: readonly unknown[]): boolean {
   );
 }
 
+/** Asks the server who this session is; the default is the capability probe. */
+export type SessionProbe = () => Promise<unknown>;
+
+function defaultProbe(): Promise<unknown> {
+  return api<unknown>("/auth/me");
+}
+
+/** Who a `/auth/me` answer names: an account, the anonymous viewer, or nobody. */
+function identityOf(value: unknown): string | null {
+  const me = asObject(value);
+  const name = asString(asObject(me?.user)?.name);
+  if (name) return `user:${name}`;
+  return me?.anonymous === true ? "anonymous" : null;
+}
+
+type SessionState = "valid" | "ended" | "unknown";
+
 export function ChangeStreamProvider({
   children,
   streamFactory,
+  sessionProbe,
 }: {
   children: ReactNode;
   streamFactory?: StreamFactory;
+  /** Test seam; the shell leaves it to the default. */
+  sessionProbe?: SessionProbe;
 }): ReactElement {
   const queryClient = useQueryClient();
   const ignored = useMemo(() => createIgnoredEngrams(), []);
@@ -104,34 +132,41 @@ export function ChangeStreamProvider({
       return undefined;
     }
     const open = streamFactory ?? defaultFactory;
-    const source = open(`${API_BASE}/events`);
+    const probe = sessionProbe ?? defaultProbe;
     const pending = new Map<string, QueryKey>();
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
+    // Failures since the last source that opened; reset on `open` only, so a
+    // stream the cap keeps refusing waits longer each time.
+    let attempt = 0;
+    let detach: (() => void) | null = null;
 
     const flush = () => {
       timer = null;
       const keys = [...pending.values()];
       pending.clear();
       for (const queryKey of keys) {
-        if (
-          (queryKey[0] === "engram" || queryKey[0] === "graph") &&
-          queryKey.length < 3
-        ) {
-          // A domain event's prefix over every engram of the domain: the
-          // editor's exemption holds here too, so the prefix passes over the
-          // engram whose room carries its text and reaches every other one.
-          void queryClient.invalidateQueries({
-            queryKey,
-            predicate: (query: Query) => !exempt(ignored, query.queryKey),
-          });
+        // The editor's exemption, decided here for every key alike, so an
+        // editor that mounted inside the window is honoured too.
+        if (queryKey[0] === "engram" || queryKey[0] === "graph") {
+          if (queryKey.length >= 3) {
+            if (exempt(ignored, queryKey)) continue;
+            void queryClient.invalidateQueries({ queryKey });
+          } else {
+            // A domain event's prefix over every engram of the domain passes
+            // over the engram whose room carries its text.
+            void queryClient.invalidateQueries({
+              queryKey,
+              predicate: (query: Query) => !exempt(ignored, query.queryKey),
+            });
+          }
         } else {
           void queryClient.invalidateQueries({ queryKey });
         }
       }
     };
-    const onFrame = (name: string) => (message: MessageEvent<string>) => {
-      const event = parseFrame(name, message.data);
-      if (!event) return;
+    const fanOut = (event: ChangeEvent) => {
       for (const listener of changeSubscribers) {
         // One listener's bug must not cost the page its own refresh, nor the
         // listeners after it their frame.
@@ -141,46 +176,125 @@ export function ChangeStreamProvider({
           console.error("a change listener threw", error);
         }
       }
+    };
+    const resetAll = () => {
+      pending.clear();
+      if (timer) clearTimeout(timer);
+      timer = null;
+      void queryClient.invalidateQueries();
+    };
+    const onFrame = (name: string) => (message: MessageEvent<string>) => {
+      const event = parseFrame(name, message.data);
+      if (!event) return;
+      fanOut(event);
       const keys = keysFor(event);
       if (keys === "everything") {
-        pending.clear();
-        if (timer) clearTimeout(timer);
-        timer = null;
-        void queryClient.invalidateQueries();
+        resetAll();
         return;
       }
       if (event.event === "engram") {
         recent.note(event.change);
       }
       for (const key of keys) {
-        // The editor's exemption: the open engram's detail and graph stay.
-        if (exempt(ignored, key)) {
-          continue;
-        }
         pending.set(JSON.stringify(key), key);
       }
       timer ??= setTimeout(flush, COALESCE_MS);
     };
-    const listeners = EVENT_NAMES.map((name) => [name, onFrame(name)] as const);
-    for (const [name, listener] of listeners) {
-      source.addEventListener(name, listener as EventListener);
-    }
-    source.onerror = () => {
-      // CONNECTING is the browser mid-reconnect; CLOSED is a 401 or 403 the
-      // browser will not retry, which is the session having ended.
-      if (source.readyState === CLOSED) {
-        void queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+
+    /**
+     * Whether the session behind the stream still stands. A closed source
+     * is not proof that it ended: by the EventSource rules any answer that
+     * is not a 200 stream closes it for good, which is also a proxy's 502
+     * during a restart and the stream cap's 503. The probe answers 200 with
+     * no identity for an ended cookie session, and an identity other than
+     * the one the shell holds is a session that ended too.
+     */
+    const checkSession = async (): Promise<SessionState> => {
+      try {
+        const now = identityOf(await probe());
+        if (now === null) return "ended";
+        const held = queryClient.getQueryData(ME_QUERY_KEY);
+        if (held !== undefined && identityOf(held) !== now) return "ended";
+        return "valid";
+      } catch (error) {
+        return error instanceof ApiProblem && error.status === 401
+          ? "ended"
+          : "unknown";
       }
     };
-    return () => {
-      if (timer) clearTimeout(timer);
+
+    const scheduleRetry = (step: () => void) => {
+      const delay = reconnectDelay(attempt);
+      attempt += 1;
+      retry = setTimeout(() => {
+        retry = null;
+        step();
+      }, delay);
+    };
+
+    const recover = () => {
+      void checkSession().then((state) => {
+        if (disposed) return;
+        if (state === "ended") {
+          // The path the query client runs for a 401: the probe answers,
+          // and the login screen replaces the shell and this provider.
+          void queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+        } else if (state === "valid") {
+          scheduleRetry(() => {
+            connect(true);
+          });
+        } else {
+          scheduleRetry(recover);
+        }
+      });
+    };
+
+    const connect = (reopened: boolean) => {
+      const source = open(`${API_BASE}/events`);
+      const listeners = EVENT_NAMES.map(
+        (name) => [name, onFrame(name)] as const,
+      );
       for (const [name, listener] of listeners) {
-        source.removeEventListener(name, listener as EventListener);
+        source.addEventListener(name, listener as EventListener);
       }
-      source.onerror = null;
-      source.close();
+      const onOpen = () => {
+        attempt = 0;
+        if (reopened) {
+          // A new source carries no `Last-Event-ID` (the browser sends it on
+          // its own reconnects only), so what happened while it was closed
+          // is covered the way the server covers a lost id: a reset.
+          reopened = false;
+          fanOut({ event: "reset" });
+          resetAll();
+        }
+      };
+      source.addEventListener("open", onOpen);
+      source.onerror = () => {
+        // CONNECTING is the browser mid-reconnect, with `Last-Event-ID`.
+        if (source.readyState !== CLOSED) return;
+        detach?.();
+        detach = null;
+        recover();
+      };
+      detach = () => {
+        for (const [name, listener] of listeners) {
+          source.removeEventListener(name, listener as EventListener);
+        }
+        source.removeEventListener("open", onOpen);
+        source.onerror = null;
+        source.close();
+      };
     };
-  }, [queryClient, streamFactory, ignored, recent]);
+
+    connect(false);
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      if (retry) clearTimeout(retry);
+      detach?.();
+      detach = null;
+    };
+  }, [queryClient, streamFactory, sessionProbe, ignored, recent]);
 
   return (
     <IgnoredEngramsContext value={ignored}>

@@ -21,12 +21,22 @@ export interface RecentChange {
 const key = (domain: string, permalink: string) =>
   `${domain}\u0000${permalink}`;
 
+/**
+ * How long an entry is kept: the status line's own sixty seconds. Older
+ * entries are dropped on the next `note`, so a tab open for days on a busy
+ * instance holds only what changed in the last minute.
+ */
+export const RECENT_TTL_MS = 60_000;
+
 export class RecentChanges {
   private entries = new Map<string, RecentChange>();
   private listeners = new Set<() => void>();
 
   note(change: EngramChange): void {
     const at = Date.now();
+    for (const [entry, value] of this.entries) {
+      if (at - value.at >= RECENT_TTL_MS) this.entries.delete(entry);
+    }
     if (change.kind === "moved" && change.from) {
       this.entries.set(key(change.domain, change.permalink), {
         kind: "moved_here",
@@ -51,6 +61,11 @@ export class RecentChanges {
       this.entries.delete(key(change.domain, change.permalink));
     }
     for (const listener of this.listeners) listener();
+  }
+
+  /** How many entries are held; for the bound's test. */
+  get size(): number {
+    return this.entries.size;
   }
 
   get(domain: string, permalink: string): RecentChange | null {
