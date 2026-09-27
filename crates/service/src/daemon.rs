@@ -662,6 +662,10 @@ pub async fn run_serve(
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
+        // A second receiver of the same signal for the event streams, which
+        // end on it so the drain `run_http` waits for is never held open by
+        // a browser; see `rest::RestState::with_shutdown`.
+        let streams_rx = shared.watch();
         let token = setup_token.clone();
         tokio::spawn(async move {
             // Three failure classes, three sentences, because the remedy
@@ -674,7 +678,7 @@ pub async fn run_serve(
             // actually applies: a `--http` address beats both `service.http`
             // spellings, so telling a flag user to edit the config would be
             // advice that does nothing.
-            let router = match http_service(allowed_hosts, e, sessions, token).await {
+            let router = match http_service(allowed_hosts, e, sessions, token, streams_rx).await {
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
@@ -1201,11 +1205,19 @@ async fn http_service(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<axum::Router> {
     let auth = Arc::new(
         crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
     );
-    http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)
+    http_router_with_shutdown(
+        engine,
+        http_sessions,
+        &allowed_hosts,
+        auth,
+        setup_token,
+        shutdown,
+    )
 }
 
 /// Serve the built router on a bound listener until shutdown.
@@ -1623,6 +1635,47 @@ pub fn http_router(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
+    http_router_inner(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        setup_token,
+        None,
+    )
+}
+
+/// [`http_router`] for the daemon itself: the same router, with the
+/// shutdown watch every event stream selects on. See
+/// `rest::RestState::with_shutdown`.
+pub fn http_router_with_shutdown(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<axum::Router> {
+    http_router_inner(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        setup_token,
+        Some(shutdown),
+    )
+}
+
+/// The body both router builders above share; `shutdown` is `None` for a
+/// router with no daemon behind it.
+fn http_router_inner(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> anyhow::Result<axum::Router> {
     #[cfg(feature = "fluid-ui")]
     {
         http_router_with_assets::<crate::ui::FluidAssets>(
@@ -1631,6 +1684,7 @@ pub fn http_router(
             allowed_hosts,
             auth,
             setup_token,
+            shutdown,
         )
     }
     #[cfg(not(feature = "fluid-ui"))]
@@ -1648,6 +1702,7 @@ pub fn http_router(
             api,
             setup_token,
             mcp_auth,
+            shutdown,
         )?;
         Ok(router.fallback_service(service))
     }
@@ -1664,6 +1719,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<axum::Router> {
     // One snapshot for all three keys: they are read once when the HTTP surface
     // starts, like `service.read_only`, and `ui_enabled`
@@ -1683,6 +1739,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         api,
         setup_token,
         mcp_auth,
+        shutdown,
     )?;
     if !ui {
         return Ok(router.fallback_service(service));
@@ -1769,9 +1826,16 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// route; `None` closes the token path, which is what a loopback bind wants.
 /// `mcp_auth` is the store the identity gate resolves agent tokens through,
 /// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
+/// `shutdown` is the daemon's shutdown watch, which every event stream ends
+/// on; `None` for a router with no daemon behind it.
 ///
 /// Also where the engine is handed its private-domain resolver, since this is
 /// the one place an accounts store and the engine meet on every HTTP path.
+///
+/// Eight parameters, each a separate startup setting both router builders
+/// resolve and hand down; a struct for this one private seam would only
+/// rename them.
+#[allow(clippy::too_many_arguments)]
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1780,6 +1844,7 @@ fn http_base(
     api: bool,
     setup_token: Option<String>,
     mcp_auth: Option<Arc<crate::rest::AuthStore>>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -1873,11 +1938,16 @@ fn http_base(
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
     // that daemon is deliberately not offering.
+    // With the API off the shutdown watch is simply dropped: no event stream
+    // is served to end on it.
     let rest = if api {
-        Some(crate::rest::router(
-            crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
-                .with_setup_token(setup_token),
-        ))
+        let state = crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
+            .with_setup_token(setup_token);
+        let state = match shutdown {
+            Some(rx) => state.with_shutdown(rx),
+            None => state,
+        };
+        Some(crate::rest::router(state))
     } else {
         None
     };

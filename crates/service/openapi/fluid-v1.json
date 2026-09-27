@@ -6031,6 +6031,63 @@
         }
       }
     },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Live changes to the knowledge, as a server-sent event stream.",
+        "description": "A `text/event-stream` the web UI keeps open once per tab. Frames: `id: <epoch>:<seq>` + `event: engram` + `data: <EngramChanged>`; `id` + `event: domain` + `data: <DomainChanged>`; `event: reset` + `data: {}` with no id (invalidate everything and keep the connection); and a `: ping` comment every fifteen seconds. `Last-Event-ID` replays the ring after that id, or answers one `reset` when the epoch is not this process's or the id is older than the ring's oldest entry. Every frame is filtered by what the session may read; a `draft_of` frame reaches the draft's owner alone. Served read-only. OpenAPI cannot type a stream, so the body below is described as text and the schemas `EngramChanged`, `DomainChanged` and `ChangeKind` carry the shapes.",
+        "operationId": "stream_events",
+        "parameters": [
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "The `id` of the last frame this client saw, as the browser's `EventSource` sends it on reconnect.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "1758542400:17"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stream. Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/evolve": {
       "get": {
         "tags": [
@@ -9116,6 +9173,16 @@
           }
         }
       },
+      "ChangeKind": {
+        "type": "string",
+        "description": "What happened to the engram: the four things the sync engine counts.",
+        "enum": [
+          "added",
+          "modified",
+          "deleted",
+          "moved"
+        ]
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -9369,6 +9436,24 @@
           }
         }
       },
+      "DomainChanged": {
+        "type": "object",
+        "description": "A whole domain moved: refetch everything of it.",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "type": "string"
+          }
+        }
+      },
       "DomainMember": {
         "type": "object",
         "description": "One membership row: who was invited to a private domain, at what level, by\nwhom and when.",
@@ -9394,6 +9479,64 @@
           "principal": {
             "type": "string",
             "description": "The member's login name, folded by [`normalize_account_name`]."
+          }
+        }
+      },
+      "EngramChanged": {
+        "type": "object",
+        "description": "One engram changed, as every subscriber hears it.",
+        "required": [
+          "domain",
+          "permalink",
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who made the change, as a display label. Null for a change the watcher\nfound on disk and for a write nobody signed."
+          },
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lowercase hex SHA-256 of the new content, the value every write\nreceipt reports as `checksum`. Absent for `deleted`."
+          },
+          "domain": {
+            "type": "string"
+          },
+          "draft_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the change landed in this actor's draft overlay. Delivered to\nthat actor's own sessions and to nobody else."
+          },
+          "from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MovedFrom",
+                "description": "`moved` only."
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChangeKind"
+          },
+          "path": {
+            "type": "string",
+            "description": "Domain-relative, forward slashes, `.md`; after the change."
+          },
+          "permalink": {
+            "type": "string",
+            "description": "After the change; for `deleted`, what the row had before it went."
           }
         }
       },
@@ -10062,6 +10205,23 @@
             "type": "string",
             "description": "The engram to move, by permalink.",
             "example": "notes/beta"
+          }
+        }
+      },
+      "MovedFrom": {
+        "type": "object",
+        "description": "Where a moved engram came from.",
+        "required": [
+          "path",
+          "permalink"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Domain-relative, forward slashes, `.md`."
+          },
+          "permalink": {
+            "type": "string"
           }
         }
       },
@@ -11255,6 +11415,10 @@
     {
       "name": "maintenance",
       "description": "The consolidation queue: what the knowledge needs next. Read-only."
+    },
+    {
+      "name": "events",
+      "description": "Live changes to the knowledge, as one server-sent event stream per tab."
     },
     {
       "name": "users",
