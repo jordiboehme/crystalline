@@ -17,7 +17,7 @@
  *   door opened or closed with Space, which is what `focusOf` offers.
  * - A sliding door opens by itself while the player is within `APPROACH`,
  *   and an unsealed portal needs nothing at all: walking into it is the
- *   action, so neither is offered for E.
+ *   action, so neither is offered for Space.
  * - A sealed door or portal is offered only to say why it is sealed.
  *
  * A way that failed on travel (the session's `failed` map) is treated as
@@ -194,7 +194,7 @@ export function approaches(slot: WallSlot, player: Player): boolean {
 }
 
 /**
- * What the HUD offers for a fixture, or null when E does nothing there and
+ * What the HUD offers for a fixture, or null when Space does nothing there and
  * nothing needs saying: an unsealed sliding door opens on approach and an
  * unsealed portal on contact, and machines, posters and the placard are
  * only looked at.
@@ -284,7 +284,7 @@ export function focusOf(
  * Every door of the room gets a state (a door not in `doors` starts shut).
  * A sliding door heads open while the player `approaches` it (in front
  * of its wall and within `APPROACH` of its wall point) and shut otherwise; a bulkhead or blast door keeps heading
- * where it was until `pressed`, the index of the fixture E was pressed at
+ * where it was until `pressed`, the index of the fixture Space was pressed at
  * this tick, names it, which turns it round. A sealed door always heads
  * shut, and so does a door in `failed`, whatever the player does. Then each
  * door moves `DOOR_STEP` towards where it is heading. Returns a new map;
@@ -333,7 +333,7 @@ export function stepDoors(
  * (`PORTAL_HALF`). Nothing carries the player from behind a wall, where a
  * bay or the backlink corridor may lie. A way in `failed` carries no one,
  * whatever its `DoorState` says.
- * Hatches are crawled through on E instead (`hatchTravel`).
+ * Hatches are crawled through on Space instead (`hatchTravel`).
  */
 export function travelOf(
   room: RoomSpec,
@@ -369,7 +369,7 @@ export function travelOf(
 
 /**
  * The way through hatch `index`, or null when that fixture is not a hatch
- * or is in `failed`. The session calls it when E is pressed at a hatch.
+ * or is in `failed`. The session calls it when Space is pressed at a hatch.
  */
 export function hatchTravel(
   room: RoomSpec,

@@ -537,7 +537,7 @@ export function createSession(opts: SessionOptions): Session {
    * session has changed yet: the player stays in the room they were in,
    * with its blockers, lights and doors, and `fail` says `?LOAD ERROR`.
    * Returns whether the room was entered. Every press not yet consumed is
-   * dropped on the way in, so a key hit for the room left behind (an E
+   * dropped on the way in, so a key hit for the room left behind (a Space
    * while this one loaded) does nothing here.
    */
   const enter = (
