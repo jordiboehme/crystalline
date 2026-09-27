@@ -70,15 +70,20 @@
  *
  * The pass (`placeCurios`), in order:
  *
- * 1. **Draws.** `curioDraws(room)`: one stream of `seedFor(room.seed,
- *    "curio", "draw")` draws the retro slot's chance (`RETRO_SHARE`) and
- *    roll, the gear slot's (`GEAR_SHARE`), the ball slot's (`BALL_SHARE`)
- *    and its floor chance (`BALL_FLOOR`), the under slot's
- *    (`UNDER_SHARE`) and the tech slot's (`TECH_SHARE`), then one uniform
- *    and a roll each for the radar and the capsule case, the uniform
- *    giving both the slot's own chance and its paired chance. Everything
- *    is always drawn, and the later slots come after every earlier value,
- *    so no earlier draw moves.
+ * 1. **Draws.** `curioDraws(room)`, which is `curioDrawsOf(room.seed)`: one
+ *    stream of `seedFor(seed, "curio", "draw")` draws the retro slot's
+ *    chance (`RETRO_SHARE`) and roll, the gear slot's (`GEAR_SHARE`), the
+ *    ball slot's (`BALL_SHARE`) and its floor chance (`BALL_FLOOR`), the
+ *    under slot's (`UNDER_SHARE`) and the tech slot's (`TECH_SHARE`), then
+ *    one uniform and a roll each for the radar and the capsule case, the
+ *    uniform giving both the slot's own chance and its paired chance.
+ *    Everything is always drawn, and the later slots come after every
+ *    earlier value, so no earlier draw moves. `curioDrawsOf` reads nothing
+ *    of a room but its seed, so a neighbour's raw curios (`rawCurios`, 2.6f
+ *    C6) are made from its seed alone: it steps through the same slots,
+ *    picking each from its whole pool (`poolOf`) with no fit filter and no
+ *    layout, leaving out a slot whose pool is the archetype's own
+ *    (`ARCHETYPE_SLOTS`) when the archetype is unknown.
  * 2. **Surfaces.** `hostSurfaces(room)`, once.
  * 3. **Slots, in order: retro, gear, ball, under, tech, radar, capsule.**
  *    A slot that takes (`slotTakes`: its own chance, or for the radar and
@@ -1218,20 +1223,28 @@ const SLOTS: readonly CurioSlot[] = [
 function slotTakes(
   slot: CurioSlot,
   draw: SlotDraw | PairedDraw,
-  placed: readonly Curio[],
+  held: readonly CurioKind[],
 ): boolean {
   if (draw.take) return true;
   if (!("paired" in draw) || !draw.paired) return false;
-  const holds = (k: CurioKind) => placed.some((c) => c.kind === k);
+  const holds = (k: CurioKind) => held.includes(k);
   if (slot === "radar") return holds("star-ball");
   if (slot === "capsule") return holds("star-ball") || holds("treasure-radar");
   return false;
 }
 
 /**
- * A room's curio draws (the module doc's step 1): one stream of
- * `seedFor(room.seed, "curio", "draw")` draws, in this order, the retro
- * slot's chance of `RETRO_SHARE` and its roll, the gear slot's chance of
+ * A room's curio draws: `curioDrawsOf(room.seed)`.
+ */
+export function curioDraws(room: CurioBase): CurioDraws {
+  return curioDrawsOf(room.seed);
+}
+
+/**
+ * The draws of the room with seed `seed` (the module doc's step 1),
+ * exactly as `curioDraws` makes them (2.6f C6): one stream of
+ * `seedFor(seed, "curio", "draw")` draws, in this order, the retro slot's
+ * chance of `RETRO_SHARE` and its roll, the gear slot's chance of
  * `GEAR_SHARE` and its roll, the ball slot's chance of `BALL_SHARE`, its
  * roll and its floor chance of `BALL_FLOOR`, the under slot's chance of
  * `UNDER_SHARE` and its roll, the tech slot's chance of `TECH_SHARE` and
@@ -1240,10 +1253,11 @@ function slotTakes(
  * share (`RADAR_SHARE`, `CAPSULE_SHARE`) and its `paired` below its chance
  * beside a partner (`RADAR_BESIDE_BALL`, `CAPSULE_BESIDE`). Everything is
  * drawn whether it is used or not, so no draw ever moves another. No draw
- * forces a kind.
+ * forces a kind. They read nothing of a room but its seed, so a
+ * neighbour's draws (`rawCurios`) are made from its seed alone.
  */
-export function curioDraws(room: CurioBase): CurioDraws {
-  const rng = createRng(seedFor(room.seed, "curio", "draw"));
+export function curioDrawsOf(seed: number): CurioDraws {
+  const rng = createRng(seedFor(seed, "curio", "draw"));
   const slot = (share: number): SlotDraw => {
     const take = rng.chance(share);
     return { take, roll: rng.next() };
@@ -1273,6 +1287,40 @@ export function curioDraws(room: CurioBase): CurioDraws {
     radar,
     capsule,
   };
+}
+
+/** The slots whose pool is the archetype's own (C7): left out for a neighbour of unknown type. */
+const ARCHETYPE_SLOTS: ReadonlySet<CurioSlot> = new Set([
+  "retro",
+  "gear",
+  "tech",
+]);
+
+/**
+ * A room's raw curios (2.6f C6): the kinds its draws would place where
+ * every kind fits and no neighbour is skipped, slot by slot in the pass's
+ * order (`SLOTS`), each picked by its slot's roll from the slot's whole
+ * pool (`poolOf`); a paired slot takes beside a partner listed before it
+ * (`slotTakes`). A slot whose pool is the archetype's own is left out when
+ * the archetype is unknown (null); the other slots read no archetype, so
+ * the stand-in handed to `poolOf` for them never matters.
+ */
+export function rawCurios(
+  draws: CurioDraws,
+  archetype: Archetype | null,
+): CurioKind[] {
+  const out: CurioKind[] = [];
+  for (const slot of SLOTS) {
+    const draw = draws[slot];
+    if (draw === undefined || !slotTakes(slot, draw, out)) continue;
+    if (archetype === null && ARCHETYPE_SLOTS.has(slot)) continue;
+    const kind = pickByRoll(
+      draw.roll,
+      poolOf(slot, draw, archetype ?? "bridge"),
+    );
+    if (kind !== null) out.push(kind);
+  }
+  return out;
 }
 
 /** How far in from both hall walls a floor ball's centre stands, in metres. */
@@ -1622,7 +1670,15 @@ export function placeCurios(
   const placed: Curio[] = [];
   for (const slot of SLOTS) {
     const draw = draws[slot];
-    if (draw === undefined || !slotTakes(slot, draw, placed)) continue;
+    if (
+      draw === undefined ||
+      !slotTakes(
+        slot,
+        draw,
+        placed.map((c) => c.kind),
+      )
+    )
+      continue;
     const pool = poolOf(slot, draw, room.archetype);
     let floor = slot === "ball" && draws.ball.floor;
     const tryPlace = (kind: CurioKind): Curio | null => {

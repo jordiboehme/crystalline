@@ -31,6 +31,7 @@ import {
   CURIO_ORDER,
   DECOR_SURFACES,
   FIXTURE_SURFACES,
+  GEAR_POOLS,
   GEAR_SHARE,
   PROP_SURFACES,
   RADAR_BESIDE_BALL,
@@ -44,6 +45,7 @@ import {
   cornerSpots,
   curioBox,
   curioDraws,
+  curioDrawsOf,
   curioFits,
   curioLift,
   curioOn,
@@ -51,6 +53,7 @@ import {
   curiosClash,
   hostSurfaces,
   placeCurios,
+  rawCurios,
   type CurioDraws,
   type CurioSlot,
   type HostSurface,
@@ -1224,6 +1227,49 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
 
 describe("the 2.6d curios (2.6d C3 to C9)", () => {
   const HUB_ROOMS = matrix(CANNED_HUB);
+
+  it("makes a room's curio draws from its seed alone (2.6f C6)", () => {
+    // Mutation caught: curioDrawsOf reading another stream or order.
+    for (const { room } of ROOMS.slice(0, 20))
+      expect(curioDraws(base(room))).toEqual(curioDrawsOf(room.seed));
+  });
+
+  it("lists a room's raw curios slot by slot from the whole pools (2.6f C6)", () => {
+    // Mutation caught: the fit filter applied (it needs the room), a
+    // paired slot taken without its partner, or an archetype-bound slot
+    // kept for an unknown archetype.
+    // The kinds only an archetype's own pool gives: no slot outside the
+    // retro, gear and tech slots holds one.
+    const bound = new Set<CurioKind>(
+      [
+        ...Object.values(RETRO_POOLS),
+        ...Object.values(GEAR_POOLS),
+        ...Object.values(TECH_POOLS),
+      ]
+        .flat()
+        .map(([k]) => k),
+    );
+    expect(bound.size).toBeGreaterThan(10);
+    let placed = 0;
+    let inRaw = 0;
+    let unknownSeen = 0;
+    for (const made of ROOMS)
+      for (let i = 0; i < 10; i++) {
+        const b = reseed(made.room, "raw-f", made.name, i);
+        const raw = rawCurios(curioDraws(b), made.archetype);
+        const got = placeCurios(b);
+        placed += got.length;
+        inRaw += got.filter((c) => raw.includes(c.kind)).length;
+        for (const k of rawCurios(curioDraws(b), null)) {
+          unknownSeen++;
+          expect(bound.has(k), k).toBe(false);
+        }
+      }
+    expect(unknownSeen).toBeGreaterThan(0);
+    expect(placed).toBeGreaterThan(100);
+    // The planner measured 81 percent.
+    expect(inRaw / placed).toBeGreaterThan(0.7);
+  }, 30_000);
 
   it("names exactly one hovering curio and its lift (2.6d C4)", () => {
     // Mutation caught: a second floater added without a conscious change,

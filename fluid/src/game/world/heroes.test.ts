@@ -44,6 +44,7 @@ import {
   TURRET_SHARE,
   heroCap,
   heroDraws,
+  heroDrawsOf,
   heroEdges,
   heroMinCeiling,
   heroPoint,
@@ -52,6 +53,7 @@ import {
   heroUsePoint,
   isTallHero,
   placeHeroes,
+  rawHero,
   type HeroDraws,
 } from "./heroes";
 import heroesSource from "./heroes.ts?raw";
@@ -729,6 +731,93 @@ describe("the hero pass", () => {
   /** A pool slot's roll that picks `kind` out of `archetype`'s full pool. */
   const forcedPoolRoll = (archetype: Archetype, kind: HeroKind) =>
     middleRoll(HERO_POOLS[archetype], kind);
+
+  /** Draws that try `kind` alone, the way its own draw would. */
+  const alone = (archetype: Archetype, kind: HeroKind): HeroDraws => {
+    const off = { take: false, roll: 0 };
+    if (kind === "black-slab")
+      return { slab: true, turret: false, picks: [off] };
+    if (kind === "turret") return { slab: false, turret: true, picks: [off] };
+    if (kind === "question-block")
+      return { slab: false, turret: false, block: true, picks: [off] };
+    if (ANY_POOL.some(([k]) => k === kind))
+      return {
+        slab: false,
+        turret: false,
+        picks: [off],
+        any: { take: true, roll: forcedAnyRoll(kind) },
+      };
+    return {
+      slab: false,
+      turret: false,
+      picks: [{ take: true, roll: forcedPoolRoll(archetype, kind) }],
+    };
+  };
+
+  it("makes a room's draws from its seed and cap alone (2.6f C6)", () => {
+    // Mutation caught: heroDrawsOf reading another stream, or heroDraws
+    // not going through it.
+    let n = 0;
+    for (const { base } of EVERY_BASE)
+      for (const r of reseeded(base, 20)) {
+        n++;
+        expect(heroDraws(r)).toEqual(heroDrawsOf(r.seed, heroCap(r.hall)));
+      }
+    expect(n).toBeGreaterThan(0);
+  });
+
+  it("places the raw hero wherever it fits, in one-hero halls (2.6f C6)", () => {
+    // The planner measured 93.9 percent of halls placing exactly their raw
+    // hero. Mutation caught: rawHero trying the pools before the solo
+    // draws, the any draw before the pools, or picking from the wrong
+    // pool.
+    let halls = 0;
+    let same = 0;
+    for (const { archetype, base } of [...WORKSHOP_BASES, ...BRIDGE_BASES])
+      for (const r of reseeded(base, 200)) {
+        if (heroCap(r.hall) !== 1) continue;
+        halls++;
+        const raw = rawHero(heroDraws(r), archetype);
+        const got = place(base, r)[0]?.kind ?? null;
+        if (raw === null) {
+          expect(got, `${archetype} ${String(r.seed)}`).toBeNull();
+          continue;
+        }
+        if (got === raw) {
+          same++;
+          continue;
+        }
+        // Not placed: the raw kind finds no place in this hall alone.
+        expect(
+          placeHeroes(r, alone(archetype, raw), sitesOf(base)),
+          `${archetype} ${raw}`,
+        ).toEqual([]);
+      }
+    expect(halls).toBeGreaterThan(1000);
+    expect(same / halls).toBeGreaterThan(0.85);
+  }, 30_000);
+
+  it("draws nothing archetype-bound for a neighbour of unknown type (Review Focus 2)", () => {
+    // Mutation caught: an unknown archetype read as archetypeFor(null)'s,
+    // or the pool slot skipped so the any draw shows through it.
+    const pooled = new Set<HeroKind>(
+      Object.values(HERO_POOLS).flatMap((p) => p.map(([k]) => k)),
+    );
+    const seen = new Set<HeroKind>();
+    for (let i = 0; i < 2000; i++) {
+      const d = heroDrawsOf(seedFor("unknown-type", i), 1);
+      const raw = rawHero(d, null);
+      if (raw === null) {
+        // A pool slot that takes hides the any draw, known or not.
+        expect(d.slab || d.turret || d.block === true).toBe(false);
+        continue;
+      }
+      expect(pooled.has(raw), raw).toBe(false);
+      seen.add(raw);
+    }
+    expect(seen.has("turret")).toBe(true);
+    expect([...seen].some((k) => ANY_POOL.some(([a]) => a === k))).toBe(true);
+  });
 
   it("holds a hero in about nine halls in ten (2.6f C2)", () => {
     // Measured by the planner: 1821 of 2000 (0.910) at 3/5 and 3/4; 1577

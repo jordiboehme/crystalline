@@ -34,13 +34,14 @@
  * before the dressing, on the room's sites (`dressingSites`, which read no
  * hero and no prop). In this order:
  *
- * 1. The draws (`heroDraws`, H6, H7, C9): `seedFor(room.seed, "hero",
- *    "draw")` draws the slab's chance (`SLAB_SHARE`), then the turret's
+ * 1. The draws (`heroDraws`, which is `heroDrawsOf(room.seed,
+ *    heroCap(room.hall))`, H6, H7, C9): `seedFor(seed, "hero", "draw")`
+ *    draws the slab's chance (`SLAB_SHARE`), then the turret's
  *    (`TURRET_SHARE`), then the question block's (`BLOCK_SHARE`), the third
- *    value on that stream; each of the `heroCap(room.hall)` pool slots
- *    draws a chance of `HERO_SHARE` and a roll from `seedFor(room.seed,
- *    "hero", "pick", i)`; the any-archetype draw a chance of `ANY_SHARE`
- *    and a roll from `seedFor(room.seed, "hero", "any")`.
+ *    value on that stream; each of the `cap` pool slots draws a chance of
+ *    `HERO_SHARE` and a roll from `seedFor(seed, "hero", "pick", i)`; the
+ *    any-archetype draw a chance of `ANY_SHARE` and a roll from
+ *    `seedFor(seed, "hero", "any")`.
  * 2. The slab, when drawn: one candidate, at the hall's centre x with its
  *    south face on the hall's centre line, facing the entrance (turn 2,
  *    H9). It stands only where the centre is free: its box grown by
@@ -78,6 +79,15 @@
  *    same moat, seen from the flush side). Anchors are rounded to three
  *    decimals before they are measured.
  * 8. The output, sorted by `HERO_ORDER`.
+ *
+ * The neighbour shortcut (2.6f C6): `rawHero(draws, archetype)` reads a
+ * room's raw hero, the one kind the pass above would place in a one-hero
+ * hall where every kind fits and no neighbour is skipped, straight off its
+ * draws and its archetype, with no layout, hosts or ceiling. It follows the
+ * pass's own order (the slab, the turret or the block, then pool slot 0,
+ * then the any-archetype draw) but tries none of the placement steps, so a
+ * neighbouring room can learn what this room would draw without generating
+ * it.
  *
  * The surface hook (H21, C3): `HERO_CATALOGUE[kind].surfaces` lists each
  * top in the hero's local terms (`SurfaceSpec`, with its free height
@@ -851,24 +861,34 @@ export interface HeroDraws {
 }
 
 /**
- * A room's hero draws, from its own streams: `seedFor(room.seed, "hero",
- * "draw")` draws the slab's chance, then the turret's, then the question
- * block's (`BLOCK_SHARE`); pool slot `i` (one per `heroCap`) draws its
- * chance of `HERO_SHARE` and its roll from `seedFor(room.seed, "hero",
- * "pick", i)`; the any-archetype draw its chance of `ANY_SHARE` and its
- * roll from `seedFor(room.seed, "hero", "any")`.
+ * A room's hero draws: `heroDrawsOf(room.seed, heroCap(room.hall))`.
  */
 export function heroDraws(room: SiteBase): HeroDraws {
-  const rng = createRng(seedFor(room.seed, "hero", "draw"));
+  return heroDrawsOf(room.seed, heroCap(room.hall));
+}
+
+/**
+ * The draws of the room with seed `seed` and `cap` pool slots, exactly as
+ * `heroDraws` makes them (2.6f C6): `seedFor(seed, "hero", "draw")` draws
+ * the slab's chance, then the turret's, then the question block's
+ * (`BLOCK_SHARE`); pool slot `i` (one per `cap`) draws its chance of
+ * `HERO_SHARE` and its roll from `seedFor(seed, "hero", "pick", i)`; the
+ * any-archetype draw its chance of `ANY_SHARE` and its roll from
+ * `seedFor(seed, "hero", "any")`. They read nothing of a room but its seed
+ * and its cap, so a neighbour's draws (`rawHero`) are made from its seed
+ * alone, with no need for its layout, hosts or ceiling.
+ */
+export function heroDrawsOf(seed: number, cap: number): HeroDraws {
+  const rng = createRng(seedFor(seed, "hero", "draw"));
   const slab = rng.chance(SLAB_SHARE);
   const turret = rng.chance(TURRET_SHARE);
   // Third on the same stream, so the slab's and the turret's stay as they were.
   const block = rng.chance(BLOCK_SHARE);
-  const picks = Array.from({ length: heroCap(room.hall) }, (_, i) => {
-    const r = createRng(seedFor(room.seed, "hero", "pick", i));
+  const picks = Array.from({ length: cap }, (_, i) => {
+    const r = createRng(seedFor(seed, "hero", "pick", i));
     return { take: r.chance(HERO_SHARE), roll: r.next() };
   });
-  const a = createRng(seedFor(room.seed, "hero", "any"));
+  const a = createRng(seedFor(seed, "hero", "any"));
   return {
     slab,
     turret,
@@ -876,6 +896,33 @@ export function heroDraws(room: SiteBase): HeroDraws {
     picks,
     any: { take: a.chance(ANY_SHARE), roll: a.next() },
   };
+}
+
+/**
+ * A room's raw hero (2.6f C6): the one kind its draws would place in a
+ * one-hero hall where every kind fits and no neighbour is skipped. In the
+ * pass's order: the slab, the turret or the block when drawn; else pool
+ * slot 0's pick from the archetype's whole pool when it takes (null when
+ * the archetype is unknown, since that pick cannot be known); else the
+ * any-archetype draw's pick from `ANY_POOL` when it takes; else null.
+ * What a neighbouring room draws (`nearOf` in `neighbours.ts`), so it never
+ * needs this room's layout.
+ */
+export function rawHero(
+  draws: HeroDraws,
+  archetype: Archetype | null,
+): HeroKind | null {
+  if (draws.slab) return "black-slab";
+  if (draws.turret) return "turret";
+  if (draws.block === true) return "question-block";
+  const pick = draws.picks[0];
+  if (pick?.take === true)
+    return archetype === null
+      ? null
+      : pickByRoll(pick.roll, HERO_POOLS[archetype]);
+  const any = draws.any;
+  if (any?.take === true) return pickByRoll(any.roll, ANY_POOL);
+  return null;
 }
 
 /** One place a hero may be tried at: its seed, its anchor and how to make the hero. */
