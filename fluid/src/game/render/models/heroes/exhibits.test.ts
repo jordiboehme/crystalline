@@ -2,20 +2,33 @@
  * The exhibits' shape tests: the hand has no light and holds four fingers
  * and a thumb, the rocket's hull is a true chequer with three fins on its
  * plinth and four portholes centred on its front, and the hammer's head
- * is its true size with its crack flat on the floor.
+ * is its true size with its crack flat on the floor and its runes cut
+ * into its two long sides between the knotwork bands.
  */
 
 import { describe, expect, it } from "vitest";
 
 import { FLAG, type V3 } from "../../geometry";
-import { frameAt } from "../../kit";
+import { DECAL_LIFT, frameAt } from "../../kit";
 import { GLOWING, partsOf, toLocal, type Part } from "../../modelChecks";
-import { FLOOR_CRACK, HAMMER, HAMMER_HEAD, ROCKET } from "./exhibits";
+import { HAMMER_RUNES } from "../marks";
+import { FLOOR_CRACK, HAMMER, HAMMER_HEAD, ROCKET, RUNE_INK } from "./exhibits";
+import { runsOf } from "./pixels";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
 const extent = (pts: V3[], i: 0 | 1 | 2) =>
   Math.max(...pts.map((q) => q[i])) - Math.min(...pts.map((q) => q[i]));
+/** The panels of `parts` painted exactly `ink`. */
+const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
+  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
+
+/**
+ * The head faces the runes are cut into: the two long sides (`+d` and
+ * `-d`), one band each, as the original carries them.
+ */
+const RUNE_FACES = 2;
+
 const same = (x: readonly number[] | null, y: readonly number[]) =>
   x !== null && x.every((v, i) => Math.abs(v - (y[i] ?? NaN)) < 1e-6);
 
@@ -109,5 +122,42 @@ describe("exhibit hero models", () => {
         HAMMER.crack.h + 1e-6,
       );
     }
+  });
+
+  it("cuts the runes into the hammer head's faces, inside its size (2.6f C13)", () => {
+    // Mutation caught: the runes missing, on one face only when the
+    // original carries them on both, or standing off the head.
+    // `pixelPanel` lays one quad per run of equal characters (`runsOf`).
+    const runs = runsOf(HAMMER_RUNES).filter((r) => r.ch !== ".").length;
+    expect(runs).toBeGreaterThan(3);
+    const ink = inked(partsOf("thunder-hammer"), RUNE_INK);
+    expect(ink).toHaveLength(RUNE_FACES * runs);
+    for (const p of ink)
+      for (const q of local(p)) {
+        expect(Math.abs(q[0])).toBeLessThanOrEqual(
+          HAMMER_HEAD.long / 2 + 0.005,
+        );
+        expect(q[2]).toBeLessThanOrEqual(HAMMER_HEAD.side + 0.005);
+      }
+  });
+
+  it("sets one rune band on each long side, one lift proud, between the knotwork bands (2.6f C17)", () => {
+    // Mutation caught: both bands on the same side, a band floating off
+    // its face or sunk into it, and a band run over a knotwork band.
+    const ink = inked(partsOf("thunder-hammer"), RUNE_INK);
+    expect(ink.length).toBeGreaterThan(0);
+    const face = HAMMER_HEAD.side / 2 + DECAL_LIFT;
+    const inner = Math.min(...HAMMER.bands.map(Math.abs)) - HAMMER.bandHalf;
+    let front = 0;
+    for (const p of ink) {
+      const pts = local(p);
+      if ((pts[0]?.[1] ?? 0) > 0) front++;
+      for (const q of pts) {
+        expect(Math.abs(q[1])).toBeCloseTo(face, 6);
+        expect(Math.abs(q[0])).toBeLessThanOrEqual(inner + 1e-9);
+        expect(q[2]).toBeGreaterThanOrEqual(0);
+      }
+    }
+    expect(front * 2).toBe(ink.length);
   });
 });

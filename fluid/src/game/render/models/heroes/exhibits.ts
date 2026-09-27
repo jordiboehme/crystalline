@@ -18,7 +18,9 @@
  *   spread at its front, with a row of portholes near the top facing `+d`.
  * - The hammer's grey bevelled head is the screen prop's true size
  *   (`HAMMER_HEAD`), its long axis along `a`, flat on the floor, with two
- *   faint knotwork bands. Its leather-wrapped handle rises from the head's
+ *   faint knotwork bands, and a band of runes cut into each long side
+ *   (`+d` and `-d`) in the panel between them, in a grey darker than the
+ *   knotwork (`RUNE_INK`). Its leather-wrapped handle rises from the head's
  *   top middle towards `-d` at 55 degrees and ends in a pommel with a
  *   strap hanging from it. Under the head a dark dent marks the floor,
  *   and flat jagged cracks a few millimetres high radiate from it,
@@ -33,7 +35,9 @@ import type { HeroKind } from "../../../world/types";
 import { DECAL_LIFT, frameAt, type Frame } from "../../kit";
 import type { Rgb } from "../../looks";
 import { discOutline, shade, sideways, tiltedBar, yawed } from "../common";
+import { HAMMER_RUNES } from "../marks";
 import { heroHalf, type HeroRecipe } from "./common";
+import { fit, pixelPanel } from "./pixels";
 
 /** The recipe's own frame: the origin, facing north. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
@@ -384,6 +388,12 @@ const HAMMER_GREY: Rgb = [0.45, 0.45, 0.47];
 /** The knotwork bands: a slightly darker grey. */
 const KNOT_GREY: Rgb = [0.36, 0.36, 0.38];
 
+/**
+ * The runes' ink: a grey darker than `KNOT_GREY`, so the runes read as
+ * cut into the metal rather than painted on it (2.6f C13).
+ */
+export const RUNE_INK: Rgb = [0.28, 0.28, 0.3];
+
 /** The handle's dark brown leather. */
 const LEATHER: Rgb = [0.3, 0.18, 0.1];
 
@@ -400,7 +410,8 @@ const FLOOR_DENT: Rgb = [0.28, 0.27, 0.26];
  * The hammer's measures past its head, in metres and radians:
  * - `bevel`: the head's bevel;
  * - `bands`: the knotwork bands' centres along `a`, each `bandHalf` either
- *   side and `bandOut` proud of the head's sides and top;
+ *   side and `bandOut` proud of the head's sides and top; the panel
+ *   between them, less a `bevel` margin all round, holds the runes;
  * - `handle`: the handle's centre `(c, h)` in the sideways frame (`c` runs
  *   towards `-d`), its angle up from the floor, length and square side;
  * - `wraps`: where along the handle (0 at its foot, 1 at its end) each
@@ -482,9 +493,9 @@ export const HAMMER = {
 } as const;
 
 /**
- * The thunder hammer: the head with its two bands, the handle with its
- * wraps, the pommel and the strap in the sideways frame, and the crack in
- * the floor round the head.
+ * The thunder hammer: the head with its two bands and its runes, the
+ * handle with its wraps, the pommel and the strap in the sideways frame,
+ * and the crack in the floor round the head.
  */
 const thunderHammer: HeroRecipe = ({ k, kitAt, s }) => {
   const grey = s.tinted(HAMMER_GREY);
@@ -503,6 +514,17 @@ const thunderHammer: HeroRecipe = ({ k, kitAt, s }) => {
       0,
       top + o,
       knot,
+    );
+  // The runes: `HAMMER_RUNES` fitted into the panel between the bands,
+  // on `+d` and, through a kit turned half round, on `-d`, so each band
+  // reads left to right from its own side.
+  const ra0 = HAMMER.bands[0] + HAMMER.bandHalf + HAMMER.bevel;
+  const ra1 = HAMMER.bands[1] - HAMMER.bandHalf - HAMMER.bevel;
+  const r = fit(HAMMER_RUNES, ra0, ra1, HAMMER.bevel, top - HAMMER.bevel);
+  const rune = s.tinted(RUNE_INK);
+  for (const kit of [k, kitAt(yawed(ORIGIN, 0, 0, Math.PI))])
+    pixelPanel(kit, HAMMER_RUNES, r.left, r.top, r.px, ld + DECAL_LIFT, (ch) =>
+      ch === "#" ? rune : null,
     );
   // Sideways: `(c, h)` with `c` towards -d, and the thickness along `a`.
   const side = kitAt(sideways(ORIGIN));
