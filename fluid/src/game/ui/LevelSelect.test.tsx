@@ -241,6 +241,35 @@ describe("LevelSelect", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("finds a renamed domain by any of its names, labels it with both and jumps by the local one", async () => {
+    const { field, onJump } = renderSelect(
+      () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file" },
+          {
+            name: "infra",
+            kind: "file",
+            canonical_name: "platform",
+            aliases: ["old-infra"],
+          },
+        ],
+      }),
+      "old-infra",
+    );
+    await screen.findAllByRole("option");
+    expect(rows()).toEqual(["eng", "platform (infra)"]);
+    const options = screen.getAllByRole("option");
+    expect(within(options[1]!).getByText("HERE")).toBeInTheDocument();
+    expect(within(options[0]!).queryByText("HERE")).toBeNull();
+    for (const query of ["platform", "old-infra", "INFRA"]) {
+      fireEvent.change(field, { target: { value: query } });
+      expect(rows()).toEqual(["platform (infra)"]);
+    }
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(onJump).toHaveBeenCalledWith("infra");
+  });
+
   // Review Focus 5.
   it("one domain: one row, selected, marked and jumpable", async () => {
     const { field, onJump } = renderSelect(() => listing(["eng"]), "eng");

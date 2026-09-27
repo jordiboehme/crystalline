@@ -9,15 +9,15 @@
  * and the window.
  *
  * Typing goes into the field and filters the list. Up and down move the
- * selection, Enter or a click jumps (`onJump` with the domain's name), and
- * Esc closes (`onClose`). Those four keys are read on `window`, as the CRT
- * reader reads its keys, so they work wherever the focus went; a key
- * pressed with Ctrl, Cmd or Alt is left to the browser (C18). A mousedown
- * anywhere but on the field is prevented, so a click never takes the
- * focus from the field. The field swallows auto-repeat until its first
- * fresh key, so the V that completed the word, if still held, types
- * nothing (C17). While the listing loads, fails or matches nothing, one
- * line says so and Enter does nothing (C16).
+ * selection, Enter or a click jumps (`onJump` with the domain's local
+ * name, whichever name found it), and Esc closes (`onClose`). Those four
+ * keys are read on `window`, as the CRT reader reads its keys, so they work
+ * wherever the focus went; a key pressed with Ctrl, Cmd or Alt is left to
+ * the browser (C18). A mousedown anywhere but on the field is prevented,
+ * so a click never takes the focus from the field. The field swallows
+ * auto-repeat until its first fresh key, so the V that completed the word,
+ * if still held, types nothing (C17). While the listing loads, fails or
+ * matches nothing, one line says so and Enter does nothing (C16).
  *
  * The session already released the pointer lock and stopped reading keys
  * when it opened the select; the host unmounts it when the session says
@@ -41,14 +41,19 @@ import {
   LEVELS_TITLE,
   NO_SUCH_LEVEL,
   filterLevels,
+  hereKey,
   levelWindow,
+  levelsOf,
   sortLevels,
   stepSelection,
 } from "./levels";
 
 /** The props of the level select. */
 export interface LevelSelectProps {
-  /** The domain the player is in, marked in the list (C14). */
+  /**
+   * The domain the player is in, by any name it answers to; its one row is
+   * marked in the list (C14).
+   */
   current: string;
   /** Enter or a click on a row: go to that domain's bridge. */
   onJump: (domain: string) => void;
@@ -70,10 +75,14 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
   const fresh = useRef(false);
 
   const sorted = useMemo(
-    () => sortLevels((listing.data?.domains ?? []).map((d) => d.name)),
+    () => sortLevels(levelsOf(listing.data?.domains ?? []), (l) => l.label),
     [listing.data],
   );
-  const shown = useMemo(() => filterLevels(sorted, query), [sorted, query]);
+  const shown = useMemo(
+    () => filterLevels(sorted, query, (l) => l.terms),
+    [sorted, query],
+  );
+  const here = useMemo(() => hereKey(sorted, current), [sorted, current]);
   const at = stepSelection(shown.length, selected, 0);
   const { start, end } = levelWindow(shown.length, at);
 
@@ -92,8 +101,8 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
           setSelected(stepSelection(shown.length, at, 1));
           break;
         case "Enter": {
-          const name = shown[at];
-          if (!event.repeat && name !== undefined) onJump(name);
+          const level = shown[at];
+          if (!event.repeat && level !== undefined) onJump(level.key);
           break;
         }
         case "Escape":
@@ -164,22 +173,22 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
             <p className="py-1">{status}</p>
           ) : (
             <ul role="listbox" aria-label={LEVELS_LIST}>
-              {shown.slice(start, end).map((name, n) => {
+              {shown.slice(start, end).map((level, n) => {
                 const on = start + n === at;
                 return (
                   <li
-                    key={name}
+                    key={level.key}
                     role="option"
                     aria-selected={on}
                     className={`flex h-6 cursor-pointer items-center justify-between gap-4 px-1 ${
                       on ? "bg-white text-black [text-shadow:none]" : ""
                     }`}
                     onClick={() => {
-                      onJump(name);
+                      onJump(level.key);
                     }}
                   >
-                    <span className="min-w-0 truncate">{name}</span>
-                    {name === current && (
+                    <span className="min-w-0 truncate">{level.label}</span>
+                    {level.key === here && (
                       <span className="shrink-0 opacity-70">{LEVELS_HERE}</span>
                     )}
                   </li>

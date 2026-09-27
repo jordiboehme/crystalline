@@ -4,12 +4,16 @@
  *
  * Every string the select shows is here, and every one is the station's
  * own (C20): the title is the word that opens it, `NO SUCH LEVEL` is the
- * spec's line, and the rest follow the HUD's voice. The list is sorted by
- * the lowercased name and then by code point (C12), filtered by a trimmed,
- * case-insensitive substring (C12), and shown as a window of `LEVEL_ROWS`
- * rows around the selection (C15), which moves one row at a time and stops
- * at both ends (C13).
+ * spec's line, and the rest follow the HUD's voice. Each domain is one row
+ * (`levelsOf`), keyed and jumped to by its local name and found by every
+ * name it answers to. The list is sorted by the lowercased label and then
+ * by code point (C12), filtered by a trimmed, case-insensitive substring of
+ * any of those names (C12), and shown as a window of `LEVEL_ROWS` rows
+ * around the selection (C15), which moves one row at a time and stops at
+ * both ends (C13).
  */
+
+import type { DomainSummary } from "../../api/domains";
 
 /** The title line: the word that opens the select. */
 export const LEVELS_TITLE = "IDCLEV";
@@ -34,25 +38,93 @@ export const LEVELS_FOOTER =
 /** How many rows the list shows at most (C15). */
 export const LEVEL_ROWS = 10;
 
-/** The names sorted by lowercased name, then by code point (C12). */
-export function sortLevels(names: readonly string[]): string[] {
-  const order = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
-  return [...names].sort(
-    (a, b) => order(a.toLowerCase(), b.toLowerCase()) || order(a, b),
-  );
+/** One row of the list: one domain of the listing. */
+export interface Level {
+  /** The local registered name: the row's key and where a jump goes. */
+  key: string;
+  /** What the row shows: the local name, or the canonical one beside it. */
+  label: string;
+  /** The name the domain's content declares, or null when not said. */
+  canonical: string | null;
+  /** The former names the domain still answers to. */
+  aliases: readonly string[];
+  /** Whether another domain's local name holds this one's canonical name. */
+  shadowed: boolean;
+  /** Every name the filter finds the row by: local, canonical, aliases. */
+  terms: readonly string[];
 }
 
 /**
- * The names that hold the query, ignoring case and the query's outer
- * spaces, in the order given; all of them for an empty query (C12).
+ * One row per domain, in the listing's order. The label is the local name,
+ * or `canonical (local)` when the canonical name differs from it.
  */
-export function filterLevels(
-  sorted: readonly string[],
+export function levelsOf(
+  domains: readonly Pick<
+    DomainSummary,
+    "name" | "canonicalName" | "aliases" | "shadowed"
+  >[],
+): Level[] {
+  return domains.map((d) => ({
+    key: d.name,
+    label:
+      d.canonicalName !== null && d.canonicalName !== d.name
+        ? `${d.canonicalName} (${d.name})`
+        : d.name,
+    canonical: d.canonicalName,
+    aliases: d.aliases,
+    shadowed: d.shadowed,
+    terms: [
+      d.name,
+      ...(d.canonicalName !== null ? [d.canonicalName] : []),
+      ...d.aliases,
+    ],
+  }));
+}
+
+/**
+ * The key of the row `current` names, so only one row is ever marked: the
+ * row whose local name it is, else the one whose canonical name it is and
+ * that is not shadowed, else the first that has it as an alias; null when
+ * none does (C14).
+ */
+export function hereKey(
+  levels: readonly Level[],
+  current: string,
+): string | null {
+  const level =
+    levels.find((l) => l.key === current) ??
+    levels.find((l) => l.canonical === current && !l.shadowed) ??
+    levels.find((l) => l.aliases.includes(current));
+  return level?.key ?? null;
+}
+
+/** The items sorted by lowercased label, then by code point (C12). */
+export function sortLevels<T>(
+  items: readonly T[],
+  label: (item: T) => string = String,
+): T[] {
+  const order = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  return [...items].sort((x, y) => {
+    const a = label(x);
+    const b = label(y);
+    return order(a.toLowerCase(), b.toLowerCase()) || order(a, b);
+  });
+}
+
+/**
+ * The items with a term that holds the query, ignoring case and the query's
+ * outer spaces, in the order given; all of them for an empty query (C12).
+ */
+export function filterLevels<T>(
+  sorted: readonly T[],
   query: string,
-): string[] {
+  terms: (item: T) => readonly string[] = (item) => [String(item)],
+): T[] {
   const q = query.trim().toLowerCase();
   if (q === "") return [...sorted];
-  return sorted.filter((name) => name.toLowerCase().includes(q));
+  return sorted.filter((item) =>
+    terms(item).some((term) => term.toLowerCase().includes(q)),
+  );
 }
 
 /**
