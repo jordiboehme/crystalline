@@ -1685,6 +1685,32 @@ async fn registering_the_domain_a_prefix_names_heals_the_link_at_home() {
     );
 }
 
+/// The same for a virtual domain: registering `ops` with its scaffolded
+/// MANIFEST engram heals `[[ops:manifest]]` in home at once, though home holds
+/// a MANIFEST of its own under that permalink.
+#[tokio::test]
+async fn registering_a_virtual_domain_a_prefix_names_heals_the_link_at_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = memory_store().await;
+    let home = file_domain(
+        tmp.path(),
+        "home",
+        "home",
+        &[("src.md", engram("Src", "src", "See [[ops:manifest]]."))],
+    );
+    let engine = engine(store.clone(), tmp.path(), vec![("home", home)]);
+    engine.sync(None).await.unwrap();
+    assert!(!link_resolved(&engine, "home", "src").await);
+
+    engine.domain_add_virtual("ops").await.unwrap();
+
+    assert!(link_resolved(&engine, "home", "src").await);
+    assert_eq!(
+        bound_to(&store, "home", "src").await,
+        Some(("ops".to_string(), "manifest".to_string()))
+    );
+}
+
 /// What an index upgrade unbinds is bound again by the engine's startup pass,
 /// in a virtual domain too, which never syncs from disk. The upgrade is stood in
 /// for by the reset that unbinds every reference spelled `typo`: the same rows,

@@ -495,25 +495,104 @@ impl Engine {
     }
 
     /// Bind every pending reference in every domain the index knows, for a
-    /// change that may have left references pending where no sync of their
-    /// own domain will come to bind them: a rename that took a spelling
-    /// another domain held, a newly registered domain that a prefix elsewhere
-    /// already named, and the start of a daemon or server, after an index
-    /// upgrade may have unbound references in a virtual domain or a draft.
-    /// Each actor's drafts are bound in that actor's own view first, then the
-    /// rest against the base. Best effort, like the push.
-    pub async fn resolve_pending_everywhere(&self) {
+    /// change that may have unbound references without a spelling push to
+    /// notice it: a rename that took a spelling another domain held. Each
+    /// actor's drafts are bound in that actor's own view first, then the rest
+    /// against the base. One transaction and one store-lock window per domain,
+    /// so a request waits for one domain's pass at most, never for all of
+    /// them. Best effort, like the push.
+    pub(super) async fn resolve_pending_everywhere(&self) {
+        self.resolve_pending_domain_by_domain(&HashSet::new()).await;
+    }
+
+    /// The pass a daemon or an embedded server runs once its first sync has
+    /// returned. An index upgrade may have unbound references in a virtual
+    /// domain or in a draft, and no sync from disk reaches either. A file
+    /// domain's base rows are left alone: the sync that just ran bound them.
+    pub(super) async fn resolve_pending_after_startup(&self) {
+        let files: Vec<String> = self
+            .config()
+            .domains
+            .iter()
+            .filter(|(_, entry)| !entry.is_virtual())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut synced = HashSet::new();
+        {
+            let store = self.store.lock().await;
+            for name in &files {
+                match store.domain_id(name).await {
+                    Ok(Some(id)) => {
+                        synced.insert(id);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "binding the references left pending at startup failed: {e}"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        self.resolve_pending_domain_by_domain(&synced).await;
+    }
+
+    /// Bind the pending references, in every domain, that a newly registered
+    /// `domain` answers: the rows spelled with one of its names. A reference
+    /// elsewhere that already named it waited pending, and its own domain's
+    /// next sync is not coming on its own. Only those rows are read.
+    pub(super) async fn resolve_references_into(&self, domain: &str) {
         let store = self.store.lock().await;
-        if let Err(e) = resolve_pending_in_every_domain(&*store).await {
-            tracing::warn!("binding the pending references in every domain failed: {e}");
+        let bound = async {
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(0);
+            };
+            let spellings: Vec<String> = store
+                .domain_spellings()
+                .await?
+                .into_iter()
+                .filter(|(_, holder)| *holder == id)
+                .map(|(spelling, _)| spelling)
+                .collect();
+            store.resolve_references_to_spellings(&spellings).await
+        }
+        .await;
+        if let Err(e) = bound {
+            tracing::warn!("binding the references that name '{domain}' failed: {e}");
+        }
+    }
+
+    /// One resolve pass per domain row the index's spellings reach, each in
+    /// its own transaction under its own store-lock window. `base_done` names
+    /// the domains whose base rows need no pass; their drafts still get one.
+    async fn resolve_pending_domain_by_domain(&self, base_done: &HashSet<DomainId>) {
+        let every = {
+            let store = self.store.lock().await;
+            every_domain_id(&*store).await
+        };
+        let every = match every {
+            Ok(every) => every,
+            Err(e) => {
+                tracing::warn!("binding the pending references failed: {e}");
+                return;
+            }
+        };
+        for id in every {
+            let store = self.store.lock().await;
+            let base = !base_done.contains(&id);
+            if let Err(e) = in_one_transaction(&*store, bind_pending(&*store, id, base)).await {
+                tracing::warn!(
+                    "binding the pending references of domain {} failed: {e}",
+                    id.0
+                );
+            }
         }
     }
 }
 
-/// One resolve pass over every domain row the index's spellings reach, in
-/// one transaction: each drafting actor's rows in that actor's own view, as a
-/// draft write binds them, and then every row still pending against the base.
-async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index::Result<()> {
+/// Every domain row the index's spellings reach, in id order.
+async fn every_domain_id(store: &dyn Store) -> crystalline_index::Result<Vec<DomainId>> {
     let mut every: Vec<DomainId> = store
         .domain_spellings()
         .await?
@@ -522,25 +601,53 @@ async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index
         .collect();
     every.sort_by_key(|id| id.0);
     every.dedup();
-    store.begin().await?;
-    let pass = async {
-        for id in &every {
-            for (actor, _) in store.overlay_counts(*id).await? {
-                store.reresolve_actor_references(*id, &actor).await?;
-            }
-            store.resolve_pending_relations(*id).await?;
-            store.resolve_pending_links(*id).await?;
-        }
-        Ok::<(), crystalline_index::IndexError>(())
+    Ok(every)
+}
+
+/// Bind one domain's pending rows: each drafting actor's in that actor's own
+/// view, as a draft write binds them, and then, when `base`, every row still
+/// pending against the base. No transaction of its own.
+async fn bind_pending(
+    store: &dyn Store,
+    id: DomainId,
+    base: bool,
+) -> crystalline_index::Result<()> {
+    for (actor, _) in store.overlay_counts(id).await? {
+        store.reresolve_actor_references(id, &actor).await?;
     }
-    .await;
-    match pass {
+    if base {
+        store.resolve_pending_relations(id).await?;
+        store.resolve_pending_links(id).await?;
+    }
+    Ok(())
+}
+
+/// `pass` inside one transaction, rolled back when it fails.
+async fn in_one_transaction(
+    store: &dyn Store,
+    pass: impl std::future::Future<Output = crystalline_index::Result<()>>,
+) -> crystalline_index::Result<()> {
+    store.begin().await?;
+    match pass.await {
         Ok(()) => store.commit().await,
         Err(e) => {
             let _ = store.rollback().await;
             Err(e)
         }
     }
+}
+
+/// One resolve pass over every domain row the index's spellings reach, in
+/// one transaction, for the spelling push, which already holds the store.
+async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index::Result<()> {
+    let every = every_domain_id(store).await?;
+    in_one_transaction(store, async {
+        for id in &every {
+            bind_pending(store, *id, true).await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// The table over `entries`: each file domain's canonical name read from its

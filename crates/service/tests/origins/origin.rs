@@ -411,6 +411,61 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
     );
 }
 
+/// Connecting a repository as `brand` heals `[[brand:Alpha]]` in another
+/// domain at once: the link waited pending while nothing answered to the
+/// prefix, and the connect binds the rows spelled with the new name.
+#[tokio::test]
+async fn origin_add_heals_a_pending_link_that_names_the_new_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "brand alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("src.md"),
+        engram("Src", "src", "See [[brand:Alpha]]."),
+    )
+    .unwrap();
+    eng.domain_add_local(Some("home"), Some(home.to_str().unwrap()))
+        .await
+        .unwrap();
+    let src_resolved = || async {
+        let read = eng
+            .read_engram(
+                &ReadParams {
+                    identifier: "src".to_string(),
+                    domain: Some("home".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        read["links"][0]["resolved"].as_bool().unwrap()
+    };
+    assert!(!src_resolved().await, "`brand` names no domain yet");
+
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(tmp.path().join("brand").to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(src_resolved().await, "healed by the connect");
+}
+
 #[tokio::test]
 async fn origin_add_reports_stage_progress() {
     let tmp = tempfile::tempdir().unwrap();
