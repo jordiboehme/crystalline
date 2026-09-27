@@ -21,7 +21,9 @@
  * - `boxEntry` is the box version of `travelOf`, but of the box's own
  *   doors, not a way out of the room: a police box leads nowhere the
  *   generator ever built, so it is the session's business, not this
- *   module's, to decide what a walk through it does.
+ *   module's, to decide what a walk through it does. `steppedAway` says
+ *   when the player is far enough from a box (`BOX_LATCH_CLEAR`) for its
+ *   walk-in latch to clear.
  * - `DomainRow`, `exitSeed` and `pickExitDomain` are the console room's own
  *   business: which of the domains the sidebar's listing knows about the
  *   inner doors lead out to (2.6e C13). `DomainRow` lives here rather than
@@ -206,6 +208,25 @@ export function boxEntry(
     }
   }
   return null;
+}
+
+/**
+ * How far from a police box's front the player must be before its walk-in
+ * latch clears, in metres (C29): twice `BOX_REACH`, so a player who steps
+ * out of a box still holding the forward key, or who pushes against its
+ * doors on the spot, never walks straight back in; only a real step away
+ * and a walk back does.
+ */
+export const BOX_LATCH_CLEAR = 1.2;
+
+/**
+ * Whether the player has stepped away from police box `h`: their centre at
+ * least `BOX_LATCH_CLEAR` from the middle of its front (`boxFront`), in any
+ * direction. The session clears the box's walk-in latch then (C11, C29).
+ */
+export function steppedAway(h: Hero, player: Player): boolean {
+  const f = boxFront(h);
+  return Math.hypot(player.x - f.x, player.z - f.z) >= BOX_LATCH_CLEAR;
 }
 
 /**

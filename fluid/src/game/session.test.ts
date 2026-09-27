@@ -2289,6 +2289,73 @@ describe("the console room", () => {
     expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
   });
 
+  it("walks back into the arrival box only after a step 1.2 m from its front, not a short one (2.6e C29)", async () => {
+    // Mutation caught: the walk-in latch cleared once the player leaves
+    // the 0.6 m doorway, or at any distance short of 1.2 m, so a short step
+    // back and a push forward walks straight back in.
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    walkIn();
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("ops");
+    });
+    frames(20);
+    key("keydown", "ArrowLeft");
+    frames(37);
+    key("keyup", "ArrowLeft");
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE OPEN");
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    const room = lastRoom();
+    const box = room?.heroes.find((h) => h.kind === "police-box");
+    if (box === undefined) throw new Error("no arrival box");
+    const away = () => {
+      const f = boxFront(box);
+      const e = lastCamera().eye;
+      return Math.hypot(e[0] - f.x, e[2] - f.z);
+    };
+    const shown = renderer.setRoom.mock.calls.length;
+    const stepBackTo = (d: number) => {
+      key("keydown", "ArrowDown");
+      for (let t = 0; t < 60 && away() < d; t++) frames(1);
+      key("keyup", "ArrowDown");
+      frames(15);
+    };
+    // Walks forward until the player stands against the box's front (or
+    // cuts in), then pushes three ticks more: long enough to walk in, too
+    // short to slide along the front out of the doorway.
+    const pushIn = () => {
+      key("keydown", "ArrowUp");
+      for (
+        let t = 0;
+        t < 40 && away() > 0.4 && renderer.setRoom.mock.calls.length === shown;
+        t++
+      )
+        frames(1);
+      frames(3);
+      key("keyup", "ArrowUp");
+      frames(2);
+    };
+    // A short step: out of the doorway, short of 1.2 m.
+    stepBackTo(0.8);
+    expect(away()).toBeGreaterThan(0.6);
+    expect(away()).toBeLessThan(1.2);
+    pushIn();
+    // In the open doorway, against the box, and still outside.
+    expect(away()).toBeLessThan(0.45);
+    expect(renderer.setRoom.mock.calls.length).toBe(shown);
+    // A real step away: past 1.2 m, then in again.
+    stepBackTo(1.4);
+    expect(away()).toBeGreaterThanOrEqual(1.2);
+    pushIn();
+    expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
+    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+  });
+
   it("ends the console room's visit on any other entry: its doorway's spot in another room leads nowhere (Review Focus 4)", async () => {
     // Mutation caught: an entry that does not clear the visit, so the
     // exit still fires at (6, 12) m in the next room.

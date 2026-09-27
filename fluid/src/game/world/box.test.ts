@@ -8,12 +8,14 @@ import { describe, expect, it } from "vitest";
 
 import { heroHallRoom } from "./canned";
 import {
+  BOX_LATCH_CLEAR,
   boxEntry,
   boxFocus,
   boxFront,
   exitSeed,
   pickExitDomain,
   stepBoxDoors,
+  steppedAway,
   type DomainRow,
 } from "./box";
 import { heroFootprint } from "./footprints";
@@ -118,6 +120,23 @@ describe("the police box's doors and front (2.6e C10, C11)", () => {
         ix !== 0 ? (box.z0 + box.z1) / 2 : (box.x0 + box.x1) / 2,
         9,
       );
+    }
+  });
+
+  it("counts the player stepped away from a box only 1.2 m from its front, in any direction, at every turn (2.6e C29)", () => {
+    // Mutation caught: the latch distance left at the doorway's 0.6 m, or
+    // measured along the front's direction only (a player beside the box,
+    // or behind it, never counted away; or one 1.0 m out counted away).
+    expect(BOX_LATCH_CLEAR).toBe(1.2);
+    for (const h of fourBoxes().heroes) {
+      expect(steppedAway(h, facing(h, 0.45))).toBe(false);
+      expect(steppedAway(h, facing(h, 1.19))).toBe(false);
+      expect(steppedAway(h, facing(h, 1.21))).toBe(true);
+      // Along the front, beside the doorway: the same distance counts.
+      expect(steppedAway(h, facing(h, 0, 1.19))).toBe(false);
+      expect(steppedAway(h, facing(h, 0, 1.21))).toBe(true);
+      // Behind the box: well over 1.2 m from its front.
+      expect(steppedAway(h, facing(h, -1.6))).toBe(true);
     }
   });
 

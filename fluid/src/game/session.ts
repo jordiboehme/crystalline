@@ -51,11 +51,12 @@
  * naming the domain; the exit waits while the listing is still being read,
  * and falls back to the room left's own domain when it could not be read
  * or has not answered within `LISTING_WAIT_MS`.
- * The bridge lands with a police box beside its entrance for that visit
- * (`withArrivalBox`): the player steps out of it, its doors open and
- * swinging shut, and its walk-in latched until the player has left its
- * doorway. The walk-in and the exit are latched like a way, so each fires
- * again only after the player has left its zone; a failed exit leaves the
+ * The bridge lands with a police box standing free near its entrance for
+ * that visit (`withArrivalBox`): the player steps out of it, its doors open
+ * and swinging shut, and its walk-in latched until the player has stepped
+ * `BOX_LATCH_CLEAR` (1.2 m) away from its front (`steppedAway`). The
+ * walk-in is latched that way after every walk-in, the exit like a way, so
+ * each fires again only after the player has stepped away; a failed exit leaves the
  * player inside with the notice. Neither fires while a load is in flight
  * or an overlay has the keys, and every entry of a room ends the visit of
  * the console room (a jump from inside leaves it like any `go`).
@@ -116,6 +117,7 @@ import {
   exitSeed,
   pickExitDomain,
   stepBoxDoors,
+  steppedAway,
   type DomainRow,
 } from "./world/box";
 import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
@@ -490,7 +492,10 @@ export function createSession(opts: SessionOptions): Session {
   let exitRows: readonly DomainRow[] | null | undefined = undefined;
   /** Whether the exit fired and the player has not left its doorway since. */
   let exitLatched = false;
-  /** The police box walked into (or stepped out of) and not left since. */
+  /**
+   * The police box walked into (or stepped out of) and not stepped away
+   * from since (`steppedAway`).
+   */
   let boxLatched: number | null = null;
   /** Aborts the listing read for the console room's visit. */
   let listing: AbortController | null = null;
@@ -1152,19 +1157,15 @@ export function createSession(opts: SessionOptions): Session {
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
     for (const [index, state] of boxes) doorOpen.set(boxKey(index), state.open);
-    // The walk-in latch holds until the player has left the latched box's
-    // doorway, whatever its doors do meanwhile: counted as wide open, so a
-    // player who steps out of the arrival box, turns and opens it again
-    // walks in only after stepping back out and in (C11, C14).
-    if (
-      boxLatched !== null &&
-      boxEntry(
-        room,
-        player,
-        new Map([[boxLatched, { open: 1, target: 1 }]]),
-      ) === null
-    ) {
-      boxLatched = null;
+    // The walk-in latch holds until the player has stepped
+    // `BOX_LATCH_CLEAR` away from the latched box's front, whatever its
+    // doors do meanwhile, so a player who steps out of the arrival box
+    // still walking, or turns and opens it again on the spot, walks in
+    // only after a real step away and back (C11, C14, C29).
+    if (boxLatched !== null) {
+      const latched = room.heroes[boxLatched];
+      if (latched === undefined || steppedAway(latched, player))
+        boxLatched = null;
     }
     if (opts.consoleRoom !== undefined && !loading && !modal()) {
       const entered = boxEntry(room, player, boxes);
