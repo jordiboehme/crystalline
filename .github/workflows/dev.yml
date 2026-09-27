@@ -28,16 +28,25 @@ on:
 #
 # The group is decided when a run starts, before any job `if` runs, and
 # workflow_run fires for every CI conclusion. So a run that will not ship (a
-# red or cancelled CI run, a pull request, a dispatch off main) gets a group
-# of its own; in the shared group it would cancel a green build and then skip
-# itself, and nothing would ship. The condition is the `version` job's guard.
+# red or cancelled CI run, a pull request, a dispatch off main, or a CI run
+# for a commit that is no longer main's tip) gets a group of its own; in the
+# shared group it would cancel a newer build and then skip itself, and
+# nothing would ship. The condition is the `version` job's guard.
+#
+# The tip check matters because CI runs on main can finish out of order
+# (ci.yml has no concurrency group and a docs-only fast path) and an old CI
+# run can be re-run. For workflow_run, github.sha is main's tip when this run
+# started, so `head_sha == github.sha` means CI tested the tip. It also keeps
+# `uses: ./.github/workflows/build.yml`, which resolves at github.sha, on the
+# same commit as the source the build checks out.
 concurrency:
   group: >-
     ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
     (github.event_name == 'workflow_run' &&
     github.event.workflow_run.conclusion == 'success' &&
     github.event.workflow_run.event == 'push' &&
-    github.event.workflow_run.head_repository.full_name == github.repository))
+    github.event.workflow_run.head_repository.full_name == github.repository &&
+    github.event.workflow_run.head_sha == github.sha))
     && 'dev-channel' || format('dev-channel-skip-{0}', github.run_id) }}
   cancel-in-progress: true
 
@@ -48,25 +57,39 @@ jobs:
   version:
     name: compute the dev version
     runs-on: ubuntu-latest
-    # Only a green CI run of a push to main in this repository ships. The
-    # branches filter above matches a head branch by name, so a pull request
-    # from a fork's own `main` would pass it; the event and repository checks
-    # keep those out.
+    # Only a green CI run of a push to main in this repository, for the commit
+    # that is still main's tip, ships. The branches filter above matches a
+    # head branch by name, so a pull request from a fork's own `main` would
+    # pass it; the event and repository checks keep those out. The tip check
+    # is explained at `concurrency` above.
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_sha == github.sha)
     outputs:
       version: ${{ steps.version.outputs.version }}
       sha: ${{ steps.version.outputs.sha }}
-      exists: ${{ steps.exists.outputs.exists }}
+      build: ${{ steps.plan.outputs.build }}
+      formula: ${{ steps.plan.outputs.formula }}
     steps:
+      # Before anything is signed or published: without the tap token the run
+      # would build, notarize and publish a release and then fail to point the
+      # formula at it.
+      - name: The tap token is configured
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::the TAP_GITHUB_TOKEN secret is empty or not visible to this workflow, so the crystalline-dev formula could not be updated. Set it as a repository secret."
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # The commit CI tested. For workflow_run, github.sha is main's head
-          # when this run started, which may already be a newer commit.
+          # The commit CI tested, which the guard above makes main's tip.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           # The commit count is the version's last field, so the full history.
           fetch-depth: 0
@@ -81,27 +104,45 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      # A re-run of the same commit computes the same version, and a published
-      # release is not rebuilt: the tag names one commit and one set of
-      # archives. The rest of the run is skipped then.
-      - name: Is this version already published
-        id: exists
+      # What this run does, from the published dev releases and the tap's
+      # current formula (scripts/dev-plan.sh has the rules): build and publish
+      # only a version newer than every published one, and update the formula
+      # whenever it is behind a published or about-to-be-published version.
+      # A re-run of a run whose tap push failed therefore skips the build and
+      # finishes the formula.
+      - name: Plan the run
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: dev-${{ steps.version.outputs.version }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
-            echo "::notice::$TAG is already published, nothing to build"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          gh release list --repo "${{ github.repository }}" --limit 200 \
+            --json tagName,isPrerelease,isDraft > "$RUNNER_TEMP/releases.json"
+
+          formula="$RUNNER_TEMP/crystalline-dev.rb"
+          : > "$formula"
+          if ! GH_TOKEN="$TAP_GITHUB_TOKEN" gh api \
+              -H "Accept: application/vnd.github.raw" \
+              repos/jordiboehme/homebrew-tap/contents/Formula/crystalline-dev.rb \
+              > "$formula" 2> "$RUNNER_TEMP/formula.err"; then
+            if grep -q "HTTP 404" "$RUNNER_TEMP/formula.err"; then
+              echo "the tap has no crystalline-dev formula yet"
+              : > "$formula"
+            else
+              cat "$RUNNER_TEMP/formula.err"
+              echo "::error::could not read Formula/crystalline-dev.rb from the tap"
+              exit 1
+            fi
           fi
+
+          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: build
     needs: version
-    if: needs.version.outputs.exists == 'false'
+    if: needs.version.outputs.build == 'true'
     uses: ./.github/workflows/build.yml
     with:
       channel: dev
@@ -112,6 +153,7 @@ jobs:
   publish:
     name: publish the dev pre-release
     needs: [version, build]
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -142,6 +184,22 @@ jobs:
           sha256sum -- *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # gh uploads the assets to a draft and publishes it last, so a run
+      # cancelled in between leaves a draft of this tag behind. A draft does
+      # not count as published (scripts/dev-plan.sh), and deleting it here
+      # means it never blocks its version: the next run creates the release
+      # afresh. Drafts are looked up through the API, because the by-tag
+      # lookups do not return drafts.
+      - name: Delete a leftover draft of this tag
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${{ github.repository }}/releases" \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")"
+          for id in $ids; do
+            echo "deleting the leftover draft $id of $TAG"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+          done
+
       # The notes list the commits since the previous dev pre-release. Without
       # --notes-start-tag GitHub would compare against the latest release,
       # which is the last stable tag. The first dev release has no previous
@@ -150,8 +208,8 @@ jobs:
         run: |
           set -euo pipefail
           previous="$(gh release list --repo "${{ github.repository }}" --limit 200 \
-            --json tagName,isPrerelease,createdAt \
-            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("dev-")))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+            --json tagName,isPrerelease,isDraft,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith("dev-")))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
           start=()
           if [ -n "$previous" ]; then
             echo "notes since $previous"
@@ -166,9 +224,20 @@ jobs:
             --generate-notes \
             "${start[@]}"
 
+  # Runs after a fresh publish, and also on its own when the release already
+  # exists but the formula is behind it (a re-run after a failed tap push).
+  # `!cancelled()` lets it run when build and publish were skipped on
+  # purpose; the publish result check keeps it from running after a failed or
+  # cancelled publish.
   homebrew:
     name: update the crystalline-dev formula
     needs: [version, publish]
+    if: >-
+      !cancelled() &&
+      needs.version.result == 'success' &&
+      needs.version.outputs.formula == 'true' &&
+      (needs.publish.result == 'success' ||
+       (needs.publish.result == 'skipped' && needs.version.outputs.build != 'true'))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -240,8 +309,8 @@ jobs:
         run: |
           set -euo pipefail
           old="$(gh release list --repo "${{ github.repository }}" --limit 200 \
-            --json tagName,isPrerelease,createdAt \
-            --jq "[.[] | select(.isPrerelease and (.tagName | startswith(\"dev-\")))] | sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName")"
+            --json tagName,isPrerelease,isDraft,createdAt \
+            --jq "[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith(\"dev-\")))] | sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName")"
           if [ -z "$old" ]; then
             echo "nothing to prune"
             exit 0
