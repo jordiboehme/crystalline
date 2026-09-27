@@ -17,9 +17,9 @@
  * person is the only safe direction. And a queue row carries no family of its
  * own. The engine counts families over the whole filtered result and numbers
  * every rule by family in its catalog (`V0xx` temporal, `V1xx` structure,
- * `V2xx` redundancy), so the section a row belongs under is read off its rule
- * id, and a rule id from a newer catalog belongs to no section rather than to
- * the wrong one.
+ * `V2xx` redundancy, `V3xx` meaning), so the section a row belongs under is
+ * read off its rule id, and a rule id from a newer catalog belongs to no
+ * section rather than to the wrong one.
  */
 
 import { api, encodeSegment } from "./client";
@@ -27,7 +27,12 @@ import { asArray, asNumber, asObject, asString } from "./json";
 import type { AckBody } from "./model";
 
 /** The detector families, in the catalog's own order. */
-export const EVOLVE_FAMILIES = ["temporal", "structure", "redundancy"] as const;
+export const EVOLVE_FAMILIES = [
+  "temporal",
+  "structure",
+  "redundancy",
+  "meaning",
+] as const;
 
 /**
  * The rule whose subject is an attachment nothing references, and the only one
@@ -43,6 +48,7 @@ export const EVOLVE_FAMILY_TITLES: Record<EvolveFamily, string> = {
   temporal: "Temporal",
   structure: "Structure",
   redundancy: "Redundancy",
+  meaning: "Meaning",
 };
 
 /** What a family section says it is about, in one line. */
@@ -50,6 +56,8 @@ export const EVOLVE_FAMILY_BLURBS: Record<EvolveFamily, string> = {
   temporal: "Validity windows, staleness and the supersede lifecycle.",
   structure: "References, reciprocity, orphans, stubs and size.",
   redundancy: "Duplicate content, colliding titles and tag drift.",
+  meaning:
+    "Semantic twins and possible contradictions, by embedding and by a local model's reading.",
 };
 
 /**
@@ -221,18 +229,14 @@ export interface EvolveQueue {
 
 /**
  * Which family each rule series files under, as the sweep's own catalog files
- * it.
- *
- * A table rather than the series number used as an index, because the two
- * stopped agreeing: `V3xx` finds redundancy by meaning where `V2xx` finds it
- * by wording, and the catalog puts both under the one heading. Two engrams
- * that say the same thing are one kind of work whichever pass noticed it.
+ * it. A table rather than the series number used as an index, so a series the
+ * catalog has not named reads as no family at all.
  */
 const EVOLVE_FAMILY_OF_SERIES: Record<string, EvolveFamily> = {
   "0": "temporal",
   "1": "structure",
   "2": "redundancy",
-  "3": "redundancy",
+  "3": "meaning",
 };
 
 /**

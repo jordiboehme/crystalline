@@ -594,7 +594,7 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
         .to_string();
     assert_eq!(
         e,
-        "unknown family 'lifecycle'; valid families: temporal, structure, redundancy"
+        "unknown family 'lifecycle'; valid families: temporal, structure, redundancy, meaning"
     );
 
     let e = engine

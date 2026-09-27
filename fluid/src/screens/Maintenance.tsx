@@ -28,12 +28,12 @@
  * nobody could see.
  *
  * The queue arrives ranked across the whole result and is drawn under the
- * catalog's three families, in the catalog's own order, because the shape of a
+ * catalog's four families, in the catalog's own order, because the shape of a
  * backlog is what somebody opening this page came to see - a flat hundred rows
  * would answer a different question. The family of a row is read off its rule
  * id (`api/evolve.ts` says why), and a rule from a catalog newer than this
  * client is drawn under its own heading rather than guessed into one of the
- * three.
+ * four.
  *
  * Two things the page refuses to blur. A judgment finding wears its class on
  * its face, because it is a question for a person rather than a change to

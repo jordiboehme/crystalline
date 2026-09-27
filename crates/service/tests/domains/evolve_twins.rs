@@ -69,7 +69,7 @@ async fn sweep(engine: &Engine) -> Value {
         .evolve_engrams(
             &EvolveParams {
                 domains: vec!["notes".to_string()],
-                families: vec!["redundancy".to_string()],
+                families: vec!["redundancy".to_string(), "meaning".to_string()],
                 rules: Vec::new(),
                 min_priority: None,
                 limit: Some(50),
@@ -255,10 +255,7 @@ async fn acknowledging_one_pair_leaves_the_other_standing() {
     // test does, or the pair would vanish for the wrong reason.
     engine.embed_pending().await.unwrap();
     let after = sweep(&engine).await;
-    assert_eq!(
-        after["acknowledged"]["by_family"]["redundancy"], 1,
-        "{after}"
-    );
+    assert_eq!(after["acknowledged"]["by_family"]["meaning"], 1, "{after}");
     assert_eq!(
         rules_of(&after).iter().filter(|(r, _)| r == "V301").count(),
         twins_before - 1
@@ -314,10 +311,7 @@ async fn two_pairs_on_one_hub_are_acknowledged_side_by_side() {
     );
 
     let after = sweep(&engine).await;
-    assert_eq!(
-        after["acknowledged"]["by_family"]["redundancy"], 2,
-        "{after}"
-    );
+    assert_eq!(after["acknowledged"]["by_family"]["meaning"], 2, "{after}");
     let rows: Vec<&Value> = after["queue"]
         .as_array()
         .unwrap()
@@ -562,13 +556,13 @@ fn account(name: &str) -> Scope {
     }
 }
 
-/// The redundancy sweep of `team`, asked as somebody in particular.
+/// The redundancy and meaning sweep of `team`, asked as somebody in particular.
 async fn sweep_team(engine: &Engine, scope: &Scope) -> Value {
     engine
         .evolve_engrams(
             &EvolveParams {
                 domains: vec!["team".to_string()],
-                families: vec!["redundancy".to_string()],
+                families: vec!["redundancy".to_string(), "meaning".to_string()],
                 rules: Vec::new(),
                 min_priority: None,
                 limit: Some(50),

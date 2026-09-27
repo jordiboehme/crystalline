@@ -3,7 +3,7 @@
  *
  * The screen is a report rather than a workbench, and everything pinned here
  * follows from that. The queue arrives ranked and is drawn under the catalog's
- * own three families, so a reader sees the shape of the backlog rather than a
+ * own four families, so a reader sees the shape of the backlog rather than a
  * flat hundred rows. A finding names the engram it fired on and links there,
  * because the usual thing to do about one is to go and read the engram - and a
  * finding with no engram behind it says its subject in plain text instead,
@@ -211,7 +211,8 @@ function twinPayload() {
     families: [
       { family: "temporal", findings: 1 },
       { family: "structure", findings: 1 },
-      { family: "redundancy", findings: 3 },
+      { family: "redundancy", findings: 1 },
+      { family: "meaning", findings: 2 },
     ],
     queue: [
       ...base.queue,
@@ -1121,10 +1122,7 @@ describe("acknowledging a finding", () => {
     // The second of the hub's two twin rows. Naming the rule alone would leave
     // the server to pick, and it picks the first - so the pair a reader read
     // and the pair their note lands on would be different ones.
-    const row = defined(
-      rows(await section(/^Redundancy/))[2],
-      "the second twin",
-    );
+    const row = defined(rows(await section(/^Meaning/))[1], "the second twin");
     expect(row).toHaveTextContent("twin: eng/second");
 
     await userEvent.click(
@@ -1159,7 +1157,7 @@ describe("acknowledging a finding", () => {
       },
     });
     const row = defined(
-      rows(await section(/^Redundancy/))[1],
+      rows(await section(/^Meaning/))[0],
       "the silenced twin",
     );
 

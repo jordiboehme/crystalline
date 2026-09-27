@@ -5,7 +5,7 @@
 //! it well organized?". This module is that third question, expressed as
 //! detectors over prepared facts.
 //!
-//! Three families, four letters:
+//! Four families, four letters:
 //!
 //! - `V0xx` **temporal and lifecycle** - a validity window that closed, a
 //!   staleness date that elapsed, a replacement that landed without the
@@ -18,10 +18,9 @@
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
 //!   sit at or above the twin threshold: knowledge that says the same thing
-//!   twice in different words. Filed under the redundancy family, because
-//!   that is what it is. It compares meaning to find twins and still never
-//!   confirms a contradiction, which no rule here can: two texts close in
-//!   embedding space agree about their topic, not about what is true.
+//!   twice in different words. It compares meaning to find twins and never
+//!   confirms a contradiction: two texts close in embedding space agree about
+//!   their topic, not about what is true.
 //!
 //! # Detect and guide, never auto-consolidate
 //!
@@ -232,7 +231,7 @@ pub const RECIPROCAL_PAIRS: [(&str, &str); 3] = [
 // Vocabulary
 // ---------------------------------------------------------------------------
 
-/// The three detector families.
+/// The four detector families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
@@ -240,14 +239,21 @@ pub enum Family {
     Temporal,
     /// `V1xx`: references, reciprocity, orphans, stubs and size.
     Structure,
-    /// `V2xx` and `V301`: duplicate content, semantic twins, colliding titles
-    /// and tag drift.
+    /// `V2xx`: duplicate content, colliding titles and tag drift.
     Redundancy,
+    /// `V3xx`: what two engrams say. Semantic twins by embedding, and the
+    /// observation lines a local model read as a possible contradiction.
+    Meaning,
 }
 
 impl Family {
     /// Every family, in catalog order.
-    pub const ALL: [Family; 3] = [Family::Temporal, Family::Structure, Family::Redundancy];
+    pub const ALL: [Family; 4] = [
+        Family::Temporal,
+        Family::Structure,
+        Family::Redundancy,
+        Family::Meaning,
+    ];
 
     /// The wire name.
     pub fn as_str(self) -> &'static str {
@@ -255,6 +261,7 @@ impl Family {
             Family::Temporal => "temporal",
             Family::Structure => "structure",
             Family::Redundancy => "redundancy",
+            Family::Meaning => "meaning",
         }
     }
 
@@ -483,7 +490,7 @@ pub const RULES: [RuleInfo; 24] = [
     },
     RuleInfo {
         id: "V301",
-        family: Family::Redundancy,
+        family: Family::Meaning,
         base: 75,
         summary: "semantic twins",
         instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: this sweep still cannot confirm one. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
@@ -594,8 +601,10 @@ pub struct AckCounts {
     pub temporal: usize,
     /// Suppressed `V1xx` findings.
     pub structure: usize,
-    /// Suppressed redundancy findings: `V2xx` and `V301`.
+    /// Suppressed `V2xx` findings.
     pub redundancy: usize,
+    /// Suppressed `V3xx` findings.
+    pub meaning: usize,
 }
 
 impl AckCounts {
@@ -606,6 +615,7 @@ impl AckCounts {
             Family::Temporal => self.temporal += 1,
             Family::Structure => self.structure += 1,
             Family::Redundancy => self.redundancy += 1,
+            Family::Meaning => self.meaning += 1,
         }
     }
 }

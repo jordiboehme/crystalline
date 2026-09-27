@@ -6053,7 +6053,7 @@
           {
             "name": "families",
             "in": "query",
-            "description": "Restrict to these detector families, comma separated: `temporal`,\n`structure` or `redundancy`. Defaults to all three.",
+            "description": "Restrict to these detector families, comma separated: `temporal`,\n`structure`, `redundancy` or `meaning`. Defaults to all four.",
             "required": false,
             "schema": {
               "type": "string"
@@ -6126,6 +6126,7 @@
                 "example": {
                   "acknowledged": {
                     "by_family": {
+                      "meaning": 0,
                       "redundancy": 0,
                       "structure": 1,
                       "temporal": 0

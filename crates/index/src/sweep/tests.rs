@@ -1330,7 +1330,7 @@ fn v301_flags_a_twin_pair_on_lead_vectors_and_scopes_the_pair() {
 
     let report = detect(&input(vec![a, b, c]));
     let finding = only(&report, "V301");
-    assert_eq!(finding.family, Family::Redundancy);
+    assert_eq!(finding.family, Family::Meaning);
     assert_eq!(finding.class, Class::Judgment);
     assert_eq!(finding.priority, 75);
     assert_eq!(
@@ -1538,7 +1538,7 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
     two.lead_vector = Some(unit(&[1.0, 0.0]));
 
     let report = detect(&input(vec![hub, one, two]));
-    assert_eq!(report.acknowledged.redundancy, 1);
+    assert_eq!(report.acknowledged.meaning, 1);
     let twins: Vec<&Finding> = report
         .findings
         .iter()
@@ -1578,7 +1578,7 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
     two.lead_vector = Some(unit(&[1.0, 0.0]));
 
     let report = detect(&input(vec![hub, one, two]));
-    assert_eq!(report.acknowledged.redundancy, 2);
+    assert_eq!(report.acknowledged.meaning, 2);
     let twins: Vec<&Finding> = report
         .findings
         .iter()
@@ -2124,15 +2124,18 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         let expected = match &rule.id[..2] {
             "V0" => Family::Temporal,
             "V1" => Family::Structure,
-            _ => Family::Redundancy,
+            "V2" => Family::Redundancy,
+            _ => Family::Meaning,
         };
         assert_eq!(rule.family, expected, "{}", rule.id);
     }
     assert_eq!(
         rule_info("V301").expect("V301 is in the catalog").family,
-        Family::Redundancy,
-        "semantic twins are redundancy, which is what they are"
+        Family::Meaning,
+        "semantic twins compare what two engrams say, which is the meaning family"
     );
+    assert_eq!(Family::ALL.len(), 4);
+    assert_eq!(Family::parse("meaning"), Some(Family::Meaning));
 }
 
 #[test]
@@ -2216,6 +2219,7 @@ fn a_scoped_ack_suppresses_its_finding_and_is_counted() {
     assert_eq!(report.acknowledged.structure, 1);
     assert_eq!(report.acknowledged.temporal, 0);
     assert_eq!(report.acknowledged.redundancy, 0);
+    assert_eq!(report.acknowledged.meaning, 0);
 }
 
 #[test]

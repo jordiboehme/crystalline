@@ -8252,7 +8252,7 @@ export interface operations {
                 domains?: string;
                 /**
                  * @description Restrict to these detector families, comma separated: `temporal`,
-                 *     `structure` or `redundancy`. Defaults to all three.
+                 *     `structure`, `redundancy` or `meaning`. Defaults to all four.
                  * @example temporal,structure
                  */
                 families?: string;
@@ -8300,6 +8300,7 @@ export interface operations {
                      * @example {
                      *       "acknowledged": {
                      *         "by_family": {
+                     *           "meaning": 0,
                      *           "redundancy": 0,
                      *           "structure": 1,
                      *           "temporal": 0

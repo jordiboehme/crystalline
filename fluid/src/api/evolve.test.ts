@@ -461,8 +461,8 @@ describe("the acknowledgment fields", () => {
 
 /**
  * Which section a finding is drawn under. The rule id says it - the catalog
- * numbers temporal rules `V0xx`, structure `V1xx` and redundancy `V2xx` - and
- * a row carries no family of its own to read instead.
+ * numbers temporal rules `V0xx`, structure `V1xx`, redundancy `V2xx` and
+ * meaning `V3xx` - and a row carries no family of its own to read instead.
  */
 describe("the family of a rule", () => {
   it("reads the family off the rule id", () => {
@@ -470,10 +470,10 @@ describe("the family of a rule", () => {
     expect(evolveFamily("V006")).toBe("temporal");
     expect(evolveFamily("V105")).toBe("structure");
     expect(evolveFamily("V203")).toBe("redundancy");
-    // The meaning series shares the redundancy heading, as the catalog does:
-    // a twin found by embedding is the same kind of work as a duplicate found
-    // by wording, and a section of its own would say otherwise.
-    expect(evolveFamily("V301")).toBe("redundancy");
+    // The meaning series is its own section: a twin and a possible
+    // contradiction are both questions about what two engrams say.
+    expect(evolveFamily("V301")).toBe("meaning");
+    expect(evolveFamily("V302")).toBe("meaning");
   });
 
   it("puts a rule from a newer catalog under no section at all", () => {
@@ -485,7 +485,12 @@ describe("the family of a rule", () => {
   });
 
   it("lists the families in the catalog's own order", () => {
-    expect(EVOLVE_FAMILIES).toEqual(["temporal", "structure", "redundancy"]);
+    expect(EVOLVE_FAMILIES).toEqual([
+      "temporal",
+      "structure",
+      "redundancy",
+      "meaning",
+    ]);
   });
 });
 

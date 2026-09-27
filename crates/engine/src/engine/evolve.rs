@@ -184,6 +184,7 @@ impl Engine {
             acknowledged.temporal += swept.report.acknowledged.temporal;
             acknowledged.structure += swept.report.acknowledged.structure;
             acknowledged.redundancy += swept.report.acknowledged.redundancy;
+            acknowledged.meaning += swept.report.acknowledged.meaning;
             findings.extend(swept.report.findings);
         }
 
@@ -315,6 +316,7 @@ impl Engine {
                     "temporal": acknowledged.temporal,
                     "structure": acknowledged.structure,
                     "redundancy": acknowledged.redundancy,
+                    "meaning": acknowledged.meaning,
                 },
             },
             "queue": queue,

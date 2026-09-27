@@ -660,7 +660,7 @@ enum Command {
         #[arg(long)]
         domain: Vec<String>,
         /// Restrict to these detector families (repeatable): temporal,
-        /// structure or redundancy.
+        /// structure, redundancy or meaning.
         #[arg(long = "family")]
         families: Vec<String>,
         /// Restrict to these rule ids (repeatable), for example V001 or V201.

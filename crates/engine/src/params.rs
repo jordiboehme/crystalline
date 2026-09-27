@@ -477,8 +477,9 @@ pub struct EvolveParams {
     pub domains: Vec<String>,
     /// Restrict the sweep to these detector families: temporal (validity
     /// windows, staleness and the supersede lifecycle), structure (references,
-    /// reciprocity, orphans, stubs and size) or redundancy (duplicate content,
-    /// colliding titles and tag drift). Omit for all three.
+    /// reciprocity, orphans, stubs and size), redundancy (duplicate content,
+    /// colliding titles and tag drift) or meaning (semantic twins and possible
+    /// contradictions). Omit for all four.
     #[serde(default, deserialize_with = "null_as_default")]
     pub families: Vec<String>,
     /// Restrict the sweep to these rule ids, for example V001 or V201. Omit for

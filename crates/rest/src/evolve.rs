@@ -40,7 +40,7 @@ pub struct EvolveQuery {
     #[param(example = "eng,ops")]
     domains: Option<String>,
     /// Restrict to these detector families, comma separated: `temporal`,
-    /// `structure` or `redundancy`. Defaults to all three.
+    /// `structure`, `redundancy` or `meaning`. Defaults to all four.
     #[serde(default)]
     #[param(example = "temporal,structure")]
     families: Option<String>,
@@ -142,7 +142,7 @@ pub struct EvolveQuery {
                 "families": [{ "family": "temporal", "findings": 2 }],
                 "acknowledged": {
                     "total": 1,
-                    "by_family": { "temporal": 0, "structure": 1, "redundancy": 0 }
+                    "by_family": { "temporal": 0, "structure": 1, "redundancy": 0, "meaning": 0 }
                 },
                 "queue": [{
                     "n": 1,
