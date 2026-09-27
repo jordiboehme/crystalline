@@ -1,6 +1,8 @@
 /**
  * How long the change stream waits before it reopens a source the browser
- * closed for good (controller ruling C1b, 2026-09-28).
+ * closed for good. A closed source is often a server restarting behind a
+ * proxy or the stream cap turning a tab away, so the tab tries again, a
+ * little later each time, instead of hammering the server or giving up.
  */
 
 /** The first wait before a closed stream is reopened, doubled per failure. */

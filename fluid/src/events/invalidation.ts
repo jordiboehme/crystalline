@@ -56,9 +56,9 @@ export function keysForEngram(change: EngramChange): QueryKey[] {
   if (change.kind === "added" || change.kind === "deleted") {
     keys.push(DOMAINS_QUERY_KEY);
   }
-  // Jordi, 2026-09-27 (Section J (l)): a domain's MANIFEST carries its
-  // canonical name, and domainSpellings, cross-domain link resolution and
-  // the station game's IDCLEV level list are all built from this key.
+  // Jordi, 2026-09-27: a domain's MANIFEST carries its canonical name, and
+  // domainSpellings, cross-domain link resolution and the station game's
+  // IDCLEV level list are all built from this key.
   if (change.kind === "modified" && change.path === "MANIFEST.md") {
     keys.push(DOMAINS_QUERY_KEY);
   }
