@@ -94,6 +94,7 @@ import { RetireDialog } from "../components/RetireDialog";
 import { ShareDialog } from "../components/ShareDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
+import { domainSpellings } from "../domainNames";
 import { plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
@@ -161,12 +162,16 @@ export default function EngramPage() {
     enabled: detail.isSuccess,
   });
 
-  // The names alone, and only once the listing has landed: the resolver reads
-  // a missing list as "this caller cannot tell whether a prefix is a domain"
-  // and an empty one as "none of them is", so handing it an empty array while
-  // the request is in flight would answer a question nobody can answer yet.
+  // Every spelling of every domain, and only once the listing has landed: the
+  // resolver reads a missing table as "this caller cannot tell whether a
+  // prefix is a domain" and an empty one as "none of them is", so handing it
+  // an empty table while the request is in flight would answer a question
+  // nobody can answer yet.
   const domainNames = useMemo(
-    () => domains.data?.domains.map((entry) => entry.name),
+    () =>
+      domains.data === undefined
+        ? undefined
+        : domainSpellings(domains.data.domains),
     [domains.data],
   );
 

@@ -32,10 +32,17 @@
  * mirrors the server's parser, and the two must not drift - and the fallback
  * lives in the resolver, which is handed the domain list this app already
  * holds. That mirrors where the server keeps it too (`core/src/address.rs`).
+ *
+ * A prefix may spell its domain with the local name, the canonical name the
+ * domain's MANIFEST declares or a former name, and the server binds all three.
+ * So the domain list is the spelling table from `domainNames.ts`, and every
+ * key below names the domain by the local name it maps to, spelled exactly as
+ * the server matches it.
  */
 
 import type { EngramDetail, LinkTarget } from "./api/engram";
 import type { GraphNeighborhood } from "./api/graph";
+import type { DomainSpellings } from "./domainNames";
 import { engramRoute } from "./paths";
 
 /** What one `[[Target]]` turned out to be. */
@@ -121,9 +128,21 @@ export function innerOf(target: LinkTarget): string {
     : `${target.domain}:${target.target}`;
 }
 
-/** The key one target is looked up by: its domain, if it named one, and its text. */
-function keyOf(target: LinkTarget, fallbackDomain: string): string {
-  return `${(target.domain ?? fallbackDomain).toLowerCase()} ${target.target.toLowerCase()}`;
+/**
+ * The key one target is looked up by: its domain, if it named one, and its
+ * text. The domain is the local name its spelling maps to, compared exactly as
+ * the server compares it; only the text is folded.
+ */
+function keyOf(
+  target: LinkTarget,
+  fallbackDomain: string,
+  names: DomainSpellings | undefined,
+): string {
+  const domain =
+    target.domain === null
+      ? fallbackDomain
+      : (names?.get(target.domain) ?? target.domain);
+  return `${domain} ${target.target.toLowerCase()}`;
 }
 
 /**
@@ -139,7 +158,7 @@ function keyOf(target: LinkTarget, fallbackDomain: string): string {
  */
 function readings(
   inner: string,
-  known: ReadonlySet<string> | undefined,
+  known: DomainSpellings | undefined,
 ): LinkTarget[] {
   const parsed = parseWikiTarget(inner);
   if (
@@ -162,20 +181,20 @@ function readings(
 export function buildWikilinkResolver(
   detail: EngramDetail,
   graph: GraphNeighborhood | undefined,
-  domains?: readonly string[],
+  domains?: DomainSpellings,
 ): WikilinkResolver {
   const home = detail.domain;
   // Undefined rather than empty when the caller has no listing to give: an
-  // empty set would say every prefix names no domain, which is a claim, where
-  // undefined says this caller cannot tell and asks for the old behavior.
-  const known = domains === undefined ? undefined : new Set(domains);
+  // empty table would say every prefix names no domain, which is a claim,
+  // where undefined says this caller cannot tell and asks for the old behavior.
+  const known = domains;
 
   // What the index made of each parsed reference. Both lists are consulted,
   // because a target written as prose on one line and declared as a relation on
   // another is the same target, and the engram page draws the prose.
   const parsed = new Map<string, boolean>();
   for (const reference of [...detail.links, ...detail.relations]) {
-    const key = keyOf(reference.target, home);
+    const key = keyOf(reference.target, home, known);
     // Resolved anywhere wins: the same text on two lines is one target, and one
     // line failing to resolve while another succeeds is an indexing detail
     // rather than something to draw twice.
@@ -197,8 +216,14 @@ export function buildWikilinkResolver(
     };
     for (const name of [node.title, node.permalink]) {
       // Keyed through the same function the lookup uses, so the two can never
-      // disagree about what a key is.
-      const key = keyOf({ domain: node.domain, target: name }, node.domain);
+      // disagree about what a key is. A node's domain is already the local
+      // name, so it skips the spelling table: another domain's canonical name
+      // or alias may be spelled like it, and must not move the node there.
+      const key = keyOf(
+        { domain: node.domain, target: name },
+        node.domain,
+        undefined,
+      );
       if (name !== "" && !located.has(key)) {
         located.set(key, where);
       }
@@ -212,7 +237,7 @@ export function buildWikilinkResolver(
     // to say about. A verdict of false is the verdict: a second reading is a
     // different way of asking the same server, not a second opinion.
     const resolved = candidates
-      .map((target) => parsed.get(keyOf(target, home)))
+      .map((target) => parsed.get(keyOf(target, home, known)))
       .find((verdict) => verdict !== undefined);
     if (resolved === undefined) {
       // Not a reference the server parsed out of this engram at all. Rendered
@@ -228,7 +253,7 @@ export function buildWikilinkResolver(
     // own title, so a target the index resolved through the fallback reading is
     // findable under that reading and under no other.
     for (const target of candidates) {
-      const where = located.get(keyOf(target, home));
+      const where = located.get(keyOf(target, home, known));
       if (where !== undefined) {
         return {
           kind: "resolved",

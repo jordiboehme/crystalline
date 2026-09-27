@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 
 import { readEngramDetail } from "./api/engram";
 import { readGraph } from "./api/graph";
+import { domainSpellings } from "./domainNames";
 import { buildWikilinkResolver, parseWikiTarget } from "./wikilinks";
 
 function detail() {
@@ -97,7 +98,10 @@ function graph() {
 }
 
 /** The domain listing the app already holds, as the resolver takes it. */
-const DOMAINS = ["eng", "ops"];
+const DOMAINS = domainSpellings([
+  { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
+  { name: "ops", canonicalName: "ops", aliases: [], shadowed: false },
+]);
 
 describe("parsing what is inside the brackets", () => {
   it("reads a leading domain prefix", () => {
@@ -213,5 +217,169 @@ describe("the wikilink resolver", () => {
     const resolve = buildWikilinkResolver(detail(), graph());
 
     expect(resolve("Log: Weekly Garden Notes")).toBeNull();
+  });
+});
+
+/**
+ * A domain registered here as `moonbase` whose MANIFEST calls it `moon` and
+ * which used to be called `lunar`; a domain `sky` beside one registered as
+ * `skybase` that also calls itself `sky`, so `sky` stays the first one's, and
+ * lists `moonbase` as a former name, which the local name keeps. Links carry
+ * the domain as it was written, and the server binds every spelling.
+ */
+const NAMED = domainSpellings([
+  { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
+  {
+    name: "moonbase",
+    canonicalName: "moon",
+    aliases: ["lunar"],
+    shadowed: false,
+  },
+  { name: "sky", canonicalName: "sky", aliases: [], shadowed: false },
+  {
+    name: "skybase",
+    canonicalName: "sky",
+    aliases: ["moonbase"],
+    shadowed: true,
+  },
+]);
+
+function resolvedLink(line: number, domain: string | null, target: string) {
+  return { line, resolved: true, target: { domain, target } };
+}
+
+function namedDetail(home: string, links: ReturnType<typeof resolvedLink>[]) {
+  return readEngramDetail(
+    { domain: home, permalink: "here", title: "Here", content: "", links },
+    home,
+    "here",
+  );
+}
+
+function namedGraph() {
+  const node = (
+    id: number,
+    domain: string,
+    permalink: string,
+    title: string,
+  ) => ({
+    id,
+    domain,
+    permalink,
+    title,
+    status: "stable",
+    type: "engram",
+  });
+  return readGraph({
+    nodes: [
+      node(1, "moonbase", "crater-base", "Crater Base"),
+      node(2, "sky", "star", "Star"),
+      node(3, "skybase", "star", "Star"),
+    ],
+    edges: [],
+    truncated: false,
+  });
+}
+
+const CRATER = {
+  kind: "resolved",
+  href: "/d/moonbase/e/crater-base",
+  label: "Crater Base",
+};
+
+describe("a link that names its domain by another name", () => {
+  it("follows a canonical name to the domain that declares it", () => {
+    const detail = namedDetail("eng", [resolvedLink(1, "moon", "Crater Base")]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("moon:Crater Base")).toEqual(CRATER);
+  });
+
+  it("follows an alias to the domain that answers to it", () => {
+    const detail = namedDetail("eng", [
+      resolvedLink(1, "lunar", "Crater Base"),
+    ]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("lunar:Crater Base")).toEqual(CRATER);
+  });
+
+  it("sends a shadowed canonical name to the domain registered under it", () => {
+    const detail = namedDetail("eng", [resolvedLink(1, "sky", "Star")]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("sky:Star")).toEqual({
+      kind: "resolved",
+      href: "/d/sky/e/star",
+      label: "Star",
+    });
+  });
+
+  it("still follows the local name", () => {
+    const detail = namedDetail("eng", [
+      resolvedLink(1, "moonbase", "Crater Base"),
+    ]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("moonbase:Crater Base")).toEqual(CRATER);
+  });
+
+  it("leaves a name no domain answers to as prose", () => {
+    // Not even the home domain's engram of that title: the server reads the
+    // whole bracket text as a title there, prefix and all.
+    const detail = namedDetail("moonbase", [
+      resolvedLink(1, "mars", "Crater Base"),
+    ]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("mars:Crater Base")).toBeNull();
+  });
+
+  it("treats the home domain's canonical name as the home domain", () => {
+    const detail = namedDetail("moonbase", [
+      resolvedLink(1, "moon", "Crater Base"),
+      resolvedLink(2, null, "Crater Base"),
+    ]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("moon:Crater Base")).toEqual(CRATER);
+    expect(resolve("Crater Base")).toEqual(CRATER);
+  });
+
+  it("takes the verdict of a reference written with another spelling", () => {
+    // The relation names the local name, the prose the canonical one: the
+    // server reports them as one target, and so does the resolver.
+    const detail = readEngramDetail(
+      {
+        domain: "eng",
+        permalink: "here",
+        title: "Here",
+        content: "",
+        relations: [
+          {
+            relType: "uses",
+            ...resolvedLink(1, "moonbase", "Crater Base"),
+          },
+        ],
+      },
+      "eng",
+      "here",
+    );
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("moon:Crater Base")).toEqual(CRATER);
+  });
+
+  it("matches the domain by its exact spelling", () => {
+    // The server binds no spelling in another case, so these fall back to a
+    // title in the engram's own domain, where nothing of that name lives.
+    const detail = namedDetail("eng", [
+      resolvedLink(1, "Moon", "Crater Base"),
+      resolvedLink(2, "MoonBase", "Crater Base"),
+    ]);
+    const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
+
+    expect(resolve("Moon:Crater Base")).toBeNull();
+    expect(resolve("MoonBase:Crater Base")).toBeNull();
   });
 });

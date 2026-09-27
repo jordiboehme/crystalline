@@ -45,6 +45,7 @@ import { DraftLinkDialog } from "../components/DraftLinkDialog";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
+import { domainSpellings } from "../domainNames";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -629,7 +630,10 @@ function Surface({
     queryFn: fetchDomains,
   });
   const domainNames = useMemo(
-    () => domains.data?.domains.map((entry) => entry.name),
+    () =>
+      domains.data === undefined
+        ? undefined
+        : domainSpellings(domains.data.domains),
     [domains.data],
   );
   const resolver = useMemo(

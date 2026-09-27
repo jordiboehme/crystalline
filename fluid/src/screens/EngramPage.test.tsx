@@ -240,6 +240,75 @@ describe("the engram page", () => {
     });
   });
 
+  it("links a wikilink that names its domain by its canonical name or an alias", async () => {
+    // Registered here as `moonbase`, called `moon` by its MANIFEST and `lunar`
+    // before a rename: the server resolves all three spellings, and so must
+    // the page, onto the local name every route carries.
+    const listing = domainsResponse();
+    serve({
+      "/domains": () => ({
+        ...listing,
+        domains: [
+          ...listing.domains,
+          {
+            name: "moonbase",
+            kind: "file",
+            canonical_name: "moon",
+            aliases: ["lunar"],
+            shadowed: false,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: BODY.replace(
+            "Body prose linking",
+            "See [[moon:Crater Base]] and [[lunar:Crater Base]]. Body prose linking",
+          ),
+          links: [
+            {
+              line: 7,
+              resolved: true,
+              target: { domain: "moon", target: "Crater Base" },
+            },
+            {
+              line: 7,
+              resolved: true,
+              target: { domain: "lunar", target: "Crater Base" },
+            },
+          ],
+        }),
+      "/graph": () => {
+        const graph = graphResponse();
+        return {
+          ...graph,
+          nodes: [
+            ...graph.nodes,
+            {
+              id: 3,
+              domain: "moonbase",
+              permalink: "crater-base",
+              title: "Crater Base",
+              status: "stable",
+              type: "engram",
+            },
+          ],
+        };
+      },
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const body = await screen.findByRole("article");
+    await waitFor(() => {
+      const links = within(body).getAllByRole("link", { name: "Crater Base" });
+      expect(links).toHaveLength(2);
+      for (const link of links) {
+        expect(link).toHaveAttribute("href", "/d/moonbase/e/crater-base");
+      }
+    });
+  });
+
   it("marks a wikilink the index could not resolve rather than linking it", async () => {
     serve();
 
