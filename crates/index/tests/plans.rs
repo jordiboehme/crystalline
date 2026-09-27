@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, twenty-two entries, each named by the function that issues it, so a
+//! One place, twenty-four entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -50,7 +50,10 @@
 //! spec named as a fallback.
 
 use crystalline_index::SearchOrder;
-use crystalline_index::{DomainId, DomainKind, EmbeddingRow, Store, TursoStore, sync_domain};
+use crystalline_index::{
+    ContradictionRow, DomainId, DomainKind, EmbeddingRow, ScoredPair, Store, TursoStore,
+    sync_domain,
+};
 
 // --- the registry ------------------------------------------------------------
 
@@ -120,7 +123,15 @@ pub struct HotStatement {
 /// primary key from the three statements that project one, and a full pass over
 /// it would carry every body in the index into exactly the read the move took
 /// them out of.
-pub const GUARDED_TABLES: &[&str] = &["engram", "engram_content", "chunk", "relation", "link"];
+pub const GUARDED_TABLES: &[&str] = &[
+    "engram",
+    "engram_content",
+    "chunk",
+    "relation",
+    "link",
+    "contradiction",
+    "contradiction_pair",
+];
 
 /// Which table each alias in these statements stands for.
 ///
@@ -138,6 +149,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("r", "relation"),
     ("l", "link"),
     ("d", "domain"),
+    ("cn", "contradiction"),
+    ("cp", "contradiction_pair"),
 ];
 
 fn table_of(name: &str) -> &str {
@@ -545,21 +558,28 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_link_to_domain"],
             postgres_must_seek: &["idx_link_to_domain"],
         },
-        // The contradiction scorer wave (plans/2026-09-14-contradiction-scorer-plan.md)
-        // adds two per-domain reads, and both belong here the day they land:
-        //
-        //   Store::contradiction_pairs_scored
-        //     SELECT ... FROM contradiction_pair WHERE domain_id=?1 AND model=?2
-        //   Store::contradictions
-        //     SELECT ... FROM contradiction c JOIN contradiction_pair p
-        //     ON p.engram_a=c.engram_a AND p.engram_b=c.engram_b AND p.model=c.model
-        //     WHERE p.domain_id=?1 AND c.model=?2 AND c.score>=?3
-        //
-        // That wave's Task 1 writes both statements and their migrations. Its
-        // last step adds two entries here, named by those two functions, adds
-        // `contradiction` and `contradiction_pair` to GUARDED_TABLES, and
-        // extends `seed` with scored pairs so the planner has statistics for
-        // them. Nothing else about this file changes.
+        HotStatement {
+            issued_by: "Store::contradiction_pairs_scored",
+            turso: || crystalline_index::turso::CONTRADICTION_PAIRS_SCORED_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CONTRADICTION_PAIRS_SCORED_SQL.to_string(),
+            literals: &["1", "'m'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_pair_domain"],
+            postgres_must_seek: &["idx_contradiction_pair_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::contradictions",
+            turso: || crystalline_index::turso::CONTRADICTIONS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CONTRADICTIONS_SQL.to_string(),
+            literals: &["1", "'m'", "0.5"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_domain"],
+            postgres_must_seek: &["idx_contradiction_domain"],
+        },
     ]
 }
 
@@ -646,6 +666,47 @@ async fn seed(store: &dyn Store) -> DomainId {
         })
         .collect();
     store.store_embeddings(&batch, "fake").await.unwrap();
+
+    // Scored pairs in both domains under the model the literals name, so the
+    // two contradiction reads are planned over real rows.
+    for domain_name in ["d", "other"] {
+        let descs = store.list_engrams(domain_name, None, None).await.unwrap();
+        for w in descs.windows(2) {
+            let (a, b) = if w[0].id.0 < w[1].id.0 {
+                (w[0].id, w[1].id)
+            } else {
+                (w[1].id, w[0].id)
+            };
+            let pair = ScoredPair {
+                a,
+                b,
+                checksum_a: "ca".to_string(),
+                checksum_b: "cb".to_string(),
+            };
+            let rows = [ContradictionRow {
+                a,
+                b,
+                line_a: 12,
+                line_b: 12,
+                hash_a: format!("h{}", a.0),
+                hash_b: format!("h{}", b.0),
+                score_ab: 0.9,
+                score_ba: 0.6,
+                period: false,
+            }];
+            store
+                .replace_contradictions(
+                    w[0].domain_id,
+                    &pair,
+                    0.9,
+                    "m",
+                    "2026-09-27T00:00:00Z",
+                    &rows,
+                )
+                .await
+                .unwrap();
+        }
+    }
 
     let domain = first.expect("two domains were seeded");
     // The literals say `1`, and a statement planned against a domain with no

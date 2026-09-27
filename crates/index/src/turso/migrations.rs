@@ -102,6 +102,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain spellings",
         sql: SCHEMA_V16,
     },
+    Migration {
+        version: 17,
+        label: "contradiction scores",
+        sql: SCHEMA_V17,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -563,6 +568,51 @@ CREATE INDEX idx_relation_to_domain ON relation(to_domain) WHERE to_domain IS NO
 CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
+// The contradiction check's persisted output. `contradiction_pair` is one row
+// per scored engram pair and says "up to date at these checksums";
+// `contradiction` holds the line pairs that cleared the store floor, both
+// reading orders. Both carry `domain_id`, so a domain clear and the sweep's
+// read never name the `engram` table. The cascades are declared for the
+// record; this connection does not enforce foreign keys, so `delete_engram`
+// and `clear_domain` delete by hand. Never in `delete_children`: that runs on
+// every upsert, and `reindex --full` would erase every score.
+//
+// `idx_contradiction_pair_domain` carries the pair columns after the seek
+// key so it also serves the read's `ORDER BY engram_a, engram_b`; on
+// `(domain_id, model)` alone the planner scans the primary key for the
+// order instead, which `tests/plans.rs` rejects.
+const SCHEMA_V17: &str = r#"
+CREATE TABLE contradiction_pair (
+    domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    checksum_a TEXT NOT NULL,
+    checksum_b TEXT NOT NULL,
+    cosine REAL NOT NULL,
+    model TEXT NOT NULL,
+    scored_at TEXT NOT NULL,
+    PRIMARY KEY (engram_a, engram_b, model)
+);
+CREATE INDEX idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+
+CREATE TABLE contradiction (
+    domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    line_a INTEGER NOT NULL,
+    line_b INTEGER NOT NULL,
+    hash_a TEXT NOT NULL,
+    hash_b TEXT NOT NULL,
+    model TEXT NOT NULL,
+    score_ab REAL NOT NULL,
+    score_ba REAL NOT NULL,
+    period INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
+);
+CREATE INDEX idx_contradiction_engrams ON contradiction(engram_a, engram_b);
+CREATE INDEX idx_contradiction_domain ON contradiction(domain_id, model);
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -586,8 +636,11 @@ CREATE TABLE attachment_blob (
 /// `domain_lock` and `domain_spelling` all reference `domain(id)`, so they are
 /// cleared before `domain`; `attachment_blob` references `attachment`, so it
 /// goes before it, and `engram_content` references `engram`, so it goes
-/// before that.
+/// before that. `contradiction` and `contradiction_pair` reference `engram`
+/// and `domain`, so they go first.
 pub const WIPE_TABLES: &[&str] = &[
+    "contradiction",
+    "contradiction_pair",
     "observation_tag",
     "engram_tag",
     "chunk",
@@ -1560,6 +1613,19 @@ mod tests {
                 2,
                 "and nothing else"
             );
+            // `WIPE_TABLES` is the current list, so the migrations after v16
+            // run first (stamped, so the store opened below runs nothing
+            // again) and the tables they add are checked with the rest.
+            for m in &MIGRATIONS[16..] {
+                conn.execute_batch(m.sql).await.unwrap();
+                conn.execute_batch(&format!(
+                    "INSERT INTO schema_migration(version, applied_at) \
+                     VALUES ({},'2026-09-27T00:00:00Z');",
+                    m.version
+                ))
+                .await
+                .unwrap();
+            }
             for table in WIPE_TABLES {
                 assert_eq!(
                     scalar(
@@ -1570,7 +1636,7 @@ mod tests {
                     )
                     .await,
                     1,
-                    "wipe names a table that exists at v16: {table}"
+                    "wipe names a table that exists once every migration ran: {table}"
                 );
             }
             let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);

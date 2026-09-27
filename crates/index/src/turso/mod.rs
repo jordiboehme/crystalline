@@ -44,15 +44,15 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DomainHost, DomainId,
-    DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
-    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
-    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
-    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
+    DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
+    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
+    HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount,
+    NewChunk, OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ScoredPair,
+    SearchHit, SearchMode, SearchQuery, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary, changed_spellings, domain_url_needles, folder_slash, in_transaction,
+    names_a_domain_url, page_window, reference_match, referencing_domains_sql,
+    rename_onto_taken_row, reset_spelled_references_sql, spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -971,6 +971,20 @@ fn resolve_pending_sql(table: &str) -> String {
 pub const FILE_STAMPS_SQL: &str =
     "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''";
 
+/// The read behind [`Store::contradiction_pairs_scored`], one domain's pair
+/// rows for one model through `idx_contradiction_pair_domain`.
+#[doc(hidden)]
+pub const CONTRADICTION_PAIRS_SCORED_SQL: &str = "SELECT cp.engram_a, cp.engram_b, cp.checksum_a, cp.checksum_b FROM contradiction_pair cp \
+     WHERE cp.domain_id=?1 AND cp.model=?2 ORDER BY cp.engram_a, cp.engram_b";
+
+/// The sweep's read behind [`Store::contradictions`], through
+/// `idx_contradiction_domain`. The floor applies to the higher reading order.
+#[doc(hidden)]
+pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a, cn.line_b, cn.hash_a, cn.hash_b, \
+     cn.score_ab, cn.score_ba, cn.period FROM contradiction cn \
+     WHERE cn.domain_id=?1 AND cn.model=?2 AND (cn.score_ab >= ?3 OR cn.score_ba >= ?3) \
+     ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
+
 /// The address lookup behind [`Store::find_engram`].
 ///
 /// A permalink hit wins over a title hit; among title hits the byte-lower path
@@ -1540,6 +1554,8 @@ impl Store for TursoStore {
         // same paths so the rows and their mirror go together.
         let did = vec![Value::Integer(domain.0)];
         for sql in [
+            "DELETE FROM contradiction WHERE domain_id=?1",
+            "DELETE FROM contradiction_pair WHERE domain_id=?1",
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
@@ -1579,6 +1595,15 @@ impl Store for TursoStore {
         .await?
         .and_then(|r| cell_i64(&r, 0));
         if let Some(id) = id {
+            // The scores of every pair this engram is in. Here and in
+            // `clear_domain` only, never in `delete_children`, which every
+            // upsert runs: a full reindex would erase every score.
+            for sql in [
+                "DELETE FROM contradiction WHERE engram_a=?1 OR engram_b=?1",
+                "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1",
+            ] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
             self.delete_children(id).await?;
             self.conn
                 .execute(
@@ -2625,6 +2650,143 @@ impl Store for TursoStore {
             });
         }
         Ok(out)
+    }
+
+    async fn contradiction_pairs_scored(
+        &self,
+        domain: DomainId,
+        model: &str,
+    ) -> Result<Vec<ScoredPair>> {
+        let rows = query_all(
+            &self.conn,
+            CONTRADICTION_PAIRS_SCORED_SQL,
+            vec![Value::Integer(domain.0), Value::Text(model.to_string())],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ScoredPair {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    checksum_a: cell_text(r, 2)?,
+                    checksum_b: cell_text(r, 3)?,
+                })
+            })
+            .collect())
+    }
+
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(pair.a.0),
+                Value::Integer(pair.b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(
+                    "DELETE FROM contradiction WHERE engram_a=?1 AND engram_b=?2 AND model=?3",
+                    key.clone(),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM contradiction_pair WHERE engram_a=?1 AND engram_b=?2 AND model=?3",
+                    key,
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Integer(pair.a.0),
+                        Value::Integer(pair.b.0),
+                        Value::Text(pair.checksum_a.clone()),
+                        Value::Text(pair.checksum_b.clone()),
+                        Value::Real(cosine),
+                        Value::Text(model.to_string()),
+                        Value::Text(scored_at.to_string()),
+                    ],
+                )
+                .await?;
+            for row in rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, period) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        vec![
+                            Value::Integer(domain.0),
+                            Value::Integer(row.a.0),
+                            Value::Integer(row.b.0),
+                            Value::Integer(row.line_a as i64),
+                            Value::Integer(row.line_b as i64),
+                            Value::Text(row.hash_a.clone()),
+                            Value::Text(row.hash_b.clone()),
+                            Value::Text(model.to_string()),
+                            Value::Real(f64::from(row.score_ab)),
+                            Value::Real(f64::from(row.score_ba)),
+                            Value::Integer(i64::from(row.period)),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn contradictions(
+        &self,
+        domain: DomainId,
+        model: &str,
+        min_score: f32,
+    ) -> Result<Vec<ContradictionRow>> {
+        let rows = query_all(
+            &self.conn,
+            CONTRADICTIONS_SQL,
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(model.to_string()),
+                Value::Real(f64::from(min_score)),
+            ],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ContradictionRow {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    line_a: cell_i64(r, 2)? as usize,
+                    line_b: cell_i64(r, 3)? as usize,
+                    hash_a: cell_text(r, 4)?,
+                    hash_b: cell_text(r, 5)?,
+                    score_ab: cell_real(r, 6)? as f32,
+                    score_ba: cell_real(r, 7)? as f32,
+                    period: cell_i64(r, 8)? != 0,
+                })
+            })
+            .collect())
+    }
+
+    async fn scored_pair_count(&self, model: &str) -> Result<u64> {
+        let row = query_first(
+            &self.conn,
+            "SELECT COUNT(*) FROM contradiction_pair WHERE model=?1",
+            vec![Value::Text(model.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| cell_i64(&r, 0)).unwrap_or(0).max(0) as u64)
     }
 
     async fn wipe(&self) -> Result<()> {

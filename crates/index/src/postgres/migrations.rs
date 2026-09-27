@@ -101,6 +101,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain spellings",
         sql: SCHEMA_V15,
     },
+    Migration {
+        version: 16,
+        label: "contradiction scores",
+        sql: SCHEMA_V16,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -476,6 +481,44 @@ CREATE INDEX IF NOT EXISTS idx_relation_to_domain ON relation(to_domain) WHERE t
 CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
+// The Turso v17 tables, same meaning. Foreign keys are enforced here, so the
+// declared cascades do the work on a delete; `delete_engram` and
+// `clear_domain` still delete by hand for symmetry with Turso. Written to
+// replay (`IF NOT EXISTS`), because the ledger stamp is a separate statement.
+// `idx_contradiction_pair_domain` carries the order columns as its Turso twin
+// does, so the two schemas stay the same.
+const SCHEMA_V16: &str = r#"
+CREATE TABLE IF NOT EXISTS contradiction_pair (
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    checksum_a TEXT NOT NULL,
+    checksum_b TEXT NOT NULL,
+    cosine DOUBLE PRECISION NOT NULL,
+    model TEXT NOT NULL,
+    scored_at TEXT NOT NULL,
+    PRIMARY KEY (engram_a, engram_b, model)
+);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+
+CREATE TABLE IF NOT EXISTS contradiction (
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    line_a BIGINT NOT NULL,
+    line_b BIGINT NOT NULL,
+    hash_a TEXT NOT NULL,
+    hash_b TEXT NOT NULL,
+    model TEXT NOT NULL,
+    score_ab DOUBLE PRECISION NOT NULL,
+    score_ba DOUBLE PRECISION NOT NULL,
+    period BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
+);
+CREATE INDEX IF NOT EXISTS idx_contradiction_engrams ON contradiction(engram_a, engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_domain ON contradiction(domain_id, model);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -500,7 +543,11 @@ CREATE TABLE attachment_blob (
 /// and `domain_spelling` all reference `domain(id)`, so they are cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes before it,
 /// and `engram_content` references `engram`, so it goes before that.
+/// `contradiction` and `contradiction_pair` reference `engram` and `domain`,
+/// so they go first.
 pub const WIPE_TABLES: &[&str] = &[
+    "contradiction",
+    "contradiction_pair",
     "observation_tag",
     "engram_tag",
     "chunk",

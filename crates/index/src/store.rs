@@ -1447,6 +1447,53 @@ pub struct LeadVector {
     pub vector: Vec<f32>,
 }
 
+/// One scored engram pair as `contradiction_pair` records it: the two engrams,
+/// ordered `a < b` by id, and the content checksums they were scored at. The
+/// daemon's pending set is "candidate pairs minus the ones whose row here still
+/// carries both current checksums for the model", so this row is what says
+/// "this pair is up to date".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoredPair {
+    /// The engram with the lower id.
+    pub a: EngramId,
+    /// The engram with the higher id.
+    pub b: EngramId,
+    /// `a`'s content checksum at scoring time, as `file_stamps` reports it.
+    pub checksum_a: String,
+    /// `b`'s content checksum at scoring time.
+    pub checksum_b: String,
+}
+
+/// One scored observation-line pair as `contradiction` records it.
+///
+/// `line_*` are the one-based lines `read_engram` reports; `hash_*` are the
+/// sha256 of the observation text with its category and tags stripped and its
+/// whitespace folded, so a row survives a renumbering and dies with an edit of
+/// the line. Both reading orders are kept, so the order aggregation can change
+/// without a rescore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContradictionRow {
+    /// The engram with the lower id.
+    pub a: EngramId,
+    /// The engram with the higher id.
+    pub b: EngramId,
+    /// `a`'s observation line at scoring time.
+    pub line_a: usize,
+    /// `b`'s observation line at scoring time.
+    pub line_b: usize,
+    /// The hash of `a`'s observation text.
+    pub hash_a: String,
+    /// The hash of `b`'s observation text.
+    pub hash_b: String,
+    /// The contradiction probability with `a` as premise and `b` as hypothesis.
+    pub score_ab: f32,
+    /// The same with the order reversed.
+    pub score_ba: f32,
+    /// Whether either line names a period (a year, a date, a month, since or
+    /// until): the finding then points at the validity window.
+    pub period: bool,
+}
+
 /// A freshly computed chunk to store against an engram. Produced by the chunker
 /// and handed to [`Store::replace_chunks`], which reconciles it against the
 /// engram's existing chunk rows and carries over any matching embedding.
@@ -2033,6 +2080,8 @@ pub trait Store: Send + Sync {
     /// would keep resolving references to a domain nobody registers and would
     /// hold the spelling against the next domain that claims it.
     ///
+    /// It also clears the domain's contradiction pairs and line rows.
+    ///
     /// A reindex does not use this, and deliberately: `--full` re-reads and
     /// re-upserts instead, so rows a reader is using are never absent between
     /// a clear and the rebuild that would have refilled them, and an unchanged
@@ -2449,11 +2498,49 @@ pub trait Store: Send + Sync {
         actor: Option<&str>,
     ) -> Result<Vec<LeadVector>>;
 
+    /// Every engram pair `model` has scored in `domain`, with the checksums it
+    /// was scored at, ordered by `(a, b)`.
+    async fn contradiction_pairs_scored(
+        &self,
+        domain: DomainId,
+        model: &str,
+    ) -> Result<Vec<ScoredPair>>;
+
+    /// Record one scoring of `pair` by `model`: the pair row with `cosine` and
+    /// `scored_at`, and its line rows, replacing whatever an earlier scoring
+    /// left, in one transaction. `rows` may be empty: a pair with nothing above
+    /// the store floor is scored with nothing to say and is not asked again
+    /// until an edit moves a checksum. Refuses inside an open `begin`.
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()>;
+
+    /// Every stored line pair in `domain` for `model` whose higher reading
+    /// order is at or above `min_score`, ordered by `(a, b, line_a, line_b)`.
+    /// The sweep's read: it filters by status, window and line hash itself, so
+    /// a pair that stopped being a candidate still comes back here.
+    async fn contradictions(
+        &self,
+        domain: DomainId,
+        model: &str,
+        min_score: f32,
+    ) -> Result<Vec<ContradictionRow>>;
+
+    /// How many engram pairs `model` has scored across the whole index. The
+    /// status block's figure.
+    async fn scored_pair_count(&self, model: &str) -> Result<u64>;
+
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary
     /// rebuild (`--full`) never comes here, because destroying every embedding
     /// to re-read files that mostly did not change costs hours and buys
-    /// nothing.
+    /// nothing. The contradiction tables go with everything else.
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file

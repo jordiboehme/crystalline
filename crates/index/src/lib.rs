@@ -37,15 +37,15 @@ pub use embed::{
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
 pub use factory::{open_store, store_location};
 pub use store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
-    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
-    RecentFilter, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo, StoredEngram,
-    TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status, merge_vocabularies,
-    parse_metadata_filters, retired_factor, salience_prior,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
+    DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats,
+    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
+    EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind,
+    HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO,
+    LeadVector, MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES,
+    RebuildKind, RecentFilter, ScoredPair, SearchHit, SearchMode, SearchOrder, SearchQuery, Store,
+    StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status,
+    merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.

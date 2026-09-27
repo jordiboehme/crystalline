@@ -54,7 +54,7 @@ async fn store_info_reports_turso_schema_version() {
     // v12 domain rebuild marker, v13 engram actor dimension,
     // v14 domain rebuild kind, v15 engram body in its own table,
     // v16 domain spellings.
-    assert_eq!(info.schema_version, 16);
+    assert_eq!(info.schema_version, 17);
 }
 
 #[tokio::test]

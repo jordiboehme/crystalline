@@ -105,15 +105,15 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DomainHost, DomainId,
-    DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
-    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
-    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
-    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
+    DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
+    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
+    HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount,
+    NewChunk, OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ScoredPair,
+    SearchHit, SearchMode, SearchQuery, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary, changed_spellings, domain_url_needles, folder_slash, in_transaction,
+    names_a_domain_url, page_window, reference_match, referencing_domains_sql,
+    rename_onto_taken_row, reset_spelled_references_sql, spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -946,6 +946,21 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
 pub const FILE_STAMPS_SQL: &str =
     "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=$1 AND actor = ''";
 
+/// The read behind [`Store::contradiction_pairs_scored`], one domain's pair
+/// rows for one model through `idx_contradiction_pair_domain`. The Turso text
+/// with `$n` placeholders.
+#[doc(hidden)]
+pub const CONTRADICTION_PAIRS_SCORED_SQL: &str = "SELECT cp.engram_a, cp.engram_b, cp.checksum_a, cp.checksum_b FROM contradiction_pair cp \
+     WHERE cp.domain_id=$1 AND cp.model=$2 ORDER BY cp.engram_a, cp.engram_b";
+
+/// The sweep's read behind [`Store::contradictions`], through
+/// `idx_contradiction_domain`. The floor applies to the higher reading order.
+#[doc(hidden)]
+pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a, cn.line_b, cn.hash_a, cn.hash_b, \
+     cn.score_ab, cn.score_ba, cn.period FROM contradiction cn \
+     WHERE cn.domain_id=$1 AND cn.model=$2 AND (cn.score_ab >= $3 OR cn.score_ba >= $3) \
+     ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
+
 /// The address lookup behind [`Store::find_engram`].
 ///
 /// A permalink hit wins over a title hit; among title hits the lowest path
@@ -1489,6 +1504,8 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         for sql in [
+            "DELETE FROM contradiction WHERE domain_id=$1",
+            "DELETE FROM contradiction_pair WHERE domain_id=$1",
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=$1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
@@ -1535,6 +1552,18 @@ impl Store for PostgresStore {
             .map_err(IndexError::from)?
             .and_then(|r| cell_i64(&r, 0));
         if let Some(id) = id {
+            // The declared cascade would take these with the engram row; they
+            // are written out for symmetry with Turso, which enforces nothing.
+            for sql in [
+                "DELETE FROM contradiction WHERE engram_a=$1 OR engram_b=$1",
+                "DELETE FROM contradiction_pair WHERE engram_a=$1 OR engram_b=$1",
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
             delete_children(&mut *c, id).await?;
             sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
                 .bind(id)
@@ -2668,6 +2697,138 @@ impl Store for PostgresStore {
             });
         }
         Ok(out)
+    }
+
+    async fn contradiction_pairs_scored(
+        &self,
+        domain: DomainId,
+        model: &str,
+    ) -> Result<Vec<ScoredPair>> {
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            CONTRADICTION_PAIRS_SCORED_SQL,
+            vec![Param::Int(domain.0), Param::Text(model.to_string())],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ScoredPair {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    checksum_a: cell_text(r, 2)?,
+                    checksum_b: cell_text(r, 3)?,
+                })
+            })
+            .collect())
+    }
+
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for sql in [
+                "DELETE FROM contradiction WHERE engram_a=$1 AND engram_b=$2 AND model=$3",
+                "DELETE FROM contradiction_pair WHERE engram_a=$1 AND engram_b=$2 AND model=$3",
+            ] {
+                sqlx::query(sql)
+                    .bind(pair.a.0)
+                    .bind(pair.b.0)
+                    .bind(model)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            sqlx::query(
+                "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(domain.0)
+            .bind(pair.a.0)
+            .bind(pair.b.0)
+            .bind(&pair.checksum_a)
+            .bind(&pair.checksum_b)
+            .bind(cosine)
+            .bind(model)
+            .bind(scored_at)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+            for row in rows {
+                sqlx::query(
+                    "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, period) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                )
+                .bind(domain.0)
+                .bind(row.a.0)
+                .bind(row.b.0)
+                .bind(row.line_a as i64)
+                .bind(row.line_b as i64)
+                .bind(&row.hash_a)
+                .bind(&row.hash_b)
+                .bind(model)
+                .bind(f64::from(row.score_ab))
+                .bind(f64::from(row.score_ba))
+                .bind(i64::from(row.period))
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn contradictions(
+        &self,
+        domain: DomainId,
+        model: &str,
+        min_score: f32,
+    ) -> Result<Vec<ContradictionRow>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(CONTRADICTIONS_SQL)
+            .bind(domain.0)
+            .bind(model)
+            .bind(f64::from(min_score))
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ContradictionRow {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    line_a: cell_i64(r, 2)? as usize,
+                    line_b: cell_i64(r, 3)? as usize,
+                    hash_a: cell_text(r, 4)?,
+                    hash_b: cell_text(r, 5)?,
+                    score_ab: cell_real(r, 6)? as f32,
+                    score_ba: cell_real(r, 7)? as f32,
+                    period: cell_i64(r, 8)? != 0,
+                })
+            })
+            .collect())
+    }
+
+    async fn scored_pair_count(&self, model: &str) -> Result<u64> {
+        let mut conn = self.acquire().await?;
+        let n = scalar_i64(
+            conn.as_mut(),
+            "SELECT COUNT(*) FROM contradiction_pair WHERE model=$1",
+            vec![Param::Text(model.to_string())],
+        )
+        .await?;
+        Ok(n.max(0) as u64)
     }
 
     async fn wipe(&self) -> Result<()> {
