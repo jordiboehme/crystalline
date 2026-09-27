@@ -24,6 +24,7 @@ import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
+  LISTING_WAIT_MS,
   NOTICE_MS,
   createSession,
   type HudSink,
@@ -2310,6 +2311,130 @@ describe("the console room", () => {
     await flush();
     expect(loads).toEqual([]);
     expect(hud.connector).not.toHaveBeenCalled();
+  });
+
+  it("tries a console room the renderer refuses once, with one notice, until the player steps out and back in", () => {
+    // Mutation caught: the walk-in latched only after a successful cut, so
+    // a refused room is rebuilt and refused on every tick in the doorway.
+    renderer.setRoom.mockImplementation((room) => {
+      if (room.interior !== undefined) throw new Error("too many layers");
+    });
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    const tries = () =>
+      renderer.setRoom.mock.calls.filter(([r]) => r.interior !== undefined)
+        .length;
+    const errors = () =>
+      hud.notice.mock.calls.filter(([t]) => t === "?LOAD ERROR").length;
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    key("keydown", "ArrowUp");
+    frames(30); // pressed against the open box, in its doorway
+    key("keyup", "ArrowUp");
+    expect(tries()).toBe(1);
+    expect(errors()).toBe(1);
+    expect(session.current?.domain).toBe(HALL);
+    key("keydown", "ArrowDown");
+    frames(10);
+    key("keyup", "ArrowDown");
+    frames(10);
+    key("keydown", "ArrowUp");
+    frames(30);
+    key("keyup", "ArrowUp");
+    expect(tries()).toBe(2);
+  });
+
+  it("aborts the listing's signal when the console room is left and on dispose", async () => {
+    // Mutation caught: an entry or a dispose that leaves the listing read
+    // running after the visit it was for.
+    const signals: AbortSignal[] = [];
+    const hung = {
+      domains: (signal: AbortSignal) => {
+        signals.push(signal);
+        return new Promise<readonly DomainRow[] | null>(() => undefined);
+      },
+    };
+    const session = start({ load: okBridge, consoleRoom: hung });
+    standAtBox(session);
+    walkIn();
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+    session.jump("ops");
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("ops");
+    });
+    expect(signals[0]?.aborted).toBe(true);
+
+    const other = start({ load: okBridge, consoleRoom: hung });
+    standAtBox(other);
+    walkIn();
+    expect(signals).toHaveLength(2);
+    other.dispose();
+    expect(signals[1]?.aborted).toBe(true);
+  });
+
+  it("never fires the exit while a jump is loading, even when the listing lands during it", async () => {
+    // Mutation caught: the exit without its loading guard, which would
+    // abort the jump in favour of a random bridge.
+    const listing = deferred<readonly DomainRow[] | null>();
+    const far = deferred<LoadedPlace>();
+    const loads: string[] = [];
+    const load: PlaceLoader = (a, signal) => {
+      loads.push(a.domain);
+      return a.domain === "far" ? far.promise : okBridge(a, signal);
+    };
+    const session = startWithConsole(listing.promise, load);
+    standAtBox(session);
+    walkIn();
+    backOut(); // in the doorway, the listing still being read
+    session.jump("far");
+    listing.resolve([row(HALL), row("ops")]);
+    await flush();
+    frames(5);
+    await flush();
+    expect(loads).toEqual(["far"]);
+    far.resolve({
+      kind: "place",
+      place: { ...CANNED_BRIDGE, domain: "far", permalink: "manifest" },
+    });
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("far");
+    });
+    expect(loads).toEqual(["far"]);
+  });
+
+  it("gives up on a listing that has not answered in five seconds and leads to the room left's domain", async () => {
+    // Mutation caught: no wait limit (the inner doors dead for good while
+    // the listing hangs), or a limit that fires early.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const loads: string[] = [];
+      const load: PlaceLoader = (a, signal) => {
+        loads.push(a.domain);
+        return okBridge(a, signal);
+      };
+      const session = start({
+        load,
+        consoleRoom: {
+          domains: () =>
+            new Promise<readonly DomainRow[] | null>(() => undefined),
+        },
+      });
+      standAtBox(session);
+      walkIn();
+      backOut(); // in the doorway
+      await vi.advanceTimersByTimeAsync(LISTING_WAIT_MS - 100);
+      frames(2);
+      expect(loads).toEqual([]);
+      await vi.advanceTimersByTimeAsync(100);
+      frames(2);
+      expect(loads).toEqual([HALL]);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(session.current).toEqual({ domain: HALL, permalink: "manifest" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for the listing and falls back to the room left's domain when it fails (2.6e C13)", async () => {

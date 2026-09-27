@@ -49,7 +49,8 @@
  * (`atConsoleExit`) travels to the bridge of a domain picked from that
  * listing (`pickExitDomain`, seeded by the tick count), with the connector
  * naming the domain; the exit waits while the listing is still being read,
- * and falls back to the room left's own domain when it could not be read.
+ * and falls back to the room left's own domain when it could not be read
+ * or has not answered within `LISTING_WAIT_MS`.
  * The bridge lands with a police box beside its entrance for that visit
  * (`withArrivalBox`): the player steps out of it, its doors open and
  * swinging shut, and its walk-in latched until the player has left its
@@ -333,6 +334,14 @@ export const NOTICE_MS = 3000;
 /** How long the inverted-look notice stays up, in milliseconds. */
 export const LOOK_NOTICE_MS = 1500;
 
+/**
+ * How long the console room's exit waits for the domain listing, in
+ * milliseconds from the cut in: a listing that has not answered by then
+ * counts as failed, so the inner doors lead to the room left's own domain
+ * rather than nowhere.
+ */
+export const LISTING_WAIT_MS = 5000;
+
 /** The notice for a refused or missing GPU. */
 const NO_DEVICE = "?DEVICE NOT PRESENT ERROR";
 
@@ -485,6 +494,8 @@ export function createSession(opts: SessionOptions): Session {
   let boxLatched: number | null = null;
   /** Aborts the listing read for the console room's visit. */
   let listing: AbortController | null = null;
+  /** Gives up on the listing after `LISTING_WAIT_MS`; null when not waiting. */
+  let listingTimer: ReturnType<typeof setTimeout> | null = null;
   /** Counts the cuts in, so a listing that answers late is dropped. */
   let visit = 0;
 
@@ -656,6 +667,8 @@ export function createSession(opts: SessionOptions): Session {
     inside = null;
     listing?.abort();
     listing = null;
+    if (listingTimer !== null) clearTimeout(listingTimer);
+    listingTimer = null;
     placeNotice = null;
     showStanding();
     showStatus();
@@ -842,8 +855,8 @@ export function createSession(opts: SessionOptions): Session {
   /**
    * Walks into the police box: cuts to the console room at once, under the
    * address of the room left (C12), and starts reading the listing its
-   * inner doors pick from. Does nothing without the console room option
-   * or with no room to return to.
+   * inner doors pick from, giving up on it after `LISTING_WAIT_MS`. Does
+   * nothing without the console room option or with no room to return to.
    */
   const cutIn = () => {
     const options = opts.consoleRoom;
@@ -873,6 +886,11 @@ export function createSession(opts: SessionOptions): Session {
         exitRows = null;
       },
     );
+    listingTimer = setTimeout(() => {
+      listingTimer = null;
+      if (disposed || mine !== visit || inside === null) return;
+      if (exitRows === undefined) exitRows = null;
+    }, LISTING_WAIT_MS);
   };
 
   /**
@@ -1151,6 +1169,9 @@ export function createSession(opts: SessionOptions): Session {
     if (opts.consoleRoom !== undefined && !loading && !modal()) {
       const entered = boxEntry(room, player, boxes);
       if (entered !== null && entered !== boxLatched) {
+        // Latched before the cut: a console room the renderer refuses
+        // leaves the player outside with one notice, not one a tick.
+        boxLatched = entered;
         cutIn();
         // The rest of this tick read the room left: the console room
         // starts on the next.
@@ -1284,6 +1305,8 @@ export function createSession(opts: SessionOptions): Session {
       controller = null;
       listing?.abort();
       listing = null;
+      if (listingTimer !== null) clearTimeout(listingTimer);
+      listingTimer = null;
       if (noticeTimer !== null) clearTimeout(noticeTimer);
       noticeTimer = null;
       loop.stop();
