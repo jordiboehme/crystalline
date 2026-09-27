@@ -1254,6 +1254,16 @@ async fn apply_changes<S: Store + ?Sized>(
         store.file_stamps(domain).await?
     };
     let domain_name = report.domain.clone();
+    // The permalinks a subscriber keys its pages on, read in at most two
+    // listings per apply rather than one domain scan per path: every row's
+    // permalink before the moves and deletes, and once more after the moves,
+    // since the store decides whether a permalink follows its path.
+    let before = if moves.is_empty() && deletes.is_empty() {
+        HashMap::new()
+    } else {
+        permalinks(store, &domain_name).await?
+    };
+    let mut renamed: Vec<usize> = Vec::new();
 
     for (from, to) in moves {
         // A move is a delete of `from` plus an add of `to`; if either end's db
@@ -1264,18 +1274,24 @@ async fn apply_changes<S: Store + ?Sized>(
             tracing::debug!(from = %from, to = %to, "sync: deferring a move whose db stamp moved mid-scan");
             continue;
         }
-        let from_permalink = permalink_at(store, &domain_name, &from).await?;
         store.rename_engram(domain, &from, &to).await?;
-        let permalink = permalink_at(store, &domain_name, &to).await?;
+        renamed.push(report.changes.len());
         report.changes.push(PathChange {
             kind: PathChangeKind::Moved,
             path: to.clone(),
             from: Some(from.clone()),
-            from_permalink,
-            permalink,
+            from_permalink: before.get(&from).cloned(),
+            permalink: None,
             checksum: snapshot.get(&from).map(|stamp| stamp.sha256.clone()),
         });
         report.moved += 1;
+    }
+    if !renamed.is_empty() {
+        let after = permalinks(store, &domain_name).await?;
+        for index in renamed {
+            let change = &mut report.changes[index];
+            change.permalink = after.get(&change.path).cloned();
+        }
     }
     for path in deletes {
         // The row was rewritten mid-scan: someone indexed newer state at this
@@ -1295,14 +1311,13 @@ async fn apply_changes<S: Store + ?Sized>(
             tracing::debug!(path = %path, "sync: deferring a delete whose file reappeared on disk");
             continue;
         }
-        let permalink = permalink_at(store, &domain_name, &path).await?;
         store.delete_engram(domain, &path).await?;
         report.changes.push(PathChange {
             kind: PathChangeKind::Deleted,
             path: path.clone(),
             from: None,
             from_permalink: None,
-            permalink,
+            permalink: before.get(&path).cloned(),
             checksum: None,
         });
         report.deleted += 1;
@@ -1331,20 +1346,15 @@ async fn apply_changes<S: Store + ?Sized>(
     Ok(())
 }
 
-/// The permalink the index holds for `path`, or `None` when no row stands
-/// there. One prefix query, the same read-back the engine's save receipt
-/// makes: the row's own permalink is what a subscriber's page is keyed on.
-async fn permalink_at<S: Store + ?Sized>(
-    store: &S,
-    domain: &str,
-    path: &str,
-) -> Result<Option<String>> {
+/// Every row's permalink in one domain, keyed by its exact path: one listing,
+/// the same rows the engine's save receipt reads its permalink back from.
+async fn permalinks<S: Store + ?Sized>(store: &S, domain: &str) -> Result<HashMap<String, String>> {
     Ok(store
-        .list_engrams(domain, Some(path), None)
+        .list_engrams(domain, None, None)
         .await?
         .into_iter()
-        .find(|row| row.path == path)
-        .map(|row| row.permalink))
+        .map(|row| (row.path, row.permalink))
+        .collect())
 }
 
 /// Read, parse, chunk and upsert one slab of changed files.
