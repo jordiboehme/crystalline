@@ -40,6 +40,16 @@
  * malfunction from the start, with or without `?fault=`. `?fault=` and
  * `?hall=heroes` are not meant together: the hero hall carries no
  * malfunctioning fixture.
+ *
+ * `?hall=console` (2.6e C21) shows `consoleRoom()` on its own instead, for
+ * judging its fittings without walking in through a police box: no
+ * `consoleRoom` option reaches `createSession` here, so the inner doors
+ * lead nowhere in the gallery, same as every other door. `?view=<name>`
+ * puts the player at one of `CONSOLE_VIEWS` (`entry`, `console`, `rotor`,
+ * `wall`, `doors`, `scanner`, `corner`, from `dev/consoleViews.ts`); a
+ * missing or unknown name falls back to `entry`. `?at=` and `?fault=` are
+ * not meant with `?hall=console`: the console room carries no fixture and
+ * no prop or curio `?at=` could frame.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -52,6 +62,8 @@ import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { galleryRoom, heroHallRoom } from "../world/canned";
+import { consoleRoom } from "../world/consoleRoom";
+import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
 import { spotView } from "./spots";
 
 /** The keys, along the top of the screen. */
@@ -77,10 +89,20 @@ export default function Gallery() {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
     const params = new URLSearchParams(window.location.search);
+    const hall = params.get("hall");
     const base =
-      params.get("hall") === "heroes" ? heroHallRoom() : galleryRoom();
+      hall === "console"
+        ? consoleRoom()
+        : hall === "heroes"
+          ? heroHallRoom()
+          : galleryRoom();
     const at = params.get("at");
-    const atView = at === null ? null : spotView(base, at);
+    const roomView =
+      hall === "console"
+        ? (consoleView(params.get("view")) ?? CONSOLE_VIEWS.entry)
+        : at === null
+          ? null
+          : spotView(base, at);
     const fault = params.get("fault");
     const load: PlaceLoader | undefined =
       fault === "missing" || fault === "denied"
@@ -97,8 +119,8 @@ export default function Gallery() {
     });
     sessionRef.current = session;
     session.showRoom(
-      atView === null ? base : { ...base, spawn: atView.spawn },
-      atView === null ? undefined : { pitch: atView.pitch },
+      roomView === null ? base : { ...base, spawn: roomView.spawn },
+      roomView === null ? undefined : { pitch: roomView.pitch },
     );
     return () => {
       sessionRef.current = null;
