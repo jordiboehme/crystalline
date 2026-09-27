@@ -7,12 +7,23 @@
  * (the star ball's body); the catch ball's two hemispheres reuse the same
  * latitude math through the private `sphereArc`, kept apart at the
  * equator so the two colours never share a triangle (no z-fighting seam).
- * Every proud decal (a hazard stripe, the fuel case's red band and label,
- * the trefoil's sectors and disc) sits a few millimetres inside its
+ * Every proud decal (a hazard stripe, the fuel case's red band, label
+ * and sticker, and the marks on them) sits a few millimetres inside its
  * curio's catalogue box, so the body it decorates is built a little
  * short of the box on every side that carries one, leaving room for the
  * decal to stand proud without ever leaving the envelope the model tests
  * pin.
+ *
+ * The fuel case is the one keepsake that carries its original's marks
+ * (2.6f C13, C17): the radiation trefoil and three hazard lines
+ * (`MARKS.caseLabels`). The trefoil is drawn geometry (three sectors and
+ * a centre disc, each extruded proud of the label), which reads as the
+ * symbol in both looks where an 11 by 11 cell picture reads as a block
+ * shape; each line is a `pixelPanel` `MARK_PROUD` in front of its face.
+ * The trefoil and the hazard class line share the yellow label on the
+ * front, the handling line runs along the front under the red stripe,
+ * and the caution line sits on a cream sticker on the `-a` side, the case's
+ * own right, which a three-quarter view from its front right shows.
  */
 
 import type { CurioKind } from "../../../world/types";
@@ -20,6 +31,8 @@ import type { Surface } from "../../geometry";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import { discOutline, profileAlong, yawed } from "../common";
+import { fit, MARK_PROUD, pixelPanel, textRows } from "../heroes/pixels";
+import { MARKS } from "../marks";
 import { curioHalf, type CurioRecipe } from "./common";
 
 /** Every curio in this file is built in this frame, at the origin. */
@@ -469,12 +482,16 @@ const trapBox: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
 const CASE_GREY: Rgb = [0.62, 0.63, 0.65];
 /** Every piece of steel hardware: the corner guards, the lid seam, the latches and the handle. */
 const STEEL_GREY: Rgb = [0.45, 0.46, 0.48];
-/** The red stripe band. */
-const STRIPE_RED: Rgb = [0.75, 0.1, 0.08];
-/** The label's backing plate. */
-const LABEL_YELLOW: Rgb = [0.95, 0.78, 0.05];
-/** The trefoil, and the case's corner guards and lid seam. */
-const TREFOIL_BLACK: Rgb = [0.05, 0.05, 0.05];
+/** The red stripe band. Exported so the case's test can find the stripe. */
+export const STRIPE_RED: Rgb = [0.75, 0.1, 0.08];
+/** The label's backing plate. Exported so the case's test can find the label. */
+export const LABEL_YELLOW: Rgb = [0.95, 0.78, 0.05];
+/** The trefoil on the label: black. */
+export const TREFOIL_BLACK: Rgb = [0.05, 0.05, 0.05];
+/** The three hazard lines' letters (`MARKS.caseLabels`): a black a shade deeper than the trefoil's. */
+export const CASE_LABEL_INK: Rgb = [0.02, 0.02, 0.02];
+/** The caution line's sticker on the case's side: a cream. */
+export const STICKER_CREAM: Rgb = [0.93, 0.91, 0.84];
 
 /** How far the case body is built inside its catalogue box on `a` and `d`, leaving room for every proud detail. */
 const CASE_MARGIN = 0.02;
@@ -546,14 +563,54 @@ function sectorOutline(
 }
 
 /**
+ * Where the case's marks are fitted, each a box `[a0, a1, h0, h1]` on its
+ * face, the pixel as large as the box allows (`fit`):
+ * - `classLine`: the label's foot, under the trefoil's lowest blade tips
+ *   (about 0.125), the hazard class line (`MARKS.caseLabels[0]`) at about
+ *   1.4 mm;
+ * - `handling`: the case's front under the red stripe (0.07) and over
+ *   the lower corner guards (0.03), the handling line
+ *   (`MARKS.caseLabels[2]`) at about 2.5 mm, as letters on the aluminium
+ *   with no plate, the way a die-cut sticker reads;
+ * - `sticker`: the cream sticker's plate on the `-a` side, `a` across the
+ *   side (from `-d` to `+d`, as its reader sees it) between the side's
+ *   corner guards, between the stripe and the seam;
+ * - `caution`: the caution line (`MARKS.caseLabels[1]`) inside the
+ *   sticker, at about 1.4 mm.
+ */
+const CASE_MARKS = {
+  classLine: [-0.041, 0.041, 0.1135, 0.1225],
+  handling: [-0.13, 0.13, 0.035, 0.06],
+  sticker: [-0.085, 0.085, 0.118, 0.148],
+  caution: [-0.08, 0.08, 0.123, 0.143],
+} as const;
+
+/**
+ * Draws a pixel picture fitted into `box` (`[a0, a1, h0, h1]`) as
+ * `pixelPanel` quads facing `+d` at depth `d`, every lit cell in `ink`:
+ * one of the fuel case's marks.
+ */
+function caseMark(
+  k: Kit,
+  rows: readonly string[],
+  box: readonly [a0: number, a1: number, h0: number, h1: number],
+  d: number,
+  ink: Surface,
+): void {
+  const { px, left, top } = fit(rows, ...box);
+  pixelPanel(k, rows, left, top, px, d, (ch) => (ch === "#" ? ink : null));
+}
+
+/**
  * The fuel case: a small aluminium hard case with steel corner guards, a
  * dark lid seam, a red stripe wrapped round all four faces, two latches
- * and a carry handle, and, on the front above the stripe, a yellow label
- * carrying a black radiation trefoil (three sectors and a centre disc,
- * each extruded proud of the label). No lights, no text: the case's bank
- * is steady.
+ * and a carry handle. On the front above the stripe sits the yellow
+ * hazard label, a black radiation trefoil (three sectors and a centre
+ * disc, each extruded proud of the label) over the hazard class line; under the stripe runs the handling line; on the `+a` side a
+ * cream sticker on the `-a` side carries the caution line (module doc). No lights: the
+ * case's bank is steady.
  */
-const fuelCase: CurioRecipe = ({ k, s, variant, kind }) => {
+const fuelCase: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   const { hw, hd, top } = curioHalf(kind, variant);
   const bw = hw - CASE_MARGIN;
   const bd = hd - CASE_MARGIN;
@@ -635,6 +692,34 @@ const fuelCase: CurioRecipe = ({ k, s, variant, kind }) => {
     trefoilD0,
     trefoilD0 + TREFOIL_THICK,
     trefoil,
+  );
+
+  // The hazard class line on the label's foot, under the trefoil.
+  const onLabel = labelD0 + LABEL_THICK + MARK_PROUD;
+  const [classLine, cautionLine, handlingLine] = MARKS.caseLabels;
+  const letters = s.tinted(CASE_LABEL_INK);
+  caseMark(k, textRows(classLine), CASE_MARKS.classLine, onLabel, letters);
+
+  // The handling line along the front, under the stripe.
+  caseMark(
+    k,
+    textRows(handlingLine),
+    CASE_MARKS.handling,
+    bd + MARK_PROUD,
+    letters,
+  );
+
+  // The caution sticker on the `-a` side, read from that side: a frame
+  // turned a quarter so its `d` points out of the side and its `a` runs
+  // from `-d` to `+d`.
+  const [s0, s1, sh0, sh1] = CASE_MARKS.sticker;
+  k.box(-bw - LABEL_THICK, -bw, s0, s1, sh0, sh1, s.tinted(STICKER_CREAM));
+  caseMark(
+    kitAt(yawed(ORIGIN, -bw, 0, Math.PI / 2)),
+    textRows(cautionLine),
+    CASE_MARKS.caution,
+    LABEL_THICK + MARK_PROUD,
+    letters,
   );
 };
 

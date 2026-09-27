@@ -10,7 +10,11 @@
  * lying on the back plane of its tilted lid, its lid and mark keep the
  * brief's numbers, its two drive slots sit either side of the latch, its
  * keys stand in five rows before a palm rest, and it stays under 900
- * triangles.
+ * triangles. The console, the tape drive and the tape player carry their
+ * originals' badges (`MARKS`, 2.6f C13): each rebuilt from its parts
+ * cell by cell must be the font's own rows of its word, on the face the
+ * original prints it on, one `MARK_PROUD` off that face and at least
+ * 1 mm a pixel.
  *
  * Parts are told apart by their colour: `recordingKitAt` keeps each kit
  * call's surface tint.
@@ -24,25 +28,31 @@ import { DECAL_LIFT, frameAt } from "../../kit";
 import { TEXT_BASE } from "../../layers";
 import { LOOKS, type Rgb } from "../../looks";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
-import { pixelRuns, textRows } from "../heroes/pixels";
+import { MARK_PROUD, pixelRuns, textRows } from "../heroes/pixels";
+import { MARKS } from "../marks";
 import { buildCurio, buildCurioMesh } from ".";
 import { curioHalf } from "./common";
 import {
+  CONSOLE_BADGE_INK,
   CONSOLE_LED,
   CONSOLE_PLAY,
   CONSOLE_SCREEN,
   CONSOLE_TITLE,
+  DRIVE_BADGE_INK,
   DRIVE_KEY,
   DRIVE_RECORD_KEY,
+  DRIVE_WINDOW,
   LAPTOP_KEY,
   LAPTOP_LATCH,
   LAPTOP_LID,
   LAPTOP_MARK,
   LAPTOP_SLOT,
   MARK_PX,
+  PLAYER_BADGE_INK,
   PLAYER_FOAM,
   PLAYER_LABEL,
   PLAYER_ORANGE,
+  PLAYER_SMOKE,
   TAPE_REEL,
 } from "./retro";
 
@@ -94,6 +104,77 @@ function overlapAH(p: Part, q: Part): boolean {
     y.lo[2] < x.hi[2] - e
   );
 }
+
+/** How many lit runs `lines` make in the font. */
+const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** The parts of `parts` painted exactly `ink`, whatever primitive drew them. */
+const inked = (parts: readonly Part[], ink: Rgb): Part[] =>
+  parts.filter((p) => inTint(p, ink));
+
+/** A picture with its all-dark rows and columns round the edge cut off. */
+function trimmed(rows: readonly string[]): string[] {
+  const lit = (r: string) => r.includes("#");
+  const inRows = rows.filter(lit);
+  const cols = inRows[0]?.length ?? 0;
+  const litCol = (c: number) => inRows.some((r) => r[c] === "#");
+  let c0 = 0;
+  while (c0 < cols && !litCol(c0)) c0++;
+  let c1 = cols;
+  while (c1 > c0 && !litCol(c1 - 1)) c1--;
+  const first = rows.findIndex(lit);
+  const last = rows.length - [...rows].reverse().findIndex(lit);
+  return rows.slice(first, last).map((r) => r.slice(c0, c1));
+}
+
+/**
+ * A mark's lit cells rebuilt from its parts: `at` puts a local point into
+ * the reader's `[x, y]`, `x` to the right along the text and `y` down it.
+ * The pixel is the smallest extent any part has there (some piece is one
+ * cell), and every part covers whole cells from the mark's top left. A
+ * mark turned about, mirrored or scrambled comes out as other rows than
+ * the font's.
+ */
+function cellsOf(
+  parts: readonly Part[],
+  at: (q: V3) => readonly [x: number, y: number],
+): { rows: string[]; px: number } {
+  const boxes = parts.map((p) => {
+    const xy = p.points.map(at);
+    const xs = xy.map((q) => q[0]);
+    const ys = xy.map((q) => q[1]);
+    return {
+      x0: Math.min(...xs),
+      x1: Math.max(...xs),
+      y0: Math.min(...ys),
+      y1: Math.max(...ys),
+    };
+  });
+  const px = Math.min(...boxes.map((b) => Math.min(b.x1 - b.x0, b.y1 - b.y0)));
+  const x0 = Math.min(...boxes.map((b) => b.x0));
+  const y0 = Math.min(...boxes.map((b) => b.y0));
+  const cell = (v: number, o: number) => Math.round((v - o) / px);
+  const cols = Math.max(...boxes.map((b) => cell(b.x1, x0)));
+  const grid = Array.from(
+    { length: Math.max(...boxes.map((b) => cell(b.y1, y0))) },
+    () => Array.from({ length: cols }, () => "."),
+  );
+  for (const b of boxes)
+    for (let r = cell(b.y0, y0); r < cell(b.y1, y0); r++)
+      for (let c = cell(b.x0, x0); c < cell(b.x1, x0); c++) {
+        const row = grid[r];
+        if (row) row[c] = "#";
+      }
+  return { rows: grid.map((r) => r.join("")), px };
+}
+
+/** Every point of some parts. */
+const pointsOf = (parts: readonly Part[]): V3[] =>
+  parts.flatMap((p) => p.points);
 
 describe("retro curio models", () => {
   describe("pocket console", () => {
@@ -159,6 +240,49 @@ describe("retro curio models", () => {
       expect(led.lo[2]).toBeGreaterThan(screenLow);
       expect(led.hi[2]).toBeLessThan(screenHigh);
     });
+
+    it("prints the console's name and maker on the grey under its bezel, one mark proud, left to right (2.6f C13)", () => {
+      // Mutation caught: the grey left bare, a word dropped, the text over
+      // the screen or on the bezel, turned about or mirrored, the words
+      // swapped, floating or sunk, or under the 1 mm floor. The console
+      // stands upright facing `+d`, so "under the screen" is along `h`.
+      expect(runsOfLines(MARKS.consoleBadge)).toBeGreaterThan(3);
+      const ink = inked(parts, CONSOLE_BADGE_INK);
+      expect(ink).toHaveLength(runsOfLines(MARKS.consoleBadge));
+      for (const p of ink) {
+        expect(p.method).toBe("panel");
+        expect(p.flag).toBe(FLAG.lit);
+      }
+      const screen = pointsOf(parts.filter((p) => p.flag !== FLAG.lit));
+      expect(screen.length).toBeGreaterThan(0);
+      const screenBottom = Math.min(...screen.map((q) => q[2]));
+      const pts = pointsOf(ink);
+      const lo = Math.min(...pts.map((q) => q[2]));
+      const hi = Math.max(...pts.map((q) => q[2]));
+      expect(hi).toBeLessThanOrEqual(screenBottom + 1e-6);
+      // The face the text lies on: the front of every other part that
+      // spans the text's whole height.
+      const face = Math.max(
+        ...parts
+          .filter((p) => !ink.includes(p))
+          .map(bounds)
+          .filter((b) => b.lo[2] <= lo && b.hi[2] >= hi)
+          .map((b) => b.hi[1]),
+      );
+      for (const q of pts) expect(q[1]).toBeCloseTo(face + MARK_PROUD, 9);
+      const { rows, px } = cellsOf(ink, (q) => [q[0], -q[2]]);
+      expect(px).toBeGreaterThanOrEqual(0.001 - 1e-9);
+      const [maker, name] = MARKS.consoleBadge.map((w) => trimmed(textRows(w)));
+      if (!maker || !name) throw new Error("two words");
+      const gap =
+        (rows[0]?.length ?? 0) -
+        (maker[0]?.length ?? 0) -
+        (name[0]?.length ?? 0);
+      expect(gap).toBeGreaterThanOrEqual(2);
+      expect(rows).toEqual(
+        maker.map((r, i) => r + ".".repeat(gap) + (name[i] ?? "")),
+      );
+    });
   });
 
   describe("tape drive", () => {
@@ -197,6 +321,68 @@ describe("retro curio models", () => {
         .filter((q) => Math.abs(q[1] - hd) < 1e-9);
       expect(front.length).toBeGreaterThan(0);
       expect(Math.max(...front.map((q) => q[2]))).toBeCloseTo(0.045, 9);
+    });
+
+    it("prints its maker's word on the lid, in front of the window and behind the keys at the left, reading from the front (2.6f C13)", () => {
+      // Mutation caught: the lid left bare, the word on the key deck or
+      // over the window, on the right, turned about or mirrored, floating
+      // over the lid or sunk into it, or under the 1 mm floor.
+      const parts = partsOf("tape-drive");
+      const ink = inked(parts, DRIVE_BADGE_INK);
+      expect(ink.length).toBeGreaterThan(0);
+      const { rows, px } = cellsOf(ink, (q) => [q[0], q[1]]);
+      expect(rows).toEqual(trimmed(textRows(MARKS.driveBadge)));
+      expect(px).toBeGreaterThanOrEqual(0.001 - 1e-9);
+      const pts = pointsOf(ink);
+      const keys = pointsOf(
+        parts.filter(
+          (p) => inTint(p, DRIVE_KEY) || inTint(p, DRIVE_RECORD_KEY),
+        ),
+      );
+      const window = pointsOf(
+        parts.filter((p) => inTint(p, DRIVE_WINDOW) && p.method === "extrude"),
+      );
+      expect(window.length).toBeGreaterThan(0);
+      expect(Math.max(...pts.map((q) => q[1]))).toBeLessThan(
+        Math.min(...keys.map((q) => q[1])),
+      );
+      expect(Math.min(...pts.map((q) => q[1]))).toBeGreaterThan(
+        Math.max(...window.map((q) => q[1])),
+      );
+      expect(Math.max(...pts.map((q) => q[0]))).toBeLessThan(0);
+      // The lid: the slab on the slope that spans the window's width and
+      // more; its top runs straight from its back edge to its front.
+      const lid = parts
+        .filter((p) => p.method === "extrude")
+        .map(bounds)
+        .find(
+          (b) =>
+            b.lo[0] < Math.min(...window.map((q) => q[0])) - 0.02 &&
+            b.hi[0] - b.lo[0] < 0.19 &&
+            b.hi[1] < Math.min(...keys.map((q) => q[1])) &&
+            b.lo[2] > 0.02,
+        );
+      if (!lid) throw new Error("the lid");
+      const lidParts = parts.filter(
+        (p) =>
+          p.method === "extrude" &&
+          bounds(p).lo[0] === lid.lo[0] &&
+          bounds(p).hi[0] === lid.hi[0],
+      );
+      const lidPts = pointsOf(lidParts);
+      const topAt = (d: number) =>
+        Math.max(
+          ...lidPts.filter((q) => Math.abs(q[1] - d) < 1e-9).map((q) => q[2]),
+        );
+      const [back, front] = [lid.lo[1], lid.hi[1]];
+      const lidTop = (d: number) =>
+        topAt(back) +
+        ((d - back) / (front - back)) * (topAt(front) - topAt(back));
+      for (const p of ink) {
+        const off = p.points.map((q) => q[2] - lidTop(q[1]));
+        expect(Math.min(...off)).toBeCloseTo(0, 9);
+        expect(Math.max(...off)).toBeCloseTo(MARK_PROUD, 9);
+      }
     });
   });
 
@@ -267,6 +453,54 @@ describe("retro curio models", () => {
       expect(label.hi[1] - label.lo[1]).toBeGreaterThan(
         3 * (label.hi[0] - label.lo[0]),
       );
+    });
+
+    it("prints the maker's word by the buttons and the model's at the far end, flat on the lid and reading from the front (2.6f C13)", () => {
+      // Mutation caught: the lid left bare, a word dropped or over the
+      // window, the two words swapped, turned about or mirrored, floating
+      // over the lid or sunk into it, or under the 1 mm floor.
+      const ink = inked(parts, PLAYER_BADGE_INK);
+      const window = bounds(parts.find((p) => inTint(p, PLAYER_SMOKE)) as Part);
+      const orange = bounds(
+        parts.find((p) => inTint(p, PLAYER_ORANGE)) as Part,
+      );
+      const lidTop = window.lo[2];
+      const mid = (p: Part) => (bounds(p).lo[1] + bounds(p).hi[1]) / 2;
+      const maker = ink.filter((p) => mid(p) > 0);
+      const model = ink.filter((p) => mid(p) < 0);
+      expect(maker.length).toBeGreaterThan(0);
+      expect(model.length).toBeGreaterThan(0);
+      const [makerWord, modelWord] = MARKS.playerBadge;
+      if (!makerWord || !modelWord) throw new Error("two words");
+      for (const [part, word] of [
+        [maker, makerWord],
+        [model, modelWord],
+      ] as const) {
+        const { rows, px } = cellsOf(part, (q) => [q[0], q[1]]);
+        expect(rows).toEqual(trimmed(textRows(word)));
+        expect(px).toBeGreaterThanOrEqual(0.001 - 1e-9);
+      }
+      for (const p of ink) {
+        const b = bounds(p);
+        expect(p.method).toBe("box");
+        expect(b.lo[2]).toBeCloseTo(lidTop, 9);
+        expect(b.hi[2]).toBeCloseTo(lidTop + MARK_PROUD, 9);
+        expect(b.lo[0]).toBeGreaterThanOrEqual(window.lo[0] - 0.008);
+        expect(b.hi[0]).toBeLessThanOrEqual(window.hi[0] + 0.008);
+      }
+      const body = parts
+        .filter((p) => p.method === "box")
+        .map(bounds)
+        .filter((b) => b.lo[2] === 0);
+      const end = Math.min(...body.map((b) => b.lo[1]));
+      for (const p of maker) {
+        expect(bounds(p).lo[1]).toBeGreaterThan(window.hi[1]);
+        expect(bounds(p).hi[1]).toBeLessThan(orange.lo[1]);
+      }
+      for (const p of model) {
+        expect(bounds(p).hi[1]).toBeLessThan(window.lo[1]);
+        expect(bounds(p).lo[1]).toBeGreaterThan(end);
+      }
     });
   });
 

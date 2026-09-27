@@ -5,7 +5,10 @@
  * the beige laptop. Colours and helpers stay in this file, which imports
  * only `common.ts` of the curio batches.
  *
- * Each follows its original's shape closely and copies no name or marking:
+ * Each follows its original's shape closely. The console, the tape drive
+ * and the tape player carry their originals' badges (2.6f C13), the
+ * strings of `MARKS` (`marks.ts`); the video tape and the laptop carry
+ * none of their originals' names:
  * - The console is a tall light grey brick standing upright on a small dark
  *   foot (C15), the lower half 4 mm thinner at the front. Its upper half
  *   holds a grey-green bezel round a pale yellow-green screen sunk into
@@ -40,6 +43,18 @@
  *   carrying the grey-green screen in a wide bezel in front and a block
  *   pixel "<=>" on its back (C17).
  *
+ * The badges (C17): the console's two words side by side on the grey
+ * under its bezel, off the blinking screen, as `pixelPanel` quads
+ * `MARK_PROUD` in front of the face. The drive's and the player's lie on
+ * faces that look up, where no quad can lie (a kit frame only turns about
+ * the upright), so each is built from thin pieces `MARK_PROUD` thick
+ * instead: the drive's word as slabs on the lid's slope in front of its
+ * window, the player's two words as boxes on its lid, the maker's by the
+ * buttons and the model's at the far end. Each piece is a run of lit
+ * cells merged with the runs straight under it (`pixelRects`), which
+ * keeps the player inside the curio budget. Both read from the curio's
+ * front (`+d`), their first row towards `-d`.
+ *
  * The laptop's lid is the one part that tilts. The kit has no pitched
  * frames, so the lid, its screen and every run of the mark are
  * `profileAlong` slabs of quadrilaterals in the lid's own `(s, o)` terms
@@ -66,7 +81,15 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import { blinkPicture, pixelRuns, textRows } from "../heroes/pixels";
+import {
+  blinkPicture,
+  fit,
+  MARK_PROUD,
+  pixelPanel,
+  pixelRuns,
+  textRows,
+} from "../heroes/pixels";
+import { MARKS } from "../marks";
 import { curioHalf, type CurioRecipe } from "./common";
 
 /** A point of a side profile: depth `d`, height `h`. */
@@ -135,6 +158,59 @@ function planBar(
   );
 }
 
+/** A rectangle of a pixel picture's lit cells: its first column, its top row, its width and its height in cells. */
+interface PixelRect {
+  col: number;
+  row: number;
+  len: number;
+  rows: number;
+}
+
+/**
+ * A pixel picture's lit cells (`#`) as rectangles: each horizontal run of
+ * `pixelRuns`, merged with the runs straight under it that start and end
+ * in the same columns, so an upright stroke is one piece however tall.
+ * Together they cover every lit cell exactly once. For a mark built from
+ * boxes or slabs, which cost a dozen triangles a piece.
+ */
+function pixelRects(rows: readonly string[]): PixelRect[] {
+  const rects: PixelRect[] = [];
+  for (const r of pixelRuns(rows)) {
+    const above = rects.find(
+      (x) => x.col === r.col && x.len === r.len && x.row + x.rows === r.row,
+    );
+    if (above) above.rows++;
+    else rects.push({ ...r, rows: 1 });
+  }
+  return rects;
+}
+
+/**
+ * Lays `text` flat on a face that looks up, fitted into `a0..a1` along
+ * and `d0..d1` across with square pixels as large as both allow (`fit`),
+ * centred: `lay` draws one rectangle of lit cells (`pixelRects`) from
+ * `a0` to `a1` and `d0` to `d1`. The first row lies towards `-d`, so the
+ * text reads from the curio's front (`+d`), left to right along `+a`.
+ * Returns the pixel size, to hold to C13's 1 mm floor.
+ */
+function flatText(
+  text: string,
+  box: readonly [a0: number, a1: number, d0: number, d1: number],
+  lay: (a0: number, a1: number, d0: number, d1: number) => void,
+): number {
+  const rows = textRows(text);
+  const { px, left } = fit(rows, ...box);
+  const far = (box[2] + box[3]) / 2 - (rows.length * px) / 2;
+  for (const r of pixelRects(rows))
+    lay(
+      left + r.col * px,
+      left + (r.col + r.len) * px,
+      far + r.row * px,
+      far + (r.row + r.rows) * px,
+    );
+  return px;
+}
+
 // --- Pocket console --------------------------------------------------------
 
 /** The console's body: a light warm grey. */
@@ -171,6 +247,23 @@ const CONSOLE_SLIT: Rgb = [0.38, 0.38, 0.36];
 
 /** The foot stand: a dark charcoal. */
 const CONSOLE_STAND: Rgb = [0.12, 0.12, 0.13];
+
+/** The badge's letters under the bezel: a dark navy, as the original prints them. */
+export const CONSOLE_BADGE_INK: Rgb = [0.1, 0.12, 0.32];
+
+/**
+ * The console's badge (2.6f C13): the box `[a0, a1, h0, h1]` both words
+ * are fitted into together, on the grey front between the lower half's
+ * top (`CONSOLE.mid`, 0.08) and the bezel's foot (0.088), and the dark
+ * columns between the maker's word on the left and the console's name on
+ * the right, wider than the space inside the name so the two read as
+ * two marks. Both words share one pixel, about 1.2 mm, which the width
+ * sets.
+ */
+const CONSOLE_BADGE = {
+  box: [-0.042, 0.042, 0.0805, 0.0875],
+  gap: 6,
+} as const;
 
 /**
  * The console's layout in metres (`a` across, `d` out of its face, `h`
@@ -384,6 +477,21 @@ const pocketConsole: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   const ink = (ch: string) => (ch === "#" ? CONSOLE_SCREEN : null);
   blinkPicture(k, s, CONSOLE_TITLE, screen, C.pixD, 0, ink);
   blinkPicture(k, s, CONSOLE_PLAY, screen, C.pixD, 4, ink);
+
+  // The badge under the bezel, the maker's word left of the console's
+  // name: two marks at one pixel, steady, off the screen's blink bank.
+  const [maker, name] = MARKS.consoleBadge.map((w) => textRows(w));
+  const both = (maker ?? []).map(
+    (r, i) => r + ".".repeat(CONSOLE_BADGE.gap) + (name?.[i] ?? ""),
+  );
+  const at = fit(both, ...CONSOLE_BADGE.box);
+  const badge = s.tinted(CONSOLE_BADGE_INK);
+  const letters = (ch: string) => (ch === "#" ? badge : null);
+  const badgeFace = C.front + MARK_PROUD;
+  pixelPanel(k, maker ?? [], at.left, at.top, at.px, badgeFace, letters);
+  const nameLeft =
+    at.left + ((maker?.[0]?.length ?? 0) + CONSOLE_BADGE.gap) * at.px;
+  pixelPanel(k, name ?? [], nameLeft, at.top, at.px, badgeFace, letters);
 };
 
 // --- Tape drive ------------------------------------------------------------
@@ -398,7 +506,18 @@ export const DRIVE_KEY: Rgb = [0.45, 0.32, 0.22];
 export const DRIVE_RECORD_KEY: Rgb = [0.3, 0.2, 0.14];
 
 /** The cassette window and the counter: a dark smoky grey. */
-const DRIVE_WINDOW: Rgb = [0.15, 0.14, 0.13];
+export const DRIVE_WINDOW: Rgb = [0.15, 0.14, 0.13];
+
+/** The badge's letters on the lid: a dark warm brown-grey. */
+export const DRIVE_BADGE_INK: Rgb = [0.24, 0.21, 0.18];
+
+/**
+ * The drive's badge (2.6f C13): the box `[a0, a1, d0, d1]` its word is
+ * fitted into, on the lid's strip between the window's front edge (0.03)
+ * and the lid's own front (`DRIVE.lidFront`, 0.04), at the left, behind
+ * the record key. The strip's depth sets the pixel, 1.4 mm.
+ */
+const DRIVE_BADGE = [-0.088, -0.03, 0.0315, 0.0385] as const;
 
 /** The reel hubs behind the window and the counter's strip: a pale grey. */
 const DRIVE_HUB: Rgb = [0.8, 0.8, 0.78];
@@ -551,6 +670,13 @@ const tapeDrive: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   k.box(exitA - 0.008, exitA + 0.008, back - 0.003, back, 0, 0.012, cable);
   cylinderAlongD(kitAt, exitA, r, runD, back, r, 6, cable);
   k.cylinderAlong(-0.03, exitA + r, runD, r, r, 6, cable);
+
+  // The badge on the lid's front strip: each piece a slab on the slope,
+  // standing `MARK_PROUD` off the lid.
+  const badge = s.tinted(DRIVE_BADGE_INK);
+  flatText(MARKS.driveBadge, DRIVE_BADGE, (a0, a1, d0, d1) =>
+    onSlope(lidH, d0, d1, 0, MARK_PROUD, a0, a1, badge),
+  );
 };
 
 // --- Tape player -----------------------------------------------------------
@@ -574,7 +700,23 @@ export const PLAYER_FOAM: Rgb = [0.95, 0.5, 0.1];
 export const PLAYER_LABEL: Rgb = [0.85, 0.84, 0.8];
 
 /** The lid's window: a smoky blue-grey, light enough for the dark hubs to show. */
-const PLAYER_SMOKE: Rgb = [0.3, 0.31, 0.35];
+export const PLAYER_SMOKE: Rgb = [0.3, 0.31, 0.35];
+
+/** The badges' letters on the lid: a dark navy on the silver. */
+export const PLAYER_BADGE_INK: Rgb = [0.07, 0.09, 0.2];
+
+/**
+ * The player's two badges (2.6f C13), each the `d0..d1` strip of the lid
+ * its word is fitted into, centred along the player: the maker's word
+ * between the window's top edge (0.034) and the buttons (0.054), the
+ * model's between the far end (-0.067) and the window's bottom edge
+ * (-0.058), where the original carries its name label. The strips' depth
+ * sets the pixels, 2.4 mm and 1.4 mm.
+ */
+const PLAYER_BADGE = {
+  maker: [0.038, 0.05],
+  model: [-0.066, -0.059],
+} as const;
 
 /**
  * The tape player's layout in metres:
@@ -651,6 +793,17 @@ const tapePlayer: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   );
   for (const d of [-0.04, 0.002])
     k.cylinder(mid, d, lidTop + 0.0006, lidTop + 0.0014, 0.0065, 6, dark);
+
+  // The badges on the lid, flat boxes `MARK_PROUD` thick.
+  const badge = s.tinted(PLAYER_BADGE_INK);
+  const [makerWord, modelWord] = MARKS.playerBadge;
+  for (const [word, [d0, d1]] of [
+    [makerWord, PLAYER_BADGE.maker],
+    [modelWord, PLAYER_BADGE.model],
+  ] as const)
+    flatText(word, [a0 + 0.008, a1 - 0.008, d0, d1], (x0, x1, y0, y1) =>
+      k.box(x0, x1, y0, y1, lidTop, lidTop + MARK_PROUD, badge),
+    );
 
   // The row of buttons flush with the top end edge, one orange.
   for (let i = 0; i < PLAYER_BUTTONS; i++) {
