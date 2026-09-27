@@ -50,7 +50,7 @@ export const MARKS = {
   panelName: ["HAL", "9000"],
   /** The photo console's small wordmark plate, below the screen. */
   deskBadge: "esper",
-  /** The tube bench's two embossed labels, separate marks: one across the tube area, one by the door. */
+  /** The tube bench's two embossed labels, separate marks: the short one on the bottom rail under the tubes, the long one along the strip over the status lights. */
   benchLabels: [
     "SHIELD EYES FROM LIGHT",
     "DISCONNECT CAPACITOR DRIVE BEFORE OPENING",

@@ -328,4 +328,31 @@ describe("arcade hero models", () => {
       );
     }
   });
+
+  it("reads the marquee title from the front: its first row highest up the hood, left to right (2.6f C17)", () => {
+    // Mutation caught: the columns mirrored or the rows flipped, so the
+    // title reads backwards or upside down. The lit cells are rebuilt
+    // from the runs, the highest run up the face as row 0 and the low-`a`
+    // edge as column 0, and must be the title's own rows.
+    const rows = textRows(MARKS.recruitMarquee);
+    const ink = inked(partsOf("recruit-cabinet", 0), RECRUIT_MARQUEE_INK).map(
+      (p) => local(p),
+    );
+    const span = (xs: number[]) => Math.max(...xs) - Math.min(...xs);
+    const px = Math.min(...ink.map((ps) => span(ps.map((q) => onHood(q).s))));
+    const s1 = Math.max(...ink.flatMap((ps) => ps.map((q) => onHood(q).s)));
+    const a0 = Math.min(...ink.flatMap((ps) => ps.map((q) => q[0])));
+    const grid = rows.map((r) => [...r].map(() => "."));
+    for (const ps of ink) {
+      const top = Math.max(...ps.map((q) => onHood(q).s));
+      const row = Math.round((s1 - top) / px);
+      const c0 = Math.round((Math.min(...ps.map((q) => q[0])) - a0) / px);
+      const c1 = Math.round((Math.max(...ps.map((q) => q[0])) - a0) / px);
+      for (let c = c0; c < c1; c++) {
+        const line = grid[row];
+        if (line) line[c] = "#";
+      }
+    }
+    expect(grid.map((r) => r.join(""))).toEqual(rows);
+  });
 });
