@@ -5,6 +5,7 @@ import type { GraphNeighborhood, GraphNode } from "../../api/graph";
 import type { InboundRefHit, InboundRefPage } from "../../api/inbound";
 import { domainSpellings } from "../../domainNames";
 import { placeKeyOf } from "../paths";
+import { generateRoom } from "../world/generate";
 import { HATCH_CAP, type PlaceReference } from "../world/types";
 import { placeFromDetail, type PlaceSources } from "./place";
 
@@ -152,6 +153,7 @@ describe("placeFromDetail relations", () => {
     expect(relation("Reactor Core")).toEqual({
       relType: "depends_on",
       target: { domain: null, target: "Reactor Core" },
+      targetDomain: null,
       resolved: true,
       address: { domain: "eng", permalink: "reactor-core" },
       targetTitle: "Reactor Core",
@@ -165,6 +167,7 @@ describe("placeFromDetail relations", () => {
     expect(relation("old-bridge")).toEqual({
       relType: "supersedes",
       target: { domain: null, target: "old-bridge" },
+      targetDomain: null,
       resolved: true,
       address: null,
       targetTitle: null,
@@ -176,6 +179,7 @@ describe("placeFromDetail relations", () => {
     expect(relation("Nowhere")).toEqual({
       relType: "relates_to",
       target: { domain: null, target: "Nowhere" },
+      targetDomain: null,
       resolved: false,
       address: null,
       targetTitle: null,
@@ -200,6 +204,7 @@ describe("placeFromDetail links", () => {
     expect(link("Runbook")).toEqual({
       relType: null,
       target: { domain: "ops", target: "Runbook" },
+      targetDomain: "ops",
       resolved: true,
       address: { domain: "ops", permalink: "runbook" },
       targetTitle: "Runbook",
@@ -410,5 +415,51 @@ describe("placeFromDetail determinism", () => {
     expect(JSON.stringify(placeFromDetail(shuffled))).toBe(
       JSON.stringify(placeFromDetail(SOURCES)),
     );
+  });
+});
+
+describe("a portal spelled with a domain's other names", () => {
+  // Home is `moonbase`, which its MANIFEST calls `moon` and which used to be
+  // `lunar`; `eng` is another domain. No graph, so no portal has an address
+  // and the colour rests on the prefix alone.
+  const NAMES = domainSpellings([
+    { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
+    {
+      name: "moonbase",
+      canonicalName: "moon",
+      aliases: ["lunar"],
+      shadowed: false,
+    },
+  ]);
+  const detail: EngramDetail = {
+    ...DETAIL,
+    domain: "moonbase",
+    url: "crystalline://moonbase/hub",
+    relations: [],
+    links: [
+      ref(null, "moon", "Crater Base", true),
+      ref(null, "lunar", "Landing Pad", true),
+      ref(null, "eng", "Reactor Core", true),
+    ],
+  };
+  const portals = (domains: PlaceSources["domains"]) =>
+    generateRoom(
+      placeFromDetail({ ...SOURCES, detail, graph: null, domains }),
+    ).fixtures.flatMap((f) =>
+      f.kind === "portal" ? [[f.label, f.crossDomain] as const] : [],
+    );
+
+  it("keeps a portal spelled with the home domain's canonical name or alias at home", () => {
+    expect(new Map(portals(NAMES))).toEqual(
+      new Map([
+        ["Crater Base", false],
+        ["Landing Pad", false],
+        ["Reactor Core", true],
+      ]),
+    );
+  });
+
+  it("compares the prefix as written when the listing is unknown", () => {
+    expect(new Map(portals(undefined)).get("Crater Base")).toBe(true);
   });
 });

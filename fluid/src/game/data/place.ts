@@ -127,6 +127,7 @@ function typesOf(
 function placeReference(
   reference: EngramReference,
   resolve: WikilinkResolver,
+  domains: DomainSpellings | undefined,
   targetSalience: ReadonlyMap<string, number | null>,
   types: ReadonlyMap<string, string | null>,
 ): PlaceReference {
@@ -134,12 +135,18 @@ function placeReference(
   const state = referenceState(resolution, reference.resolved);
   const address =
     resolution?.kind === "resolved" ? addressOfRoute(resolution.href) : null;
+  const prefix = reference.target.domain;
   const base = {
     relType: reference.relType,
     target: {
-      domain: reference.target.domain,
+      domain: prefix,
       target: reference.target.target,
     },
+    ...(domains === undefined
+      ? {}
+      : {
+          targetDomain: prefix === null ? null : (domains.get(prefix) ?? null),
+        }),
   };
   if (state === "unresolved") {
     return {
@@ -221,7 +228,7 @@ export function placeFromDetail(input: PlaceSources): PlaceInput {
   const types = typesOf(graph);
 
   const map = (reference: EngramReference) =>
-    placeReference(reference, resolve, targetSalience, types);
+    placeReference(reference, resolve, domains, targetSalience, types);
 
   const { frontmatter } = detail;
   return {

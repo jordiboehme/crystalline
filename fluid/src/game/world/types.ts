@@ -48,6 +48,15 @@ export interface PlaceReference {
    * know the archetype of the room this way leads to.
    */
   targetType?: string | null;
+  /**
+   * The local name of the domain the bracket text's prefix names, read
+   * through the listing's spelling table (`domainNames.ts`), so a prefix
+   * spelled with a canonical name or an alias names its domain here too.
+   * Null for no prefix and for a prefix no domain answers to, which both
+   * read at home. Absent when the listing could not be read; the generator
+   * then compares the prefix as written.
+   */
+  targetDomain?: string | null;
 }
 
 /**

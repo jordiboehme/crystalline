@@ -570,12 +570,16 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     const slot = take("north");
     if (slot === null) continue;
     const way = wayOf(l);
+    // The domain the prefix names through the spelling table, so a link
+    // spelled with the home domain's canonical name or an alias stays home.
+    const lands =
+      l.targetDomain === undefined ? l.target.domain : l.targetDomain;
     fixtures.push({
       kind: "portal",
       slot,
       label: l.targetTitle ?? l.target.target,
       address: way.address,
-      crossDomain: l.target.domain !== null && l.target.domain !== place.domain,
+      crossDomain: lands !== null && lands !== place.domain,
       sealedLabel: way.sealedLabel,
       seed: seedFor(seed, "portal", targetKey(l)),
     });
