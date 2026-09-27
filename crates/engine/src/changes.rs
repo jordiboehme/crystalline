@@ -335,6 +335,16 @@ impl ChangeBus {
         ring.captured.insert(domain.to_string(), audience);
     }
 
+    /// The audience captured for `domain` right now, or `None` when no
+    /// rename or removal of it is under way. For the route to read at
+    /// delivery time: an event announced before the capture may already sit
+    /// unread in a slow subscriber's channel queue, which the capture's ring
+    /// re-stamp cannot reach, so a frame with no audience of its own is
+    /// checked against this before it goes out.
+    pub fn captured_audience(&self, domain: &str) -> Option<DomainAudience> {
+        self.lock().captured.get(domain).cloned()
+    }
+
     /// End a capture: events under `domain` go back to the ordinary check.
     /// Entries the capture stamped keep their audience.
     pub fn release(&self, domain: &str) {
@@ -591,7 +601,10 @@ mod tests {
         let audiences: Vec<Option<&DomainAudience>> =
             events.iter().map(|e| e.change.audience()).collect();
         assert_eq!(audiences, vec![Some(&nobody), None, Some(&nobody)]);
+        assert_eq!(bus.captured_audience("eng"), Some(nobody.clone()));
+        assert_eq!(bus.captured_audience("ops"), None);
         bus.release("eng");
+        assert_eq!(bus.captured_audience("eng"), None);
         let id = bus.announce(modified("eng", "d.md", "1")).unwrap();
         let Replay::Events(events) = bus.replay_after(EventId {
             epoch: id.epoch,

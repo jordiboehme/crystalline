@@ -1115,3 +1115,58 @@ async fn leaving_review_mode_announces_each_dropped_draft_under_its_own_permalin
         (ChangeKind::Deleted, "not-the-slug", Some("ada"))
     );
 }
+
+/// The same rule on a virtual domain, whose write reads the row rather than
+/// a file to tell a creation from a replacement.
+#[tokio::test]
+async fn a_virtual_overwrite_that_creates_is_added_and_a_replacement_is_modified() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    engine.domain_add_virtual("vault").await.unwrap();
+    let vault = |title: &str| WriteParams {
+        domain: "vault".to_string(),
+        ..write_params(title, true)
+    };
+    let mut rx = engine.changes().subscribe();
+    engine.write_engram(&vault("Gamma")).await.unwrap();
+    assert_eq!(engram_of(&drain(&mut rx)[0]).kind, ChangeKind::Added);
+    engine.write_engram(&vault("Gamma")).await.unwrap();
+    assert_eq!(engram_of(&drain(&mut rx)[0]).kind, ChangeKind::Modified);
+}
+
+/// A write made inside somebody else's draft through a join names the
+/// writer, while `draft_of` stays the draft's owner, whose sessions alone
+/// hear it. Catches a joined view that labels the change with the owner.
+#[tokio::test]
+async fn a_joined_edit_names_the_writer_and_stays_the_owners_draft() {
+    let (_tmp, engine, _scratch) = engine_fixture(true).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    engine
+        .edit_engram_as(&append_edit("alpha", "ada's line"), None, &ada)
+        .await
+        .unwrap();
+    let join = crystalline_service::Join {
+        account: "bob".to_string(),
+        holder: crystalline_service::Holder::Process(1),
+        domain: "notes".to_string(),
+        path: "alpha.md".to_string(),
+        owner: "ada".to_string(),
+        expires_at: None,
+    };
+    let bob = Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    };
+    let mut rx = engine.changes().subscribe();
+    engine
+        .edit_engram_joined(&append_edit("alpha", "bob's line"), None, &bob, Some(&join))
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let change = engram_of(&heard[0]);
+    assert_eq!(change.actor.as_deref(), Some("bob"));
+    assert_eq!(change.draft_of.as_deref(), Some("ada"));
+}

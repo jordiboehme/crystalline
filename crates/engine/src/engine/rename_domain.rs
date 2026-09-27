@@ -228,12 +228,14 @@ impl Engine {
                     )));
                 }
                 let _origins = self.lock_both_origins(old, new).await;
-                self.close_editors(old).await;
                 // A resumed journal may already have carried the old name's
                 // privacy records over, so who could read it is no longer
                 // known: its events fail closed, to the machine owner only.
+                // Taken before `close_editors`, whose room saves land under
+                // the old name.
                 let _captured =
                     self.capture_audience(old, DomainAudience::Accounts(HashSet::new()));
+                self.close_editors(old).await;
                 let mut report = self
                     .finish_rename(
                         journal,
