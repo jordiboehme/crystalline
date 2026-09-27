@@ -1637,6 +1637,18 @@ describe("the reading page follows the stream", () => {
     return source;
   }
 
+  /** The line's live region, which stays mounted and is empty between changes. */
+  function line(): HTMLElement {
+    return screen.getByRole("status", { name: "Recent change" });
+  }
+
+  /** What the router says happened last, which is where a replace shows. */
+  function Probe() {
+    const how = useNavigationType();
+    const { pathname } = useLocation();
+    return <output data-testid="navigation">{`${how} ${pathname}`}</output>;
+  }
+
   const frame = (overrides: Record<string, unknown> = {}) => ({
     domain: "eng",
     permalink: "alpha",
@@ -1655,7 +1667,9 @@ describe("the reading page follows the stream", () => {
     serve({ "/domains/eng/engrams/alpha": () => served });
     renderApp(engramRoute("eng", "alpha"));
     await screen.findByRole("heading", { name: "Alpha" });
-    expect(screen.queryByRole("status", { name: "Recent change" })).toBeNull();
+    // The region is there before anything changed, and says nothing.
+    const region = line();
+    expect(region.textContent).toBe("");
     served = detailResponse({
       content: BODY.replace("Body prose", "Revised prose"),
       checksum: "new1",
@@ -1664,41 +1678,97 @@ describe("the reading page follows the stream", () => {
       stream().emit("engram", frame(), "1:1");
     });
     await screen.findByText(/Revised prose/);
-    expect(
-      screen.getByRole("status", { name: "Recent change" }),
-    ).toHaveTextContent("Updated a moment ago by ada");
+    expect(line()).toHaveTextContent("Updated a moment ago by ada");
+    // The same node the reader's screen reader was already listening to.
+    expect(line()).toBe(region);
     // The page ran its scroll keeper over the refetch.
     expect(scrollTo).toHaveBeenCalled();
     act(() => {
       stream().emit("engram", frame({ actor: null, checksum: "new2" }), "1:2");
     });
     await waitFor(() => {
-      expect(
-        screen.getByRole("status", { name: "Recent change" }),
-      ).toHaveTextContent(/^Updated a moment ago$/);
+      expect(line()).toHaveTextContent(/^Updated a moment ago$/);
     });
     // A newer event resets the minute: most of one passes, the line stays.
     act(() => {
       vi.advanceTimersByTime(59_000);
     });
-    expect(
-      screen.getByRole("status", { name: "Recent change" }),
-    ).toBeInTheDocument();
+    expect(line()).toHaveTextContent("Updated a moment ago");
     act(() => {
       vi.advanceTimersByTime(1_000);
     });
     await waitFor(() => {
-      expect(
-        screen.queryByRole("status", { name: "Recent change" }),
-      ).toBeNull();
+      expect(line().textContent).toBe("");
     });
     // And a change after the minute brings it back.
     act(() => {
       stream().emit("engram", frame({ checksum: "new3" }), "1:3");
     });
-    expect(
-      await screen.findByRole("status", { name: "Recent change" }),
-    ).toHaveTextContent("Updated a moment ago by ada");
+    await waitFor(() => {
+      expect(line()).toHaveTextContent("Updated a moment ago by ada");
+    });
+  });
+
+  it("names the actor the way the details panel does", async () => {
+    serve();
+    renderApp(engramRoute("eng", "alpha"));
+    await screen.findByRole("heading", { name: "Alpha" });
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({ actor: "process:crystalline-cli", checksum: "3f8a1c05e2" }),
+        "1:1",
+      );
+    });
+    await waitFor(() => {
+      expect(line()).toHaveTextContent(
+        /^Updated a moment ago by crystalline-cli \(process\)$/,
+      );
+    });
+  });
+
+  it("holds the reader's place when the line comes and when it goes", async () => {
+    // A browser without native scroll anchoring moves the text under a
+    // reader who scrolled past the header; the page scrolls by what the
+    // body moved instead. `top` is where the body's top edge sits.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let top = -500;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(
+      () => ({
+        top,
+        bottom: top + 20,
+        left: 0,
+        right: 0,
+        width: 0,
+        height: 20,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }),
+    );
+    serve();
+    renderApp(engramRoute("eng", "alpha"));
+    await screen.findByRole("heading", { name: "Alpha" });
+    // The line's height pushes the body down by 60px.
+    top = -440;
+    act(() => {
+      stream().emit("engram", frame({ checksum: "3f8a1c05e2" }), "1:1");
+    });
+    expect(line()).toHaveTextContent("Updated a moment ago by ada");
+    expect(scrollTo).toHaveBeenCalledWith(0, 60);
+    scrollTo.mockClear();
+    // The page scrolled, so the body is back where the reader had it; then
+    // the line goes and takes its height with it.
+    top = -500;
+    window.dispatchEvent(new Event("scroll"));
+    top = -560;
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    await waitFor(() => {
+      expect(line().textContent).toBe("");
+    });
+    expect(scrollTo).toHaveBeenCalledWith(0, -60);
   });
 
   it("a delete refetches, the server answers 404 and the not-found face appears", async () => {
@@ -1720,6 +1790,8 @@ describe("the reading page follows the stream", () => {
       );
     });
     await screen.findByRole("heading", { name: "Engram not found" });
+    // The not-found face, and not an error said first.
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("a move follows to the new address, replaces history and says so", async () => {
@@ -1729,12 +1801,6 @@ describe("the reading page follows the stream", () => {
       "/domains/eng/inbound/topics/alpha": (path: string) =>
         inboundResponse(path),
     });
-    /** What the router says happened last, which is where a replace shows. */
-    function Probe() {
-      const how = useNavigationType();
-      const { pathname } = useLocation();
-      return <output data-testid="navigation">{`${how} ${pathname}`}</output>;
-    }
     render(
       <MemoryRouter
         initialEntries={["/d/eng", engramRoute("eng", "alpha")]}
@@ -1742,6 +1808,96 @@ describe("the reading page follows the stream", () => {
       >
         <App />
         <Probe />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Alpha" });
+    // Everything the line ever said on the way: the old address must not
+    // say "Updated" for the commit before it follows the move.
+    const said: string[] = [];
+    // Read off the mutation records rather than the live node: by the time
+    // an observer runs, the follow may already have replaced the text.
+    const inRegion = (node: Node) =>
+      (node instanceof Element ? node : node.parentElement)?.closest(
+        '[aria-label="Recent change"]',
+      ) != null;
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          // A text node written into the region, or a region mounted anew
+          // (the line is keyed on the address, so a follow mounts one).
+          const regions =
+            node instanceof Element
+              ? [
+                  ...(node.matches('[aria-label="Recent change"]')
+                    ? [node]
+                    : []),
+                  ...node.querySelectorAll('[aria-label="Recent change"]'),
+                ]
+              : inRegion(record.target)
+                ? [node]
+                : [];
+          for (const region of regions) {
+            if (region.textContent) said.push(region.textContent);
+          }
+        }
+        if (inRegion(record.target) && record.oldValue) {
+          said.push(record.oldValue);
+        }
+      }
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      characterDataOldValue: true,
+    });
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({
+          permalink: "topics/alpha",
+          path: "topics/alpha.md",
+          kind: "moved",
+          from: { path: "alpha.md", permalink: "alpha" },
+        }),
+        "1:1",
+      );
+    });
+    await waitFor(() => {
+      expect(line()).toHaveTextContent("Moved here a moment ago by ada");
+    });
+    observer.disconnect();
+    expect(said.length).toBeGreaterThan(0);
+    expect(said.every((text) => text.startsWith("Moved here"))).toBe(true);
+    expect(screen.getByTestId("navigation")).toHaveTextContent(
+      `REPLACE ${engramRoute("eng", "topics/alpha")}`,
+    );
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "topics",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says the reader's own move once, with the dialog's counts", async () => {
+    // The dialog lands here with what it rewrote; the stream's frame for the
+    // same move follows it and must not add a second line saying the same.
+    serve({
+      "/domains/eng/engrams/topics/alpha": () =>
+        detailResponse({ permalink: "topics/alpha", path: "topics/alpha.md" }),
+      "/domains/eng/inbound/topics/alpha": (path: string) =>
+        inboundResponse(path),
+    });
+    render(
+      <MemoryRouter
+        initialEntries={[
+          {
+            pathname: engramRoute("eng", "topics/alpha"),
+            state: { moved: { references: 2, engrams: 1 } },
+          },
+        ]}
+      >
+        <App />
       </MemoryRouter>,
     );
     await screen.findByRole("heading", { name: "Alpha" });
@@ -1757,18 +1913,11 @@ describe("the reading page follows the stream", () => {
         "1:1",
       );
     });
-    await waitFor(() => {
-      expect(
-        screen.getByRole("status", { name: "Recent change" }),
-      ).toHaveTextContent("Moved here a moment ago by ada");
-    });
-    expect(screen.getByTestId("navigation")).toHaveTextContent(
-      `REPLACE ${engramRoute("eng", "topics/alpha")}`,
+    expect(screen.getByRole("status", { name: "Moved" })).toHaveTextContent(
+      "Rewrote 2 references",
     );
-    expect(
-      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
-        "topics",
-      ),
-    ).toBeInTheDocument();
+    // Give the frame every chance to have drawn something.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(line().textContent).toBe("");
   });
 });

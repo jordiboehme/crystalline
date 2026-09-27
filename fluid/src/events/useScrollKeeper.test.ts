@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   captureAnchor,
   restoreAnchor,
+  useHoldPlace,
   useScrollKeeper,
 } from "./useScrollKeeper";
 
@@ -126,8 +127,22 @@ describe("the scroll keeper", () => {
 });
 
 describe("the keeper hook", () => {
+  /** A heading in the live document whose viewport top the test moves. */
+  let heading: HTMLElement | null = null;
+  let headingTop = 0;
+  function placeHeading(top: number) {
+    headingTop = top;
+    heading = document.createElement("h2");
+    heading.id = "auth";
+    heading.getBoundingClientRect = () => rect(headingTop, 20);
+    document.body.appendChild(heading);
+  }
+
   afterEach(() => {
+    heading?.remove();
+    heading = null;
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   type Props = { address: string; fetching: boolean; checksum: string };
@@ -151,6 +166,63 @@ describe("the keeper hook", () => {
     hook.rerender({ address: "eng/alpha", fetching: true, checksum: "a1" });
     hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a2" });
     expect(scrollTo).toHaveBeenCalledTimes(1);
+  });
+
+  it("puts the anchor back where it sat before the new content", () => {
+    // Captured over the OLD content: a capture taken after the new content
+    // rendered would read the moved heading as the place to keep and never
+    // scroll at all.
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(1000);
+    placeHeading(-20);
+    const hook = mount({
+      address: "eng/alpha",
+      fetching: false,
+      checksum: "a1",
+    });
+    hook.rerender({ address: "eng/alpha", fetching: true, checksum: "a1" });
+    // The new content pushed the heading 200px further down.
+    headingTop = 180;
+    hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a2" });
+    expect(scrollTo).toHaveBeenCalledWith(0, 1200);
+  });
+
+  it("keeps the place the reader scrolled to while the fetch was in flight", () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    vi.stubGlobal("requestAnimationFrame", (run: FrameRequestCallback) => {
+      run(0);
+      return 1;
+    });
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(1000);
+    placeHeading(-20);
+    const hook = mount({
+      address: "eng/alpha",
+      fetching: false,
+      checksum: "a1",
+    });
+    hook.rerender({ address: "eng/alpha", fetching: true, checksum: "a1" });
+    // The reader scrolls on while the GET runs: the heading now sits 100px
+    // above the top, and that is the offset to keep.
+    headingTop = -100;
+    window.dispatchEvent(new Event("scroll"));
+    headingTop = 180;
+    hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a2" });
+    expect(scrollTo).toHaveBeenCalledWith(0, 1280);
+  });
+
+  it("drops the anchor of a fetch that brought nothing new", () => {
+    // A focus refetch that found the same text leaves no anchor behind for
+    // a later change that arrives without a fetch of its own.
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    const hook = mount({
+      address: "eng/alpha",
+      fetching: false,
+      checksum: "a1",
+    });
+    hook.rerender({ address: "eng/alpha", fetching: true, checksum: "a1" });
+    hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a1" });
+    hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a2" });
+    expect(scrollTo).not.toHaveBeenCalled();
   });
 
   it("leaves the scroll alone when the reader went to another engram", () => {
@@ -179,6 +251,75 @@ describe("the keeper hook", () => {
     );
     hook.rerender({ address: "eng/alpha", fetching: true, checksum: "a1" });
     hook.rerender({ address: "eng/alpha", fetching: false, checksum: "a2" });
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+});
+
+describe("holding the place while the line comes and goes", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mountHold(element: HTMLElement, shape: string) {
+    return renderHook(
+      (props: { shape: string }) => {
+        useHoldPlace(() => element, props.shape);
+      },
+      { initialProps: { shape } },
+    );
+  }
+
+  it("scrolls by what the heading moved once the reader is past it", () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(800);
+    let top = -300;
+    const heading = document.createElement("h2");
+    heading.getBoundingClientRect = () => rect(top, 20);
+    const hook = mountHold(heading, "");
+    // The line appears above and pushes the heading down 60px.
+    top = -240;
+    hook.rerender({ shape: "Updated a moment ago" });
+    expect(scrollTo).toHaveBeenCalledWith(0, 860);
+    // The browser scrolled; the heading is back. Then the line goes.
+    top = -300;
+    window.dispatchEvent(new Event("scroll"));
+    top = -360;
+    hook.rerender({ shape: "" });
+    expect(scrollTo).toHaveBeenLastCalledWith(0, 740);
+  });
+
+  it("measures from where the reader scrolled to, not where the page opened", () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    vi.spyOn(window, "scrollY", "get").mockReturnValue(1300);
+    let top = -300;
+    const heading = document.createElement("h2");
+    heading.getBoundingClientRect = () => rect(top, 20);
+    const hook = mountHold(heading, "");
+    // The reader reads on for a while before anything changes.
+    top = -800;
+    window.dispatchEvent(new Event("scroll"));
+    top = -740;
+    hook.rerender({ shape: "Updated a moment ago" });
+    expect(scrollTo).toHaveBeenCalledWith(0, 1360);
+  });
+
+  it("does nothing where the browser already held it", () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    const heading = document.createElement("h2");
+    heading.getBoundingClientRect = () => rect(-300, 20);
+    const hook = mountHold(heading, "");
+    hook.rerender({ shape: "Updated a moment ago" });
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("lets the line push the text while the reader can see it arrive", () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    let top = 200;
+    const heading = document.createElement("h2");
+    heading.getBoundingClientRect = () => rect(top, 20);
+    const hook = mountHold(heading, "");
+    top = 260;
+    hook.rerender({ shape: "Updated a moment ago" });
     expect(scrollTo).not.toHaveBeenCalled();
   });
 });

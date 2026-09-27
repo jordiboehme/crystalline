@@ -105,12 +105,31 @@ export function useScrollKeeper({
     anchor.current = null;
   }, [address]);
 
+  // Captured when the refetch starts and again whenever the reader scrolls
+  // while it is in flight (once per frame at most): on a slow link the fetch
+  // takes long enough to scroll away from where it started, and the place to
+  // hold is the last one before the new content lands.
   useLayoutEffect(() => {
     if (off || !fetching || shown.current == null) return;
-    anchor.current = captureAnchor(document, {
-      scrollY: window.scrollY,
-      innerHeight: window.innerHeight,
-    });
+    const capture = () => {
+      anchor.current = captureAnchor(document, {
+        scrollY: window.scrollY,
+        innerHeight: window.innerHeight,
+      });
+    };
+    capture();
+    let frame: number | null = null;
+    const onScroll = () => {
+      frame ??= requestAnimationFrame(() => {
+        frame = null;
+        capture();
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
   }, [fetching, off]);
 
   useLayoutEffect(() => {
@@ -128,4 +147,63 @@ export function useScrollKeeper({
     });
     anchor.current = null;
   }, [checksum, off]);
+
+  // Declared last so it runs after the restore: a fetch that ended without a
+  // new checksum (a focus refetch that found nothing new, a cancelled one)
+  // drops its anchor, so a later change that arrives some other way is never
+  // restored against a place the reader left long ago.
+  useLayoutEffect(() => {
+    if (!fetching) anchor.current = null;
+  }, [fetching]);
+}
+
+/**
+ * Hold the reader's place while something above it changes height.
+ *
+ * The status line above the body appears when a change arrives and goes a
+ * minute later. A browser with native scroll anchoring absorbs both shifts;
+ * one without it moves the text under the reader, twice. `below` names the
+ * first element under the thing that changes, and `shape` is what changes it:
+ * when `shape` changes and that element had scrolled past the viewport top,
+ * the page scrolls by exactly as much as the element moved. Where the browser
+ * already compensated the element has not moved, and this does nothing.
+ *
+ * Where the reader can see the element, nothing is held: the line appearing
+ * in view is meant to be seen.
+ */
+export function useHoldPlace(
+  below: () => Element | null,
+  shape: unknown,
+): void {
+  const last = useRef<number | null>(null);
+  const target = useRef(below);
+  useLayoutEffect(() => {
+    target.current = below;
+  });
+
+  // Where the element stood, kept current as the reader scrolls.
+  useLayoutEffect(() => {
+    const measure = () => {
+      last.current = target.current()?.getBoundingClientRect().top ?? null;
+    };
+    measure();
+    window.addEventListener("scroll", measure, { passive: true });
+    window.addEventListener("resize", measure);
+    return () => {
+      window.removeEventListener("scroll", measure);
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const element = target.current();
+    const before = last.current;
+    const now = element?.getBoundingClientRect().top ?? null;
+    last.current = now;
+    if (now === null || before === null || before >= 0 || now === before) {
+      return;
+    }
+    window.scrollTo(0, window.scrollY + now - before);
+    last.current = before;
+  }, [shape]);
 }

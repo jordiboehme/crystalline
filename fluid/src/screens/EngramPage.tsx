@@ -97,8 +97,8 @@ import { useRememberedDisclosure } from "../disclosure";
 import { domainSpellings } from "../domainNames";
 import type { RecentChange } from "../events/recent";
 import { useRecentChange } from "../events/recent";
-import { useScrollKeeper } from "../events/useScrollKeeper";
-import { plural } from "../format";
+import { useHoldPlace, useScrollKeeper } from "../events/useScrollKeeper";
+import { formatActor, plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import { prefetchEngramEditor } from "../prefetch";
@@ -616,15 +616,23 @@ export default function EngramPage() {
         </p>
       )}
       {/*
-        What the stream last said about this page, for a minute. Keyed on the
-        change, so a newer one starts the minute over.
+        What the stream last said about this page, for a minute. The region
+        is always there, so a screen reader hears the text arrive in it;
+        keyed on the address, so a page the reader comes back to after the
+        minute does not flash a change that is already old.
+
+        Nothing on the reader's own move through the dialog: the "Moved"
+        line above already says it, with the counts. Nothing at the old
+        address either, which is about to follow the move.
       */}
-      {recent && recent.kind !== "moved_away" && (
-        <RecentChangeLine
-          key={`${recent.kind}:${String(recent.at)}:${recent.actor ?? ""}`}
-          change={recent}
-        />
-      )}
+      <RecentChangeLine
+        key={`${domain}/${permalink}`}
+        change={
+          moved === null && recent && recent.kind !== "moved_away"
+            ? recent
+            : null
+        }
+      />
 
       <LifecycleBanner
         status={engram.frontmatter.status}
@@ -939,7 +947,6 @@ function EngramNotFound({
   );
 }
 
-/** Whether this failure is the server saying there is nothing at that address. */
 /** How long the status line stays after a change. A newer one resets it. */
 export const RECENT_CHANGE_MS = 60_000;
 
@@ -948,43 +955,61 @@ export const RECENT_CHANGE_MS = 60_000;
  * in the neutral chip colors rather than amber. Not a control, and no
  * accessible name a journey could depend on beyond the region's own.
  *
- * It never counts up to "two minutes ago": it is gone at the minute.
+ * It never counts up to "two minutes ago": it is gone at the minute. Between
+ * changes the region stays mounted, empty and visually hidden, so what a
+ * screen reader hears is text arriving in a live region it already knows.
  */
-function RecentChangeLine({ change }: { change: RecentChange }) {
-  const [expired, setExpired] = useState(
-    () => Date.now() - change.at >= RECENT_CHANGE_MS,
+function RecentChangeLine({ change }: { change: RecentChange | null }) {
+  const shownKey = change ? changeKey(change) : null;
+  /** The change whose minute is over, by its key: a newer one shows again. */
+  const [expired, setExpired] = useState(() =>
+    change && Date.now() - change.at >= RECENT_CHANGE_MS ? shownKey : null,
   );
   useEffect(() => {
-    const left = change.at + RECENT_CHANGE_MS - Date.now();
+    if (!change) return undefined;
+    const over = changeKey(change);
     const timer = setTimeout(
       () => {
-        setExpired(true);
+        setExpired(over);
       },
-      Math.max(0, left),
+      Math.max(0, change.at + RECENT_CHANGE_MS - Date.now()),
     );
     return () => {
       clearTimeout(timer);
     };
   }, [change]);
-  if (expired) {
-    return null;
-  }
-  const verb =
-    change.kind === "moved_here"
-      ? "Moved here a moment ago"
-      : "Updated a moment ago";
+  const text = change && shownKey !== expired ? recentChangeText(change) : "";
+  // The line changes the height above the body when it comes and when it
+  // goes; the reader's place holds either way.
+  const line = useRef<HTMLParagraphElement>(null);
+  useHoldPlace(() => line.current?.nextElementSibling ?? null, text);
   return (
     <p
+      ref={line}
       role="status"
       aria-label="Recent change"
       aria-live="polite"
-      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 dark:bg-slate-800 dark:text-slate-200"
+      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 empty:sr-only dark:bg-slate-800 dark:text-slate-200"
     >
-      {change.actor ? `${verb} by ${change.actor}` : verb}
+      {text}
     </p>
   );
 }
 
+function changeKey(change: RecentChange): string {
+  return `${change.kind}:${String(change.at)}:${change.actor ?? ""}`;
+}
+
+/** The line's words, the actor named the way the details panel names one. */
+function recentChangeText(change: RecentChange): string {
+  const verb =
+    change.kind === "moved_here"
+      ? "Moved here a moment ago"
+      : "Updated a moment ago";
+  return change.actor ? `${verb} by ${formatActor(change.actor)}` : verb;
+}
+
+/** Whether this failure is the server saying there is nothing at that address. */
 function isMissing(error: unknown): boolean {
   return error instanceof ApiProblem && error.status === 404;
 }
