@@ -653,6 +653,71 @@ describe("the engram editor", () => {
     expect(putBody(0)).toEqual({ content: linked });
   });
 
+  it("draws a wikilink spelled with a domain's canonical name or an alias as resolved", async () => {
+    // Registered here as `moonbase`, called `moon` by its MANIFEST and `lunar`
+    // before a rename: the chips place both spellings through the same table
+    // the reading page uses.
+    const linked = CONTENT.replace(
+      "A rule.",
+      "A rule about [[moon:Crater Base]] and [[lunar:Crater Base]].",
+    );
+    const listing = domainsResponse();
+    const graph = graphResponse();
+    serveEditor({
+      "/domains": () => ({
+        ...listing,
+        domains: [
+          ...listing.domains,
+          {
+            name: "moonbase",
+            kind: "file",
+            canonical_name: "moon",
+            aliases: ["lunar"],
+            shadowed: false,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: linked,
+          links: [
+            {
+              line: 9,
+              resolved: true,
+              target: { domain: "moon", target: "Crater Base" },
+            },
+            {
+              line: 9,
+              resolved: true,
+              target: { domain: "lunar", target: "Crater Base" },
+            },
+          ],
+        }),
+      "/graph": () => ({
+        ...graph,
+        nodes: [
+          ...graph.nodes,
+          {
+            id: 3,
+            domain: "moonbase",
+            permalink: "crater-base",
+            title: "Crater Base",
+            status: "stable",
+            type: "engram",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      const resolved = [
+        ...editor.querySelectorAll(".cm-wikilink-resolved"),
+      ].map((chip) => chip.textContent);
+      expect(resolved).toEqual(["Crater Base", "Crater Base"]);
+    });
+  });
+
   it("keeps the findings under the buffer at full width, form and all", async () => {
     // The frame's own preference, read by the screen through the context the
     // frame provides. The column beside the buffer goes, and what goes with
