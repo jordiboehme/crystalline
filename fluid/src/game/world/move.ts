@@ -50,11 +50,13 @@ export interface Intent {
   forward: number;
   /** -1 left, 1 right. */
   strafe: number;
-  /** -1 right, 1 left (arrow keys). */
+  /** -1 right, 1 left (the turn keys). */
   turn: number;
   /** Mouse pixels since the last tick. */
   lookDx: number;
   lookDy: number;
+  /** Whether the run key is held: `RUN_FACTOR` times the walk speed. */
+  run: boolean;
 }
 
 /** The player's collision radius, in metres. */
@@ -66,6 +68,11 @@ export const MAX_PITCH = Math.PI / 6;
 
 const DT = 1 / TICK_HZ;
 const MAX_SPEED = 7;
+/**
+ * How much faster running is than walking: twice, as in the classic
+ * layout, so 14 m/s, 0.4 m a tick. Turning keeps its speed.
+ */
+export const RUN_FACTOR = 2;
 /** Fraction of velocity kept per tick with no input: quick stops. */
 const FRICTION = 0.55;
 const TURN_SPEED = 3;
@@ -252,6 +259,53 @@ function pushOut(
 }
 
 /**
+ * One step of the move: the player's circle at (px, pz) moved by (dx, dz),
+ * clamped to the grid's rectangle and pushed out of whatever it then
+ * overlaps (see `stepPlayer`), and whether anything stopped it.
+ */
+function moveCircle(
+  px: number,
+  pz: number,
+  dx: number,
+  dz: number,
+  room: RoomSpec,
+  blockers: readonly Box[],
+): { x: number; z: number; collided: boolean } {
+  const minX = PLAYER_RADIUS;
+  const maxX = room.width * CELL - PLAYER_RADIUS;
+  const minZ = PLAYER_RADIUS;
+  const maxZ = room.depth * CELL - PLAYER_RADIUS;
+  const clampX = (v: number) => Math.max(minX, Math.min(maxX, v));
+  const clampZ = (v: number) => Math.max(minZ, Math.min(maxZ, v));
+
+  const rawX = px + dx;
+  const rawZ = pz + dz;
+  const tx = clampX(rawX);
+  const tz = clampZ(rawZ);
+  let x = tx;
+  let z = tz;
+  // A wall on the grid's edge stops the player through the clamp, not
+  // through `hits`, and must stop the stride just the same.
+  let collided = tx !== rawX || tz !== rawZ;
+  if (hits(tx, tz, room.grid, blockers)) {
+    collided = true;
+    const pushed = pushOut(tx, tz, tx - px, tz - pz, room.grid, blockers);
+    const free =
+      pushed !== null &&
+      !hits(clampX(pushed[0]), clampZ(pushed[1]), room.grid, blockers);
+    if (pushed !== null && free) {
+      x = clampX(pushed[0]);
+      z = clampZ(pushed[1]);
+    } else {
+      // Backstop: milestone 1's axis by axis rule.
+      x = hits(tx, pz, room.grid, blockers) ? px : tx;
+      z = hits(x, tz, room.grid, blockers) ? pz : tz;
+    }
+  }
+  return { x, z, collided };
+}
+
+/**
  * One tick of movement: turn and pitch from the intent, blend the velocity
  * towards the wished one, then move.
  *
@@ -266,7 +320,9 @@ function pushOut(
  * anything. The grid's bounding rectangle is clamped to first, and a
  * clamp counts as a collision too: a wall on the grid's edge (every hall's
  * north wall, and its west wall when there is no corridor) takes the
- * velocity into it just as a wall of void cells does.
+ * velocity into it just as a wall of void cells does. A move longer than
+ * `PLAYER_RADIUS` (a run) is taken in equal steps no longer than it, each
+ * resolved that way (`moveCircle`).
  */
 export function stepPlayer(
   p: Player,
@@ -290,39 +346,33 @@ export function stepPlayer(
     wz /= len;
   }
   // Blend towards the wished velocity: most of the way in one tick.
-  let vx = p.vx * FRICTION + wx * MAX_SPEED * (1 - FRICTION);
-  let vz = p.vz * FRICTION + wz * MAX_SPEED * (1 - FRICTION);
+  const top = intent.run ? MAX_SPEED * RUN_FACTOR : MAX_SPEED;
+  let vx = p.vx * FRICTION + wx * top * (1 - FRICTION);
+  let vz = p.vz * FRICTION + wz * top * (1 - FRICTION);
 
-  const minX = PLAYER_RADIUS;
-  const maxX = room.width * CELL - PLAYER_RADIUS;
-  const minZ = PLAYER_RADIUS;
-  const maxZ = room.depth * CELL - PLAYER_RADIUS;
-  const clampX = (v: number) => Math.max(minX, Math.min(maxX, v));
-  const clampZ = (v: number) => Math.max(minZ, Math.min(maxZ, v));
-
-  const rawX = p.x + vx * DT;
-  const rawZ = p.z + vz * DT;
-  const tx = clampX(rawX);
-  const tz = clampZ(rawZ);
-  let x = tx;
-  let z = tz;
-  // A wall on the grid's edge stops the player through the clamp, not
-  // through `hits`, and must stop the stride just the same.
-  let collided = tx !== rawX || tz !== rawZ;
-  if (hits(tx, tz, room.grid, blockers)) {
-    collided = true;
-    const pushed = pushOut(tx, tz, tx - p.x, tz - p.z, room.grid, blockers);
-    const free =
-      pushed !== null &&
-      !hits(clampX(pushed[0]), clampZ(pushed[1]), room.grid, blockers);
-    if (pushed !== null && free) {
-      x = clampX(pushed[0]);
-      z = clampZ(pushed[1]);
-    } else {
-      // Backstop: milestone 1's axis by axis rule.
-      x = hits(tx, p.z, room.grid, blockers) ? p.x : tx;
-      z = hits(x, tz, room.grid, blockers) ? p.z : tz;
-    }
+  // A move longer than the player's radius is taken in equal steps no
+  // longer than it (running is two), so the push-out never finds the
+  // centre past the middle of a thin blocker and pushes it out the far
+  // side. A walk is always one step.
+  const steps = Math.max(
+    1,
+    Math.ceil((Math.hypot(vx, vz) * DT) / PLAYER_RADIUS),
+  );
+  let x = p.x;
+  let z = p.z;
+  let collided = false;
+  for (let i = 0; i < steps; i++) {
+    const moved = moveCircle(
+      x,
+      z,
+      (vx * DT) / steps,
+      (vz * DT) / steps,
+      room,
+      blockers,
+    );
+    x = moved.x;
+    z = moved.z;
+    if (moved.collided) collided = true;
   }
   if (collided) {
     vx = (x - p.x) / DT;
@@ -349,9 +399,8 @@ export function headBob(p: Player): number {
 
 /**
  * The vertical look handed to `stepPlayer`, after the player's choice of
- * inverted look (key I): the mouse's and the arrow keys' `dy` as they came,
- * or negated when inverted, so moving the mouse forward looks down instead
- * of up. Kept apart from `stepPlayer` so the choice lives in one place and
+ * inverted look (key I): the mouse's `dy` as it came, or negated when
+ * inverted, so moving the mouse forward looks down instead of up. Kept apart from `stepPlayer` so the choice lives in one place and
  * the session only passes a flag.
  */
 export function lookDelta(dy: number, inverted: boolean): number {

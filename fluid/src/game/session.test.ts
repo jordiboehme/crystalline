@@ -914,6 +914,43 @@ describe("keys", () => {
   });
 });
 
+describe("the classic controls", () => {
+  /** A session on the canned bridge, one tick in, at the entrance. */
+  function onBridge(): Session {
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    return session;
+  }
+
+  /** How far the player moves in `ticks` with `codes` held, then released. */
+  function moved(codes: string[], ticks: number): number {
+    const from = eyeAt();
+    for (const code of codes) key("keydown", code);
+    frames(ticks);
+    for (const code of codes) key("keyup", code);
+    const to = eyeAt();
+    return Math.hypot(to[0] - from[0], to[1] - from[1]);
+  }
+
+  it("runs at about twice the walk while Shift is held", () => {
+    // Each from the entrance, on a session of its own, so no wall ahead
+    // cuts a run short.
+    const from = (codes: string[]) => {
+      const session = onBridge();
+      const distance = moved(codes, 8);
+      session.dispose();
+      return distance;
+    };
+    const walked = from(["KeyW"]);
+    const ran = from(["ShiftLeft", "KeyW"]);
+    const ranRight = from(["ShiftRight", "KeyW"]);
+    expect(walked).toBeGreaterThan(0.5);
+    expect(ran).toBeGreaterThan(1.8 * walked);
+    expect(ranRight).toBeGreaterThan(1.8 * walked);
+  });
+});
+
 describe("the level cheat", () => {
   let levels: ReturnType<typeof vi.fn<(open: boolean) => void>>;
   beforeEach(() => {

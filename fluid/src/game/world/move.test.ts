@@ -16,6 +16,7 @@ import { BAY, isFloor } from "./layout";
 import {
   MAX_PITCH,
   PLAYER_RADIUS,
+  RUN_FACTOR,
   blockersFor,
   headBob,
   lookDelta,
@@ -30,7 +31,14 @@ import { CELL } from "./units";
 
 const room = generateRoom(CANNED_BRIDGE);
 const blockers = blockersFor(room);
-const idle: Intent = { forward: 0, strafe: 0, turn: 0, lookDx: 0, lookDy: 0 };
+const idle: Intent = {
+  forward: 0,
+  strafe: 0,
+  turn: 0,
+  lookDx: 0,
+  lookDy: 0,
+  run: false,
+};
 
 function run(p: Player, intent: Intent, ticks: number) {
   let q = p;
@@ -548,6 +556,7 @@ describe("walking on the grid", () => {
           turn: rng.int(-1, 1),
           lookDx: rng.range(-40, 40),
           lookDy: 0,
+          run: rng.int(0, 1) === 1,
         };
         const ticks = rng.int(1, 12);
         for (let t = 0; t < ticks; t++) {
@@ -788,5 +797,45 @@ describe("blockersFor", () => {
     }
     expect(q.z).toBeLessThan(panel.z0 - 0.3);
     expect(q.x).toBeCloseTo(PLAYER_RADIUS + 0.01);
+  });
+});
+
+describe("running", () => {
+  it("runs at about twice the walk speed", () => {
+    expect(RUN_FACTOR).toBe(2);
+    const p = spawnPlayer(room);
+    const walked = run(p, { ...idle, forward: 1 }, 12);
+    const ran = run(p, { ...idle, forward: 1, run: true }, 12);
+    const walkSpeed = Math.hypot(walked.vx, walked.vz);
+    const runSpeed = Math.hypot(ran.vx, ran.vz);
+    expect(walkSpeed).toBeCloseTo(7, 1);
+    expect(runSpeed).toBeCloseTo(14, 1);
+    expect(p.z - ran.z).toBeGreaterThan(1.8 * (p.z - walked.z));
+  });
+
+  it("runs no faster on the diagonal than straight ahead", () => {
+    const p = spawnPlayer(room);
+    const q = run(p, { ...idle, forward: 1, strafe: 1, run: true }, 3);
+    expect(Math.hypot(q.vx, q.vz)).toBeLessThanOrEqual(14 + 1e-9);
+  });
+
+  it("never runs through a thin blocker, from any start", () => {
+    // A board 2 cm thick across an open floor, run at head on from
+    // twenty starts a little apart, so every phase of the 0.4 m running
+    // stride meets it. One unsplit step that long would carry the centre
+    // past the board's middle from some of them, and the push-out would
+    // then land the player on the far side.
+    const board: Box = { x0: 0, x1: room.width * CELL, z0: 0, z1: 0.02 };
+    const z0 = spawnPlayer(room).z - 1.5;
+    board.z0 = z0;
+    board.z1 = z0 + 0.02;
+    const bs = [board];
+    for (let i = 0; i < 20; i++) {
+      let p = { ...spawnPlayer(room), z: z0 + 1.2 + i * 0.02 };
+      for (let t = 0; t < 40; t++) {
+        p = stepPlayer(p, { ...idle, forward: 1, run: true }, room, bs);
+        expect(p.z).toBeGreaterThanOrEqual(board.z1 + PLAYER_RADIUS - 1e-6);
+      }
+    }
   });
 });

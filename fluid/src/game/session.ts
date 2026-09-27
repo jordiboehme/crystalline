@@ -878,6 +878,7 @@ export function createSession(opts: SessionOptions): Session {
           look.dy + (still ? 0 : axis("ArrowDown", "ArrowUp") * ARROW_LOOK),
           inverted,
         ),
+        run: !still && (input.held("ShiftLeft") || input.held("ShiftRight")),
       },
       room,
       blockers,
