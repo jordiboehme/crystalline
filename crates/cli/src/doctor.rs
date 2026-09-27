@@ -2560,7 +2560,12 @@ fn contradiction_summary(
         }),
         Some(m) => {
             let downloaded = cached(m.repo);
-            let reason = (!downloaded).then(|| {
+            // A load failure already gets its own line from
+            // `contradiction_wait_reason` (the model could not be loaded:
+            // <error>); repeating `last_error` here too would print it twice.
+            // "Not downloaded" alone is still correct: the weights are not on
+            // disk, whatever the reason the load never finished.
+            let reason = (!downloaded && !load_failed).then(|| {
                 last_error.clone().unwrap_or_else(|| {
                     if LOCAL_NLI_AVAILABLE {
                         "the daemon downloads it on its first pass".to_string()
@@ -3111,7 +3116,7 @@ pub fn render_human(report: &DoctorReport) -> String {
                     _ => "not downloaded".to_string(),
                 };
                 let pending = match c["pending_pairs"].as_u64() {
-                    Some(n) => format!("{n} pairs pending"),
+                    Some(n) => format!("{n} {} pending", crate::cmd::pair_word(n)),
                     None => "not counted yet".to_string(),
                 };
                 let mut line = format!(
@@ -3122,6 +3127,11 @@ pub fn render_human(report: &DoctorReport) -> String {
                     line.push_str(&format!(", {reason}"));
                 }
                 let _ = writeln!(out, "{line}");
+                if let Some(remedy) = crate::cmd::contradiction_reload_remedy(c) {
+                    for l in remedy {
+                        let _ = writeln!(out, "{l}");
+                    }
+                }
             }
         }
         if let Some(stale) = c["stale_checkpoints"].as_array().filter(|s| !s.is_empty()) {
@@ -4451,8 +4461,18 @@ mod tests {
         let out = render_human(&report);
         assert!(
             out.contains(
-                "1 pairs pending, the model could not be loaded: contradiction model error: offline"
+                "1 pair pending, the model could not be loaded: contradiction model error: offline"
             ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "not retried until evolve.contradictions is set again or the daemon restarts"
+            ),
+            "the remedy is on its own line: {out}"
+        );
+        assert!(
+            out.contains("crystalline config set evolve.contradictions full"),
             "{out}"
         );
 
@@ -4466,6 +4486,33 @@ mod tests {
         let out = render_human(&report);
         assert!(
             out.contains("0 pairs pending, embedding not finished for some candidates"),
+            "{out}"
+        );
+    }
+
+    /// The common offline-first-use shape: the model is not downloaded AND
+    /// the load failed, so `contradiction_summary` must not also parrot
+    /// `last_error` into the "not downloaded" parenthetical - the wait
+    /// reason already carries it once.
+    #[test]
+    fn a_failed_load_that_never_downloaded_names_the_error_exactly_once() {
+        let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": false, "reason": null, "pending_pairs": 1,
+            "failing_pairs": 0, "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+            "stale_checkpoints": [],
+        }));
+        let out = render_human(&report);
+        assert_eq!(
+            out.matches("contradiction model error: offline").count(),
+            1,
+            "{out}"
+        );
+        assert!(
+            out.contains("(not downloaded), 1 pair pending, the model could not be loaded: contradiction model error: offline"),
             "{out}"
         );
     }

@@ -2517,7 +2517,7 @@ pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String>
     if let Some(n) = c["failing_pairs"].as_u64().filter(|n| *n > 0) {
         return c["last_error"]
             .as_str()
-            .map(|e| format!("{n} pairs failing: {e}"));
+            .map(|e| format!("{n} {} failing: {e}", pair_word(n)));
     }
     if c["embedding_pending"].as_bool().unwrap_or(false) {
         return Some("embedding not finished for some candidates".to_string());
@@ -2525,11 +2525,36 @@ pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String>
     None
 }
 
-/// The status lines about the contradiction check: one line, plus nothing
-/// when the report predates this block (an older daemon), rather than a
-/// guess. `pending_pairs` absent renders as "not counted yet", never `0`
-/// (lesson 37/62): a fresh daemon that has not walked yet and a standalone
-/// read with no worker both mean "unknown", not "nothing pending".
+/// "pair" for one, "pairs" otherwise.
+pub(crate) fn pair_word(n: u64) -> &'static str {
+    if n == 1 { "pair" } else { "pairs" }
+}
+
+/// The remedy for a load failure that will not retry on its own (Task 6: a
+/// failed load waits for `evolve.contradictions` to be set again or for the
+/// daemon to restart). A command on its own line, never folded into the
+/// reason sentence above it (lesson 36's copy-paste test), and `None` when
+/// nothing is stuck. Only ever `Some` on the daemon path: `load_failed` is
+/// always `false` on a direct read, which has no worker to have failed.
+/// Shared with doctor's row so the two surfaces name the same fix.
+pub(crate) fn contradiction_reload_remedy(c: &serde_json::Value) -> Option<Vec<String>> {
+    if !c["load_failed"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let profile = c["profile"].as_str().unwrap_or("<profile>");
+    Some(vec![
+        "  not retried until evolve.contradictions is set again or the daemon restarts; run:"
+            .to_string(),
+        format!("  crystalline config set evolve.contradictions {profile}"),
+    ])
+}
+
+/// The status lines about the contradiction check: one line, plus a remedy
+/// when a load failure is stuck, plus nothing when the report predates this
+/// block (an older daemon), rather than a guess. `pending_pairs` absent
+/// renders as "not counted yet", never `0` (lesson 37/62): a fresh daemon
+/// that has not walked yet and a standalone read with no worker both mean
+/// "unknown", not "nothing pending".
 pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
     let Some(c) = data.get("contradictions") else {
         return Vec::new();
@@ -2539,14 +2564,18 @@ pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
     };
     let profile = c["profile"].as_str().unwrap_or_default();
     let pending = match c["pending_pairs"].as_u64() {
-        Some(n) => format!("{n} pairs pending"),
+        Some(n) => format!("{n} {} pending", pair_word(n)),
         None => "not counted yet".to_string(),
     };
     let mut line = format!("Contradictions: {profile} ({model}), {pending}");
     if let Some(reason) = contradiction_wait_reason(c) {
         line.push_str(&format!(", {reason}"));
     }
-    vec![line]
+    let mut lines = vec![line];
+    if let Some(remedy) = contradiction_reload_remedy(c) {
+        lines.extend(remedy);
+    }
+    lines
 }
 
 /// Render a status report (the daemon's or the in-process one) as human
@@ -2625,9 +2654,6 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             "text"
         }
     );
-    for line in contradictions_lines(data) {
-        println!("{line}");
-    }
 
     // The rebuild markers, printed directly under the coverage figure they
     // qualify: a number read as normal in the middle of a rebuild is the
@@ -2679,6 +2705,14 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
                 ),
             }
         }
+    }
+
+    // After the rebuild markers, never between them and the Embeddings figure
+    // they qualify: a caveat about a wipe or a rebuild must stay attached to
+    // the coverage number it explains, not read as if it were about the
+    // contradiction check instead.
+    for line in contradictions_lines(data) {
+        println!("{line}");
     }
 
     // What the daemon is doing right now; only its report carries this.
@@ -4066,7 +4100,9 @@ mod contradictions_status_tests {
 
     /// A load failure is a different reason from a parked batch failure, even
     /// though the pending count is known (the walk counted candidates before
-    /// it ever reached the model).
+    /// it ever reached the model). Singular "1 pair pending", and a load
+    /// failure never retries on its own, so the remedy is its own line
+    /// (lesson 36's copy-paste test).
     #[test]
     fn a_load_failure_is_named_as_such_not_as_failing_pairs() {
         let data = json!({ "contradictions": {
@@ -4078,7 +4114,9 @@ mod contradictions_status_tests {
         assert_eq!(
             contradictions_lines(&data),
             vec![
-                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 1 pairs pending, the model could not be loaded: contradiction model error: offline"
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 1 pair pending, the model could not be loaded: contradiction model error: offline",
+                "  not retried until evolve.contradictions is set again or the daemon restarts; run:",
+                "  crystalline config set evolve.contradictions full",
             ]
         );
     }
