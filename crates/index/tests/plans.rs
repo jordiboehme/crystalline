@@ -545,6 +545,30 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_link_to_domain"],
             postgres_must_seek: &["idx_link_to_domain"],
         },
+        HotStatement {
+            // The pass after a registration: only the pending rows spelled with
+            // the new domain's names, reached through the partial index.
+            issued_by: "Store::resolve_references_to_spellings (relation)",
+            turso: || crystalline_index::resolve_spelled_references_sql("relation", "?1"),
+            postgres: || crystalline_index::resolve_spelled_references_sql("relation", "$1"),
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_to_domain"],
+            postgres_must_seek: &["idx_relation_to_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::resolve_references_to_spellings (link)",
+            turso: || crystalline_index::resolve_spelled_references_sql("link", "?1"),
+            postgres: || crystalline_index::resolve_spelled_references_sql("link", "$1"),
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_link_to_domain"],
+            postgres_must_seek: &["idx_link_to_domain"],
+        },
         // The contradiction scorer wave (plans/2026-09-14-contradiction-scorer-plan.md)
         // adds two per-domain reads, and both belong here the day they land:
         //

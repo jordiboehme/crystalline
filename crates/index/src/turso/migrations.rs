@@ -579,9 +579,9 @@ CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 // and a bound engram that is not the whole bracket text at home, the one
 // reading such a prefix still gets. A row bound to that engram keeps it. A row
 // written before `to_raw` existed compares against NULL and is unbound, which
-// is what the current rule gives it too. The engine runs one resolve pass over
-// every domain after its startup sync, so file domains, virtual domains and
-// drafts all bind any unbound row the whole text now reaches. A row whose
+// is what the current rule gives it too. The startup sync binds a file
+// domain's rows again, and the engine's pass after it binds virtual domains
+// and drafts, so every unbound row the whole text now reaches is bound. A row whose
 // engram matches the whole text by title while another matches it by
 // permalink keeps the title match (contrived, left as is).
 // Idempotent: a second run finds nothing the first left behind.

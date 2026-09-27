@@ -1551,6 +1551,73 @@ parity!(
     a_prefix_that_gains_a_meaning_heals_the_link
 );
 
+/// The pass after a registration binds the pending rows spelled with the new
+/// domain's names, in whichever domain they sit, and nothing else: a pending
+/// row spelled with another domain's name waits for its own domain's pass.
+async fn resolving_by_spelling_binds_only_those_rows(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let ops = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:Runbook"),
+    );
+    write(
+        home.path(),
+        "to-eng.md",
+        &source_engram("To Eng", "to-eng", "eng:Runbook"),
+    );
+    for dir in [&ops, &eng] {
+        write(
+            dir.path(),
+            "runbook.md",
+            &engram("Runbook", "runbook", "engram", "", "body\n"),
+        );
+    }
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    let to_eng = store.lookup_id("home", "to-eng").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        None,
+        "home was synced first"
+    );
+
+    assert_eq!(store.resolve_references_to_spellings(&[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        2,
+        "the relation and the link spelled `ops`"
+    );
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    assert_eq!(
+        bound_target(store, to_eng).await,
+        None,
+        "a row spelled `eng` is not this pass's"
+    );
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolving_by_spelling_binds_only_those_rows_on_both_backends,
+    resolving_by_spelling_binds_only_those_rows
+);
+
 /// A core [`crystalline_core::LinkResolver`] over the same engrams and the
 /// same spelling table the store holds, so the index verdict can be compared
 /// with `core::address::resolve`, the rule verify follows. `viewer` reads one

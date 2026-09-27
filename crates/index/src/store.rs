@@ -248,6 +248,25 @@ pub fn reset_spelled_references_sql(table: &str, list: &str) -> String {
     )
 }
 
+/// The pass behind [`Store::resolve_references_to_spellings`], one statement
+/// per reference table: bind the pending rows, in every domain, whose domain
+/// prefix is one of the spellings in `list` (the caller's placeholders).
+///
+/// A seek through the table's partial `to_domain` index, so it reads only the
+/// rows that carry one of the prefixes rather than every pending row of every
+/// domain. The binding is [`reference_match`] with the base candidates, the
+/// rule every resolve pass uses. The `to_domain IS NOT NULL` term repeats the
+/// partial index's own condition, as in [`reset_spelled_references_sql`].
+#[doc(hidden)]
+pub fn resolve_spelled_references_sql(table: &str, list: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} \
+         WHERE {table}.to_domain IS NOT NULL AND {table}.to_domain IN ({list}) \
+         AND {table}.to_id IS NULL AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
 /// The edge half of [`Store::engrams_referencing_domains`]: every base engram
 /// with a relation or link row naming one of the spellings in `list`.
 ///
@@ -1945,6 +1964,19 @@ pub trait Store: Send + Sync {
     /// [`Store::commit`]. The resolve passes that follow it are the caller's
     /// to wrap, as [`crate::resolve_forward_refs`] does.
     async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Bind every pending relation and link row, in every domain and every
+    /// actor's included, whose `to_domain` is one of `spellings`. Answers the
+    /// number of rows bound. The pass a newly registered domain needs: a
+    /// reference elsewhere that already named it waited pending, and only the
+    /// rows spelled with its names can bind to it, so nothing else is read.
+    ///
+    /// Base candidates, as every resolve pass has: right for a domain that was
+    /// just registered, which holds no drafts and no tombstones yet.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
 
     /// Rename a domain row in place: `domain.name` becomes `new` and the id
     /// stays, so every engram and every bound reference stays attached. The

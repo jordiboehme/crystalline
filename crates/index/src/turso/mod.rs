@@ -52,7 +52,7 @@ use crate::store::{
     SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
     domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
     reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -1260,6 +1260,28 @@ impl Store for TursoStore {
                     .await?;
             }
             Ok(reset)
+        })
+        .await
+    }
+
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
+        in_transaction(self, async {
+            let mut bound = 0;
+            for table in ["relation", "link"] {
+                bound += self
+                    .conn
+                    .execute(
+                        &resolve_spelled_references_sql(table, &list),
+                        params.clone(),
+                    )
+                    .await?;
+            }
+            Ok(bound)
         })
         .await
     }

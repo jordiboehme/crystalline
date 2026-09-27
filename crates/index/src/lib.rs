@@ -63,7 +63,8 @@ pub use store::{
 #[doc(hidden)]
 pub use store::{
     link_frontier_sql, referencing_domains_sql, relation_frontier_sql,
-    reset_spelled_references_sql, resolve_pending_sql, spelled_references_sql,
+    reset_spelled_references_sql, resolve_pending_sql, resolve_spelled_references_sql,
+    spelled_references_sql,
 };
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,

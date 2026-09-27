@@ -113,7 +113,7 @@ use crate::store::{
     SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
     domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
     reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -1185,6 +1185,29 @@ impl Store for PostgresStore {
                     .rows_affected();
             }
             Ok(reset)
+        })
+        .await
+    }
+
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut bound = 0;
+            for table in ["relation", "link"] {
+                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
+                let sql = resolve_spelled_references_sql(table, &list);
+                bound += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(bound)
         })
         .await
     }
