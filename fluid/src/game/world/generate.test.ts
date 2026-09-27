@@ -12,13 +12,22 @@ import {
   generateRoom,
   neighboursOf,
   roomSeed,
+  withHeroes,
 } from "./generate";
-import { HERO_POOLS, heroDrawsOf, placeHeroes, rawHero } from "./heroes";
+import {
+  HERO_ORDER,
+  HERO_POOLS,
+  heroDrawsOf,
+  placeHeroes,
+  rawHero,
+} from "./heroes";
+import { curioDrawsOf, placeCurios } from "./curios";
 import { HALL_CAP, isFloor } from "./layout";
 import { pickByRoll, skipNear } from "./sites";
 import type {
   Archetype,
   Fixture,
+  Hero,
   HeroKind,
   PlaceInput,
   PlaceReference,
@@ -954,4 +963,58 @@ describe("the neighbours (2.6f C5)", () => {
       expect(room.heroes.map((h) => h.kind)).toEqual(["helper-robot"]);
     }
   }, 30_000);
+});
+
+describe("withHeroes (2.6e C15)", () => {
+  it("re-dresses a room around its own heroes exactly as the generator does (2.6e C15)", () => {
+    // Mutation caught: a seam that skips the neighbours or the curios, or
+    // leaves the heroes unsorted. Shown red by a dressing that does not
+    // keep off the heroes handed in; the next test starts from a bare
+    // room, which the skipped passes and the order need to show.
+    for (const place of [CANNED_BRIDGE, CANNED_WORKSHOP]) {
+      const built = generateRoom(place);
+      expect(withHeroes(place, built, built.heroes)).toEqual(built);
+    }
+  });
+
+  it("dresses and places curios afresh, whatever the room held, and sorts the heroes it is handed", () => {
+    // Mutation caught: a seam that keeps the room's own props or curios
+    // (skips `dressRoom` or `placeCurios`), reads the curios' neighbours
+    // as nothing, or keeps the heroes in the order handed. The test above
+    // starts from a room already dressed as the generator dresses it, so
+    // it cannot see a skipped pass; this one starts from a bare room. The
+    // reseeded workshop is one whose neighbours skip a curio it would
+    // otherwise draw (the canned places' curios read no neighbour).
+    const skips = { ...CANNED_WORKSHOP, permalink: "manifest-25" };
+    const own = generateRoom(skips);
+    expect(placeCurios(own, curioDrawsOf(own.seed))).not.toEqual(own.curios);
+    const places = [CANNED_BRIDGE, CANNED_WORKSHOP, CANNED_HUB, skips];
+    expect(places.length).toBeGreaterThan(0);
+    for (const place of places) {
+      const built = generateRoom(place);
+      expect(built.props.length).toBeGreaterThan(0);
+      const bare: RoomSpec = { ...built, props: [], curios: [] };
+      expect(withHeroes(place, bare, built.heroes)).toEqual(built);
+    }
+    const built = generateRoom(CANNED_WORKSHOP);
+    const a: Hero = {
+      kind: "turret",
+      variant: 0,
+      x: built.hall.x0 + 1.5,
+      y: built.hall.y0 + 1.5,
+      turn: 0,
+      seed: 1,
+    };
+    const b: Hero = {
+      kind: "turret",
+      variant: 0,
+      x: built.hall.x1 - 1.5,
+      y: built.hall.y1 - 1.5,
+      turn: 0,
+      seed: 2,
+    };
+    const out = withHeroes(CANNED_WORKSHOP, built, [b, a]);
+    expect(out.heroes).toEqual([a, b].sort(HERO_ORDER));
+    expect(out.heroes).toEqual([a, b]);
+  });
 });

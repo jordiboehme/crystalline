@@ -46,6 +46,15 @@
  *    since shelves and cabinets are props; they read everything and move
  *    nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the
  *    rooms its ways lead to draw.
+ *
+ * The forced-hero seam (2.6e C15): `withHeroes` stands a given set of
+ * heroes in a room the generator built and re-runs steps 8 and 9 round
+ * them, exactly as `generateRoom` runs them round its own draws: the
+ * heroes sorted by `HERO_ORDER`, the dressing, then the curios with the
+ * room's own draws and neighbours. Handed the room's own heroes, it gives
+ * the room back unchanged. The dev switches (`dev/demo.ts`) and the
+ * arrival box (`world/arrival.ts`) both go through it; the generator
+ * itself never calls it.
  */
 
 import { isRetired } from "../../lifecycle";
@@ -62,7 +71,7 @@ import {
 import { dressRoom } from "./dress";
 import { curioDraws, placeCurios } from "./curios";
 import { decorFootprint } from "./footprints";
-import { heroDraws, placeHeroes } from "./heroes";
+import { HERO_ORDER, heroDraws, placeHeroes } from "./heroes";
 import { nearOf, type Neighbour } from "./neighbours";
 import {
   dressingSites,
@@ -87,6 +96,7 @@ import {
   type PlaceInbound,
   type PlaceInput,
   type PlaceReference,
+  type Hero,
   type Rect,
   type RoomSpec,
   type WallSlot,
@@ -690,5 +700,32 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     lights,
     dropped: left,
     inboundMore: more,
+  };
+}
+
+/**
+ * `room` with `heroes` standing in it in place of its own, and the passes
+ * that read the heroes run again round them (2.6e C15): the heroes sorted
+ * by `HERO_ORDER` (a copy; the list handed in is left as it is), the
+ * props dressed afresh (`dressRoom`, which keeps off what the heroes
+ * reserve), then the curios placed afresh on those props with the room's
+ * own draws (`curioDraws`) and its neighbours (`nearFor(place)`), as
+ * `generateRoom` places them. Nothing else of the room moves: the layout,
+ * the fixtures, the furniture, the scaffold and the lights are the room's
+ * own, and the fields keep their order. The heroes are taken as given:
+ * nothing here checks that they fit, so the caller stands them where the
+ * hero pass would allow. `withHeroes(place, generateRoom(place),
+ * generateRoom(place).heroes)` is `generateRoom(place)` again.
+ */
+export function withHeroes(
+  place: PlaceInput,
+  room: RoomSpec,
+  heroes: readonly Hero[],
+): RoomSpec {
+  const standing: RoomSpec = { ...room, heroes: [...heroes].sort(HERO_ORDER) };
+  const dressed: RoomSpec = { ...standing, props: dressRoom(standing) };
+  return {
+    ...dressed,
+    curios: placeCurios(dressed, curioDraws(dressed), nearFor(place)),
   };
 }

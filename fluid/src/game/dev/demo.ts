@@ -28,7 +28,8 @@
  * still swaps the condition, rebuilding the same way.
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
- * own forced-draws path (`roomWithForcedHero`): a canned demo room draws at
+ * own forced-draws path and the shared forced-hero seam, `withHeroes` in
+ * `world/generate.ts` (`roomWithForcedHero`): a canned demo room draws at
  * most one hero of its own (the canned bridge a photo console, the hub a
  * hoverboard, the workshop a flying cloud), so this is
  * how the demo shows any kind standing in a real, generated room rather
@@ -83,7 +84,7 @@ import {
   type SlotDraw,
 } from "../world/curios";
 import { NO_RARE, dressRoom, type RareDraws } from "../world/dress";
-import { generateRoom, nearFor } from "../world/generate";
+import { generateRoom, nearFor, withHeroes } from "../world/generate";
 import {
   ANY_POOL,
   HERO_POOLS,
@@ -195,16 +196,17 @@ function forcedHeroDraws(
  * room, its heroes replaced by `placeHeroes` run again on
  * `forcedHeroDraws`'s draws (under the pool archetype the kind forces, not
  * necessarily the room's own: `placeHeroes` reads `room.archetype` only to
- * pick the pool, so this is the one field the forced call overrides) and
- * its props re-dressed (`dressRoom`) to keep off what that hero reserves,
- * exactly as `generateRoom` dresses a room around the heroes it draws on
- * its own. Its curios are placed again (`placeCurios`) on the re-dressed
- * room, with the room's own draws and neighbours (`nearFor`, 2.6f C9), so
- * no curio stands on a host that moved or was dropped and a curio the
- * room skips stays skipped. The forced hero itself never reads the
- * neighbours, so it lands even where one draws it. The returned room
- * keeps its own archetype throughout;
- * only the `placeHeroes` call sees the forced one. `placed` is `kind` when it
+ * pick the pool, so this is the one field the forced call overrides). The
+ * seam is `withHeroes` (`world/generate.ts`, 2.6e C15), which the arrival
+ * box shares: it stands those heroes in the room, re-dresses its props
+ * (`dressRoom`) to keep off what they reserve, exactly as `generateRoom`
+ * dresses a room around the heroes it draws on its own, and places its
+ * curios again (`placeCurios`) on the re-dressed room, with the room's own
+ * draws and neighbours (`nearFor`, 2.6f C9), so no curio stands on a host
+ * that moved or was dropped and a curio the room skips stays skipped. The
+ * forced hero itself never reads the neighbours, so it lands even where
+ * one draws it. The returned room keeps its own archetype throughout; only
+ * the `placeHeroes` call sees the forced one. `placed` is `kind` when it
  * landed, else null: the caller reads it to decide whether to say so on
  * the HUD.
  */
@@ -217,15 +219,7 @@ export function roomWithForcedHero(
   const sites = dressingSites(built);
   const heroes = placeHeroes({ ...built, archetype }, draws, sites);
   const placed = heroes.length > 0 ? kind : null;
-  const withHeroes: RoomSpec = { ...built, heroes };
-  const withProps: RoomSpec = { ...withHeroes, props: dressRoom(withHeroes) };
-  return {
-    room: {
-      ...withProps,
-      curios: placeCurios(withProps, curioDraws(withProps), nearFor(place)),
-    },
-    placed,
-  };
+  return { room: withHeroes(place, built, heroes), placed };
 }
 
 /**
