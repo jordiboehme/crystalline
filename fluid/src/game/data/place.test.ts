@@ -148,6 +148,8 @@ describe("placeFromDetail relations", () => {
       address: { domain: "eng", permalink: "reactor-core" },
       targetTitle: "Reactor Core",
       targetSalience: 8,
+      // GRAPH's node carries type: null.
+      targetType: null,
     });
   });
 
@@ -195,6 +197,8 @@ describe("placeFromDetail links", () => {
       targetTitle: "Runbook",
       // The salience map does not know it.
       targetSalience: null,
+      // GRAPH's node carries type: null.
+      targetType: null,
     });
   });
 
@@ -204,6 +208,60 @@ describe("placeFromDetail links", () => {
       permalink: "notes/deep note",
     });
     expect(link("Deep Note")?.targetTitle).toBe("Deep Note");
+  });
+});
+
+const TYPED_GRAPH: GraphNeighborhood = {
+  ...GRAPH,
+  nodes: [
+    ...GRAPH.nodes.map((n) =>
+      n.permalink === "reactor-core"
+        ? { ...n, type: "runbook" }
+        : n.permalink === "runbook"
+          ? { ...n, type: "guide" }
+          : n,
+    ),
+    {
+      id: 9,
+      domain: "eng",
+      permalink: "src-00",
+      title: "Source",
+      status: null,
+      type: "reference",
+    },
+  ],
+};
+
+describe("placeFromDetail neighbour types (2.6f C10)", () => {
+  const place = placeFromDetail({ ...SOURCES, graph: TYPED_GRAPH });
+
+  it("gives a located way its target's type, null where the node carries none", () => {
+    // Mutation caught: the type left off, read from the wrong node, or a
+    // null type dropped as if unknown.
+    const relation = byTarget(place.relations);
+    const link = byTarget(place.links);
+    expect(relation("Reactor Core")?.targetType).toBe("runbook");
+    expect(link("Runbook")?.targetType).toBe("guide");
+    expect(link("Deep Note")).toHaveProperty("targetType", null);
+  });
+
+  it("leaves the type absent on a way that leads nowhere", () => {
+    // Mutation caught: a sealed or unresolved way given a type.
+    const relation = byTarget(place.relations);
+    expect(relation("old-bridge")).not.toHaveProperty("targetType");
+    expect(relation("Nowhere")).not.toHaveProperty("targetType");
+  });
+
+  it("gives a hatch its source's type when the graph holds it, and none when not", () => {
+    // Mutation caught: every hatch typed null (unknown read as known), or
+    // the lookup keyed by title.
+    const known = place.inbound.find((h) => h.address.permalink === "src-00");
+    expect(known?.type).toBe("reference");
+    const unknown = place.inbound.filter(
+      (h) => h.address.permalink !== "src-00",
+    );
+    expect(unknown.length).toBeGreaterThan(0);
+    for (const h of unknown) expect(h).not.toHaveProperty("type");
   });
 });
 

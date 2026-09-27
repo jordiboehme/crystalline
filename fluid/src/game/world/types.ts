@@ -41,6 +41,13 @@ export interface PlaceReference {
   targetTitle: string | null;
   /** Its salience, when known; it picks the door style. */
   targetSalience: number | null;
+  /**
+   * The `type` of the engram it lands on (2.6f C10): a string, null when
+   * that engram carries none, and absent when it is unknown (a sealed way,
+   * or a target the graph did not return). The generator reads it only to
+   * know the archetype of the room this way leads to.
+   */
+  targetType?: string | null;
 }
 
 /**
@@ -52,6 +59,11 @@ export interface PlaceInbound {
   title: string;
   /** The relation it points here with; `links_to` for a prose wikilink. */
   relType: string;
+  /**
+   * The `type` of the engram that points here (2.6f C10): a string, null
+   * when it carries none, absent when the graph did not return it.
+   */
+  type?: string | null;
 }
 
 /** One observation bullet, in document order. */

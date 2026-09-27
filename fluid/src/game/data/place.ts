@@ -23,6 +23,10 @@
  * and are capped at `HATCH_CAP`. An engram hundreds of others point at is a
  * hub, and a hub is still one room: past the cap the placard names the rest
  * as a count, and the true total rides along for it as `inboundTotal`.
+ *
+ * Each way also carries the type of the engram it leads to, read from the
+ * same graph (2.6f C10), so the generator knows its neighbours' archetypes
+ * without a request of its own.
  */
 
 import type { EngramDetail, EngramReference } from "../../api/engram";
@@ -100,11 +104,28 @@ function compare(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * Every graph node's `type` by its place key (2.6f C10): what kind of room
+ * each way leads to. A key missing from the map is a neighbour the graph
+ * did not return, so its type stays unknown (absent), never null.
+ */
+function typesOf(
+  graph: GraphNeighborhood | null,
+): ReadonlyMap<string, string | null> {
+  return new Map(
+    (graph?.nodes ?? []).map((n) => [
+      placeKeyOf(n.domain, n.permalink),
+      n.type,
+    ]),
+  );
+}
+
 /** Map one parsed reference through the resolver and the graph. */
 function placeReference(
   reference: EngramReference,
   resolve: WikilinkResolver,
   targetSalience: ReadonlyMap<string, number | null>,
+  types: ReadonlyMap<string, string | null>,
 ): PlaceReference {
   const resolution = resolve(innerOf(reference.target));
   const state = referenceState(resolution, reference.resolved);
@@ -145,6 +166,7 @@ function placeReference(
     // or the bracket text for a node that carries none.
     targetTitle: resolution.label,
     targetSalience: targetSalience.get(key) ?? null,
+    ...(types.has(key) ? { targetType: types.get(key) ?? null } : {}),
   };
 }
 
@@ -158,7 +180,10 @@ function placeReference(
  * before the cap, so which hatches make it does not depend on that order
  * either.
  */
-function hatchesOf(page: InboundRefPage): PlaceInbound[] {
+function hatchesOf(
+  page: InboundRefPage,
+  types: ReadonlyMap<string, string | null>,
+): PlaceInbound[] {
   const seen = new Map<string, PlaceInbound>();
   for (const hit of page.hits) {
     const key = placeKeyOf(hit.domain, hit.permalink);
@@ -168,6 +193,7 @@ function hatchesOf(page: InboundRefPage): PlaceInbound[] {
         address: { domain: hit.domain, permalink: hit.permalink },
         title: hit.title,
         relType: hit.rel,
+        ...(types.has(key) ? { type: types.get(key) ?? null } : {}),
       });
     }
   }
@@ -189,9 +215,10 @@ function hatchesOf(page: InboundRefPage): PlaceInbound[] {
 export function placeFromDetail(input: PlaceSources): PlaceInput {
   const { detail, graph, domains, inbound, targetSalience } = input;
   const resolve = buildWikilinkResolver(detail, graph ?? undefined, domains);
+  const types = typesOf(graph);
 
   const map = (reference: EngramReference) =>
-    placeReference(reference, resolve, targetSalience);
+    placeReference(reference, resolve, targetSalience, types);
 
   const { frontmatter } = detail;
   return {
@@ -207,7 +234,7 @@ export function placeFromDetail(input: PlaceSources): PlaceInput {
     content: detail.content,
     relations: detail.relations.map(map),
     links: detail.links.map(map),
-    inbound: inbound === null ? [] : hatchesOf(inbound),
+    inbound: inbound === null ? [] : hatchesOf(inbound, types),
     inboundTotal: inbound === null ? detail.inboundCount : inbound.total,
     observations: detail.observations.map((observation) => ({
       category: observation.category,
