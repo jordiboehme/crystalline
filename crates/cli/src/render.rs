@@ -261,7 +261,8 @@ fn render_named_counts(items: &[Value], out: &mut impl Write) -> io::Result<()> 
 /// printed uppercase in the header line of every block, which is what keeps a
 /// `MECHANICAL` item (complete intent the archive already records) visually
 /// apart from a `JUDGMENT` one (change what the archive claims, propose first)
-/// without colour.
+/// without colour. An empty queue still prints its truncation notes, so
+/// "nothing to work" never hides a cap or a count nobody has made yet.
 pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(queue), Some(total)) = (
         v.get("queue").and_then(Value::as_array),
@@ -329,7 +330,9 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
     if queue.is_empty() {
         writeln!(out)?;
         writeln!(out, "nothing to work in this scope")?;
-        return Ok(());
+        // A cap or an unknown count is still worth saying on an empty queue:
+        // it is what keeps "nothing to work" from reading as a clean domain.
+        return render_truncations(v, out);
     }
 
     for item in queue {
@@ -391,6 +394,18 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
         }
     }
 
+    render_truncations(v, out)?;
+
+    // The one fixed string the engine returns on every call, printed from the
+    // constant rather than re-typed here so the CLI and the tool can never
+    // state different authority.
+    writeln!(out)?;
+    writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
+}
+
+/// The `Truncated:` block of an evolve queue, when a cap fired or a count is
+/// unknown.
+fn render_truncations(v: &Value, out: &mut impl Write) -> io::Result<()> {
     if let Some(truncations) = v.get("truncations").and_then(Value::as_array)
         && !truncations.is_empty()
     {
@@ -400,12 +415,7 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
             writeln!(out, "  {t}")?;
         }
     }
-
-    // The one fixed string the engine returns on every call, printed from the
-    // constant rather than re-typed here so the CLI and the tool can never
-    // state different authority.
-    writeln!(out)?;
-    writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
+    Ok(())
 }
 
 /// `write`: a confirmation line carrying the new engram's address, and where
@@ -832,6 +842,25 @@ mod tests {
         assert_eq!(
             out,
             "Sweep of eng, ops as of 2026-08-02\n1 engram scanned, 0 findings (showing 0, page 1)\n\nnothing to work in this scope\n"
+        );
+    }
+
+    /// An empty queue still prints what a cap or an unknown count left out:
+    /// with the contradiction check on and the daemon behind, "nothing to work"
+    /// alone would read as a domain with no possible contradictions.
+    #[test]
+    fn evolve_empty_queue_still_names_what_is_not_counted() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-08-02" },
+            "engrams_scanned": 3,
+            "total": 0, "page": 1, "limit": 10, "count": 0,
+            "families": [], "queue": [], "actions": [],
+            "truncations": ["eng - V302: related pairs not counted yet (the daemon counts them after embedding)"],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert_eq!(
+            out,
+            "Sweep of eng as of 2026-08-02\n3 engrams scanned, 0 findings (showing 0, page 1)\n\nnothing to work in this scope\n\nTruncated:\n  eng - V302: related pairs not counted yet (the daemon counts them after embedding)\n"
         );
     }
 
