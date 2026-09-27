@@ -325,8 +325,9 @@ describe("a link that names its domain by another name", () => {
   });
 
   it("leaves a name no domain answers to as prose", () => {
-    // Not even the home domain's engram of that title: the server reads the
-    // whole bracket text as a title there, prefix and all.
+    // Not even the home domain's engram of that title: `core/src/address.rs`
+    // reads an unknown prefix as part of a title at home, prefix and all, so
+    // `Crater Base` there is not what this link names.
     const detail = namedDetail("moonbase", [
       resolvedLink(1, "mars", "Crater Base"),
     ]);
