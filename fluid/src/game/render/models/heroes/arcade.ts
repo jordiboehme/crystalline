@@ -32,6 +32,7 @@ import type { HeroKind } from "../../../world/types";
 import type { Surface } from "../../geometry";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
+import { MARKS } from "../marks";
 import {
   discOutline,
   profileAlong,
@@ -42,7 +43,14 @@ import {
   type Surfaces,
 } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
-import { blinkPicture, fit, pixelPanel, runsOf, textRows } from "./pixels";
+import {
+  blinkPicture,
+  fit,
+  pixelPanel,
+  pixelRuns,
+  runsOf,
+  textRows,
+} from "./pixels";
 
 /** A point of a side profile or a side shape: depth out from the wall, height. */
 type DH = readonly [d: number, h: number];
@@ -108,7 +116,7 @@ const RECRUIT_BLACK: Rgb = [0.05, 0.05, 0.08];
 /** The recruitment cabinet's glowing side panels: a deep blue-violet. */
 const SIDE_VIOLET: Rgb = [0.3, 0.16, 0.85];
 
-/** The recruitment cabinet's plain marquee: a pale violet glow. */
+/** The recruitment cabinet's marquee plate: a pale violet glow under its title. */
 const MARQUEE_VIOLET: Rgb = [0.62, 0.55, 1.0];
 
 /** A star on the side panels and the marquee: a cold white. */
@@ -128,6 +136,14 @@ const TRENCH_VIOLET: Rgb = [0.7, 0.45, 1.0];
 
 /** The recruitment title card: gold. */
 const TITLE_GOLD: Rgb = [1.0, 0.78, 0.2];
+
+/**
+ * The recruitment marquee's title (`MARKS.recruitMarquee`): a bright red,
+ * steady and lit (`s.signal`) over the plate's pale violet glow, so it
+ * never reads dark (2.6f C17). No other part of the cabinet wears it, so
+ * a test can count the letters.
+ */
+export const RECRUIT_MARQUEE_INK: Rgb = [1.0, 0.18, 0.12];
 
 /**
  * The arcade cabinet's three games, one per variant, each its own
@@ -745,14 +761,60 @@ const SIDE_STARS: readonly DH[] = [
   [0.9, 0.9],
 ];
 
-/** The stars on the recruitment marquee: `a` across it and `u` up the hood's face (0 to 1). */
+/**
+ * The stars on the recruitment marquee: `a` across it and `u` up the
+ * hood's face (0 to 1), in the plate's margins under and over its title's
+ * band, so no star stands in a letter.
+ */
 const HOOD_STARS: readonly (readonly [a: number, u: number])[] = [
-  [-0.3, 0.3],
-  [-0.12, 0.7],
-  [0.04, 0.4],
-  [0.2, 0.75],
-  [0.32, 0.35],
+  [-0.3, 0.2],
+  [-0.12, 0.8],
+  [0.04, 0.2],
+  [0.2, 0.8],
+  [0.32, 0.2],
 ];
+
+/**
+ * The recruitment marquee plate on the hood's face: its `u` range up the
+ * face and its half width; and the box its title is fitted into, `a` half
+ * width and `u` range, inside the plate and clear of the stars.
+ */
+const HOOD_PLATE = { u0: 0.08, u1: 0.92, half: 0.38 } as const;
+const HOOD_TITLE = { u0: 0.25, u1: 0.75, half: 0.36 } as const;
+
+/**
+ * Lays `rows` of a pixel text on a sloped face of a side profile, as the
+ * recruitment marquee carries its title: fitted with `fit` into `a0..a1`
+ * across the face by `s0..s1` metres up it, each lit run a thin block
+ * from `n0` to `n1` out of the face (`profileAlong` over `face`, `onFace`'s
+ * map, whose `u` runs over `len` metres), so the letters lean with the
+ * face rather than stand upright off it. Returns the pixel size.
+ */
+function faceText(
+  kitAt: KitAt,
+  face: (u: number, n: number) => DH,
+  len: number,
+  rows: readonly string[],
+  box: readonly [a0: number, a1: number, s0: number, s1: number],
+  n0: number,
+  n1: number,
+  sf: Surface,
+): number {
+  const { px, left, top } = fit(rows, ...box);
+  for (const r of pixelRuns(rows)) {
+    const u1 = (top - r.row * px) / len;
+    const u0 = (top - (r.row + 1) * px) / len;
+    profileAlong(
+      kitAt,
+      ORIGIN,
+      [face(u0, n0), face(u1, n0), face(u1, n1), face(u0, n1)],
+      left + r.col * px,
+      left + (r.col + r.len) * px,
+      sf,
+    );
+  }
+  return px;
+}
 
 /** The fighter silhouette on the recruitment side panels: an arrowhead with two swept wings, nose up. */
 const FIGHTER: readonly DH[] = [
@@ -785,8 +847,11 @@ const STAR_HALF = 0.009;
  * - The screen: `VOID WING` in the upper band (groups 0 to 3) and the
  *   demo (`RECRUIT_DEMO`, groups 4 to 7) in the lower band, in the swap
  *   bank.
- * - A plain glowing marquee plate on the hood's face with a few small
- *   star squares on it, and no text.
+ * - A glowing marquee plate on the hood's face carrying the original's
+ *   title (`MARKS.recruitMarquee`, C18) in `RECRUIT_MARQUEE_INK`, steady
+ *   and lit, its letters thin blocks one `DECAL_LIFT` proud of the plate
+ *   that lean with the hood (`faceText`), and a few small star squares in
+ *   the plate's margins under and over the title.
  * - On the deck plate a flight stick (a column on a boot with a T grip)
  *   and two red fire buttons.
  */
@@ -857,19 +922,32 @@ const recruitCabinet: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   const p = at(RECRUIT_PROFILE, 6);
   const q = at(RECRUIT_PROFILE, 7);
   const hood = onFace(p, q);
-  const du = STAR_HALF / Math.hypot(q[0] - p[0], q[1] - p[1]);
+  const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+  const du = STAR_HALF / len;
+  const P = HOOD_PLATE;
   profileAlong(
     kitAt,
     ORIGIN,
     [
-      hood(0.08, 0),
-      hood(0.92, 0),
-      hood(0.92, DECAL_LIFT),
-      hood(0.08, DECAL_LIFT),
+      hood(P.u0, 0),
+      hood(P.u1, 0),
+      hood(P.u1, DECAL_LIFT),
+      hood(P.u0, DECAL_LIFT),
     ],
-    -0.38,
-    0.38,
+    -P.half,
+    P.half,
     s.signal(MARQUEE_VIOLET),
+  );
+  const T = HOOD_TITLE;
+  faceText(
+    kitAt,
+    hood,
+    len,
+    textRows(MARKS.recruitMarquee),
+    [-T.half, T.half, T.u0 * len, T.u1 * len],
+    DECAL_LIFT,
+    2 * DECAL_LIFT,
+    s.signal(RECRUIT_MARQUEE_INK),
   );
   for (const [a, u] of HOOD_STARS)
     profileAlong(

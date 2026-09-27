@@ -6,14 +6,17 @@
  * too, the slab keeps its 1 : 4 : 9, the turret's eye looks out of its
  * front and a seam splits its shell, the eye panel is a portrait plate
  * with a small dot at the middle of its lens, the photo console's picture
- * leans back, and the laser's lens hangs over the chair's seat.
+ * leans back, and the laser's lens hangs over the chair's seat. The marks:
+ * the eye panel's two words on its badge, the first on the black and the
+ * last on the blue field, and the photo console's wordmark on the lip
+ * beside its print slot.
  */
 
 import { describe, expect, it } from "vitest";
 
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import { blinkFlag, FLAG, type V3 } from "../../geometry";
-import { frameAt } from "../../kit";
+import { DECAL_LIFT, frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import {
   partsOf,
@@ -22,8 +25,10 @@ import {
   toLocal,
   type Part,
 } from "../../modelChecks";
+import { MARKS } from "../marks";
 import { buildHeroMesh } from ".";
-import { OFFICE_CHAIR } from "./optics";
+import { BADGE_BLUE, BADGE_INK, DESK_BADGE_INK, OFFICE_CHAIR } from "./optics";
+import { pixelRuns, textRows } from "./pixels";
 
 /**
  * How high the laser desk's catalogue top must stay clear of a part, in
@@ -35,6 +40,39 @@ const CLEAR_TO = 1.9;
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
+
+/** How many lit runs `lines` make in the font. */
+const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** The panels of `parts` painted exactly `ink`. */
+const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
+  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
+
+/** The height of a panel part: its pixel size, for a mark's run. */
+const heightOf = (p: Part): number => {
+  const hs = local(p).map((q) => q[2]);
+  return Math.max(...hs) - Math.min(...hs);
+};
+
+/**
+ * The eye panel's name badge, as `EYE_PANEL` builds it: its black plate's
+ * `a` and `h` range and its front (the plate's face at 0.05 plus the
+ * badge's 0.012), and the blue field's lift over that front.
+ */
+const BADGE = { a0: -0.17, a1: 0.17, h0: 1.98, h1: 2.07, front: 0.062 };
+const BLUE_LIFT = 0.004;
+
+/**
+ * The photo console's lip under its screen, as `PHOTO_CONSOLE` builds it:
+ * the upright strip of the hood at d 0.45 from the deck's back edge (h
+ * 0.95) to the screen face's foot (h 1.0), out to the hood's half width;
+ * the print slot takes `a` -0.2 to 0.2 of it.
+ */
+const LIP = { d: 0.45, h0: 0.95, h1: 1.0, slot: 0.2, half: 0.52 };
 
 /** The one part of a list, failing the test when there is not exactly one. */
 function one(parts: readonly Part[]): Part {
@@ -186,5 +224,81 @@ describe("optics hero models", () => {
         ...picture.filter((q) => Math.abs(q[2] - h) < 0.01).map((q) => q[1]),
       );
     expect(dAt(b.lo[2]) - dAt(b.hi[2])).toBeGreaterThan(0.05);
+  });
+
+  it("names the eye panel on its badge, the words split as the original splits them (2.6f C13)", () => {
+    // Mutation caught: the badge left blank, both words on the black, or
+    // the words below the floor.
+    expect(runsOfLines(MARKS.panelName)).toBeGreaterThan(3);
+    const parts = partsOf("eye-panel");
+    const ink = inked(parts, BADGE_INK);
+    expect(ink).toHaveLength(runsOfLines(MARKS.panelName));
+    const badge = parts
+      .filter((p) => p.tint?.join() === BADGE_BLUE.join())
+      .flatMap(local);
+    expect(badge.length).toBeGreaterThan(0);
+    for (const p of ink)
+      expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+    // The last word sits on the blue field.
+    const last = MARKS.panelName.at(-1) ?? "";
+    const onBlue = ink.filter((p) =>
+      local(p).every((q) => q[0] >= Math.min(...badge.map((b) => b[0])) - 1e-6),
+    );
+    expect(onBlue.length).toBeGreaterThanOrEqual(runsOfLines(last));
+  });
+
+  it("sets the first word on the black and the last inside the blue field, one lift proud and the same size (2.6f C17)", () => {
+    // Mutation caught: both words on the blue, a word off the badge, the
+    // ink sunk into or floating off its field, or the two words at two
+    // different sizes.
+    const [first = "", last = ""] = MARKS.panelName;
+    const parts = partsOf("eye-panel");
+    const ink = inked(parts, BADGE_INK);
+    const blue = parts
+      .filter((p) => p.tint?.join() === BADGE_BLUE.join())
+      .flatMap(local);
+    const as = blue.map((q) => q[0]);
+    const hs = blue.map((q) => q[2]);
+    const [b0, b1] = [Math.min(...as), Math.max(...as)];
+    const [c0, c1] = [Math.min(...hs), Math.max(...hs)];
+    const inside = (q: V3, a0: number, a1: number, h0: number, h1: number) =>
+      q[0] >= a0 - 1e-9 &&
+      q[0] <= a1 + 1e-9 &&
+      q[2] >= h0 - 1e-9 &&
+      q[2] <= h1 + 1e-9;
+    const onBlue = ink.filter((p) =>
+      local(p).every((q) => inside(q, b0, b1, c0, c1)),
+    );
+    const onBlack = ink.filter((p) =>
+      local(p).every((q) => inside(q, BADGE.a0, b0, BADGE.h0, BADGE.h1)),
+    );
+    expect(onBlue).toHaveLength(runsOfLines(last));
+    expect(onBlack).toHaveLength(runsOfLines(first));
+    for (const p of onBlack)
+      for (const q of local(p))
+        expect(q[1]).toBeCloseTo(BADGE.front + DECAL_LIFT, 9);
+    for (const p of onBlue)
+      for (const q of local(p))
+        expect(q[1]).toBeCloseTo(BADGE.front + BLUE_LIFT + DECAL_LIFT, 9);
+    const sizes = ink.map(heightOf);
+    for (const h of sizes) expect(h).toBeCloseTo(sizes[0] ?? NaN, 9);
+  });
+
+  it("prints the photo console's wordmark in its own dark ink on the lip beside the print slot (2.6f C13)", () => {
+    // Mutation caught: the wordmark missing or set from the wrong string,
+    // over the slot, off the lip, floating or sunk, or below the floor.
+    expect(runsOfLines(MARKS.deskBadge)).toBeGreaterThan(3);
+    const ink = inked(partsOf("photo-console"), DESK_BADGE_INK);
+    expect(ink).toHaveLength(runsOfLines(MARKS.deskBadge));
+    for (const p of ink) {
+      expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+      for (const q of local(p)) {
+        expect(q[1]).toBeCloseTo(LIP.d + DECAL_LIFT, 9);
+        expect(q[2]).toBeGreaterThanOrEqual(LIP.h0 - 1e-9);
+        expect(q[2]).toBeLessThanOrEqual(LIP.h1 + 1e-9);
+        expect(q[0]).toBeGreaterThanOrEqual(LIP.slot - 1e-9);
+        expect(q[0]).toBeLessThanOrEqual(LIP.half + 1e-9);
+      }
+    }
   });
 });

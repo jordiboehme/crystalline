@@ -4,8 +4,10 @@
  * groups and never overlap; the big gun, taken from the built rack and
  * bench, is the same parts only moved, and nothing else meets its grip;
  * the tube bench's three tubes meet at one round hub, two arms up and the
- * stem down; and the field pack's chase climbs its cell one light per
- * group and runs round its cyclotron in ring order. Whether a workshop
+ * stem down, and its box carries its two warning labels on red tape, one
+ * on the bottom rail and one over the status lights; and the field pack's
+ * chase climbs its cell one light per group and runs round its cyclotron
+ * in ring order. Whether a workshop
  * hero's parts float, and whether the gun bench's and the tube bench's
  * catalogue tops lie on a real, clear upward face, are
  * `heroModels.test.ts`'s checks now, for every kind, not only these.
@@ -15,7 +17,7 @@ import { describe, expect, it } from "vitest";
 
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import { FLAG, type V3 } from "../../geometry";
-import { frameAt } from "../../kit";
+import { DECAL_LIFT, frameAt } from "../../kit";
 import {
   partsOf,
   reaches,
@@ -24,6 +26,40 @@ import {
   toLocal,
   type Part,
 } from "../../modelChecks";
+import { MARKS } from "../marks";
+import { pixelRuns, textRows } from "./pixels";
+import { LABEL_INK, LABEL_TAPE } from "./workshop";
+
+/** A part's points in the recipe's local `[a, d, h]`. */
+const local = (p: Part): V3[] =>
+  p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
+
+/** How many lit runs `lines` make in the font. */
+const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** The panels of `parts` painted exactly `ink`. */
+const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
+  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
+
+/** The height of a panel part: its pixel size, for a mark's run. */
+const heightOf = (p: Part): number => {
+  const hs = local(p).map((q) => q[2]);
+  return Math.max(...hs) - Math.min(...hs);
+};
+
+/**
+ * The tube bench's box front, as `tubeBox` builds it: its `a` range and
+ * its face's depth; the bottom rail's heights (on the bench top at 0.9);
+ * and the top of the status lights' row and the box's top, the strip
+ * between them the second label's.
+ */
+const BOX_FRONT = { a0: 0.1, a1: 0.7, d: 0.7 };
+const BOTTOM_RAIL = { h0: 0.9, h1: 0.94 };
+const OVER_LIGHTS = { h0: 1.372, h1: 1.4 };
 
 /** Whether a part is a light in one of the eight blink groups. */
 const blinks = (p: Part) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 8;
@@ -215,6 +251,70 @@ describe("workshop hero models", () => {
       const first = steps[0] ?? 0;
       expect(Math.abs(Math.abs(first) - Math.PI / 2)).toBeLessThan(1e-6);
       for (const step of steps) expect(step).toBeCloseTo(first, 6);
+    }
+  });
+
+  it("prints the tube bench's two labels on the box, the short one on the bottom rail and the long one over the lights (2.6f C13)", () => {
+    // Mutation caught: a label missing, the two swapped, a label set from
+    // the wrong string, or below the floor.
+    const [low = "", high = ""] = MARKS.benchLabels;
+    expect(runsOfLines(MARKS.benchLabels)).toBeGreaterThan(3);
+    const ink = inked(partsOf("tube-bench"), LABEL_INK);
+    expect(ink).toHaveLength(runsOfLines(MARKS.benchLabels));
+    const within = (p: Part, h0: number, h1: number) =>
+      local(p).every(
+        (q) =>
+          q[0] >= BOX_FRONT.a0 - 1e-9 &&
+          q[0] <= BOX_FRONT.a1 + 1e-9 &&
+          q[2] >= h0 - 1e-9 &&
+          q[2] <= h1 + 1e-9,
+      );
+    expect(
+      ink.filter((p) => within(p, BOTTOM_RAIL.h0, BOTTOM_RAIL.h1)),
+    ).toHaveLength(runsOfLines(low));
+    expect(
+      ink.filter((p) => within(p, OVER_LIGHTS.h0, OVER_LIGHTS.h1)),
+    ).toHaveLength(runsOfLines(high));
+    for (const p of ink)
+      expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+  });
+
+  it("sets each label's letters one lift proud of its red tape, the tape one lift proud of the box (2.6f C17)", () => {
+    // Mutation caught: the letters off the tape (floating or sunk), a tape
+    // missing, or a letter run past its tape's ends.
+    const parts = partsOf("tube-bench");
+    const tapes = parts
+      .filter(
+        (p) => p.method === "panel" && p.tint?.join() === LABEL_TAPE.join(),
+      )
+      .map((p) => {
+        const ps = local(p);
+        for (const q of ps)
+          expect(q[1]).toBeCloseTo(BOX_FRONT.d + DECAL_LIFT, 9);
+        const as = ps.map((q) => q[0]);
+        const hs = ps.map((q) => q[2]);
+        return [
+          Math.min(...as),
+          Math.max(...as),
+          Math.min(...hs),
+          Math.max(...hs),
+        ] as const;
+      });
+    expect(tapes).toHaveLength(MARKS.benchLabels.length);
+    for (const p of inked(parts, LABEL_INK)) {
+      const ps = local(p);
+      for (const q of ps)
+        expect(q[1]).toBeCloseTo(BOX_FRONT.d + 2 * DECAL_LIFT, 9);
+      const on = tapes.filter(([a0, a1, h0, h1]) =>
+        ps.every(
+          (q) =>
+            q[0] >= a0 - 1e-9 &&
+            q[0] <= a1 + 1e-9 &&
+            q[2] >= h0 - 1e-9 &&
+            q[2] <= h1 + 1e-9,
+        ),
+      );
+      expect(on).toHaveLength(1);
     }
   });
 });

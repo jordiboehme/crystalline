@@ -7,9 +7,11 @@
  * cloud's underside at 0.4 m. Only the block has a light: its four marks
  * breathe; the board and the cloud are unlit, as their originals are.
  *
- * The block's mark (C12) is the one readable thing here: a "?" drawn as a
- * pixel picture, `QUESTION_MARK`, not a glyph of `PIXEL_FONT`, so the
- * font still refuses "?" and the block stays its only use.
+ * Two marks are readable here. The block's (C12) is a "?" drawn as a pixel
+ * picture, `QUESTION_MARK`, not a glyph of `PIXEL_FONT`, so the font still
+ * refuses "?" and the block stays its only use. The board's is its
+ * original's wordmark on its deck (`MARKS.boardLogo`, 2.6f C13), set in
+ * the font as one two-line block on a yellow patch.
  *
  * The numbers each kind is built to are named in a table above its
  * recipe: `BLOCK` for the block, `BOARD` for the hoverboard, and `BODY`
@@ -21,9 +23,10 @@ import type { HeroKind } from "../../../world/types";
 import type { Surface } from "../../geometry";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
+import { MARKS } from "../marks";
 import { yawed, type Surfaces } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
-import { pixelPanel } from "./pixels";
+import { fit, pixelPanel, runsOf, textBlock } from "./pixels";
 
 /** The recipe's own frame: the origin, facing north. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
@@ -177,8 +180,15 @@ const BOARD_PAD: Rgb = [0.05, 0.05, 0.05];
 /** The board's front edge panels: lime green. */
 const BOARD_LIME: Rgb = [0.55, 0.9, 0.15];
 
-/** The board's back edge panels: yellow. */
+/** The board's back edge panels and the patch under its wordmark: yellow. */
 const BOARD_YELLOW: Rgb = [0.98, 0.85, 0.1];
+
+/**
+ * The board's wordmark letters (`MARKS.boardLogo`): a magenta on the
+ * yellow patch, as the original prints it (2.6f C13). No other part of
+ * the board wears it, so a test can count the letters.
+ */
+export const DECK_LOGO_INK: Rgb = [0.85, 0.1, 0.55];
 
 /**
  * The hoverboard's measures, in metres. The deck is `thick` thick and
@@ -191,7 +201,8 @@ const BOARD_YELLOW: Rgb = [0.98, 0.85, 0.1];
  * and no face of the two shares a plane. A foot pad `padH` thick lies on
  * each shelf, `padA` long and `padD` wide in half measures, and ends
  * exactly at the top. The edge panels follow the deck's profile, `edge`
- * inside its top and bottom.
+ * inside its top and bottom. The wordmark's patch spans `logo` either way
+ * of the middle along `a`, inside the flat.
  */
 const BOARD = {
   thick: 0.035,
@@ -203,14 +214,50 @@ const BOARD = {
   padD: 0.07,
   padH: 0.004,
   edge: 0.004,
+  logo: 0.11,
 } as const;
+
+/**
+ * Lays the board's wordmark flat on its deck's top at height `h`: the
+ * lines of `MARKS.boardLogo` as one block (`textBlock`) with one dark
+ * pixel of border, fitted along `a` into `-half..half` and centred across
+ * `d`, the first line at `-d` so the mark reads from the board's front
+ * (`+d`). A frame cannot tilt, so no quad can face up; each run is a thin
+ * `k.box` one `DECAL_LIFT` thick instead, the lit runs in `ink` and the
+ * dark ones in `patch`, side by side, so the patch and the letters are one
+ * flat layer with no face over another.
+ */
+function deckLogo(
+  k: Kit,
+  half: number,
+  h: number,
+  ink: Surface,
+  patch: Surface,
+): void {
+  const block = textBlock(MARKS.boardLogo);
+  const w = (block[0]?.length ?? 0) + 2;
+  const rows = [".".repeat(w), ...block.map((r) => `.${r}.`), ".".repeat(w)];
+  const { px, left } = fit(rows, -half, half, -half, half);
+  const far = -(rows.length * px) / 2;
+  for (const r of runsOf(rows))
+    k.box(
+      left + r.col * px,
+      left + (r.col + r.len) * px,
+      far + r.row * px,
+      far + (r.row + 1) * px,
+      h,
+      h + DECAL_LIFT,
+      r.ch === "#" ? ink : patch,
+    );
+}
 
 /**
  * The hoverboard: a deck profile along `a`, flat in the middle and
  * kicking up to a level shelf at each end, extruded across `d`; a round
  * disc on each shelf for the rounded end; a black foot pad on each shelf;
  * and edge panels along both sides that follow the deck, lime towards
- * `+a` and yellow towards `-a`. Level at its lift.
+ * `+a` and yellow towards `-a`; on the flat middle between the pads, the
+ * wordmark in magenta on a yellow patch (`deckLogo`). Level at its lift.
  */
 const hoverboard: HeroRecipe = ({ k, s, variant, kind }) => {
   const { hw, d1, lift, top } = heroHalf(kind, variant);
@@ -271,6 +318,7 @@ const hoverboard: HeroRecipe = ({ k, s, variant, kind }) => {
     k.extrude(profile([0, BOARD.flat, ramp, c], lo, hi), e0, e1, lime);
     k.extrude(profile([-c, -ramp, -BOARD.flat, 0], lo, hi), e0, e1, yellow);
   }
+  deckLogo(k, BOARD.logo, lift + t, s.tinted(DECK_LOGO_INK), yellow);
 };
 
 /** The cloud's body: a bright golden yellow. */

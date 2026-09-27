@@ -3,8 +3,9 @@
  * for every kind. Three games with their own titles and colours, attract
  * screens whose title card and demo never share a quad, a recruitment
  * cabinet that is bigger than the arcade cabinet and glows along its
- * sides, nothing that reaches out into the use point in front, and no
- * two faces stacked closer than the decal spacing.
+ * sides and carries its original's title on its marquee, steady and lit,
+ * nothing that reaches out into the use point in front, and no two faces
+ * stacked closer than the decal spacing.
  */
 
 import { describe, expect, it } from "vitest";
@@ -30,9 +31,15 @@ import {
   type Part,
 } from "../../modelChecks";
 import { buildHero, buildHeroMesh } from ".";
-import { ARCADE_GAMES, RECRUIT_DEMO, RECRUIT_TITLE } from "./arcade";
+import { MARKS } from "../marks";
+import {
+  ARCADE_GAMES,
+  RECRUIT_DEMO,
+  RECRUIT_MARQUEE_INK,
+  RECRUIT_TITLE,
+} from "./arcade";
 import { heroHalf } from "./common";
-import { textRows } from "./pixels";
+import { pixelRuns, textRows } from "./pixels";
 
 const CABINETS = ["arcade-cabinet", "recruit-cabinet"] as const;
 
@@ -51,6 +58,46 @@ function partsOf(kind: HeroKind, variant: number): Part[] {
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
+
+/** How many lit runs `lines` make in the font. */
+const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** The parts of `parts` painted exactly `ink`, whatever primitive drew them. */
+const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
+  parts.filter((p) => p.tint?.join() === ink.join());
+
+/**
+ * The recruitment cabinet's hood face in the side view, as its profile
+ * builds it: from `[d, h]` 0.72, 1.84 at its foot to 0.64, 2.0 at its top,
+ * leaning back; the marquee plate covers `u` 0.08 to 0.92 of it and `a`
+ * -0.38 to 0.38.
+ */
+const HOOD = {
+  p: [0.72, 1.84],
+  q: [0.64, 2.0],
+  u0: 0.08,
+  u1: 0.92,
+  half: 0.38,
+};
+
+/**
+ * A local point on the hood's terms: `s` metres up the face from its foot
+ * and `n` metres out of it along its normal.
+ */
+function onHood(q: V3): { s: number; n: number } {
+  const [pd = 0, ph = 0] = HOOD.p;
+  const [qd = 0, qh = 0] = HOOD.q;
+  const len = Math.hypot(qd - pd, qh - ph);
+  const [dd, dh] = [q[1] - pd, q[2] - ph];
+  return {
+    s: (dd * (qd - pd) + dh * (qh - ph)) / len,
+    n: (dd * (qh - ph) + dh * (pd - qd)) / len,
+  };
+}
 
 /** A part's bounds in `(a, h)`: `[a0, a1, h0, h1]`. */
 function boundsAH(p: Part): [number, number, number, number] {
@@ -230,11 +277,55 @@ describe("arcade hero models", () => {
             const [p, q] = [ts[i], ts[j]];
             if (!p || !q || dot(p.n, q.n) < 1 - 1e-6) continue;
             const gap = Math.abs(p.off - q.off);
-            if (gap >= DECAL_LIFT - 1e-6) continue;
+            // The mesh holds 32-bit floats: a small triangle on a sloped
+            // face (a marquee letter's run) gets its plane's offset a few
+            // micrometres off, so a face exactly one lift away can measure
+            // a hair under it. A tenth of a millimetre is far below any
+            // real stacking fault.
+            if (gap >= DECAL_LIFT - 1e-4) continue;
             if (overlapAlong(p.n, p.pts, q.pts))
               close.push(`${gap.toFixed(4)} at ${p.pts[0]?.join(",") ?? ""}`);
           }
         expect(close, `${kind} ${String(v)}`).toEqual([]);
       }
+  });
+
+  it("puts the original's title on the recruitment marquee, steady and lit (2.6f C18)", () => {
+    // Mutation caught: the marquee left blank, the title set from the
+    // wrong string, or its ink on a blink bank or unlit, so it could read
+    // dark.
+    expect(runsOfLines(MARKS.recruitMarquee)).toBeGreaterThan(3);
+    const ink = inked(partsOf("recruit-cabinet", 0), RECRUIT_MARQUEE_INK);
+    expect(ink).toHaveLength(runsOfLines(MARKS.recruitMarquee));
+    expect(ink.every((p) => p.flag === FLAG.signal)).toBe(true);
+    // The attract screen keeps its own title.
+    expect(RECRUIT_TITLE).not.toBe(MARKS.recruitMarquee);
+  });
+
+  it("lays the marquee title on the plate's face, one lift proud of it, inside the plate and over the floor (2.6f C17)", () => {
+    // Mutation caught: the title off the hood (floating, sunk or upright
+    // instead of leaning with it), past the plate's ends, or below the
+    // floor.
+    const [pd = 0, ph = 0] = HOOD.p;
+    const [qd = 0, qh = 0] = HOOD.q;
+    const len = Math.hypot(qd - pd, qh - ph);
+    const ink = inked(partsOf("recruit-cabinet", 0), RECRUIT_MARQUEE_INK);
+    expect(ink.length).toBeGreaterThan(3);
+    for (const p of ink) {
+      const ps = local(p);
+      const on = ps.map(onHood);
+      for (const [i, q] of ps.entries()) {
+        const h = on[i];
+        expect(Math.abs(q[0])).toBeLessThanOrEqual(HOOD.half + 1e-9);
+        expect(h?.s).toBeGreaterThanOrEqual(HOOD.u0 * len - 1e-9);
+        expect(h?.s).toBeLessThanOrEqual(HOOD.u1 * len + 1e-9);
+        expect(h?.n).toBeGreaterThanOrEqual(DECAL_LIFT - 1e-9);
+        expect(h?.n).toBeLessThanOrEqual(2 * DECAL_LIFT + 1e-9);
+      }
+      const ss = on.map((h) => h.s);
+      expect(Math.max(...ss) - Math.min(...ss)).toBeGreaterThanOrEqual(
+        0.003 - 1e-9,
+      );
+    }
   });
 });

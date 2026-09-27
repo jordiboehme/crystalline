@@ -38,6 +38,7 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
+import { MARKS } from "../marks";
 import {
   ALUMINIUM,
   heroHalf,
@@ -45,6 +46,7 @@ import {
   STATUS_GREEN,
   type HeroRecipe,
 } from "./common";
+import { fit, markLines, textRows } from "./pixels";
 
 /** The turret's shell: a clean glossy white, the same in every look. */
 const WHITE_SHELL: Rgb = [0.92, 0.92, 0.9];
@@ -79,8 +81,25 @@ const GRILLE_GREY: Rgb = ALUMINIUM;
 /** The small bright dot in the middle of the eye panel's lens. */
 const LENS_YELLOW: Rgb = [1.0, 0.85, 0.25];
 
-/** The blue field on the right of the eye panel's blank name badge. */
-const BADGE_BLUE: Rgb = [0.16, 0.32, 0.72];
+/**
+ * The blue field on the right of the eye panel's name badge, under the
+ * badge's second word (`MARKS.panelName`).
+ */
+export const BADGE_BLUE: Rgb = [0.16, 0.32, 0.72];
+
+/**
+ * The eye panel's badge letters: a warm white, both words in it, the first
+ * on the badge's black and the second on its blue field (2.6f C13). No
+ * other part of the panel wears it, so a test can count the letters.
+ */
+export const BADGE_INK: Rgb = [0.94, 0.93, 0.88];
+
+/**
+ * The photo console's wordmark (`MARKS.deskBadge`): a dark brown-black
+ * printed straight on the cream lip beside the print slot (2.6f C13). No
+ * other part of the console wears it, so a test can count the letters.
+ */
+export const DESK_BADGE_INK: Rgb = [0.1, 0.085, 0.075];
 
 /** The photo console's casing: an old cream plastic, gone warm with age. */
 const CASING_CREAM: Rgb = [0.84, 0.79, 0.66];
@@ -476,9 +495,10 @@ const blackSlab: HeroRecipe = ({ k, s, variant, kind }) => {
 
 /**
  * The eye panel's measures, in metres: the faceplate's half width, depth
- * and bottom (a portrait plate of about 3 : 1, 0.6 by 1.8 m); the blank
- * name badge at the top (half width, heights, depth, its blue field's `a`
- * range, lift and inset); the eye (its height, the black bezel disc's
+ * and bottom (a portrait plate of about 3 : 1, 0.6 by 1.8 m); the name
+ * badge at the top (half width, heights, depth, its blue field's `a`
+ * range, lift and inset, and the margin its second word keeps inside the
+ * blue); the eye (its height, the black bezel disc's
  * radius and depth, the lens radius, the red dome's radius and how far it
  * stands out of the bezel, the yellow centre dot's radius and reach); and
  * the grille (half width, heights, backing depth, the slats' count, first
@@ -494,9 +514,10 @@ const EYE_PANEL = {
     h0: 1.98,
     h1: 2.07,
     depth: 0.012,
-    blue: [0.06, 0.155],
+    blue: [0.0, 0.155],
     lift: 0.004,
     inset: 0.014,
+    margin: 0.012,
   },
   eye: {
     h: 1.62,
@@ -526,7 +547,11 @@ const EYE_PANEL = {
  * The eye panel, flush on its wall: a tall portrait faceplate of warm
  * brushed metal (d 0 to 0.05, h 0.4 to the top, 0.6 m wide), and on it,
  * from the top down:
- * - a blank black name badge with a blue field on its right, no text;
+ * - a black name badge with a blue field on its right half, its two words
+ *   (`MARKS.panelName`) split between them as the original splits them:
+ *   the first on the black, the second on the blue, both in `BADGE_INK`
+ *   one `DECAL_LIFT` proud of their field and at the one pixel size the
+ *   blue field allows the second, so the two read at the same height;
  * - the eye, high on the plate (h 1.62): a black round bezel disc, a red
  *   `lens` (r 0.14) in it, a smaller red dome standing out of the lens
  *   like a fisheye's glass, and a small yellow dot at its very middle, all
@@ -559,6 +584,35 @@ const eyePanel: HeroRecipe = ({ k, s, variant, kind }) => {
     b.h0 + b.inset,
     b.h1 - b.inset,
     s.tinted(BADGE_BLUE),
+  );
+  // The badge's words: the second fitted into the blue field less its
+  // margin, the first on the black left of it at the same pixel size,
+  // both centred on the badge's height.
+  const [first = "", second = ""] = MARKS.panelName;
+  const ink = s.tinted(BADGE_INK);
+  const mid = (b.h0 + b.h1) / 2;
+  const { px } = fit(
+    textRows(second),
+    blue0 + b.margin,
+    blue1 - b.margin,
+    b.h0 + b.inset,
+    b.h1 - b.inset,
+  );
+  markLines(
+    k,
+    second,
+    [blue0 + b.margin, blue1 - b.margin, mid - 2.5 * px, mid + 2.5 * px],
+    face + b.depth + b.lift + DECAL_LIFT,
+    ink,
+  );
+  const blackMid = (-b.half + blue0) / 2;
+  const half = ((textRows(first)[0]?.length ?? 0) * px) / 2;
+  markLines(
+    k,
+    first,
+    [blackMid - half, blackMid + half, mid - 2.5 * px, mid + 2.5 * px],
+    face + b.depth + DECAL_LIFT,
+    ink,
   );
   // The eye: the bezel disc, the lens seated on it, the dome and the dot.
   const e = P.eye;
@@ -604,7 +658,8 @@ const eyePanel: HeroRecipe = ({ k, s, variant, kind }) => {
  * widths, heights and how far each stands off the face), the tonal
  * blocks of the photograph on it (each an `a` and `h` range and a tone of
  * `PHOTO_TONES`) and how far they stand off, and the grid lines over it;
- * the print slot in the lip; the chunky buttons; how far a slab on the
+ * the print slot in the lip and the wordmark's box beside it on the lip's
+ * upright face (right of the slot); the chunky buttons; how far a slab on the
  * deck sinks under it; the knobs (with their own sink); and the trackball
  * (its place, its pad's half side and top over the deck, its radius, its
  * profile over the pad's top as `[share of the radius, height]` pairs, and
@@ -632,6 +687,7 @@ const PHOTO_CONSOLE = {
   toneOff1: 0.0175,
   grid: { width: 0.008, off1: 0.019 },
   slot: { half: 0.2, h0: 0.962, h1: 0.99, depth: 0.006 },
+  badge: { a0: 0.24, a1: 0.48, h0: 0.955, h1: 0.995 },
   buttons: { a0: -0.76, pitch: 0.13, a: 0.1, d0: 0.58, d: 0.09, above: 0.035 },
   sink: 0.005,
   knobs: { as: [0.1, 0.24], d: 0.66, r: 0.035, h: 0.035, sink: 0.01 },
@@ -695,7 +751,9 @@ const CONSOLE_LIGHTS: readonly Rgb[] = [
  *   1.76), the roof sloping to the wall at the top.
  * - On that sloped face: a black bezel and a grey-blue picture (`s.glow`)
  *   with a pale grid of two lines each way over it; a dark print slot in
- *   the lip under it.
+ *   the lip under it, and right of the slot on the lip's upright face the
+ *   console's lower-case wordmark (`MARKS.deskBadge`) in `DESK_BADGE_INK`,
+ *   printed straight on the cream one `DECAL_LIFT` proud.
  * - The picture carries three tonal blocks under the grid (a pale
  *   window, a mid-grey floor, a dark shape), so it reads as a photograph.
  * - On the deck: a row of six chunky lit buttons (blink groups 0 to 5 of
@@ -813,6 +871,15 @@ const photoConsole: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   }
   const sl = C.slot;
   k.box(-sl.half, sl.half, backD, backD + sl.depth, sl.h0, sl.h1, s.dark);
+  // The wordmark, printed on the lip's upright face right of the slot.
+  const wm = C.badge;
+  markLines(
+    k,
+    MARKS.deskBadge,
+    [wm.a0, wm.a1, wm.h0, wm.h1],
+    backD + DECAL_LIFT,
+    s.tinted(DESK_BADGE_INK),
+  );
   // On the deck: buttons, knobs and the ball's pad follow the slope, as
   // sloped slabs from `below` under the deck to `above` over it.
   const slab = (

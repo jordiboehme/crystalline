@@ -27,6 +27,7 @@ import { HERO_CATALOGUE } from "../../../world/heroes";
 import type { HeroKind, SurfaceSpec } from "../../../world/types";
 import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
+import { MARKS } from "../marks";
 import {
   discOutline,
   profileAlong,
@@ -44,7 +45,7 @@ import {
   STATUS_GREEN,
   type HeroRecipe,
 } from "./common";
-import { pixelPanel, textRows } from "./pixels";
+import { markLines, pixelPanel, textRows } from "./pixels";
 
 /** A status light that says trouble, and a tool's red handle. */
 const STATUS_RED: Rgb = [1.0, 0.15, 0.1];
@@ -624,8 +625,28 @@ const gunBench: HeroRecipe = ({ k, s, variant, kind }) => {
 /** The tubes' glow: a warm amber, like gas-discharge tubes. */
 const TUBE_AMBER: Rgb = [0.95, 0.55, 0.15];
 
-/** The box's small label plate: a pale cream. */
-const LABEL_CREAM: Rgb = [0.9, 0.85, 0.75];
+/**
+ * The box's two warning labels' tape: the deep red of embossing tape
+ * (2.6f C13). Each label is one strip of it, one `DECAL_LIFT` proud of the
+ * box's front.
+ */
+export const LABEL_TAPE: Rgb = [0.65, 0.08, 0.06];
+
+/**
+ * The labels' letters: the pale core an embossed letter shows through the
+ * tape, one more `DECAL_LIFT` proud. No other part of the bench wears it,
+ * so a test can count the letters.
+ */
+export const LABEL_INK: Rgb = [0.96, 0.95, 0.93];
+
+/**
+ * A label tape's height, and the one pixel size its letters take: the
+ * font's 5 rows with one pixel of tape above and below. Both labels share
+ * it, as one tape would. 3.4 mm, over C13's 3 mm floor; the long label's
+ * strip over the status lights has room for no more.
+ */
+const TAPE_TALL = 0.024;
+const TAPE_PX = TAPE_TALL / 7;
 
 /** The soldering lamp's bulb: a warm white filament. */
 const LAMP_WARM: Rgb = [1.0, 0.92, 0.75];
@@ -641,6 +662,9 @@ const BOX_WALL = 0.02;
 const FRAME_RAIL = 0.04;
 const FRAME_TOP_RAIL = 0.04;
 const FRAME_STILE = 0.04;
+
+/** Half the side of a status light on the box's top rail. */
+const LIGHT_HALF = 0.012;
 
 /** The Y of tubes: its hub's centre in `(a, h)`, the hub's depth band and radius. */
 const HUB_A = 0.4;
@@ -734,11 +758,48 @@ function tubeY(k: Kit, s: Surfaces): void {
 }
 
 /**
+ * One warning label on the box's front (`MARKS.benchLabels`): a strip of
+ * red tape centred on `(am, hm)`, `TAPE_TALL` high and one `TAPE_PX` longer
+ * than its text at each end, one `DECAL_LIFT` proud of the front, and the
+ * text in `LABEL_INK` one more `DECAL_LIFT` proud, set by `markLines` at
+ * `TAPE_PX` (C17's sticker).
+ */
+function tapeLabel(
+  k: Kit,
+  s: Surfaces,
+  text: string,
+  am: number,
+  hm: number,
+): void {
+  const cols = textRows(text)[0]?.length ?? 0;
+  const half = ((cols + 2) * TAPE_PX) / 2;
+  const h0 = hm - TAPE_TALL / 2;
+  const h1 = hm + TAPE_TALL / 2;
+  k.panel(
+    am - half,
+    am + half,
+    BOX_D1 + DECAL_LIFT,
+    h0,
+    h1,
+    s.tinted(LABEL_TAPE),
+  );
+  markLines(
+    k,
+    text,
+    [am - half + TAPE_PX, am + half - TAPE_PX, h0 + TAPE_PX, h1 - TAPE_PX],
+    BOX_D1 + 2 * DECAL_LIFT,
+    s.tinted(LABEL_INK),
+  );
+}
+
+/**
  * The metal box: back, left side and top walls, a front frame round a
- * large open window with a small cream label on its bottom rail and five
- * status lights along its top rail (groups 3 to 7 of the chase bank), and
- * its right side a door hinged at the back corner, standing open, a darker
- * inner panel on its face.
+ * large open window with five status lights along its top rail (groups 3
+ * to 7 of the chase bank), and its right side a door hinged at the back
+ * corner, standing open, a darker inner panel on its face. Its two
+ * warning labels (`tapeLabel`) sit on the front as the original's do: the
+ * short one on the bottom rail under the tubes, the long one along the
+ * strip between the status lights and the box's top.
  */
 function tubeBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
   k.box(BOX_A0, BOX_A1, BOX_D0, BOX_D0 + BOX_WALL, h0, BOX_H1, s.metal);
@@ -767,23 +828,18 @@ function tubeBox(k: Kit, kitAt: KitAt, s: Surfaces, h0: number): void {
     s.metal,
   );
   const am = (BOX_A0 + BOX_A1) / 2;
-  k.panel(
-    am - 0.09,
-    am + 0.09,
-    BOX_D1 + DECAL_LIFT,
-    h0 + 0.01,
-    h0 + 0.03,
-    s.tinted(LABEL_CREAM),
-  );
+  const lightH = topRail + FRAME_TOP_RAIL / 2;
+  const [low = "", high = ""] = MARKS.benchLabels;
+  tapeLabel(k, s, low, am, h0 + FRAME_RAIL / 2);
+  tapeLabel(k, s, high, am, (lightH + LIGHT_HALF + BOX_H1) / 2);
   STATUS_TINTS.forEach((tint, i) => {
     const a = am - 0.16 + i * 0.08;
-    const hm = topRail + FRAME_TOP_RAIL / 2;
     k.panel(
-      a - 0.012,
-      a + 0.012,
+      a - LIGHT_HALF,
+      a + LIGHT_HALF,
       BOX_D1 + DECAL_LIFT,
-      hm - 0.012,
-      hm + 0.012,
+      lightH - LIGHT_HALF,
+      lightH + LIGHT_HALF,
       s.blink(tint, 3 + i),
     );
   });
@@ -879,8 +935,8 @@ function solderingLamp(k: Kit, kitAt: KitAt, s: Surfaces, top: number): void {
 
 /**
  * The tube bench: `workbench` at the catalogue surface's height. On its
- * right part the metal box with its window, its open side door and the
- * tube Y inside (`tubeBox`); left of it a small tool box and a
+ * right part the metal box with its window, its open side door, its two
+ * warning labels on red tape and the tube Y inside (`tubeBox`); left of it a small tool box and a
  * screwdriver on the top; the soldering lamp (`solderingLamp`) reaching
  * over the middle; and a coil of cable lying on the lower shelf with its
  * lead rising into the slab under the box. The bench's left end, the
