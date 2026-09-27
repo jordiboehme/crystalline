@@ -597,6 +597,13 @@ async fn no_identity_is_401_the_anonymous_viewer_is_200_and_read_only_serves_it(
     assert_eq!(resp.headers()["content-type"], "application/problem+json");
 
     let published = serve(true, true).await;
+    // `lab` is private, so the anonymous viewer's stream is filtered like
+    // any anonymous read (R1, P20; review I3).
+    published
+        .auth
+        .set_domain_visibility("lab", true, "root")
+        .await
+        .unwrap();
     let mut resp = open(published.addr, None, None).await;
     assert_eq!(
         resp.status(),
@@ -609,15 +616,203 @@ async fn no_identity_is_401_the_anonymous_viewer_is_200_and_read_only_serves_it(
         ALPHA.replace("A rule", "A revised rule"),
     )
     .unwrap();
+    std::fs::write(
+        published._tmp.path().join("lab/secret.md"),
+        ALPHA
+            .replace("Alpha", "Secret")
+            .replace("alpha", "secret")
+            .replace("A rule", "A revised rule"),
+    )
+    .unwrap();
+    published
+        .engine
+        .sync_paths("lab", vec!["secret.md".to_string()])
+        .await
+        .unwrap();
     published
         .engine
         .sync_paths("eng", vec!["alpha.md".to_string()])
         .await
         .unwrap();
-    let frames = read_frames(&mut resp, 1, Duration::from_secs(3)).await;
+    let frames = read_frames(&mut resp, 2, Duration::from_secs(3)).await;
+    assert_eq!(
+        domains_of(&frames),
+        vec!["eng"],
+        "the private domain is silent: {frames:?}"
+    );
     assert_eq!(frames[0].event, "engram");
     let data: serde_json::Value = serde_json::from_str(&frames[0].data).unwrap();
     assert_eq!(data["actor"], serde_json::Value::Null);
+}
+
+/// Past the ten seconds a stream trusts what it resolved.
+const PAST_TTL: Duration = Duration::from_secs(11);
+
+/// Read until the body ends or `within` elapsed: the frames seen, and
+/// whether it ended.
+async fn read_to_end(resp: &mut reqwest::Response, within: Duration) -> (Vec<String>, bool) {
+    let mut seen = Vec::new();
+    let ended = tokio::time::timeout(within, async {
+        loop {
+            match resp.chunk().await {
+                Ok(Some(bytes)) => seen.push(String::from_utf8_lossy(&bytes).to_string()),
+                Ok(None) | Err(_) => return,
+            }
+        }
+    })
+    .await
+    .is_ok();
+    (seen, ended)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_session_ends_its_stream_at_the_next_refresh() {
+    // Catches the identity frozen at connect (review I1, ruled): the session
+    // is revoked (what a logout does to it), and the first event after the
+    // refresh is due ends the stream instead of being written.
+    let fx = serve(false, false).await;
+    let cookie = login(fx.addr, "ada", "adapw").await;
+    let mut resp = open(fx.addr, Some(&cookie), None).await;
+    fx.auth.delete_session(&cookie).await.unwrap();
+    tokio::time::sleep(PAST_TTL).await;
+    fx.engine
+        .edit_engram(&edit("eng", "alpha", "after the logout"))
+        .await
+        .unwrap();
+    let (seen, ended) = read_to_end(&mut resp, Duration::from_secs(3)).await;
+    assert!(ended, "the stream ends");
+    assert!(
+        !seen.iter().any(|chunk| chunk.contains("event: engram")),
+        "nothing is written to a session that is gone: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_account_ends_its_stream_at_the_next_refresh() {
+    let fx = serve(false, false).await;
+    let cookie = login(fx.addr, "ada", "adapw").await;
+    let mut resp = open(fx.addr, Some(&cookie), None).await;
+    fx.auth.set_disabled("ada", true).await.unwrap();
+    tokio::time::sleep(PAST_TTL).await;
+    fx.engine
+        .edit_engram(&edit("eng", "alpha", "after the disable"))
+        .await
+        .unwrap();
+    let (seen, ended) = read_to_end(&mut resp, Duration::from_secs(3)).await;
+    assert!(ended, "the stream ends");
+    assert!(
+        !seen.iter().any(|chunk| chunk.contains("event: engram")),
+        "nothing is written to a disabled account: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demoted_admin_loses_admin_visibility_at_the_next_refresh() {
+    // Catches the connect-time `admin` flag kept for the life of the stream
+    // (review I1, ruled): `chief` hears the private `lab` as an admin, is
+    // demoted, and after the refresh hears `eng` only.
+    let fx = serve(false, false).await;
+    fx.auth
+        .add_user("chief", "Chief", None, Role::Admin, "chiefpw")
+        .await
+        .unwrap();
+    fx.auth
+        .set_domain_visibility("lab", true, "root")
+        .await
+        .unwrap();
+    let cookie = login(fx.addr, "chief", "chiefpw").await;
+    let mut resp = open(fx.addr, Some(&cookie), None).await;
+    fx.engine
+        .edit_engram(&edit("lab", "secret", "while an admin"))
+        .await
+        .unwrap();
+    let heard = read_frames(&mut resp, 1, Duration::from_secs(3)).await;
+    assert_eq!(
+        domains_of(&heard),
+        vec!["lab"],
+        "an admin hears the private domain"
+    );
+    fx.auth.set_role("chief", Role::Viewer).await.unwrap();
+    tokio::time::sleep(PAST_TTL).await;
+    fx.engine
+        .edit_engram(&edit("lab", "secret", "after the demotion"))
+        .await
+        .unwrap();
+    fx.engine
+        .edit_engram(&edit("eng", "alpha", "after the demotion"))
+        .await
+        .unwrap();
+    let heard = read_frames(&mut resp, 2, Duration::from_secs(3)).await;
+    assert_eq!(domains_of(&heard), vec!["eng"], "{heard:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_member_hears_a_private_domain_and_its_rename() {
+    // Review M5: the `Accounts` path end to end for a member who is neither
+    // the owner nor an admin.
+    let fx = serve(false, false).await;
+    fx.auth
+        .set_domain_visibility("lab", true, "root")
+        .await
+        .unwrap();
+    fx.auth
+        .upsert_domain_member("lab", "vera", MemberLevel::Viewer, "root")
+        .await
+        .unwrap();
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let mut member = open(fx.addr, Some(&vera), None).await;
+    fx.engine
+        .edit_engram(&edit("lab", "secret", "a line"))
+        .await
+        .unwrap();
+    fx.engine
+        .rename_domain(
+            "lab",
+            "vault",
+            true,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let heard = read_until(&mut member, Duration::from_secs(3), |frames| {
+        domains_of(frames).contains(&"vault".to_string())
+    })
+    .await;
+    let names = domains_of(&heard);
+    assert_eq!(names.first().map(String::as_str), Some("lab"), "{heard:?}");
+    assert!(
+        names.contains(&"vault".to_string()),
+        "the member hears the rename's new name: {heard:?}"
+    );
+    assert!(
+        heard
+            .iter()
+            .any(|f| f.event == "domain" && domains_of(std::slice::from_ref(f)) == ["lab"]),
+        "and its old name's domain frame: {heard:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_account_holds_at_most_thirty_two_streams() {
+    // Review M3, ruled: the thirty-third stream of one account is refused
+    // 503 with `Retry-After`, while another account still subscribes.
+    let fx = serve(false, false).await;
+    let ada = login(fx.addr, "ada", "adapw").await;
+    let mut open_streams = Vec::new();
+    for _ in 0..32 {
+        let resp = open(fx.addr, Some(&ada), None).await;
+        assert_eq!(resp.status(), 200);
+        open_streams.push(resp);
+    }
+    let refused = open(fx.addr, Some(&ada), None).await;
+    assert_eq!(refused.status(), 503);
+    assert_eq!(refused.headers()["retry-after"], "30");
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    let vera = login(fx.addr, "vera", "verapw").await;
+    assert_eq!(open(fx.addr, Some(&vera), None).await.status(), 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6084,6 +6084,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Too many streams are open, for this account (32) or on this instance (4096). `Retry-After` says when to try again.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       }

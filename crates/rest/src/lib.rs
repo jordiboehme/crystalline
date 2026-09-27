@@ -382,6 +382,10 @@ pub struct RestState {
     /// ends when its connection does. Private like `setup_token`; the
     /// `events` module is a child of this one and reads it.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The open event streams, counted against their caps. One count for the
+    /// whole process: every clone of this state shares it. See
+    /// [`events::STREAMS_PER_ACCOUNT`].
+    streams: Arc<events::StreamSlots>,
 }
 
 impl RestState {
@@ -430,6 +434,7 @@ impl RestState {
             login_slots: auth::login_slots(),
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
             shutdown: None,
+            streams: Arc::new(events::StreamSlots::default()),
         })
     }
 

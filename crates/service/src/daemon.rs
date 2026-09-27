@@ -1207,9 +1207,29 @@ async fn http_service(
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<axum::Router> {
-    let auth = Arc::new(
-        crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
-    );
+    http_service_at(
+        &crystalline_core::config::web_auth_db_path()?,
+        allowed_hosts,
+        engine,
+        http_sessions,
+        setup_token,
+        shutdown,
+    )
+    .await
+}
+
+/// [`http_service`] over the accounts database at `auth_db`, so a test can
+/// build the router `run_serve` serves, shutdown wiring included, without
+/// this machine's own accounts file.
+async fn http_service_at(
+    auth_db: &std::path::Path,
+    allowed_hosts: Vec<String>,
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<axum::Router> {
+    let auth = Arc::new(crate::rest::AuthStore::open(auth_db).await?);
     http_router_with_shutdown(
         engine,
         http_sessions,
@@ -3015,6 +3035,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The router `run_serve` builds ends an open event stream when the
+    /// daemon's shutdown watch flips (review M4). Catches `http_service`
+    /// building the router without the watch, where a stream would hold
+    /// the drain until its browser hung up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_served_router_ends_an_event_stream_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let config = crystalline_core::config::GlobalConfig {
+            auth: Some(crystalline_core::config::AuthConfig {
+                anonymous: Some(true),
+                ..crystalline_core::config::AuthConfig::default()
+            }),
+            ..crystalline_core::config::GlobalConfig::default()
+        };
+        let engine = Arc::new(Engine::new(
+            Arc::new(TokioMutex::new(store)),
+            config,
+            None,
+            None,
+        ));
+        let (flip, rx) = watch::channel(false);
+        let router = http_service_at(
+            &dir.path().join("web-auth.db"),
+            Vec::new(),
+            engine,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            rx,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut resp = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/api/v1/events"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Not unwrapped: a router that dropped the watch has no receiver
+        // left, and the stream that never ends is the failure to see.
+        let _ = flip.send(true);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = resp.chunk().await {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the body closes on shutdown");
+    }
 
     /// Five requests while the first run is held: one run at a time, and
     /// exactly one follow-up for the four that came in during it. The caller
