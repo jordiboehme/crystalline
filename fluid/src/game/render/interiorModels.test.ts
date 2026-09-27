@@ -1,8 +1,9 @@
 /**
  * The console room's fittings as models (2.6e C2, C19): every kind and
  * variant, built at the origin and placed as the GPU places an instance at
- * every turn it can take, against the family's rules. The blockouts pass
- * it; the finished recipes keep it green.
+ * every turn it can take, against the family's rules. The console's rotor,
+ * built as a mover outside the instanced mesh, is recorded on its own and
+ * held to the same rules at its rest height.
  */
 
 import { describe, expect, it } from "vitest";
@@ -36,7 +37,9 @@ import {
   buildInteriorMesh,
   buildInteriorMovers,
 } from "./models/interior";
+import { surfaces } from "./models/common";
 import { INTERIOR_BANK, interiorHalf } from "./models/interior/common";
+import { ROTOR, buildRotor } from "./models/interior/console";
 
 const EPS = 1e-4;
 
@@ -263,6 +266,21 @@ describe("interior models (2.6e C2)", () => {
       const mesh = rotorIn(LOOKS.aperture);
       expect(mesh.count).toBeGreaterThan(0);
       expect(worstWinding(mesh)).toBeGreaterThan(0.999);
+    });
+
+    it("holds together, and glows only on or in its body", () => {
+      // Mutation caught: a disc, a bar or a plate hung clear of the rod and
+      // the rest of the rotor, which the height and radius checks would
+      // still pass.
+      const parts: Part[] = [];
+      const at: V3 = [FREE_AT.x * CELL, 0, FREE_AT.y * CELL];
+      buildRotor(
+        recordingKitAt(createBuilder(), parts)(frameAt(at, 0)),
+        surfaces(LOOKS.aperture),
+      );
+      expect(parts.length).toBeGreaterThan(0);
+      expect(looseParts(parts, null, ROTOR.h0)).toEqual([]);
+      expect(floatingGlow(parts, null)).toEqual([]);
     });
 
     it("keeps its colours in every look (C4)", () => {

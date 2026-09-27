@@ -18,8 +18,7 @@
  *
  * The wall pieces (the roundel wall, the inner doors and the scanner) are
  * built in `walls.ts`, the console with its column's frame in
- * `console.ts`. `interiorBlockout` (`common.ts`) stays the shape a new
- * kind starts as. The family's
+ * `console.ts`. The family's
  * test (`interiorModels.test.ts`) builds every kind and variant, places it
  * at every turn it can take and checks its envelope (`interiorHalf`), the
  * winding, that nothing glows in mid-air, that no part floats clear of the

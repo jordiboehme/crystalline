@@ -1,7 +1,7 @@
 /**
  * What every console room fitting's recipe shares (2.6e C2, C4): the shape
- * of a recipe, each kind's blink bank, the sizes a recipe reads, the
- * blockout every kind starts as, and the room's fixed colours.
+ * of a recipe, each kind's blink bank, the sizes a recipe reads and the
+ * room's fixed colours.
  *
  * A fitting's mesh is built like a hero's: once per kind, variant and look,
  * at the origin in `frameAt([0, 0, 0], 0)`, and drawn instanced, turned by
@@ -106,39 +106,3 @@ export function interiorHalf(kind: InteriorKind): {
     top: entry.top,
   };
 }
-
-/** The bevel of a blockout's box, in metres. */
-const BLOCKOUT_BEVEL = 0.02;
-
-/** A blinking blockout's cap: its side, in metres (less on a thin piece). */
-const CAP_SIDE = 0.1;
-
-/** A blinking blockout's cap: its height, in metres; the box stops this far under the top. */
-const CAP_HEIGHT = 0.02;
-
-/**
- * The blockout cap's colour: a plain warm white, a stand-in light that
- * belongs to no finished model.
- */
-const CAP_TINT: Rgb = [1.0, 0.92, 0.8];
-
-/**
- * The blockout every fitting starts as (like `heroBlockout`): one bevelled
- * box over its whole footprint from the floor up to its top, less 0.02 m
- * for a kind whose bank blinks, which gets a blink-group-0 cap on the
- * box's top in the middle, so every check (glow contact, the bank rule)
- * runs on it from the start. The cap is `CAP_SIDE` wide and `CAP_HEIGHT`
- * thick and ends exactly at the top; on a piece thinner than `CAP_SIDE` it
- * spans the piece's depth, so it never leaves the envelope.
- */
-export const interiorBlockout: InteriorRecipe = ({ k, s, kind }) => {
-  const { hw, d0, d1, top } = interiorHalf(kind);
-  const blinks = INTERIOR_BANK[kind] !== "steady";
-  const h1 = blinks ? top - CAP_HEIGHT : top;
-  k.bevelBox(-hw, hw, d0, d1, 0, h1, BLOCKOUT_BEVEL, s.body);
-  if (!blinks) return;
-  const dm = (d0 + d1) / 2;
-  const c = CAP_SIDE / 2;
-  const cd = Math.min(c, (d1 - d0) / 2);
-  k.box(-c, c, dm - cd, dm + cd, h1, top, s.blink(CAP_TINT, 0));
-};

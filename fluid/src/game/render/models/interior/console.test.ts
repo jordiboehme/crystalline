@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { consoleRoom } from "../../../world/consoleRoom";
+import { INTERIOR_CATALOGUE, consoleRoom } from "../../../world/consoleRoom";
 import type { InteriorPiece } from "../../../world/types";
 import { CELL } from "../../../world/units";
 import {
@@ -166,6 +166,18 @@ describe("the console (2.6e C8)", () => {
     expect(ribs.length).toBe(COLUMN.ribs);
     for (const rib of ribs)
       expect(radial(boundsOf(rib).mid)).toBeGreaterThan(ROTOR.radius + 0.05);
+  });
+});
+
+describe("the console's collision box (2.6e C8)", () => {
+  it("is the desk's size and the column's height, as the catalogue gives it", () => {
+    // Mutation caught: the catalogue's console box (its collision
+    // footprint and envelope) left at one size while the model is built at
+    // another.
+    const entry = INTERIOR_CATALOGUE.console;
+    expect(entry.width).toBe(CONSOLE.corners);
+    expect(entry.depth).toBe(CONSOLE.corners);
+    expect(entry.top).toBe(COLUMN.h1);
   });
 });
 

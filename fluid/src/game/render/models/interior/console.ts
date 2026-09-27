@@ -265,9 +265,10 @@ export const CONSOLE_RECIPES = {
  * at each end `ROTOR.radius` out, a silver rod up the middle, three
  * glowing discs stacked on it (`s.signal(ROTOR_GLOW)`: a mover draws in
  * the steady bank, so the discs glow without blinking) and a cage of four
- * slim silver bars round them.
+ * slim silver bars round them. `rotorMover` builds it at the console's
+ * anchor; the family's test records it through a recording kit.
  */
-function rotor(k: Kit, s: Surfaces): void {
+export function buildRotor(k: Kit, s: Surfaces): void {
   const { h0, h1, radius } = ROTOR;
   const plate = 0.03;
   const white = s.tinted(CONSOLE_WALL);
@@ -308,7 +309,7 @@ export function rotorMover(
     b,
     frameAt([piece.x * CELL, 0, piece.y * CELL], piece.turn),
   );
-  rotor(k, surfaces(look));
+  buildRotor(k, surfaces(look));
   return {
     key: `rotor:${String(index)}`,
     part: "rotor",
