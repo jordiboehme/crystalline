@@ -26,7 +26,11 @@
  *   business: which of the domains the sidebar's listing knows about the
  *   inner doors lead out to (2.6e C13). `DomainRow` lives here rather than
  *   in the data layer so the world side never imports it: `data/source.ts`
- *   imports `DomainRow` from here instead.
+ *   imports `DomainRow` from here instead. The domain the room was entered
+ *   from is matched against the listing through `domainSpellings`
+ *   (`../../domainNames`), the same table a door's own link resolves
+ *   through, so an alias or a canonical name never excludes the wrong
+ *   domain on a naming collision.
  *
  * The generator (`generate.ts`) never imports this module: a police box's
  * doors, and the console room's exit, are a session concern, like a
@@ -34,6 +38,7 @@
  */
 
 import { seedFor, createRng } from "../core/seed";
+import { domainSpellings } from "../../domainNames";
 import { REACH, FACING, type DoorState, type WallPoint } from "./interact";
 import { HERO_FRONT, heroTurn, turnedPoint } from "./footprints";
 import type { Player } from "./move";
@@ -233,26 +238,41 @@ export function exitSeed(from: string, ticks: number): number {
 }
 
 /**
- * Whether a domain row answers to the spelling `from`: by its local name,
- * its canonical name, or one of its aliases. Used both to find the room
- * left among the rows and to leave it out of the pick, so a door written
- * with an alias or a canonical name still excludes the very domain the
- * room was entered from (Review Focus 1).
+ * The one local name the spelling `from` means among `rows`, by the very
+ * table links resolve through (`domainSpellings`): a local name always
+ * wins, a canonical name or an alias maps to its domain unless another row's
+ * local name already holds that same text (it is shadowed) or two-plus rows
+ * claim it (it is contested and resolves nowhere). `from` itself when no
+ * row's local name, canonical name or alias maps it at all.
+ *
+ * Resolving through the one shared table, rather than checking each row's
+ * three fields independently, is what keeps a naming collision from
+ * over-excluding: a row whose *canonical name text* happens to equal
+ * another row's *local name* must not match on that text, since the
+ * spelling belongs to the other domain (2.6e review: `answersTo` matched
+ * every row whose canonical name or alias happened to equal `from`, so two
+ * rows sharing a contested canonical name, or a row's canonical name
+ * shadowed by another's local name, were both excluded even though at most
+ * one of them is truly the domain `from` names).
  */
-function answersTo(row: DomainRow, from: string): boolean {
-  return (
-    row.name === from ||
-    row.canonicalName === from ||
-    row.aliases.includes(from)
+function resolveLocal(rows: readonly DomainRow[], from: string): string {
+  const spellings = domainSpellings(
+    rows.map((row) => ({
+      name: row.name,
+      canonicalName: row.canonicalName,
+      aliases: [...row.aliases],
+    })),
   );
+  return spellings.get(from) ?? from;
 }
 
 /**
  * Which domain the console room's inner doors lead out to: one of `rows`
  * chosen uniformly at random among every row other than the one the room
- * was entered from, `from` matched by any of its names (`answersTo`), so an
- * alias or a canonical name spelled in the door that led in still excludes
- * that same domain (Review Focus 1).
+ * was entered from, `from` resolved to its one local name first
+ * (`resolveLocal`), so an alias or a canonical name spelled in the door
+ * that led in still excludes that same domain, and only that domain, even
+ * across a naming collision elsewhere in the listing (Review Focus 1).
  *
  * The rows are sorted by their local name before the draw, so the pick
  * does not depend on the listing's own order: two listings holding the same
@@ -260,8 +280,8 @@ function answersTo(row: DomainRow, from: string): boolean {
  *
  * With no other domain to pick, whether because `rows` holds only the room
  * left's own row or none at all, the room left's own domain is given back:
- * the local name of the row that answered to `from`, or `from` itself when
- * no row did (an empty listing, C13's fallback).
+ * the resolved local name itself, when some row is registered under it, or
+ * `from` when none is (an empty listing, C13's fallback).
  *
  * `seed` is `exitSeed(from, ticks)`; a fresh `createRng(seed)` is drawn from
  * once, so the same seed always gives the same pick.
@@ -271,12 +291,13 @@ export function pickExitDomain(
   from: string,
   seed: number,
 ): string {
+  const local = resolveLocal(rows, from);
   const sorted = [...rows].sort((a, b) =>
     a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
   );
-  const others = sorted.filter((row) => !answersTo(row, from));
+  const others = sorted.filter((row) => row.name !== local);
   if (others.length === 0) {
-    return sorted.find((row) => answersTo(row, from))?.name ?? from;
+    return sorted.find((row) => row.name === local)?.name ?? from;
   }
   const index = Math.floor(createRng(seed).next() * others.length);
   return others[index]?.name ?? from;

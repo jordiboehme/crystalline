@@ -176,4 +176,40 @@ describe("the console room's exit pick (2.6e C13)", () => {
         pickExitDomain([...a].reverse(), "eng", t),
       );
   });
+
+  it("never lets a shadowed canonical name exclude the domain that really holds it (fix round 1)", () => {
+    // Mutation caught: matching row.canonicalName === from independently of
+    // the other rows, which would also exclude "moonbase" here since its
+    // canonical name collides with the real domain "moon"'s local name.
+    const rows = [row("moon"), row("moonbase", "moon", ["luna"]), row("alpha")];
+    const picks = new Set<string>();
+    for (let t = 0; t < 300; t++)
+      picks.add(pickExitDomain(rows, "moon", exitSeed("moon", t)));
+    expect([...picks].sort()).toEqual(["alpha", "moonbase"]);
+  });
+
+  it("leaves nothing excluded when the entry spelling is a contested canonical name (fix round 1)", () => {
+    // Mutation caught: matching row.canonicalName === from independently of
+    // the other rows, which would wrongly exclude both "moonbase" and
+    // "station" here, leaving only "alpha" ever pickable.
+    const rows = [
+      row("moonbase", "luna"),
+      row("station", "luna"),
+      row("alpha"),
+    ];
+    const picks = new Set<string>();
+    for (let t = 0; t < 300; t++)
+      picks.add(pickExitDomain(rows, "luna", exitSeed("luna", t)));
+    expect([...picks].sort()).toEqual(["alpha", "moonbase", "station"]);
+  });
+
+  it("leaves an alias's own domain untouched when a local name shadows it (fix round 1)", () => {
+    // Mutation caught: matching row.aliases.includes(from) independently of
+    // the other rows, which would also exclude "archive" here since it
+    // lists "eng" as an alias, even though "eng" is a real domain's own
+    // local name and the alias is shadowed away from "archive".
+    const rows = [row("eng"), row("archive", null, ["eng"])];
+    for (let t = 0; t < 200; t++)
+      expect(pickExitDomain(rows, "eng", exitSeed("eng", t))).toBe("archive");
+  });
 });

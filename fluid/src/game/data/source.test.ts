@@ -417,11 +417,26 @@ describe("loadPlace", () => {
 
 describe("loadDomainRows", () => {
   it("returns the three fields of each row of the domain listing", async () => {
-    // Mutation caught: dropping a field, or passing through the listing's
-    // own rows instead of the three the exit reads.
-    serve();
+    // Mutation caught: dropping a field, or hardcoding canonicalName to null
+    // (or aliases to []) regardless of what the listing said. The fixture
+    // gives every field a non-empty, non-null value so a mutation that
+    // ignores it is observable (fix round 1).
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "moonbase",
+            kind: "file",
+            canonical_name: "moon",
+            aliases: ["luna"],
+            shadowed: false,
+          },
+        ],
+      }),
+    });
     await expect(loadDomainRows(client)).resolves.toEqual([
-      { name: "eng", canonicalName: null, aliases: [] },
+      { name: "moonbase", canonicalName: "moon", aliases: ["luna"] },
     ]);
   });
 
