@@ -1024,6 +1024,24 @@ describe("the classic controls", () => {
     );
   });
 
+  // Walking forward, a strafe of 2 would tilt the walk further to the
+  // side than a strafe of 1, even after the wish is cut to length 1, so
+  // this sees two strafe keys for one side summed instead of taken once.
+  it("strafes on two keys for one side exactly as on one, while walking", () => {
+    const one = holding(["KeyW", "KeyD"]);
+    expect(one.dx).toBeGreaterThan(0.3);
+    expect(one.dz).toBeLessThan(-0.3);
+    for (const two of [
+      ["KeyW", "KeyD", "AltLeft", "ArrowRight"],
+      ["KeyW", "KeyD", "Period"],
+      ["KeyW", "Period", "AltRight", "ArrowRight"],
+    ]) {
+      const both = holding(two);
+      expect(both.dx).toBeCloseTo(one.dx, 9);
+      expect(both.dz).toBeCloseTo(one.dz, 9);
+    }
+  });
+
   it("looks up and down with the mouse alone", () => {
     onBridge();
     mouseLook(-48);
