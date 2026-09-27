@@ -336,7 +336,8 @@ describe("buildRoomMesh details", () => {
 
 describe("buildRoomMesh's hero movers", () => {
   it("gives every police box in a room its two leaves as movers, and no other hero any (2.6e C17)", () => {
-    // Mutation caught: the hero movers not emitted, or keyed by the fixture index.
+    // Mutation caught: the hero movers not emitted, or keyed by the fixture
+    // index.
     const room = heroHallRoom();
     const boxes = room.heroes.flatMap((h, i) =>
       h.kind === "police-box" ? [i] : [],

@@ -48,7 +48,10 @@ function wallParts(
   return parts;
 }
 
-/** A part's box in the piece's local terms: `a` across (x at turn 0, mirrored), `d` out from the wall, `h` up. */
+/**
+ * A part's box in the piece's local terms: `a` across (x at turn 0,
+ * mirrored), `d` out from the wall, `h` up.
+ */
 function extent(p: Part): {
   a0: number;
   a1: number;

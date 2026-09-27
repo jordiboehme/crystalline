@@ -180,7 +180,9 @@ export function archetypeFor(type: string | null): Archetype {
   );
 }
 
-/** The door a target's salience earns: 0-3 sliding, 4-6 bulkhead, 7-10 blast. */
+/**
+ * The door a target's salience earns: 0-3 sliding, 4-6 bulkhead, 7-10 blast.
+ */
 export function doorStyleFor(salience: number | null): DoorStyle {
   if (salience === null || salience < 4) return "sliding";
   return salience < 7 ? "bulkhead" : "blast";
@@ -242,7 +244,9 @@ function postersOf(place: PlaceInput): { category: string; lines: string[] }[] {
   return [...posters].map(([category, lines]) => ({ category, lines }));
 }
 
-/** The placard: title, type, status, salience, validity and inbound overflow. */
+/**
+ * The placard: title, type, status, salience, validity and inbound overflow.
+ */
 function placardLines(place: PlaceInput, inboundMore: number): string[] {
   const lines = [
     place.title,
@@ -478,7 +482,10 @@ function intersects(a: Box, b: Box) {
   return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
 }
 
-/** A room's seed: the generator's version, its domain and its permalink. What a neighbour's draws start from too (2.6f C5). */
+/**
+ * A room's seed: the generator's version, its domain and its permalink.
+ * What a neighbour's draws start from too (2.6f C5).
+ */
 export function roomSeed(domain: string, permalink: string): number {
   return seedFor(GAME_VERSION, domain, permalink);
 }
@@ -512,7 +519,10 @@ export function neighboursOf(place: PlaceInput): Neighbour[] {
     .map(([, n]) => n);
 }
 
-/** What a place's neighbours draw raw (2.6f C6): `nearOf` its seed and `neighboursOf` it. */
+/**
+ * What a place's neighbours draw raw (2.6f C6): `nearOf` its seed and
+ * `neighboursOf` it.
+ */
 export function nearFor(place: PlaceInput): Near {
   return nearOf(roomSeed(place.domain, place.permalink), neighboursOf(place));
 }

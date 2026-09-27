@@ -40,7 +40,9 @@ import type { KitAt, Surfaces } from "../common";
 /** Bare aluminium: frames, grilles and trims, shared by every batch. */
 export const ALUMINIUM: Rgb = [0.55, 0.55, 0.57];
 
-/** A status light that says all is well, shared by every hero that shows one. */
+/**
+ * A status light that says all is well, shared by every hero that shows one.
+ */
 export const STATUS_GREEN: Rgb = [0.25, 1.0, 0.35];
 
 /** A status light that says wait, shared by every hero that shows one. */
@@ -85,7 +87,10 @@ export type HeroRecipe = (r: {
   movers: boolean;
 }) => void;
 
-/** Each hero kind's blink bank (the tables in the 2.6a plan's Task 3 and the 2.6c plan's C13). */
+/**
+ * Each hero kind's blink bank (the tables in the 2.6a plan's Task 3 and the
+ * 2.6c plan's C13).
+ */
 export const HERO_BANK = {
   turret: "breathe",
   "black-slab": "steady",
@@ -149,7 +154,10 @@ const BLOCKOUT_BEVEL = 0.02;
 /** A blinking blockout's cap: its side, in metres. */
 const CAP_SIDE = 0.1;
 
-/** A blinking blockout's cap: its height, in metres; the box stops this far under the top. */
+/**
+ * A blinking blockout's cap: its height, in metres; the box stops this far
+ * under the top.
+ */
 const CAP_HEIGHT = 0.02;
 
 /**

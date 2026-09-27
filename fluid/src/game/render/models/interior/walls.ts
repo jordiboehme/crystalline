@@ -212,7 +212,10 @@ function roundel(
   k.panel(a - s, a + s, d + DECAL_LIFT, h - s, h + s, face, 2 * s, 2 * s);
 }
 
-/** A roundel wall cell's centre `(a, h)`, column 0 on the left, row 0 at the bottom. */
+/**
+ * A roundel wall cell's centre `(a, h)`, column 0 on the left, row 0 at the
+ * bottom.
+ */
 const cellAt = (col: number, row: number) => ({
   a: (col - (ROUNDEL.cols - 1) / 2) * ROUNDEL.pitchA,
   h: ROUNDEL.low + row * ROUNDEL.pitchH,

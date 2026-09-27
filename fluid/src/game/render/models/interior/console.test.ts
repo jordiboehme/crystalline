@@ -61,7 +61,9 @@ function boundsOf(p: Part): { lo: V3; hi: V3; mid: V3 } {
 }
 const height = (p: Part) => boundsOf(p).hi[1] - boundsOf(p).lo[1];
 const radial = (q: V3) => Math.hypot(q[0], q[2]);
-/** A desk panel: `CONSOLE_PANEL` tint, reaching from the ring out to the rim. */
+/**
+ * A desk panel: `CONSOLE_PANEL` tint, reaching from the ring out to the rim.
+ */
 const isPanel = (p: Part) =>
   p.tint !== null &&
   p.tint.every((c, i) => Math.abs(c - (CONSOLE_PANEL[i] ?? -1)) < 1e-6) &&
@@ -104,7 +106,8 @@ function consolePiece(): { piece: InteriorPiece; index: number } {
 
 describe("the console (2.6e C8)", () => {
   it("slopes six panels down from the centre ring to the rim at waist height (2.6e C8)", () => {
-    // Mutation caught: flat panels, five or seven sides, or the rim off waist height.
+    // Mutation caught: flat panels, five or seven sides, or the rim off
+    // waist height.
     const panels = consoleParts().filter(isPanel);
     expect(panels.length).toBe(6);
     const bearings = panels

@@ -15,7 +15,8 @@
  * The console room's fittings set no text at all (2.6e C20): every
  * interior kind and variant is built in every look with the records
  * cleared first, with the console room's moving parts (the rotor), and
- * neither `textRows` nor a pixel-mark helper may be called. Their recipes take no model context, so `label` and
+ * neither `textRows` nor a pixel-mark helper may be called. Their recipes take
+ * no model context, so `label` and
  * `textPanel`, which need one for a text layer, are out of their reach.
  */
 

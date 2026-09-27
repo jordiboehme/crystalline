@@ -40,7 +40,10 @@ export interface PlaceReference {
   target: { domain: string | null; target: string };
   /** The index resolved it. */
   resolved: boolean;
-  /** Where it lands; null when unresolved or not located (then the fixture is sealed). */
+  /**
+   * Where it lands; null when unresolved or not located (then the fixture
+   * is sealed).
+   */
   address: PlaceAddress | null;
   /** The title of the engram it lands on, when the graph located it. */
   targetTitle: string | null;
@@ -345,7 +348,8 @@ export type CeilingPropKind =
   | "beacon"
   // condition extra
   | "loose-cable"
-  // spans a line across the hall's interior, stopping one cell short of every wall
+  // spans a line across the hall's interior, stopping one cell short of
+  // every wall
   | "span-duct"
   | "span-tray";
 
@@ -589,7 +593,10 @@ export interface RoomSpec {
   width: number;
   /** Cells north to south, of the whole grid. */
   depth: number;
-  /** One string per row, `"."` for floor and `" "` for void, each `width` long. */
+  /**
+   * One string per row, `"."` for floor and `" "` for void, each `width`
+   * long.
+   */
   grid: string[];
   /** The main hall inside the grid; the entrance is on its south wall. */
   hall: Rect;

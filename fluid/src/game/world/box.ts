@@ -41,7 +41,13 @@
 
 import { seedFor, createRng } from "../core/seed";
 import { domainSpellings } from "../../domainNames";
-import { REACH, FACING, type DoorState, type WallPoint } from "./interact";
+import {
+  REACH,
+  FACING,
+  relative,
+  type DoorState,
+  type WallPoint,
+} from "./interact";
 import { FOOTPRINTS, HERO_FRONT, heroTurn, turnedPoint } from "./footprints";
 import type { Player } from "./move";
 import type { Hero, RoomSpec } from "./types";
@@ -73,7 +79,10 @@ export const BOX_REACH = 0.6;
  */
 export const BOX_OPENING = 0.45;
 
-/** A police box's doors are open enough to walk through above this fraction (C11). */
+/**
+ * A police box's doors are open enough to walk through above this fraction
+ * (C11).
+ */
 export const BOX_OPEN_ENOUGH = 0.9;
 
 /**
@@ -91,20 +100,6 @@ export function boxFront(h: Hero): WallPoint {
   const depth = FOOTPRINTS.hero[h.kind][h.variant]?.depth ?? 0;
   const p = turnedPoint(h.x, h.y, turn, 0, depth / 2);
   return { x: p.x, z: p.z, inward: [fx, fz], along: [fz, -fx] };
-}
-
-/**
- * Where the player stands relative to a police box's front wall (see
- * `boxFront`): `depth` metres in front of it (negative behind it, inside
- * the box's own body) and `side` metres along it from its middle.
- */
-function relative(w: WallPoint, x: number, z: number) {
-  const dx = x - w.x;
-  const dz = z - w.z;
-  return {
-    depth: dx * w.inward[0] + dz * w.inward[1],
-    side: dx * w.along[0] + dz * w.along[1],
-  };
 }
 
 /**
@@ -272,11 +267,7 @@ export function exitSeed(from: string, ticks: number): number {
  * three fields independently, is what keeps a naming collision from
  * over-excluding: a row whose *canonical name text* happens to equal
  * another row's *local name* must not match on that text, since the
- * spelling belongs to the other domain (2.6e review: `answersTo` matched
- * every row whose canonical name or alias happened to equal `from`, so two
- * rows sharing a contested canonical name, or a row's canonical name
- * shadowed by another's local name, were both excluded even though at most
- * one of them is truly the domain `from` names).
+ * spelling belongs to the other domain.
  */
 function resolveLocal(rows: readonly DomainRow[], from: string): string {
   const spellings = domainSpellings(

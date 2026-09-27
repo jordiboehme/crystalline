@@ -58,7 +58,10 @@ export const BLINK_BANKS = [
 export type BlinkBank = (typeof BLINK_BANKS)[number];
 /** Groups per bank: a part's flag is `FLAG.blink + group`. */
 export const BLINK_GROUPS = 8;
-/** Gains the shader reads, bank by bank: `uBlink[slot * BLINK_GROUPS + group]`. */
+/**
+ * Gains the shader reads, bank by bank: `uBlink[slot * BLINK_GROUPS +
+ * group]`.
+ */
 export const BLINK_CHANNELS = BLINK_BANKS.length * BLINK_GROUPS;
 /** A dark group of the swap and chase banks: dim glass, not black. */
 export const BLINK_LOW = 0.15;
@@ -83,7 +86,10 @@ const SPECIAL: Partial<Record<BlinkBank, LightSpecial>> = {
   twinkle: "flicker",
 };
 
-/** The longest glow cycle `GLOW_CYCLE` will record before it gives up, in ticks. */
+/**
+ * The longest glow cycle `GLOW_CYCLE` will record before it gives up, in
+ * ticks.
+ */
 const GLOW_CYCLE_MAX = 1000;
 
 /**

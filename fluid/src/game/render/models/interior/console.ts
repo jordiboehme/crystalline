@@ -97,7 +97,10 @@ const DIAL: Rgb = [0.2, 0.22, 0.23];
 /** The lever's knob: red. */
 const KNOB: Rgb = [0.78, 0.16, 0.12];
 
-/** The panel lights' colours, one per light of a row: amber, green, red and white (C8). */
+/**
+ * The panel lights' colours, one per light of a row: amber, green, red and
+ * white (C8).
+ */
 const LIGHTS: readonly Rgb[] = [
   [1.0, 0.62, 0.15],
   [0.35, 1.0, 0.45],
@@ -129,16 +132,24 @@ const PANEL_MARGIN = 0.06;
 /** The column's rings: their radius and each ring's height, in metres. */
 const COLUMN_RING = { radius: 0.4, base: 0.1, top: 0.06, sides: 18 } as const;
 
-/** A rib's side, in metres, and how far out from the column's axis it stands. */
+/**
+ * A rib's side, in metres, and how far out from the column's axis it stands.
+ */
 const RIB = { side: 0.02, at: 0.37 } as const;
 
 /** Facets round the column's rings, the dials and the rotor's round parts. */
 const ROUND = 16;
 
-/** The apothem of a regular hexagon of corner radius `r`: its centre to a side's middle. */
+/**
+ * The apothem of a regular hexagon of corner radius `r`: its centre to a
+ * side's middle.
+ */
 const apothem = (r: number) => r * Math.cos(Math.PI / SIDES);
 
-/** A facet's slope down and out, in metres of drop per metre along the slope's plan. */
+/**
+ * A facet's slope down and out, in metres of drop per metre along the
+ * slope's plan.
+ */
 const SLOPE =
   (CONSOLE.ring - CONSOLE.rim) /
   (apothem(CONSOLE.corners / 2) - apothem(RING_RADIUS));

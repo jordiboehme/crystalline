@@ -166,7 +166,10 @@ describe("stepPlayer", () => {
   });
 });
 
-/** One tick's travel at full speed, in metres: how short of contact a stop can land. */
+/**
+ * One tick's travel at full speed, in metres: how short of contact a stop
+ * can land.
+ */
 const STEP = 7 / 35 + 1e-6;
 
 /** A player standing still at a point, facing north. */
@@ -284,7 +287,8 @@ describe("walking on the grid", () => {
 
   it("walks into a bay through its doorway and stops at the wall beside it", () => {
     const hall = hub.hall;
-    // The first bay's doorway is the hall's east neighbour column, rows 3 and 4.
+    // The first bay's doorway is the hall's east neighbour column, rows 3
+    // and 4.
     expect(isFloor(hub.grid, hall.x1, 3)).toBe(true);
     expect(isFloor(hub.grid, hall.x1, 4)).toBe(true);
     expect(isFloor(hub.grid, hall.x1, 2)).toBe(false);

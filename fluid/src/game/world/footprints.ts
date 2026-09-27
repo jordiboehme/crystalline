@@ -436,7 +436,10 @@ export const HERO_LIFT = {
 /** A hero kind that hovers. */
 export type LiftedHeroKind = keyof typeof HERO_LIFT;
 
-/** A hero kind's lift (`HERO_LIFT`), 0 for every kind that stands on the floor. */
+/**
+ * A hero kind's lift (`HERO_LIFT`), 0 for every kind that stands on the
+ * floor.
+ */
 export function heroLift(kind: HeroKind): number {
   return (HERO_LIFT as Partial<Record<HeroKind, number>>)[kind] ?? 0;
 }

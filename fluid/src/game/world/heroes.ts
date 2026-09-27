@@ -198,7 +198,10 @@ export const HERO_KINDS: readonly HeroKind[] = [
   "slab-walker",
 ];
 
-/** One kind's entry: where it stands, how many variants, how tall, its edges and its tops. */
+/**
+ * One kind's entry: where it stands, how many variants, how tall, its edges
+ * and its tops.
+ */
 export interface HeroEntry {
   placement: HeroPlacement;
   variants: number;
@@ -222,7 +225,8 @@ export interface HeroEntry {
    * only the kinds a later spec gives a use keep one. The cabinets, the
    * thunder hammer and the police box keep one `HERO_USE_OUT` (0.45 m) in
    * front of the face on the centre line, the question block one under its
-   * middle (C15); nothing reads them in 2.6c but the tests.
+   * middle (C15). The arrival box's spawn reads the police box's use point
+   * (`withArrivalBox`); every other kind's is read only by the tests.
    */
   use: { a: number; d: number } | null;
 }
@@ -243,8 +247,8 @@ export const HERO_USE_OUT = 0.45;
  * may stand under (`heroMinCeiling`), a wall hero's top under
  * `HERO_WALL_TOP`; a top over `HERO_FLOOR_TOP` makes the kind tall
  * (`isTallHero`, C6), and a tall kind stands in the band, at the centre,
- * free in the open or backed against a wall, never in a corner. An arcade cabinet's three
- * variants are its three games, one size.
+ * free in the open or backed against a wall, never in a corner. An arcade
+ * cabinet's three variants are its three games, one size.
  */
 export const HERO_CATALOGUE = {
   turret: {
@@ -633,9 +637,15 @@ export const HERO_BIG_HALL = 16;
 export const HERO_SHARE = 3 / 5;
 /** Chance a room draws the turret (spec: about 1 room in 6). */
 export const TURRET_SHARE = 1 / 6;
-/** Chance a room draws the slab (spec: about 1 room in 40, where the centre is free). */
+/**
+ * Chance a room draws the slab (spec: about 1 room in 40, where the centre
+ * is free).
+ */
 export const SLAB_SHARE = 1 / 40;
-/** Chance a room draws the question block (spec: about 1 hall in 20), after the turret (C9). */
+/**
+ * Chance a room draws the question block (spec: about 1 hall in 20), after
+ * the turret (C9).
+ */
 export const BLOCK_SHARE = 1 / 20;
 
 /**
@@ -654,7 +664,10 @@ export const ANY_POOL = [
 
 /** Chance the any-archetype draw takes (C9, 2.6f C2). */
 export const ANY_SHARE = 3 / 4;
-/** The moat around a free or backed hero, in metres (H19, H20): wider than the player (0.7 m). */
+/**
+ * The moat around a free or backed hero, in metres (H19, H20): wider than
+ * the player (0.7 m).
+ */
 export const HERO_CLEAR = 1.0;
 
 /**
@@ -687,7 +700,10 @@ export function standsFree(room: SiteBase, box: Box): boolean {
     fitsFloor(room, ring)
   );
 }
-/** How deep the clear view box in front of a flush wall hero is, in metres (H19). */
+/**
+ * How deep the clear view box in front of a flush wall hero is, in metres
+ * (H19).
+ */
 export const HERO_VIEW = 1.5;
 /** The slab's height (H9): nine of its 0.3 m depth. */
 export const SLAB_TOP = 2.7;
@@ -700,7 +716,10 @@ export const HERO_WALL_TOP = 2.25;
 /** The lowest ceiling the generator makes, in metres (salience 0). */
 export const LOWEST_CEILING = 3.0;
 
-/** How far under the ceiling a hero's top stays at the least, in metres (the models' `HEADROOM`). */
+/**
+ * How far under the ceiling a hero's top stays at the least, in metres (the
+ * models' `HEADROOM`).
+ */
 export const HERO_CEILING_GAP = 0.05;
 
 /**
@@ -719,7 +738,10 @@ export const HERO_MIN_CEILING = {
   "garden-robot": 3.7,
 } as const satisfies Partial<Record<HeroKind, number>>;
 
-/** The lowest ceiling a kind stands under: its `HERO_MIN_CEILING` entry, else `LOWEST_CEILING`. */
+/**
+ * The lowest ceiling a kind stands under: its `HERO_MIN_CEILING` entry, else
+ * `LOWEST_CEILING`.
+ */
 export function heroMinCeiling(kind: HeroKind): number {
   return (
     (HERO_MIN_CEILING as Partial<Record<HeroKind, number>>)[kind] ??
@@ -739,7 +761,10 @@ export function isTallHero(kind: HeroKind): boolean {
   return e.placement !== "wall" && e.top > HERO_FLOOR_TOP;
 }
 
-/** How many heroes a hall holds (H6): 2 when both sides reach `HERO_BIG_HALL`, else 1. */
+/**
+ * How many heroes a hall holds (H6): 2 when both sides reach
+ * `HERO_BIG_HALL`, else 1.
+ */
 export function heroCap(hall: Rect): 1 | 2 {
   return hall.x1 - hall.x0 >= HERO_BIG_HALL &&
     hall.y1 - hall.y0 >= HERO_BIG_HALL
@@ -747,7 +772,10 @@ export function heroCap(hall: Rect): 1 | 2 {
     : 1;
 }
 
-/** The wall a wall-anchored hero at each quarter turn stands on: `turnForSide` inverted. */
+/**
+ * The wall a wall-anchored hero at each quarter turn stands on:
+ * `turnForSide` inverted.
+ */
 const SIDE_FOR_TURN: readonly Side[] = ["s", "w", "n", "e"];
 
 /**
@@ -836,7 +864,10 @@ export function heroPoint(
   return turnedPoint(h.x, h.y, heroTurn(h), a, d);
 }
 
-/** One of a hero's surfaces in world metres: its box, height, free height and class. */
+/**
+ * One of a hero's surfaces in world metres: its box, height, free height
+ * and class.
+ */
 export interface HeroSurface {
   box: Box;
   h: number;
@@ -880,7 +911,10 @@ export function heroUnder(h: Hero): HeroSurface[] {
   return heroRects(h, specs);
 }
 
-/** The heroes' order in `RoomSpec.heroes`: by `y`, then `x`, then kind by code point. */
+/**
+ * The heroes' order in `RoomSpec.heroes`: by `y`, then `x`, then kind by
+ * code point.
+ */
 export const HERO_ORDER = (a: Hero, b: Hero): number =>
   a.y - b.y || a.x - b.x || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
 
@@ -975,7 +1009,10 @@ export function rawHero(
   return null;
 }
 
-/** One place a hero may be tried at: its seed, its anchor and how to make the hero. */
+/**
+ * One place a hero may be tried at: its seed, its anchor and how to make
+ * the hero.
+ */
 interface HeroCandidate {
   seed: number;
   x: number;

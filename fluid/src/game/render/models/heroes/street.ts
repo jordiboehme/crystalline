@@ -23,8 +23,9 @@
  *   behind it, and two on the lower panels, over the chassis and over the
  *   rear wheel, each on a plate of its own or printed straight on the red.
  * - The police box stands free, centred on its anchor like any free hero
- *   (2.6e: never against a wall), its doors facing `+d` (C3, C10): deep blue painted wood on a low plinth, a corner post from
- *   the plinth to the roof at each corner, a black sign band under the
+ *   (2.6e: never against a wall), its doors facing `+d` (C3, C10): deep blue
+ *   painted wood on a low plinth, a corner post from the plinth to the roof at
+ *   each corner, a black sign band under the
  *   roof on all four sides with its words in white block pixels
  *   (`BOX_SIGN`, laid out by `boxSignLayout`), a roof in two steps under
  *   a small lamp in a white cage that breathes, and on every side two
@@ -52,8 +53,8 @@
  *   to (`movers`), which the model checks are.
  *
  * The numbers each kind is built to are named above its recipe: `BIKE`,
- * `BIKE_BODY` and `BIKE_PROFILE` for the bike, `BOX` for the box. Round parts use few
- * facets, as in every batch.
+ * `BIKE_BODY` and `BIKE_PROFILE` for the bike, `BOX` for the box. Round parts
+ * use few facets, as in every batch.
  */
 
 import { boxKey } from "../../../world/box";
@@ -90,7 +91,9 @@ const ORIGIN: Frame = frameAt([0, 0, 0], 0);
 /** The bike's glossy red. */
 const BIKE_RED: Rgb = [0.9, 0.08, 0.06];
 
-/** The gloss on the top of the cowl: a lighter red where the light catches it. */
+/**
+ * The gloss on the top of the cowl: a lighter red where the light catches it.
+ */
 const BIKE_SHINE: Rgb = [0.98, 0.22, 0.16];
 
 /** The bike's tyres: a near black rubber. */
@@ -282,7 +285,10 @@ const TREAD: Rgb = [0.025, 0.025, 0.03];
 /** The front brake disc's bright steel. */
 export const BRAKE_STEEL: Rgb = [0.72, 0.72, 0.75];
 
-/** The bezels round the lamps, the caliper and the instrument panel: a dark grey. */
+/**
+ * The bezels round the lamps, the caliper and the instrument panel: a dark
+ * grey.
+ */
 const BIKE_DARK: Rgb = [0.14, 0.14, 0.16];
 
 /** The accent line along each side: an off white. */
@@ -631,7 +637,10 @@ const BLUE: Rgb = [0.05, 0.15, 0.35];
 /** The sign band's black. */
 const SIGN_BLACK: Rgb = [0.05, 0.05, 0.05];
 
-/** The white of the sign's words, the window frames, the notice and the lamp's cage. */
+/**
+ * The white of the sign's words, the window frames, the notice and the
+ * lamp's cage.
+ */
 const WHITE: Rgb = [0.95, 0.95, 0.92];
 
 /** The frosted panes' faint steady glow. */
@@ -665,7 +674,10 @@ export const BOX_SWING = (5 * Math.PI) / 12;
  */
 const SHELL = 0.04;
 
-/** The thickness of the white lining on each side wall's inner face, in metres. */
+/**
+ * The thickness of the white lining on each side wall's inner face, in
+ * metres.
+ */
 const LINING = 0.005;
 
 /**
@@ -718,7 +730,10 @@ const BOX = {
  */
 const BOX_BODY: Frame = offset(ORIGIN, 0, -BOX.front / 2);
 
-/** Half the width of the meeting stile between the two door leaves, in metres. */
+/**
+ * Half the width of the meeting stile between the two door leaves, in
+ * metres.
+ */
 const STILE = 0.02;
 
 /**
@@ -916,8 +931,8 @@ export function boxHinge(leaf: "left" | "right"): { a: number; d: number } {
  *
  * The leaf is built in a frame whose origin is its hinge (`boxHinge`):
  * the vertical line at its outer edge on the leaf's inner face, so
- * swinging it is a turn about that frame's origin. It is a slab `BOX.leaf` thick from
- * the body's front out to the door plane, with its column of panels
+ * swinging it is a turn about that frame's origin. It is a slab `BOX.leaf`
+ * thick from the body's front out to the door plane, with its column of panels
  * (`facePanels`) on the slab's front and a dark handle at its inner edge.
  * The right leaf (at `+a`, the viewer's right) carries the meeting stile
  * that covers the joint between the two; the left one the door notice.

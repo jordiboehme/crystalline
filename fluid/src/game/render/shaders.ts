@@ -118,12 +118,16 @@ layout(location = 3) in float aLayer;
 layout(location = 4) in vec3 aTint;
 layout(location = 5) in float aFlag;
 layout(location = 6) in vec3 aInstanceOffset;
-layout(location = 7) in vec2 aInstanceTurn; // x: quarter turns, y: slot, the blink bank (H11); 0 for the room, the movers and the props
+// x: quarter turns, y: slot, the blink bank (H11); 0 for the room, the movers
+// and the props
+layout(location = 7) in vec2 aInstanceTurn;
 uniform mat4 uViewProjection;
 uniform vec3 uModelOffset;
 uniform vec3 uModelPivot;
 uniform float uModelScale;
-uniform vec2 uModelYaw; // (cos, sin) of the turn about uModelPivot's vertical; (1, 0) for everything but a swinging leaf
+// (cos, sin) of the turn about uModelPivot's vertical; (1, 0) for everything
+// but a swinging leaf
+uniform vec2 uModelYaw;
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;

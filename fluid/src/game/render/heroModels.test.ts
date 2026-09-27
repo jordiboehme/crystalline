@@ -33,7 +33,10 @@ import { HERO_BANK } from "./models/heroes/common";
 import { FLOOR_TOP, WALL_TOP } from "./models/props/common";
 
 const EPS = 1e-4;
-/** A free hero's anchor, in cell units: the middle of a cell's width, on a row line. */
+/**
+ * A free hero's anchor, in cell units: the middle of a cell's width, on a row
+ * line.
+ */
 const FREE_AT = { x: 4.5, y: 3 } as const;
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 

@@ -22,10 +22,10 @@
  * and I inverts the vertical look.
  *
  * `options.props` false shows the place undressed: `session.showRoom` with
- * `generateRoom`'s props, heroes and curios stripped, rather than `session.showCanned`, which
- * is the dev-only comparison `?props=0` reads. That path has no client-side
- * `PlaceInput` kept by the session, so its terminals open no reader; R
- * still swaps the condition, rebuilding the same way.
+ * `generateRoom`'s props, heroes and curios stripped, rather than
+ * `session.showCanned`, which is the dev-only comparison `?props=0` reads. That
+ * path has no client-side `PlaceInput` kept by the session, so its terminals
+ * open no reader; R still swaps the condition, rebuilding the same way.
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
  * own forced-draws path and the shared forced-hero seam, `withHeroes` in
@@ -320,8 +320,9 @@ export function roomWithForcedProp(
  * Safari takes can be judged on any browser. `options.openFluid` is where F
  * sends the engram's Fluid page. `options.place` is the canned bridge
  * unless the caller names another, and `options.props` is true unless the
- * caller asks for the undressed comparison (no props and no heroes). R shows the same place again
- * with its status swapped, which keeps the player where they stand.
+ * caller asks for the undressed comparison (no props and no heroes). R shows
+ * the same place again with its status swapped, which keeps the player where
+ * they stand.
  *
  * `options.hero` forces that kind into the room instead (`roomWithForcedHero`),
  * which overrides `options.props`: the room is always shown dressed, since
@@ -390,7 +391,10 @@ export function startDemo(
     openFluid: options.openFluid,
     forceRgba8: options.forceRgba8,
   });
-  /** Shows a room built by `hero`, `curio` or `prop`, framed at `at` when it resolves. */
+  /**
+   * Shows a room built by `hero`, `curio` or `prop`, framed at `at` when it
+   * resolves.
+   */
   const showBuilt = (room: RoomSpec) => {
     const spot = at === undefined ? null : spotView(room, at);
     session.showRoom(

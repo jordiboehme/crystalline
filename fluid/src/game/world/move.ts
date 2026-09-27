@@ -407,8 +407,9 @@ export function headBob(p: Player): number {
 /**
  * The vertical look handed to `stepPlayer`, after the player's choice of
  * inverted look (key I): the mouse's `dy` as it came, or negated when
- * inverted, so moving the mouse forward looks down instead of up. Kept apart from `stepPlayer` so the choice lives in one place and
- * the session only passes a flag.
+ * inverted, so moving the mouse forward looks down instead of up. Kept apart
+ * from `stepPlayer` so the choice lives in one place and the session only
+ * passes a flag.
  */
 export function lookDelta(dy: number, inverted: boolean): number {
   return inverted ? -dy : dy;

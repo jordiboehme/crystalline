@@ -5,9 +5,9 @@
  * neighbourhood graph are read with `client.fetchQuery` under the very keys the
  * reading screen uses (`engramDetailKey`, `graphKey`), so a room entered from
  * the page it mirrors costs no second request while the cached answer is fresh
- * (`GAME_STALE_MS`), and the page and the room cannot disagree about which version of the
- * engram they are holding. The domain listing is the sidebar's, under
- * `DOMAINS_QUERY_KEY`. Only the inbound page has a key of the game's own,
+ * (`GAME_STALE_MS`), and the page and the room cannot disagree about which
+ * version of the engram they are holding. The domain listing is the sidebar's,
+ * under `DOMAINS_QUERY_KEY`. Only the inbound page has a key of the game's own,
  * because it asks for a page size (`HATCH_CAP`) no screen asks for.
  *
  * What fails decides what comes back. The detail is the room: a 404, a 403 or

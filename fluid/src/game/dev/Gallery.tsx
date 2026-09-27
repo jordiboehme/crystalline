@@ -27,8 +27,8 @@
  * room is shown through `session.showRoom`'s `view` argument rather than
  * only its `spawn`. An optional view suffix frames any of them from
  * elsewhere (2.6d C20): `:back` from behind, `:side` from the right side,
- * `:quarter` from halfway between the front and the right, and `:close`
- * a hero or prop from nearer (`?at=prop:<kind>:<n>[:back|:side|:quarter|:close]`);
+ * `:quarter` from halfway between the front and the right, and `:close` a hero
+ * or prop from nearer (`?at=prop:<kind>:<n>[:back|:side|:quarter|:close]`);
  * `?at=<kind>:<n>` still puts the player in front of the n-th fixture of
  * that kind, facing it, instead of the room's own entrance, to judge a
  * malfunctioning fixture without walking across the hall. `?fault=missing`

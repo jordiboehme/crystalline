@@ -56,8 +56,8 @@
  * and swinging shut, and its walk-in latched until the player has stepped
  * `BOX_LATCH_CLEAR` (1.2 m) away from its front (`steppedAway`). The
  * walk-in is latched that way after every walk-in, the exit like a way, so
- * each fires again only after the player has stepped away; a failed exit leaves the
- * player inside with the notice. Neither fires while a load is in flight
+ * each fires again only after the player has stepped away; a failed exit leaves
+ * the player inside with the notice. Neither fires while a load is in flight
  * or an overlay has the keys, and every entry of a room ends the visit of
  * the console room (a jump from inside leaves it like any `go`).
  *
@@ -390,7 +390,7 @@ const CLAIMED_KEYS: ReadonlySet<string> = new Set([
   ...ALT_KEYS,
 ]);
 
-/** The use key: doors, terminals, the hatch. */
+/** The use key: doors, terminals, the hatch, a police box's doors. */
 const USE_KEY = "Space";
 
 /** The look keys, in the order they are read. */
@@ -453,7 +453,10 @@ export function createSession(opts: SessionOptions): Session {
   /** The blink banks' gains, one state for the whole session (H11). */
   const blink = createBlink();
   let doors = new Map<number, DoorState>();
-  /** Every police box's doors, keyed by its index in `room.heroes` (`boxKey`). */
+  /**
+   * Every police box's doors, keyed by its index in `room.heroes`
+   * (`boxKey`).
+   */
   let boxes = new Map<number, DoorState>();
   let doorOpen = new Map<string, number>();
   let player: Player | null = null;

@@ -6,9 +6,10 @@
  * Every way's moving parts come back from its model as movers (`Mover` in
  * `models/common.ts`): leaves keyed `door:<i>`, and `spark:<i>`,
  * `lamp:<i>`, `lid:<i>` and `disc:<i>`. Each one is drawn with its slide
- * (`axis * travel`) times an open fraction, a scale about its pivot, a
- * turn about its pivot's vertical (`yaw`), a gain and a swirl time. Leaves take the door's fraction from `DoorState`
- * unless a fault frame names their fixture. A lid takes only the frame's.
+ * (`axis * travel`) times an open fraction, a scale about its pivot, a turn
+ * about its pivot's vertical (`yaw`), a gain and a swirl time. Leaves take the
+ * door's fraction from `DoorState` unless a fault frame names their fixture.
+ * A lid takes only the frame's.
  * Sparks are drawn only while a frame lights them. The lamp glows at its
  * rest gain and blinks brighter while a frame lights it. A disc scales,
  * flickers and shifts its swirl with the frame, and is skipped at scale 0.
@@ -100,8 +101,8 @@ export function swungPoint(p: V3, pivot: V3, yaw: number): V3 {
 
 /**
  * The uniforms that leave a draw as it is: no offset, scale 1 about the
- * origin, gain 1, no turn, and the frame's own swirl time. The renderer sets them
- * before the static room, again after the movers, before the props and
+ * origin, gain 1, no turn, and the frame's own swirl time. The renderer sets
+ * them before the static room, again after the movers, before the props and
  * heroes, and once more after those, so every draw pass ends at the
  * identity.
  */
@@ -120,8 +121,8 @@ export function restDraw(seconds: number): MoverDraw {
  * How mover `m` is drawn this frame, given its door's open fraction
  * (`doorOpen`, from `DoorState` by the mover's key, 0 when missing), the
  * running fault frame of its fixture (undefined while none runs) and the
- * frame's time in seconds (which alone drives a rotor). See the module doc for each part; null means
- * the part is not drawn.
+ * frame's time in seconds (which alone drives a rotor). See the module doc for
+ * each part; null means the part is not drawn.
  */
 export function moverDraw(
   m: MoverInfo,

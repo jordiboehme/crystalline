@@ -35,7 +35,10 @@ import { dressingSites, fitsFloor, grow, overlaps } from "./sites";
 import type { Box, Fixture, Hero, PlaceInput, Prop, RoomSpec } from "./types";
 import { CELL } from "./units";
 
-/** The statuses the sweep cycles through: every condition once in four rooms. */
+/**
+ * The statuses the sweep cycles through: every condition once in four
+ * rooms.
+ */
 const STATUSES = ["stable", "draft", "archived", "deprecated"] as const;
 
 /**

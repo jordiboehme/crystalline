@@ -56,7 +56,10 @@ function fourBoxes(): RoomSpec {
   return { ...room, heroes };
 }
 
-/** A player standing `out` metres in front of box `h`'s front, `side` metres along it, facing it. */
+/**
+ * A player standing `out` metres in front of box `h`'s front, `side` metres
+ * along it, facing it.
+ */
 function facing(h: Hero, out: number, side = 0): Player {
   const f = boxFront(h);
   return {

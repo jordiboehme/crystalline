@@ -10,9 +10,9 @@
  * `arrivalBoxCandidates` where it fits. The candidates are the hall's
  * half-cell points within `ARRIVAL_REACH` cells of the entrance's doorway
  * (the middle of the entrance cell's south edge), nearest first, the east
- * one first where two lie equally far. `placeArrivalBox` takes a candidate when the box stands free
- * (`standsFree` in `heroes.ts`: a walkway of `HERO_WALKWAY` all round it,
- * clear of every wall and of what hangs on the walls), its floor
+ * one first where two lie equally far. `placeArrivalBox` takes a candidate when
+ * the box stands free (`standsFree` in `heroes.ts`: a walkway of `HERO_WALKWAY`
+ * all round it, clear of every wall and of what hangs on the walls), its floor
  * (`heroFootprint`) enters no lane of `dressingSites(room)`, its moat
  * (`HERO_CLEAR`, wider than the walkway) overlaps none of its taken boxes
  * (the fixtures' footprints, the furniture and the scaffold frames) and
@@ -43,6 +43,7 @@ import { seedFor } from "../core/seed";
 import { HERO_FRONT, heroFootprint, pipeRunBox } from "./footprints";
 import { withHeroes } from "./generate";
 import { HERO_CLEAR, heroUsePoint, standsFree } from "./heroes";
+import { yawFacing } from "./interact";
 import { dressingSites, grow, overlaps } from "./sites";
 import type { Hero, PlaceInput, RoomSpec } from "./types";
 
@@ -154,8 +155,7 @@ export function withArrivalBox(
       h.y === placed.y &&
       h.seed === placed.seed,
   );
-  const [fx, fz] = HERO_FRONT[placed.turn] ?? [0, -1];
-  // `forwardOf(yaw)` is `[-sin, -cos]`; the `+ 0` turns a -0 into 0.
-  const yaw = Math.atan2(-fx, -fz) + 0;
+  const front = HERO_FRONT[placed.turn] ?? [0, -1];
+  const yaw = yawFacing(front);
   return { room: next, box, spawn: { x: use.x, z: use.z, yaw } };
 }

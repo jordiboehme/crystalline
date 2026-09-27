@@ -397,7 +397,8 @@ function flatQuad(
   up: boolean,
   s: Surface,
 ) {
-  // Counter-clockwise seen from above for the floor, from below for the ceiling.
+  // Counter-clockwise seen from above for the floor, from below for the
+  // ceiling.
   const corners: [number, number][] = up
     ? [
         [x0, z1],

@@ -10,8 +10,8 @@
  * small light upload, the blink gains (`uBlink`, the blink banks of
  * `blink.ts`, H11), the room and its moving parts (each mover drawn with
  * the uniforms `moverDraw` in `parts.ts` gives it), one instanced draw per
- * prop, hero, curio or fitting kind and variant, and six full-screen passes. The
- * scene is rendered at the canvas size handed to `resize`, the bloom at
+ * prop, hero, curio or fitting kind and variant, and six full-screen passes.
+ * The scene is rendered at the canvas size handed to `resize`, the bloom at
  * half of that and below. The static room is drawn at `restDraw`, the
  * movers at their own uniforms, and the uniforms go back to `restDraw`
  * before the instance groups and once more after them, so `uGain` is 1
@@ -31,8 +31,8 @@
  * needs is built once as its own mesh in the look's colours and kept in a
  * cache keyed by the group's key; the cache is cleared when the look's id
  * changes and otherwise grows lazily, bounded by the prop, hero, curio and
- * fitting catalogues. The condition does not enter the key: it changes only grime
- * and light scale, never the palette a mesh is coloured from (a look test
+ * fitting catalogues. The condition does not enter the key: it changes only
+ * grime and light scale, never the palette a mesh is coloured from (a look test
  * pins that). The room's instance buffers depend only on the room, so a
  * look switch, which calls `setRoom` again with the very same room object,
  * keeps them and only rebuilds the small vertex arrays that bind them to
@@ -200,9 +200,9 @@ function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
 }
 
 /**
- * One prop, hero, curio or fitting kind and variant of the room on the GPU: which
- * mesh it draws (`id`), its instance buffer, kept while the room stays the
- * same, and the vertex array that binds it to the cached mesh of the
+ * One prop, hero, curio or fitting kind and variant of the room on the GPU:
+ * which mesh it draws (`id`), its instance buffer, kept while the room stays
+ * the same, and the vertex array that binds it to the cached mesh of the
  * current look, remade on every `setRoom`.
  */
 interface GpuGroup {
@@ -232,7 +232,10 @@ interface Targets {
   u1: Target;
 }
 
-/** Vertical field of view: 70 degrees, a little wider than DOOM's feel on a tall screen. */
+/**
+ * Vertical field of view: 70 degrees, a little wider than DOOM's feel on a
+ * tall screen.
+ */
 const FOV_Y = (70 * Math.PI) / 180;
 
 /**
@@ -413,8 +416,8 @@ export function createRenderer(
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
       const needed: readonly GroupMesh[] =
         nextGroups ?? groups.map((g) => g.id);
-      // The prop, hero, curio and fitting meshes this room lacks in this look are
-      // built on the CPU before the old room is let go, like the room mesh,
+      // The prop, hero, curio and fitting meshes this room lacks in this look
+      // are built on the CPU before the old room is let go, like the room mesh,
       // so one that cannot be built leaves the old room drawn too.
       const fresh = new Map<string, MeshData>();
       for (const g of needed) {

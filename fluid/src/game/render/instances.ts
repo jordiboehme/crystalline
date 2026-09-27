@@ -153,7 +153,9 @@ export interface InteriorGroup {
   data: Float32Array;
 }
 
-/** One instance group of any of the four families; `family` tells them apart. */
+/**
+ * One instance group of any of the four families; `family` tells them apart.
+ */
 export type InstanceGroup = PropGroup | HeroGroup | CurioGroup | InteriorGroup;
 
 /**

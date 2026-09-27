@@ -355,7 +355,9 @@ const SLIDE_LINTEL = 0.15;
 /** The leaves' depth range, inside the jambs'. */
 const SLIDE_D0 = 0.03;
 const SLIDE_D1 = 0.09;
-/** Where the sliding door's label sits: bottom edge, half width, plate depth. */
+/**
+ * Where the sliding door's label sits: bottom edge, half width, plate depth.
+ */
 const SLIDE_LABEL_BOTTOM = 2.62;
 const SLIDE_LABEL_HALF = 0.9;
 const SLIDE_LABEL_D = 0.1;

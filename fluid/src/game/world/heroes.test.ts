@@ -108,7 +108,10 @@ const ARCHETYPES: readonly Archetype[] = [
   "lab",
 ];
 
-/** A hero of `kind` on edge `e` (wall and backed kinds), or centred at (4.5, 3). */
+/**
+ * A hero of `kind` on edge `e` (wall and backed kinds), or centred at
+ * (4.5, 3).
+ */
 function heroAt(kind: HeroKind, variant: number, side: Side = "s"): Hero {
   if (HERO_FOOTING[kind] === "free")
     return { kind, variant, x: 4.5, y: 3, turn: 0, seed: 1 };
@@ -361,7 +364,10 @@ describe("hero local terms against the kit's frame", () => {
     return [byFrame, byTurn];
   }
 
-  /** A hero of `kind` at each of the four turns: on each wall, or turned in place. */
+  /**
+   * A hero of `kind` at each of the four turns: on each wall, or turned in
+   * place.
+   */
   const atEveryTurn = (kind: HeroKind): Hero[] =>
     HERO_FOOTING[kind] === "free"
       ? [0, 1, 2, 3].map((turn) => ({ ...heroAt(kind, 0), turn }))
@@ -542,7 +548,8 @@ describe("what a hero reserves (H19)", () => {
       const got = r.boxes[0];
       if (got === undefined) throw new Error(kind);
       if (HERO_FOOTING[kind] === "flush") {
-        // At turn 0 (a south wall) the view box runs HERO_VIEW north of the wall point.
+        // At turn 0 (a south wall) the view box runs HERO_VIEW north of the
+        // wall point.
         expect(got.z1, kind).toBeCloseTo(h.y * CELL);
         expect(got.z1 - got.z0, kind).toBeCloseTo(HERO_VIEW);
         expect([got.x0, got.x1], kind).toEqual([box.x0, box.x1]);
@@ -657,7 +664,10 @@ function withHeroes(base: SiteBase, heroes: Hero[]): RoomSpec {
 }
 
 const SITES = new Map<SiteBase, DressingSites>();
-/** The sites of a layout, worked out once (`dressingSites` does not read the seed). */
+/**
+ * The sites of a layout, worked out once (`dressingSites` does not read the
+ * seed).
+ */
 const sitesOf = (base: SiteBase) => {
   const known = SITES.get(base);
   if (known !== undefined) return known;
@@ -752,7 +762,10 @@ describe("the hero pass", () => {
     const total = pool.reduce((s, [, x]) => s + x, 0);
     return (before + w / 2) / total;
   };
-  /** The any-archetype draw's roll that picks `kind` out of the full `ANY_POOL`. */
+  /**
+   * The any-archetype draw's roll that picks `kind` out of the full
+   * `ANY_POOL`.
+   */
   const forcedAnyRoll = (kind: HeroKind) => middleRoll(ANY_POOL, kind);
   /** A pool slot's roll that picks `kind` out of `archetype`'s full pool. */
   const forcedPoolRoll = (archetype: Archetype, kind: HeroKind) =>
@@ -1059,7 +1072,8 @@ describe("the hero pass", () => {
     const forced = (base: SiteBase) =>
       placeHeroes(base, { slab: true, turret: false, picks: [] }).length === 1;
     const eligible = EVERY_BASE.filter(({ base }) => forced(base));
-    // The planner's probe: the canned bridge place in every archetype, the hub's bridge and archive.
+    // The planner's probe: the canned bridge place in every archetype, the
+    // hub's bridge and archive.
     expect(
       eligible
         .map(({ base, archetype }) => `${base.permalink} ${archetype}`)

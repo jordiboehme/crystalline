@@ -785,8 +785,8 @@ export const GALLERY_HALL_PROPS = [
  *   (`duct`, `ceiling-tray`) the same way; a ceiling prop may share an edge
  *   with a wall prop, since the two hang at different heights, exactly as
  *   the dressing pass allows;
- * - regular floor kinds centred on rows 1, 3 and 5 of the six inner columns of each
- *   bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0, then row 7 of bay 3 and of
+ * - regular floor kinds centred on rows 1, 3 and 5 of the six inner columns of
+ *   each bay (`bay.x0 + 1` to `bay.x1 - 2`), turn 0, then row 7 of bay 3 and of
  *   bay 4 in the same columns: the four tall kinds Task 1 adds push the
  *   count past what rows 1, 3 and 5 hold. A row-7 cell is left out when its
  *   south wall edge carries a keep-clear wall prop, since the prop lies
@@ -987,7 +987,10 @@ const HERO_HALL_NEED = {
 /** The hero hall's one light level, steady everywhere, as `galleryRoom`'s. */
 const HERO_HALL_LIGHT = 210;
 
-/** One steady light zone per four by four block that holds any floor, as `galleryRoom`'s. */
+/**
+ * One steady light zone per four by four block that holds any floor, as
+ * `galleryRoom`'s.
+ */
 function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
   const lights: LightZone[] = [];
   for (let y0 = 0; y0 < layout.depth; y0 += 4) {

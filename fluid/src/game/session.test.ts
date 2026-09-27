@@ -1998,7 +1998,9 @@ const row = (
   aliases: string[] = [],
 ): DomainRow => ({ name, canonicalName, aliases });
 
-/** The hero hall's domain: the room left when the tests walk in from the hall. */
+/**
+ * The hero hall's domain: the room left when the tests walk in from the hall.
+ */
 const HALL = heroHallRoom().domain;
 
 /** Answers every place with the canned bridge moved to that address. */
@@ -2008,7 +2010,10 @@ const okBridge: PlaceLoader = (a) =>
     place: { ...CANNED_BRIDGE, domain: a.domain, permalink: a.permalink },
   });
 
-/** A session with the console room switched on, its listing `rows` (a value or a promise). */
+/**
+ * A session with the console room switched on, its listing `rows` (a value
+ * or a promise).
+ */
 function startWithConsole(
   rows: readonly DomainRow[] | null | Promise<readonly DomainRow[] | null>,
   load: PlaceLoader,
@@ -2021,7 +2026,10 @@ function startWithConsole(
   });
 }
 
-/** Opens the box in front and walks forward until the room changes (at most 60 ticks). */
+/**
+ * Opens the box in front and walks forward until the room changes (at most
+ * 60 ticks).
+ */
 function walkIn() {
   key("keydown", "Space");
   key("keyup", "Space");

@@ -41,7 +41,10 @@ import { CELL } from "./units";
 /** How far away a fixture can be used, in metres. */
 export const REACH = 2.2;
 
-/** How far off the view direction a fixture may lie and still be faced, in radians. */
+/**
+ * How far off the view direction a fixture may lie and still be faced, in
+ * radians.
+ */
 export const FACING = Math.PI / 4;
 
 /** How close the player must be for a sliding door to open, in metres. */
@@ -69,10 +72,16 @@ export const DOOR_HALF: Readonly<Record<DoorStyle, number>> = {
  */
 export const DOOR_REACH = 0.6;
 
-/** How close to its wall the player must come for a portal to carry the player through. */
+/**
+ * How close to its wall the player must come for a portal to carry the
+ * player through.
+ */
 export const PORTAL_REACH = 0.5;
 
-/** Half the portal's ring, in metres: the part of the wall that is the way through. */
+/**
+ * Half the portal's ring, in metres: the part of the wall that is the way
+ * through.
+ */
 export const PORTAL_HALF = 0.75;
 
 /** How far in front of the fixture the player arrives, in metres. */
@@ -169,15 +178,25 @@ export function wallFacingSpawn(slot: WallSlot): {
 
 /**
  * Where the player stands relative to a wall: `depth` metres in front of it
- * (negative behind it) and `side` metres along it from its middle.
+ * (negative behind it) and `side` metres along it from its middle. Shared
+ * with `box.ts`'s police box front, in the same terms.
  */
-function relative(w: WallPoint, x: number, z: number) {
+export function relative(w: WallPoint, x: number, z: number) {
   const dx = x - w.x;
   const dz = z - w.z;
   return {
     depth: dx * w.inward[0] + dz * w.inward[1],
     side: dx * w.along[0] + dz * w.along[1],
   };
+}
+
+/**
+ * The yaw that faces away from `inward` (into the room, out of a wall or a
+ * police box's front): `forwardOf(yaw)` is `[-sin, -cos]`, so this is
+ * `atan2(-inward[0], -inward[1])`. The `+ 0` turns a -0 into 0.
+ */
+export function yawFacing(inward: readonly [number, number]): number {
+  return Math.atan2(-inward[0], -inward[1]) + 0;
 }
 
 /** Whether two addresses name the same place. */
@@ -287,8 +306,9 @@ export function focusOf(
  *
  * Every door of the room gets a state (a door not in `doors` starts shut).
  * A sliding door heads open while the player `approaches` it (in front
- * of its wall and within `APPROACH` of its wall point) and shut otherwise; a bulkhead or blast door keeps heading
- * where it was until `pressed`, the index of the fixture Space was pressed at
+ * of its wall and within `APPROACH` of its wall point) and shut otherwise; a
+ * bulkhead or blast door keeps heading where it was until `pressed`, the
+ * index of the fixture Space was pressed at
  * this tick, names it, which turns it round. A sealed door always heads
  * shut, and so does a door in `failed`, whatever the player does. Then each
  * door moves `DOOR_STEP` towards where it is heading. Returns a new map;
@@ -426,6 +446,6 @@ export function arrivalSpawn(
   return {
     x: w.x + w.inward[0] * ARRIVAL_DISTANCE,
     z: w.z + w.inward[1] * ARRIVAL_DISTANCE,
-    yaw: Math.atan2(-w.inward[0], -w.inward[1]),
+    yaw: yawFacing(w.inward),
   };
 }
