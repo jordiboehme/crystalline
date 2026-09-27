@@ -1278,13 +1278,23 @@ parity!(
 /// neighbor that is not the source itself is that target. The two resolution
 /// flags must agree, since both tables are bound by the same rule.
 async fn bound_target(store: &dyn Store, source: EngramId) -> Option<(String, String)> {
+    bound_target_as(store, source, None).await
+}
+
+/// [`bound_target`] for a source read in `actor`'s view: the stored verdict,
+/// and the target among what that actor sees.
+async fn bound_target_as(
+    store: &dyn Store,
+    source: EngramId,
+    actor: Option<&str>,
+) -> Option<(String, String)> {
     let refs = store.outbound_refs(source, None).await.unwrap();
     assert_eq!(refs.len(), 2, "one relation and one link: {refs:?}");
     assert_eq!(
         refs[0].resolved, refs[1].resolved,
         "the relation and the link agree: {refs:?}"
     );
-    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    let slice = store.neighbors(&[source], 1, actor).await.unwrap();
     let targets: Vec<(String, String)> = slice
         .nodes
         .iter()
@@ -1543,43 +1553,49 @@ parity!(
 
 /// A core [`crystalline_core::LinkResolver`] over the same engrams and the
 /// same spelling table the store holds, so the index verdict can be compared
-/// with `core::address::resolve`, the rule verify follows.
+/// with `core::address::resolve`, the rule verify follows. `viewer` reads one
+/// actor's drafts over the base, their own row first, as the index's view does.
 struct SpelledLookup {
     /// spelling -> local domain name
     spellings: HashMap<String, String>,
-    /// (local domain, permalink, title)
-    engrams: Vec<(String, String, String)>,
+    /// (local domain, permalink, title, actor); an empty actor is a base row
+    engrams: Vec<(String, String, String, String)>,
+    viewer: Option<String>,
 }
 
-impl crystalline_core::LinkResolver for SpelledLookup {
-    fn by_permalink(&self, domain: &str, permalink: &str) -> Option<crystalline_core::ResolvedRef> {
+impl SpelledLookup {
+    fn find(
+        &self,
+        domain: &str,
+        matches: impl Fn(&str, &str) -> bool,
+    ) -> Option<crystalline_core::ResolvedRef> {
         let local = self
             .spellings
             .get(domain)
             .map(String::as_str)
             .unwrap_or(domain);
-        self.engrams
+        let visible = |actor: &str| actor.is_empty() || Some(actor) == self.viewer.as_deref();
+        let mut hits: Vec<&(String, String, String, String)> = self
+            .engrams
             .iter()
-            .find(|(d, p, _)| d == local && p == permalink)
-            .map(|(d, p, _)| crystalline_core::ResolvedRef {
+            .filter(|(d, p, t, a)| d == local && visible(a) && matches(p, t))
+            .collect();
+        hits.sort_by_key(|(_, _, _, a)| a.is_empty());
+        hits.first()
+            .map(|(d, p, _, _)| crystalline_core::ResolvedRef {
                 domain: d.clone(),
                 permalink: p.clone(),
             })
     }
+}
+
+impl crystalline_core::LinkResolver for SpelledLookup {
+    fn by_permalink(&self, domain: &str, permalink: &str) -> Option<crystalline_core::ResolvedRef> {
+        self.find(domain, |p, _| p == permalink)
+    }
 
     fn by_title(&self, domain: &str, title: &str) -> Option<crystalline_core::ResolvedRef> {
-        let local = self
-            .spellings
-            .get(domain)
-            .map(String::as_str)
-            .unwrap_or(domain);
-        self.engrams
-            .iter()
-            .find(|(d, _, t)| d == local && t.to_lowercase() == title.to_lowercase())
-            .map(|(d, p, _)| crystalline_core::ResolvedRef {
-                domain: d.clone(),
-                permalink: p.clone(),
-            })
+        self.find(domain, |_, t| t.to_lowercase() == title.to_lowercase())
     }
 
     fn is_domain(&self, name: &str) -> bool {
@@ -1587,24 +1603,51 @@ impl crystalline_core::LinkResolver for SpelledLookup {
     }
 }
 
+/// What `core::address::resolve` names for `inner` written in `home`.
+fn core_verdict(lookup: &SpelledLookup, inner: &str) -> Option<(String, String)> {
+    match crystalline_core::address::resolve(
+        &crystalline_core::LinkTarget::parse(inner),
+        "home",
+        lookup,
+    ) {
+        crystalline_core::Resolution::Resolved(r) => Some((r.domain, r.permalink)),
+        _ => None,
+    }
+}
+
 /// The index and verify answer the same for every reference: for a table of
 /// bracket texts written in `home`, the engram the store binds equals the one
 /// `crystalline_core::address::resolve` names, down to which engram it is.
+///
+/// The spellings come from a real name table: `eng-knowledge` declares the
+/// canonical name `engineering` and the alias `eng`; `a1` and `a2` both
+/// declare `shared`, so that canonical name is contested and names no domain;
+/// `ops2` declares `platform`, which is shadowed by the domain registered
+/// under that local name. The same table runs once more for references in
+/// alice's drafts, read in her view, where her own draft may answer.
 async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store) {
-    let home = tempfile::tempdir().unwrap();
-    let eng = tempfile::tempdir().unwrap();
-    let engrams: Vec<(&str, &str, &str)> = vec![
+    let dirs: HashMap<&str, tempfile::TempDir> =
+        ["home", "eng-knowledge", "a1", "a2", "platform", "ops2"]
+            .into_iter()
+            .map(|d| (d, tempfile::tempdir().unwrap()))
+            .collect();
+    let base: Vec<(&str, &str, &str)> = vec![
         ("home", "foo", "Foo"),
         ("home", "runbook", "Runbook"),
         ("home", "typo-foo", "typo:Foo"),
         ("home", "eng-overview", "eng:Overview"),
+        ("home", "shared-runbook", "shared:Runbook"),
         ("eng-knowledge", "runbook", "Runbook"),
         ("eng-knowledge", "foo", "Foo"),
+        ("a1", "runbook", "Runbook"),
+        ("a2", "runbook", "Runbook"),
+        ("platform", "runbook", "Runbook"),
+        ("ops2", "runbook", "Runbook"),
+        ("ops2", "guide", "Guide"),
     ];
-    for (domain, permalink, title) in &engrams {
-        let dir = if *domain == "home" { &home } else { &eng };
+    for (domain, permalink, title) in &base {
         write(
-            dir.path(),
+            dirs[domain].path(),
             &format!("{permalink}.md"),
             &engram(title, permalink, "engram", "", "body\n"),
         );
@@ -1626,58 +1669,53 @@ async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store)
         "Foo",
         "runbook",
         "Missing",
+        // A contested canonical name names no domain: the whole text at home.
+        "shared:Runbook",
+        "shared:Foo",
+        "a1:Runbook",
+        // A shadowed canonical name is the local name of another domain.
+        "platform:Runbook",
+        "platform:Guide",
+        "ops2:Guide",
     ];
     for (i, inner) in cases.iter().enumerate() {
         write(
-            home.path(),
+            dirs["home"].path(),
             &format!("src-{i}.md"),
             &source_engram(&format!("Src {i}"), &format!("src-{i}"), inner),
         );
     }
-    sync_domain(store, "eng-knowledge", eng.path())
-        .await
-        .unwrap();
-    sync_domain(store, "home", home.path()).await.unwrap();
-    let eng_id = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    for name in ["eng-knowledge", "a1", "a2", "platform", "ops2", "home"] {
+        sync_domain(store, name, dirs[name].path()).await.unwrap();
+    }
+    let (table, changed) = push_name_table(
+        store,
+        &[
+            name_input("home", None, &[]),
+            name_input("eng-knowledge", Some("engineering"), &["eng"]),
+            name_input("a1", Some("shared"), &[]),
+            name_input("a2", Some("shared"), &[]),
+            name_input("platform", None, &[]),
+            name_input("ops2", Some("platform"), &[]),
+        ],
+    )
+    .await;
+    assert_eq!(table.resolve("shared"), None, "contested");
+    assert_eq!(table.resolve("platform"), Some("platform"), "shadowed");
     let home_id = store.domain_id("home").await.unwrap().unwrap();
-    let spellings = [
-        ("eng-knowledge", eng_id, "eng-knowledge"),
-        ("engineering", eng_id, "eng-knowledge"),
-        ("eng", eng_id, "eng-knowledge"),
-        ("home", home_id, "home"),
-    ];
-    let changed = store
-        .replace_domain_spellings(
-            &spellings
-                .iter()
-                .map(|(s, id, _)| (s.to_string(), *id))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .unwrap();
     store.reset_references_to_spellings(&changed).await.unwrap();
     store.resolve_pending_relations(home_id).await.unwrap();
     store.resolve_pending_links(home_id).await.unwrap();
 
-    let lookup = SpelledLookup {
-        spellings: spellings
+    let mut lookup = SpelledLookup {
+        spellings: table.spellings().into_iter().collect(),
+        engrams: base
             .iter()
-            .map(|(s, _, local)| (s.to_string(), local.to_string()))
+            .map(|(d, p, t)| (d.to_string(), p.to_string(), t.to_string(), String::new()))
             .collect(),
-        engrams: engrams
-            .iter()
-            .map(|(d, p, t)| (d.to_string(), p.to_string(), t.to_string()))
-            .collect(),
+        viewer: None,
     };
     for (i, inner) in cases.iter().enumerate() {
-        let core = match crystalline_core::address::resolve(
-            &crystalline_core::LinkTarget::parse(inner),
-            "home",
-            &lookup,
-        ) {
-            crystalline_core::Resolution::Resolved(r) => Some((r.domain, r.permalink)),
-            _ => None,
-        };
         let source = store
             .lookup_id("home", &format!("src-{i}"))
             .await
@@ -1685,8 +1723,59 @@ async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store)
             .unwrap();
         assert_eq!(
             bound_target(store, source).await,
-            core,
+            core_verdict(&lookup, inner),
             "[[{inner}]]: the index and core disagree"
+        );
+    }
+
+    // Alice's drafts: a colon title only she has, and one draft source per
+    // case, bound in her view the way a draft write binds them.
+    let draft = |title: &str, permalink: &str, body: &str| {
+        let text = engram(title, permalink, "engram", "", body);
+        crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&text).unwrap(),
+            &format!("{permalink}.md"),
+            FileStamp {
+                mtime: 0,
+                size: text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        )
+    };
+    store
+        .upsert_overlay(home_id, "alice", &draft("typo:Bar", "typo-bar", "body\n"))
+        .await
+        .unwrap();
+    lookup.engrams.push((
+        "home".to_string(),
+        "typo-bar".to_string(),
+        "typo:Bar".to_string(),
+        "alice".to_string(),
+    ));
+    lookup.viewer = Some("alice".to_string());
+    let mut drafted = Vec::new();
+    for inner in cases.iter().copied().chain(["typo:Bar", "home:typo:Bar"]) {
+        let i = drafted.len();
+        let text_body = format!("- relates_to [[{inner}]]\n\nSee [[{inner}]] here.\n");
+        let id = store
+            .upsert_overlay(
+                home_id,
+                "alice",
+                &draft(&format!("Draft {i}"), &format!("draft-{i}"), &text_body),
+            )
+            .await
+            .unwrap();
+        drafted.push((inner, id));
+    }
+    store
+        .reresolve_actor_references(home_id, "alice")
+        .await
+        .unwrap();
+    for (inner, id) in drafted {
+        assert_eq!(
+            bound_target_as(store, id, Some("alice")).await,
+            core_verdict(&lookup, inner),
+            "[[{inner}]] in alice's draft: the index and core disagree"
         );
     }
 }
