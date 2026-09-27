@@ -1,6 +1,6 @@
 /**
  * The approved marks (2.6d, 2.6f C16): every string sets in the
- * block-pixel font, and the six pictures keep the shapes their recipes
+ * block-pixel font, and the five pictures keep the shapes their recipes
  * rely on.
  */
 
@@ -85,8 +85,9 @@ describe("the approved marks", () => {
   it("draws the hammer's runes as one band of separate marks, none a letter (2.6f C14, C15)", () => {
     // Mutation caught: the band a solid bar, rows of unequal width, a
     // colour key other than the one ink (a stray character `lit` would
-    // still count as lit), or a letter-shaped glyph from the font pasted
-    // in as one of the runes.
+    // still count as lit), a band of four marks with one widened to five
+    // columns, or a letter-shaped glyph from the font pasted in as one of
+    // the runes.
     expect(HAMMER_RUNES).toHaveLength(5);
     const width = HAMMER_RUNES[0]?.length ?? 0;
     expect(width).toBe(14);
@@ -95,7 +96,6 @@ describe("the approved marks", () => {
       expect(r).toMatch(/^[#.]+$/);
     }
     const lit = (c: number) => HAMMER_RUNES.some((r) => r[c] !== ".");
-    let gaps = 0;
     const marks: [number, number][] = [];
     let start = -1;
     for (let c = 0; c <= width; c++) {
@@ -103,11 +103,10 @@ describe("the approved marks", () => {
       if (on && start === -1) start = c;
       if (!on && start !== -1) {
         marks.push([start, c]);
-        if (c > 0 && lit(c - 1) && !lit(c)) gaps++;
         start = -1;
       }
     }
-    expect(gaps).toBeGreaterThanOrEqual(4);
+    expect(marks.map(([a, b]) => b - a)).toEqual([2, 2, 2, 2, 2]);
     for (const [c0, c1] of marks) {
       const mark = HAMMER_RUNES.map((r) => r.slice(c0, c1));
       for (const glyph of Object.values(PIXEL_FONT))
