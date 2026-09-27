@@ -186,7 +186,7 @@ async fn a_nameless_connect_reads_the_manifest_under_the_subpath() {
     );
 }
 
-/// Open issue 4, the MANIFEST branch: a declared name that is already taken
+/// The MANIFEST branch: a declared name that is already taken
 /// steps to `-2` and never adopts the domain holding it.
 #[tokio::test]
 async fn a_taken_manifest_name_steps_and_never_adopts_the_holder() {
@@ -227,7 +227,7 @@ async fn a_taken_manifest_name_steps_and_never_adopts_the_holder() {
     assert!(cfg.domains["eng-2"].origin.is_some());
 }
 
-/// Open issue 4, the repository-default branch: no declared name falls back
+/// The repository-default branch: no declared name falls back
 /// to the repository's own name, which is never written into the team's
 /// MANIFEST.
 #[tokio::test]
@@ -253,7 +253,7 @@ async fn a_nameless_connect_without_a_declared_name_uses_the_repo_name() {
     assert!(change_paths(&r.eng, "eng-knowledge").await.is_empty());
 }
 
-/// Open issue 4, repository-default branch, today's behaviour: an
+/// The repository-default branch, today's behaviour: an
 /// origin-less domain already holding the repository's name is adopted in
 /// place, keeping what was decided about it.
 #[tokio::test]

@@ -24,6 +24,17 @@ struct Options {
     anonymous: bool,
     read_only: bool,
     trusted_header: Option<&'static str>,
+    /// This machine's own index, configuration and state directory as the
+    /// daemon would name them, when a test sets one.
+    machine_owner: Option<MachineOwner>,
+}
+
+/// Which machine owner a test gives the engine: one naming another index
+/// than the one the engine opened, or exactly the one it opened.
+#[derive(Clone, Copy)]
+enum MachineOwner {
+    AnotherIndex,
+    ThisIndex,
 }
 
 struct Fixture {
@@ -102,13 +113,27 @@ async fn serve(opts: Options) -> Fixture {
     // resolve to `TokenStore::Keyring` and delete the developer's REAL keychain
     // GitHub token. The override confines the whole matrix to the temp dir.
     let engine = Arc::new(
-        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-            .with_read_only(opts.read_only)
-            .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
-            // Where a rename keeps its journal; every other write route in
-            // this suite never reaches it.
-            .with_state_dir(root.join("state")),
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            None,
+            Some(config_path.clone()),
+        )
+        .with_read_only(opts.read_only)
+        .with_token_store_dir(root.join("tokens"))
+        .with_connect_auth(Arc::new(crate::support::StubConnectAuth::accepting("octo")))
+        // Where a rename keeps its journal; every other write route in
+        // this suite never reaches it.
+        .with_state_dir(root.join("state"))
+        .with_machine_owner(opts.machine_owner.map(|which| {
+            // The in-memory store names no index; this machine's own is
+            // a file somewhere else, or none at all like the store's.
+            let index = match which {
+                MachineOwner::AnotherIndex => Some("/elsewhere/index.db"),
+                MachineOwner::ThisIndex => None,
+            };
+            crystalline_service::RenameOwner::new(index, Some(&config_path), &root.join("state"))
+        })),
     );
     engine.sync(None).await.unwrap();
     // A deterministic embedder, so the neighbours advisory on create and save
@@ -1687,6 +1712,83 @@ async fn a_read_only_instance_refuses_a_rename() {
     .await
     .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+/// An instance started on another index than this machine's own refuses a
+/// rename from Fluid with a 409 that names the index, moves nothing, and
+/// lines no name up after a sync; the same instance on this machine's own
+/// index renames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_on_another_index_refuses_a_rename_and_lines_up_no_names() {
+    let fx = serve(Options {
+        machine_owner: Some(MachineOwner::AnotherIndex),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering", "local_only": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("is not this machine's own index") && body.contains("Nothing was renamed"),
+        "{body}"
+    );
+    let config_path = fx._tmp.path().join("config.yaml");
+    let registered = |path: &std::path::Path| {
+        crystalline_core::config::load_yaml::<GlobalConfig>(path)
+            .unwrap()
+            .domains
+            .contains_key("eng")
+    };
+    assert!(registered(&config_path), "the domain keeps its name");
+    assert!(!fx._tmp.path().join("state/rename-journal.json").exists());
+
+    // A MANIFEST that now declares another name is not lined up either.
+    let manifest = fx._tmp.path().join("eng/MANIFEST.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replacen("---\n", "---\ndomain_name: engineering\n", 1),
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    assert_eq!(
+        fx.engine.adopt_domain_names().await.unwrap(),
+        serde_json::json!([])
+    );
+    assert!(registered(&config_path));
+}
+
+/// The same rename on an instance whose engine opened exactly this
+/// machine's own index goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_on_this_machines_own_index_renames() {
+    let fx = serve(Options {
+        machine_owner: Some(MachineOwner::ThisIndex),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/rename",
+        &admin,
+    )
+    .json(&serde_json::json!({"name": "engineering", "local_only": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
 }
 
 /// A non-admin owner of a private domain renaming it onto a hidden domain's

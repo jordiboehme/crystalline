@@ -331,6 +331,11 @@ fn locked_file_is_current(file: &File, path: &Path) -> bool {
     match same_file::Handle::from_path(path) {
         Ok(named) => held == named,
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        // On Windows a file removed while a handle to it is still open (the
+        // one just locked, here) keeps its name until that handle closes,
+        // and opening it by that name is refused: the file is on its way
+        // out, so the lock on it is not the current one.
+        Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => false,
         Err(e) => {
             tracing::debug!("{} could not be identified: {e}", path.display());
             true
@@ -1400,11 +1405,11 @@ pub async fn ensure_daemon(
     // above: the daemon spawned for this call is still waiting for it, and
     // this is what it waits for.
     if let Some(HolderState::Standalone { pid, command }) = standalone_holder() {
-        anyhow::bail!(standalone_holder_words(
-            pid,
-            &command,
-            Duration::from_secs(15)
-        ));
+        anyhow::bail!(
+            "the standalone command `{command}` (pid {pid}) took this machine's state directory \
+             while a daemon was starting, and the daemon was not ready after 15 s of waiting. \
+             It starts once the command has finished: wait for it, or stop it, and try again"
+        );
     }
     anyhow::bail!(
         "spawned a daemon but it did not become ready within 15s (see daemon.log in the state directory)"
@@ -1723,7 +1728,7 @@ pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> S
         && !crystalline_index::is_schema_too_new_text(error)
     {
         return format!(
-            "the standalone command `{command}` (pid {}) holds the index at {location} right              now; run this again once it has finished. The index reported: {error}",
+            "the standalone command `{command}` (pid {}) holds the index at {location} right now; run this again once it has finished. The index reported: {error}",
             info.pid
         );
     }
@@ -1777,19 +1782,34 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     for attempt in 0..20 {
         // Opened afresh on every attempt: a file an owner removed while this
         // process waited is not the one the next owner locks.
-        let file = OpenOptions::new()
+        let opened = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&lock_path)?;
+            .open(&lock_path);
+        let file = match opened {
+            Ok(file) => file,
+            // A lock file its owner has just removed stays pending on Windows
+            // until every handle to it is closed, and opening or creating it
+            // is refused meanwhile: wait and try again, as for a held lock.
+            Err(e)
+                if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied && attempt < 19 =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if FileExt::try_lock(&file).is_ok() {
             if locked_file_is_current(&file, &lock_path) {
                 acquired = Some(file);
                 break;
             }
             let _ = FileExt::unlock(&file);
-            continue;
+            tracing::debug!(
+                "the service.lock this process locked was removed meanwhile; opening it again"
+            );
         }
         if attempt < 19 {
             std::thread::sleep(Duration::from_millis(50));
@@ -2896,9 +2916,16 @@ mod tests {
         let _ = FileExt::unlock(&file);
         std::fs::remove_file(&path).unwrap();
         assert!(!locked_file_is_current(&file, &path), "the path is gone");
-        let fresh = open();
-        assert!(!locked_file_is_current(&file, &path), "a new file is there");
-        assert!(locked_file_is_current(&fresh, &path));
+        // A new file beside a removed one that is still open: unix allows
+        // it, and so does Windows with the delete semantics current NTFS
+        // uses, but with the older ones the removed name stays taken until
+        // `file` closes, so this half is unix only.
+        #[cfg(unix)]
+        {
+            let fresh = open();
+            assert!(!locked_file_is_current(&file, &path), "a new file is there");
+            assert!(locked_file_is_current(&fresh, &path));
+        }
         drop(home);
     }
 
@@ -2927,10 +2954,13 @@ mod tests {
             !locked_file_is_current(&waiting, &path),
             "the owner removed the file before letting it go"
         );
+        // Closed before the next owner comes: on Windows with the older
+        // delete semantics the removed file keeps its name while this handle
+        // is open, and the next owner waits for it to go.
+        drop(waiting);
         let next = acquire_ownership().expect("the next owner takes the file at the path");
         assert!(locked_file_is_current(&next.lock_file, &path));
         drop(next);
-        drop(waiting);
         drop(home);
     }
 

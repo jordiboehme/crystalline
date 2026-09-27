@@ -1694,62 +1694,42 @@ impl ListedStats {
         }
     }
 
-    /// One row of a daemon's `list_domains` reply: `Some(None)` for a domain
-    /// it has not synced yet (`engrams` null), `None` for a row that does not
-    /// read back at all.
-    fn from_list_domains(v: &serde_json::Value) -> Option<Option<ListedStats>> {
-        let name = v.get("name").and_then(serde_json::Value::as_str)?;
-        let engrams = match v.get("engrams") {
-            Some(serde_json::Value::Null) | None => return Some(None),
-            Some(count) => count.as_i64()?,
-        };
-        let host = |key: &str| {
-            v.get("host")
-                .and_then(|h| h.get(key))
+    fn from_json(v: &serde_json::Value) -> Option<ListedStats> {
+        let text = |key: &str| {
+            v.get(key)
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         };
-        Some(Some(ListedStats {
-            name: name.to_string(),
-            engrams,
-            host_instance_id: host("instance_id"),
-            host_heartbeat_at: host("heartbeat_at"),
-        }))
+        Some(ListedStats {
+            name: text("name")?,
+            engrams: v.get("engrams").and_then(serde_json::Value::as_i64)?,
+            host_instance_id: text("host_instance_id"),
+            host_heartbeat_at: text("host_heartbeat_at"),
+        })
     }
 }
 
-/// Every registered virtual domain's declared canonical name, from a
-/// `list_domains` reply already in hand - the daemon's own JSON over the ctl
-/// `tool` command. Keyed by local name, one entry per virtual domain row
-/// `data` carries; a row missing either field, or a reply with no `domains`
-/// array at all, contributes nothing rather than failing the read this rides
-/// along with. Feeds [`crystalline_core::names::NameTable::from_config`]'s
-/// `virtual_names` input, the one canonical name a config-only table
-/// (`build_name_table`'s own no-index case) cannot supply for a
-/// database-backed domain: its MANIFEST lives in the database, not on disk.
-fn virtual_names_from_list_domains(
+/// Every registered virtual domain's declared canonical name, from a ctl
+/// `status` reply already in hand: its `virtual_names` object, keyed by local
+/// name. A reply without it (a daemon from before the field) contributes
+/// nothing, and the NAME column falls back to the local name.
+fn virtual_names_from_status(
     data: &serde_json::Value,
 ) -> std::collections::BTreeMap<String, String> {
-    let mut out = std::collections::BTreeMap::new();
-    let Some(rows) = data.get("domains").and_then(serde_json::Value::as_array) else {
-        return out;
-    };
-    for row in rows {
-        if row.get("kind").and_then(serde_json::Value::as_str) != Some("virtual") {
-            continue;
-        }
-        let name = row.get("name").and_then(serde_json::Value::as_str);
-        let canonical = row
-            .get("canonical_name")
-            .and_then(serde_json::Value::as_str);
-        if let (Some(name), Some(canonical)) = (name, canonical) {
-            out.insert(name.to_string(), canonical.to_string());
-        }
-    }
-    out
+    data.get("virtual_names")
+        .and_then(serde_json::Value::as_object)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|(local, canonical)| {
+                    canonical.as_str().map(|c| (local.clone(), c.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// [`virtual_names_from_list_domains`], read directly off the index instead
+/// [`virtual_names_from_status`], read directly off the index instead
 /// of a daemon's reply: for every registered virtual domain, its one
 /// MANIFEST engram (permalink `manifest`), read once through the store this
 /// listing already opened read-only for its counts - the way every other
@@ -1818,10 +1798,10 @@ pub async fn domain_list(
     // `ctl_if_running` fail, and letting that fail the command would put the
     // daemon's bare error where this listing's registrations belong - the raw
     // backend text this whole task exists to stop showing a person.
-    // Over a daemon, one `list_domains` call carries both the counts and the
-    // name fields a virtual domain's declared name lives in.
+    // Over a daemon, one `status` call carries both the counts and every
+    // virtual domain's declared name (`virtual_names`).
     let route = match reach_index(
-        Some(serde_json::json!({ "v": 1, "cmd": "tool", "tool": "list_domains", "args": {} })),
+        Some(serde_json::json!({ "v": 1, "cmd": "status" })),
         &cfg,
         config_override,
         db_override,
@@ -1846,26 +1826,23 @@ pub async fn domain_list(
     let stats: Option<Vec<ListedStats>> = match route {
         None => None,
         Some(route) => match route {
-            // The daemon's own `list_domains`: one row per registered domain,
-            // `engrams` null for a domain it has not synced yet, which is the
-            // "(not indexed)" case below and not a count nobody read. A reply
-            // that carries no rows, or a row that does not read back, is a
-            // count nobody read: saying so is the point, and rendering it as
-            // an empty set would put every domain back on the "(not indexed)"
-            // line this routing exists to end.
+            // The daemon's own `domain_stats`, annotated with a `hosted_here`
+            // field this command has no use for. A reply that carries no counts,
+            // or a row that does not read back, is a count nobody read: saying so
+            // is the point, and rendering it as an empty set would put every
+            // domain back on the "(not indexed)" line this routing exists to end.
             IndexRoute::Daemon(data) => {
                 let parsed = match data.get("domains").and_then(serde_json::Value::as_array) {
                     Some(rows) => {
-                        let parsed: Option<Vec<Option<ListedStats>>> =
-                            rows.iter().map(ListedStats::from_list_domains).collect();
-                        match parsed {
-                            Some(parsed) => Some(parsed.into_iter().flatten().collect()),
-                            None => {
-                                not_read = Some(
+                        let parsed: Vec<ListedStats> =
+                            rows.iter().filter_map(ListedStats::from_json).collect();
+                        if parsed.len() == rows.len() {
+                            Some(parsed)
+                        } else {
+                            not_read = Some(
                             "the running Crystalline daemon answered, but its per-domain counts did not read back in the shape this listing expects. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
                         );
-                                None
-                            }
+                            None
                         }
                     }
                     None => {
@@ -1877,8 +1854,9 @@ pub async fn domain_list(
                 };
                 // The same reply names every virtual domain's declared name,
                 // which lives in its MANIFEST engram in the database, out of
-                // reach from configuration alone.
-                virtual_names = virtual_names_from_list_domains(&data);
+                // reach from configuration alone. A daemon from before this
+                // field sends none, and the NAME column shows the local name.
+                virtual_names = virtual_names_from_status(&data);
                 parsed
             }
             IndexRoute::Direct(store) => {

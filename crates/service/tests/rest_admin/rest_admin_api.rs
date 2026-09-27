@@ -556,8 +556,7 @@ async fn github_domain_name_peek_refuses_a_malformed_repo_or_path() {
 }
 
 /// An empty `path` and one that is nothing but a trailing slash both name the
-/// repository root and pass validation - the regression Task 22 introduced
-/// (carried to Task 23): both used to reach past this check before the
+/// repository root and pass validation: both used to reach past this check before the
 /// traversal guard tightened the rule. Neither repo nor GitHub is actually
 /// reachable in this fixture, so a valid path clears the 422 and lands on the
 /// same 409 "not ready" the bare `repo=acme/kb` case above answers with,

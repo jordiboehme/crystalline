@@ -797,7 +797,13 @@ pub struct RenameDoctor {
     /// Whether the journal belongs to this machine's own index and
     /// configuration, so the daemon or the next plain command finishes it.
     pub belongs_here: bool,
-    /// The command that finishes the rename.
+    /// What to put back first, for a journal recorded against another
+    /// spelling of this machine's configuration or database: the journal is
+    /// finished only against this machine's own, so the spelling it recorded
+    /// has to become this machine's own again.
+    pub restore: Vec<String>,
+    /// The command that finishes the rename, once `restore` is done; `None`
+    /// when the journal can only be dropped with `--discard-rename`.
     pub finish: Option<String>,
     /// Whether `--discard-rename` deleted the journal in this run.
     pub discarded: bool,
@@ -1130,31 +1136,50 @@ fn rename_doctor(
 ) -> RenameDoctor {
     let belongs_here = matches!((&pending.owner, here), (Some(owner), Some(here)) if owner == here);
     let local = if pending.local_only { " --local" } else { "" };
-    let finish = if belongs_here {
-        Some(format!(
-            "crystalline domain rename {} {}{local}",
-            pending.old, pending.new
-        ))
+    let plain = format!(
+        "crystalline domain rename {} {}{local}",
+        pending.old, pending.new
+    );
+    // Only this machine's own index and configuration ever finish a
+    // journal, so one recorded against another spelling of them is finished
+    // by putting that spelling back, never by a command pointed at it. What
+    // cannot be put back that way (another state directory, or a Turso file
+    // that is not this state directory's own index) can only be dropped.
+    let (finish, restore) = if belongs_here {
+        (Some(plain), Vec::new())
     } else {
-        pending.owner.as_ref().map(|owner| {
-            // A Turso index is a file the command names with `--db`; a
-            // Postgres one comes from the configuration alone.
-            let db = owner
-                .index
-                .as_deref()
-                .filter(|index| Path::new(index).is_absolute())
-                .map(|index| format!(" --db {index}"))
-                .unwrap_or_default();
-            let config = owner
-                .config
-                .as_deref()
-                .map(|config| format!(" --config {config}"))
-                .unwrap_or_default();
-            format!(
-                "crystalline{db} domain rename {} {}{local}{config}",
-                pending.old, pending.new
-            )
-        })
+        match (&pending.owner, here) {
+            (Some(owner), Some(here)) if owner.state_dir == here.state_dir => {
+                let mut restore = Vec::new();
+                let mut restorable = true;
+                if owner.config != here.config {
+                    match &owner.config {
+                        Some(config) => restore.push(format!(
+                            "point CRYSTALLINE_CONFIG at {config}, or put the configuration back \
+                             there"
+                        )),
+                        None => restorable = false,
+                    }
+                }
+                if owner.index != here.index {
+                    match owner.index.as_deref() {
+                        // A Postgres index is named by its host and database,
+                        // which the configuration's url chooses.
+                        Some(index) if !Path::new(index).is_absolute() => restore.push(format!(
+                            "set database.url (or CRYSTALLINE_DATABASE_URL) back to the database \
+                             at {index}"
+                        )),
+                        _ => restorable = false,
+                    }
+                }
+                if restorable {
+                    (Some(plain), restore)
+                } else {
+                    (None, Vec::new())
+                }
+            }
+            _ => (None, Vec::new()),
+        }
     };
     RenameDoctor {
         old: pending.old.clone(),
@@ -1169,6 +1194,7 @@ fn rename_doctor(
         owner: pending.owner.as_ref().map(|o| o.describe()),
         this_machine: here.map(|h| h.describe()),
         belongs_here,
+        restore,
         finish,
         discarded: false,
         error: None,
@@ -1213,6 +1239,10 @@ fn render_rename(out: &mut String, r: &RenameDoctor) {
             "  [warning] {what}. The daemon finishes it when it starts, and so does the next \
              command run without --db and --config"
         );
+        let _ = writeln!(
+            out,
+            "  crystalline doctor --discard-rename would drop it instead and leave it half moved"
+        );
     } else {
         let _ = writeln!(
             out,
@@ -1223,6 +1253,9 @@ fn render_rename(out: &mut String, r: &RenameDoctor) {
                 .as_deref()
                 .unwrap_or("an index that could not be named")
         );
+        for step in &r.restore {
+            let _ = writeln!(out, "  first: {step}");
+        }
         if let Some(finish) = &r.finish {
             let _ = writeln!(out, "  run: {finish}");
         }
@@ -3299,6 +3332,67 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
 mod tests {
     use super::*;
     use crystalline_index::{TursoStore, sync_domain};
+
+    fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
+        crystalline_service::RenameOwner {
+            index: Some(index.to_string()),
+            config: Some(config.to_string()),
+            state_dir: state_dir.to_string(),
+        }
+    }
+
+    fn pending(owner: crystalline_service::RenameOwner) -> crystalline_service::PendingRename {
+        crystalline_service::PendingRename {
+            old: "eng".to_string(),
+            new: "platform".to_string(),
+            local_only: true,
+            owner: Some(owner),
+            done: Vec::new(),
+            remaining: Vec::new(),
+        }
+    }
+
+    /// A journal recorded against a Postgres url written differently is not
+    /// finished by a command pointed at it (only this machine's own index
+    /// ever finishes a journal): doctor says to put the url back, then run
+    /// the plain command.
+    #[test]
+    fn a_journal_on_a_postgres_url_written_differently_names_the_url_to_put_back() {
+        let here = owner("localhost:5432/kb", "/home/a/config.yaml", "/state");
+        let recorded = owner("127.0.0.1:5432/kb", "/home/a/config.yaml", "/state");
+        let r = rename_doctor(&pending(recorded), Some(&here));
+        assert!(!r.belongs_here);
+        assert_eq!(r.restore.len(), 1, "{:?}", r.restore);
+        assert!(
+            r.restore[0].contains("database.url") && r.restore[0].contains("127.0.0.1:5432/kb"),
+            "{:?}",
+            r.restore
+        );
+        assert_eq!(
+            r.finish.as_deref(),
+            Some("crystalline domain rename eng platform --local")
+        );
+        let mut out = String::new();
+        render_rename(&mut out, &r);
+        assert!(!out.contains("--db") && !out.contains("--config"), "{out}");
+    }
+
+    /// A journal recorded in another state directory (a moved one) cannot be
+    /// put back from here at all: doctor names only --discard-rename.
+    #[test]
+    fn a_journal_from_a_moved_state_directory_can_only_be_dropped() {
+        let here = owner("/new/state/index.db", "/home/a/config.yaml", "/new/state");
+        let recorded = owner("/old/state/index.db", "/home/a/config.yaml", "/old/state");
+        let r = rename_doctor(&pending(recorded), Some(&here));
+        assert!(!r.belongs_here);
+        assert!(r.finish.is_none() && r.restore.is_empty(), "{r:?}");
+        let mut out = String::new();
+        render_rename(&mut out, &r);
+        assert!(
+            out.contains("--discard-rename") && !out.contains("run:"),
+            "{out}"
+        );
+    }
 
     /// A minimal harness fixture: only the fields [`hook_lines`] reads are
     /// worth setting, everything else keeps its `Default`.

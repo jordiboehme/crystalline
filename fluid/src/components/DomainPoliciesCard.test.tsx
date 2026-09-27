@@ -220,6 +220,63 @@ describe("the domain policies card", () => {
     expect(within(dialog).getByLabelText("New name")).toBeVisible();
   });
 
+  it("renames exactly the domain whose card 'Change name' belongs to", async () => {
+    const renamed = vi.fn(() => ({
+      domain: "engineering",
+      previous: "eng",
+      local_only: false,
+      manifest_written: true,
+      manifest_draft: false,
+      rewritten: [],
+      left_behind: [],
+      aliases: ["eng"],
+      shadows: [],
+    }));
+    serve({
+      // A second domain beside it, so a dialog opened for the wrong one
+      // would show in the path it posts to.
+      "/domains": () => {
+        const listed = domainsResponse();
+        return {
+          ...listed,
+          domains: [
+            ...listed.domains,
+            { ...listed.domains[0], name: "ops", when_to_use: [] },
+          ],
+        };
+      },
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return renamed();
+      },
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    await userEvent.click(
+      within(domainName).getByRole("button", { name: "Change name" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Rename domain" });
+    await userEvent.type(
+      within(dialog).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Rename" }),
+    );
+
+    await waitFor(() => {
+      expect(renamed).toHaveBeenCalledTimes(1);
+    });
+    const renames = apiMock.mock.calls
+      .map(([path]) => path)
+      .filter((path) => String(path).endsWith("/rename"));
+    expect(renames).toEqual(["/domains/eng/rename"]);
+  });
+
   it("withholds 'Change name' from a caller with neither the owner nor the admin right", async () => {
     serve({
       "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),

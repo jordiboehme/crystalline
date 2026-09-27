@@ -141,6 +141,22 @@ impl Engine {
                     .to_string(),
             ));
         }
+        // Not over an index `--db` or `--config` named instead of this
+        // machine's own: the steps would move this machine's state folders
+        // and write its configuration while its own index keeps the old
+        // name.
+        if let Some(why) = self.off_machine().await? {
+            return Err(EngineError::Conflict(format!(
+                "a rename moves this machine's state folders and writes its configuration, so \
+                 it runs only against this machine's own index and configuration, and {}. \
+                 Nothing was renamed. Rename in a Crystalline started without --db and --config",
+                if may_see_server_paths(scope) {
+                    why
+                } else {
+                    "this instance opened another index or configuration".to_string()
+                }
+            )));
+        }
         let hidden = self.hidden_for(scope).await?;
         // Privacy alone, never `hidden_for`'s extra "an index row this
         // instance has no registration for" names: the still-running and
@@ -398,6 +414,38 @@ impl Engine {
             );
             return Ok(None);
         }
+        // Nothing is finished over an index `--db` or `--config` named
+        // instead of this machine's own, and no journal recorded against
+        // anything but this machine's own index and configuration: `crystalline
+        // doctor` names such a journal and how to finish or drop it.
+        if let Some(why) = self.off_machine().await? {
+            tracing::warn!(
+                "the rename of domain '{}' to '{}' that an earlier run left half done is left \
+                 alone here: {why}. To finish it, {}",
+                journal.old,
+                journal.new,
+                finish_elsewhere_hint(&journal)
+            );
+            return Ok(None);
+        }
+        if let Some(machine) = &self.machine_owner
+            && journal.owner.as_ref() != Some(machine)
+        {
+            tracing::warn!(
+                "the rename of domain '{}' to '{}' that an earlier run left half done is left \
+                 alone: it was recorded against {}, which is not this machine's own {}. \
+                 `crystalline doctor` says how to finish or drop it",
+                journal.old,
+                journal.new,
+                journal
+                    .owner
+                    .as_ref()
+                    .map(RenameOwner::describe)
+                    .unwrap_or_else(|| "no recorded index".to_string()),
+                machine.describe()
+            );
+            return Ok(None);
+        }
         // A journal another index's rename left behind is not this engine's
         // to finish: its steps would move this machine's state folders and
         // configuration while the index it belongs to keeps the old name.
@@ -506,6 +554,20 @@ impl Engine {
             self.config_path.as_deref(),
             state_dir,
         ))
+    }
+
+    /// Why the index, configuration or state directory this engine opened
+    /// are not this machine's own, naming each part that differs; `None`
+    /// when they are, or when the opener named no machine owner
+    /// ([`Engine::with_machine_owner`]).
+    pub(crate) async fn off_machine(&self) -> Result<Option<String>> {
+        let Some(machine) = &self.machine_owner else {
+            return Ok(None);
+        };
+        let state_dir = self.journal_state_dir()?;
+        let here = self.rename_owner(&state_dir).await?;
+        let differences = here.differences_from(machine);
+        Ok((!differences.is_empty()).then(|| differences.join(", and ")))
     }
 
     /// `None` when `journal` belongs to the index, configuration and state

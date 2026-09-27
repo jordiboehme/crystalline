@@ -69,6 +69,27 @@ impl Engine {
             );
             return Ok(json!([]));
         }
+        // Nor over an index `--db` or `--config` named instead of this
+        // machine's own: the renames would move this machine's state folders
+        // and write its configuration while its own index keeps the old names.
+        match self.off_machine().await {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                tracing::warn!(
+                    "domain names are not lined up with their MANIFESTs here: lining them up \
+                     renames this machine's own state and configuration, and {why}; a \
+                     Crystalline started without --db and --config does it"
+                );
+                return Ok(json!([]));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "domain names are not lined up with their MANIFESTs here: whether this is \
+                     this machine's own index could not be told ({e})"
+                );
+                return Ok(json!([]));
+            }
+        }
         let mut report: Vec<Value> = Vec::new();
         let planned = {
             let _admin = self.domain_admin().await;

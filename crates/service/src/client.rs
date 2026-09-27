@@ -631,7 +631,8 @@ async fn build_embedded(
     let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
         .with_embed_channel(embed_tx)
         .with_read_only(read_only)
-        .with_env_overlay(loaded.overlay.clone());
+        .with_env_overlay(loaded.overlay.clone())
+        .with_machine_owner(machine_owner_for_engine());
     // Told where the state directory is, as the daemon and the standalone
     // opener are; see `open_standalone`.
     if let Ok(state) = crystalline_core::config::state_dir() {
@@ -790,7 +791,8 @@ async fn open_standalone_finishing(
                 &format!("{e:#}"),
                 bypassed
             ))
-        })?;
+        })?
+        .with_machine_owner(machine_owner_for_engine());
     if bypassed {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
@@ -1281,13 +1283,10 @@ pub async fn domain_rename(
 /// compared with the ones a plain command opens, the identity a rename
 /// journal records ([`crystalline_engine::RenameOwner`]), and any part that
 /// differs is named. `--db` or `--config` spelling this machine's own index
-/// or configuration differs in nothing and is allowed.
-///
-/// One exception: the resend of a rename whose journal records exactly the
-/// index and configuration this command opened. That journal can only have
-/// been started against them, and finishing it there is what `doctor` tells
-/// a person to do when the spelling of this machine's own paths changed
-/// after a crash.
+/// or configuration differs in nothing and is allowed. The engine refuses the
+/// same rename too ([`crystalline_engine::Engine::with_machine_owner`]); this
+/// check runs first so the refusal can name the command, and so the opener
+/// never even looks at a journal.
 fn refuse_rename_off_this_machine(
     domain: &str,
     new: &str,
@@ -1296,18 +1295,10 @@ fn refuse_rename_off_this_machine(
     db_path: &Path,
 ) -> anyhow::Result<()> {
     let state_dir = crystalline_core::config::state_dir()?;
-    let opened = rename_owner_for(loaded, db_path, &state_dir);
+    let opened = crystalline_engine::RenameOwner::for_opened(loaded, db_path, &state_dir);
     let home = machine_rename_owner()?;
     let differences = opened.differences_from(&home);
     if differences.is_empty() {
-        return Ok(());
-    }
-    if let Ok(Some(pending)) = crystalline_engine::pending_rename(&state_dir)
-        && pending.owner.as_ref() == Some(&opened)
-        && pending.old == domain
-        && pending.new == new
-        && pending.local_only == local_only
-    {
         return Ok(());
     }
     anyhow::bail!(
@@ -1319,28 +1310,25 @@ fn refuse_rename_off_this_machine(
     )
 }
 
-/// The identity a rename journal records for an engine that opens `db_path`
-/// under `loaded`'s configuration, computed without opening anything.
-fn rename_owner_for(
-    loaded: &overlay::LoadedConfig,
-    db_path: &Path,
-    state_dir: &Path,
-) -> crystalline_engine::RenameOwner {
-    crystalline_engine::RenameOwner::new(
-        crystalline_index::store_location(&loaded.effective.database(), Some(db_path)).as_deref(),
-        Some(&loaded.path),
-        state_dir,
-    )
-}
+pub use crystalline_engine::machine_rename_owner;
 
-/// This machine's own index, configuration and state directory, as a rename
-/// journal records them: what a plain command, with no `--db` and no
-/// `--config`, opens, the environment overlay included.
-pub fn machine_rename_owner() -> anyhow::Result<crystalline_engine::RenameOwner> {
-    let state_dir = crystalline_core::config::state_dir()?;
-    let loaded = overlay::load(None)?;
-    let db_path = resolve_db(None)?;
-    Ok(rename_owner_for(&loaded, &db_path, &state_dir))
+/// [`machine_rename_owner`] for an opener to hand its engine
+/// ([`Engine::with_machine_owner`]): the daemon, the embedded stack and the
+/// standalone opener. When this machine's own index cannot be named (its
+/// default configuration does not load, say) the engine is told nothing and
+/// behaves as before, and a warning says that renames and name adoption are
+/// not checked against it.
+pub(crate) fn machine_owner_for_engine() -> Option<crystalline_engine::RenameOwner> {
+    match machine_rename_owner() {
+        Ok(owner) => Some(owner),
+        Err(e) => {
+            tracing::warn!(
+                "this machine's own index could not be named ({e:#}); a rename and the lining \
+                 up of domain names are not checked against it"
+            );
+            None
+        }
+    }
 }
 
 /// Delete this machine's pending rename journal, leaving every step it
@@ -1533,7 +1521,8 @@ pub async fn adopt_domain_names_direct(
     let read_only = loaded.effective.read_only();
     let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
         .with_read_only(read_only)
-        .with_env_overlay(loaded.overlay);
+        .with_env_overlay(loaded.overlay)
+        .with_machine_owner(machine_owner_for_engine());
     // Where a rename keeps its journal, as every other opener says.
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);

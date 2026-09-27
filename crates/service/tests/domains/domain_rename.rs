@@ -1594,7 +1594,7 @@ async fn an_unwritable_manifest_refuses_and_names_local() {
     assert!(!m.journal().exists());
 }
 
-/// Open issue 8: a full rename onto another domain's canonical name goes
+/// A full rename onto another domain's canonical name goes
 /// through and names that domain under `shadows`; onto another domain's
 /// local name it is refused.
 async fn a_full_rename_onto_a_canonical_shadows_and_onto_a_local_name_refuses_body(

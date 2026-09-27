@@ -1433,13 +1433,27 @@ mod tests {
             );
 
             // `WIPE_TABLES` has to name the new table, and every name in it has
-            // to still be a table after the swap. Tables a later migration
-            // creates are not there yet at v15; v16's own test checks them.
+            // to still be a table after the swap. The migrations after v15 run
+            // first (stamped, so the store opened below runs nothing again):
+            // `WIPE_TABLES` is the current list, and the tables they add
+            // (`domain_spelling` among them) are checked with the rest rather
+            // than skipped by name.
             assert!(
                 WIPE_TABLES.contains(&"engram_content"),
                 "a wipe that leaves the bodies behind leaves the whole index behind"
             );
-            for table in WIPE_TABLES.iter().filter(|t| **t != "domain_spelling") {
+            for m in &MIGRATIONS[15..] {
+                conn.execute_batch(m.sql).await.unwrap();
+                conn.execute_batch(&format!(
+                    "INSERT INTO schema_migration(version, applied_at) \
+                     VALUES ({},'2026-09-21T00:00:00Z');",
+                    m.version
+                ))
+                .await
+                .unwrap();
+            }
+            assert!(WIPE_TABLES.contains(&"domain_spelling"));
+            for table in WIPE_TABLES {
                 assert_eq!(
                     scalar(
                         &conn,

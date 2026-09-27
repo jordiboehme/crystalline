@@ -808,6 +808,88 @@ describe("previewing a repository's declared name", () => {
     );
   });
 
+  it("drops the peeked placeholder when the form leaves team mode", async () => {
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => ({
+        domain_name: "engineering",
+        default_name: "kb",
+      }),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    });
+
+    for (const mode of ["Local folder", "Virtual"]) {
+      await userEvent.click(within(dialog).getByRole("radio", { name: mode }));
+      expect(within(dialog).getByLabelText("Name")).not.toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    }
+  });
+
+  it("leaves nothing behind when the dialog closes while a peek waits", async () => {
+    let answer: (value: unknown) => void = () => {
+      throw new Error("answer called before the request was made");
+    };
+    const pending = new Promise((resolve) => {
+      answer = resolve;
+    });
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => pending,
+    });
+    const errors = vi.spyOn(console, "error");
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(peekCalls()).toHaveLength(1);
+    });
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Cancel" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /new domain/i })).toBeNull();
+    });
+    // The answer lands after the dialog is gone: no update of an unmounted
+    // form, and nothing of it in the next dialog.
+    answer({ domain_name: "late", default_name: "kb" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+
+    const reopened = await openFromSidebar();
+    expect(within(reopened).getByLabelText("Name")).not.toHaveAttribute(
+      "placeholder",
+      "late",
+    );
+  });
+
   it("submits no name when the field is left blank, even once a peek fills its placeholder", async () => {
     const created = vi.fn(() => ({ domain: "engineering", root: null }));
     serveAs("admin", {

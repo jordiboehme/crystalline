@@ -426,6 +426,16 @@ impl Engine {
                 v
             })
             .collect();
+        // Every registered virtual domain's declared name, which lives in its
+        // MANIFEST engram in the database: `domain list` over the daemon reads
+        // it from here, beside the counts, in the one call it makes.
+        let table = self.name_table_now().await;
+        let virtual_names: serde_json::Map<String, Value> = self
+            .registered_domain_entries()
+            .iter()
+            .filter(|(_, entry)| entry.is_virtual())
+            .map(|(name, _)| (name.clone(), json!(table.canonical(name).unwrap_or(name))))
+            .collect();
         let registered: Vec<String> = self
             .config
             .read()
@@ -449,6 +459,7 @@ impl Engine {
             "instance_id": if self.instance_id.is_empty() { Value::Null } else { json!(self.instance_id) },
             "registered": registered,
             "domains": serde_json::to_value(&domains).unwrap_or(Value::Null),
+            "virtual_names": Value::Object(virtual_names),
             "embeddings": {
                 "active_model": self.model_id,
                 "provider": self.provider().is_some(),

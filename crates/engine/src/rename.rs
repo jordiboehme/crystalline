@@ -180,6 +180,23 @@ impl RenameOwner {
         }
     }
 
+    /// The owner for an engine that opens `db_path` under `loaded`'s
+    /// configuration, named without opening anything: the index as its store
+    /// would name it ([`crystalline_index::store_location`]), the
+    /// configuration file `loaded` resolved and `state_dir`.
+    pub fn for_opened(
+        loaded: &crate::overlay::LoadedConfig,
+        db_path: &Path,
+        state_dir: &Path,
+    ) -> RenameOwner {
+        RenameOwner::new(
+            crystalline_index::store_location(&loaded.effective.database(), Some(db_path))
+                .as_deref(),
+            Some(&loaded.path),
+            state_dir,
+        )
+    }
+
     /// The three, for a log line or a refusal.
     pub fn describe(&self) -> String {
         format!(
@@ -219,6 +236,18 @@ impl RenameOwner {
         }
         parts
     }
+}
+
+/// This machine's own index, configuration and state directory, as a rename
+/// journal records them: what a plain command, with no `--db` and no
+/// `--config`, opens, the environment overlay included. For Turso the index
+/// is always `index.db` in the state directory; for Postgres it is the
+/// database the configuration names.
+pub fn machine_rename_owner() -> anyhow::Result<RenameOwner> {
+    let state_dir = crystalline_core::config::state_dir()?;
+    let loaded = crate::overlay::load(None)?;
+    let db_path = crystalline_core::config::index_db_path()?;
+    Ok(RenameOwner::for_opened(&loaded, &db_path, &state_dir))
 }
 
 /// A rename journal as it waits in a state directory, for a caller outside

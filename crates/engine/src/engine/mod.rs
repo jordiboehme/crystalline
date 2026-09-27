@@ -1018,6 +1018,12 @@ pub struct Engine {
     // moment it needs it: a rename journal is run, and a MANIFEST name
     // adopted, only while it is held, so no two processes do either at once.
     holds_state_dir: std::sync::atomic::AtomicBool,
+    // This machine's own index, configuration and state directory, as a
+    // plain command opens them, when the opener said so
+    // ([`Engine::with_machine_owner`]). A rename and a name adoption move
+    // this machine's state folders and configuration, so they run only when
+    // the engine opened exactly these; with none set nothing is compared.
+    machine_owner: Option<crate::rename::RenameOwner>,
     // The rename test seams: a failure after one step, and a hold after one.
     #[cfg(any(test, feature = "testing"))]
     rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
@@ -1717,6 +1723,7 @@ impl Engine {
             adoption_failures: std::sync::Mutex::new(HashMap::new()),
             names_frozen: std::sync::atomic::AtomicBool::new(false),
             holds_state_dir: std::sync::atomic::AtomicBool::new(true),
+            machine_owner: None,
             #[cfg(any(test, feature = "testing"))]
             rename_fail_after: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
@@ -2238,6 +2245,17 @@ impl Engine {
     /// domain held by another live instance is skipped on a full sync and refused
     /// on a named one and this instance renews its locks on the heartbeat timer.
     /// An empty id (the default) leaves collaboration off.
+    /// Tell the engine which index, configuration and state directory are
+    /// this machine's own ([`crate::machine_rename_owner`]). The daemon, the
+    /// embedded stack and the standalone opener set it: a rename, a name
+    /// adoption and the finishing of a rename journal then run only when
+    /// the engine opened exactly those, never over an index `--db` or
+    /// `--config` named instead. An engine without it compares nothing.
+    pub fn with_machine_owner(mut self, owner: Option<crate::rename::RenameOwner>) -> Engine {
+        self.machine_owner = owner;
+        self
+    }
+
     pub fn with_instance_id(mut self, instance_id: String) -> Engine {
         self.label = instance_id.clone();
         self.instance_id = instance_id;

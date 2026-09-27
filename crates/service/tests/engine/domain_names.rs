@@ -1542,3 +1542,89 @@ async fn list_domains_says_shadowed_only_when_the_caller_sees_the_holder() {
     .await;
     assert_eq!(domain_row(&owner, "eng")["shadowed"], true, "{owner}");
 }
+
+// --- name table refresh paths ------------------------------------------------
+
+/// A full sync of a domain whose MANIFEST was deleted releases the canonical
+/// name it declared; its machine-local alias stays.
+#[tokio::test]
+async fn a_full_sync_after_the_manifest_is_deleted_releases_the_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = eng_with_alias(tmp.path()).await;
+    assert_eq!(
+        engine.local_domain_name("eng").await.as_deref(),
+        Some("eng-knowledge")
+    );
+    std::fs::remove_file(tmp.path().join("eng-knowledge/MANIFEST.md")).unwrap();
+    engine.sync(Some("eng-knowledge")).await.unwrap();
+    assert_eq!(engine.local_domain_name("eng").await, None);
+    assert_eq!(
+        engine.local_domain_name("old-eng").await.as_deref(),
+        Some("eng-knowledge")
+    );
+}
+
+/// Removing a domain releases its canonical name and its aliases at once,
+/// in the table and in the index's spellings.
+#[tokio::test]
+async fn removing_a_domain_releases_its_canonical_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = eng_with_alias(tmp.path()).await;
+    let spelled = |spellings: Vec<(String, crystalline_index::DomainId)>, name: &str| {
+        spellings.iter().any(|(s, _)| s == name)
+    };
+    assert!(spelled(
+        engine
+            .store()
+            .lock()
+            .await
+            .domain_spellings()
+            .await
+            .unwrap(),
+        "eng"
+    ));
+
+    engine.domain_remove("eng-knowledge").await.unwrap();
+    assert_eq!(engine.local_domain_name("eng").await, None);
+    assert_eq!(engine.local_domain_name("old-eng").await, None);
+    assert_eq!(
+        engine.local_domain_name("ops").await.as_deref(),
+        Some("ops")
+    );
+    let spellings = engine
+        .store()
+        .lock()
+        .await
+        .domain_spellings()
+        .await
+        .unwrap();
+    assert!(!spelled(spellings.clone(), "eng"), "{spellings:?}");
+    assert!(!spelled(spellings, "old-eng"));
+}
+
+/// An alias the table has to ignore is warned about once, when it first
+/// becomes ignored, not on every rebuild after that.
+#[tokio::test(flavor = "current_thread")]
+async fn an_ignored_alias_is_warned_about_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut eng = file_domain(tmp.path(), "eng-knowledge", "eng", &[]);
+    // `ops` is another domain's local name, so this alias resolves nowhere.
+    eng.aliases = vec!["ops".to_string()];
+    let ops = file_domain(tmp.path(), "ops", "ops", &[]);
+    let engine = engine(
+        memory_store().await,
+        tmp.path(),
+        vec![("eng-knowledge", eng), ("ops", ops)],
+    );
+    let (logs, _guard) = crate::support::capture_logs();
+    engine.sync(None).await.unwrap();
+    engine.refresh_names().await;
+    engine.sync(None).await.unwrap();
+    engine.refresh_names().await;
+    let warned = logs
+        .lines()
+        .iter()
+        .filter(|l| l.contains("alias 'ops' of domain 'eng-knowledge' is ignored"))
+        .count();
+    assert_eq!(warned, 1, "{:?}", logs.lines());
+}

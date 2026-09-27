@@ -304,8 +304,9 @@ pub fn choose_domain_name(
 /// never for a team domain (`entry.origin` set) whatever its name's origin -
 /// explicit or derived. The owner adds the name upstream by hand; an
 /// automatic write would plant a pending local change that blocks review
-/// mode and conflicts once the owner adds the name upstream. Otherwise written for every plain local file or
-/// virtual domain (no `origin`), whatever its name's origin.
+/// mode and conflicts once the owner adds the name upstream. Otherwise
+/// written for every plain local file or virtual domain (no `origin`),
+/// whatever its name's origin.
 pub fn needs_manifest_write_back(entry: &DomainEntry, manifest_declares: bool) -> bool {
     !manifest_declares && entry.origin.is_none()
 }

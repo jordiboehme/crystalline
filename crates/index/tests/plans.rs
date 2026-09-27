@@ -404,7 +404,10 @@ pub fn registry() -> Vec<HotStatement> {
             // can lose the title index to a rewrite that still has it seeking
             // something, and only that guard notices.
             turso_must_seek: &["idx_relation_unresolved"],
-            postgres_must_seek: &[],
+            // Each reference's domain spelling is looked up by its key, per
+            // row of the pass: a scan of `domain_spelling` there would be a
+            // full pass per reference.
+            postgres_must_seek: &["domain_spelling_pkey"],
         },
         HotStatement {
             issued_by: "Store::resolve_pending_links",
@@ -415,7 +418,7 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected: &[],
             scan_expected_pg: None,
             turso_must_seek: &["idx_link_unresolved"],
-            postgres_must_seek: &[],
+            postgres_must_seek: &["domain_spelling_pkey"],
         },
         HotStatement {
             issued_by: "Store::unresolved_refs",

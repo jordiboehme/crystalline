@@ -1472,8 +1472,7 @@ mod tests {
     }
 
     /// An empty path, or one that is nothing but a trailing slash, names the
-    /// repository root and is accepted - the regression Task 22 introduced
-    /// (F-carry to Task 23): both used to work before the traversal guard
+    /// repository root and is accepted: both used to work before the traversal guard
     /// above tightened the rule, and a form field or a shell-completed folder
     /// name commonly ends in either shape.
     #[test]

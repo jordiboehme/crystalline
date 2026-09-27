@@ -155,7 +155,7 @@ impl Engine {
         if self.domain_entry(&domain_name).is_err() {
             validate_domain_name(&domain_name).map_err(EngineError::Invalid)?;
         }
-        // Open issue 4, ruled: an explicit name and the repository default
+        // An explicit name and the repository default
         // keep adopting an origin-less domain that holds them in place, as
         // they always have; a MANIFEST-declared name that is taken has
         // already stepped to `<name>-2` above and never adopts. This one
