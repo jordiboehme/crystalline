@@ -1,17 +1,20 @@
 /**
- * The approved marks (2.6d C16): every string sets in the block-pixel
- * font, and the four pictures keep the shapes their recipes rely on.
+ * The approved marks (2.6d, 2.6f C16): every string sets in the
+ * block-pixel font, and the six pictures keep the shapes their recipes
+ * rely on.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { textRows } from "./heroes/pixels";
+import { PIXEL_FONT, textRows } from "./heroes/pixels";
 import {
   CAPSULE_LOGO,
   COMPUTER_LOGO,
+  HAMMER_RUNES,
   MARKS,
   SIGNATURE,
   SPACE_BADGE,
+  TREFOIL_MARK,
 } from "./marks";
 
 const strings = (): string[] =>
@@ -78,5 +81,50 @@ describe("the approved marks", () => {
       expect(COMPUTER_LOGO[y]?.slice(3).includes("#"), `row ${String(y)}`).toBe(
         true,
       );
+  });
+
+  it("draws the hammer's runes as one band of separate marks, none a letter (2.6f C14, C15)", () => {
+    // Mutation caught: the band a solid bar, rows of unequal width, or a
+    // letter-shaped glyph from the font pasted in as one of the runes.
+    expect(HAMMER_RUNES.length).toBeGreaterThanOrEqual(3);
+    const width = HAMMER_RUNES[0]?.length ?? 0;
+    for (const r of HAMMER_RUNES) expect(r).toHaveLength(width);
+    const lit = (c: number) => HAMMER_RUNES.some((r) => r[c] !== ".");
+    let gaps = 0;
+    const marks: [number, number][] = [];
+    let start = -1;
+    for (let c = 0; c <= width; c++) {
+      const on = c < width && lit(c);
+      if (on && start === -1) start = c;
+      if (!on && start !== -1) {
+        marks.push([start, c]);
+        if (c > 0 && lit(c - 1) && !lit(c)) gaps++;
+        start = -1;
+      }
+    }
+    expect(gaps).toBeGreaterThanOrEqual(4);
+    for (const [c0, c1] of marks) {
+      const mark = HAMMER_RUNES.map((r) => r.slice(c0, c1));
+      for (const glyph of Object.values(PIXEL_FONT))
+        expect(mark.join(), `${String(c0)}-${String(c1)}`).not.toBe(
+          glyph.join(),
+        );
+    }
+  });
+
+  it("cuts the fuel case's trefoil into three blades around a filled centre (2.6f C14)", () => {
+    // Mutation caught: a solid disc with no blades, a blade drawn straight
+    // down (the case's own angles keep the lower blades either side, never
+    // beneath centre), or the shape losing its left-right mirror.
+    expect(TREFOIL_MARK.length % 2).toBe(1);
+    const width = TREFOIL_MARK[0]?.length ?? 0;
+    for (const r of TREFOIL_MARK) expect(r).toHaveLength(width);
+    for (const r of TREFOIL_MARK) expect([...r].reverse().join(""), r).toBe(r);
+    const midRow = Math.floor(TREFOIL_MARK.length / 2);
+    const midCol = Math.floor(width / 2);
+    expect(TREFOIL_MARK[midRow]?.[midCol]).toBe("#");
+    expect(TREFOIL_MARK[midRow - 2]?.includes("#")).toBe(false);
+    expect(TREFOIL_MARK[0]?.[midCol]).toBe("#");
+    expect(TREFOIL_MARK[TREFOIL_MARK.length - 1]?.[midCol]).toBe(".");
   });
 });

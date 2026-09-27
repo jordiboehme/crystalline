@@ -11,7 +11,15 @@ import { describe, expect, it } from "vitest";
 import { FLAG, createBuilder } from "../../geometry";
 import { frameAt } from "../../kit";
 import { recordingKitAt, type Part } from "../../modelChecks";
-import { PIXEL_FONT, pixelBoxes, pixelRuns, textRows } from "./pixels";
+import {
+  PIXEL_FONT,
+  fit,
+  markLines,
+  pixelBoxes,
+  pixelRuns,
+  textBlock,
+  textRows,
+} from "./pixels";
 
 /** The on-screen titles the cabinets carry: every letter must exist. */
 const TITLES = ["TILEFALL", "ROCK RAIN", "MAZE HUNT", "VOID WING"];
@@ -19,7 +27,7 @@ const TITLES = ["TILEFALL", "ROCK RAIN", "MAZE HUNT", "VOID WING"];
 describe("block-pixel font", () => {
   it("draws every glyph as 5 rows of 3 lit or dark cells", () => {
     const keys = Object.keys(PIXEL_FONT);
-    for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .<=>")
+    for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .<=>&")
       expect(keys, c).toContain(c);
     for (const [c, rows] of Object.entries(PIXEL_FONT)) {
       expect(rows, c).toHaveLength(5);
@@ -90,6 +98,17 @@ describe("block-pixel font", () => {
     expect(() => textRows("a!")).toThrow(/!/);
   });
 
+  it("draws the new glyph apart from every other glyph (2.6f C15)", () => {
+    // Mutation caught: "&" drawn as an "8" or a "B", or a glyph not 5 rows
+    // of 3.
+    const g = PIXEL_FONT["&"];
+    expect(g).toBeDefined();
+    expect(g).toHaveLength(5);
+    for (const row of g ?? []) expect(row).toMatch(/^[#.]{3}$/);
+    for (const [other, h] of Object.entries(PIXEL_FONT))
+      if (other !== "&") expect(h.join(), `& vs ${other}`).not.toBe(g?.join());
+  });
+
   it("lays one box per run with pixelBoxes, from d0 to d1", () => {
     // Mutation caught: a box per pixel (the merge lost), or the depth span
     // taken from the wrong arguments. At turn 0 the frame's inward (+d)
@@ -108,6 +127,67 @@ describe("block-pixel font", () => {
       expect(Math.min(...ds)).toBeCloseTo(-0.1015, 6);
       expect(Math.max(...ds)).toBeCloseTo(-0.1, 6);
     }
+  });
+});
+
+describe("textBlock (2.6f C14)", () => {
+  it("sets lines under each other, centred, one dark row apart", () => {
+    // Mutation caught: no gap row, lines left aligned, or rows of unequal
+    // width (which `fit` reads from row 0 alone).
+    const rows = textBlock(["AB", "C"]);
+    expect(rows).toHaveLength(11);
+    for (const r of rows) expect(r).toHaveLength(7);
+    expect(rows[5]).toBe(".......");
+    expect(rows.slice(0, 5)).toEqual(textRows("AB"));
+    expect(rows.slice(6)).toEqual(textRows("C").map((r) => `..${r}..`));
+  });
+
+  it("keeps every lit run of every line, and no other", () => {
+    // Mutation caught: padding lit, or a line dropped.
+    const lines = ["POLICE", "FREE", "PULL TO OPEN"];
+    expect(pixelRuns(textBlock(lines))).toHaveLength(
+      lines.reduce((n, l) => n + pixelRuns(textRows(l)).length, 0),
+    );
+  });
+});
+
+describe("markLines (2.6f C17)", () => {
+  it("draws a mark's lines as one block fitted into its box, and reports the pixel size", () => {
+    // Mutation caught: px not returned from fit, the block laid off the
+    // box's left or top, or the wrong ink used.
+    const builder = createBuilder();
+    const parts: Part[] = [];
+    const k = recordingKitAt(builder, parts)(frameAt([0, 0, 0], 0));
+    const ink = { layer: 0, tint: [1, 0, 0] as const, flag: FLAG.lit };
+    const box = [-0.05, 0.05, 0.1, 0.14] as const;
+    const rows = textBlock(["AB", "C"]);
+    const want = fit(rows, ...box);
+    const px = markLines(k, ["AB", "C"], box, 0.02, ink);
+    expect(px).toBeCloseTo(want.px, 9);
+    expect(parts).toHaveLength(pixelRuns(rows).length);
+    for (const p of parts) {
+      expect(p.method).toBe("panel");
+      expect(p.tint).toEqual(ink.tint);
+      const ds = p.points.map((q) => q[2]);
+      expect(Math.min(...ds)).toBeCloseTo(-0.02, 6);
+      expect(Math.max(...ds)).toBeCloseTo(-0.02, 6);
+    }
+  });
+
+  it("gives a single string the same block as its one-line array", () => {
+    // Mutation caught: the string form skipping textBlock's centring, or
+    // wrapping the string a different way than `[lines]`.
+    const builder = createBuilder();
+    const parts: Part[] = [];
+    const k = recordingKitAt(builder, parts)(frameAt([0, 0, 0], 0));
+    const ink = { layer: 0, tint: [0, 1, 0] as const, flag: FLAG.lit };
+    const box = [-0.05, 0.05, 0.1, 0.14] as const;
+    const pxString = markLines(k, "GO", box, 0.02, ink);
+    const partsFromString = parts.map((p) => ({ ...p }));
+    parts.length = 0;
+    const pxArray = markLines(k, ["GO"], box, 0.02, ink);
+    expect(pxArray).toBe(pxString);
+    expect(parts).toEqual(partsFromString);
   });
 });
 

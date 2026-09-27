@@ -26,7 +26,8 @@ import type { Surfaces } from "../common";
 
 /**
  * The block-pixel font: `A` to `Z`, `a` to `z`, `0` to `9`, the space, a
- * one-pixel period and the three marks `<`, `=` and `>` (the laptop's
+ * one-pixel period, `&` (2.6f C15, the police box's door notice) and the
+ * three marks `<`, `=` and `>` (the laptop's
  * "<=>", C17), each glyph 5 rows of 3 cells from the top, `#` lit and `.`
  * dark (the period glyph's own single lit cell sits at its bottom
  * middle). It is the smallest grid a capital letter still reads in, the
@@ -113,6 +114,7 @@ export const PIXEL_FONT: Readonly<Record<string, readonly string[]>> = {
   "<": ["..#", ".#.", "#..", ".#.", "..#"],
   "=": ["...", "###", "...", "###", "..."],
   ">": ["#..", ".#.", "..#", ".#.", "#.."],
+  "&": [".#.", "#.#", ".#.", "#.#", ".##"],
 };
 
 /** One horizontal run of equal characters: its first column, its row (0 at the top) and its length. */
@@ -169,6 +171,47 @@ export function textRows(text: string): string[] {
   return Array.from({ length: 5 }, (_, y) =>
     glyphs.map((g) => g[y] ?? "...").join("."),
   );
+}
+
+/**
+ * `lines` set in the font one under the other (2.6f C14): each line's 5
+ * rows from `textRows`, centred on the widest line with dark columns, and
+ * one dark row between two lines. Every line goes through `textRows`, so
+ * `textCalls.test.ts` records each one. Pixel count and runs are the
+ * lines' own: the padding is dark.
+ */
+export function textBlock(lines: readonly string[]): string[] {
+  const sets = lines.map((l) => textRows(l));
+  const width = Math.max(0, ...sets.map((r) => r[0]?.length ?? 0));
+  const out: string[] = [];
+  sets.forEach((rows, i) => {
+    if (i > 0) out.push(".".repeat(width));
+    const pad = width - (rows[0]?.length ?? 0);
+    const left = Math.floor(pad / 2);
+    for (const r of rows)
+      out.push(".".repeat(left) + r + ".".repeat(pad - left));
+  });
+  return out;
+}
+
+/**
+ * Sets `lines` (one string or several) as a mark (2.6f C17): the block
+ * from `textBlock`, fitted into the box `a0..a1` by `h0..h1` with square
+ * pixels as large as it allows (`fit`), laid by `pixelPanel` as quads
+ * facing `+d` at depth `d` in `ink`. Returns the pixel size, so a recipe
+ * can hold it to C13's floor (3 mm on a hero, 1 mm on a curio).
+ */
+export function markLines(
+  k: Kit,
+  lines: string | readonly string[],
+  box: readonly [a0: number, a1: number, h0: number, h1: number],
+  d: number,
+  ink: Surface,
+): number {
+  const rows = textBlock(typeof lines === "string" ? [lines] : lines);
+  const { px, left, top } = fit(rows, ...box);
+  pixelPanel(k, rows, left, top, px, d, (ch) => (ch === "#" ? ink : null));
+  return px;
 }
 
 /**
