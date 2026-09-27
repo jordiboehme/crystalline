@@ -184,7 +184,7 @@ const codeOf = (src: string): string =>
  * (2.6d C16 fix): `RECRUIT_DEMO`, `QUESTION_MARK`, `CONSOLE_TITLE` and
  * `CONSOLE_PLAY` from before 2.6d, 2.6d's own `SAUCER_PICTURE`,
  * `CAPSULE_LOGO`, `SIGNATURE`, `SPACE_BADGE` and `COMPUTER_LOGO`, and
- * 2.6f's own `HAMMER_RUNES` and `TREFOIL_MARK`. `PLAQUE_LINES`
+ * 2.6f's own `HAMMER_RUNES`. `PLAQUE_LINES`
  * (`finds.ts`) is left out on purpose: it is `readonly (readonly
  * string[])[]` built from `textRows`, so its digits and letters are
  * caught by the guards above already.
@@ -200,7 +200,6 @@ const APPROVED_PICTURES = new Set([
   "SPACE_BADGE",
   "COMPUTER_LOGO",
   "HAMMER_RUNES",
-  "TREFOIL_MARK",
 ]);
 
 /** Every top-level `readonly string[]` constant's name, across `SOURCES`. */

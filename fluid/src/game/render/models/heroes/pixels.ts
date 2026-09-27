@@ -255,9 +255,13 @@ export function pixelPanel(
  * metres (2.6d C16): thin enough, at curio range, to read as printed on
  * the face rather than as far out as the mark is tall, the way a panel
  * lifted the taller `DECAL_LIFT` would stand. A curio's mark (`finds.ts`,
- * `desktop.ts`) is a `pixelPanel` quad at this lift instead of at
- * `DECAL_LIFT`, since a box per run would cost about six times the
- * triangles a panel does, inside the curio budget; the designer tower's
+ * `desktop.ts`, `retro.ts`, `keepsakes.ts`) is a `pixelPanel` quad at
+ * this lift instead of at `DECAL_LIFT`, since a box per run would cost
+ * about six times the triangles a panel does, inside the curio budget.
+ * The one exception is a curio mark on a face that looks up, where no
+ * quad can lie (the tape drive's lid and the tape player's top,
+ * `retro.ts`): it is built from thin slabs or boxes this thick, runs
+ * merged with the runs under them to stay in budget. The designer tower's
  * badge, clock and signature and the ooze canisters' letters
  * (`props/rare.ts`) are `pixelBoxes` at this same lift, inside the
  * roomier prop budget.
@@ -271,8 +275,9 @@ export const MARK_PROUD = 0.0015;
  * same `a0`, `h1` and `px` placing. Only the designer tower's badge,
  * clock and signature and the ooze canisters' letters call it
  * (`props/rare.ts`, 2.6d C16), each a box `MARK_PROUD` proud of its
- * face; a curio's mark is a `pixelPanel` at the same lift instead, so no
- * curio calls this.
+ * face; a curio's mark is a `pixelPanel` at the same lift instead (or,
+ * on a face that looks up, its own merged slabs or boxes), so no curio
+ * calls this.
  */
 export function pixelBoxes(
   k: Kit,

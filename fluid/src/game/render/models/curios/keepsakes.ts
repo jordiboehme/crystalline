@@ -606,9 +606,10 @@ function caseMark(
  * dark lid seam, a red stripe wrapped round all four faces, two latches
  * and a carry handle. On the front above the stripe sits the yellow
  * hazard label, a black radiation trefoil (three sectors and a centre
- * disc, each extruded proud of the label) over the hazard class line; under the stripe runs the handling line; on the `+a` side a
- * cream sticker on the `-a` side carries the caution line (module doc). No lights: the
- * case's bank is steady.
+ * disc, each extruded proud of the label) over the hazard class line;
+ * under the stripe runs the handling line; a cream sticker on the `-a`
+ * side carries the caution line (module doc). No lights: the case's
+ * bank is steady.
  */
 const fuelCase: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   const { hw, hd, top } = curioHalf(kind, variant);

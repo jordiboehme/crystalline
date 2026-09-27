@@ -14,7 +14,7 @@
  * original sets it: in capitals, or in lower case where the original's
  * wordmark is lower case, and a number in numerals. A mark that is no
  * text (the round C, the signature, the planet badge, the computers'
- * maker's logo, the hammer's runes, the trefoil) is a picture: rows of
+ * maker's logo, the hammer's runes) is a picture: rows of
  * characters, row 0 at the top, `.` dark, drawn with `pixelPanel` or
  * `pixelBoxes`. A multi-line text mark (`boardLogo`, `boxNotice`) is a
  * `readonly string[]` of lines, set through `textBlock`/`markLines`
@@ -150,26 +150,4 @@ export const HAMMER_RUNES: readonly string[] = [
   ".#.#..##.#...#",
   "#...#.#...#.#.",
   "#...#.##.#..#.",
-];
-
-/**
- * The fuel case's trefoil (2.6f C13, C14): `#` the trefoil ink, one blade
- * straight up and two more at the lower left and right (the case's own
- * three sector angles), a filled disc at the centre and a dark ring
- * between the disc and the blades. Mirror-symmetric left to right, since
- * the case's own angles put one blade on the vertical axis and the other
- * two at equal angles either side of it.
- */
-export const TREFOIL_MARK: readonly string[] = [
-  "..#######..",
-  "...#####...",
-  "....###....",
-  "...........",
-  "....###....",
-  "....###....",
-  "....###....",
-  "...........",
-  "..#.....#..",
-  ".##.....##.",
-  "###.....###",
 ];

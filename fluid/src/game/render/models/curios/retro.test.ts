@@ -243,8 +243,8 @@ describe("retro curio models", () => {
 
     it("prints the console's name and maker on the grey under its bezel, one mark proud, left to right (2.6f C13)", () => {
       // Mutation caught: the grey left bare, a word dropped, the text over
-      // the screen or on the bezel, turned about or mirrored, the words
-      // swapped, floating or sunk, or under the 1 mm floor. The console
+      // the screen, turned about or mirrored, the words swapped, floating
+      // or sunk, or under the 1 mm floor. The console
       // stands upright facing `+d`, so "under the screen" is along `h`.
       expect(runsOfLines(MARKS.consoleBadge)).toBeGreaterThan(3);
       const ink = inked(parts, CONSOLE_BADGE_INK);
