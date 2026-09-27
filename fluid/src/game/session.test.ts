@@ -34,6 +34,7 @@ import {
 } from "./session";
 import { withArrivalBox } from "./world/arrival";
 import { boxFront, type DomainRow } from "./world/box";
+import { atConsoleExit } from "./world/consoleRoom";
 import { CANNED_BRIDGE, galleryRoom, heroHallRoom } from "./world/canned";
 import { NOT_FOUND, generateRoom } from "./world/generate";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
@@ -2249,6 +2250,66 @@ describe("the console room", () => {
     expect(lastDoors().get(key)).toBeGreaterThan(0.9);
     frames(19);
     expect(lastDoors().get(key)).toBe(0);
+  });
+
+  it("does not walk back into the arrival box on the spot: only after a step out of its doorway (2.6e C11, C14)", async () => {
+    // Mutation caught: the walk-in latch cleared by the doors swinging
+    // shut, not by the player leaving the doorway, so turning round at the
+    // arrival spot and opening the box walks straight back in.
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    walkIn();
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("ops");
+    });
+    frames(20); // the arrival box's doors swing shut
+    key("keydown", "ArrowLeft");
+    frames(37); // about half a turn at 3 rad/s
+    key("keyup", "ArrowLeft");
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE OPEN");
+    const shown = renderer.setRoom.mock.calls.length;
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    expect(renderer.setRoom.mock.calls.length).toBe(shown);
+    // A step back out of the doorway, then in again: now it walks in.
+    key("keydown", "ArrowDown");
+    frames(6);
+    key("keyup", "ArrowDown");
+    frames(10);
+    key("keydown", "ArrowUp");
+    for (let t = 0; t < 60 && renderer.setRoom.mock.calls.length === shown; t++)
+      frames(1);
+    key("keyup", "ArrowUp");
+    expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
+    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+  });
+
+  it("ends the console room's visit on any other entry: its doorway's spot in another room leads nowhere (Review Focus 4)", async () => {
+    // Mutation caught: an entry that does not clear the visit, so the
+    // exit still fires at (6, 12) m in the next room.
+    const loads: string[] = [];
+    const load: PlaceLoader = (a, signal) => {
+      loads.push(a.domain);
+      return okBridge(a, signal);
+    };
+    const session = startWithConsole([row(HALL), row("ops")], load);
+    standAtBox(session);
+    walkIn();
+    await flush(); // the listing has landed: the exit could fire
+    const hall = heroHallRoom();
+    expect(hall.grid[5]?.[3]).toBe(".");
+    session.showRoom({ ...hall, spawn: { x: 2.5, y: 5.25, yaw: 0 } });
+    hud.connector.mockClear();
+    frames(3);
+    const eye = lastCamera().eye;
+    expect(atConsoleExit({ x: eye[0], z: eye[2] })).toBe(true);
+    await flush();
+    expect(loads).toEqual([]);
+    expect(hud.connector).not.toHaveBeenCalled();
   });
 
   it("waits for the listing and falls back to the room left's domain when it fails (2.6e C13)", async () => {

@@ -1134,11 +1134,23 @@ export function createSession(opts: SessionOptions): Session {
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
     for (const [index, state] of boxes) doorOpen.set(boxKey(index), state.open);
+    // The walk-in latch holds until the player has left the latched box's
+    // doorway, whatever its doors do meanwhile: counted as wide open, so a
+    // player who steps out of the arrival box, turns and opens it again
+    // walks in only after stepping back out and in (C11, C14).
+    if (
+      boxLatched !== null &&
+      boxEntry(
+        room,
+        player,
+        new Map([[boxLatched, { open: 1, target: 1 }]]),
+      ) === null
+    ) {
+      boxLatched = null;
+    }
     if (opts.consoleRoom !== undefined && !loading && !modal()) {
       const entered = boxEntry(room, player, boxes);
-      if (entered === null) {
-        boxLatched = null;
-      } else if (entered !== boxLatched) {
+      if (entered !== null && entered !== boxLatched) {
         cutIn();
         // The rest of this tick read the room left: the console room
         // starts on the next.
