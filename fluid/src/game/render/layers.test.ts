@@ -5,6 +5,7 @@ import { generateRoom } from "../world/generate";
 import type { RoomSpec } from "../world/types";
 import {
   LABEL_ROWS,
+  LAYER,
   LAYER_SIZE,
   ROW_HEIGHT,
   TEXT_BASE,
@@ -75,6 +76,16 @@ describe("textRequests", () => {
         expect(r.row).toBeNull();
       }
     }
+  });
+});
+
+describe("LAYER", () => {
+  it("keeps every procedural layer below TEXT_BASE and distinct (2.7 C12)", () => {
+    // Mutation caught: a procedural layer's index moved to or past
+    // TEXT_BASE, or two procedural layers sharing an index.
+    expect(TEXT_BASE).toBe(11);
+    const indices = Object.values(LAYER).sort((a, b) => a - b);
+    expect(indices).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 });
 

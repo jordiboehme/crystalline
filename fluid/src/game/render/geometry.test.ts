@@ -15,8 +15,10 @@ import {
   FLAG,
   FLOATS_PER_VERTEX,
   LINTEL,
+  WALL_PATTERN_LOOK,
   accentTint,
   buildRoomMesh,
+  wallPatternOf,
   type MeshData,
 } from "./geometry";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
@@ -34,6 +36,7 @@ function vertexOf(m: MeshData, i: number) {
   return {
     pos: [v(0), v(1), v(2)] as const,
     normal: [v(3), v(4), v(5)] as const,
+    uv: [v(6), v(7)] as const,
     layer: v(8),
     tint: [v(9), v(10), v(11)],
     flag: v(12),
@@ -510,5 +513,79 @@ describe("the accent stripe (2.7 C8, C9)", () => {
       LOOKS.freescape.accents[3],
     );
     expect(accentFor(room, LOOKS.aperture)).toEqual(LOOKS.aperture.accents[3]);
+  });
+});
+
+/**
+ * The shell's full-height wall quads in a mesh (Review Focus 1): walked six
+ * vertices at a time, every vertical quad on one of the wall pattern's own
+ * layers (never the accent stripe) that spans the room's whole height,
+ * with its layer, the uv spans `du` and `dv` across the quad, its height
+ * and the cell `(cx, cy)` it faces into (read back from its position and
+ * its normal, as `edgeQuad` places it).
+ */
+function wallQuads(m: MeshData): {
+  layer: number;
+  du: number;
+  dv: number;
+  height: number;
+  cx: number;
+  cy: number;
+}[] {
+  const vs = all(m);
+  const patternLayers = new Set(WALL_PATTERN_LOOK.map((p) => p.layer));
+  const candidates: {
+    layer: number;
+    du: number;
+    dv: number;
+    height: number;
+    cx: number;
+    cy: number;
+  }[] = [];
+  for (let q = 0; q + 5 < vs.length; q += 6) {
+    const quad = vs.slice(q, q + 6);
+    const first = quad[0];
+    if (first === undefined) continue;
+    if (!patternLayers.has(first.layer)) continue;
+    if (quad.some((v) => v.tint[0] === ACCENT_MARK)) continue;
+    if (!quad.every((v) => Math.abs(v.normal[1]) < EPS)) continue;
+    const ys = quad.map((v) => v.pos[1]);
+    const height = Math.max(...ys) - Math.min(...ys);
+    const us = quad.map((v) => v.uv[0]);
+    const vs2 = quad.map((v) => v.uv[1]);
+    const du = Math.max(...us) - Math.min(...us);
+    const dv = Math.max(...vs2) - Math.min(...vs2);
+    const [nx, , nz] = first.normal;
+    const mid = (k: 0 | 2) =>
+      quad.reduce((sum, v) => sum + v.pos[k], 0) / quad.length;
+    const cx = Math.floor((mid(0) + nx * CELL * 0.5 + EPS) / CELL);
+    const cy = Math.floor((mid(2) + nz * CELL * 0.5 + EPS) / CELL);
+    candidates.push({ layer: first.layer, du, dv, height, cx, cy });
+  }
+  const full = Math.max(...candidates.map((c) => c.height));
+  return candidates.filter((c) => Math.abs(c.height - full) < EPS);
+}
+
+describe("wall patterns (2.7 C11)", () => {
+  it("gives each bay and the corridor a pattern of their own, on the built walls (Review Focus 1)", () => {
+    // Mutation caught: every wall on the hall's layer, a bay's walls on the
+    // hall's pattern, or the pattern's uv scale left out (Aperture's seams
+    // would not move).
+    const room = generateRoom(CANNED_HUB);
+    expect(room.bays.length).toBeGreaterThan(0);
+    expect(room.corridor).not.toBeNull();
+    const walls = wallQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    expect(walls.length).toBeGreaterThan(0);
+    for (const w of walls) {
+      const want = WALL_PATTERN_LOOK[wallPatternOf(room, w.cx, w.cy)]!;
+      expect(w.layer).toBe(want.layer);
+      expect(w.du / CELL).toBeCloseTo(want.u, 6); // uv run along one 2 m edge over 2 m
+      expect(w.dv / w.height).toBeCloseTo(want.v, 6);
+    }
+    const bayCell = { x: room.bays[0]!.x0 + 1, y: room.bays[0]!.y0 + 1 };
+    expect(wallPatternOf(room, bayCell.x, bayCell.y)).toBe(
+      room.finish.bayWalls[0],
+    );
+    expect(room.finish.bayWalls[0]).not.toBe(room.finish.hallWalls);
   });
 });

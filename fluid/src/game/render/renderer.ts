@@ -3,8 +3,11 @@
  *
  * `setRoom` does the expensive work once per room or look - it builds the
  * static room mesh and one small mesh per moving part of a way, fills the
- * texture array (procedural layers, the pictogram set, and the text layers
- * of `layerPlan`: one per screen, poster and placard, one per six labels),
+ * texture array (the procedural layers up to `LAYER.decal` - panels, floor,
+ * ceiling, metal, hazard, the portal swirl, grime, the ribbed and plated
+ * wall patterns and the decal atlas, 2.7 C11 and C12 - the pictogram set,
+ * and the text layers of `layerPlan`: one per screen, poster and placard,
+ * one per six labels),
  * makes the room's light grid texture, uploads the set dressing and keeps
  * the look's numbers - and `draw` is then a handful of uniform uploads
  * (the room's accent among them, `uAccent` from `accentFor`, 2.7 C8), one

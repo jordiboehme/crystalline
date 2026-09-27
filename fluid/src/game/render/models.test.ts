@@ -125,7 +125,7 @@ const HIGH_CEILING = 5.0;
 const EPS = 1e-4;
 const HALL: Rect = { x0: 2, y0: 0, x1: 7, y1: 6 };
 /** The text layer the test hands out for one-line labels. */
-const LABEL_LAYER = 12;
+const LABEL_LAYER = 14;
 
 /** A context that records the text keys it was asked for. */
 function context(ceiling = CEILING): { ctx: ModelContext; keys: string[] } {
@@ -143,7 +143,7 @@ function context(ceiling = CEILING): { ctx: ModelContext; keys: string[] } {
           key.startsWith("poster") ||
           key === "placard"
         )
-          return { layer: 9, v0: 0, v1: 1 };
+          return { layer: 11, v0: 0, v1: 1 };
         return { layer: LABEL_LAYER, v0: 2 / 6, v1: 3 / 6 };
       },
     },

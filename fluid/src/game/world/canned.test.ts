@@ -53,6 +53,7 @@ import {
   VARIANTS_HALL_DECOR,
   variantsHallRoom,
 } from "./canned";
+import { plainFinish } from "./finish";
 import { MACHINE_KINDS } from "./generate";
 import { VARIANT_COUNTS } from "./variants";
 import type {
@@ -702,5 +703,17 @@ describe("the variants hall (2.7 C24)", () => {
       });
       for (const lane of sites.lanes) expect(overlaps(b, lane)).toBe(false);
     });
+  });
+});
+
+describe("the gallery and the hero hall keep the plain finish (Review Focus 5)", () => {
+  it("draws the gallery and the hero hall in accent 0 and pattern 0 everywhere", () => {
+    // Mutation caught: a hand-built room drawn with a picked finish, so its
+    // walls or its stripe would change with its seed instead of staying
+    // plain.
+    const gallery = galleryRoom();
+    expect(gallery.finish).toEqual(plainFinish(gallery.bays.length));
+    const hall = heroHallRoom();
+    expect(hall.finish).toEqual(plainFinish(hall.bays.length));
   });
 });

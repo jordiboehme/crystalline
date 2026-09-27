@@ -4,7 +4,8 @@
  * The station draws everything with one shader and one `TEXTURE_2D_ARRAY`,
  * after the demoscene habit: a handful of procedural layers made once at
  * start (panels, floor plates, ceiling, metal, hazard stripes, the portal's
- * swirl, grime, pictograms), followed by the room's text. A terminal
+ * swirl, grime, pictograms, the ribbed and plated wall patterns and the
+ * decal atlas, 2.7 C11 and C12), followed by the room's text. A terminal
  * screen, a poster and the placard each get a whole layer; the one-line
  * labels of doors, portals, hatches and machine tags are packed six to a
  * layer, one label per row, so a hub with forty tags and twenty doors does
@@ -25,7 +26,10 @@ import type { RoomSpec } from "../world/types";
  * The procedural layers, made once at start and shared by every room. Their
  * indices are fixed so the geometry can name a surface's texture without
  * asking the texture code, and the text layers start right after them at
- * `TEXT_BASE`.
+ * `TEXT_BASE`. `ribbed` and `plated` are the shell's two alternative wall
+ * patterns (2.7 C11), read only by the geometry's wall, lintel and stripe
+ * quads; every model keeps `panel`. `decal` is the decal atlas (2.7 C12),
+ * fully transparent until the atlas is drawn onto it.
  */
 export const LAYER = {
   panel: 0,
@@ -36,13 +40,16 @@ export const LAYER = {
   portal: 5,
   grime: 6,
   pictogram: 7,
+  ribbed: 8,
+  plated: 9,
+  decal: 10,
 } as const;
 
 /**
  * The first text layer: the whole layers (placard, screens, posters) start
  * here in `textRequests` order, and the label layers follow them.
  */
-export const TEXT_BASE = 8;
+export const TEXT_BASE = 11;
 
 /**
  * The side of every layer in texels. One size for all layers is what a

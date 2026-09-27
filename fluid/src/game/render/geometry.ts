@@ -34,19 +34,24 @@
  * The shell is built cell by cell: a floor and a ceiling quad per floor
  * cell and a wall quad on every edge where a floor cell meets void or the
  * grid's edge, the same rule `wallSlots` uses for the walls fixtures stand
- * against. The uv of every shell quad is its world position in metres, so
- * the seams run on unbroken across cells. A room with `interior` (the
- * console room, 2.6e C4) draws its shell in `CONSOLE_SHELL`'s fixed tints
- * on the same layers, whatever the look; its flush fittings cover the
- * walls. Every other room's full wall quads carry the accent stripe
+ * against. The uv of every shell quad is its world position in metres times
+ * its wall pattern's uv scale, so the seams run unbroken across cells of
+ * the same pattern. A room with `interior` (the console room, 2.6e C4)
+ * draws its shell in `CONSOLE_SHELL`'s fixed tints on pattern 0's layer,
+ * whatever the look; its flush fittings cover the walls. Every other
+ * room's walls, lintels and stripe read their cell's own wall pattern
+ * (`wallPatternOf`, `WALL_PATTERN_LOOK`, 2.7 C11): the hall's, a bay's or
+ * the corridor's, so a bay or the corridor always reads as a space of its
+ * own. Every other room's full wall quads also carry the accent stripe
  * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
  * fixture edges, the entrance edge and lintels. The models themselves are
- * built by the recipes in `models/`, with the modelling kit of `kit.ts`.
+ * built by the recipes in `models/`, with the modelling kit of `kit.ts`,
+ * and always keep `LAYER.panel` whatever the room's wall patterns.
  */
 
 import { lampBoxes } from "../world/lamps";
 import { STEP, doorwayColumns, isFloor } from "../world/layout";
-import type { Box, RoomSpec, Side } from "../world/types";
+import type { Box, Rect, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import { BLINK_GROUPS } from "./blink";
 import { DECAL_LIFT, createKit } from "./kit";
@@ -159,6 +164,47 @@ export function accentTint(k: number): Rgb {
  * every look.
  */
 export const ACCENT_STRIPE = { h0: 1.2, h1: 1.28 } as const;
+
+/**
+ * The three wall patterns (2.7 C11), by `RoomSpec.finish`'s pattern index:
+ * the texture layer the shell's wall, lintel and stripe quads read, and the
+ * uv scale (`edgeQuad`'s `scale`) that makes their seams run at the
+ * pattern's own spacing rather than every metre.
+ *
+ * | # | name | layer | seams |
+ * |---|---|---|---|
+ * | 0 | panels | `LAYER.panel` | every 1 m |
+ * | 1 | ribbed | `LAYER.ribbed` | every 0.5 m along, 2 m up |
+ * | 2 | plated | `LAYER.plated` | every 2 m along, 1 m up |
+ *
+ * Every model keeps `LAYER.panel` whatever the room's patterns: this table
+ * is read only by the shell.
+ */
+export const WALL_PATTERN_LOOK: readonly {
+  layer: number;
+  u: number;
+  v: number;
+}[] = [
+  { layer: LAYER.panel, u: 1, v: 1 },
+  { layer: LAYER.ribbed, u: 2, v: 0.5 },
+  { layer: LAYER.plated, u: 0.5, v: 1 },
+];
+
+/**
+ * The wall pattern index (into `WALL_PATTERN_LOOK`) of cell `(x, y)` (2.7
+ * C11): the corridor's pattern inside the corridor, a bay's pattern inside
+ * that bay, and the hall's pattern everywhere else, including a doorway
+ * column's cell, which sits in none of `room.bays` or `room.corridor`.
+ */
+export function wallPatternOf(room: RoomSpec, x: number, y: number): number {
+  const inside = (r: Rect) => x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
+  if (room.corridor !== null && inside(room.corridor)) {
+    return room.finish.corridorWalls;
+  }
+  const bay = room.bays.findIndex(inside);
+  if (bay !== -1) return room.finish.bayWalls[bay] ?? room.finish.hallWalls;
+  return room.finish.hallWalls;
+}
 
 /** Floats the builder reserves at first: room for 1024 vertices. */
 const INITIAL_FLOATS = 1024 * FLOATS_PER_VERTEX;
@@ -354,8 +400,11 @@ const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 /**
  * One vertical quad on a side of cell `(x, y)`, from `h0` to `h1`, `inset`
  * metres into the cell, facing into it. Its uv is the world position along
- * the wall and the height, in metres, so neighbouring quads continue each
- * other's seams.
+ * the wall and the height, in metres, times `scale` (2.7 C11: a wall
+ * pattern's own uv scale, default `{ u: 1, v: 1 }`, world metres
+ * unscaled), so neighbouring quads of the same scale continue each other's
+ * seams and a pattern's seams run at its own spacing. `scale` never moves a
+ * vertex position, only the uv the shader samples the pattern's layer with.
  */
 function edgeQuad(
   b: Builder,
@@ -366,6 +415,7 @@ function edgeQuad(
   h1: number,
   inset: number,
   s: Surface,
+  scale: { u: number; v: number } = { u: 1, v: 1 },
 ) {
   const X0 = x * CELL;
   const X1 = X0 + CELL;
@@ -406,13 +456,15 @@ function edgeQuad(
       break;
   }
   const u = (p: [number, number]) =>
-    side === "n" || side === "s" ? p[0] : p[1];
-  b.vertex([l[0], h0, l[1]], n, u(l), h0, s);
-  b.vertex([r[0], h0, r[1]], n, u(r), h0, s);
-  b.vertex([r[0], h1, r[1]], n, u(r), h1, s);
-  b.vertex([l[0], h0, l[1]], n, u(l), h0, s);
-  b.vertex([r[0], h1, r[1]], n, u(r), h1, s);
-  b.vertex([l[0], h1, l[1]], n, u(l), h1, s);
+    (side === "n" || side === "s" ? p[0] : p[1]) * scale.u;
+  const v0 = h0 * scale.v;
+  const v1 = h1 * scale.v;
+  b.vertex([l[0], h0, l[1]], n, u(l), v0, s);
+  b.vertex([r[0], h0, r[1]], n, u(r), v0, s);
+  b.vertex([r[0], h1, r[1]], n, u(r), v1, s);
+  b.vertex([l[0], h0, l[1]], n, u(l), v0, s);
+  b.vertex([r[0], h1, r[1]], n, u(r), v1, s);
+  b.vertex([l[0], h1, l[1]], n, u(l), v1, s);
 }
 
 /**
@@ -488,23 +540,23 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  * `doorwayColumns`) meets the hall, a bay or the corridor, a lintel runs
  * from `LINTEL` to the ceiling on both faces of the edge. A full wall quad
  * on an edge that is neither a fixture's slot nor the entrance's carries
- * the accent stripe, unless the room has fittings (`interior`). Lamps and
- * scaffolding share the hall's ceiling height, which bays and the corridor
- * share too.
+ * the accent stripe, unless the room has fittings (`interior`). Every wall,
+ * lintel and stripe quad reads its cell's wall pattern
+ * (`wallPatternOf`, `WALL_PATTERN_LOOK`, 2.7 C11): the hall's, a bay's or
+ * the corridor's, whichever rectangle the cell falls in, pattern 0 always
+ * on a room with fittings. Lamps and scaffolding share the hall's ceiling
+ * height, which bays and the corridor share too.
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const b = createBuilder();
   const p = look.palette;
   const H = room.ceiling;
   const doorways = doorwayColumns(room);
-  // A room with fittings (the console room) keeps its own colours in
-  // every look (2.6e C4); every other room takes the look's.
+  // A room with fittings (the console room) keeps its own colours and
+  // pattern 0 in every look (2.6e C4); every other room takes the look's
+  // colours and each cell's own wall pattern (2.7 C11).
   const fitted = room.interior !== undefined;
-  const wall: Surface = {
-    layer: LAYER.panel,
-    tint: fitted ? CONSOLE_SHELL.wall : p.panel,
-    flag: FLAG.lit,
-  };
+  const wallTint = fitted ? CONSOLE_SHELL.wall : p.panel;
   const floor: Surface = {
     layer: LAYER.floor,
     tint: fitted ? CONSOLE_SHELL.floor : p.floor,
@@ -519,14 +571,6 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const hazard: Surface = {
     layer: LAYER.hazard,
     tint: [1, 1, 1] as Rgb,
-    flag: FLAG.lit,
-  };
-  // The accent stripe (2.7 C9) runs on the wall's own layer in the room's
-  // accent, and skips every fixture's edge and the entrance's. A room with
-  // fittings draws none.
-  const stripe: Surface = {
-    layer: wall.layer,
-    tint: accentTint(1),
     flag: FLAG.lit,
   };
   const fixtureEdges = new Set(
@@ -549,12 +593,31 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
       const Z0 = y * CELL;
       flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, 0, true, floor);
       flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, H, false, ceiling);
+      // The cell's own wall pattern (2.7 C11): pattern 0 (today's panels)
+      // on a room with fittings, whichever the hall, its bay or the
+      // corridor picked otherwise.
+      const patternLook =
+        WALL_PATTERN_LOOK[fitted ? 0 : wallPatternOf(room, x, y)]!;
+      const scale = { u: patternLook.u, v: patternLook.v };
+      const wall: Surface = {
+        layer: patternLook.layer,
+        tint: wallTint,
+        flag: FLAG.lit,
+      };
+      // The accent stripe (2.7 C9) runs on the cell's own wall layer in
+      // the room's accent, and skips every fixture's edge and the
+      // entrance's. A room with fittings draws none.
+      const stripe: Surface = {
+        layer: patternLook.layer,
+        tint: accentTint(1),
+        flag: FLAG.lit,
+      };
       for (const side of SIDES) {
         const [dx, dy] = STEP[side];
         const nx = x + dx;
         const ny = y + dy;
         if (!isFloor(room.grid, nx, ny)) {
-          edgeQuad(b, x, y, side, 0, H, 0, wall);
+          edgeQuad(b, x, y, side, 0, H, 0, wall, scale);
           const key = `${x},${y},${side}`;
           if (!fitted && !fixtureEdges.has(key) && key !== entranceEdge)
             edgeQuad(
@@ -566,11 +629,12 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
               ACCENT_STRIPE.h1,
               DECAL_LIFT,
               stripe,
+              scale,
             );
           if (building && !openings.has(`${x},${y},${side}`))
             edgeQuad(b, x, y, side, 0, BASEBOARD, BASEBOARD_INSET, hazard);
         } else if (doorways.has(x) !== doorways.has(nx) && H > LINTEL) {
-          edgeQuad(b, x, y, side, LINTEL, H, 0, wall);
+          edgeQuad(b, x, y, side, LINTEL, H, 0, wall, scale);
         }
       }
     }
