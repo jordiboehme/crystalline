@@ -107,12 +107,12 @@ const codeOf = (src: string): string =>
 /**
  * Every top-level picture, by grep of `export const NAME: readonly
  * string[] =` across the hero, curio and prop recipes and `marks.ts`
- * (2.6d C16 fix): `RECRUIT_DEMO` and `QUESTION_MARK` from before 2.6d,
- * `CONSOLE_TITLE` and `CONSOLE_PLAY` from 2.6c, and 2.6d's own
- * `SAUCER_PICTURE`, `CAPSULE_LOGO`, `SIGNATURE`, `SPACE_BADGE` and
- * `COMPUTER_LOGO`. `PLAQUE_LINES` (`finds.ts`) is left out on purpose: it
- * is `readonly (readonly string[])[]` built from `textRows`, so its
- * digits and letters are caught by the guards above already.
+ * (2.6d C16 fix): `RECRUIT_DEMO`, `QUESTION_MARK`, `CONSOLE_TITLE` and
+ * `CONSOLE_PLAY` from before 2.6d, and 2.6d's own `SAUCER_PICTURE`,
+ * `CAPSULE_LOGO`, `SIGNATURE`, `SPACE_BADGE` and `COMPUTER_LOGO`.
+ * `PLAQUE_LINES` (`finds.ts`) is left out on purpose: it is `readonly
+ * (readonly string[])[]` built from `textRows`, so its digits and
+ * letters are caught by the guards above already.
  */
 const APPROVED_PICTURES = new Set([
   "RECRUIT_DEMO",
