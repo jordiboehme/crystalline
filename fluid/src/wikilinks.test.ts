@@ -323,9 +323,12 @@ describe("a link that names its domain by another name", () => {
   });
 
   it("leaves a name no domain answers to as prose", () => {
-    // Not even the home domain's engram of that title: `core/src/address.rs`
-    // reads an unknown prefix as part of a title at home, prefix and all, so
-    // `Crater Base` there is not what this link names.
+    // The `resolved: true` is the index's verdict: its resolve pass
+    // (`reference_match` in `index/src/store.rs`) falls back to the home
+    // domain for a prefix no spelling names, so it binds this link to home's
+    // `Crater Base`. `core/src/address.rs` instead reads the whole bracket
+    // text as a title at home. The two disagree, and this pins what Fluid does
+    // until that is settled: it follows core, and the link stays prose.
     const detail = namedDetail("moonbase", [
       resolvedLink(1, "mars", "Crater Base"),
     ]);
