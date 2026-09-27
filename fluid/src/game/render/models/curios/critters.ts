@@ -18,8 +18,11 @@
  *   it but through the pegs. Four dark seam pegs lie in the plus
  *   seam, set back from the face, joining each quarter to the core. On
  *   the front a pale metal barrel reaches out of the core and carries the
- *   eye: a large round blue-white disc (`EYE`) with a brighter centre
- *   (`EYE_CENTRE`), both breathing in group 0 of the `breathe` bank. The
+ *   eye: a steady dim blue base disc (`EYE_BASE`, `s.signal`) carrying a
+ *   round blue-white lens (`EYE`) with a brighter centre (`EYE_CENTRE`),
+ *   both breathing in group 0 of the `breathe` bank and tinted past 1 so
+ *   that at the bank's low they show at least the base's blue: the eye
+ *   never reads dark. The
  *   bottom point is the lift and the top point the curio's top.
  * - The soot puffs huddle on the floor, three in v0 and five in v1
  *   (`PUFFS`). Each is one lathe in `SOOT_BLACK`: a ball whose radius
@@ -67,11 +70,32 @@ const BACK_GREYS: readonly Rgb[] = [
 /** The eye's barrel: a pale bright metal ring round the lens. */
 const BARREL: Rgb = [0.78, 0.79, 0.82];
 
-/** The eye's glow: blue-white. */
-const EYE: Rgb = [0.6, 0.85, 1.0];
+/**
+ * The breathe bank's low gain: the glow special's low level, 0.4 of its
+ * level (`minLevelOf` in `lights.ts`), which the bank reads unclamped
+ * since it lies above `BLINK_LOW`. The eye's tints are sized from it.
+ */
+const BREATHE_LOW = 0.4;
 
-/** The eye's brighter centre. */
-const EYE_CENTRE: Rgb = [0.85, 0.95, 1.0];
+/**
+ * The eye's steady base: a dim blue `s.signal` disc behind the breathing
+ * lens, a little wider than it, so the eye never reads dark (R-a).
+ */
+const EYE_BASE: Rgb = [0.25, 0.4, 0.55];
+
+/**
+ * The breathing lens: `EYE_BASE` over `BREATHE_LOW`, so at the breathe
+ * bank's low the lens shows the base's own blue, and at its high the
+ * renderer's clamp takes it to a bright blue-white.
+ */
+const EYE: Rgb = [
+  EYE_BASE[0] / BREATHE_LOW,
+  EYE_BASE[1] / BREATHE_LOW,
+  EYE_BASE[2] / BREATHE_LOW,
+];
+
+/** The lens's brighter centre, past 1 too: near white at the high, a pale blue at the low. */
+const EYE_CENTRE: Rgb = [1.2, 1.4, 1.5];
 
 /** The drone's middle over its surface: half way between its lift (0.35) and its top (0.53). */
 const DRONE_MID = 0.44;
@@ -115,13 +139,18 @@ const LAYERS: readonly Layer[] = [
 /** The middle layer's index in `LAYERS`: its plates are `SHELL_GREY`. */
 const MIDDLE_LAYER = 2;
 
-/** The eye barrel's radius and its front; the eye disc's radius and depth; the centre's. */
+/**
+ * The eye barrel's radius and its front; the base's, the lens's and the
+ * centre's radii and how far each one's front stands before the barrel.
+ */
 const BARREL_R = 0.034;
 const BARREL_FRONT = 0.07;
-const EYE_R = 0.03;
-const EYE_PROUD = 0.004;
-const CENTRE_R = 0.012;
-const CENTRE_PROUD = 0.001;
+const BASE_R = 0.03;
+const BASE_PROUD = 0.0025;
+const EYE_R = 0.024;
+const EYE_PROUD = 0.0045;
+const CENTRE_R = 0.01;
+const CENTRE_PROUD = 0.0055;
 
 /** The seam pegs: their half thickness, their reach out from the middle and their depth range. */
 const PEG_HALF = 0.003;
@@ -204,8 +233,9 @@ const hoverDrone: CurioRecipe = ({ k, s }) => {
       dark,
     );
   }
-  // The eye: a pale barrel out of the core, the glowing lens on it and
-  // its brighter centre.
+  // The eye: a pale barrel out of the core, the steady blue base on it,
+  // the breathing lens on the base and its brighter centre, each proud of
+  // the one behind, so no two faces share a plane.
   k.extrude(
     discOutline(0, DRONE_MID, BARREL_R, 12),
     0,
@@ -213,15 +243,21 @@ const hoverDrone: CurioRecipe = ({ k, s }) => {
     s.tinted(BARREL),
   );
   k.extrude(
-    discOutline(0, DRONE_MID, EYE_R, 12),
+    discOutline(0, DRONE_MID, BASE_R, 12),
     BARREL_FRONT - 0.001,
+    BARREL_FRONT + BASE_PROUD,
+    s.signal(EYE_BASE),
+  );
+  k.extrude(
+    discOutline(0, DRONE_MID, EYE_R, 12),
+    BARREL_FRONT + BASE_PROUD - 0.0005,
     BARREL_FRONT + EYE_PROUD,
     s.blink(EYE, 0),
   );
   k.extrude(
     discOutline(0, DRONE_MID, CENTRE_R, 8),
     BARREL_FRONT + EYE_PROUD - 0.0005,
-    BARREL_FRONT + EYE_PROUD + CENTRE_PROUD,
+    BARREL_FRONT + CENTRE_PROUD,
     s.blink(EYE_CENTRE, 0),
   );
 };

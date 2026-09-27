@@ -93,7 +93,15 @@ const LINE_H = 0.006;
 const LINE_PROUD = 0.003;
 const LINE_INSET = 0.004;
 
-/** The hinge pins' radius and facets, and how far a pin reaches into a slab. */
+/**
+ * The hinge pins' radius and facets, and how far a pin reaches into a
+ * slab. An outer pin starts flush on the inner slab's outer face and
+ * reaches `PIN_INTO` into the swung slab only, on purpose: the swung
+ * slab is the one that hangs from it, and the float check holds that
+ * slab through its pin (the inner slab stands on the floor and needs
+ * none), so only that end must overlap. The middle pin reaches
+ * `PIN_INTO` into both inner slabs, since it joins two slabs alike.
+ */
 const PIN_R = 0.03;
 const PIN_SIDES = 10;
 const PIN_INTO = 0.01;

@@ -13,7 +13,8 @@ import { describe, expect, it } from "vitest";
 
 import { curioLift } from "../../../world/curios";
 import type { CurioKind } from "../../../world/types";
-import { blinkFlag, createBuilder, type V3 } from "../../geometry";
+import { BLINK_GROUPS, bankSlot, createBlink } from "../../blink";
+import { blinkFlag, createBuilder, FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
@@ -64,6 +65,46 @@ describe("the critters' models", () => {
     expect(Math.max(...eye.flatMap(local).map((q) => q[1]))).toBeGreaterThan(
       hd - 0.02,
     );
+  });
+
+  it("sets the drone's breathing eye over a steady blue base it never shows darker than", () => {
+    // Mutation caught: the eye's steady base removed, or a breathing part
+    // whose low phase reads darker than the base behind it.
+    const blink = createBlink();
+    const channel = bankSlot("breathe") * BLINK_GROUPS;
+    let low = 1;
+    for (let t = 0; t < 2000; t++) {
+      low = Math.min(low, blink.gains[channel] ?? 1);
+      blink.tick();
+    }
+    const parts = recorded("hover-drone");
+    const eye = parts.filter((p) => p.flag === blinkFlag(0));
+    expect(eye.length).toBeGreaterThan(0);
+    for (const part of eye) {
+      const q = local(part);
+      const [a, h, d] = [span(q, 0).mid, span(q, 2).mid, span(q, 1).lo];
+      const bases = parts.filter((p) => {
+        if (p.flag !== FLAG.signal || p.tint === null) return false;
+        const b = local(p);
+        return (
+          span(b, 0).lo < a &&
+          span(b, 0).hi > a &&
+          span(b, 2).lo < h &&
+          span(b, 2).hi > h &&
+          span(b, 1).hi <= span(q, 1).hi &&
+          span(b, 1).lo < d
+        );
+      });
+      expect(bases, "a steady base behind the eye").toHaveLength(1);
+      const base = bases[0]?.tint;
+      const tint = part.tint;
+      if (!base || !tint) throw new Error("tinted eye and base");
+      expect(Math.max(...base), "the base is lit").toBeGreaterThan(0.3);
+      for (const i of [0, 1, 2] as const)
+        expect((tint[i] ?? 0) * low).toBeGreaterThanOrEqual(
+          (base[i] ?? 0) * 0.9,
+        );
+    }
   });
 
   it("splits the drone's shell into at least four plates around a round core", () => {
