@@ -786,7 +786,8 @@ export function boxSignLayout(width: number, mid: number): SignWord[] {
  * the white window frame over them and its frosted panes, which glow
  * faintly and leave the frame's white showing between them as glazing
  * bars. With `notice`, the white notice sits on the top raised panel,
- * its lines (`MARKS.boxNotice`) set on it in black. The door leaves and the other three sides share it.
+ * its lines (`MARKS.boxNotice`) set on it in black. The door leaves and
+ * the other three sides share it.
  */
 function facePanels(
   k: Kit,
