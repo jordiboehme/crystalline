@@ -997,6 +997,14 @@ pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
 pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1";
 
+/// The read behind [`Store::scored_pair_count`], through
+/// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
+/// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
+/// which leads with `domain_id`. Called on every `ctl status` and every
+/// daemon-mode `doctor` run.
+#[doc(hidden)]
+pub const SCORED_PAIR_COUNT_SQL: &str = "SELECT COUNT(*) FROM contradiction_pair WHERE model=?1";
+
 /// The address lookup behind [`Store::find_engram`].
 ///
 /// A permalink hit wins over a title hit; among title hits the byte-lower path
@@ -2794,7 +2802,7 @@ impl Store for TursoStore {
     async fn scored_pair_count(&self, model: &str) -> Result<u64> {
         let row = query_first(
             &self.conn,
-            "SELECT COUNT(*) FROM contradiction_pair WHERE model=?1",
+            SCORED_PAIR_COUNT_SQL,
             vec![Value::Text(model.to_string())],
         )
         .await?;

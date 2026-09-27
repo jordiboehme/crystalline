@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, twenty-six entries, each named by the function that issues it, so a
+//! One place, twenty-seven entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -568,6 +568,17 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             turso_must_seek: &["idx_contradiction_pair_domain"],
             postgres_must_seek: &["idx_contradiction_pair_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::scored_pair_count",
+            turso: || crystalline_index::turso::SCORED_PAIR_COUNT_SQL.to_string(),
+            postgres: || crystalline_index::postgres::SCORED_PAIR_COUNT_SQL.to_string(),
+            literals: &["'m'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_pair_model"],
+            postgres_must_seek: &["idx_contradiction_pair_model"],
         },
         HotStatement {
             issued_by: "Store::contradictions",

@@ -488,7 +488,9 @@ CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain
 // `idx_contradiction_pair_domain` carries the order columns as its Turso twin
 // does, so the two schemas stay the same, and the two `engram_b` indexes serve
 // the second half of `delete_engram`'s `engram_a=$1 OR engram_b=$1` beside the
-// primary keys that serve the first.
+// primary keys that serve the first. `idx_contradiction_pair_model` serves
+// `Store::scored_pair_count`'s `WHERE model=$1`, which names no domain and so
+// cannot seek `idx_contradiction_pair_domain` - see the Turso twin's comment.
 const SCHEMA_V16: &str = r#"
 CREATE TABLE IF NOT EXISTS contradiction_pair (
     domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -502,6 +504,7 @@ CREATE TABLE IF NOT EXISTS contradiction_pair (
     PRIMARY KEY (engram_a, engram_b, model)
 );
 CREATE INDEX IF NOT EXISTS idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_model ON contradiction_pair(model);
 
 CREATE TABLE IF NOT EXISTS contradiction (
     domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,

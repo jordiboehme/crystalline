@@ -3487,6 +3487,7 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
 
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
@@ -4541,5 +4542,223 @@ mod tests {
             crystalline_index::nli::NLI_MODELS[0].repo
         ));
         assert!(is_embedding_listing("BAAI/bge-small-en-v1.5"));
+    }
+
+    // --- contradiction_summary, driven directly ------------------------
+    //
+    // Every test above builds the JSON `report.contradictions` by hand and
+    // only exercises `render_human`; that let two of the bugs the review
+    // round caught (the doubled load-failure error, and a reason string
+    // that should have been suppressed) through with every other test
+    // green. These drive `contradiction_summary` itself, the function that
+    // actually assembles the row.
+
+    /// Guards every test below: `contradiction_summary` reads
+    /// `CRYSTALLINE_MODELS_DIR` through `config::models_dir()`, env vars are
+    /// process-global, and `cargo test --workspace` runs this file's tests
+    /// on multiple threads (nextest gives each test its own process, but the
+    /// canonical fallback does not) - the same convention as
+    /// `crystalline-core`'s `MODELS_DIR_ENV_LOCK`.
+    static MODELS_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `CRYSTALLINE_MODELS_DIR` at a directory for its lifetime and
+    /// restores whatever the environment had on drop, even on panic.
+    struct ModelsDirOverride {
+        previous: Option<String>,
+    }
+
+    impl ModelsDirOverride {
+        fn set(dir: &Path) -> ModelsDirOverride {
+            let previous = std::env::var("CRYSTALLINE_MODELS_DIR").ok();
+            unsafe {
+                std::env::set_var("CRYSTALLINE_MODELS_DIR", dir);
+            }
+            ModelsDirOverride { previous }
+        }
+    }
+
+    impl Drop for ModelsDirOverride {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => unsafe { std::env::set_var("CRYSTALLINE_MODELS_DIR", v) },
+                None => unsafe { std::env::remove_var("CRYSTALLINE_MODELS_DIR") },
+            }
+        }
+    }
+
+    /// A `GlobalConfig` with `evolve.contradictions` set to `profile`.
+    fn cfg_with_profile(profile: &str) -> GlobalConfig {
+        GlobalConfig {
+            evolve: Some(EvolveConfig {
+                contradictions: Some(profile.to_string()),
+            }),
+            ..GlobalConfig::default()
+        }
+    }
+
+    /// Fabricates a cached NLI checkpoint at
+    /// `<dir>/<hub name>/snapshots/<id>/model.safetensors`, the shape
+    /// `weights_cached` reads (a config alone is not a download).
+    fn seed_nli_checkpoint(dir: &Path, repo: &str) {
+        let snap = dir
+            .join(crystalline_index::hub_dir_name(repo))
+            .join("snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("model.safetensors"), b"w").unwrap();
+    }
+
+    #[test]
+    fn contradiction_summary_off_names_no_model_and_no_pending() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&GlobalConfig::default(), None);
+        assert_eq!(summary["profile"], "off");
+        assert_eq!(summary["model"], serde_json::Value::Null);
+        assert_eq!(summary["repo"], serde_json::Value::Null);
+        assert_eq!(summary["downloaded"], serde_json::Value::Null);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+        assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["embedding_pending"], false);
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn contradiction_summary_full_with_pending_from_a_running_daemon() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Full).repo);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 12, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        assert_eq!(summary["profile"], "full");
+        assert_eq!(summary["model"], nli_model(NliProfile::Full).id);
+        assert_eq!(summary["repo"], nli_model(NliProfile::Full).repo);
+        assert_eq!(summary["downloaded"], true);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+        assert_eq!(summary["pending_pairs"], 12);
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    /// L7/lesson 62: no daemon answered (a direct read, or one that has not
+    /// walked yet), so the pending count is unknown - `null`, never `0`.
+    #[test]
+    fn contradiction_summary_with_no_daemon_answer_leaves_the_count_unknown_not_zero() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("light"), None);
+        assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
+        assert_ne!(summary["pending_pairs"], serde_json::json!(0), "{summary}");
+        assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["embedding_pending"], false);
+        assert_eq!(summary["downloaded"], false);
+        assert_eq!(
+            summary["reason"],
+            serde_json::json!("the daemon downloads it on its first pass")
+        );
+    }
+
+    /// The bug the review round caught: a load failure must not also set the
+    /// "not downloaded" reason to `last_error`, since `contradiction_wait_reason`
+    /// already renders that error on its own line.
+    #[test]
+    fn contradiction_summary_a_failed_load_suppresses_the_download_reason() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0,
+            "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        assert_eq!(summary["downloaded"], false);
+        assert_eq!(summary["load_failed"], true);
+        assert_eq!(summary["last_error"], "contradiction model error: offline");
+        assert_eq!(
+            summary["reason"],
+            serde_json::Value::Null,
+            "the wait reason already carries the error; the download reason must not repeat it: {summary}"
+        );
+    }
+
+    /// A parked batch failure (the model loaded fine; some pairs failed
+    /// scoring) is carried through untouched, with no download reason since
+    /// a batch failure only happens once the model is downloaded.
+    #[test]
+    fn contradiction_summary_carries_failing_pairs_through() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Full).repo);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 2, "failing_pairs": 2,
+            "last_error": "the batch failed", "load_failed": false,
+            "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        assert_eq!(summary["failing_pairs"], 2);
+        assert_eq!(summary["last_error"], "the batch failed");
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["downloaded"], true);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+    }
+
+    /// The exact combination that produced the doubled-error bug:
+    /// `load_failed` must win over a nonzero `failing_pairs` for the download
+    /// reason too (it stays suppressed), even though both are set at once -
+    /// a stale failing-pairs count left over from before the load broke.
+    #[test]
+    fn contradiction_summary_load_failed_suppresses_the_reason_even_with_failing_pairs_set() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 3, "failing_pairs": 2,
+            "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        assert_eq!(summary["load_failed"], true);
+        assert_eq!(summary["failing_pairs"], 2);
+        assert_eq!(
+            summary["reason"],
+            serde_json::Value::Null,
+            "load_failed suppresses the download reason even with failing pairs parked too: {summary}"
+        );
+        assert_eq!(summary["last_error"], "contradiction model error: offline");
+    }
+
+    /// Plan correction 14, from `contradiction_summary`'s own side: a
+    /// checkpoint cached for a profile the config does not run is listed as
+    /// stale, and the configured model's own (uncached) state is unaffected.
+    #[test]
+    fn contradiction_summary_lists_an_unused_cached_checkpoint_as_stale() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Light).repo);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        let stale: Vec<&str> = summary["stale_checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(stale, vec![nli_model(NliProfile::Light).repo]);
+        assert_eq!(
+            summary["downloaded"], false,
+            "the configured (full) model itself is not the one that is cached: {summary}"
+        );
     }
 }

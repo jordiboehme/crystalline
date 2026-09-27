@@ -582,6 +582,12 @@ CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 // `(domain_id, model)` alone the planner scans the primary key for the
 // order instead, which `tests/plans.rs` rejects.
 //
+// `idx_contradiction_pair_model` serves `Store::scored_pair_count`'s
+// `WHERE model=?1`, which names no domain: `idx_contradiction_pair_domain`
+// leads with `domain_id`, so it cannot seek on `model` alone and that count
+// would otherwise scan the whole table. `ctl status` and a daemon-mode
+// `doctor` run call it on every request.
+//
 // `delete_engram` deletes by `engram_a=?1 OR engram_b=?1` on both tables.
 // Each primary key leads with `engram_a` and serves one half of the OR; the
 // two `engram_b` indexes serve the other, so a delete never walks a table.
@@ -598,6 +604,7 @@ CREATE TABLE contradiction_pair (
     PRIMARY KEY (engram_a, engram_b, model)
 );
 CREATE INDEX idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+CREATE INDEX idx_contradiction_pair_model ON contradiction_pair(model);
 
 CREATE TABLE contradiction (
     domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
