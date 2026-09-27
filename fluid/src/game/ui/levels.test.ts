@@ -117,9 +117,9 @@ describe("hereKey", () => {
     expect(hereKey(levels, "moon")).toBe("moon");
   });
 
-  // A shadowed canonical name belongs to the domain that holds it locally
-  // or, as here, answers to it as an alias; skipping the shadowed flag
-  // would mark the shadowed row.
+  // A shadowed canonical name is never taken as the current row, even when
+  // no local name matches; ignoring the shadowed flag would mark the
+  // shadowed row here instead of the alias holder.
   it("skips a shadowed canonical name", () => {
     const levels = levelsOf([
       domain("sat", "moon", [], true),
