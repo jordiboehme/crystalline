@@ -93,7 +93,7 @@ pub struct Config {
     pub classifier_config: Option<ClassifierConfig>,
 }
 
-// Ours, not upstream's: this workspace pins clippy at 1.98.0 under -D warnings
+// Ours, not upstream's: this workspace pins clippy at 1.98.1 under -D warnings
 // and it rejects these variant names, which are upstream's and stay as they are.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Deserialize, PartialEq, Copy, Default)]
