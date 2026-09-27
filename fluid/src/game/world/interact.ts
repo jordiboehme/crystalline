@@ -14,7 +14,7 @@
  * of the door and inside its opening" means the same here as on screen.
  *
  * - A terminal is read, a hatch crawled through and a bulkhead or blast
- *   door opened or closed with E, which is what `focusOf` offers.
+ *   door opened or closed with Space, which is what `focusOf` offers.
  * - A sliding door opens by itself while the player is within `APPROACH`,
  *   and an unsealed portal needs nothing at all: walking into it is the
  *   action, so neither is offered for E.

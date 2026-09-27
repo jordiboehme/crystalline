@@ -1,5 +1,5 @@
 /**
- * The CRT reader: what a terminal shows when the player leans in with E.
+ * The CRT reader: what a terminal shows when the player leans in with Space.
  *
  * A full-screen overlay laid out as an 80-column terminal, the engram's
  * markdown flattened by `crtLines` into screen lines. The font is sized so

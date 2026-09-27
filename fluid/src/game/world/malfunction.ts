@@ -8,7 +8,7 @@
  *
  * Each broken way has a `Fault`: a clock in 35 Hz ticks that starts a run
  * when the player comes near (`approaches`, after a seeded delay counted
- * down only while the player is near) or presses E at it, plays the run's
+ * down only while the player is near) or presses Space at it, plays the run's
  * frames one per tick, then waits 2 to 5 s before the next run may start,
  * this wait counted down unconditionally. A run is a list of `FaultFrame`s
  * planned in full when it starts (`planRun`), from a seed keyed by the

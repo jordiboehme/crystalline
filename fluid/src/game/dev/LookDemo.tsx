@@ -132,7 +132,7 @@ function propFor(params: URLSearchParams): RarePropKind | undefined {
  * there, and deciding before the first paint means the canvas never flashes
  * up on a device that is about to be refused. The session starts in an
  * effect once the canvas exists, and the effect's cleanup is `startDemo`'s.
- * A terminal read with E mounts the CRT reader over the canvas; closing it
+ * A terminal read with Space mounts the CRT reader over the canvas; closing it
  * hands the keys back to the session.
  */
 export default function LookDemo() {
