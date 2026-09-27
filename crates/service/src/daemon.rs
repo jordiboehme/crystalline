@@ -2260,6 +2260,10 @@ pub async fn run_embed_tick(
                 // Every tick, whatever the backlog: a model nobody used for
                 // ten minutes, or one the setting no longer names, goes.
                 engine.drop_idle_scorer();
+                // Once per tick, the next walk (this tick's, or the one the
+                // embed worker hands over to) retries the pairs a failed
+                // batch left, and only while the model is loaded anyway.
+                engine.mark_contradiction_retry();
                 if engine.embed_in_flight() {
                     continue;
                 }

@@ -777,6 +777,10 @@ pub struct Engine {
     // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
     #[cfg(any(test, feature = "testing"))]
     contradiction_fact_walks: std::sync::atomic::AtomicU64,
+    // The same for walks of the contradiction pass, parsed or not, so a test
+    // can see a worker that keeps asking.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_walks: std::sync::atomic::AtomicU64,
     // What the last successful embedding-model load pruned from the model
     // cache, so `ctl status` after a start says what that start freed. Empty on
     // every install that had nothing to prune, which is every install that
@@ -1762,15 +1766,42 @@ pub(crate) struct SettledDomain {
     /// a moved count walks the domain again. `None` when every possible
     /// candidate had its vector, where only a stamp can change the pairs.
     pub(crate) coverage: Option<usize>,
+    /// Whether the domain settled with pairs a failed batch left: a walk the
+    /// tick marked as a retry walks it again, any other walk skips it.
+    pub(crate) failing: bool,
+}
+
+/// One engram pair the scorer or the store failed on, at the checksums and
+/// under the model it failed with. A pair that fails the same way twice is
+/// not worth a walk on every write: it is retried once per tick at most, and
+/// an edit that moves a checksum makes it a new pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FailedPair {
+    pub(crate) repo: &'static str,
+    pub(crate) a: i64,
+    pub(crate) b: i64,
+    pub(crate) checksum_a: String,
+    pub(crate) checksum_b: String,
 }
 
 /// What the contradiction pass remembers between walks.
 #[derive(Default)]
 pub(crate) struct ContradictionState {
-    /// Related pairs left unscored per domain after the last walk. `None`
-    /// until a walk has run, and again once the check is turned off: unknown,
-    /// which is what makes the tick ask.
+    /// Bumped by every change of `evolve.contradictions` (and by off). A walk
+    /// publishes what it found only when the generation it started under is
+    /// still current, so a walk under the old profile cannot overwrite the
+    /// unknown pending a setting change just asked for.
+    pub(crate) generation: u64,
+    /// Related pairs left unscored per domain after the last walk, the pairs
+    /// a failed batch left included. `None` until a walk has run, and again
+    /// once the setting changes: unknown, which is what makes the tick ask.
     pub(crate) pending: Option<BTreeMap<String, usize>>,
+    /// Per domain, the pairs the scorer or the store failed on. Skipped by
+    /// every walk but a retry walk, which the tick asks for at most once per
+    /// tick and only while the model is loaded anyway.
+    pub(crate) failed: HashMap<String, HashSet<FailedPair>>,
+    /// Set by the tick: the next walk retries the failed pairs once.
+    pub(crate) retry_due: bool,
     /// Per domain, what the last walk that left it at zero saw, so a walk
     /// skips a domain nothing changed in.
     pub(crate) settled: HashMap<String, SettledDomain>,
@@ -1799,8 +1830,43 @@ fn default_scorer_loader() -> ScorerLoader {
         |model: &'static crystalline_index::nli::NliModel| -> futures::future::BoxFuture<
             'static,
             crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>>,
-        > { Box::pin(crystalline_index::nli::load_scorer(model)) },
+        > {
+            if let Some(hold) = held_nli_load() {
+                return Box::pin(hold_the_load(hold));
+            }
+            Box::pin(crystalline_index::nli::load_scorer(model))
+        },
     )
+}
+
+/// How long the daemon's NLI loader holds a load, from
+/// [`crate::overlay::NLI_LOAD_HOLD_ENV`], or `None`. A test-only seam in the
+/// same spirit as the daemon's parked blocking task: the shutdown test needs
+/// a load that is still running on a blocking thread when the daemon is asked
+/// to stop, and a real download is neither hermetic nor slow on demand. An
+/// unset, empty, zero or unparsable value holds nothing.
+fn held_nli_load() -> Option<std::time::Duration> {
+    std::env::var(crate::overlay::NLI_LOAD_HOLD_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// The held load: a blocking thread asleep for `hold`, then a failure, so it
+/// never downloads anything.
+async fn hold_the_load(
+    hold: std::time::Duration,
+) -> crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>> {
+    // Said out loud, so the test that sets it can tell the load is held.
+    tracing::info!(
+        "test hook: holding the contradiction model load for {}s",
+        hold.as_secs()
+    );
+    let _ = tokio::task::spawn_blocking(move || std::thread::sleep(hold)).await;
+    Err(IndexError::Embedding(
+        "test hook: the held contradiction model load ended".to_string(),
+    ))
 }
 
 impl Engine {
@@ -1839,6 +1905,8 @@ impl Engine {
             scorer_loader: default_scorer_loader(),
             #[cfg(any(test, feature = "testing"))]
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_walks: std::sync::atomic::AtomicU64::new(0),
             model_cache_pruned: std::sync::RwLock::new(Vec::new()),
             provider: std::sync::RwLock::new(provider),
             model_id,

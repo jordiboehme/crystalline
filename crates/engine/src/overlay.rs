@@ -106,6 +106,10 @@ pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
 /// `parked_blocking_task`.
 pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
 
+/// The test-only variable that holds the daemon's contradiction model load on
+/// a blocking thread instead of loading; see `held_nli_load` in the engine.
+pub const NLI_LOAD_HOLD_ENV: &str = "CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS";
+
 /// Variables that live outside the settings registry and are read elsewhere.
 /// They are skipped silently rather than warned about, so a legitimate
 /// deployment does not get a spurious warning for a variable Crystalline
@@ -137,6 +141,10 @@ const RESERVED_VARS: &[&str] = &[
     // daemon is asked to stop. Read straight from the environment in
     // `run_serve`, so reserved for the same reason as the two above.
     PARK_BLOCKING_ENV,
+    // The engine's held contradiction model load (`held_nli_load`), which
+    // the same shutdown test family uses to keep a load on a blocking thread
+    // while the daemon is asked to stop. Read straight from the environment.
+    NLI_LOAD_HOLD_ENV,
     // The install-channel marker (see [`CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the

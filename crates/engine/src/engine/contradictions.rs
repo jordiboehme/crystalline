@@ -68,7 +68,13 @@ struct DomainWork {
     name: String,
     id: DomainId,
     facts: Vec<ContradictionFact>,
+    /// The pairs this walk scores.
     pending: Vec<CandidatePair>,
+    /// Known failures this walk leaves alone (every walk but a retry walk).
+    known_failing: usize,
+    /// The known failures still pending at their checksums, as the walk
+    /// started.
+    failures: HashSet<FailedPair>,
     settle: SettledDomain,
 }
 
@@ -83,17 +89,25 @@ impl Engine {
 
     /// Called by `configure` after every set or unset: a change of
     /// `evolve.contradictions` lifts a failed load (the one way, besides a
-    /// daemon start, to ask for that model again) and makes pending unknown,
-    /// so the next tick asks for a pass under the new profile.
+    /// daemon start, to ask for that model again), forgets the failed pairs
+    /// and makes pending unknown, so the next tick asks for a pass under the
+    /// new profile. The generation moves too, so a walk still running under
+    /// the old profile publishes nothing.
     pub(crate) fn contradiction_setting_touched(&self, key: &str) {
         if key != CONTRADICTIONS_KEY {
             return;
         }
+        self.reset_contradiction_state();
+    }
+
+    /// Forget everything the pass remembers and move the generation on.
+    fn reset_contradiction_state(&self) {
         let mut state = self.contradiction_state.lock().unwrap();
-        state.pending = None;
-        state.load_failed = None;
-        state.last_error = None;
-        state.error_logged = false;
+        let generation = state.generation.wrapping_add(1);
+        *state = ContradictionState {
+            generation,
+            ..ContradictionState::default()
+        };
     }
 
     /// Ask the contradiction worker for a pass. `false` when no worker is
@@ -105,6 +119,25 @@ impl Engine {
         }
     }
 
+    /// The tick's once-per-tick mark: the next walk retries the pairs a failed
+    /// batch or store write left. Marked only while there are such pairs and
+    /// the model is loaded anyway, so a failing pair never loads a model by
+    /// itself. Returns whether it marked.
+    pub fn mark_contradiction_retry(&self) -> bool {
+        let Some(model) = self.contradiction_model() else {
+            return false;
+        };
+        if !self.contradiction_scorer_loaded() {
+            return false;
+        }
+        let mut state = self.contradiction_state.lock().unwrap();
+        let any = failed_count(&state, model.repo) > 0;
+        if any {
+            state.retry_due = true;
+        }
+        any
+    }
+
     /// Whether a contradiction pass is running right now.
     pub fn contradictions_in_flight(&self) -> bool {
         self.contradiction_gate.lock().unwrap().running
@@ -112,8 +145,9 @@ impl Engine {
 
     /// Whether the tick should ask for a pass: the check is on, nothing is
     /// scoring, the model's last load did not fail, and pending is unknown (a
-    /// fresh start, a changed setting) or non-zero (a pass the budget cut
-    /// short, a batch that failed).
+    /// fresh start, a changed setting), holds a pair no batch has failed on
+    /// (a pass the budget cut short), or holds a failed pair while the model
+    /// is loaded (the tick's retry).
     pub fn contradictions_wanted(&self) -> bool {
         let Some(model) = self.contradiction_model() else {
             return false;
@@ -121,13 +155,18 @@ impl Engine {
         if self.contradictions_in_flight() {
             return false;
         }
+        let loaded = self.contradiction_scorer_loaded();
         let state = self.contradiction_state.lock().unwrap();
         if state.load_failed == Some(model.repo) {
             return false;
         }
         match &state.pending {
             None => true,
-            Some(pending) => pending.values().sum::<usize>() > 0,
+            Some(pending) => {
+                let total = pending.values().sum::<usize>();
+                let failing = failed_count(&state, model.repo);
+                total > failing || (failing > 0 && loaded)
+            }
         }
     }
 
@@ -149,6 +188,14 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn contradiction_fact_walks(&self) -> u64 {
         self.contradiction_fact_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many walks the contradiction pass has made since this engine was
+    /// built, parsed or not: a worker that keeps asking shows here.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn contradiction_walks(&self) -> u64 {
+        self.contradiction_walks
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -178,13 +225,15 @@ impl Engine {
 
     /// Score related pairs for possible contradictions, one walk over every
     /// domain in scope and another for each request that arrived meanwhile.
+    /// Each walk reads the profile afresh, so a changed setting takes effect
+    /// on the next walk and off ends the pass.
     pub async fn score_contradictions(&self) -> Result<ContradictionOutcome> {
-        let Some(model) = self.contradiction_model() else {
-            *self.contradiction_state.lock().unwrap() = ContradictionState::default();
+        let Some(first) = self.contradiction_model() else {
+            self.reset_contradiction_state();
             *self.scorer.lock().unwrap() = None;
             return Ok(ContradictionOutcome::Off);
         };
-        if self.load_blocked(model) {
+        if self.load_blocked(first) {
             return Ok(ContradictionOutcome::ModelUnavailable);
         }
         let Some(mut pass) = ContradictionPass::claim(&self.contradiction_gate) else {
@@ -197,7 +246,17 @@ impl Engine {
             remaining: 0,
         };
         loop {
-            let walk = self.contradiction_walk(model).await?;
+            let Some(model) = self.contradiction_model() else {
+                // Turned off while the pass ran: silent at once.
+                *self.scorer.lock().unwrap() = None;
+                while pass.walk_again() {}
+                break;
+            };
+            let walk = if self.load_blocked(model) {
+                ContradictionOutcome::ModelUnavailable
+            } else {
+                self.contradiction_walk(model).await?
+            };
             outcome = match (outcome, walk) {
                 (
                     ContradictionOutcome::Scored {
@@ -246,39 +305,48 @@ impl Engine {
     }
 
     async fn contradiction_walk(&self, model: &'static NliModel) -> Result<ContradictionOutcome> {
-        let work = self.contradiction_work(model).await?;
+        #[cfg(any(test, feature = "testing"))]
+        self.contradiction_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (generation, retry) = {
+            let mut state = self.contradiction_state.lock().unwrap();
+            (state.generation, std::mem::take(&mut state.retry_due))
+        };
+        let work = self.contradiction_work(model, retry).await?;
         let mut pending: BTreeMap<String, usize> = work
             .iter()
-            .map(|w| (w.name.clone(), w.pending.len()))
+            .map(|w| (w.name.clone(), w.pending.len() + w.known_failing))
             .collect();
-        if pending.values().sum::<usize>() == 0 {
-            let mut state = self.contradiction_state.lock().unwrap();
-            for w in &work {
-                state.settled.insert(w.name.clone(), w.settle.clone());
-            }
-            state.pending = Some(pending);
-            state.last_error = None;
-            state.error_logged = false;
+        let mut failures: HashMap<String, HashSet<FailedPair>> = work
+            .iter()
+            .map(|w| (w.name.clone(), w.failures.clone()))
+            .collect();
+        if work.iter().all(|w| w.pending.is_empty()) {
+            let remaining = pending.values().sum();
+            self.publish_walk(model, generation, &work, pending, failures, None);
             return Ok(ContradictionOutcome::Scored {
                 pairs: 0,
                 line_pairs: 0,
-                remaining: 0,
+                remaining,
             });
         }
         let scorer = match self.scorer_for(model).await {
             Ok(scorer) => scorer,
             Err(e) => {
+                let current = self.contradiction_model().map(|m| m.repo);
                 let mut state = self.contradiction_state.lock().unwrap();
-                if !state.error_logged {
-                    tracing::warn!(
-                        model = model.repo,
-                        "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
-                    );
-                    state.error_logged = true;
+                if state.generation == generation && current == Some(model.repo) {
+                    if !state.error_logged {
+                        tracing::warn!(
+                            model = model.repo,
+                            "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
+                        );
+                        state.error_logged = true;
+                    }
+                    state.last_error = Some(e.to_string());
+                    state.load_failed = Some(model.repo);
+                    state.pending = Some(pending);
                 }
-                state.last_error = Some(e.to_string());
-                state.load_failed = Some(model.repo);
-                state.pending = Some(pending);
                 return Ok(ContradictionOutcome::ModelUnavailable);
             }
         };
@@ -289,48 +357,47 @@ impl Engine {
         let mut batch_error: Option<String> = None;
         'domains: for w in &work {
             for pair in &w.pending {
+                // The profile is read between pairs, so off, or another
+                // profile, ends this walk at once and lets go of the model.
+                if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
+                    break 'domains;
+                }
                 let (a, b) = (&w.facts[pair.a], &w.facts[pair.b]);
                 let lines = line_pairs(&a.observations, &b.observations);
                 if lines.len() > budget {
                     break 'domains;
                 }
-                let inputs = scorer_inputs(&lines);
-                let expected = inputs.len();
-                // One failing batch skips its pair, which stays pending and
-                // unstored, and the pass goes on with the others: a pair is
-                // stored whole or not at all.
-                let probabilities = match run_scorer(Arc::clone(&scorer), inputs).await {
-                    Ok(p) => p,
+                let key = failed_key(model, a, b);
+                // One failing batch or store write skips its pair, which stays
+                // pending and unstored, and the pass goes on with the others:
+                // a pair is stored whole or not at all.
+                let done = self
+                    .score_pair(model, w.id, pair.cosine, a, b, &lines, &scorer)
+                    .await;
+                let set = failures.entry(w.name.clone()).or_default();
+                match done {
+                    Ok(n) => {
+                        batches += n;
+                        set.remove(&key);
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            a = a.id.0,
-                            b = b.id.0,
-                            "skipping a pair the contradiction scorer failed on: {e}"
-                        );
+                        if w.failures.contains(&key) {
+                            tracing::debug!(
+                                a = a.id.0,
+                                b = b.id.0,
+                                "a pair the contradiction check failed on failed again: {e}"
+                            );
+                        } else {
+                            tracing::warn!(
+                                a = a.id.0,
+                                b = b.id.0,
+                                "skipping a pair the contradiction check failed on; the tick retries it: {e}"
+                            );
+                        }
                         batch_error = Some(e.to_string());
+                        set.insert(key);
                         continue;
                     }
-                };
-                batches += expected.div_ceil(NLI_BATCH_SIZE);
-                let rows = score_rows(a.id, b.id, &lines, &probabilities);
-                let scored = ScoredPair {
-                    a: a.id,
-                    b: b.id,
-                    checksum_a: a.checksum.clone(),
-                    checksum_b: b.checksum.clone(),
-                };
-                {
-                    let store = self.store.lock().await;
-                    store
-                        .replace_contradictions(
-                            w.id,
-                            &scored,
-                            pair.cosine,
-                            model.repo,
-                            &Utc::now().to_rfc3339(),
-                            &rows,
-                        )
-                        .await?;
                 }
                 budget -= lines.len();
                 pairs_done += 1;
@@ -340,10 +407,14 @@ impl Engine {
                 }
             }
         }
-        if let Some(held) = self.scorer.lock().unwrap().as_mut() {
-            held.last_used = tokio::time::Instant::now();
+        drop(scorer);
+        if self.contradiction_model().is_none() {
+            *self.scorer.lock().unwrap() = None;
         }
         if pairs_done > 0 {
+            if let Some(held) = self.scorer.lock().unwrap().as_mut() {
+                held.last_used = tokio::time::Instant::now();
+            }
             tracing::info!(
                 model = model.id,
                 pairs = pairs_done,
@@ -354,17 +425,7 @@ impl Engine {
             );
         }
         let remaining = pending.values().sum();
-        let mut state = self.contradiction_state.lock().unwrap();
-        for w in &work {
-            if pending.get(&w.name) == Some(&0) {
-                state.settled.insert(w.name.clone(), w.settle.clone());
-            } else {
-                state.settled.remove(&w.name);
-            }
-        }
-        state.pending = Some(pending);
-        state.last_error = batch_error;
-        state.error_logged = false;
+        self.publish_walk(model, generation, &work, pending, failures, batch_error);
         Ok(ContradictionOutcome::Scored {
             pairs: pairs_done,
             line_pairs: lines_done,
@@ -372,8 +433,98 @@ impl Engine {
         })
     }
 
+    /// Score one pair and store it, returning the batches it took. The store
+    /// lock is taken only for the write, never across a batch.
+    #[allow(clippy::too_many_arguments)]
+    async fn score_pair(
+        &self,
+        model: &'static NliModel,
+        domain: DomainId,
+        cosine: f64,
+        a: &ContradictionFact,
+        b: &ContradictionFact,
+        lines: &[crystalline_index::nli::LinePair<'_>],
+        scorer: &Arc<dyn ContradictionScorer>,
+    ) -> Result<usize> {
+        let inputs = scorer_inputs(lines);
+        let batches = inputs.len().div_ceil(NLI_BATCH_SIZE);
+        let probabilities = run_scorer(Arc::clone(scorer), inputs).await?;
+        let rows = score_rows(a.id, b.id, lines, &probabilities);
+        let scored = ScoredPair {
+            a: a.id,
+            b: b.id,
+            checksum_a: a.checksum.clone(),
+            checksum_b: b.checksum.clone(),
+        };
+        let store = self.store.lock().await;
+        store
+            .replace_contradictions(
+                domain,
+                &scored,
+                cosine,
+                model.repo,
+                &Utc::now().to_rfc3339(),
+                &rows,
+            )
+            .await?;
+        Ok(batches)
+    }
+
+    /// Record what a walk found, but only when the generation it started under
+    /// is still current and the setting still names its model: a walk under
+    /// a profile the setting has since left must not overwrite the unknown
+    /// pending the change asked for.
+    fn publish_walk(
+        &self,
+        model: &'static NliModel,
+        generation: u64,
+        work: &[DomainWork],
+        pending: BTreeMap<String, usize>,
+        mut failures: HashMap<String, HashSet<FailedPair>>,
+        batch_error: Option<String>,
+    ) -> bool {
+        let current = self.contradiction_model().map(|m| m.repo);
+        let mut state = self.contradiction_state.lock().unwrap();
+        if state.generation != generation || current != Some(model.repo) {
+            return false;
+        }
+        for w in work {
+            let failing = failures.remove(&w.name).unwrap_or_default();
+            let left = pending.get(&w.name).copied().unwrap_or(0);
+            if left == failing.len() {
+                state.settled.insert(
+                    w.name.clone(),
+                    SettledDomain {
+                        failing: !failing.is_empty(),
+                        ..w.settle.clone()
+                    },
+                );
+            } else {
+                state.settled.remove(&w.name);
+            }
+            if failing.is_empty() {
+                state.failed.remove(&w.name);
+            } else {
+                state.failed.insert(w.name.clone(), failing);
+            }
+        }
+        state.pending = Some(pending);
+        match batch_error {
+            Some(e) => state.last_error = Some(e),
+            None if failed_count(&state, model.repo) == 0 => state.last_error = None,
+            None => {}
+        }
+        state.error_logged = false;
+        true
+    }
+
     /// The first half of a walk: every domain in scope with its pending pairs.
-    async fn contradiction_work(&self, model: &'static NliModel) -> Result<Vec<DomainWork>> {
+    /// Known failures are left alone unless `retry`.
+    async fn contradiction_work(
+        &self,
+        model: &'static NliModel,
+        retry: bool,
+    ) -> Result<Vec<DomainWork>> {
         let (scope, coverage) = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
@@ -404,20 +555,37 @@ impl Engine {
                 continue;
             }
             let digest = walk_digest(model, threshold, &self.model_id, &stamps);
-            let settled = self
-                .contradiction_state
-                .lock()
-                .unwrap()
-                .settled
-                .get(&name)
-                .filter(|s| s.digest == digest && s.coverage.is_none_or(|c| c == coverage))
-                .cloned();
+            let (settled, known) = {
+                let state = self.contradiction_state.lock().unwrap();
+                let settled = state
+                    .settled
+                    .get(&name)
+                    .filter(|s| {
+                        s.digest == digest
+                            && s.coverage.is_none_or(|c| c == coverage)
+                            && !(retry && s.failing)
+                    })
+                    .cloned();
+                let known: HashSet<FailedPair> = state
+                    .failed
+                    .get(&name)
+                    .map(|set| {
+                        set.iter()
+                            .filter(|f| f.repo == model.repo)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (settled, known)
+            };
             if let Some(settle) = settled {
                 out.push(DomainWork {
                     name,
                     id: domain_id,
                     facts: Vec::new(),
                     pending: Vec::new(),
+                    known_failing: known.len(),
+                    failures: known,
                     settle,
                 });
                 continue;
@@ -436,6 +604,7 @@ impl Engine {
             let settle = SettledDomain {
                 digest,
                 coverage: waiting.then_some(coverage),
+                failing: false,
             };
             let scored = {
                 let store = self.store.lock().await;
@@ -443,7 +612,7 @@ impl Engine {
                     .contradiction_pairs_scored(domain_id, model.repo)
                     .await?
             };
-            let pending = {
+            let all = {
                 let views: Vec<CandidateFacts<'_>> =
                     facts.iter().map(ContradictionFact::view).collect();
                 let found = contradiction_candidates(&views, threshold, max_pairs);
@@ -456,11 +625,27 @@ impl Engine {
                 }
                 pending_pairs(&views, &found.pairs, &scored)
             };
+            // A known failure counts only while its pair is still pending at
+            // the checksums it failed at; an edit makes it a new pair.
+            let key = |p: &CandidatePair| failed_key(model, &facts[p.a], &facts[p.b]);
+            let failures: HashSet<FailedPair> =
+                all.iter().map(key).filter(|k| known.contains(k)).collect();
+            let (pending, known_failing) = if retry {
+                (all, 0)
+            } else {
+                let fresh: Vec<CandidatePair> = all
+                    .into_iter()
+                    .filter(|p| !failures.contains(&key(p)))
+                    .collect();
+                (fresh, failures.len())
+            };
             out.push(DomainWork {
                 name,
                 id: domain_id,
                 facts,
                 pending,
+                known_failing,
+                failures,
                 settle,
             });
         }
@@ -542,13 +727,15 @@ impl Engine {
 
     /// The scorer for `model`, loaded on first use. Another profile's model is
     /// dropped before the new one loads, so two never sit in memory together.
+    /// Handing out a loaded scorer does not count as use: only a walk that
+    /// scored a pair does, so walks that retry a failing pair and score
+    /// nothing let the model idle out.
     async fn scorer_for(&self, model: &'static NliModel) -> Result<Arc<dyn ContradictionScorer>> {
         {
             let mut held = self.scorer.lock().unwrap();
-            if let Some(h) = held.as_mut()
+            if let Some(h) = held.as_ref()
                 && h.repo == model.repo
             {
-                h.last_used = tokio::time::Instant::now();
                 return Ok(Arc::clone(&h.scorer));
             }
             *held = None;
@@ -560,6 +747,30 @@ impl Engine {
             last_used: tokio::time::Instant::now(),
         });
         Ok(loaded)
+    }
+}
+
+/// How many failed pairs the state holds for `repo`.
+fn failed_count(state: &ContradictionState, repo: &str) -> usize {
+    state
+        .failed
+        .values()
+        .map(|set| set.iter().filter(|f| f.repo == repo).count())
+        .sum()
+}
+
+/// The key a failure of `a` against `b` under `model` is remembered by.
+fn failed_key(
+    model: &'static NliModel,
+    a: &ContradictionFact,
+    b: &ContradictionFact,
+) -> FailedPair {
+    FailedPair {
+        repo: model.repo,
+        a: a.id.0,
+        b: b.id.0,
+        checksum_a: a.checksum.clone(),
+        checksum_b: b.checksum.clone(),
     }
 }
 

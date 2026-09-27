@@ -737,6 +737,169 @@ fn a_stopping_daemon_does_not_wait_for_a_blocking_task() {
     );
 }
 
+/// A minimal OpenAI-compatible embeddings endpoint on a loopback port: every
+/// input gets the same unit vector, so every pair of engrams is related. One
+/// request per connection, answered with `Connection: close`. The thread
+/// lives as long as the test process.
+fn serve_flat_embeddings() -> String {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            if stream.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let inputs = match &request["input"] {
+                Value::Array(items) => items.len(),
+                Value::String(_) => 1,
+                _ => 0,
+            };
+            let data: Vec<Value> = (0..inputs)
+                .map(|i| json!({ "embedding": [1.0, 0.0, 0.0], "index": i }))
+                .collect();
+            let reply = json!({ "data": data }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Lesson 10 for the contradiction check: a daemon asked to stop while the
+/// contradiction pass is loading its model (held on a blocking thread by the
+/// test hook, where a real run downloads about 1.1 GB) is gone within the
+/// shutdown deadline, and the index opens from another process straight
+/// after. The embeddings come from a loopback endpoint, so the pass has lead
+/// vectors and a pending pair, which is what makes it ask for the model.
+#[test]
+fn a_stopping_daemon_does_not_wait_for_a_contradiction_model_load() {
+    let env = Env::new("nli");
+    let endpoint = serve_flat_embeddings();
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    let cfg = GlobalConfig {
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        embeddings: Some(config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "flat".to_string(),
+            endpoint: Some(endpoint),
+            api_key_env: None,
+        }),
+        evolve: Some(config::EvolveConfig {
+            contradictions: Some("full".to_string()),
+        }),
+        ..GlobalConfig::default()
+    };
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+    env.setup_domain("eng");
+    let root = env.dir.join("kb-eng");
+    for (slug, node) in [("eighteen", "18"), ("twenty", "20")] {
+        std::fs::write(
+            root.join(format!("{slug}.md")),
+            format!(
+                "---\ntype: engram\ntitle: {slug}\npermalink: {slug}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nThe build runs on a pinned runtime.\n\n- [fact] The build uses Node {node}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let stderr_path = env.dir.join("serve.stderr");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    cmd.env("CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS", "60");
+    let mut daemon = cmd
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    // The sync, the embed pass and the handover run in the background; the
+    // pass reaches the loader once both lead vectors exist. No `wait_ready`
+    // first: `ctl status` reads the store, and a pass that wrongly held the
+    // store lock across the load would park it there until the load ended,
+    // which would hide exactly the fault this test is for. The hook's line
+    // comes after the socket is up.
+    let started = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if log.contains("test hook: holding the contradiction model load for 60s") {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!("the contradiction pass never asked for its model; stderr:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Timed from before the request: a pass that held the store lock across
+    // the load would stall the ctl answer itself, not only the exit.
+    let asked = Instant::now();
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break Some(status);
+        }
+        if asked.elapsed() > Duration::from_secs(12) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let gone_after = asked.elapsed();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = status else {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!(
+            "the daemon was still running {gone_after:?} after ctl shutdown; its stderr:\n{stderr}"
+        );
+    };
+    assert!(
+        gone_after < Duration::from_secs(12),
+        "gone inside the shutdown deadline, not after the held load: {gone_after:?}\n{stderr}"
+    );
+    assert!(status.success(), "a clean exit: {status:?}\n{stderr}");
+    assert!(
+        !stderr.contains("did not finish in"),
+        "the steps finished on their own; the watchdog never fired:\n{stderr}"
+    );
+    assert!(!env.lock_path().exists(), "lock file removed");
+
+    // A successor opens the index at once.
+    let db = env.state_dir().join("index.db");
+    let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
+    assert!(
+        ok,
+        "the index opens right after the daemon left: {stdout}\n{stderr}"
+    );
+}
+
 /// End to end: a daemon started read-only reports it over ctl status, hides
 /// the write-gated tools from tools/list and refuses a write call by name with
 /// the read-only error.
