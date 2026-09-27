@@ -97,3 +97,12 @@ describe("the renderer's draw order", () => {
     expect(at("gl.disable(gl.DEPTH_TEST);", third)).toBeGreaterThan(third);
   });
 });
+
+it("turns a mover about its pivot with uModelYaw, the map swungPoint mirrors (2.6e C16)", () => {
+  // Mutation caught: the uniform declared but not applied, or the matrix
+  // written with the other sign, which would swing every leaf outward.
+  expect(SCENE_VS).toContain("uniform vec2 uModelYaw;");
+  expect(SCENE_VS).toContain(
+    "mat2(uModelYaw.x, -uModelYaw.y, uModelYaw.y, uModelYaw.x)",
+  );
+});

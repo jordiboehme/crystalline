@@ -167,6 +167,7 @@ function leaves(f: Frame, key: string, index: number): Leaves {
         travel,
         pivot: null,
         rest: 1,
+        swing: 0,
       });
     },
   };
@@ -247,6 +248,7 @@ function lamp(
     travel: 0,
     pivot: null,
     rest: LAMP_IDLE,
+    swing: 0,
   };
 }
 
@@ -285,6 +287,7 @@ function sparks(st: Style, h: number): Mover {
     travel: 0,
     pivot: null,
     rest: 0,
+    swing: 0,
   };
 }
 

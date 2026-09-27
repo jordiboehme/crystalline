@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { LAMP_ON, REST_FRAME, type FaultFrame } from "../world/malfunction";
 import { DISC_SEALED_GAIN, LAMP_IDLE } from "./models";
-import { moverDraw, restDraw, type MoverInfo } from "./parts";
+import {
+  moverDraw,
+  restDraw,
+  ROTOR_PERIOD,
+  swungPoint,
+  type MoverInfo,
+} from "./parts";
 import { SCENE_FS, SCENE_VS } from "./shaders";
 
 const SLIDE: [number, number, number] = [0.5, 0, 0];
@@ -12,7 +18,7 @@ const info = (
   part: MoverInfo["part"],
   rest = 1,
   pivot: MoverInfo["pivot"] = null,
-): MoverInfo => ({ part, slide: SLIDE, pivot, rest });
+): MoverInfo => ({ part, slide: SLIDE, pivot, rest, swing: 0 });
 
 const frame = (p: Partial<FaultFrame>): FaultFrame => ({ ...REST_FRAME, ...p });
 
@@ -24,6 +30,7 @@ describe("moverDraw", () => {
         pivot: [0, 0, 0],
         scale: 1,
         gain: 1,
+        yaw: 0,
         time: T,
       });
     });
@@ -93,6 +100,7 @@ describe("moverDraw", () => {
           pivot,
           scale: 1,
           gain: rest,
+          yaw: 0,
           time: T,
         });
       }
@@ -141,21 +149,39 @@ describe("the identity draw", () => {
       pivot: [0, 0, 0],
       scale: 1,
       gain: 1,
+      yaw: 0,
       time: T,
     });
   });
 
   it("places a vertex exactly where it was under the rest uniforms", () => {
     // The vertex shader's placement, in single precision as the GPU does
-    // it: pivot + (placed - pivot) * scale + offset. At the rest values
+    // it: the offset from the pivot turned by (cos, sin) of the yaw in the
+    // xz plane, then pivot + turned * scale + offset. At the rest values
     // every step is exact, so today's image is unchanged bit for bit.
     const f = Math.fround;
     const d = restDraw(T);
-    const place = (p: number, k: 0 | 1 | 2) =>
-      f(f(d.pivot[k] + f(f(p - d.pivot[k]) * d.scale)) + d.offset[k]);
-    for (const p of [0, 1e-7, -3.14159, 12.345678, 199.99, -0.1]) {
-      for (const k of [0, 1, 2] as const) {
-        expect(Object.is(place(f(p), k), f(p))).toBe(true);
+    const c = f(Math.cos(d.yaw));
+    const s = f(Math.sin(d.yaw));
+    const place = (p: [number, number, number]) => {
+      const l = [0, 1, 2].map((k) => f((p[k] ?? 0) - d.pivot[k as 0]));
+      const lx = l[0] ?? 0;
+      const ly = l[1] ?? 0;
+      const lz = l[2] ?? 0;
+      const turned = [f(f(c * lx) + f(s * lz)), ly, f(f(-s * lx) + f(c * lz))];
+      return [0, 1, 2].map((k) =>
+        f(
+          f(d.pivot[k as 0] + f((turned[k] ?? 0) * d.scale)) + d.offset[k as 0],
+        ),
+      );
+    };
+    const values = [0, 1e-7, -3.14159, 12.345678, 199.99, -0.1].map(f);
+    for (const x of values) {
+      for (const z of values) {
+        const at = place([x, f(1.5), z]);
+        expect(Object.is(at[0], x) || (x === 0 && at[0] === 0)).toBe(true);
+        expect(Object.is(at[1], f(1.5))).toBe(true);
+        expect(Object.is(at[2], z) || (z === 0 && at[2] === 0)).toBe(true);
       }
     }
     for (const c of [0, 0.02, 0.7, 1.4, 3.5]) {
@@ -169,8 +195,11 @@ describe("the identity draw", () => {
     expect(SCENE_VS).toContain(
       "vec3 placed = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset;",
     );
+    expect(SCENE_VS).toContain("uniform vec2 uModelYaw;");
+    expect(SCENE_VS).toContain("vec3 local = placed - uModelPivot;");
+    expect(SCENE_VS).toContain("vec2 turned = yaw * local.xz;");
     expect(SCENE_VS).toContain(
-      "vec3 world = uModelPivot + (placed - uModelPivot) * uModelScale + uModelOffset;",
+      "vec3 world = uModelPivot + vec3(turned.x, local.y, turned.y) * uModelScale + uModelOffset;",
     );
   });
 
@@ -192,5 +221,69 @@ describe("the identity draw", () => {
       expect(at).toBeGreaterThan(0);
       expect(at).toBeLessThan(firstExit);
     }
+  });
+});
+
+describe("wing and rotor parts (2.6e C16)", () => {
+  const wing: MoverInfo = {
+    part: "wing",
+    slide: [0, 0, 0],
+    pivot: [2, 0, 3],
+    rest: 1,
+    swing: Math.PI / 3,
+  };
+
+  it("turns a wing by its swing times the open fraction, clamped", () => {
+    // Mutation caught: the yaw not scaled by the fraction, or not clamped.
+    expect(moverDraw(wing, 0, undefined, 1)?.yaw).toBe(0);
+    expect(moverDraw(wing, 0.5, undefined, 1)?.yaw).toBeCloseTo(Math.PI / 6);
+    expect(moverDraw(wing, 2, undefined, 1)?.yaw).toBeCloseTo(Math.PI / 3);
+    expect(moverDraw(wing, 0.5, undefined, 1)?.pivot).toEqual([2, 0, 3]);
+    expect(moverDraw(wing, 0.5, undefined, 1)?.offset).toEqual([0, 0, 0]);
+  });
+
+  it("leaves every other part and the rest draw at yaw 0", () => {
+    // Mutation caught: restDraw or a door leaf picking up a yaw.
+    expect(restDraw(3).yaw).toBe(0);
+    const leaf: MoverInfo = {
+      part: "leaf",
+      slide: [1, 0, 0],
+      pivot: null,
+      rest: 1,
+      swing: 0,
+    };
+    expect(moverDraw(leaf, 1, undefined, 3)?.yaw).toBe(0);
+  });
+
+  it("slides the rotor up and back over its period", () => {
+    // Mutation caught: a sine (not at rest at 0), or the period ignored.
+    const rotor: MoverInfo = {
+      part: "rotor",
+      slide: [0, 0.3, 0],
+      pivot: null,
+      rest: 1,
+      swing: 0,
+    };
+    expect(moverDraw(rotor, 0, undefined, 0)?.offset[1]).toBeCloseTo(0);
+    expect(
+      moverDraw(rotor, 0, undefined, ROTOR_PERIOD / 2)?.offset[1],
+    ).toBeCloseTo(0.3);
+    expect(moverDraw(rotor, 0, undefined, ROTOR_PERIOD)?.offset[1]).toBeCloseTo(
+      0,
+    );
+    for (let s = 0; s < 2 * ROTOR_PERIOD; s += 0.05) {
+      const y = moverDraw(rotor, 0, undefined, s)?.offset[1] ?? -1;
+      expect(y).toBeGreaterThanOrEqual(-1e-9);
+      expect(y).toBeLessThanOrEqual(0.3 + 1e-9);
+    }
+  });
+
+  it("turns a point about the pivot's vertical, as the shader does", () => {
+    // Mutation caught: the sign of the sine flipped between the two sides.
+    const p = swungPoint([3, 1, 3], [2, 0, 3], Math.PI / 2);
+    expect(p[0]).toBeCloseTo(2);
+    expect(p[1]).toBe(1);
+    expect(p[2]).toBeCloseTo(2); // east of the pivot turns to north of it
+    expect(swungPoint([3, 1, 3], [2, 0, 3], 0)).toEqual([3, 1, 3]);
   });
 });

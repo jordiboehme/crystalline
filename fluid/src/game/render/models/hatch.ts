@@ -201,6 +201,7 @@ export function buildHatch(
       travel: LID_CRACK,
       pivot: null,
       rest: 1,
+      swing: 0,
     },
   ];
 }

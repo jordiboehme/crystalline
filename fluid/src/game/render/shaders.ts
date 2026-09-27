@@ -90,14 +90,19 @@ const TURN_TABLE = [0, 1, 2, 3]
  * branch; a way's malfunction is drawn with per-draw uniforms, not
  * instance data. The vertex is turned by `TURNS` (emitted from
  * `turnMat2Columns`) and moved by the instance offset; then comes a
- * mover's scale about its pivot
+ * mover's turn about its pivot's vertical (`uModelYaw`, the cosine and
+ * sine of the angle, applied as `mat2(c, -s, s, c)` to the offset from
+ * `uModelPivot` in the xz plane: a police box's door leaf swinging on its
+ * hinge; (1, 0), no turn, for everything else), its scale about its pivot
  * (`uModelScale` about `uModelPivot`: a portal disc collapsing; 1 about
  * the origin for everything else) and its slide (`uModelOffset`: a door
- * leaf or hatch lid while it opens; zero for the static room and the
- * props). At those rest values the placement is exact, so the room and
- * the props land where they always did. The normal turns with the
- * vertex, so a prop is lit and nudged into the light grid the way it
- * faces; a uniform scale does not change a normal's direction. The moved
+ * leaf or hatch lid while it opens, the rotor while it rises; zero for
+ * the static room and the props). `swungPoint` in `render/parts.ts` is
+ * the same turn on the CPU. At those rest values the placement is exact,
+ * so the room and the props land where they always did. The normal turns
+ * with the vertex, by the instance turn and then the mover's, so a prop
+ * is lit and nudged into the light grid the way it faces; a uniform scale
+ * does not change a normal's direction. The moved
  * world position goes on for the distance and light-grid lookups, and
  * layer, tint and flag go through flat so a triangle never blends between
  * two surfaces. The flag is rounded to an int once here, so the fragment
@@ -118,6 +123,7 @@ uniform mat4 uViewProjection;
 uniform vec3 uModelOffset;
 uniform vec3 uModelPivot;
 uniform float uModelScale;
+uniform vec2 uModelYaw; // (cos, sin) of the turn about uModelPivot's vertical; (1, 0) for everything but a swinging leaf
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;
@@ -130,8 +136,11 @@ void main() {
   mat2 turn = TURNS[int(aInstanceTurn.x + 0.5) & 3];
   vec2 xz = turn * aPosition.xz;
   vec3 placed = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset;
-  vec3 world = uModelPivot + (placed - uModelPivot) * uModelScale + uModelOffset;
-  vec2 nxz = turn * aNormal.xz;
+  mat2 yaw = mat2(uModelYaw.x, -uModelYaw.y, uModelYaw.y, uModelYaw.x);
+  vec3 local = placed - uModelPivot;
+  vec2 turned = yaw * local.xz;
+  vec3 world = uModelPivot + vec3(turned.x, local.y, turned.y) * uModelScale + uModelOffset;
+  vec2 nxz = yaw * (turn * aNormal.xz);
   vWorld = world;
   vNormal = vec3(nxz.x, aNormal.y, nxz.y);
   vUv = aUv;

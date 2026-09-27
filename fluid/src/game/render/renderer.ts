@@ -16,7 +16,7 @@
  * movers at their own uniforms, and the uniforms go back to `restDraw`
  * before the instance groups and once more after them, so `uGain` is 1
  * for every prop, hero and curio and no later draw inherits a mover's
- * gain.
+ * gain or turn (`uModelYaw`, a swinging leaf's cosine and sine).
  *
  * The set dressing, the heroes and the curios are drawn instanced (see
  * `instances.ts`). Heroes are instanced like props, in their own key space
@@ -141,7 +141,8 @@ export interface Renderer {
 
 /**
  * A moving part on the GPU: its key, part and fixture index, its mesh,
- * its slide (`axis * travel`), its pivot and its rest gain.
+ * its slide (`axis * travel`), its pivot, its rest gain and its swing
+ * (the radians a wing turns when fully open, 0 for every other part).
  */
 interface GpuMover {
   key: string;
@@ -151,6 +152,7 @@ interface GpuMover {
   slide: V3;
   pivot: V3 | null;
   rest: number;
+  swing: number;
 }
 
 /**
@@ -452,6 +454,7 @@ export function createRenderer(
         ],
         pivot: m.pivot,
         rest: m.rest,
+        swing: m.swing,
       }));
       const array = createTextureArray(gl, LAYER_SIZE, plan.count);
       textures = array;
@@ -571,14 +574,17 @@ export function createRenderer(
       const scaleU = scene.uniform("uModelScale");
       const gain = scene.uniform("uGain");
       const time = scene.uniform("uTime");
+      const yawU = scene.uniform("uModelYaw");
       const set = (d: MoverDraw) => {
         gl.uniform3f(offset, ...d.offset);
         gl.uniform3f(pivot, ...d.pivot);
         gl.uniform1f(scaleU, d.scale);
         gl.uniform1f(gain, d.gain);
+        gl.uniform2f(yawU, Math.cos(d.yaw), Math.sin(d.yaw));
         gl.uniform1f(time, d.time);
       };
-      // The static room at the identity: offset 0, pivot 0, scale 1, gain 1.
+      // The static room at the identity: offset 0, pivot 0, scale 1, gain 1,
+      // no turn.
       set(restDraw(seconds));
       mesh.draw();
       for (const m of movers) {

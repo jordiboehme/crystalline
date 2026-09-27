@@ -157,6 +157,7 @@ export function buildPortal(
         f.origin[2] + f.inward[2] * RING_D,
       ],
       rest: sealed ? DISC_SEALED_GAIN : 1,
+      swing: 0,
     },
   ];
 }

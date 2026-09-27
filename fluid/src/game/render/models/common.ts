@@ -59,11 +59,14 @@ export interface ModelContext {
 }
 
 /**
- * The five kinds of moving part a way has: a door `leaf`, a door's
- * `spark` cluster and hazard `lamp` lens, a hatch's `lid` and a portal's
- * swirl `disc`.
+ * The seven kinds of moving part: a way's door `leaf`, a door's `spark`
+ * cluster and hazard `lamp` lens, a hatch's `lid` and a portal's swirl
+ * `disc`, a police box's door `wing` (a leaf that swings on its hinge
+ * instead of sliding) and the console room's `rotor` (the mechanism that
+ * rises and falls on the clock).
  */
-export type MoverPart = "leaf" | "spark" | "lamp" | "lid" | "disc";
+export type MoverPart =
+  "leaf" | "spark" | "lamp" | "lid" | "disc" | "wing" | "rotor";
 
 /**
  * A part that moves, blinks or collapses: its own mesh in world space at
@@ -74,14 +77,20 @@ export type MoverPart = "leaf" | "spark" | "lamp" | "lid" | "disc";
  *   leaves of a door share it, as they open together, and it is the key
  *   the door's open fraction comes under), `spark:<i>`, `lamp:<i>`,
  *   `lid:<i>` and `disc:<i>`.
- * - `part` says which of the five it is, `fixture` the index `i` in
- *   `room.fixtures` (the key the fault frames come under).
+ * - `part` says which of the seven it is, `fixture` the index `i` in
+ *   `room.fixtures` (the key the fault frames come under), -1 for a
+ *   hero's mover, which no fault frame names.
  * - A leaf or lid is drawn offset by `axis * travel * open`: `axis` the
  *   world unit direction it slides, `travel` how many metres it slides
  *   when fully open. A spark, lamp or disc has travel 0 and axis the
  *   wall's `inward`.
- * - A disc is drawn scaled about `pivot`, its centre in world metres;
- *   every other part has pivot null and is never scaled.
+ * - A disc is drawn scaled about `pivot`, its centre in world metres. A
+ *   wing is drawn turned about the vertical through `pivot`, its hinge in
+ *   world metres, by `swing * open`: `swing` the radians it turns when
+ *   fully open (the sign picks the way it turns), 0 for every part but a
+ *   wing. Every other part has pivot null and is never scaled or turned.
+ * - A rotor is drawn offset by `axis * travel` times its phase on the
+ *   clock (`rotorPhase` in `render/parts.ts`), at rest at phase 0.
  * - Every part has a rest gain, `rest`: the gain it is drawn with while no
  *   fault frame names the fixture. It is 1 for a leaf, a lid or an open
  *   disc, the lamp's idle glow, 0 for sparks (which are then not drawn at
@@ -98,6 +107,7 @@ export interface Mover {
   travel: number;
   pivot: V3 | null;
   rest: number;
+  swing: number;
 }
 
 /**
