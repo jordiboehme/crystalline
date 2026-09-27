@@ -12,7 +12,12 @@
  * with lower case in it, so the font's lower case is set from `marks.ts`
  * alone. No recipe reads `PIXEL_FONT` itself either, so every glyph goes
  * through `textRows`, whose calls `textCalls.test.ts` records while every
- * recipe builds and holds to this same list. Mutation caught: any new readable string in a recipe (add
+ * recipe builds and holds to this same list. A picture (rows of `.` and
+ * `#` or lower-case colour keys, drawn with `pixelPanel`, `pixelBoxes`,
+ * `runsOf`, `pixelRuns` or `blinkPicture`) never reaches `textRows`, so
+ * neither this scan nor that one sees it; `APPROVED_PICTURES` below
+ * names every top-level one instead, so a new picture is a conscious
+ * change and reviewed by eye rather than caught by a letter. Mutation caught: any new readable string in a recipe (add
  * `"FOO"`, `"42"` or a backtick `FOO` to a recipe and this fails).
  */
 
@@ -99,6 +104,39 @@ const MARKS_ONLY = [
 const codeOf = (src: string): string =>
   src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
+/**
+ * Every top-level picture, by grep of `export const NAME: readonly
+ * string[] =` across the hero, curio and prop recipes and `marks.ts`
+ * (2.6d C16 fix): `RECRUIT_DEMO` and `QUESTION_MARK` from before 2.6d,
+ * `CONSOLE_TITLE` and `CONSOLE_PLAY` from 2.6c, and 2.6d's own
+ * `SAUCER_PICTURE`, `CAPSULE_LOGO`, `SIGNATURE`, `SPACE_BADGE` and
+ * `COMPUTER_LOGO`. `PLAQUE_LINES` (`finds.ts`) is left out on purpose: it
+ * is `readonly (readonly string[])[]` built from `textRows`, so its
+ * digits and letters are caught by the guards above already.
+ */
+const APPROVED_PICTURES = new Set([
+  "RECRUIT_DEMO",
+  "QUESTION_MARK",
+  "CONSOLE_TITLE",
+  "CONSOLE_PLAY",
+  "SAUCER_PICTURE",
+  "CAPSULE_LOGO",
+  "SIGNATURE",
+  "SPACE_BADGE",
+  "COMPUTER_LOGO",
+]);
+
+/** Every top-level `readonly string[]` constant's name, across `SOURCES`. */
+function picturesFound(): Set<string> {
+  const found = new Set<string>();
+  for (const src of Object.values(SOURCES))
+    for (const m of codeOf(src).matchAll(
+      /^(?:export\s+)?const\s+([A-Z][A-Za-z0-9_]*)\s*:\s*readonly string\[\]\s*=/gm,
+    ))
+      found.add(m[1] ?? "");
+  return found;
+}
+
 describe("readable text in the recipes", () => {
   it("draws no string but the station's titles and the approved exceptions", () => {
     // The folders hold the files the 2.6c and 2.6d tasks fill, at the least.
@@ -167,5 +205,13 @@ describe("readable text in the recipes", () => {
       expect(/textRows\(\s*["'`][^"'`]*[a-z]/.test(codeOf(src)), name).toBe(
         false,
       );
+  });
+
+  it("names every top-level picture on the approved list (2.6d C16 fix)", () => {
+    // A picture's `.`/`#` cells never pass through textRows, so the two
+    // guards above never see one, and a letter it spells would pass both.
+    // Mutation caught: an unlisted `export const FOO: readonly string[] =
+    // [...]` added to a recipe or to marks.ts.
+    expect([...picturesFound()].sort()).toEqual([...APPROVED_PICTURES].sort());
   });
 });
