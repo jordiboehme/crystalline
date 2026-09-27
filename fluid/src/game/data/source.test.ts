@@ -19,7 +19,12 @@ import { ApiProblem, api } from "../../api/client";
 import { engramDetailKey } from "../../api/engram";
 import type { Answer } from "../../test/harness";
 import { answersFor, domainsResponse } from "../../test/harness";
-import { GAME_STALE_MS, loadPlace, TARGET_TIMEOUT_MS } from "./source";
+import {
+  GAME_STALE_MS,
+  loadDomainRows,
+  loadPlace,
+  TARGET_TIMEOUT_MS,
+} from "./source";
 
 vi.mock("../../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api/client")>();
@@ -407,5 +412,47 @@ describe("loadPlace", () => {
     ).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(DOMException);
     expect((error as DOMException).name).toBe("AbortError");
+  });
+});
+
+describe("loadDomainRows", () => {
+  it("returns the three fields of each row of the domain listing", async () => {
+    // Mutation caught: dropping a field, or passing through the listing's
+    // own rows instead of the three the exit reads.
+    serve();
+    await expect(loadDomainRows(client)).resolves.toEqual([
+      { name: "eng", canonicalName: null, aliases: [] },
+    ]);
+  });
+
+  it("reads the listing from the cache (a second call makes no second request)", async () => {
+    // Mutation caught: fetching /domains again instead of joining the
+    // cached query the room's own load shares.
+    serve();
+    await loadDomainRows(client);
+    await loadDomainRows(client);
+    expect(requested().filter((path) => path === "/domains")).toHaveLength(1);
+  });
+
+  it("resolves null when the domain listing fails", async () => {
+    // Mutation caught: throwing instead of resolving null, or resolving an
+    // empty list instead of null.
+    serve({
+      "/domains": () => {
+        throw new ApiProblem(500, "boom", "listing failed");
+      },
+    });
+    await expect(loadDomainRows(client)).resolves.toBeNull();
+  });
+
+  it("rejects with an AbortError for an aborted signal", async () => {
+    // Mutation caught: resolving null instead of rejecting when the signal
+    // has already fired.
+    serve();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      loadDomainRows(client, controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
   });
 });

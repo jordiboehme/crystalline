@@ -28,6 +28,13 @@
  * decided here: `placeFromDetail` is asked once with no saliences to say where
  * each relation lands, and once more with them, so the rule for what is a link
  * lives in one place only.
+ *
+ * `loadDomainRows` reads the same listing (`DOMAINS_QUERY_KEY`) for the
+ * console room's exit: which domain its inner doors lead out to. It is
+ * usually already cached by the room's own load above, so a walk out of the
+ * inner doors costs no request of its own; a failed listing gives the exit
+ * null rather than an empty list, the same distinction `loadPlace` draws for
+ * door style.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
@@ -44,6 +51,7 @@ import { fetchInbound } from "../../api/inbound";
 import { domainSpellings } from "../../domainNames";
 import { placeKeyOf } from "../paths";
 import { HATCH_CAP, type PlaceAddress, type PlaceInput } from "../world/types";
+import type { DomainRow } from "../world/box";
 import { placeFromDetail } from "./place";
 
 /**
@@ -300,4 +308,45 @@ export function prefetchPlace(
 ): void {
   void client.prefetchQuery(detailQuery(domain, permalink));
   void client.prefetchQuery(graphQuery(domain, permalink));
+}
+
+/**
+ * The domain listing's rows, for the console room's exit
+ * (`pickExitDomain`), or null when the listing could not be read.
+ *
+ * Reads the very query the sidebar and `loadPlace` share
+ * (`DOMAINS_QUERY_KEY`), so a room already holding a fresh listing costs no
+ * second request. Null rather than an empty list on failure: an empty list
+ * would claim no other domain exists, while null lets the exit tell "cannot
+ * tell" apart from "there truly is nowhere else to go" and try again on the
+ * next visit.
+ *
+ * `signal` cancels the read exactly as `loadPlace`'s does: fired at any await
+ * boundary, the promise rejects with a `DOMException` named `AbortError`
+ * instead of resolving.
+ */
+export async function loadDomainRows(
+  client: QueryClient,
+  signal?: AbortSignal,
+): Promise<readonly DomainRow[] | null> {
+  checkAborted(signal);
+  const rows = await abortable(
+    client
+      .fetchQuery({
+        queryKey: DOMAINS_QUERY_KEY,
+        queryFn: fetchDomains,
+        staleTime: GAME_STALE_MS,
+      })
+      .then((listing) =>
+        listing.domains.map((d): DomainRow => ({
+          name: d.name,
+          canonicalName: d.canonicalName,
+          aliases: d.aliases,
+        })),
+      )
+      .catch(() => null),
+    signal,
+  );
+  checkAborted(signal);
+  return rows;
 }

@@ -1,15 +1,31 @@
 /**
- * The police box in play: its front, the focus on it, the door steps and
- * the walk-in through its open doors (`world/box.ts`).
+ * The police box in play: its front, the focus on it, the door steps, the
+ * walk-in through its open doors, and the console room's own exit pick
+ * (`world/box.ts`).
  */
 
 import { describe, expect, it } from "vitest";
 
 import { heroHallRoom } from "./canned";
-import { boxEntry, boxFocus, boxFront, stepBoxDoors } from "./box";
+import {
+  boxEntry,
+  boxFocus,
+  boxFront,
+  exitSeed,
+  pickExitDomain,
+  stepBoxDoors,
+  type DomainRow,
+} from "./box";
 import type { Player } from "./move";
 import { wallAnchor } from "./sites";
 import type { Hero, RoomSpec, WallSlot } from "./types";
+
+/** One domain row, defaulting to no canonical name and no aliases. */
+const row = (
+  name: string,
+  canonicalName: string | null = null,
+  aliases: string[] = [],
+): DomainRow => ({ name, canonicalName, aliases });
 
 /**
  * The hero hall with its heroes replaced by four police boxes, one backed
@@ -106,5 +122,58 @@ describe("the police box's doors and front (2.6e C10, C11)", () => {
       expect(boxEntry(room, facing(h, 0.36, 0.5), open)).toBeNull();
       expect(boxEntry(room, facing(h, 0.7), open)).toBeNull();
     });
+  });
+});
+
+describe("the console room's exit pick (2.6e C13)", () => {
+  it("picks uniformly among the other domains (2.6e C13)", () => {
+    // Mutation caught: the room left counted in, or a biased index (a floor
+    // over the whole list, a modulo of the seed).
+    const rows = ["alpha", "beta", "gamma", "delta", "eng"].map((n) => row(n));
+    const counts = new Map<string, number>();
+    for (let t = 0; t < 4000; t++) {
+      const d = pickExitDomain(rows, "eng", exitSeed("eng", t));
+      counts.set(d, (counts.get(d) ?? 0) + 1);
+    }
+    expect([...counts.keys()].sort()).toEqual([
+      "alpha",
+      "beta",
+      "delta",
+      "gamma",
+    ]);
+    for (const n of counts.values()) {
+      expect(n).toBeGreaterThan(850);
+      expect(n).toBeLessThan(1150);
+    }
+  });
+
+  it("never picks the domain left, whichever of its names the room was entered by (Review Focus 1)", () => {
+    // Mutation caught: excluding by the local name only.
+    const rows = [row("moonbase", "moon", ["luna"]), row("alpha"), row("beta")];
+    for (const from of ["moonbase", "moon", "luna"])
+      for (let t = 0; t < 1000; t++)
+        expect(pickExitDomain(rows, from, exitSeed(from, t))).not.toBe(
+          "moonbase",
+        );
+  });
+
+  it("gives the room left's own domain when no other exists or the listing is empty", () => {
+    // Mutation caught: returning the URL spelling instead of the row's local
+    // name, or throwing on an empty listing instead of falling back.
+    expect(pickExitDomain([row("eng")], "eng", 1)).toBe("eng");
+    expect(pickExitDomain([], "eng", 1)).toBe("eng");
+    expect(pickExitDomain([row("moonbase", "moon")], "moon", 1)).toBe(
+      "moonbase",
+    );
+  });
+
+  it("does not depend on the listing's order", () => {
+    // Mutation caught: drawing the index over the listing's own order instead
+    // of a name-sorted one.
+    const a = ["alpha", "beta", "gamma"].map((n) => row(n));
+    for (let t = 0; t < 50; t++)
+      expect(pickExitDomain(a, "eng", t)).toBe(
+        pickExitDomain([...a].reverse(), "eng", t),
+      );
   });
 });

@@ -1,6 +1,7 @@
 /**
- * The police box in play: its front wall, the focus on it, the door steps
- * and the walk-in through its open doors.
+ * The police box in play: its front wall, the focus on it, the door steps,
+ * the walk-in through its open doors, and which domain a walk out of the
+ * console room's own inner doors leads to.
  *
  * A police box's two door leaves are movers (`boxLeafMovers` in
  * `render/models/heroes/street.ts`) that open and close together, so both
@@ -21,12 +22,18 @@
  *   doors, not a way out of the room: a police box leads nowhere the
  *   generator ever built, so it is the session's business, not this
  *   module's, to decide what a walk through it does.
+ * - `DomainRow`, `exitSeed` and `pickExitDomain` are the console room's own
+ *   business: which of the domains the sidebar's listing knows about the
+ *   inner doors lead out to (2.6e C13). `DomainRow` lives here rather than
+ *   in the data layer so the world side never imports it: `data/source.ts`
+ *   imports `DomainRow` from here instead.
  *
  * The generator (`generate.ts`) never imports this module: a police box's
- * doors are a session concern, like a fixture door's own state, not
- * something a room is built with.
+ * doors, and the console room's exit, are a session concern, like a
+ * fixture door's own state, not something a room is built with.
  */
 
+import { seedFor, createRng } from "../core/seed";
 import { REACH, FACING, type DoorState, type WallPoint } from "./interact";
 import { HERO_FRONT, heroTurn, turnedPoint } from "./footprints";
 import type { Player } from "./move";
@@ -192,4 +199,85 @@ export function boxEntry(
     }
   }
   return null;
+}
+
+/**
+ * One row of the domain listing, as the console room's exit reads it: the
+ * three fields `pickExitDomain` and the room-left match need. `name` is the
+ * local registered name (the exit's own key, as `IDCLEV` keys and jumps to
+ * a domain by its local name too); `canonicalName` and `aliases` are the
+ * other spellings the same domain answers to.
+ *
+ * Defined on the world side, not the data layer, so the world never has to
+ * import from `data/`: `data/source.ts` imports this type from here instead.
+ */
+export interface DomainRow {
+  /** The local registered name: the row's key and where a walk out lands. */
+  name: string;
+  /** The name the domain's content declares, or null when not said. */
+  canonicalName: string | null;
+  /** Every former name the domain still answers to. */
+  aliases: readonly string[];
+}
+
+/**
+ * The seed of one exit pick: `seedFor("box-exit", from, ticks)`, `from` the
+ * local name of the domain the room was entered from and `ticks` the
+ * session's own tick count at the moment of the exit. Deterministic under a
+ * hand-cranked clock in a test and different on every visit in play, since
+ * the tick count never repeats: no wall clock, no counter of its own (2.6e
+ * C13).
+ */
+export function exitSeed(from: string, ticks: number): number {
+  return seedFor("box-exit", from, ticks);
+}
+
+/**
+ * Whether a domain row answers to the spelling `from`: by its local name,
+ * its canonical name, or one of its aliases. Used both to find the room
+ * left among the rows and to leave it out of the pick, so a door written
+ * with an alias or a canonical name still excludes the very domain the
+ * room was entered from (Review Focus 1).
+ */
+function answersTo(row: DomainRow, from: string): boolean {
+  return (
+    row.name === from ||
+    row.canonicalName === from ||
+    row.aliases.includes(from)
+  );
+}
+
+/**
+ * Which domain the console room's inner doors lead out to: one of `rows`
+ * chosen uniformly at random among every row other than the one the room
+ * was entered from, `from` matched by any of its names (`answersTo`), so an
+ * alias or a canonical name spelled in the door that led in still excludes
+ * that same domain (Review Focus 1).
+ *
+ * The rows are sorted by their local name before the draw, so the pick
+ * does not depend on the listing's own order: two listings holding the same
+ * domains in a different order draw the same domain for the same seed.
+ *
+ * With no other domain to pick, whether because `rows` holds only the room
+ * left's own row or none at all, the room left's own domain is given back:
+ * the local name of the row that answered to `from`, or `from` itself when
+ * no row did (an empty listing, C13's fallback).
+ *
+ * `seed` is `exitSeed(from, ticks)`; a fresh `createRng(seed)` is drawn from
+ * once, so the same seed always gives the same pick.
+ */
+export function pickExitDomain(
+  rows: readonly DomainRow[],
+  from: string,
+  seed: number,
+): string {
+  const sorted = [...rows].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
+  const others = sorted.filter((row) => !answersTo(row, from));
+  if (others.length === 0) {
+    return sorted.find((row) => answersTo(row, from))?.name ?? from;
+  }
+  const index = Math.floor(createRng(seed).next() * others.length);
+  return others[index]?.name ?? from;
 }
