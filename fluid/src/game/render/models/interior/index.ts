@@ -12,13 +12,14 @@
  *
  * A fitting's moving part is not in its instanced mesh: `buildInteriorMovers`
  * builds it as a mover in world space at the piece's anchor and turn, which
- * `buildRoomMesh` hands the renderer with the fixtures' and heroes'. No
- * kind has one yet.
+ * `buildRoomMesh` hands the renderer with the fixtures' and heroes'. Only
+ * the console has one, its rotor (`rotorMover`); it is the console room's
+ * only moving part (C9).
  *
  * The wall pieces (the roundel wall, the inner doors and the scanner) are
- * built in `walls.ts`; the console is still the blockout
- * (`interiorBlockout`), so the room can be entered, walked and lit before
- * it is modelled. The family's
+ * built in `walls.ts`, the console with its column's frame in
+ * `console.ts`. `interiorBlockout` (`common.ts`) stays the shape a new
+ * kind starts as. The family's
  * test (`interiorModels.test.ts`) builds every kind and variant, places it
  * at every turn it can take and checks its envelope (`interiorHalf`), the
  * winding, that nothing glows in mid-air, that no part floats clear of the
@@ -32,13 +33,14 @@ import { createBuilder, type MeshData } from "../../geometry";
 import { createKit, frameAt } from "../../kit";
 import type { Look } from "../../looks";
 import { surfaces, type KitAt, type Mover } from "../common";
-import { interiorBlockout, type InteriorRecipe } from "./common";
+import type { InteriorRecipe } from "./common";
+import { CONSOLE_RECIPES, rotorMover } from "./console";
 import { WALL_RECIPES } from "./walls";
 
 /** Every fitting kind's recipe. */
 const RECIPES = {
   ...WALL_RECIPES,
-  console: interiorBlockout,
+  ...CONSOLE_RECIPES,
 } satisfies Record<InteriorKind, InteriorRecipe>;
 
 /**
@@ -84,12 +86,14 @@ export function buildInteriorMesh(
 
 /**
  * The moving parts of the fitting at `index` in `room.interior`, as movers
- * in world space at its anchor and turn. None yet: every kind gives `[]`.
+ * in world space at its anchor and turn: the console's rotor
+ * (`rotorMover`, keyed `rotor:<index>`), and `[]` for every other kind,
+ * none of which moves (C9).
  */
 export function buildInteriorMovers(
-  _piece: InteriorPiece,
-  _index: number,
-  _look: Look,
+  piece: InteriorPiece,
+  index: number,
+  look: Look,
 ): Mover[] {
-  return [];
+  return piece.kind === "console" ? [rotorMover(piece, index, look)] : [];
 }

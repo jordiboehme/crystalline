@@ -16,8 +16,10 @@ import {
 } from "./geometry";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS, type Rgb } from "./looks";
-import { worstWinding } from "./modelChecks";
+import { positions, worstWinding } from "./modelChecks";
+import { buildInteriorMesh } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
+import { COLUMN } from "./models/interior/console";
 
 const EPS = 1e-4;
 
@@ -394,5 +396,35 @@ describe("the console room's shell (2.6e C4)", () => {
       expect(floor.length).toBeGreaterThan(0);
       for (const v of floor) expectTint(v.tint, look.palette.floor);
     }
+  });
+});
+
+describe("the console room's movers and size (2.6e C9, C19)", () => {
+  it("gives the console room exactly one mover, the rotor, and it stays inside the column (2.6e C9)", () => {
+    // Mutation caught: a second moving part (the doors, the scanner), or the
+    // rotor travelling through the column's top ring.
+    const { movers } = buildRoomMesh(consoleRoom(), LOOKS.aperture);
+    expect(movers.map((m) => m.part)).toEqual(["rotor"]);
+    const m = movers[0]!;
+    const top = Math.max(...positions(m.mesh).map((p) => p[1])) + m.travel;
+    expect(top).toBeLessThanOrEqual(COLUMN.h1 - 0.1);
+    const r = Math.max(
+      ...positions(m.mesh).map((p) => Math.hypot(p[0] - 6, p[2] - 6)),
+    );
+    expect(r).toBeLessThan(COLUMN.radius);
+  });
+
+  it("keeps the whole console room under 60,000 triangles (2.6e C19)", () => {
+    // Mutation caught: a fitting or the shell grown past the room's share
+    // of the frame.
+    const room = consoleRoom();
+    const { static: s, movers } = buildRoomMesh(room, LOOKS.aperture);
+    const pieces = (room.interior ?? []).reduce(
+      (n, p) => n + buildInteriorMesh(p.kind, p.variant, LOOKS.aperture).count,
+      0,
+    );
+    const total =
+      (s.count + pieces + movers.reduce((n, m) => n + m.mesh.count, 0)) / 3;
+    expect(total).toBeLessThan(60_000);
   });
 });

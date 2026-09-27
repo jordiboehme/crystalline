@@ -31,7 +31,11 @@ import {
   worstWinding,
   type Part,
 } from "./modelChecks";
-import { buildInterior, buildInteriorMesh } from "./models/interior";
+import {
+  buildInterior,
+  buildInteriorMesh,
+  buildInteriorMovers,
+} from "./models/interior";
 import { INTERIOR_BANK, interiorHalf } from "./models/interior/common";
 
 const EPS = 1e-4;
@@ -55,6 +59,9 @@ const BUDGET = {
   scanner: 1500,
   console: 4000,
 } as const satisfies Record<InteriorKind, number>;
+
+/** The rotor's triangle budget (C19): the console's one mover, under 1000. */
+const ROTOR_BUDGET = 1000;
 
 /** The wall edge whose side takes turn `t`. */
 function sideFor(t: number): Side {
@@ -210,14 +217,13 @@ describe("interior models (2.6e C2)", () => {
     }
   });
 
-  it("keeps the wall pieces' colours in every look (C4)", () => {
-    // Mutation caught: a wall piece painted with a look's colour
-    // (`s.body`, `s.panel`, `s.dark`), which would turn the room's white
-    // beige in one look and grey in another.
-    const walls = KINDS.filter((k) => k !== "console");
-    expect(walls.length).toBe(3);
+  it("keeps every fitting's colours in every look (C4)", () => {
+    // Mutation caught: a fitting painted with a look's colour (`s.body`,
+    // `s.panel`, `s.dark`), which would turn the room's white beige in one
+    // look and grey in another, or the console's panels with it.
+    expect(KINDS.length).toBe(4);
     expect(Object.values(LOOKS).length).toBeGreaterThan(1);
-    for (const kind of walls)
+    for (const kind of KINDS)
       for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
         const tintsIn = (look: Look) => {
           const parts: Part[] = [];
@@ -233,6 +239,41 @@ describe("interior models (2.6e C2)", () => {
       }
   });
 
+  describe("the rotor (C8, C19)", () => {
+    const console0 = pieceAt("console", 0, 0).piece;
+    const rotorIn = (look: Look) => {
+      const movers = buildInteriorMovers(console0, 0, look);
+      expect(movers).toHaveLength(1);
+      const m = movers[0];
+      if (!m) throw new Error("no rotor");
+      return m.mesh;
+    };
+
+    it("stays under its triangle budget (C19)", () => {
+      // Mutation caught: a rotor grown past its share of the room.
+      const mesh = rotorIn(LOOKS.aperture);
+      triangles.push(`rotor: ${String(mesh.count / 3)}`);
+      expect(mesh.count).toBeGreaterThan(0);
+      expect(mesh.count / 3).toBeLessThan(ROTOR_BUDGET);
+    });
+
+    it("winds every triangle with its normal", () => {
+      // Mutation caught: a face of the rotor wound the wrong way, which
+      // the renderer would cull.
+      const mesh = rotorIn(LOOKS.aperture);
+      expect(mesh.count).toBeGreaterThan(0);
+      expect(worstWinding(mesh)).toBeGreaterThan(0.999);
+    });
+
+    it("keeps its colours in every look (C4)", () => {
+      // Mutation caught: a rotor part painted with a look's colour.
+      const first = Array.from(rotorIn(LOOKS.aperture).vertices);
+      expect(first.length).toBeGreaterThan(0);
+      for (const look of Object.values(LOOKS))
+        expect(Array.from(rotorIn(look).vertices), look.id).toEqual(first);
+    });
+  });
+
   it("refuses a variant the catalogue does not have", () => {
     // Mutation caught: the variant check dropped from `buildInterior`.
     expect(() => buildInteriorMesh("console", 1, LOOKS.aperture)).toThrow(
@@ -246,7 +287,7 @@ describe("interior models (2.6e C2)", () => {
   it("logs every kind and variant's triangle count", () => {
     // Mutation caught: a kind or a variant the loop above skipped.
     expect(triangles).toHaveLength(
-      KINDS.reduce((n, k) => n + INTERIOR_CATALOGUE[k].variants, 0),
+      KINDS.reduce((n, k) => n + INTERIOR_CATALOGUE[k].variants, 0) + 1,
     );
     console.info(`interior triangles:\n${triangles.join("\n")}`);
   });

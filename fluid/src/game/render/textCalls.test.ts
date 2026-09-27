@@ -14,8 +14,8 @@
  *
  * The console room's fittings set no text at all (2.6e C20): every
  * interior kind and variant is built in every look with the records
- * cleared first, and neither `textRows` nor a pixel-mark helper may be
- * called. Their recipes take no model context, so `label` and
+ * cleared first, with the console room's moving parts (the rotor), and
+ * neither `textRows` nor a pixel-mark helper may be called. Their recipes take no model context, so `label` and
  * `textPanel`, which need one for a text layer, are out of their reach.
  */
 
@@ -30,9 +30,9 @@ import { LOOKS } from "./looks";
 import type { KitAt } from "./models/common";
 import { buildCurio } from "./models/curios";
 import { buildHero } from "./models/heroes";
-import { INTERIOR_CATALOGUE } from "../world/consoleRoom";
+import { INTERIOR_CATALOGUE, consoleRoom } from "../world/consoleRoom";
 import type { InteriorKind } from "../world/types";
-import { buildInterior } from "./models/interior";
+import { buildInterior, buildInteriorMovers } from "./models/interior";
 import * as pixels from "./models/heroes/pixels";
 import { buildProp } from "./models/props";
 
@@ -146,16 +146,21 @@ describe("no text on the console room's fittings (2.6e C20)", () => {
 
   it("sets no text and lays no mark on any interior kind or variant, in any look", () => {
     // Mutation caught: a label or a pixel mark on a piece (a caption on
-    // the scanner, a number on the inner doors).
+    // the scanner, a number on the inner doors, a figure on a console
+    // panel's dial or on the rotor).
     const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
     expect(kinds.length).toBe(4);
     expect(Object.values(LOOKS).length).toBeGreaterThan(1);
+    const pieces = consoleRoom().interior ?? [];
+    expect(pieces.some((p) => p.kind === "console")).toBe(true);
     recorded.length = 0;
     marked.length = 0;
-    for (const look of Object.values(LOOKS))
+    for (const look of Object.values(LOOKS)) {
       for (const kind of kinds)
         for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++)
           buildInterior(fresh(), kind, v, look);
+      pieces.forEach((p, i) => buildInteriorMovers(p, i, look));
+    }
     expect(recorded).toEqual([]);
     expect(marked).toEqual([]);
   });
