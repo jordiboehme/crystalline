@@ -2,8 +2,8 @@
  * The block-pixel font and the pixel pictures built from it: titles and
  * demos on the arcade cabinets' attract screens and marquees (H14), the
  * pocket console's two screen pictures (C16), the small "<=>" mark on
- * the back of the beige laptop's lid (C17), and the 2.6d props' marks
- * (`marks.ts`, 2.6d C16).
+ * the back of the beige laptop's lid (C17), and the 2.6d and 2.6f props'
+ * marks (`marks.ts`, 2.6d C16, 2.6f C13-C17).
  *
  * A picture is a list of rows of characters, row 0 at the top, one
  * character per pixel; `.` is dark, any other character names a colour the
@@ -16,7 +16,12 @@
  * instead, for a mark too small to float a panel over its face. `fit`
  * centres a picture in a box with square pixels, and `blinkPicture` draws
  * one as blinking pixels, a group per column quarter: the one way a screen
- * that swaps two pictures is drawn.
+ * that swaps two pictures is drawn. `textBlock` (2.6f C14) sets several
+ * lines of text one under the other as one picture, and `markLines`
+ * (2.6f C17) fits that block into a box and draws it in one call: the
+ * 2.6f props' multi-line marks (the hoverboard's deck wordmark, the
+ * police box's door notice) go through these two instead of a picture of
+ * their own.
  */
 
 import type { Surface } from "../../geometry";

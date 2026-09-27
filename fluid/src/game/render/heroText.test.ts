@@ -47,7 +47,7 @@ const SOURCES = Object.fromEntries(
 
 /**
  * The station's own titles, then the approved exceptions (2.6a, 2.6b,
- * 2.6c), then the 2.6d marks of `marks.ts` (C16).
+ * 2.6c), then the 2.6d and 2.6f marks of `marks.ts` (C16).
  */
 const READABLE = new Set([
   "TILEFALL",

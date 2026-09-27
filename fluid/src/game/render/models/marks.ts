@@ -138,11 +138,11 @@ export const COMPUTER_LOGO: readonly string[] = [
 ];
 
 /**
- * The thunder hammer's rune band (2.6f C13, C14): a schematic angular
- * band, not a literal transliteration and not the font's letters, five
- * separate marks each two columns wide with one dark column between two,
- * so it reads as a continuous carved band rather than a solid bar or a
- * word.
+ * The thunder hammer's rune band (2.6f C13, C14): `#` the rune ink, one
+ * dark column between each of five separate marks each two columns wide,
+ * a schematic angular band, not a literal transliteration and not the
+ * font's letters, so it reads as a continuous carved band rather than a
+ * solid bar or a word.
  */
 export const HAMMER_RUNES: readonly string[] = [
   ".#.#..##.#..#.",

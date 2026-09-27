@@ -155,7 +155,8 @@ describe("textBlock (2.6f C14)", () => {
 describe("markLines (2.6f C17)", () => {
   it("draws a mark's lines as one block fitted into its box, and reports the pixel size", () => {
     // Mutation caught: px not returned from fit, the block laid off the
-    // box's left or top, or the wrong ink used.
+    // box's left or top (anchored at the box's raw corner instead of
+    // fit's centred left/top), or the wrong ink used.
     const builder = createBuilder();
     const parts: Part[] = [];
     const k = recordingKitAt(builder, parts)(frameAt([0, 0, 0], 0));
@@ -173,6 +174,17 @@ describe("markLines (2.6f C17)", () => {
       expect(Math.min(...ds)).toBeCloseTo(-0.02, 6);
       expect(Math.max(...ds)).toBeCloseTo(-0.02, 6);
     }
+    // The block's in-plane extent, not only its depth: this fixture's own
+    // rows light column 0 and the last column, and row 0 and the last
+    // row (checked by hand above), so the lit panels' own bounds must
+    // reach exactly fit's left/top, not the box's raw corner.
+    const cols = rows[0]?.length ?? 0;
+    const as = parts.flatMap((p) => p.points.map((q) => q[0]));
+    const hs = parts.flatMap((p) => p.points.map((q) => q[1]));
+    expect(Math.min(...as)).toBeCloseTo(want.left, 9);
+    expect(Math.max(...as)).toBeCloseTo(want.left + cols * want.px, 9);
+    expect(Math.min(...hs)).toBeCloseTo(want.top - rows.length * want.px, 9);
+    expect(Math.max(...hs)).toBeCloseTo(want.top, 9);
   });
 
   it("gives a single string the same block as its one-line array", () => {
