@@ -101,6 +101,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain spellings",
         sql: SCHEMA_V15,
     },
+    Migration {
+        version: 16,
+        label: "unbind references an unknown prefix bound at home",
+        sql: SCHEMA_V16,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -474,6 +479,36 @@ INSERT INTO domain_spelling (spelling, domain_id) SELECT name, id FROM domain
 ON CONFLICT (spelling) DO NOTHING;
 CREATE INDEX IF NOT EXISTS idx_relation_to_domain ON relation(to_domain) WHERE to_domain IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
+"#;
+
+// A reference with a domain prefix resolves only in the domain the prefix
+// spells. Before this, a prefix that spelled no domain fell back to the
+// source's own domain and bound the bare target there, so `[[ops:Runbook]]`
+// written where `ops` is not registered landed on a home Runbook. The resolve
+// pass no longer does that, but the rows it bound that way stay bound until
+// their engram is reindexed, so this unbinds them once.
+//
+// Only the rows the current rule would not bind: a prefix no spelling holds,
+// and a bound engram that is not the whole bracket text at home, the one
+// reading such a prefix still gets. A row bound to that engram keeps it. A row
+// written before `to_raw` existed compares against NULL and is unbound, which
+// is what the current rule gives it too. The next resolve pass, which every
+// sync of the domain runs, binds any unbound row the whole text now reaches.
+// Idempotent, so a replay after a missed ledger stamp finds nothing the
+// first run left behind. The Turso v17 twin.
+const SCHEMA_V16: &str = r#"
+UPDATE relation SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = relation.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = relation.to_id
+                  AND e.domain_id = relation.domain_id
+                  AND (e.permalink = relation.to_raw OR lower(e.title) = lower(relation.to_raw)));
+UPDATE link SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = link.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = link.to_id
+                  AND e.domain_id = link.domain_id
+                  AND (e.permalink = link.to_raw OR lower(e.title) = lower(link.to_raw)));
 "#;
 
 const SCHEMA_V8: &str = r#"

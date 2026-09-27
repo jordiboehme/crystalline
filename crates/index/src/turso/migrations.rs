@@ -102,6 +102,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain spellings",
         sql: SCHEMA_V16,
     },
+    Migration {
+        version: 17,
+        label: "unbind references an unknown prefix bound at home",
+        sql: SCHEMA_V17,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -563,6 +568,35 @@ CREATE INDEX idx_relation_to_domain ON relation(to_domain) WHERE to_domain IS NO
 CREATE INDEX idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
+// A reference with a domain prefix resolves only in the domain the prefix
+// spells. Before this, a prefix that spelled no domain fell back to the
+// source's own domain and bound the bare target there, so `[[ops:Runbook]]`
+// written where `ops` is not registered landed on a home Runbook. The resolve
+// pass no longer does that, but the rows it bound that way stay bound until
+// their engram is reindexed, so this unbinds them once.
+//
+// Only the rows the current rule would not bind: a prefix no spelling holds,
+// and a bound engram that is not the whole bracket text at home, the one
+// reading such a prefix still gets. A row bound to that engram keeps it. A row
+// written before `to_raw` existed compares against NULL and is unbound, which
+// is what the current rule gives it too. The next resolve pass, which every
+// sync of the domain runs, binds any unbound row the whole text now reaches.
+// Idempotent: a second run finds nothing the first left behind.
+const SCHEMA_V17: &str = r#"
+UPDATE relation SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = relation.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = relation.to_id
+                  AND e.domain_id = relation.domain_id
+                  AND (e.permalink = relation.to_raw OR lower(e.title) = lower(relation.to_raw)));
+UPDATE link SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = link.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = link.to_id
+                  AND e.domain_id = link.domain_id
+                  AND (e.permalink = link.to_raw OR lower(e.title) = lower(link.to_raw)));
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -935,6 +969,101 @@ mod tests {
     /// reindexed. The row beside it, written with the text, is the control that
     /// proves the guard is doing the work rather than the expression failing
     /// everywhere.
+    /// v17 against an index the old resolve pass wrote: a prefix that spelled
+    /// no domain had bound the bare target at home. The migration unbinds
+    /// exactly those rows, keeps a row bound to the whole bracket text at home,
+    /// a row whose prefix names a domain and a bare row, and the resolve pass
+    /// that follows binds the unbound row the way the current rule does.
+    #[tokio::test]
+    async fn v17_unbinds_what_an_unknown_prefix_bound_at_home() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let (v17, before) = MIGRATIONS.split_last().unwrap();
+        assert_eq!(v17.version, 17, "the last migration is v17");
+        apply_migrations(&conn, before).await.unwrap();
+
+        conn.execute_batch(
+            r#"
+            INSERT INTO domain(id, name, path) VALUES (1,'home','/tmp/h'), (2,'eng','/tmp/e');
+            INSERT INTO domain_spelling(spelling, domain_id) VALUES ('home',1), ('eng',2);
+            INSERT INTO engram(id, domain_id, path, permalink, title)
+                VALUES (1,1,'foo.md','foo','Foo'),
+                       (2,1,'typo-foo.md','typo-foo','typo:Foo'),
+                       (3,1,'src.md','src','Src'),
+                       (4,2,'runbook.md','runbook','Runbook'),
+                       (5,1,'runbook.md','runbook','Runbook');
+            INSERT INTO link(id, engram_id, domain_id, line, to_target, to_domain, to_raw, to_id)
+                VALUES (1,3,1,1,'Foo','typo','typo:Foo',1),
+                       (2,3,1,2,'Foo','typo','typo:Foo',2),
+                       (3,3,1,3,'Runbook','eng','eng:Runbook',4),
+                       (4,3,1,4,'Foo',NULL,'Foo',1),
+                       (5,3,1,5,'Runbook','ops',NULL,5);
+            INSERT INTO relation(id, engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id)
+                VALUES (1,3,1,6,'relates_to','Runbook','ops','ops:Runbook',5);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        apply_migrations(&conn, MIGRATIONS).await.unwrap();
+        let bound = |id: i64, table: &'static str| {
+            let conn = &conn;
+            async move {
+                scalar(
+                    conn,
+                    &format!("SELECT COALESCE(to_id, 0) FROM {table} WHERE id={id}"),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            bound(1, "link").await,
+            0,
+            "the bare target at home is unbound"
+        );
+        assert_eq!(
+            bound(2, "link").await,
+            2,
+            "the whole text at home stays bound"
+        );
+        assert_eq!(
+            bound(3, "link").await,
+            4,
+            "a known prefix keeps its binding"
+        );
+        assert_eq!(
+            bound(4, "link").await,
+            1,
+            "a bare reference keeps its binding"
+        );
+        assert_eq!(
+            bound(5, "link").await,
+            0,
+            "a row with no raw text is unbound"
+        );
+        assert_eq!(bound(1, "relation").await, 0, "relations are unbound too");
+
+        // The next resolve pass binds what the current rule binds, and nothing
+        // it unbound comes back to the bare target.
+        for table in ["relation", "link"] {
+            conn.execute(&crate::store::resolve_pending_sql(table, "1"), ())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            bound(1, "link").await,
+            2,
+            "rebound to the whole text at home"
+        );
+        assert_eq!(bound(5, "link").await, 0);
+        assert_eq!(bound(1, "relation").await, 0);
+
+        // Idempotent: a replay changes nothing.
+        conn.execute_batch(v17.sql).await.unwrap();
+        assert_eq!(bound(1, "link").await, 2);
+        assert_eq!(bound(3, "link").await, 4);
+    }
+
     #[tokio::test]
     async fn v10_leaves_a_reference_written_before_it_resolving_as_it_did() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
