@@ -146,13 +146,13 @@ pub fn cached_model_dirs(models_dir: &Path) -> Vec<(String, u64)> {
     found
 }
 
-/// Remove every cached directory for a repository `LOCAL_MODELS` lists whose
+/// Remove every cached directory for a repository `LOCAL_MODELS` or `NLI_MODELS` lists whose
 /// id is not in `keep`, returning what went and how many bytes it freed,
 /// sorted by repo id.
 ///
-/// Only a repository the table knows is ever a candidate: `CRYSTALLINE_MODELS_DIR`
-/// may point at a cache other Hugging Face tools share, and a directory that
-/// table does not list - another tool's model, or one this build used to know
+/// Only a repository one of the two tables knows is ever a candidate: `CRYSTALLINE_MODELS_DIR`
+/// may point at a cache other Hugging Face tools share, and a directory neither
+/// table lists - another tool's model, or one this build used to know
 /// and has since dropped - is never touched, whatever `keep` says. `keep`
 /// itself holds repository ids, not table ids, so a caller that cannot
 /// resolve its configured model through the table must decline to prune
@@ -168,7 +168,10 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
     let mut removed = Vec::new();
     let mut candidates: Vec<(String, PathBuf)> = hub_dirs(models_dir)
         .into_iter()
-        .filter(|(repo, _)| LOCAL_MODELS.iter().any(|m| m.repo == repo))
+        .filter(|(repo, _)| {
+            LOCAL_MODELS.iter().any(|m| m.repo == repo)
+                || crate::nli::NLI_MODELS.iter().any(|m| m.repo == repo)
+        })
         .collect();
     candidates.sort();
     for (repo, path) in candidates {
@@ -181,7 +184,7 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
                 tracing::info!(
                     repo = %repo,
                     bytes,
-                    "removed the cached weights of an embedding model this install no longer uses"
+                    "removed the cached weights of a model this install no longer uses"
                 );
                 removed.push((repo, bytes));
             }
@@ -542,5 +545,26 @@ mod tests {
             "the bigger model measures bigger: {cached:?}"
         );
         assert_eq!(cached_model_dirs(&root.join("missing")), Vec::new());
+    }
+
+    #[test]
+    fn an_nli_checkpoint_is_pruned_unless_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        let full = crate::nli::NLI_MODELS[0].repo;
+        let light = crate::nli::NLI_MODELS[1].repo;
+        hub_dir(root, granite, &[7u8; 64]);
+        hub_dir(root, full, &[1u8; 16]);
+        hub_dir(root, light, &[2u8; 16]);
+        let removed = prune_model_cache(root, &[granite, full]).unwrap();
+        let repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            repos,
+            [light],
+            "the NLI checkpoint nobody kept goes, the kept one stays"
+        );
+        assert!(root.join(hub_dir_name(full)).is_dir());
+        assert!(root.join(hub_dir_name(granite)).is_dir());
     }
 }

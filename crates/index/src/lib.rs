@@ -19,6 +19,7 @@ mod alias;
 pub mod embed;
 mod error;
 mod factory;
+pub mod nli;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod store;
