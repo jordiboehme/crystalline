@@ -1,6 +1,7 @@
 /**
- * The street heroes' shape tests: the bike's sourced size and its two
- * lights; the police box's sign layout, its sign on all four sides, and
+ * The street heroes' shape tests: the bike's sourced size, its two
+ * lights and its sponsor stickers on both sides; the police box's sign
+ * layout, its sign on all four sides, the lines of its door notice, and
  * its doors built by the helper 2.6e will animate.
  */
 
@@ -9,11 +10,44 @@ import { describe, expect, it } from "vitest";
 import { FLAG, blinkFlag, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
 import { partsOf, toLocal, type Part } from "../../modelChecks";
-import { BIKE, BOX_BACK, BOX_SIGN, BRAKE_STEEL, boxSignLayout } from "./street";
-import { textRows } from "./pixels";
+import { MARKS } from "../marks";
+import {
+  BIKE,
+  BIKE_STICKERS,
+  BOX_BACK,
+  BOX_SIGN,
+  BRAKE_STEEL,
+  NOTICE_INK,
+  boxSignLayout,
+} from "./street";
+import { pixelRuns, textRows } from "./pixels";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
+
+/** How many lit runs `lines` make in the font. */
+const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** The panels of `parts` painted exactly `ink`. */
+const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
+  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
+
+/** The height of a panel part: its pixel size, for a mark's run. */
+const heightOf = (p: Part): number => {
+  const hs = local(p).map((q) => q[2]);
+  return Math.max(...hs) - Math.min(...hs);
+};
+
+/**
+ * The sign of `a` of the door leaf that carries the notice: `boxDoor`
+ * builds the left leaf (`facePanels(..., leaf === "left")`) at
+ * `sign * edge` with `sign` -1, so its whole column lies at negative `a`.
+ */
+const LEFT_LEAF_SIGN = -1;
 
 describe("street hero models", () => {
   it("builds the bike at the original's size: 2.95 long, 0.83 wide, the windscreen at 1.17", () => {
@@ -120,5 +154,52 @@ describe("street hero models", () => {
       .map((q) => q[1]);
     expect(Math.max(...ds)).toBeGreaterThanOrEqual(1.3 - 1e-6);
     for (const d of ds) expect(d).toBeLessThanOrEqual(1.3 + 1e-6);
+  });
+  it("puts each sponsor sticker on both sides of the bike's shell, from the approved list (2.6f C13)", () => {
+    // Mutation caught: a sticker on one side only, a sticker set from the
+    // wrong entry, or a sticker off the shell's side faces.
+    expect(BIKE_STICKERS.length).toBe(MARKS.bikeStickers.length);
+    const parts = partsOf("red-bike");
+    for (const s of BIKE_STICKERS) {
+      const text = MARKS.bikeStickers[s.text] ?? "";
+      expect(runsOfLines(text)).toBeGreaterThan(3);
+      const ink = inked(parts, s.ink);
+      expect(ink, text).toHaveLength(2 * runsOfLines(text));
+      const sides = new Set(
+        ink.map((p) => Math.sign(Math.max(...local(p).map((q) => q[1])))),
+      );
+      expect([...sides].sort(), text).toEqual([-1, 1]);
+      for (const p of ink) {
+        const [a0, a1] = s.a;
+        for (const q of local(p)) {
+          expect(q[0]).toBeGreaterThanOrEqual(a0 - 1e-6);
+          expect(q[0]).toBeLessThanOrEqual(a1 + 1e-6);
+          expect(Math.abs(q[1])).toBeGreaterThan(0.2);
+        }
+        expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+      }
+    }
+  });
+
+  it("sets the notice's lines in black on the left door leaf's white notice (2.6f C13)", () => {
+    // Mutation caught: the notice left blank, set on the right leaf, or a
+    // line dropped.
+    expect(runsOfLines(MARKS.boxNotice)).toBeGreaterThan(20);
+    const parts = partsOf("police-box");
+    const ink = inked(parts, NOTICE_INK);
+    expect(ink).toHaveLength(runsOfLines(MARKS.boxNotice));
+    const pts = ink.flatMap(local);
+    expect(Math.min(...pts.map((q) => q[2]))).toBeGreaterThanOrEqual(
+      1.3 - 1e-6,
+    );
+    expect(Math.max(...pts.map((q) => q[2]))).toBeLessThanOrEqual(1.52 + 1e-6);
+    // The left leaf, seen from the front: its `a` is below 0 in the
+    // recipe's frame (turn 0 faces north, `along` runs west).
+    const mid =
+      (Math.min(...pts.map((q) => q[0])) + Math.max(...pts.map((q) => q[0]))) /
+      2;
+    expect(Math.sign(mid)).toBe(LEFT_LEAF_SIGN);
+    for (const p of ink)
+      expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
   });
 });

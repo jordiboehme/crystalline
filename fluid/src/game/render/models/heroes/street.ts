@@ -16,7 +16,11 @@
  *   hubs, the front wheel showing under the nose and the rear one almost
  *   covered, and black under the chassis. It stands
  *   upright (C14): the kit has no roll, so the stand is a bar from the
- *   chassis down to the floor on its `-d` side. No stickers and no text.
+ *   chassis down to the floor on its `-d` side. Four sponsor stickers
+ *   (`BIKE_STICKERS`, 2.6f C13) sit on both sides of the shell: one large
+ *   on the cowl's side under the windscreen, one small on the upper panel
+ *   behind it, and two on the lower panels, over the chassis and over the
+ *   rear wheel, each on a plate of its own or printed straight on the red.
  * - The police box is backed against a wall, its doors facing `+d`
  *   (C3, C10): deep blue painted wood on a low plinth, a corner post from
  *   the plinth to the roof at each corner, a black sign band under the
@@ -26,7 +30,8 @@
  *   columns of raised panels under a window of small frosted panes that
  *   glow faintly. On the front the two columns are the two door leaves,
  *   each built by `boxDoor` as a slab of its own, so a later stage can
- *   swing them inward; the left one carries a small blank white notice.
+ *   swing them inward; the left one carries the white door notice with its
+ *   lines in black (`MARKS.boxNotice`, 2.6f C13).
  *   The body stands `BOX_BACK` off the wall, so the back sign stays in
  *   front of the wall plane.
  *
@@ -48,7 +53,8 @@ import {
   type Surfaces,
 } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
-import { pixelPanel, textRows } from "./pixels";
+import { MARKS } from "../marks";
+import { fit, markLines, pixelPanel, textBlock, textRows } from "./pixels";
 
 /** The recipe's own frame: the origin, facing north. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
@@ -304,6 +310,80 @@ function shellTopAt(a: number): number {
 }
 
 /**
+ * One sticker on the bike's fairing: which `MARKS.bikeStickers` entry, its
+ * plate and ink, and where along the shell it sits: `a` along the bike and
+ * `h` in height, on the `+d` side, mirrored on the `-d` side.
+ */
+export interface BikeSticker {
+  text: number;
+  /** The plate's colour; `null`: the letters print straight on the red. */
+  plate: Rgb | null;
+  ink: Rgb;
+  a: readonly [number, number];
+  h: readonly [number, number];
+}
+
+/**
+ * The bike's four sponsor stickers (2.6f C13), placed as the sticker sets
+ * copied from the original place them, on the flat sides of the shell:
+ * - the camera maker's, the largest, red letters on a white plate on the
+ *   cowl's side, between the seam at 0.3 and the nose, under the
+ *   windscreen's lower edge and over the accent line;
+ * - a helmet maker's in white letters straight on the red of the upper
+ *   panel between the seat and the seam at 0.3, under the shell's top as
+ *   it rises to the cowl;
+ * - the watch maker's in black on a white plate on the lower panel over
+ *   the chassis, between the footpeg and the front wheel;
+ * - the other helmet maker's in white on a black plate on the lower panel
+ *   over the rear wheel, behind the vents.
+ * Every ink is its sticker's own, used by no other part of the bike, and
+ * none is the bike's red, shine or black.
+ */
+export const BIKE_STICKERS: readonly BikeSticker[] = [
+  {
+    text: 0,
+    plate: [0.96, 0.96, 0.93],
+    ink: [0.8, 0.05, 0.05],
+    a: [0.36, 1.02],
+    h: [0.66, 0.84],
+  },
+  {
+    text: 1,
+    plate: [0.94, 0.94, 0.91],
+    ink: [0.02, 0.02, 0.03],
+    a: [-0.2, 0.56],
+    h: [0.34, 0.54],
+  },
+  {
+    text: 2,
+    plate: null,
+    ink: [1.0, 1.0, 1.0],
+    a: [0.0, 0.28],
+    h: [0.64, 0.74],
+  },
+  {
+    text: 3,
+    plate: [0.03, 0.03, 0.035],
+    ink: [0.97, 0.97, 0.97],
+    a: [-1.28, -0.72],
+    h: [0.3, 0.52],
+  },
+];
+
+/**
+ * A mark's box inset by one pixel of the block fitted into it, so the
+ * letters stand clear of its plate's (or notice's) edge.
+ */
+function insetBox(
+  lines: string | readonly string[],
+  [a0, a1, h0, h1]: readonly [number, number, number, number],
+): [number, number, number, number] {
+  const rows = textBlock(typeof lines === "string" ? [lines] : lines);
+  const m = fit(rows, a0, a1, h0, h1).px;
+  return [a0 + m, a1 - m, h0 + m, h1 - m];
+}
+
+/**
  * The red bike: the shell over two fat wheels with a dark tread band and
  * grey disc hubs with a ring of holes, the front one with a steel brake
  * disc, its caliper and the fork legs; the chassis, footpegs and the
@@ -489,6 +569,32 @@ const redBike: HeroRecipe = ({ k, kitAt, s }) => {
   );
   k.box(-1.465, -1.455, -0.1, 0.1, 0.34, 0.45, black);
   side.extrude(STAND_PROFILE, -0.22, -0.18, black);
+
+  // The stickers, on each side's flat panel: the upper panels at `half`,
+  // the lower ones (under `SEAM`) at `lower`. The `-d` side mirrors `a`.
+  // A plate stands one lift proud and its letters one more; letters
+  // printed straight on the red stand one lift proud, as any decal does.
+  for (const st of BIKE_STICKERS) {
+    const text = MARKS.bikeStickers[st.text] ?? "";
+    const [a0, a1] = st.a;
+    const [h0, h1] = st.h;
+    const face = h1 <= SEAM ? b.lower : b.half;
+    const ink = s.tinted(st.ink);
+    for (const [kk, s0, s1] of [
+      [k, a0, a1],
+      [back, -a1, -a0],
+    ] as const) {
+      if (st.plate !== null)
+        kk.panel(s0, s1, face + DECAL_LIFT, h0, h1, s.tinted(st.plate));
+      markLines(
+        kk,
+        text,
+        insetBox(text, [s0, s1, h0, h1]),
+        face + (st.plate === null ? 1 : 2) * DECAL_LIFT,
+        ink,
+      );
+    }
+  }
 };
 
 /** The box's deep blue paint. */
@@ -508,6 +614,9 @@ const LAMP: Rgb = [1.0, 0.95, 0.8];
 
 /** The door handles: a dark iron. */
 const HANDLE: Rgb = [0.08, 0.08, 0.09];
+
+/** The door notice's black ink. */
+export const NOTICE_INK: Rgb = [0.05, 0.05, 0.06];
 
 /**
  * How far the police box's body stands off its wall, in metres: the back
@@ -609,7 +718,7 @@ const COLUMN = {
  */
 const PANEL_SHADES = [1.1, 1.02, 1.06] as const;
 
-/** Half the width of the blank notice on the left door leaf, in metres. */
+/** Half the width of the white notice on the left door leaf, in metres. */
 const NOTICE_HALF = 0.14;
 
 /**
@@ -676,8 +785,8 @@ export function boxSignLayout(width: number, mid: number): SignWord[] {
  * `c0` to `c1` along it: three raised panels in their own shades of blue,
  * the white window frame over them and its frosted panes, which glow
  * faintly and leave the frame's white showing between them as glazing
- * bars. With `notice`, the blank white notice sits on the middle raised
- * panel. The door leaves and the other three sides share it.
+ * bars. With `notice`, the white notice sits on the top raised panel,
+ * its lines (`MARKS.boxNotice`) set on it in black. The door leaves and the other three sides share it.
  */
 function facePanels(
   k: Kit,
@@ -722,6 +831,13 @@ function facePanels(
     1.52,
     s.tinted(WHITE),
   );
+  markLines(
+    k,
+    MARKS.boxNotice,
+    insetBox(MARKS.boxNotice, [n - NOTICE_HALF, n + NOTICE_HALF, 1.3, 1.52]),
+    d + C.raised + 2 * DECAL_LIFT,
+    s.tinted(NOTICE_INK),
+  );
 }
 
 /**
@@ -735,7 +851,7 @@ function facePanels(
  * the body's front out to the door plane, with its column of panels
  * (`facePanels`) on the slab's front and a dark handle at its inner edge.
  * The right leaf (at `+a`, the viewer's right) carries the meeting stile
- * that covers the joint between the two; the left one the blank notice.
+ * that covers the joint between the two; the left one the door notice.
  * Nothing else of the box is built here, so the call carries the whole
  * leaf and only it.
  */
