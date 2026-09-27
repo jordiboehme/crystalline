@@ -15,12 +15,20 @@ import { FLAG, createBuilder } from "../../geometry";
 import { frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
-import { CONSOLE_WALL, ROUNDEL_FACE } from "./common";
+import { SOFT_FLOOR } from "../../blink";
+import { LAYER, LAYER_SIZE } from "../../layers";
+import type { Rgb } from "../../looks";
+import { SCENE_FS, SIGNAL_GAIN } from "../../shaders";
+import { baseLayers } from "../../textures";
+import { CONSOLE_WALL, INTERIOR_BANK, ROUNDEL_FACE } from "./common";
 import { buildInterior } from ".";
 import {
+  DOOR_FRAME,
+  DOOR_LEAF,
   GLOWING_ROUNDELS,
   INNER_DOORS,
   ROUNDEL,
+  ROUNDEL_GLOW,
   SCANNER,
   scannerHousing,
 } from "./walls";
@@ -140,7 +148,7 @@ describe("the console room's wall pieces (2.6e C5 to C7)", () => {
       expect(extent(rim).d1).toBeGreaterThan(f.d1 + 0.004);
   });
 
-  it("lights exactly its variant's roundels, on the breathe bank's groups", () => {
+  it("lights exactly its variant's roundels, each on a group of its bank's own", () => {
     // Mutation caught: every roundel glowing, or none in variants 1 and 2.
     expect(GLOWING_ROUNDELS.length).toBe(3);
     GLOWING_ROUNDELS.forEach((cells, v) => {
@@ -332,6 +340,118 @@ describe("the console room's wall pieces (2.6e C5 to C7)", () => {
     for (const d of dots) {
       expect(d.flag).toBe(FLAG.signal);
       expect(extent(d).d0 - s.d1).toBeGreaterThanOrEqual(0.01 - 1e-6);
+    }
+  });
+});
+
+/**
+ * The panel texture's mean level: what a lit surface of the console room
+ * shows of its tint on average, the texture the renderer builds (the seed
+ * `renderer.ts` passes to `baseLayers`).
+ */
+const PANEL_MEAN = (() => {
+  const px = baseLayers(LAYER_SIZE, 0x5eed)[LAYER.panel];
+  if (px === undefined) throw new Error("no panel layer");
+  let sum = 0;
+  for (let i = 0; i < px.length; i += 4) sum += px[i] ?? 0;
+  return sum / (px.length / 4) / 255;
+})();
+
+/** The scene shader's fixed shading by face direction (`SCENE_FS`). */
+const SHADING =
+  "float facing = 0.82 + 0.18 * abs(dot(normalize(vNormal), normalize(vec3(0.35, 0.8, 0.5))));";
+const facing = (n: readonly [number, number, number]) => {
+  const l = Math.hypot(0.35, 0.8, 0.5);
+  return 0.82 + (0.18 * Math.abs(n[0] * 0.35 + n[1] * 0.8 + n[2] * 0.5)) / l;
+};
+/** A wall facing the light most (+z), and a face turned up to it. */
+const WALL_N = [0, 0, 1] as const;
+const UP_N = [0, 1, 0] as const;
+
+/** A tint's level as a lit surface of the room shows it before the tone map. */
+const litLevel = (tint: Rgb, n: readonly [number, number, number]) =>
+  Math.max(...tint) * PANEL_MEAN * facing(n);
+
+/** Rec. 709 luminance of a linear colour. */
+const luma = (c: readonly number[]) =>
+  0.2126 * (c[0] ?? 0) + 0.7152 * (c[1] ?? 0) + 0.0722 * (c[2] ?? 0);
+
+describe("the console room's colours (2.6e C25 to C27)", () => {
+  it("keeps its copy of the scene shader's shading and the panel texture's level", () => {
+    // The two numbers the pins below read; they fail here first if the
+    // shader or the texture moves.
+    expect(SCENE_FS).toContain(SHADING);
+    expect(PANEL_MEAN).toBeGreaterThan(0.85);
+    expect(PANEL_MEAN).toBeLessThan(0.9);
+  });
+
+  it("whites the walls: a neutral white near 0.84 on a wall, under the aperture grid's bloom threshold even turned up to the light, the discs a shade darker (C25)", () => {
+    // Mutation caught: the old light grey (a wall level near 0.72), a tint
+    // so bright that the walls or the console's top bloom in the aperture
+    // grid, a warm or cool cast, or discs that read as dark holes (the old
+    // shade of 0.82) or not recessed at all.
+    const threshold = LOOKS.aperture.bloom.threshold;
+    expect(litLevel(CONSOLE_WALL, WALL_N)).toBeGreaterThanOrEqual(0.8);
+    expect(litLevel(CONSOLE_WALL, UP_N)).toBeLessThan(threshold);
+    expect(
+      Math.max(...CONSOLE_WALL) - Math.min(...CONSOLE_WALL),
+    ).toBeLessThanOrEqual(0.03);
+    ROUNDEL_FACE.forEach((c, i) => {
+      const r = c / (CONSOLE_WALL[i] ?? 1);
+      expect(r).toBeGreaterThanOrEqual(0.88);
+      expect(r).toBeLessThanOrEqual(0.95);
+    });
+  });
+
+  it("breathes the lit roundels softly: the peak under the bloom threshold, the lowest point over an unlit disc, warmer than the wall (C26)", () => {
+    // Mutation caught: a glow that flares (its peak past the aperture
+    // grid's threshold, the old warm white at 1.4), one that dips under
+    // its unlit neighbours (the breathe bank's low of 0.4: a brown hole),
+    // or a glow no warmer than the wall.
+    expect(INTERIOR_BANK["roundel-wall"]).toBe("soft");
+    const peak = Math.max(...ROUNDEL_GLOW) * SIGNAL_GAIN;
+    expect(peak).toBeLessThan(LOOKS.aperture.bloom.threshold);
+    const lowest = ROUNDEL_GLOW.map((c) => c * SIGNAL_GAIN * SOFT_FLOOR);
+    const unlit = ROUNDEL_FACE.map((c) => c * PANEL_MEAN * facing(WALL_N));
+    expect(luma(lowest)).toBeGreaterThanOrEqual(luma(unlit));
+    const warmth = (c: readonly number[]) =>
+      ((c[0] ?? 0) - (c[2] ?? 0)) / (c[0] ?? 1);
+    expect(warmth(ROUNDEL_GLOW)).toBeGreaterThan(warmth(CONSOLE_WALL) + 0.2);
+  });
+
+  it("sets the inner doors off the wall: leaves a faint tone cooler and darker, a frame standing deeper than the leaves (C27)", () => {
+    // Mutation caught: the leaves back in the wall's white (the doors melt
+    // into it), a tone difference so large the leaves read as another
+    // material, the frame line flush and thin again, or the leaves built in
+    // the wall's white whatever `DOOR_LEAF` says.
+    DOOR_LEAF.forEach((c, i) => {
+      const r = c / (CONSOLE_WALL[i] ?? 1);
+      expect(r).toBeGreaterThanOrEqual(0.88);
+      expect(r).toBeLessThanOrEqual(0.97);
+    });
+    expect(DOOR_LEAF[2] / DOOR_LEAF[0]).toBeGreaterThan(
+      CONSOLE_WALL[2] / CONSOLE_WALL[0],
+    );
+    expect(INNER_DOORS.frameProud).toBeGreaterThan(INNER_DOORS.proud);
+    expect(INNER_DOORS.frame).toBeGreaterThanOrEqual(0.05);
+    const parts = wallParts("inner-doors", 0);
+    const leaves = parts.filter(
+      (p) =>
+        near(extent(p).a1 - extent(p).a0, INNER_DOORS.leafWidth) &&
+        near(extent(p).h1 - extent(p).h0, INNER_DOORS.leafHeight),
+    );
+    expect(leaves.length).toBe(2);
+    for (const p of leaves) expect(tinted(p, DOOR_LEAF)).toBe(true);
+    const leafFront = Math.max(...leaves.map((p) => extent(p).d1));
+    const frame = parts.filter((p) => tinted(p, DOOR_FRAME));
+    expect(frame.length).toBe(3);
+    for (const p of frame) {
+      expect(extent(p).d1).toBeGreaterThan(leafFront + 0.01);
+      const b = extent(p);
+      expect(Math.min(b.a1 - b.a0, b.h1 - b.h0)).toBeCloseTo(
+        INNER_DOORS.frame,
+        6,
+      );
     }
   });
 });

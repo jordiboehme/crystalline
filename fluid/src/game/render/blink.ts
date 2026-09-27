@@ -7,8 +7,8 @@
  * that bank in its flag (`FLAG.blink + group`, `blinkFlag` in
  * `geometry.ts`). The shader reads the light's gain from one uniform array,
  * `uBlink[slot * BLINK_GROUPS + group]`, and multiplies only its signal
- * formula by it (and by `uGain`, as every exit is). There are six banks of
- * eight groups:
+ * formula by it (and by `uGain`, as every exit is). There are seven banks
+ * of eight groups:
  *
  * - `steady` (slot 0): every group at 1. The static room, the movers and
  *   the props all read slot 0, so they are unchanged.
@@ -23,6 +23,11 @@
  *   every `SWAP_TICS`: a face or a screen that flips between two pictures.
  * - `chase`: one group lit at a time, the next every `CHASE_TICS`: a light
  *   running round a ring.
+ * - `soft`: the breathe bank's glow, group for group at the same phase,
+ *   lifted to run from `SOFT_FLOOR` to 1 instead of from the glow's own low
+ *   level: a light that breathes softly and never dims far, for a glow set
+ *   just under the bloom threshold that must still read lit at its lowest
+ *   (the console room's glowing roundels, 2.6e C26).
  *
  * A low group reads `BLINK_LOW`, a lit one 1; the DOOM banks move between
  * their special's low level and 255, divided by 255, and never below
@@ -47,6 +52,7 @@ export const BLINK_BANKS = [
   "twinkle",
   "swap",
   "chase",
+  "soft",
 ] as const;
 /** One bank's name. */
 export type BlinkBank = (typeof BLINK_BANKS)[number];
@@ -60,6 +66,11 @@ export const BLINK_LOW = 0.15;
 export const SWAP_TICS = 105;
 /** Ticks the chase bank holds each group lit. */
 export const CHASE_TICS = 5;
+/**
+ * The soft bank's lowest gain: its glow runs from here to 1 (2.6e C26), so
+ * a light on it never falls more than a tenth under its peak.
+ */
+export const SOFT_FLOOR = 0.9;
 
 /**
  * The DOOM special behind each bank run as light zones: the strobe and the
@@ -96,6 +107,9 @@ const GLOW_CYCLE: readonly number[] = (() => {
   throw new Error("blink: the glow never came back to its level");
 })();
 
+/** The glow's lowest level in `GLOW_CYCLE`, as a gain. */
+const GLOW_LOW = Math.min(...GLOW_CYCLE) / 255;
+
 /** A bank's slot: its index in `BLINK_BANKS`. */
 export function bankSlot(bank: BlinkBank): number {
   return BLINK_BANKS.indexOf(bank);
@@ -121,6 +135,7 @@ export function createBlink(): BlinkState {
   const breathe = base("breathe");
   const swap = base("swap");
   const chase = base("chase");
+  const soft = base("soft");
   const phases = Array.from(
     { length: BLINK_GROUPS },
     (_, g) => seedFor("blink", "breathe", g) % GLOW_CYCLE.length,
@@ -160,6 +175,9 @@ export function createBlink(): BlinkState {
       const glow =
         GLOW_CYCLE[(ticks + (phases[g] ?? 0)) % GLOW_CYCLE.length] ?? 255;
       gains[breathe + g] = Math.max(BLINK_LOW, glow / 255);
+      gains[soft + g] =
+        SOFT_FLOOR +
+        ((1 - SOFT_FLOOR) * (glow / 255 - GLOW_LOW)) / (1 - GLOW_LOW);
       gains[swap + g] = g < BLINK_GROUPS / 2 === first ? 1 : BLINK_LOW;
       gains[chase + g] = g === lit ? 1 : BLINK_LOW;
     }

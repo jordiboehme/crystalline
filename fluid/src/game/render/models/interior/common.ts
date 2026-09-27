@@ -52,21 +52,34 @@ export type InteriorRecipe = (r: {
 
 /**
  * Each fitting kind's blink bank: the roundel walls' glowing roundels
- * breathe, the console's small lights twinkle out of step, and the inner
- * doors and the scanner have no blinking light.
+ * breathe softly (the `soft` bank, 2.6e C26: never far under their peak,
+ * which stays under the bloom threshold), the console's small lights
+ * twinkle out of step, and the inner doors and the scanner have no
+ * blinking light.
  */
 export const INTERIOR_BANK = {
-  "roundel-wall": "breathe",
+  "roundel-wall": "soft",
   "inner-doors": "steady",
   scanner: "steady",
   console: "twinkle",
 } as const satisfies Record<InteriorKind, BlinkBank>;
 
-/** The console room's walls and the fittings' white (C4). */
-export const CONSOLE_WALL: Rgb = [0.93, 0.93, 0.9];
+/**
+ * The console room's walls and the fittings' white (C4, C25). Above 1 on
+ * purpose: the look's panel texture (about 0.87 on average) and the fixed
+ * shading by face direction (0.82 to 0.96) would leave a plain white at a
+ * light grey. At this tint a wall comes out near 0.84 before the tone
+ * map, the brightest neutral surface in the room, and even a face turned
+ * up to the light stays under the aperture grid's bloom threshold (0.9),
+ * so nothing white blooms.
+ */
+export const CONSOLE_WALL: Rgb = [1.06, 1.06, 1.04];
 
-/** A roundel's shaded inner face (C4, C5). */
-export const ROUNDEL_FACE: Rgb = shade(CONSOLE_WALL, 0.82);
+/**
+ * A roundel's shaded inner face (C4, C5, C25): a shade darker than the
+ * wall, so the discs read as pale recesses in it, not as dark holes.
+ */
+export const ROUNDEL_FACE: Rgb = shade(CONSOLE_WALL, 0.9);
 
 /** The console room's pale floor (C4). */
 export const CONSOLE_FLOOR: Rgb = [0.78, 0.78, 0.74];

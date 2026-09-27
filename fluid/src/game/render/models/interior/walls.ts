@@ -16,13 +16,14 @@
  *
  * - The roundel wall is a slab of 3 by 5 roundels. A few of them glow
  *   (`GLOWING_ROUNDELS`, by variant): their face is a blinking light on
- *   the `breathe` bank, each on a group of its own, so they breathe out of
- *   step, and the rim stays white.
+ *   the `soft` bank, each on a group of its own, so they breathe softly
+ *   out of step, and the rim stays white.
  * - The inner doors are a 4 m slab with a column of roundels at each side,
  *   in step with the roundel walls beside them, and a pair of tall white
- *   leaves standing proud of it, each with a smaller grid of roundels
- *   (C24b), a thin grey stile where they meet and a dark frame line round
- *   the pair. They never move (C9).
+ *   leaves standing proud of it, a faint tone off the wall's white
+ *   (`DOOR_LEAF`), each with a smaller grid of roundels (C24b), a thin grey
+ *   stile where they meet and a dark frame round the pair standing out
+ *   deeper than the leaves (C27). They never move (C9).
  * - The scanner is a roundel wall with a dark housing standing out of it,
  *   whose recessed screen glows a pale blue and shows a faint field of
  *   small lit dots. No roundel sits under the housing (C24c). No text.
@@ -64,8 +65,15 @@ export const ROUNDEL = {
   rows: 5,
 } as const;
 
-/** A glowing roundel's face: a soft warm white (C5). */
-export const ROUNDEL_GLOW: Rgb = [1.0, 0.97, 0.88];
+/**
+ * A glowing roundel's face: a warm cream (C5, C26). A blinking light
+ * shines at its tint times `SIGNAL_GAIN` (1.4) times its bank's gain. Its
+ * bank (`soft`) runs from `SOFT_FLOOR` to 1, so its peak (0.896) stays under
+ * the aperture grid's bloom threshold (0.9) and its lowest point stays
+ * above an unlit roundel's face: the roundels breathe softly instead of
+ * flaring, and read lit by their warmth against the neutral white wall.
+ */
+export const ROUNDEL_GLOW: Rgb = [0.64, 0.605, 0.45];
 
 /**
  * The roundels that glow on each variant of the roundel wall, as
@@ -95,7 +103,9 @@ export const GLOWING_ROUNDELS: readonly (readonly [
  * round a smaller face, so every roundel keeps at least 0.05 m to its
  * leaf's edges and its neighbour) whose rows are `pitchH` apart round the
  * leaf's middle. A grey meeting stile `stile` wide over the join and a
- * dark frame line `frame` wide round the pair.
+ * dark frame `frame` wide round the pair, standing `frameProud` out of the
+ * surround, deeper than the leaves, so the pair reads as doors set in a
+ * frame (C27).
  */
 export const INNER_DOORS = {
   leafWidth: 1.1,
@@ -106,14 +116,22 @@ export const INNER_DOORS = {
   across: 0.46,
   pitchH: 0.62,
   stile: 0.02,
-  frame: 0.03,
+  frame: 0.05,
+  frameProud: 0.05,
 } as const;
 
 /** The inner doors' meeting stile: a light grey (C6). */
 export const DOOR_STILE: Rgb = [0.7, 0.71, 0.7];
 
-/** The dark line framing the inner doors' pair of leaves (C6). */
+/** The dark frame round the inner doors' pair of leaves (C6). */
 export const DOOR_FRAME: Rgb = [0.22, 0.23, 0.24];
+
+/**
+ * The inner doors' leaves (C27): a faint tone off the wall's white, a
+ * touch darker and cooler, so the leaves read as doors in the wall
+ * rather than more of it.
+ */
+export const DOOR_LEAF: Rgb = [0.99, 1.0, 1.0];
 
 /**
  * The scanner (C7): a screen `width` by `height` centred `centre` above
@@ -239,7 +257,7 @@ function roundelSlab(
 
 /**
  * The roundel wall (C5): a white slab of 3 by 5 recessed roundels, the
- * variant's `GLOWING_ROUNDELS` breathing a soft warm white.
+ * variant's `GLOWING_ROUNDELS` breathing softly in a warm cream.
  */
 const roundelWall: InteriorRecipe = (r) => {
   roundelSlab(r, GLOWING_ROUNDELS[r.variant] ?? [], () => false);
@@ -249,8 +267,9 @@ const roundelWall: InteriorRecipe = (r) => {
  * The inner doors (C6): the 4 m slab with a column of five roundels at
  * each side, at the spacing the neighbouring roundel walls keep (a column
  * `hw - (1 - pitchA)` out, as the next wall's near column stands), then
- * the two leaves on the floor, the frame line round them, the stile over
- * their join and each leaf's grid of roundels. Nothing glows.
+ * the two leaves on the floor in `DOOR_LEAF`, the frame round them
+ * (`frameProud` out, deeper than the leaves), the stile over their join
+ * and each leaf's grid of roundels. Nothing glows.
  */
 const innerDoors: InteriorRecipe = ({ k, s, kind }) => {
   const { hw, top } = interiorHalf(kind);
@@ -276,7 +295,8 @@ const innerDoors: InteriorRecipe = ({ k, s, kind }) => {
   const w = D.leafWidth;
   const front = d + D.proud;
   const frame = s.tinted(DOOR_FRAME);
-  const lineFront = d + D.proud / 2;
+  const leaf = s.tinted(DOOR_LEAF);
+  const lineFront = d + D.frameProud;
   k.box(-w - D.frame, -w, d, lineFront, 0, D.leafHeight + D.frame, frame);
   k.box(w, w + D.frame, d, lineFront, 0, D.leafHeight + D.frame, frame);
   k.box(-w, w, d, lineFront, D.leafHeight, D.leafHeight + D.frame, frame);
@@ -293,7 +313,7 @@ const innerDoors: InteriorRecipe = ({ k, s, kind }) => {
       0,
       D.leafHeight,
       0.01,
-      white,
+      leaf,
     );
     for (let col = 0; col < D.cols; col++) {
       const a = sign * (w - gap - across / 2 - col * (across + gap));

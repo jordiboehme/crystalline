@@ -6,6 +6,7 @@ import {
   BLINK_GROUPS,
   BLINK_LOW,
   CHASE_TICS,
+  SOFT_FLOOR,
   SWAP_TICS,
   bankSlot,
   createBlink,
@@ -112,6 +113,37 @@ describe("the DOOM banks out of step", () => {
     for (let g = 1; g < BLINK_GROUPS; g++)
       expect([...(seen[g] ?? [])].sort().join(), String(g)).toBe(ref);
     expect(seen[0]?.size).toBeGreaterThan(10);
+  });
+});
+
+describe("the soft bank (2.6e C26)", () => {
+  it("breathes with the breathe bank's glow, group for group, lifted to run from SOFT_FLOOR to 1", () => {
+    // Mutation caught: the soft bank left at the glow's own low level (a
+    // light on it dipping far under its peak), never reaching 1, or out of
+    // step with the breathe bank's phases.
+    expect(SOFT_FLOOR).toBe(0.9);
+    const b = createBlink();
+    let lo = Infinity;
+    let hi = -Infinity;
+    const pairs: [number, number][] = [];
+    for (let t = 0; t < 700; t++, b.tick())
+      for (let g = 0; g < BLINK_GROUPS; g++) {
+        const soft = at(b.gains, "soft", g);
+        lo = Math.min(lo, soft);
+        hi = Math.max(hi, soft);
+        pairs.push([at(b.gains, "breathe", g), soft]);
+      }
+    expect(lo).toBeCloseTo(SOFT_FLOOR, 6);
+    expect(hi).toBeCloseTo(1, 6);
+    // The same glow at the same phase: ordered by the breathe gain, the
+    // soft gain never goes down, and it moves whenever the breathe does.
+    pairs.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+    for (let i = 1; i < pairs.length; i++) {
+      const [b0, s0] = pairs[i - 1] ?? [0, 0];
+      const [b1, s1] = pairs[i] ?? [0, 0];
+      expect(s1).toBeGreaterThanOrEqual(s0 - 1e-9);
+      if (b1 === b0) expect(s1).toBeCloseTo(s0, 9);
+    }
   });
 });
 
