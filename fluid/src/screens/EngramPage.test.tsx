@@ -12,12 +12,23 @@
  * empty case says so plainly instead of pretending the panel is still loading.
  */
 
-import { cleanup, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import App from "../App";
 import { ApiProblem, api } from "../api/client";
+import { FakeEventSource } from "../events/testSupport";
 import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
+import { engramRoute } from "../paths";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -1600,5 +1611,164 @@ describe("what changed on this page", () => {
     // where it cannot be typed into by accident.
     expect(await screen.findByText("What changed on this page")).toBeVisible();
     expect(screen.queryByText("Discard this change")).toBeNull();
+  });
+});
+
+describe("the reading page follows the stream", () => {
+  let scrollTo: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    FakeEventSource.instances = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+    // jsdom lays nothing out and implements no scrolling; the keeper's own
+    // file pins where it scrolls to, this one only that the page runs it.
+    scrollTo = vi.fn();
+    vi.stubGlobal("scrollTo", scrollTo);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  /** The one stream the shell opened, the last one if it opened again. */
+  function stream(): FakeEventSource {
+    const source = FakeEventSource.instances.at(-1);
+    if (!source) throw new Error("the shell opened no stream");
+    return source;
+  }
+
+  const frame = (overrides: Record<string, unknown> = {}) => ({
+    domain: "eng",
+    permalink: "alpha",
+    path: "alpha.md",
+    kind: "modified",
+    from: null,
+    checksum: "new1",
+    actor: "ada",
+    draft_of: null,
+    ...overrides,
+  });
+
+  it("refetches in place and says who changed it, for a minute", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let served = detailResponse();
+    serve({ "/domains/eng/engrams/alpha": () => served });
+    renderApp(engramRoute("eng", "alpha"));
+    await screen.findByRole("heading", { name: "Alpha" });
+    expect(screen.queryByRole("status", { name: "Recent change" })).toBeNull();
+    served = detailResponse({
+      content: BODY.replace("Body prose", "Revised prose"),
+      checksum: "new1",
+    });
+    act(() => {
+      stream().emit("engram", frame(), "1:1");
+    });
+    await screen.findByText(/Revised prose/);
+    expect(
+      screen.getByRole("status", { name: "Recent change" }),
+    ).toHaveTextContent("Updated a moment ago by ada");
+    // The page ran its scroll keeper over the refetch.
+    expect(scrollTo).toHaveBeenCalled();
+    act(() => {
+      stream().emit("engram", frame({ actor: null, checksum: "new2" }), "1:2");
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole("status", { name: "Recent change" }),
+      ).toHaveTextContent(/^Updated a moment ago$/);
+    });
+    // A newer event resets the minute: most of one passes, the line stays.
+    act(() => {
+      vi.advanceTimersByTime(59_000);
+    });
+    expect(
+      screen.getByRole("status", { name: "Recent change" }),
+    ).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("status", { name: "Recent change" }),
+      ).toBeNull();
+    });
+    // And a change after the minute brings it back.
+    act(() => {
+      stream().emit("engram", frame({ checksum: "new3" }), "1:3");
+    });
+    expect(
+      await screen.findByRole("status", { name: "Recent change" }),
+    ).toHaveTextContent("Updated a moment ago by ada");
+  });
+
+  it("a delete refetches, the server answers 404 and the not-found face appears", async () => {
+    let gone = false;
+    serve({
+      "/domains/eng/engrams/alpha": () => {
+        if (gone) throw new ApiProblem(404, "Not Found", "no engram");
+        return detailResponse();
+      },
+    });
+    renderApp(engramRoute("eng", "alpha"));
+    await screen.findByRole("heading", { name: "Alpha" });
+    gone = true;
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({ kind: "deleted", checksum: null }),
+        "1:1",
+      );
+    });
+    await screen.findByRole("heading", { name: "Engram not found" });
+  });
+
+  it("a move follows to the new address, replaces history and says so", async () => {
+    serve({
+      "/domains/eng/engrams/topics/alpha": () =>
+        detailResponse({ permalink: "topics/alpha", path: "topics/alpha.md" }),
+      "/domains/eng/inbound/topics/alpha": (path: string) =>
+        inboundResponse(path),
+    });
+    /** What the router says happened last, which is where a replace shows. */
+    function Probe() {
+      const how = useNavigationType();
+      const { pathname } = useLocation();
+      return <output data-testid="navigation">{`${how} ${pathname}`}</output>;
+    }
+    render(
+      <MemoryRouter
+        initialEntries={["/d/eng", engramRoute("eng", "alpha")]}
+        initialIndex={1}
+      >
+        <App />
+        <Probe />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("heading", { name: "Alpha" });
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({
+          permalink: "topics/alpha",
+          path: "topics/alpha.md",
+          kind: "moved",
+          from: { path: "alpha.md", permalink: "alpha" },
+        }),
+        "1:1",
+      );
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole("status", { name: "Recent change" }),
+      ).toHaveTextContent("Moved here a moment ago by ada");
+    });
+    expect(screen.getByTestId("navigation")).toHaveTextContent(
+      `REPLACE ${engramRoute("eng", "topics/alpha")}`,
+    );
+    expect(
+      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
+        "topics",
+      ),
+    ).toBeInTheDocument();
   });
 });

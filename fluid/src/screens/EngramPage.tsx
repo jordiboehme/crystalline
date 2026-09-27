@@ -48,7 +48,7 @@ import {
   Printer,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { discardChanges, refusalSentence } from "../api/admin";
@@ -95,6 +95,9 @@ import { ShareDialog } from "../components/ShareDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
 import { domainSpellings } from "../domainNames";
+import type { RecentChange } from "../events/recent";
+import { useRecentChange } from "../events/recent";
+import { useScrollKeeper } from "../events/useScrollKeeper";
 import { plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
@@ -160,6 +163,21 @@ export default function EngramPage() {
     // Only once there is an engram to have a neighborhood. A wrong address
     // would otherwise be answered by two 404s where one says everything.
     enabled: detail.isSuccess,
+  });
+
+  // What the stream last said about this engram, for the status line and
+  // for following a move. The stream itself only invalidates; the refetch
+  // that moves the text is the detail query's own.
+  const recent = useRecentChange(domain, permalink);
+  useEffect(() => {
+    if (recent?.kind === "moved_away" && recent.to) {
+      void navigate(engramRoute(domain, recent.to), { replace: true });
+    }
+  }, [recent, domain, permalink, navigate]);
+  useScrollKeeper({
+    address: `${domain}/${permalink}`,
+    fetching: detail.isFetching,
+    checksum: detail.data?.checksum,
   });
 
   // Every spelling of every domain, and only once the listing has landed: the
@@ -597,6 +615,16 @@ export default function EngramPage() {
             : "Your private draft. The shared tree has not moved; share it for review when it is ready."}
         </p>
       )}
+      {/*
+        What the stream last said about this page, for a minute. Keyed on the
+        change, so a newer one starts the minute over.
+      */}
+      {recent && recent.kind !== "moved_away" && (
+        <RecentChangeLine
+          key={`${recent.kind}:${String(recent.at)}:${recent.actor ?? ""}`}
+          change={recent}
+        />
+      )}
 
       <LifecycleBanner
         status={engram.frontmatter.status}
@@ -912,6 +940,51 @@ function EngramNotFound({
 }
 
 /** Whether this failure is the server saying there is nothing at that address. */
+/** How long the status line stays after a change. A newer one resets it. */
+export const RECENT_CHANGE_MS = 60_000;
+
+/**
+ * "Updated a moment ago by ada": the same shape as the draft line above it,
+ * in the neutral chip colors rather than amber. Not a control, and no
+ * accessible name a journey could depend on beyond the region's own.
+ *
+ * It never counts up to "two minutes ago": it is gone at the minute.
+ */
+function RecentChangeLine({ change }: { change: RecentChange }) {
+  const [expired, setExpired] = useState(
+    () => Date.now() - change.at >= RECENT_CHANGE_MS,
+  );
+  useEffect(() => {
+    const left = change.at + RECENT_CHANGE_MS - Date.now();
+    const timer = setTimeout(
+      () => {
+        setExpired(true);
+      },
+      Math.max(0, left),
+    );
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [change]);
+  if (expired) {
+    return null;
+  }
+  const verb =
+    change.kind === "moved_here"
+      ? "Moved here a moment ago"
+      : "Updated a moment ago";
+  return (
+    <p
+      role="status"
+      aria-label="Recent change"
+      aria-live="polite"
+      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 dark:bg-slate-800 dark:text-slate-200"
+    >
+      {change.actor ? `${verb} by ${change.actor}` : verb}
+    </p>
+  );
+}
+
 function isMissing(error: unknown): boolean {
   return error instanceof ApiProblem && error.status === 404;
 }
