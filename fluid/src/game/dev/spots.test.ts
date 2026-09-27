@@ -16,6 +16,7 @@ import {
   CANNED_WORKSHOP,
   galleryRoom,
   heroHallRoom,
+  variantsHallRoom,
 } from "../world/canned";
 import {
   curioBox,
@@ -1000,5 +1001,34 @@ describe("every catalogued under spot seen from a standing player", () => {
       }
     }
     expect([...checked.keys()].sort()).toEqual([...want].sort());
+  });
+});
+
+describe("spotView (decor:<kind>:<n>, 2.7 Task 1)", () => {
+  const hall = variantsHallRoom();
+
+  it("frames the n-th decor piece of a kind, clear of every blocker", () => {
+    // Mutation caught: a spot that ignores the room's other decor and
+    // fixture footprints (`blockersFor`), landing the player inside one.
+    const view = spotView(hall, "decor:shelf-row:0");
+    expect(view).not.toBeNull();
+    if (view === null) throw new Error("unreachable");
+    const blockers = blockersFor(hall);
+    expect(
+      blockers.some((b) =>
+        circleOverlapsBox(
+          (view.spawn.x + 0.5) * CELL,
+          (view.spawn.y + 0.5) * CELL,
+          b,
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("gives null past the last piece of a kind, or a kind the hall lacks", () => {
+    // Mutation caught: a missing bounds check on the ordinal, or a pattern
+    // that falls through to another family's spot instead of null.
+    expect(spotView(hall, "decor:shelf-row:99")).toBeNull();
+    expect(spotView(hall, "decor:nothing:0")).toBeNull();
   });
 });

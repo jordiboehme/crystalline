@@ -54,6 +54,7 @@ import {
   type HostSurface,
 } from "./curios";
 import { PROP_ORDER } from "./dress";
+import { FOOTPRINTS, PIPE_HALF } from "./footprints";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
 import { faceCentre, HERO_ORDER } from "./heroes";
 import {
@@ -64,7 +65,7 @@ import {
   type Layout,
   type SlotPref,
 } from "./layout";
-import { PROP_CATALOGUE, PROP_KINDS } from "./props";
+import { PROP_CATALOGUE, PROP_KINDS, USE_LANE_DEPTH } from "./props";
 import { wallAnchor } from "./sites";
 import type {
   Curio,
@@ -86,6 +87,8 @@ import type {
   SurfaceClass,
   WallSlot,
 } from "./types";
+import { CELL } from "./units";
+import { VARIANT_COUNTS } from "./variants";
 
 /**
  * The station's bridge as the look demo sees it: the place input
@@ -1173,6 +1176,280 @@ export function heroHallRoom(): RoomSpec {
     inboundMore: 0,
   };
   return { ...base, curios: heroHallCurios(seed, base) };
+}
+
+/**
+ * The decor kinds in the order the variants hall stands them, `GALLERY_DECOR`'s
+ * own order: a bridge's console and chair, a council chamber's table and
+ * chairs, an engineering bay's generator and pipe run, an archive's shelf
+ * row, and a lab's island and specimen tank.
+ */
+const VARIANTS_HALL_KIND_ORDER: readonly DecorKind[] = [
+  "command-console",
+  "captain-chair",
+  "round-table",
+  "council-chair",
+  "generator",
+  "pipe-run",
+  "shelf-row",
+  "lab-island",
+  "specimen-tank",
+];
+
+/**
+ * Every decor kind and variant the variants hall stands, in hall order:
+ * kind by kind (`VARIANTS_HALL_KIND_ORDER`), variant by variant. Read off
+ * `VARIANT_COUNTS.decor`, so it grows the day Tasks 4 to 7 raise a count.
+ * Consumed by Tasks 4 to 7 (their stills) and Task 11 (its decals), and
+ * pinned against `variantsHallRoom`'s own `room.decor` by `canned.test.ts`.
+ */
+export const VARIANTS_HALL_DECOR: readonly {
+  kind: DecorKind;
+  variant: number;
+}[] = VARIANTS_HALL_KIND_ORDER.flatMap((kind) =>
+  Array.from({ length: VARIANT_COUNTS.decor[kind] }, (_, variant) => ({
+    kind,
+    variant,
+  })),
+);
+
+/** The variants hall's one light level, steady everywhere, as `galleryRoom`'s. */
+const VARIANTS_HALL_LIGHT = 210;
+
+/** How many metres apart a variants-hall decor row's centre stands from the next (2.7 Task 1). */
+const DECOR_ROW_PITCH = 4;
+
+/** How many metres a variants-hall decor piece keeps clear of its row neighbour (2.7 Task 1). */
+const DECOR_ROW_CLEAR = 1.2;
+
+/**
+ * A little past `USE_LANE_DEPTH`, so a variants-hall decor piece never
+ * lands exactly on a terminal's or a machine's use lane's own edge.
+ */
+const DECOR_ROW_SAFETY = 0.1;
+
+/**
+ * Where the variants hall's decor stands (`x` and `y`, cell units), keyed
+ * by `"<kind>:<variant>"`: one row every `DECOR_ROW_PITCH` metres, in the
+ * northern half of the hall (the entrance lane only ever reaches the
+ * southern half, C13's `withHeroes` aside, which this hand-built room never
+ * runs), packed left to right within `USE_LANE_DEPTH` plus
+ * `DECOR_ROW_SAFETY` of the west and east walls, so no piece ever reaches a
+ * terminal's or a machine's use lane whichever wall row it falls on. Widest
+ * first (a largest-fit-first bin pack): a kind's footprint never changes
+ * across its variants (2.7 C3), so every instance of one kind claims the
+ * same width regardless of which variant it draws. `pipe-run`
+ * (`decorFootprint` null, C13) packs at `PIPE_HALF * 2`, a piece hanging
+ * from the ceiling with no floor box of its own, so it still keeps its row
+ * neighbours' clearance without ever being measured against the floor.
+ * Throws, naming the kind and variant, when a piece finds no row left: a
+ * hall too small for its own decor list is a bug in this file, never a
+ * silent overlap (`row`'s own rule, above).
+ */
+function variantsHallDecorPlacements(
+  hall: Rect,
+): ReadonlyMap<string, { x: number; y: number }> {
+  const xMin = hall.x0 * CELL + USE_LANE_DEPTH + DECOR_ROW_SAFETY;
+  const xMax = hall.x1 * CELL - USE_LANE_DEPTH - DECOR_ROW_SAFETY;
+  const halfDepth = ((hall.y1 - hall.y0) * CELL) / 2;
+  const rows: { z: number; cursor: number }[] = [];
+  for (
+    let z = DECOR_ROW_PITCH / 2;
+    z <= halfDepth - DECOR_ROW_PITCH / 2;
+    z += DECOR_ROW_PITCH
+  ) {
+    rows.push({ z, cursor: xMin });
+  }
+
+  const items = VARIANTS_HALL_DECOR.map(({ kind, variant }) => {
+    const size = FOOTPRINTS.decor[kind];
+    return { kind, variant, width: size === null ? PIPE_HALF * 2 : size.width };
+  });
+  const order = items
+    .map((_, i) => i)
+    .sort((a, b) => {
+      const wa = items[a]?.width ?? 0;
+      const wb = items[b]?.width ?? 0;
+      return wb - wa || a - b;
+    });
+
+  const placed = new Map<string, { x: number; y: number }>();
+  for (const i of order) {
+    const it = items[i];
+    if (it === undefined) continue;
+    const row = rows.find((r) => {
+      const need = r.cursor === xMin ? it.width : it.width + DECOR_ROW_CLEAR;
+      return r.cursor + need <= xMax + 1e-9;
+    });
+    if (row === undefined) {
+      throw new Error(
+        `variants hall: no row left for ${it.kind}:${String(it.variant)}`,
+      );
+    }
+    const start =
+      row.cursor === xMin ? row.cursor : row.cursor + DECOR_ROW_CLEAR;
+    const centreX = start + it.width / 2;
+    row.cursor = start + it.width;
+    placed.set(`${it.kind}:${String(it.variant)}`, {
+      x: centreX / CELL,
+      y: row.z / CELL,
+    });
+  }
+  return placed;
+}
+
+/** How many machines the variants hall stands: every kind's own variant count, summed (2.7 C2 starts every kind at 1). */
+const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
+  (a, b) => a + b,
+  0,
+);
+
+/**
+ * The variants hall (2.7 C24): a room built by hand rather than generated,
+ * standing one of every machine kind and variant along the east wall and
+ * the bays that need adds beyond it, one of every terminal variant on the
+ * west wall, and one of every decor kind and variant on the floor
+ * (`VARIANTS_HALL_DECOR`), for the dev-only route `?hall=variants` and the
+ * `?at=machine:<n>`, `?at=terminal:<n>` and `?at=decor:<kind>:<n>` shots
+ * Tasks 4 to 7 and 11 judge their models with.
+ *
+ * `planLayout({ north: 0, west: VARIANT_COUNTS.terminal, east:
+ * VARIANTS_HALL_MACHINES, south: 0, any: 0, hatches: 0 })` sizes the hall
+ * from those two counts alone; the machines and terminals are then handed
+ * the slot pool's own `"east"` and `"west"` preferences in turn, the same
+ * pool `galleryRoom`'s fixtures draw from, which fills the hall's own wall
+ * first and, once a demand outgrows it, the bays the layout added to hold
+ * the rest. Every machine carries a tag that names it (`<kind>-v<variant>`,
+ * so the tag strip reads it) and its own explicit `variant`, its hue and
+ * seed keyed by that tag exactly as a generated room's machine is
+ * (`generate.ts`).
+ *
+ * Placard only: no door, portal, poster or hatch stands here, so nothing
+ * but the machines, the terminals and the decor fills the hall. Condition
+ * clean, so no scaffold; no heroes, props or curios. One steady light zone
+ * per four by four block that holds any floor, as `galleryRoom`'s and
+ * `heroHallRoom`'s. The same call gives the same room byte for byte.
+ */
+export function variantsHallRoom(): RoomSpec {
+  const seed = seedFor(GAME_VERSION, "variants-hall");
+  const condition = "clean";
+  const layout = planLayout({
+    north: 0,
+    west: VARIANT_COUNTS.terminal,
+    east: VARIANTS_HALL_MACHINES,
+    south: 0,
+    any: 0,
+    hatches: 0,
+  });
+  const pool = createSlotPool(layout);
+  const take = (pref: SlotPref): WallSlot => {
+    const slot = pool.take(pref);
+    if (slot === null) throw new Error(`variants hall: no ${pref} slot left`);
+    return slot;
+  };
+
+  const fixtures: Fixture[] = [
+    {
+      kind: "placard",
+      slot: layout.placard,
+      lines: ["Variants Hall", "EVERY MACHINE TERMINAL", "AND DECOR VARIANT"],
+    },
+  ];
+
+  for (let variant = 0; variant < VARIANT_COUNTS.terminal; variant++) {
+    fixtures.push({
+      kind: "terminal",
+      slot: take("west"),
+      heading: `Variant ${String(variant)}`,
+      lines: [`Terminal variant ${String(variant)}.`],
+      section: 0,
+      seed: seedFor(seed, "terminal", "variant", variant),
+      variant,
+    });
+  }
+
+  for (const kind of MACHINE_KINDS) {
+    const count = VARIANT_COUNTS.machine[kind];
+    for (let variant = 0; variant < count; variant++) {
+      const tag = `${kind}-v${String(variant)}`;
+      fixtures.push({
+        kind: "machine",
+        slot: take("east"),
+        machine: kind,
+        tag,
+        hue: seedFor("tag-hue", tag) % 360,
+        seed: seedFor(seed, "tag", tag),
+        variant,
+      });
+    }
+  }
+
+  const placements = variantsHallDecorPlacements(layout.hall);
+  const decor: Decor[] = VARIANTS_HALL_DECOR.map(({ kind, variant }) => {
+    const p = placements.get(`${kind}:${String(variant)}`);
+    if (p === undefined) {
+      throw new Error(
+        `variants hall: no placement for ${kind}:${String(variant)}`,
+      );
+    }
+    return {
+      kind,
+      x: p.x,
+      y: p.y,
+      turn: 0,
+      variant,
+      seed: seedFor(seed, "decor", kind, variant),
+    };
+  });
+
+  const lights: LightZone[] = [];
+  for (let y0 = 0; y0 < layout.depth; y0 += 4) {
+    for (let x0 = 0; x0 < layout.width; x0 += 4) {
+      const x1 = Math.min(layout.width, x0 + 4);
+      const y1 = Math.min(layout.depth, y0 + 4);
+      const floor = layout.grid
+        .slice(y0, y1)
+        .some((row) => row.slice(x0, x1).includes("."));
+      if (!floor) continue;
+      lights.push({
+        x0,
+        y0,
+        x1,
+        y1,
+        level: VARIANTS_HALL_LIGHT,
+        special: "steady",
+        seed: seedFor(seed, "light", x0, y0),
+      });
+    }
+  }
+
+  return {
+    version: GAME_VERSION,
+    seed,
+    domain: "station",
+    permalink: "variants-hall",
+    title: "Variants Hall",
+    archetype: "engineering",
+    condition,
+    width: layout.width,
+    depth: layout.depth,
+    grid: layout.grid,
+    hall: layout.hall,
+    bays: layout.bays,
+    corridor: layout.corridor,
+    entrance: { x: layout.entrance.x, y: layout.entrance.y },
+    ceiling: 4,
+    spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
+    fixtures,
+    decor,
+    scaffold: scaffoldFor(condition, layout.hall, decor, seed),
+    heroes: [],
+    props: [],
+    curios: [],
+    lights,
+    dropped: 0,
+    inboundMore: 0,
+  };
 }
 
 /**

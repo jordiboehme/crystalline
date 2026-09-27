@@ -45,7 +45,16 @@ import {
   wallAnchor,
 } from "./sites";
 import { spotView } from "../dev/spots";
-import { GALLERY_HALL_PROPS, galleryRoom, heroHallRoom, row } from "./canned";
+import {
+  GALLERY_HALL_PROPS,
+  galleryRoom,
+  heroHallRoom,
+  row,
+  VARIANTS_HALL_DECOR,
+  variantsHallRoom,
+} from "./canned";
+import { MACHINE_KINDS } from "./generate";
+import { VARIANT_COUNTS } from "./variants";
 import type {
   Box,
   DecorKind,
@@ -652,5 +661,46 @@ describe("row", () => {
     ]);
     expect(curios).toHaveLength(1);
     expect(curios[0]?.kind).toBe("pocket-console");
+  });
+});
+
+describe("the variants hall (2.7 C24)", () => {
+  const room = variantsHallRoom();
+  it("stands every machine, terminal and decor variant once, in hall order", () => {
+    // Mutation caught: a variant missing, or a count raised without the hall following.
+    const machines = room.fixtures.filter((f) => f.kind === "machine");
+    const want = MACHINE_KINDS.flatMap((m) =>
+      Array.from(
+        { length: VARIANT_COUNTS.machine[m] },
+        (_, v) => `${m}:${String(v)}`,
+      ),
+    );
+    expect(want.length).toBeGreaterThan(0);
+    expect(
+      machines.map((f) => `${f.machine}:${String(f.variant ?? 0)}`),
+    ).toEqual(want);
+    const terminals = room.fixtures.filter((f) => f.kind === "terminal");
+    expect(terminals.map((f) => f.variant ?? 0)).toEqual(
+      Array.from({ length: VARIANT_COUNTS.terminal }, (_, v) => v),
+    );
+    expect(
+      room.decor.map((d) => ({ kind: d.kind, variant: d.variant ?? 0 })),
+    ).toEqual(VARIANTS_HALL_DECOR);
+  });
+
+  it("keeps every piece on the floor, clear of the others and of every lane", () => {
+    // Mutation caught: two decor pieces overlapping, or one in a machine's lane.
+    const sites = dressingSites(room);
+    const boxes = room.decor
+      .map(decorFootprint)
+      .filter((b): b is Box => b !== null);
+    expect(boxes.length).toBeGreaterThan(0);
+    boxes.forEach((b, i) => {
+      expect(fitsFloor(room, b)).toBe(true);
+      boxes.forEach((c, j) => {
+        if (i !== j) expect(overlaps(b, c)).toBe(false);
+      });
+      for (const lane of sites.lanes) expect(overlaps(b, lane)).toBe(false);
+    });
   });
 });

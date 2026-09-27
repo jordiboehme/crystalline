@@ -11,6 +11,7 @@
 import { createRng, type Rng } from "../../core/seed";
 import { FOOTPRINTS } from "../../world/footprints";
 import type { Fixture, MachineKind } from "../../world/types";
+import { machineModelSeed } from "../../world/variants";
 import type { Surface } from "../geometry";
 import { DECAL_LIFT, frameForSlot, type Frame, type Kit } from "../kit";
 import { LAYER } from "../layers";
@@ -27,7 +28,11 @@ import { tagStrip } from "./wall";
 
 type Machine = Extract<Fixture, { kind: "machine" }>;
 
-/** What a recipe gets: its kits, the look's surfaces and the tag's colour. */
+/**
+ * What a recipe gets: its kits, the look's surfaces, the tag's colour and
+ * which variant to draw (2.7 C1: every recipe below is still its variant 0;
+ * Tasks 4 to 7 add the branches that read it).
+ */
 interface Recipe {
   k: Kit;
   kitAt: KitAt;
@@ -39,9 +44,15 @@ interface Recipe {
   /** Half the footprint along the wall, and how far out it reaches. */
   half: number;
   out: number;
+  variant: number;
 }
 
-/** Builds a machine and its tag strip against its wall slot. */
+/**
+ * Builds a machine and its tag strip against its wall slot. Its random
+ * details are drawn from `machineModelSeed(fx.tag)`, the tag alone, never
+ * the fixture's own `seed`, so the same tag is the same machine, part for
+ * part, in every room (2.7 C5, Review Focus 2).
+ */
 export function buildMachine(
   kitAt: KitAt,
   fx: Machine,
@@ -59,9 +70,10 @@ export function buildMachine(
     s: surfaces(ctx.look),
     ctx,
     hue,
-    rng: createRng(fx.seed),
+    rng: createRng(machineModelSeed(fx.tag)),
     half: size.along / 2,
     out: size.out,
+    variant: fx.variant ?? 0,
   });
   tagStrip(k, ctx, `tag:${index}`, hue);
 }

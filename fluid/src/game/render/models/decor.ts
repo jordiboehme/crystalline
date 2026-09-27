@@ -27,7 +27,11 @@ import {
   type Surfaces,
 } from "./common";
 
-/** What a decor recipe gets. */
+/**
+ * What a decor recipe gets, including which variant to draw (2.7 C1: every
+ * recipe below is still its variant 0; Tasks 4 to 7 add the branches that
+ * read it).
+ */
 interface Recipe {
   k: Kit;
   kitAt: KitAt;
@@ -35,6 +39,7 @@ interface Recipe {
   s: Surfaces;
   ctx: ModelContext;
   decor: Decor;
+  variant: number;
 }
 
 /** Builds a piece of furniture at its point, turned with it. */
@@ -51,6 +56,7 @@ export function buildDecor(
     s: surfaces(ctx.look),
     ctx,
     decor,
+    variant: decor.variant ?? 0,
   });
 }
 

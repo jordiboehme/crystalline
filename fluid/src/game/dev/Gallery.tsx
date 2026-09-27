@@ -20,6 +20,12 @@
  * Three more parameters are dev-only and not on the legend. `?hall=heroes`
  * shows `heroHallRoom()` (H15) instead of `galleryRoom()`: one of every hero
  * kind and variant, for judging them and for the `?at=` shots below.
+ * `?hall=variants` (2.7 C24) shows `variantsHallRoom()` instead: one of
+ * every machine kind and variant along the east wall and its bays, one of
+ * every terminal variant on the west wall, and one of every decor kind and
+ * variant on the floor, for judging a later variant's model against
+ * today's (`?at=machine:<n>`, `?at=terminal:<n>` and the new
+ * `?at=decor:<kind>:<n>`, below).
  * `?at=prop:<kind>:<n>` (H16, see `spotView`) puts the player in front of
  * the n-th hero or prop of that kind in whichever room is shown, framed
  * from its front instead of just facing it. The same pattern reaches
@@ -61,7 +67,7 @@ import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
-import { galleryRoom, heroHallRoom } from "../world/canned";
+import { galleryRoom, heroHallRoom, variantsHallRoom } from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
 import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
 import { spotView } from "./spots";
@@ -95,7 +101,9 @@ export default function Gallery() {
         ? consoleRoom()
         : hall === "heroes"
           ? heroHallRoom()
-          : galleryRoom();
+          : hall === "variants"
+            ? variantsHallRoom()
+            : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"

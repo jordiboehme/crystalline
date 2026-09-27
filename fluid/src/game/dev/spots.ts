@@ -3,7 +3,7 @@
  * hero, prop or curio, so browser shots start every malfunction, or
  * every model, already facing it.
  *
- * Three patterns. `<kind>:<n>` (`SPOT_KINDS` pins the fixture kinds it
+ * Four patterns. `<kind>:<n>` (`SPOT_KINDS` pins the fixture kinds it
  * accepts to `Fixture["kind"]`, so a new kind is a type error here until it
  * is added) is `wallFacingSpawn`'s cell-centre spot, backed off clear of
  * the fixture's own footprint when it has one (`spotFor`). `prop:<kind>:<n>`
@@ -13,6 +13,10 @@
  * pattern frames the n-th curio of that kind close and tilted down
  * instead (C18, 2.6b), when `kind` is neither a hero nor a prop kind (the
  * three families' names are disjoint, pinned in `world/curios.ts`).
+ * `decor:<kind>:<n>` (2.7 Task 1) frames the n-th decor piece of that kind
+ * (in `room.decor` order) instead, from its footprint (`decorFootprint`),
+ * the same `frameSpot` a prop is framed with; null for a pipe run, whose
+ * footprint is null (it hangs from the ceiling).
  *
  * The prop pattern takes an optional view suffix (`SpotView`, 2.6d C20),
  * for judging a model from more than its front: `:back` from behind,
@@ -127,6 +131,9 @@ function spotFor(fixture: Fixture): RoomSpec["spawn"] {
 export type SpotView = "front" | "back" | "side" | "quarter" | "close";
 
 const PROP_SPOT = /^prop:([a-z-]+):(\d+)(?::(back|side|quarter|close))?$/;
+
+/** `decor:<kind>:<n>` (2.7 Task 1): the n-th decor piece of that kind. */
+const DECOR_SPOT = /^decor:([a-z-]+):(\d+)$/;
 
 /** How far a close frame starts from a hero's or prop's face, in metres, before its size is added (2.6d C20). */
 export const CLOSE_BASE = 0.6;
@@ -668,8 +675,12 @@ function frameCurio(
  * `room.curios` order), framed close and tilted down (`frameCurio`), with a
  * real pitch; a view suffix changes the order its sides are tried in
  * (`:back` its `-front` side first, `:side` its right first, `:quarter`
- * the diagonal between its front and its right first). Null for a bad
- * spot: an unknown kind in every one of the three families, an unknown
+ * the diagonal between its front and its right first). `spotView(room,
+ * "decor:<kind>:<n>")` (2.7 Task 1) is the n-th decor piece of that kind (in
+ * `room.decor` order), framed from its front (`frameSpot` on
+ * `decorFootprint`), pitch 0; null for a piece with no footprint (a pipe
+ * run, which hangs from the ceiling). Null for a bad
+ * spot: an unknown kind in every one of the four families, an unknown
  * view, no such ordinal, no ordinal at all, or a negative one. The gallery reads this from `?at=`;
  * browser shots start every malfunction, every model or every curio there.
  * Development only, like everything in `dev/`.
@@ -686,6 +697,16 @@ export function spotView(
     const [, kind, n] = fixture;
     const f = room.fixtures.filter((x) => x.kind === kind)[Number(n)];
     return f === undefined ? null : { spawn: spotFor(f), pitch: 0 };
+  }
+  const decor = DECOR_SPOT.exec(spot);
+  if (decor !== null) {
+    const [, kind, n] = decor;
+    const d = room.decor.filter((x) => x.kind === kind)[Number(n)];
+    if (d === undefined) return null;
+    const box = decorFootprint(d);
+    if (box === null) return null;
+    const spawn = frameSpot(room, box, HERO_FRONT[d.turn] ?? [0, -1]);
+    return spawn === null ? null : { spawn, pitch: 0 };
   }
   const prop = PROP_SPOT.exec(spot);
   if (prop === null) return null;

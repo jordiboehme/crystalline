@@ -44,6 +44,7 @@ import type {
   WallSlot,
 } from "../world/types";
 import { CELL } from "../world/units";
+import { VARIANT_COUNTS } from "../world/variants";
 import { createBuilder, type MeshData } from "./geometry";
 import { createKit } from "./kit";
 import { LOOKS } from "./looks";
@@ -135,6 +136,7 @@ function fixtureHost(
   host: "terminal" | MachineKind,
   slot: WallSlot,
   seed: number,
+  variant: number,
 ): Fixture {
   if (host === "terminal")
     return {
@@ -144,8 +146,24 @@ function fixtureHost(
       lines: [],
       section: 0,
       seed,
+      variant,
     };
-  return { kind: "machine", slot, machine: host, tag: "t", hue: 0, seed };
+  return {
+    kind: "machine",
+    slot,
+    machine: host,
+    tag: "t",
+    hue: 0,
+    seed,
+    variant,
+  };
+}
+
+/** How many variants a fixture host draws (2.7 Task 1). */
+function variantCountFor(host: "terminal" | MachineKind): number {
+  return host === "terminal"
+    ? VARIANT_COUNTS.terminal
+    : VARIANT_COUNTS.machine[host];
 }
 
 /** A hero at turn `t`, placed as `heroModels.test.ts` places it. */
@@ -175,37 +193,44 @@ describe("host surfaces on their hosts' meshes", () => {
   for (const host of FIXTURE_HOSTS)
     for (const t of TURNS)
       for (const seed of SEEDS)
-        it(`${host} at turn ${String(t)}, seed ${String(seed)}`, () => {
-          const fx = fixtureHost(host, { x: 3, y: 4, side: sideFor(t) }, seed);
-          const b = createBuilder();
-          buildFixture((f) => createKit(b, f), fx, 0, CTX);
-          const footprint = footprintOf(fx);
-          if (footprint === null) throw new Error("footprint");
-          checkHost(
-            `${host} t${String(t)} s${String(seed)}`,
-            { ...BASE, fixtures: [fx] },
-            b.build(),
-            footprint,
-          );
-        });
+        for (let variant = 0; variant < variantCountFor(host); variant++)
+          it(`${host} at turn ${String(t)}, seed ${String(seed)}, variant ${String(variant)}`, () => {
+            const fx = fixtureHost(
+              host,
+              { x: 3, y: 4, side: sideFor(t) },
+              seed,
+              variant,
+            );
+            const b = createBuilder();
+            buildFixture((f) => createKit(b, f), fx, 0, CTX);
+            const footprint = footprintOf(fx);
+            if (footprint === null) throw new Error("footprint");
+            checkHost(
+              `${host} t${String(t)} s${String(seed)} v${String(variant)}`,
+              { ...BASE, fixtures: [fx] },
+              b.build(),
+              footprint,
+            );
+          });
 
   for (const kind of Object.keys(
     DECOR_SURFACES,
   ) as (keyof typeof DECOR_SURFACES)[])
     for (const t of TURNS)
-      it(`${kind} at turn ${String(t)}`, () => {
-        const d: Decor = { kind, x: 8.5, y: 6, turn: t, seed: 1 };
-        const b = createBuilder();
-        buildDecor((f) => createKit(b, f), d, CTX);
-        const footprint = decorFootprint(d);
-        if (footprint === null) throw new Error("footprint");
-        checkHost(
-          `${kind} t${String(t)}`,
-          { ...BASE, decor: [d] },
-          b.build(),
-          footprint,
-        );
-      });
+      for (let variant = 0; variant < VARIANT_COUNTS.decor[kind]; variant++)
+        it(`${kind} at turn ${String(t)}, variant ${String(variant)}`, () => {
+          const d: Decor = { kind, x: 8.5, y: 6, turn: t, seed: 1, variant };
+          const b = createBuilder();
+          buildDecor((f) => createKit(b, f), d, CTX);
+          const footprint = decorFootprint(d);
+          if (footprint === null) throw new Error("footprint");
+          checkHost(
+            `${kind} t${String(t)} v${String(variant)}`,
+            { ...BASE, decor: [d] },
+            b.build(),
+            footprint,
+          );
+        });
 
   for (const kind of Object.keys(
     PROP_SURFACES,

@@ -22,7 +22,12 @@
  * parts at the origin. The mark tests read printed marks back from those
  * parts the same ways: the parts in one ink (`inked`), the runs a line sets
  * in the font (`runsOfLines`), a picture cut to its lit cells (`trimmed`)
- * and a mark's cells rebuilt from its parts (`cellsOf`).
+ * and a mark's cells rebuilt from its parts (`cellsOf`). The variant tests
+ * (2.7 Task 1) compare two builds' silhouettes instead of their exact
+ * triangles, since a later variant is free to shape a kind differently as
+ * long as it keeps the kind's envelope (2.7 C3): `occupancy` voxelises a
+ * mesh's surfaces in a frame's local terms and `silhouetteDelta` scores how
+ * much two occupancies differ.
  */
 
 import type { Box, Hero, HeroKind } from "../world/types";
@@ -129,6 +134,63 @@ export function worstWinding(m: MeshData): number {
 export function toLocal(f: Frame, p: V3): V3 {
   const o = sub(p, f.origin);
   return [dot(o, f.along), dot(o, f.inward), o[1]];
+}
+
+/**
+ * The 0.1 m voxels a mesh's surfaces cover, in a frame's local terms, as
+ * "a,d,h" keys: every triangle is sampled on a barycentric grid no coarser
+ * than half a voxel (the grid's step is the longer of the triangle's own
+ * edges, in local terms, divided by at least two samples a voxel), so a
+ * large flat top counts by its area, not by its four corners. `cell`
+ * defaults to 0.1 m, the voxel `occupancy` and `silhouetteDelta` compare
+ * two builds of the same kind at (2.7 Task 1: a variant keeps its kind's
+ * silhouette close to today's, C3).
+ */
+export function occupancy(m: MeshData, f: Frame, cell = 0.1): Set<string> {
+  const ps = positions(m);
+  const cells = new Set<string>();
+  const step = cell / 2;
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [p0, p1, p2] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!p0 || !p1 || !p2) continue;
+    const a = toLocal(f, p0);
+    const b = toLocal(f, p1);
+    const c = toLocal(f, p2);
+    const edge = (p: V3, q: V3) => Math.hypot(...sub(p, q));
+    const longest = Math.max(edge(a, b), edge(b, c), edge(c, a));
+    const n = Math.max(1, Math.ceil(longest / step));
+    for (let i = 0; i <= n; i++) {
+      for (let j = 0; i + j <= n; j++) {
+        const u = i / n;
+        const v = j / n;
+        const w = 1 - u - v;
+        const p: V3 = [
+          a[0] * w + b[0] * u + c[0] * v,
+          a[1] * w + b[1] * u + c[1] * v,
+          a[2] * w + b[2] * u + c[2] * v,
+        ];
+        const key = `${String(Math.floor(p[0] / cell))},${String(Math.floor(p[1] / cell))},${String(Math.floor(p[2] / cell))}`;
+        cells.add(key);
+      }
+    }
+  }
+  return cells;
+}
+
+/**
+ * How different two occupancies are: the share of voxels in one but not the
+ * other, of the voxels in either. 0 when the two sets are the same, 1 when
+ * they share no voxel at all; empty sets on both sides count as identical.
+ */
+export function silhouetteDelta(
+  a: ReadonlySet<string>,
+  b: ReadonlySet<string>,
+): number {
+  const union = new Set([...a, ...b]);
+  if (union.size === 0) return 0;
+  let apart = 0;
+  for (const key of union) if (a.has(key) !== b.has(key)) apart++;
+  return apart / union.size;
 }
 
 /**

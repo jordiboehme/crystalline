@@ -9,12 +9,18 @@
  * the wall like the real thing. The screen shows the section's text layer
  * and glows; a status LED on the bezel glows beside it. The swivel chair
  * stands as far out as the terminal's footprint allows.
+ *
+ * `buildTerminal` reads the fixture's variant (absent reads as 0, 2.7 C6)
+ * and dispatches to `TERMINAL_RECIPES`, one function per variant, the same
+ * shape `machines.ts` and `decor.ts` dispatch their own recipes with.
+ * `terminal0` is variant 0, today's model, part for part (2.7 C1); Tasks 4
+ * to 7 add the rest.
  */
 
 import { FOOTPRINTS } from "../../world/footprints";
 import type { Fixture } from "../../world/types";
 import { FLAG } from "../geometry";
-import { frameForSlot } from "../kit";
+import { frameForSlot, type Frame, type Kit } from "../kit";
 import { ASPECT } from "../layers";
 import {
   profileAlong,
@@ -23,6 +29,7 @@ import {
   textPanel,
   type KitAt,
   type ModelContext,
+  type Surfaces,
 } from "./common";
 
 type Terminal = Extract<Fixture, { kind: "terminal" }>;
@@ -148,7 +155,25 @@ const deckAt = (d: number) =>
   DECK_FRONT_H +
   ((DECK_FRONT - d) / (DECK_FRONT - DECK_BACK)) * (DECK_BACK_H - DECK_FRONT_H);
 
-/** Builds the terminal against its wall slot. */
+/**
+ * What a terminal recipe gets: its kit, the frame, the look's surfaces, the
+ * room context, the fixture's own index (its text layer's key) and which
+ * variant is being drawn.
+ */
+interface Recipe {
+  k: Kit;
+  kitAt: KitAt;
+  f: Frame;
+  s: Surfaces;
+  ctx: ModelContext;
+  index: number;
+  variant: number;
+}
+
+/**
+ * Builds the terminal against its wall slot, from its variant (absent
+ * reads as 0, 2.7 C6).
+ */
 export function buildTerminal(
   kitAt: KitAt,
   fx: Terminal,
@@ -156,8 +181,21 @@ export function buildTerminal(
   ctx: ModelContext,
 ): void {
   const f = frameForSlot(fx.slot);
-  const k = kitAt(f);
-  const s = surfaces(ctx.look);
+  const variant = fx.variant ?? 0;
+  const recipe = TERMINAL_RECIPES[variant] ?? terminal0;
+  recipe({
+    k: kitAt(f),
+    kitAt,
+    f,
+    s: surfaces(ctx.look),
+    ctx,
+    index,
+    variant,
+  });
+}
+
+/** Terminal variant 0: today's desk, CRT and swivel chair, part for part (2.7 C1). */
+function terminal0({ k, kitAt, f, s, ctx, index }: Recipe): void {
   const p = ctx.look.palette;
 
   // The desk: top, two pedestals, a modesty panel and drawer fronts.
@@ -331,3 +369,6 @@ export function buildTerminal(
     s.tinted(seat),
   );
 }
+
+/** The recipe of every terminal variant, indexed by `fx.variant ?? 0` (2.7 C1). */
+const TERMINAL_RECIPES: readonly ((r: Recipe) => void)[] = [terminal0];

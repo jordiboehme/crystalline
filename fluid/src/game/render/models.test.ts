@@ -18,6 +18,7 @@ import type {
   WallSlot,
 } from "../world/types";
 import { CELL } from "../world/units";
+import { VARIANT_COUNTS } from "../world/variants";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
@@ -160,10 +161,20 @@ const INDEX = 7;
 /** Every fixture the models draw, by a readable name, on a given wall. */
 function fixtures(slot: WallSlot): [string, Fixture][] {
   const out: [string, Fixture][] = [];
-  out.push([
-    "terminal",
-    { kind: "terminal", slot, heading: "H", lines: [], section: 0, seed: 1 },
-  ]);
+  for (let v = 0; v < VARIANT_COUNTS.terminal; v++) {
+    out.push([
+      `terminal variant ${String(v)}`,
+      {
+        kind: "terminal",
+        slot,
+        heading: "H",
+        lines: [],
+        section: 0,
+        seed: 1,
+        variant: v,
+      },
+    ]);
+  }
   for (const style of ["sliding", "bulkhead", "blast"] as DoorStyle[]) {
     const door = {
       kind: "door" as const,
@@ -204,10 +215,20 @@ function fixtures(slot: WallSlot): [string, Fixture][] {
     { kind: "hatch", slot, label: "L", address: ADDRESS, seed: 4 },
   ]);
   for (const machine of MACHINE_KINDS) {
-    out.push([
-      `machine ${machine}`,
-      { kind: "machine", slot, machine, tag: "t", hue: 140, seed: 5 },
-    ]);
+    for (let v = 0; v < VARIANT_COUNTS.machine[machine]; v++) {
+      out.push([
+        `machine ${machine} variant ${String(v)}`,
+        {
+          kind: "machine",
+          slot,
+          machine,
+          tag: "t",
+          hue: 140,
+          seed: 5,
+          variant: v,
+        },
+      ]);
+    }
   }
   out.push([
     "poster",
@@ -388,6 +409,32 @@ function sunkDecals(b: Built, wall: Frame | null): string[] {
 }
 
 describe("fixture models", () => {
+  it("builds a tag's machine from the tag, never the room (Review Focus 2)", () => {
+    // 2.7 C5. Mutation caught: `createRng(fx.seed)` left in any recipe
+    // (tool lengths, bottle heights and LED picks would differ).
+    const slot = slotOn("n");
+    const f = frameForSlot(slot);
+    expect(MACHINE_KINDS.length).toBe(12);
+    for (const machine of MACHINE_KINDS) {
+      const at = (seed: number) =>
+        positions(
+          buildOne({
+            kind: "machine",
+            slot,
+            machine,
+            tag: "reactor",
+            hue: 140,
+            seed,
+          }).static,
+        ).map((p) =>
+          toLocal(f, p)
+            .map((c) => c.toFixed(5))
+            .join(","),
+        );
+      expect(at(5)).toEqual(at(987654321));
+    }
+  });
+
   for (const side of SIDES) {
     const slot = slotOn(side);
     const wall = frameForSlot(slot);
@@ -715,53 +762,55 @@ describe("fixture models", () => {
 describe("decor models", () => {
   for (const kind of DECOR_KINDS) {
     for (const turn of [0, 1, 2, 3]) {
-      describe(`${kind} turned ${turn}`, () => {
-        const decor: Decor = { kind, x: 4.5, y: 3, turn, seed: 11 };
-        const built = buildOneDecor(decor);
-        const f = frameForDecor(decor);
+      for (let variant = 0; variant < VARIANT_COUNTS.decor[kind]; variant++) {
+        describe(`${kind} turned ${turn} variant ${String(variant)}`, () => {
+          const decor: Decor = { kind, x: 4.5, y: 3, turn, seed: 11, variant };
+          const built = buildOneDecor(decor);
+          const f = frameForDecor(decor);
 
-        it("stays inside its footprint, under the ceiling", () => {
-          const own = decorFootprint(decor);
-          const half = pipeLength(decor, HALL) / 2;
-          const run = pipeRunBox(decor, HALL);
-          if (own === null) expect(run).not.toBeNull();
-          for (const p of positions(built.static)) {
-            if (own) {
-              expect(inBox(own, p)).toBe(true);
-              expect(p[1]).toBeGreaterThanOrEqual(-EPS);
-            } else {
-              const [a, d, h] = toLocal(f, p);
-              expect(Math.abs(a)).toBeLessThanOrEqual(half + EPS);
-              expect(Math.abs(d)).toBeLessThanOrEqual(PIPE_HALF + EPS);
-              // The plan box the span lines keep clear of (E3).
-              expect(inBox(run!, p, EPS)).toBe(true);
-              expect(h).toBeGreaterThanOrEqual(CEILING - PIPE_DROP - 0.2);
+          it("stays inside its footprint, under the ceiling", () => {
+            const own = decorFootprint(decor);
+            const half = pipeLength(decor, HALL) / 2;
+            const run = pipeRunBox(decor, HALL);
+            if (own === null) expect(run).not.toBeNull();
+            for (const p of positions(built.static)) {
+              if (own) {
+                expect(inBox(own, p)).toBe(true);
+                expect(p[1]).toBeGreaterThanOrEqual(-EPS);
+              } else {
+                const [a, d, h] = toLocal(f, p);
+                expect(Math.abs(a)).toBeLessThanOrEqual(half + EPS);
+                expect(Math.abs(d)).toBeLessThanOrEqual(PIPE_HALF + EPS);
+                // The plan box the span lines keep clear of (E3).
+                expect(inBox(run!, p, EPS)).toBe(true);
+                expect(h).toBeGreaterThanOrEqual(CEILING - PIPE_DROP - 0.2);
+              }
+              expect(p[1]).toBeLessThanOrEqual(CEILING - HEADROOM + EPS);
             }
-            expect(p[1]).toBeLessThanOrEqual(CEILING - HEADROOM + EPS);
-          }
-        });
+          });
 
-        it("winds every triangle with its normal", () => {
-          expect(built.static.count).toBeGreaterThan(0);
-          expect(worstWinding(built.static)).toBeGreaterThan(0.999);
-        });
+          it("winds every triangle with its normal", () => {
+            expect(built.static.count).toBeGreaterThan(0);
+            expect(worstWinding(built.static)).toBeGreaterThan(0.999);
+          });
 
-        it("stays under the triangle budget", () => {
-          expect(triangleCount(built)).toBeLessThan(4000);
-        });
+          it("stays under the triangle budget", () => {
+            expect(triangleCount(built)).toBeLessThan(4000);
+          });
 
-        it("glows only on or in its body", () => {
-          expect(floatingGlow(allParts(built), null)).toEqual([]);
-        });
+          it("glows only on or in its body", () => {
+            expect(floatingGlow(allParts(built), null)).toEqual([]);
+          });
 
-        it("lifts every decal DECAL_LIFT off what it covers", () => {
-          expect(sunkDecals(built, null)).toEqual([]);
-        });
+          it("lifts every decal DECAL_LIFT off what it covers", () => {
+            expect(sunkDecals(built, null)).toEqual([]);
+          });
 
-        it("asks for no text", () => {
-          expect(built.keys).toEqual([]);
+          it("asks for no text", () => {
+            expect(built.keys).toEqual([]);
+          });
         });
-      });
+      }
     }
   }
 

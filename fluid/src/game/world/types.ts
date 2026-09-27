@@ -199,6 +199,8 @@ export type Fixture =
       /** The occurrence of this heading among the sections, from 0. */
       section: number;
       seed: number;
+      /** Which recipe draws it (2.7 C1); absent reads as 0 (2.7 C6). */
+      variant?: number;
     }
   | {
       kind: "door";
@@ -233,6 +235,8 @@ export type Fixture =
       tag: string;
       hue: number;
       seed: number;
+      /** Which recipe draws it (2.7 C1); absent reads as 0 (2.7 C6). */
+      variant?: number;
     }
   | {
       kind: "poster";
@@ -283,6 +287,8 @@ export interface Decor {
   /** 0-3 quarter turns clockwise from facing north. */
   turn: number;
   seed: number;
+  /** Which recipe draws it (2.7 C1); absent reads as 0 (2.7 C6). */
+  variant?: number;
 }
 
 /** Where a prop hangs: on a wall, on the floor, or from the ceiling. */
