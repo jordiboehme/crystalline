@@ -2,21 +2,28 @@
  * The street heroes' shape tests: the bike's sourced size, its two
  * lights and its sponsor stickers on both sides; the police box's sign
  * layout, its sign on all four sides, the lines of its door notice, and
- * its doors built by the helper 2.6e will animate.
+ * its door leaves handed over as two swinging movers, and its hollow
+ * inside lit white behind them.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { FLAG, blinkFlag, type V3 } from "../../geometry";
-import { frameAt } from "../../kit";
+import { heroFootprint } from "../../../world/footprints";
+import type { Hero } from "../../../world/types";
+import { FLAG, blinkFlag, createBuilder, type V3 } from "../../geometry";
+import { createKit, frameAt } from "../../kit";
+import { LOOKS } from "../../looks";
 import {
   inked,
   partsOf,
+  positions,
   runsOfLines,
   toLocal,
   type Part,
 } from "../../modelChecks";
+import { swungPoint } from "../../parts";
 import { MARKS } from "../marks";
+import { buildHero, buildHeroMesh } from ".";
 import {
   BIKE,
   BIKE_STICKERS,
@@ -24,6 +31,7 @@ import {
   BOX_SIGN,
   BRAKE_STEEL,
   NOTICE_INK,
+  boxLeafMovers,
   boxSignLayout,
 } from "./street";
 import { textRows } from "./pixels";
@@ -196,5 +204,88 @@ describe("street hero models", () => {
     expect(Math.sign(mid)).toBe(LEFT_LEAF_SIGN);
     for (const p of ink)
       expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+  });
+});
+
+describe("the police box's doors (2.6e C10, C16)", () => {
+  const hero: Hero = {
+    kind: "police-box",
+    variant: 0,
+    x: 4.5,
+    y: 6,
+    turn: 0,
+    seed: 1,
+  };
+
+  it("leaves the leaves out of the instanced mesh and hands them over as two wings", () => {
+    // Mutation caught: buildHeroMesh still building the leaves (they would
+    // be drawn twice, one copy never opening), or a leaf mover missing.
+    const whole = createBuilder();
+    buildHero(
+      (f) => createKit(whole, f),
+      "police-box",
+      0,
+      LOOKS.aperture,
+      true,
+    );
+    const body = buildHeroMesh("police-box", 0, LOOKS.aperture);
+    const wings = boxLeafMovers(hero, 7, LOOKS.aperture);
+    expect(wings.map((m) => m.part)).toEqual(["wing", "wing"]);
+    expect(new Set(wings.map((m) => m.key))).toEqual(new Set(["box:7"]));
+    expect(wings.every((m) => m.fixture === -1)).toBe(true);
+    expect(body.count + wings.reduce((n, m) => n + m.mesh.count, 0)).toBe(
+      whole.build().count,
+    );
+  });
+
+  it("swings each leaf's inner edge deep into the box, never out of its front", () => {
+    // Mutation caught: a swing sign that opens a leaf outward, both leaves
+    // turning the same way, or a swing of 0 (the doors never open).
+    const wings = boxLeafMovers(hero, 0, LOOKS.aperture);
+    expect(wings.length).toBe(2);
+    expect((wings[0]?.swing ?? 0) * (wings[1]?.swing ?? 0)).toBeLessThan(0);
+    const box = heroFootprint(hero);
+    for (const m of wings) {
+      const pivot = m.pivot ?? [0, 0, 0];
+      const points = positions(m.mesh);
+      expect(points.length).toBeGreaterThan(0);
+      for (const p of points) {
+        const q = swungPoint(p, pivot, m.swing);
+        // turn 0: the front faces north (-z), so the front plane is box.z0
+        // and "deeper into the box" is a larger z.
+        expect(q[2]).toBeGreaterThanOrEqual(box.z0 - 1e-6);
+        expect(q[0]).toBeGreaterThanOrEqual(box.x0 - 1e-6);
+        expect(q[0]).toBeLessThanOrEqual(box.x1 + 1e-6);
+      }
+      // The leaf's inner edge: its vertex farthest from the hinge along x.
+      const inner = points.reduce((a, b) =>
+        Math.abs(b[0] - pivot[0]) > Math.abs(a[0] - pivot[0]) ? b : a,
+      );
+      const swung = swungPoint(inner, pivot, m.swing);
+      expect(swung[2] - inner[2]).toBeGreaterThanOrEqual(0.3);
+    }
+  });
+
+  it("lights the hollow inside white behind the doors", () => {
+    // Mutation caught: the body left solid (the open doorway would show a
+    // blue wall), or the inside lit with a lit surface that reads dark.
+    // Only a light inside the body counts: behind the door leaves, in
+    // front of the back wall and between the side walls, under the sign
+    // band, so the sign's white words on the four faces never pass it.
+    const inside = partsOf("police-box").filter(
+      (p) =>
+        p.flag === FLAG.signal &&
+        p.tint !== null &&
+        p.tint[2] > 0.85 &&
+        p.tint[0] > 0.9 &&
+        local(p).every(
+          (q) =>
+            Math.abs(q[0]) < 0.6 &&
+            q[1] > BOX_BACK &&
+            q[1] < 1.2 &&
+            q[2] < 2.08,
+        ),
+    );
+    expect(inside.length).toBeGreaterThan(0);
   });
 });

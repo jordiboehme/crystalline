@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { CANNED_BRIDGE, CANNED_HUB } from "../world/canned";
+import { boxKey } from "../world/box";
+import { CANNED_BRIDGE, CANNED_HUB, heroHallRoom } from "../world/canned";
 import { generateRoom } from "../world/generate";
 import { BAY, isFloor } from "../world/layout";
 import type { PlaceInput, RoomSpec } from "../world/types";
@@ -326,5 +327,22 @@ describe("buildRoomMesh details", () => {
     for (const v of portal) {
       v.tint.forEach((c, i) => expect(c).toBeCloseTo(alt[i] ?? NaN, 5));
     }
+  });
+});
+
+describe("buildRoomMesh's hero movers", () => {
+  it("gives every police box in a room its two leaves as movers, and no other hero any (2.6e C17)", () => {
+    // Mutation caught: the hero movers not emitted, or keyed by the fixture index.
+    const room = heroHallRoom();
+    const boxes = room.heroes.flatMap((h, i) =>
+      h.kind === "police-box" ? [i] : [],
+    );
+    expect(boxes.length).toBeGreaterThan(0);
+    const { movers } = buildRoomMesh(room, LOOKS.aperture);
+    const wings = movers.filter((m) => m.part === "wing");
+    expect(wings.length).toBe(2 * boxes.length);
+    expect(new Set(wings.map((m) => m.key))).toEqual(
+      new Set(boxes.map(boxKey)),
+    );
   });
 });

@@ -65,7 +65,16 @@ export function cornerPosts(
       k.box(a - half, a + half, d - half, d + half, h0, h1, s);
 }
 
-/** One hero kind's recipe: builds `variant` of `kind` with `k` in `frameAt([0, 0, 0], 0)`. Pure in kind, variant and look. */
+/**
+ * One hero kind's recipe: builds `variant` of `kind` with `k` in
+ * `frameAt([0, 0, 0], 0)`. Pure in kind, variant, look and `movers`.
+ *
+ * `movers` says where the kind's moving parts go (only the police box has
+ * any, its two door leaves): true builds them in place, closed, as part of
+ * the one mesh, which is what the model checks look at; false leaves them
+ * out, because `buildHeroMovers` (`heroes/index.ts`) builds them as movers
+ * of their own and the instanced mesh must not draw them a second time.
+ */
 export type HeroRecipe = (r: {
   k: Kit;
   kitAt: KitAt;
@@ -73,6 +82,7 @@ export type HeroRecipe = (r: {
   look: Look;
   variant: number;
   kind: HeroKind;
+  movers: boolean;
 }) => void;
 
 /** Each hero kind's blink bank (the tables in the 2.6a plan's Task 3 and the 2.6c plan's C13). */

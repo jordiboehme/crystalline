@@ -12,7 +12,7 @@ import { turnForSide, wallAnchor } from "../world/sites";
 import type { Hero, HeroKind, Side, WallSlot } from "../world/types";
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
-import { frameAt, frameForSlot, type Frame } from "./kit";
+import { createKit, frameAt, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
   clearAbove,
@@ -28,6 +28,7 @@ import {
   type Part,
 } from "./modelChecks";
 import { buildHero, buildHeroMesh } from "./models/heroes";
+import { boxLeafMovers } from "./models/heroes/street";
 import { HERO_BANK } from "./models/heroes/common";
 import { FLOOR_TOP, WALL_TOP } from "./models/props/common";
 
@@ -103,7 +104,10 @@ describe("hero models", () => {
       triangles.push(`${kind} ${String(v)}: ${String(mesh.count / 3)}`);
 
       it(`${kind} variant ${String(v)} builds the same floats twice`, () => {
-        const again = buildHeroMesh(kind, v, LOOKS.aperture);
+        // Built as the checks build it, moving parts in place.
+        const b = createBuilder();
+        buildHero((f) => createKit(b, f), kind, v, LOOKS.aperture);
+        const again = b.build();
         expect(again.count).toBe(mesh.count);
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
@@ -205,6 +209,33 @@ describe("hero models", () => {
           HERO_BANK[kind] !== "steady",
         );
       }
+  });
+
+  it("checks the police box with its door leaves in place (2.6e C19)", () => {
+    // Mutation caught: buildHero's default turned to leave the moving parts
+    // out, so the loop above would check a doorless police box's envelope,
+    // winding, glow contact, float and budget and never the leaves'.
+    const { mesh } = buildRecorded("police-box", 0);
+    const explicit = createBuilder();
+    buildHero(
+      recordingKitAt(explicit, []),
+      "police-box",
+      0,
+      LOOKS.aperture,
+      true,
+    );
+    const body = buildHeroMesh("police-box", 0, LOOKS.aperture);
+    const wings = boxLeafMovers(
+      { kind: "police-box", variant: 0, x: 3, y: 4, turn: 0, seed: 0 },
+      0,
+      LOOKS.aperture,
+    );
+    expect(mesh.count).toBe(explicit.build().count);
+    expect(mesh.count).toBe(
+      body.count + wings.reduce((n, m) => n + m.mesh.count, 0),
+    );
+    expect(mesh.count).toBeGreaterThan(body.count);
+    expect(mesh.count / 3).toBeLessThan(4000);
   });
 
   it("refuses a variant the catalogue does not have", () => {

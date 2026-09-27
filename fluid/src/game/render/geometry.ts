@@ -6,7 +6,10 @@
  * Everything static is emitted into one interleaved, non-indexed vertex
  * array in world space, so the whole room is one draw call; the moving
  * parts of every way come back as movers, each its own small mesh, for the
- * renderer to slide, blink or scale. Per vertex: position, normal, a uv in
+ * renderer to slide, blink, scale or turn, and after them every hero's
+ * moving parts (`buildHeroMovers`: a police box's two door leaves, keyed
+ * by the hero's index in `room.heroes`). The heroes themselves are drawn
+ * instanced, without those parts. Per vertex: position, normal, a uv in
  * metres (so panel seams fall on whole numbers and the shader can draw
  * edge lines there), the texture array layer, a tint from the look, and a
  * flag that tells the shader how the surface is lit:
@@ -49,6 +52,7 @@ import {
   type ModelContext,
   type Mover,
 } from "./models";
+import { buildHeroMovers } from "./models/heroes";
 
 /**
  * Floats per vertex in the interleaved array: position 3, normal 3, uv 2,
@@ -519,6 +523,7 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   room.fixtures.forEach((fx, i) => {
     movers.push(...buildFixture(kitAt, fx, i, ctx));
   });
+  room.heroes.forEach((h, i) => movers.push(...buildHeroMovers(h, i, look)));
   for (const d of room.decor) buildDecor(kitAt, d, ctx);
   return { static: b.build(), movers };
 }

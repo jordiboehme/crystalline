@@ -1,7 +1,8 @@
 /**
  * The street pieces: the red bike and the blue police box, two machines
  * from the street that ended up aboard. Both are lit on the `breathe`
- * bank (C13) and nothing on them moves.
+ * bank (C13). The police box's two door leaves are the one thing on
+ * either that moves.
  *
  * - The bike (`BIKE`) is a long racing motorcycle parked on its side
  *   stand, its length along `a` and its nose at `+a`: bright glossy red
@@ -29,27 +30,52 @@
  *   a small lamp in a white cage that breathes, and on every side two
  *   columns of raised panels under a window of small frosted panes that
  *   glow faintly. On the front the two columns are the two door leaves,
- *   each built by `boxDoor` as a slab of its own, so a later stage can
- *   swing them inward; the left one carries the white door notice with its
- *   lines in black (`MARKS.boxNotice`, 2.6f C13).
+ *   each built by `boxDoor` as a slab of its own; the left one carries the
+ *   white door notice with its lines in black (`MARKS.boxNotice`, 2.6f
+ *   C13), which swings with it.
  *   The body stands `BOX_BACK` off the wall, so the back sign stays in
  *   front of the wall plane.
+ * - The police box's body is hollow (2.6e C10): a back wall, two side
+ *   walls lined in a pale white on the inside, a roof slab over the
+ *   doorway and a floor on the plinth, and on the back wall's inner face a
+ *   panel that shines white by itself (`INSIDE`), so through the open
+ *   doors the box glows. Every outside face stands where the solid body's
+ *   did.
+ * - The leaves are movers (`boxLeafMovers`, C16): the instanced mesh
+ *   leaves them out and each is a `wing` of its own in world space, hinged
+ *   at its outer post (`boxHinge`) and turned inward by `BOX_SWING` at
+ *   full open, the two opposite ways, both under the one key
+ *   `boxKey(index)`, so they open and close together. That is the one
+ *   door motion; the recipe builds them in place, closed, only when asked
+ *   to (`movers`), which the model checks are.
  *
  * The numbers each kind is built to are named above its recipe: `BIKE`,
  * `BIKE_BODY` and `BIKE_PROFILE` for the bike, `BOX` for the box. Round parts use few
  * facets, as in every batch.
  */
 
-import type { HeroKind } from "../../../world/types";
-import { DECAL_LIFT, frameAt, type Frame, type Kit } from "../../kit";
-import type { Rgb } from "../../looks";
+import { boxKey } from "../../../world/box";
+import { turnedPoint } from "../../../world/footprints";
+import type { Hero, HeroKind } from "../../../world/types";
+import { CELL } from "../../../world/units";
+import { createBuilder } from "../../geometry";
+import {
+  DECAL_LIFT,
+  createKit,
+  frameAt,
+  type Frame,
+  type Kit,
+} from "../../kit";
+import type { Look, Rgb } from "../../looks";
 import {
   discOutline,
   offset,
   shade,
   sideways,
+  surfaces,
   yawed,
   type KitAt,
+  type Mover,
   type Surfaces,
 } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
@@ -619,6 +645,28 @@ const HANDLE: Rgb = [0.08, 0.08, 0.09];
 export const NOTICE_INK: Rgb = [0.05, 0.05, 0.06];
 
 /**
+ * The light inside the hollow body, on the back wall's inner face: a
+ * white that shines by itself, seen through the open doors (C10).
+ */
+const INSIDE: Rgb = [0.95, 0.95, 0.9];
+
+/**
+ * How far each door leaf turns about its hinge at full open, in radians:
+ * 75 degrees, inward, the left and right leaves opposite ways (C10).
+ */
+export const BOX_SWING = (5 * Math.PI) / 12;
+
+/**
+ * The thickness of the hollow body's back wall and of each side wall with
+ * its lining, in metres. Each side wall's inner face stands on the
+ * leaves' hinge line, so a leaf swings clear of it.
+ */
+const SHELL = 0.04;
+
+/** The thickness of the white lining on each side wall's inner face, in metres. */
+const LINING = 0.005;
+
+/**
  * How far the police box's body stands off its wall, in metres: the back
  * sign band and its words stand this side of the wall plane (C10).
  */
@@ -842,13 +890,25 @@ function facePanels(
 }
 
 /**
- * One door leaf of the police box, built into the kits `kitAt` makes at
- * the leaf's closed place. It is one call so that 2.6e can build it into
- * a mover and swing it inward; in 2.6c it stands closed (C10).
+ * Where a door leaf's hinge stands in the recipe's terms: the vertical
+ * line at the leaf's outer edge, just inside its corner post, on the
+ * leaf's inner face (the body's front, `BOX.face - BOX.leaf`). `a` is at
+ * `+a` for the right leaf, `-a` for the left.
+ */
+export function boxHinge(leaf: "left" | "right"): { a: number; d: number } {
+  const edge = BOX.half - BOX.post + 0.01;
+  return { a: (leaf === "right" ? 1 : -1) * edge, d: BOX.face - BOX.leaf };
+}
+
+/**
+ * One door leaf of the police box, closed, built into the kits `kitAt`
+ * makes in the frame `base`: the box's own frame at its anchor and turn
+ * (the recipe's origin by default, or the hero's place in the world for a
+ * mover, `boxLeafMovers`).
  *
- * The leaf is built in a frame at its hinge: the vertical line at its
- * outer edge (`±leafEdge`) on the leaf's inner face, so swinging it is a
- * turn of that frame about its origin. It is a slab `BOX.leaf` thick from
+ * The leaf is built in a frame whose origin is its hinge (`boxHinge`):
+ * the vertical line at its outer edge on the leaf's inner face, so
+ * swinging it is a turn about that frame's origin. It is a slab `BOX.leaf` thick from
  * the body's front out to the door plane, with its column of panels
  * (`facePanels`) on the slab's front and a dark handle at its inner edge.
  * The right leaf (at `+a`, the viewer's right) carries the meeting stile
@@ -860,10 +920,12 @@ export function boxDoor(
   kitAt: KitAt,
   s: Surfaces,
   leaf: "left" | "right",
+  base: Frame = ORIGIN,
 ): void {
-  const edge = BOX.half - BOX.post + 0.01;
+  const hinge = boxHinge(leaf);
+  const edge = Math.abs(hinge.a);
   const sign = leaf === "right" ? 1 : -1;
-  const k = kitAt(offset(ORIGIN, sign * edge, BOX.face - BOX.leaf));
+  const k = kitAt(offset(base, hinge.a, hinge.d));
   // Along the leaf from its hinge (0) to its inner edge (`inner`).
   const inner = sign * -(edge - STILE);
   const [c0, c1] = inner < 0 ? [inner, 0] : [0, inner];
@@ -893,20 +955,51 @@ export function boxDoor(
 }
 
 /**
- * The blue police box: the plinth, the body, the four corner posts, the
- * sign band with its words on all four sides, the two door leaves on the
- * front (`boxDoor`) and the matching panels on the other three sides,
- * the roof's three steps and the lamp in its cage on top.
+ * The blue police box: the plinth, the hollow body lit white inside, the
+ * four corner posts, the sign band with its words on all four sides, the
+ * two door leaves on the front (`boxDoor`, only with `movers`: otherwise
+ * `boxLeafMovers` builds them) and the matching panels on the other three
+ * sides, the roof's three steps and the lamp in its cage on top.
  */
-const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
+const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
   const { top } = heroHalf(kind, variant);
   const B = BOX;
   const back = BOX_BACK;
   const blue = (f: number) => s.tinted(shade(BLUE, f));
   k.box(-B.half, B.half, back, B.front, 0, B.plinth, blue(0.8));
-  // The body: its front behind the door leaves, its top under the cornice.
+  // The body, hollow: its outside faces where a solid body's would be (the
+  // front behind the door leaves, the top under the cornice), a back wall,
+  // two side walls whose inner faces stand on the hinge line, a floor on
+  // the plinth and a roof slab down to the top of the doorway.
   const d0 = back + B.post / 2;
-  k.box(-B.wall, B.wall, d0, B.face - B.leaf, B.plinth, B.eave, blue(0.84));
+  const front = B.face - B.leaf;
+  const inner = B.wall - SHELL;
+  const floor = B.plinth + DECAL_LIFT;
+  k.box(-B.wall, B.wall, d0, d0 + SHELL, B.plinth, B.eave, blue(0.84));
+  for (const a of [-1, 1]) {
+    const [w0, w1] =
+      a < 0 ? [-B.wall, -inner - LINING] : [inner + LINING, B.wall];
+    k.box(w0, w1, d0 + SHELL, front, B.plinth, B.eave, blue(0.84));
+  }
+  k.box(-inner, inner, d0 + SHELL, front, B.plinth, floor, blue(0.84));
+  k.box(-inner, inner, d0 + SHELL, front, B.band0, B.eave, blue(0.84));
+  // Inside: the side walls lined in pale white, and the back wall's inner
+  // face shining white, so the open doorway reads bright.
+  const lining = s.tinted(shade(WHITE, 0.8));
+  for (const a of [-1, 1]) {
+    const [l0, l1] =
+      a < 0 ? [-inner - LINING, -inner] : [inner, inner + LINING];
+    k.box(l0, l1, d0 + SHELL, front, floor, B.band0, lining);
+  }
+  const glowHalf = B.wall - 0.05;
+  k.panel(
+    -glowHalf,
+    glowHalf,
+    d0 + SHELL + DECAL_LIFT,
+    0.2,
+    2.0,
+    s.signal(INSIDE),
+  );
   const ph = B.half - B.post;
   for (const a of [-1, 1])
     for (const [p0, p1] of [
@@ -958,8 +1051,10 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
     facePanels(fk, s, depth, -clear, -STILE, false);
     facePanels(fk, s, depth, STILE, clear, false);
   }
-  boxDoor(kitAt, s, "left");
-  boxDoor(kitAt, s, "right");
+  if (movers) {
+    boxDoor(kitAt, s, "left");
+    boxDoor(kitAt, s, "right");
+  }
 
   // The roof: the cornice over the posts, then two smaller steps.
   k.box(-B.half, B.half, back, B.front, B.eave, B.cornice, blue(1.0));
@@ -1000,6 +1095,41 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind }) => {
   k.cylinder(0, lampD, L.glass1, L.cap, L.rim, 10, cage);
   k.cylinder(0, lampD, L.cap, top, L.finial, 6, cage);
 };
+
+/**
+ * The police box's two door leaves as movers, for the hero at `index` in
+ * `room.heroes`: each a `wing` of its own (`boxDoor` built in the hero's
+ * frame at its anchor and turn, in world metres, closed), hinged at its
+ * outer post (`boxHinge` turned into the world by `turnedPoint`, at the
+ * floor), turned by `swing` about that vertical line at full open. The
+ * left leaf turns by `+BOX_SWING` and the right by `-BOX_SWING`, so each
+ * inner edge swings into the box whatever the hero's turn (a quarter turn
+ * does not change which way a turn about the vertical goes). Both share
+ * the key `boxKey(index)`, so one door state opens both; `fixture` is -1,
+ * which no fault frame names; `axis` and `travel` are unused (a wing does
+ * not slide) and `rest` is 1.
+ */
+export function boxLeafMovers(hero: Hero, index: number, look: Look): Mover[] {
+  const base = frameAt([hero.x * CELL, 0, hero.y * CELL], hero.turn);
+  const s = surfaces(look);
+  return (["left", "right"] as const).map((leaf) => {
+    const b = createBuilder();
+    boxDoor((f) => createKit(b, f), s, leaf, base);
+    const hinge = boxHinge(leaf);
+    const p = turnedPoint(hero.x, hero.y, hero.turn, hinge.a, hinge.d);
+    return {
+      key: boxKey(index),
+      part: "wing",
+      fixture: -1,
+      mesh: b.build(),
+      axis: [0, 0, 0],
+      travel: 0,
+      pivot: [p.x, 0, p.z],
+      rest: 1,
+      swing: leaf === "left" ? BOX_SWING : -BOX_SWING,
+    };
+  });
+}
 
 /** The street kinds' recipes. */
 export const STREET_RECIPES = {
