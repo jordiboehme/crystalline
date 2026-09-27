@@ -12,6 +12,7 @@ mod support;
 
 mod collaboration;
 mod configure;
+mod contradictions;
 mod domain_access;
 mod domain_admin;
 mod domain_rename;

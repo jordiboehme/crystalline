@@ -509,20 +509,16 @@ impl Engine {
         *self.model_cache_pruned.write().unwrap() = removed;
     }
 
-    /// The repository the model cache is pruned down to, or `None` when this
+    /// The repositories the model cache is pruned down to, or `None` when this
     /// instance must not prune weights at all.
     ///
-    /// Three conditions, and every one of them has to hold. The instance is
-    /// writable: a read-only instance serves a database and a model cache it
-    /// does not own, and deleting another install's weights is not its
-    /// business. The configured provider is the local one: a remote config may
-    /// legitimately name one of the table's models by its repository id,
-    /// because that is what the endpoint serving it calls it, and that string
-    /// says nothing about which weights this disk needs. And the active model
-    /// is one the table knows, so there is a repository to keep; a model this
-    /// build does not know keeps everything, since nothing is deleted on a
-    /// guess.
-    fn model_cache_keep(&self) -> Option<&'static str> {
+    /// `None` in the same three cases as before: a read-only instance, a
+    /// remote embedding provider, or an active embedding model this build
+    /// does not know. Otherwise the active embedding model's repository, plus
+    /// the configured contradiction profile's when `evolve.contradictions` is
+    /// not off, so a changed profile's previous checkpoint goes at the next
+    /// start and a profile turned off leaves no checkpoint behind.
+    fn model_cache_keep(&self) -> Option<Vec<&'static str>> {
         if self.read_only {
             return None;
         }
@@ -534,7 +530,11 @@ impl Engine {
         if !local {
             return None;
         }
-        crystalline_index::local_model(&self.model_id).map(|m| m.repo)
+        let mut keep = vec![crystalline_index::local_model(&self.model_id)?.repo];
+        if let Some(nli) = self.contradiction_model() {
+            keep.push(nli.repo);
+        }
+        Some(keep)
     }
 
     /// Prune the model cache down to the active model's weights, recording what
@@ -542,16 +542,16 @@ impl Engine {
     ///
     /// The daemon calls this once per start and only after the active model has
     /// LOADED, never before: a failed download must not be the reason the only
-    /// working weights are deleted. The keep list is a slice because the
-    /// contradiction scorer adds its own model id to it; until then it holds
-    /// one entry. Every failure is logged and swallowed, because an unpruned
-    /// cache costs disk and nothing else.
+    /// working weights are deleted. The keep list holds the embedding model
+    /// and, when the contradiction check is on, its profile's checkpoint.
+    /// Every failure is logged and swallowed, because an unpruned cache costs
+    /// disk and nothing else.
     pub async fn prune_model_cache(&self, models_dir: PathBuf) {
         let Some(keep) = self.model_cache_keep() else {
             return;
         };
         let removed = tokio::task::spawn_blocking(move || {
-            crystalline_index::prune_model_cache(&models_dir, &[keep])
+            crystalline_index::prune_model_cache(&models_dir, &keep)
         })
         .await;
         match removed {
@@ -560,7 +560,7 @@ impl Engine {
                 tracing::info!(
                     models = removed.len(),
                     bytes,
-                    "pruned unused embedding models from the cache"
+                    "pruned unused models from the cache"
                 );
                 self.record_model_cache_prune(removed);
             }

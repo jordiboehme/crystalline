@@ -89,6 +89,11 @@ pub struct GlobalConfig {
     /// every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureConfig>,
+    /// Background maintenance settings the sweep reads. Absent means the
+    /// contradiction check is off, so every existing config keeps working
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evolve: Option<EvolveConfig>,
     /// Per-prompt recall settings. Absent means the hook is on with its
     /// defaults, so every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +274,17 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|c| c.similar)
             .unwrap_or(true)
+    }
+
+    /// The contradiction check's profile, from `evolve.contradictions`:
+    /// `off`, `full`, `light` or `english-only`. Absent means
+    /// [`DEFAULT_EVOLVE_CONTRADICTIONS`]. Returned as written; the engine maps
+    /// it to a model and reads anything it does not know as off.
+    pub fn evolve_contradictions(&self) -> &str {
+        self.evolve
+            .as_ref()
+            .and_then(|e| e.contradictions.as_deref())
+            .unwrap_or(DEFAULT_EVOLVE_CONTRADICTIONS)
     }
 
     /// Whether the per-prompt hook speaks at all, from `recall.enabled`.
@@ -838,6 +854,19 @@ pub struct CaptureConfig {
     /// the nearest existing engrams. Absent means on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similar: Option<bool>,
+}
+
+/// The profile `evolve.contradictions` takes when the key is absent. Off
+/// until the measurement says otherwise and Jordi agrees.
+pub const DEFAULT_EVOLVE_CONTRADICTIONS: &str = "off";
+
+/// The `evolve` block: what the daemon does for the sweep between sweeps.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EvolveConfig {
+    /// The contradiction check's profile. Absent means the default; an
+    /// explicit `off` is kept, so a later default never overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradictions: Option<String>,
 }
 
 /// The `recall` block: what the per-prompt hook hands the agent. Reads like a

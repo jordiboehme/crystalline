@@ -4253,6 +4253,7 @@ mod adopt_names;
 mod attachments;
 mod configure;
 mod context;
+mod contradictions;
 mod delete;
 mod domain_add;
 mod domains;
