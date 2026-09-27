@@ -876,74 +876,80 @@ describe("the neighbours (2.6f C5)", () => {
     const higher = lower === a ? b : a;
     expect(lower.heroes.map((h) => h.kind)).toContain("turret");
     expect(higher.heroes.map((h) => h.kind)).not.toContain("turret");
-    // Both pair rooms' own layouts must take the helper robot alone, so a
-    // failure below points at the skip and not at the layout. A room's
-    // decor and candidate order follow its seed, so not every permalink's
-    // layout does: the pair is the first of the raw helper robot rooms whose
-    // two layouts both take it.
-    const takesRobot = (room: RoomSpec) => {
+    // The pool half, on engineering rooms. A room takes kind `k` alone when
+    // a pool slot rolling the middle of `k`'s weight places exactly `k`.
+    const E = HERO_POOLS.engineering;
+    const total = E.reduce((sum, [, w]) => sum + w, 0);
+    const bare = (room: RoomSpec) => {
       const { heroes, props, curios, ...rest } = room;
       void heroes;
       void props;
       void curios;
-      const at = HERO_POOLS.engineering.findIndex(
-        ([k]) => k === "helper-robot",
-      );
-      const w0 = HERO_POOLS.engineering
-        .slice(0, at)
-        .reduce((sum, [, w]) => sum + w, 0);
-      return (
-        placeHeroes(rest, {
-          slab: false,
-          turret: false,
-          picks: [{ take: true, roll: (w0 + 1.5) / 22 }],
-        })
-          .map((h) => h.kind)
-          .join() === "helper-robot"
-      );
+      return rest;
     };
-    const robots: string[] = [];
-    for (let i = 0; i < 20000 && robots.length < 40; i++)
-      if (rawOf(`pair-${String(i)}`, "engineering") === "helper-robot")
-        robots.push(`pair-${String(i)}`);
-    let pools: [RoomSpec, RoomSpec] | null = null;
-    search: for (const [i, pp] of robots.entries())
-      for (const pq of robots.slice(i + 1)) {
-        const both = pair(pp, pq, "runbook");
-        if (both.every(takesRobot)) {
-          pools = both;
-          break search;
-        }
-      }
-    if (pools === null)
-      throw new Error("no pool pair whose layouts both take the helper robot");
-    for (const room of pools) {
-      expect(room.heroes.length).toBeGreaterThan(0);
-      if (!room.heroes.some((h) => h.kind === "helper-robot")) continue;
-      // Kept only when its re-pick finds no place in this hall (C7).
-      const roll = heroDrawsOf(room.seed, 1).picks[0]?.roll ?? 0;
-      const repick = pickByRoll(
-        roll,
-        skipNear(HERO_POOLS.engineering, new Set<HeroKind>(["helper-robot"])),
+    const takes = (room: RoomSpec, k: HeroKind | null) => {
+      const at = E.findIndex(([x]) => x === k);
+      const w = E[at]?.[1];
+      if (w === undefined) return false;
+      const before = E.slice(0, at).reduce((sum, [, x]) => sum + x, 0);
+      const got = placeHeroes(bare(room), {
+        slab: false,
+        turret: false,
+        picks: [{ take: true, roll: (before + w / 2) / total }],
+      });
+      return got.map((h) => h.kind).join() === k;
+    };
+    /** The kind room `room`'s own pool roll picks again with `k` skipped. */
+    const repickOf = (room: RoomSpec, k: HeroKind) =>
+      pickByRoll(
+        heroDrawsOf(room.seed, 1).picks[0]?.roll ?? 0,
+        skipNear(E, new Set<HeroKind>([k])),
       );
-      const { heroes, props, curios, ...b } = room;
-      void heroes;
-      void props;
-      void curios;
-      const index = HERO_POOLS.engineering.findIndex(([k]) => k === repick);
-      expect(index).toBeGreaterThanOrEqual(0);
-      const before = HERO_POOLS.engineering
-        .slice(0, index)
-        .reduce((s, [, w]) => s + w, 0);
-      const w = HERO_POOLS.engineering[index]?.[1] ?? 0;
+    /**
+     * The first pair of rooms that both draw `k` raw, whose layouts both
+     * take `k` alone (so a failure points at the skip, not the layout;
+     * a room's decor and candidate order follow its seed) and that `fits`.
+     */
+    const pairOf = (k: HeroKind, fits: (r: RoomSpec) => boolean) => {
+      const raws: string[] = [];
+      for (let i = 0; i < 20000 && raws.length < 40; i++)
+        if (rawOf(`pair-${String(i)}`, "engineering") === k)
+          raws.push(`pair-${String(i)}`);
+      for (const [i, pp] of raws.entries())
+        for (const pq of raws.slice(i + 1)) {
+          const both = pair(pp, pq, "runbook");
+          if (both.every((r) => takes(r, k) && fits(r))) return both;
+        }
+      return null;
+    };
+    // A pair whose re-picks both find a place: neither room shows the
+    // shared kind, and each shows its re-pick.
+    let moved: [RoomSpec, RoomSpec] | null = null;
+    let shared: HeroKind | null = null;
+    for (const [k] of E) {
+      moved = pairOf(k, (r) => takes(r, repickOf(r, k)));
+      if (moved !== null) {
+        shared = k;
+        break;
+      }
+    }
+    if (moved === null || shared === null)
+      throw new Error("no pool pair whose re-picks both find a place");
+    for (const room of moved)
       expect(
-        placeHeroes(b, {
-          slab: false,
-          turret: false,
-          picks: [{ take: true, roll: (before + w / 2) / 22 }],
-        }),
-        `${String(repick)} alone`,
-      ).toEqual([]);
+        room.heroes.map((h) => h.kind),
+        `${room.permalink} ${shared}`,
+      ).toEqual([repickOf(room, shared)]);
+    // The helper robot's re-pick is the sleep ring, which finds no place in
+    // these halls: both rooms keep the raw kind (C7), and still hold a hero.
+    const robots = pairOf("helper-robot", () => true);
+    if (robots === null)
+      throw new Error("no pool pair whose layouts both take the helper robot");
+    for (const room of robots) {
+      const repick = repickOf(room, "helper-robot");
+      expect(repick).toBe("sleep-ring");
+      expect(takes(room, repick), `${String(repick)} alone`).toBe(false);
+      expect(room.heroes.map((h) => h.kind)).toEqual(["helper-robot"]);
     }
   }, 30_000);
 });

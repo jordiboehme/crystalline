@@ -42,23 +42,33 @@ describe("nearOf", () => {
 
   it("keeps in the below sets only what a lower-seeded neighbour draws (2.6f C8)", () => {
     // Mutation caught: the comparison turned round, or every neighbour
-    // counted as below.
+    // counted as below. Twelve neighbours, so the kinds drawn below and
+    // above differ (with hundreds, both sides would draw every kind and
+    // the check could not tell them apart).
     const mine = seeds[0] ?? 0;
     const ns: Neighbour[] = seeds
-      .slice(1)
+      .slice(1, 13)
       .map((s) => ({ seed: s, archetype: "engineering" }));
     const near = nearOf(mine, ns);
     const below = ns.filter((n) => n.seed < mine);
     const above = ns.filter((n) => n.seed > mine);
     expect(below.length).toBeGreaterThan(0);
     expect(above.length).toBeGreaterThan(0);
-    const heroesBelow = new Set(
-      below.flatMap((n) => {
-        const k = rawHero(heroDrawsOf(n.seed, 1), n.archetype);
-        return k === null ? [] : [k];
-      }),
-    );
-    expect(near.heroesBelow).toEqual(heroesBelow);
+    const heroesOf = (list: Neighbour[]) =>
+      new Set(
+        list.flatMap((n) => {
+          const k = rawHero(heroDrawsOf(n.seed, 1), n.archetype);
+          return k === null ? [] : [k];
+        }),
+      );
+    const curiosOf = (list: Neighbour[]) =>
+      new Set(
+        list.flatMap((n) => rawCurios(curioDrawsOf(n.seed), n.archetype)),
+      );
+    expect(heroesOf(below)).not.toEqual(heroesOf(above));
+    expect(heroesOf(below)).not.toEqual(heroesOf(ns));
+    expect(near.heroesBelow).toEqual(heroesOf(below));
+    expect(near.curiosBelow).toEqual(curiosOf(below));
     for (const k of near.heroesBelow) expect(near.heroes.has(k)).toBe(true);
     for (const k of near.curiosBelow) expect(near.curios.has(k)).toBe(true);
   });

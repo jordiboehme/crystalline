@@ -172,9 +172,10 @@ describe("the neighbours in the seams (2.6f C9)", () => {
     // caught: a forced draw reading near, or a seam placing the curios
     // again without the room's near.
     expect(nearFor(CANNED_WORKSHOP).heroes.has("hoverboard")).toBe(true);
-    expect(roomWithForcedHero(CANNED_WORKSHOP, "hoverboard").placed).toBe(
-      "hoverboard",
-    );
+    const hover = roomWithForcedHero(CANNED_WORKSHOP, "hoverboard");
+    expect(hover.placed).toBe("hoverboard");
+    // `placed` reads only that a hero landed, so the kind is checked too.
+    expect(hover.room.heroes.map((h) => h.kind)).toEqual(["hoverboard"]);
     // A lower-seeded hatch whose room draws the radar raw.
     const mine = roomSeed("station", "pipe-shop");
     let below: string | null = null;
@@ -218,5 +219,18 @@ describe("the neighbours in the seams (2.6f C9)", () => {
     void curios;
     expect(placeCurios(rest).map((c) => c.kind)).toContain("treasure-radar");
     expect(room.curios.map((c) => c.kind)).not.toContain("treasure-radar");
+    // The forced-prop seam places the curios again the same way.
+    const kind = RARE_PROP_KINDS[0];
+    if (kind === undefined) throw new Error("no rare prop kind");
+    const withProp = roomWithForcedProp(place, kind);
+    expect(withProp.placed).toBe(kind);
+    {
+      const { curios: own, ...bare } = withProp.room;
+      void own;
+      expect(placeCurios(bare).map((c) => c.kind)).toContain("treasure-radar");
+    }
+    expect(withProp.room.curios.map((c) => c.kind)).not.toContain(
+      "treasure-radar",
+    );
   });
 });

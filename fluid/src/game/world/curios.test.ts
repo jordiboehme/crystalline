@@ -1293,8 +1293,8 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
 
   it("skips a neighbour's curio only on a collision, and drops a one-kind slot for a lower neighbour (2.6f C7, C8)", () => {
     // Mutation caught: every pick moved when a neighbour's kind is merely
-    // among the fitting kinds, the skip ignored, or the solo rule reading
-    // `curios` instead of `curiosBelow`.
+    // among the fitting kinds, the skip ignored, the solo rule reading
+    // `curios` instead of `curiosBelow`, or a forced draw reading `near`.
     const near = (all: CurioKind[], below: CurioKind[] = []): Near => ({
       ...NO_NEAR,
       curios: new Set(all),
@@ -1366,6 +1366,15 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
               (x) => x.kind,
             ),
           ).toContain("treasure-radar");
+          // A forced draw never reads its neighbours (2.6f C9): the radar
+          // forced alone lands even beside a lower neighbour's.
+          expect(
+            placeCurios(
+              b,
+              only("treasure-radar"),
+              near(["treasure-radar"], ["treasure-radar"]),
+            ).map((x) => x.kind),
+          ).toEqual(["treasure-radar"]);
         }
       }
     expect(untouched).toBeGreaterThan(50);
