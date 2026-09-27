@@ -1487,7 +1487,9 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
   });
 
   it("logs each new kind's realized rate over 1000 hubs and 1000 workshops", () => {
-    // Mutation caught: the radar's pool emptied, so it never lands.
+    // Mutation caught: any of the eight new kinds' pool emptied (the
+    // radar's, or a natural-draw kind like the soot puffs' or the
+    // reactor's, which no forced-landing test covers), so it never lands.
     const counts = new Map<string, number>();
     const pool = [...HUB_ROOMS, ...WORKSHOPS];
     for (let i = 0; i < 2000; i++) {
@@ -1496,11 +1498,12 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
       for (const c of placeCurios(reseed(made.room, "rate-d", i)))
         counts.set(c.kind, (counts.get(c.kind) ?? 0) + 1);
     }
-    const line = CURIO_KINDS.slice(CURIO_KINDS.indexOf("treasure-radar"))
+    const newKinds = CURIO_KINDS.slice(CURIO_KINDS.indexOf("treasure-radar"));
+    const line = newKinds
       .map((k) => `${k} ${String(counts.get(k) ?? 0)}`)
       .join(", ");
     console.info(`2.6d curios per 2000 rooms: ${line}`);
-    expect(counts.get("treasure-radar") ?? 0).toBeGreaterThan(0);
+    for (const k of newKinds) expect(counts.get(k) ?? 0, k).toBeGreaterThan(0);
   });
 });
 
