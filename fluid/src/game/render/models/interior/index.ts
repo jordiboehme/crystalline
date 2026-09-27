@@ -15,8 +15,10 @@
  * `buildRoomMesh` hands the renderer with the fixtures' and heroes'. No
  * kind has one yet.
  *
- * Every kind is the blockout for now (`interiorBlockout`), so the room can
- * be entered, walked and lit before its fittings are modelled. The family's
+ * The wall pieces (the roundel wall, the inner doors and the scanner) are
+ * built in `walls.ts`; the console is still the blockout
+ * (`interiorBlockout`), so the room can be entered, walked and lit before
+ * it is modelled. The family's
  * test (`interiorModels.test.ts`) builds every kind and variant, places it
  * at every turn it can take and checks its envelope (`interiorHalf`), the
  * winding, that nothing glows in mid-air, that no part floats clear of the
@@ -31,12 +33,11 @@ import { createKit, frameAt } from "../../kit";
 import type { Look } from "../../looks";
 import { surfaces, type KitAt, type Mover } from "../common";
 import { interiorBlockout, type InteriorRecipe } from "./common";
+import { WALL_RECIPES } from "./walls";
 
 /** Every fitting kind's recipe. */
 const RECIPES = {
-  "roundel-wall": interiorBlockout,
-  "inner-doors": interiorBlockout,
-  scanner: interiorBlockout,
+  ...WALL_RECIPES,
   console: interiorBlockout,
 } satisfies Record<InteriorKind, InteriorRecipe>;
 

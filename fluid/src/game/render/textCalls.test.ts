@@ -11,6 +11,12 @@
  * look, at turn 0. Mutation caught: a recipe that sets a lower-case or
  * mixed-case constant (`textRows(LABEL)` with `LABEL = "Some word"`), or
  * a template built from allowed parts.
+ *
+ * The console room's fittings set no text at all (2.6e C20): every
+ * interior kind and variant is built in every look with the records
+ * cleared first, and neither `textRows` nor a pixel-mark helper may be
+ * called. Their recipes take no model context, so `label` and
+ * `textPanel`, which need one for a text layer, are out of their reach.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -24,10 +30,21 @@ import { LOOKS } from "./looks";
 import type { KitAt } from "./models/common";
 import { buildCurio } from "./models/curios";
 import { buildHero } from "./models/heroes";
+import { INTERIOR_CATALOGUE } from "../world/consoleRoom";
+import type { InteriorKind } from "../world/types";
+import { buildInterior } from "./models/interior";
 import * as pixels from "./models/heroes/pixels";
 import { buildProp } from "./models/props";
 
 const recorded = vi.hoisted(() => [] as string[]);
+
+/**
+ * The names of the pixel-mark helpers a recipe called (`textBlock`,
+ * `markLines`, `pixelPanel`): a mark laid by any of them is text or a
+ * picture on a model, even when its rows never pass `textRows` through
+ * this wrapper (the helpers call it inside their own module).
+ */
+const marked = vi.hoisted(() => [] as string[]);
 
 vi.mock("./models/heroes/pixels", async (importOriginal) => {
   const real = await importOriginal<typeof pixels>();
@@ -36,6 +53,18 @@ vi.mock("./models/heroes/pixels", async (importOriginal) => {
     textRows: (text: string) => {
       recorded.push(text);
       return real.textRows(text);
+    },
+    textBlock: (...args: Parameters<typeof real.textBlock>) => {
+      marked.push("textBlock");
+      return real.textBlock(...args);
+    },
+    markLines: (...args: Parameters<typeof real.markLines>) => {
+      marked.push("markLines");
+      return real.markLines(...args);
+    },
+    pixelPanel: (...args: Parameters<typeof real.pixelPanel>) => {
+      marked.push("pixelPanel");
+      real.pixelPanel(...args);
     },
   };
 });
@@ -101,5 +130,32 @@ describe("readable text set while the recipes build", () => {
     const list = readable();
     for (const t of new Set(recorded))
       expect(list.has(t), JSON.stringify(t)).toBe(true);
+  });
+});
+
+describe("no text on the console room's fittings (2.6e C20)", () => {
+  it("records the pixel-mark helpers, so the check below is not vacuous", () => {
+    // Mutation caught: the wrappers not live, so a mark on a fitting
+    // would pass unseen.
+    marked.length = 0;
+    recorded.length = 0;
+    buildEverything();
+    expect(marked.length).toBeGreaterThan(0);
+    expect(recorded.length).toBeGreaterThan(0);
+  });
+
+  it("sets no text and lays no mark on any interior kind or variant, in any look", () => {
+    // Mutation caught: a label or a pixel mark on a piece (a caption on
+    // the scanner, a number on the inner doors).
+    const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
+    expect(kinds.length).toBe(4);
+    recorded.length = 0;
+    marked.length = 0;
+    for (const look of Object.values(LOOKS))
+      for (const kind of kinds)
+        for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++)
+          buildInterior(fresh(), kind, v, look);
+    expect(recorded).toEqual([]);
+    expect(marked).toEqual([]);
   });
 });

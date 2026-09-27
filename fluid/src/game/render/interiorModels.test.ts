@@ -19,7 +19,7 @@ import type {
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOKS, type Look } from "./looks";
 import {
   floatingGlow,
   inBox,
@@ -208,6 +208,28 @@ describe("interior models (2.6e C2)", () => {
         expect(variants.some(Boolean), kind).toBe(false);
       else expect(variants.some(Boolean), kind).toBe(true);
     }
+  });
+
+  it("keeps the wall pieces' colours in every look (C4)", () => {
+    // Mutation caught: a wall piece painted with a look's colour
+    // (`s.body`, `s.panel`, `s.dark`), which would turn the room's white
+    // beige in one look and grey in another.
+    const walls = KINDS.filter((k) => k !== "console");
+    expect(walls.length).toBe(3);
+    for (const kind of walls)
+      for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
+        const tintsIn = (look: Look) => {
+          const parts: Part[] = [];
+          buildInterior(recordingKitAt(createBuilder(), parts), kind, v, look);
+          return parts.map((p) => p.tint?.join() ?? "none");
+        };
+        const first = tintsIn(LOOKS.aperture);
+        expect(first.length).toBeGreaterThan(0);
+        for (const look of Object.values(LOOKS))
+          expect(tintsIn(look), `${kind} ${String(v)} ${look.id}`).toEqual(
+            first,
+          );
+      }
   });
 
   it("refuses a variant the catalogue does not have", () => {
