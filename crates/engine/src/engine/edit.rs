@@ -406,7 +406,7 @@ impl Engine {
 
         // Answered by whichever arm below runs, so the tail's `SourceEdited`
         // reports the count whichever kind of source this write landed on.
-        let normalized = match source {
+        let (normalized, checksum) = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
@@ -449,7 +449,7 @@ impl Engine {
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await
                     .map_err(SourceEditFailure::after)?;
-                count
+                (count, sha256_hex(edited.as_bytes()))
             }
             ContentSource::Virtual => {
                 let current = {
@@ -504,9 +504,28 @@ impl Engine {
                 )
                 .await
                 .map_err(SourceEditFailure::before)?;
-                count
+                (count, sha256_hex(edited.as_bytes()))
             }
         };
+
+        // Announced here rather than in `edit_engram_as`, so every edit that
+        // reaches a file or a row passes this line: a retirement, a split's
+        // tail, a successor's back-link, evolve's rewrites, the name report's
+        // fixes, the keyed MANIFEST policy edit, the MANIFEST `domain_name`
+        // write-back and a domain rename's MANIFEST and relink steps all
+        // funnel through `apply_source_edit`. The live arm and the draft arm
+        // returned above; the room's save and `DomainView::put` announce
+        // those.
+        self.announce(Change::Engram(EngramChanged {
+            domain: desc.domain.clone(),
+            permalink: desc.permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(checksum),
+            actor: Some(actor.to_string()),
+            draft_of: None,
+        }));
 
         // An edit may have rewritten this domain's MANIFEST, its routing and
         // its declared name. The store locks above are all released.

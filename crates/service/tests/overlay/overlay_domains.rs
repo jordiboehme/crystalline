@@ -7628,3 +7628,62 @@ async fn the_startup_pass_binds_a_drafts_reference_in_its_actors_view() {
         "to alice's own draft: {slice:?}"
     );
 }
+
+/// A team domain's discard is a feed point run on somebody's behalf: the
+/// restored engram is announced once, under the discarding account's name,
+/// and never under nobody's. Catches the discard's targeted sync announcing
+/// with the watcher's empty label.
+#[tokio::test]
+async fn a_team_discard_announces_the_restored_engram_under_the_discarding_account() {
+    let f = origin_fixture().await;
+    let root = f.domain_root("team");
+    f.snapshot_origin("team");
+    for rel in ["MANIFEST.md", "plan.md"] {
+        crystalline_remote::state::write_base_file(
+            &f.origins.join("team"),
+            rel,
+            &std::fs::read(root.join(rel)).unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut rx = f.engine.changes().subscribe();
+    let report = f
+        .engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: Some(crate::support::sha256_hex(ALICE_DRAFT.as_bytes())),
+            }],
+            &ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["plan.md"]),
+        "{report}"
+    );
+    let heard = rx.try_recv().expect("the restore announced");
+    match &heard.change {
+        crystalline_service::changes::Change::Engram(change) => {
+            assert_eq!(
+                (change.domain.as_str(), change.path.as_str()),
+                ("team", "plan.md")
+            );
+            assert_eq!(
+                change.kind,
+                crystalline_service::changes::ChangeKind::Modified
+            );
+            assert_eq!(change.actor.as_deref(), Some("ada"));
+            assert_eq!(
+                change.checksum.as_deref(),
+                Some(crate::support::sha256_hex(PLAN.as_bytes()).as_str())
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "once");
+}

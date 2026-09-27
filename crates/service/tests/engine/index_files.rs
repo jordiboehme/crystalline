@@ -383,3 +383,42 @@ async fn a_virtual_domain_generates_no_files() {
     // Nothing anywhere: a virtual domain has no filesystem root to navigate.
     assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
 }
+
+/// A regenerated listing is never announced: the four content mutations that
+/// rewrite `index.md` announce their engram and nothing for the listing, and
+/// a watcher pass over the regenerated listing announces nothing at all.
+#[tokio::test]
+async fn a_regenerated_index_file_is_never_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = file_engine(dir.path()).await;
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .write_engram(&write_params("First", Some("topic")))
+        .await
+        .unwrap();
+    assert!(
+        dir.path().join("topic/index.md").exists(),
+        "the listing was written"
+    );
+    let mut heard = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        heard.push(envelope.change);
+    }
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(heard[0].domain(), "notes");
+    assert!(
+        heard[0]
+            .data()
+            .unwrap()
+            .contains("\"path\":\"topic/first.md\"")
+    );
+    engine
+        .sync_paths("notes", vec!["topic/index.md".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "the listing rode the watcher and was dropped"
+    );
+}

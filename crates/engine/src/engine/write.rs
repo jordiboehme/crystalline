@@ -515,6 +515,20 @@ impl Engine {
         // engram, the source of its routing bullets, so refresh the cache the
         // sync `routing_text` reads; a MANIFEST of either kind may declare a
         // new name. The store locks above are all released.
+        self.announce(Change::Engram(EngramChanged {
+            domain: p.domain.clone(),
+            permalink: permalink.clone(),
+            path: rel.clone(),
+            kind: if p.overwrite {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Added
+            },
+            from: None,
+            checksum: Some(sha256_hex(markdown.as_bytes())),
+            actor: Some(actor.clone()),
+            draft_of: None,
+        }));
         self.after_source_write(&source, &rel).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
@@ -806,6 +820,16 @@ impl Engine {
                 });
             receipt_permalink(found, desc.permalink.clone())
         };
+        self.announce(Change::Engram(EngramChanged {
+            domain: desc.domain.clone(),
+            permalink: permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(sha256_hex(content.as_bytes())),
+            actor: change_label(scope),
+            draft_of: None,
+        }));
 
         // A save can rewrite a MANIFEST or the titles a folder index lists,
         // same as an edit.
@@ -1114,6 +1138,17 @@ impl Engine {
                 });
             receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
+        // The function takes a view and no scope, so nobody is named.
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: permalink.clone(),
+            path: path.to_string(),
+            kind: ChangeKind::Added,
+            from: None,
+            checksum: Some(sha256_hex(content.as_bytes())),
+            actor: None,
+            draft_of: None,
+        }));
         self.nudge_embed();
         Ok(json!({
             "domain": domain,

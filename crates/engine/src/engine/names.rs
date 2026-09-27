@@ -558,8 +558,27 @@ impl Engine {
             store.resolve_references_to_spellings(&spellings).await
         }
         .await;
-        if let Err(e) = bound {
-            tracing::warn!("binding the references that name '{domain}' failed: {e}");
+        drop(store);
+        match bound {
+            // The pass answers one count across every domain and names none,
+            // so every other registered domain is announced whole: a
+            // registration is rare and a `domain` event only refetches what a
+            // page is showing. The new domain's own rows rode its sync.
+            Ok(count) if count > 0 => {
+                let mut others: Vec<String> = self
+                    .registered_domain_names()
+                    .into_iter()
+                    .filter(|name| name != domain)
+                    .collect();
+                others.sort();
+                for name in others {
+                    self.announce_domain(&name, None, None);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("binding the references that name '{domain}' failed: {e}");
+            }
         }
     }
 
@@ -578,14 +597,42 @@ impl Engine {
                 return;
             }
         };
+        // The local name of each row, for the announcement: the store has no
+        // id-to-name lookup, so the registered names are asked once. A row no
+        // registered name maps to (a leftover) is bound and never announced.
+        let names: HashMap<DomainId, String> = {
+            let registered = self.registered_domain_names();
+            let store = self.store.lock().await;
+            let mut names = HashMap::new();
+            for name in registered {
+                if let Ok(Some(id)) = store.domain_id(&name).await {
+                    names.insert(id, name);
+                }
+            }
+            names
+        };
         for id in every {
             let store = self.store.lock().await;
             let base = !base_done.contains(&id);
-            if let Err(e) = in_one_transaction(&*store, bind_pending(&*store, id, base)).await {
-                tracing::warn!(
-                    "binding the pending references of domain {} failed: {e}",
-                    id.0
-                );
+            let bound = in_one_transaction(&*store, bind_pending(&*store, id, base)).await;
+            drop(store);
+            match bound {
+                // Nothing's text changed, but a pending link or relation is
+                // bound now, which the reading page, the backlinks and the
+                // graph show; the pass names no engram, so the domain is
+                // announced whole.
+                Ok(count) if count > 0 => {
+                    if let Some(name) = names.get(&id) {
+                        self.announce_domain(name, None, None);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "binding the pending references of domain {} failed: {e}",
+                        id.0
+                    );
+                }
             }
         }
     }
@@ -611,25 +658,30 @@ async fn bind_pending(
     store: &dyn Store,
     id: DomainId,
     base: bool,
-) -> crystalline_index::Result<()> {
+) -> crystalline_index::Result<u64> {
+    let mut bound = 0;
     for (actor, _) in store.overlay_counts(id).await? {
-        store.reresolve_actor_references(id, &actor).await?;
+        bound += store.reresolve_actor_references(id, &actor).await?;
     }
     if base {
-        store.resolve_pending_relations(id).await?;
-        store.resolve_pending_links(id).await?;
+        bound += store.resolve_pending_relations(id).await?;
+        bound += store.resolve_pending_links(id).await?;
     }
-    Ok(())
+    Ok(bound)
 }
 
-/// `pass` inside one transaction, rolled back when it fails.
-async fn in_one_transaction(
+/// `pass` inside one transaction, rolled back when it fails; answers what
+/// the pass answered once the transaction committed.
+async fn in_one_transaction<T>(
     store: &dyn Store,
-    pass: impl std::future::Future<Output = crystalline_index::Result<()>>,
-) -> crystalline_index::Result<()> {
+    pass: impl std::future::Future<Output = crystalline_index::Result<T>>,
+) -> crystalline_index::Result<T> {
     store.begin().await?;
     match pass.await {
-        Ok(()) => store.commit().await,
+        Ok(value) => {
+            store.commit().await?;
+            Ok(value)
+        }
         Err(e) => {
             let _ = store.rollback().await;
             Err(e)
@@ -645,7 +697,7 @@ async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index
         for id in &every {
             bind_pending(store, *id, true).await?;
         }
-        Ok(())
+        Ok::<(), crystalline_index::IndexError>(())
     })
     .await
 }

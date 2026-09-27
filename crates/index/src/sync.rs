@@ -107,6 +107,37 @@ const CONCURRENCY: usize = 8;
 /// memory independently of the domain's size.
 const SYNC_SLAB_FILES: usize = 256;
 
+/// What one path of an apply became, as the daemon announces it to whoever is
+/// listening. The counts on [`SyncReport`] say how many; this says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Moved,
+}
+
+/// One path the apply moved, deleted, added or rewrote. Never serialized: the
+/// report's JSON is a summary for people and the changes are for the engine's
+/// change bus, which announces them one by one and then forgets them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathChange {
+    pub kind: PathChangeKind,
+    /// After the change; for `Deleted`, the path that went.
+    pub path: String,
+    /// `Moved` only: the path before.
+    pub from: Option<String>,
+    /// `Moved` only: the permalink the row answered to before the rename. The
+    /// store decides whether a permalink follows its path, so both ends are
+    /// read from it rather than derived.
+    pub from_permalink: Option<String>,
+    /// The permalink after the change, when the index could say.
+    pub permalink: Option<String>,
+    /// The content's lowercase hex SHA-256, the same value the stamp records
+    /// and every write receipt reports. Absent for `Deleted`.
+    pub checksum: Option<String>,
+}
+
 /// The outcome of a sync over one domain.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncReport {
@@ -147,6 +178,10 @@ pub struct SyncReport {
     pub links_resolved_late: u64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Every path this apply changed, in apply order. Skipped by serde on
+    /// both sides: the wire shape of a report is its counts.
+    #[serde(skip)]
+    pub changes: Vec<PathChange>,
 }
 
 /// A file found on disk during the walk.
@@ -1218,6 +1253,7 @@ async fn apply_changes<S: Store + ?Sized>(
     } else {
         store.file_stamps(domain).await?
     };
+    let domain_name = report.domain.clone();
 
     for (from, to) in moves {
         // A move is a delete of `from` plus an add of `to`; if either end's db
@@ -1228,7 +1264,17 @@ async fn apply_changes<S: Store + ?Sized>(
             tracing::debug!(from = %from, to = %to, "sync: deferring a move whose db stamp moved mid-scan");
             continue;
         }
+        let from_permalink = permalink_at(store, &domain_name, &from).await?;
         store.rename_engram(domain, &from, &to).await?;
+        let permalink = permalink_at(store, &domain_name, &to).await?;
+        report.changes.push(PathChange {
+            kind: PathChangeKind::Moved,
+            path: to.clone(),
+            from: Some(from.clone()),
+            from_permalink,
+            permalink,
+            checksum: snapshot.get(&from).map(|stamp| stamp.sha256.clone()),
+        });
         report.moved += 1;
     }
     for path in deletes {
@@ -1249,7 +1295,16 @@ async fn apply_changes<S: Store + ?Sized>(
             tracing::debug!(path = %path, "sync: deferring a delete whose file reappeared on disk");
             continue;
         }
+        let permalink = permalink_at(store, &domain_name, &path).await?;
         store.delete_engram(domain, &path).await?;
+        report.changes.push(PathChange {
+            kind: PathChangeKind::Deleted,
+            path: path.clone(),
+            from: None,
+            from_permalink: None,
+            permalink,
+            checksum: None,
+        });
         report.deleted += 1;
     }
     // The changed files, slab by slab. The stale-stamp guard runs before a slab
@@ -1274,6 +1329,22 @@ async fn apply_changes<S: Store + ?Sized>(
         parse_and_apply_slab(store, domain, slab, chunk_params, report).await?;
     }
     Ok(())
+}
+
+/// The permalink the index holds for `path`, or `None` when no row stands
+/// there. One prefix query, the same read-back the engine's save receipt
+/// makes: the row's own permalink is what a subscriber's page is keyed on.
+async fn permalink_at<S: Store + ?Sized>(
+    store: &S,
+    domain: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    Ok(store
+        .list_engrams(domain, Some(path), None)
+        .await?
+        .into_iter()
+        .find(|row| row.path == path)
+        .map(|row| row.permalink))
 }
 
 /// Read, parse, chunk and upsert one slab of changed files.
@@ -1371,6 +1442,18 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                         // the model id and text, so where the chunks were computed
                         // changes nothing about the carry-over.
                         store.replace_chunks(engram_id, &chunks).await?;
+                        report.changes.push(PathChange {
+                            kind: if previously_indexed {
+                                PathChangeKind::Modified
+                            } else {
+                                PathChangeKind::Added
+                            },
+                            path: record.path.clone(),
+                            from: None,
+                            from_permalink: None,
+                            permalink: Some(record.permalink.clone()),
+                            checksum: Some(record.stamp.sha256.clone()),
+                        });
                         if previously_indexed {
                             report.updated += 1;
                         } else {

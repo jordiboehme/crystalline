@@ -35,6 +35,21 @@ impl Engine {
         )
         .await?;
         drop(store);
+        let permalink = parse_engram(markdown)
+            .ok()
+            .and_then(|engram| engram.frontmatter.permalink)
+            .filter(|permalink| !permalink.is_empty())
+            .unwrap_or_else(|| "manifest".to_string());
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink,
+            path: "MANIFEST.md".to_string(),
+            kind: ChangeKind::Added,
+            from: None,
+            checksum: Some(sha256_hex(markdown.as_bytes())),
+            actor: None,
+            draft_of: None,
+        }));
 
         // The MANIFEST engram just landed; its Scope and When to Use bullets are
         // exactly what the routing block reads for this virtual domain, so
@@ -87,6 +102,8 @@ impl Engine {
         let mut collisions: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
+        // What landed, announced once after the loop through the collapse rule.
+        let mut announced: Vec<PathChange> = Vec::new();
 
         for (rel, abs) in files {
             let text = match std::fs::read_to_string(&abs) {
@@ -124,6 +141,18 @@ impl Engine {
                 .await
             {
                 Ok(_) => {
+                    announced.push(PathChange {
+                        kind: if existing_paths.contains(&rel) {
+                            crystalline_index::PathChangeKind::Modified
+                        } else {
+                            crystalline_index::PathChangeKind::Added
+                        },
+                        path: rel.clone(),
+                        from: None,
+                        from_permalink: None,
+                        permalink: Some(record.permalink.clone()),
+                        checksum: Some(record.stamp.sha256.clone()),
+                    });
                     changes.push(json!({ "path": rel, "permalink": record.permalink }));
                     written += 1;
                 }
@@ -134,6 +163,7 @@ impl Engine {
             }
         }
 
+        self.announce_paths(domain, announced, None);
         Ok(json!({
             "domain": domain,
             "dry_run": dry_run,
@@ -218,6 +248,7 @@ impl Engine {
         // Delta 6: every entry gets a row, whatever became of it.
         let mut entries: Vec<Value> = Vec::new();
         let mut changed_paths: Vec<String> = Vec::new();
+        let mut virtual_changes: Vec<PathChange> = Vec::new();
 
         // Delta 1: the files arrive in memory, already unpacked by the caller,
         // so there is no folder to walk and no source directory to validate.
@@ -379,7 +410,20 @@ impl Engine {
                         let store = self.store.lock().await;
                         self.index_markdown(&*store, domain_id, path, text, stamp, None, true)
                             .await
-                            .map(|_| ())
+                            .map(|_| {
+                                virtual_changes.push(PathChange {
+                                    kind: if exists {
+                                        crystalline_index::PathChangeKind::Modified
+                                    } else {
+                                        crystalline_index::PathChangeKind::Added
+                                    },
+                                    path: path.clone(),
+                                    from: None,
+                                    from_permalink: None,
+                                    permalink: Some(record.permalink.clone()),
+                                    checksum: Some(sha256_hex(text.as_bytes())),
+                                });
+                            })
                     }
                 };
                 if let Err(e) = outcome {
@@ -424,6 +468,8 @@ impl Engine {
         if !changed_paths.is_empty() {
             self.sync_paths(domain, changed_paths).await?;
         }
+        // A virtual domain's rows skipped the sync, so they announce here.
+        self.announce_paths(domain, virtual_changes, None);
 
         Ok(json!({
             "domain": domain,

@@ -310,6 +310,36 @@ async fn an_agent_edit_composes_with_a_typed_line_and_lands_live() {
     );
 }
 
+/// An edit that composed into an open room announces nothing: nothing
+/// landed. The room's save a moment later is what announces, once.
+#[tokio::test]
+async fn an_agent_edit_into_an_open_room_announces_nothing_until_the_room_saves() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "a person typed this").await;
+    let mut rx = engine.changes().subscribe();
+    let receipt = engine
+        .edit_engram_as(
+            &append_edit("and the agent added that", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["landed"].as_str(), Some("live"));
+    assert!(rx.try_recv().is_err(), "nothing landed, nothing announced");
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let saved = rx.try_recv().expect("the room's save announced");
+    assert_eq!(saved.change.name(), "engram");
+    assert!(rx.try_recv().is_err(), "once");
+}
+
 /// A guarded split of a page somebody is typing in is guarded against the
 /// document, not against the file.
 ///

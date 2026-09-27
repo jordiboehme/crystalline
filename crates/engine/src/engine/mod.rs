@@ -45,9 +45,9 @@ use crystalline_index::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
-    InboundQuery, IndexError, RULES, RebuildKind, RecentFilter, ReindexHooks, SearchMode,
-    SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions,
-    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    InboundQuery, IndexError, PathChange, RULES, RebuildKind, RecentFilter, ReindexHooks,
+    SearchMode, SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram, SweepInput,
+    SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
     is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
     reindex_domains, resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain,
     scan_paths,
@@ -62,6 +62,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::changes::{
+    Change, ChangeKind, DomainAudience, DomainChanged, EngramChanged, MovedFrom, change_label,
+};
 use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::origin;
@@ -947,6 +950,11 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // Every change the store commits, announced once, for `GET /api/v1/events`
+    // to stream. On the engine for the reason `list_subscribers` is: the
+    // watcher, the verbs, a room's save, a pull and a discard share nothing
+    // else with the route. See `crate::changes`.
+    changes: crate::changes::ChangeBus,
     // Serializes a domain registration against a domain removal, for the
     // whole of each: `Engine::unregister_domain` holds it across its sweep and
     // its tail, and the REST create holds it across its own registration
@@ -1713,6 +1721,7 @@ impl Engine {
             adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            changes: crate::changes::ChangeBus::new(),
             domain_admin: tokio::sync::Mutex::new(()),
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
@@ -2454,6 +2463,117 @@ impl Engine {
         &self.list_subscribers
     }
 
+    /// The change bus every `GET /api/v1/events` subscriber listens on.
+    pub fn changes(&self) -> &crate::changes::ChangeBus {
+        &self.changes
+    }
+
+    /// Announce one committed change. Never awaits, never blocks, never
+    /// fails: called after the store call returned and outside every lock,
+    /// at every feed point the spec's Part A lists and nowhere else.
+    pub(crate) fn announce(&self, change: Change) {
+        if let Some(id) = self.changes.announce(change) {
+            tracing::trace!(%id, "announced a change");
+        }
+    }
+
+    /// Announce what a sync report says it moved: each path as an `engram`
+    /// event at or below `COLLAPSE_THRESHOLD`, one `domain` event above it.
+    /// A generated listing is dropped before it is counted, so a
+    /// regeneration by `refresh_index_files` that the watcher then sees
+    /// announces nothing.
+    pub(crate) fn announce_report(&self, name: &str, report: &SyncReport, actor: Option<&str>) {
+        let changes: Vec<&PathChange> = report
+            .changes
+            .iter()
+            .filter(|change| !crystalline_core::is_reserved_path(&change.path))
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        if changes.len() > crate::changes::COLLAPSE_THRESHOLD {
+            self.announce_domain(name, actor, None);
+            return;
+        }
+        for change in changes {
+            let permalink = change
+                .permalink
+                .clone()
+                .unwrap_or_else(|| change.path.trim_end_matches(".md").to_string());
+            let from = change.from.as_ref().map(|path| MovedFrom {
+                path: path.clone(),
+                permalink: change
+                    .from_permalink
+                    .clone()
+                    .unwrap_or_else(|| path.trim_end_matches(".md").to_string()),
+            });
+            self.announce(Change::Engram(EngramChanged {
+                domain: name.to_string(),
+                permalink,
+                path: change.path.clone(),
+                kind: change.kind.into(),
+                from,
+                checksum: change.checksum.clone(),
+                actor: actor.map(str::to_string),
+                draft_of: None,
+            }));
+        }
+    }
+
+    /// Announce a batch of changes one verb made in one domain, through the
+    /// same listing filter and collapse rule a sync report goes through.
+    pub(crate) fn announce_paths(&self, name: &str, changes: Vec<PathChange>, actor: Option<&str>) {
+        let report = SyncReport {
+            domain: name.to_string(),
+            changes,
+            ..SyncReport::default()
+        };
+        self.announce_report(name, &report, actor);
+    }
+
+    /// Announce that a whole domain moved, when nothing finer can be said.
+    /// `audience` is `Some`, from [`Self::domain_audience`] read a moment
+    /// earlier, only for the old name leaving a rename and for a removal
+    /// (ruled 2026-09-27): that name's privacy record is about to disappear,
+    /// so the frame must not be filtered against a session's own cache or a
+    /// fresh `hidden_domains` call, either of which can answer from a
+    /// registry the change itself is emptying (or, symmetrically, still
+    /// answer "member" a moment after that stopped being true). Every other
+    /// call passes `None`: a rename's new name is re-keyed, not destroyed,
+    /// so it keeps the ordinary per-session lazy check.
+    pub(crate) fn announce_domain(
+        &self,
+        name: &str,
+        actor: Option<&str>,
+        audience: Option<DomainAudience>,
+    ) {
+        self.announce(Change::Domain(DomainChanged {
+            domain: name.to_string(),
+            actor: actor.map(str::to_string),
+            audience,
+        }));
+    }
+
+    /// The identities that may read `name` right now, read from the privacy
+    /// and membership records through [`crate::scope::DomainAccess::readers_of`].
+    /// Used only to capture a rename's old name and a removal's audience in
+    /// the instant before the change takes the name out of those records
+    /// (ruled 2026-09-27). `Everyone` on an engine with no resolver
+    /// installed, which is the machine owner's engine and filters nothing.
+    pub(crate) async fn domain_audience(&self, name: &str) -> Result<DomainAudience> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(DomainAudience::Everyone);
+        };
+        let readers = access
+            .readers_of(name)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok(match readers {
+            None => DomainAudience::Everyone,
+            Some(accounts) => DomainAudience::Accounts(accounts),
+        })
+    }
+
     /// How the shipped agent skills are served over MCP: the value this engine
     /// was **built** with, not the live setting.
     ///
@@ -2924,6 +3044,16 @@ impl Engine {
         };
         self.commit_overlay_row(desc.domain_id, actor, &record)
             .await?;
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: desc.permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Deleted,
+            from: None,
+            checksum: None,
+            actor: Some(actor.to_string()),
+            draft_of: Some(actor.to_string()),
+        }));
         let warning = match crate::overlay_journal::journal_tombstone(
             &state_dir, domain, actor, &desc.path,
         ) {
@@ -5367,6 +5497,16 @@ fn changed_anything(report: &SyncReport) -> bool {
     report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
 }
 
+/// The label a share actor's own changes are announced under: the account,
+/// or nobody for the machine owner and an unauthenticated HTTP agent, the
+/// rule `crate::changes::change_label` applies to a scope.
+fn share_actor_label(actor: &ShareActor) -> Option<String> {
+    match actor {
+        ShareActor::Account(name) => Some(name.clone()),
+        ShareActor::Owner | ShareActor::HttpAgent => None,
+    }
+}
+
 /// The refusal for a path whose filename is one of the OKF reserved names.
 /// Actionable: it says which name is reserved, why, and what to do instead.
 fn reserved_name_error(rel: &str) -> String {
@@ -6957,6 +7097,7 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
         if changed_anything(report) {
             self.engine.refresh_index_files(name).await;
         }
+        self.engine.announce_report(name, report, None);
     }
 }
 
@@ -8571,5 +8712,62 @@ mod share_actor_tests {
 
         let offline = enrich_write_error(RemoteError::Offline, Some("alice"), "team/knowledge");
         assert_eq!(offline.to_string(), RemoteError::Offline.to_string());
+    }
+}
+
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+    use crystalline_index::{PathChangeKind, TursoStore};
+
+    fn change(kind: PathChangeKind, path: &str) -> PathChange {
+        PathChange {
+            kind,
+            path: path.to_string(),
+            from: None,
+            from_permalink: None,
+            permalink: None,
+            checksum: None,
+        }
+    }
+
+    /// A generated listing never rides the bus, even when a report names
+    /// one: the sync's delete loop still takes a reserved row recorded
+    /// before the exclusion existed, and that deletion is not an engram's.
+    /// Catches a report announced without the listing filter.
+    #[tokio::test]
+    async fn a_listing_in_a_report_is_dropped_and_the_rest_is_announced() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let mut rx = engine.changes().subscribe();
+        engine.announce_paths(
+            "eng",
+            vec![
+                change(PathChangeKind::Deleted, "topic/index.md"),
+                change(PathChangeKind::Modified, "topic/a.md"),
+            ],
+            None,
+        );
+        let heard = rx.try_recv().unwrap();
+        match heard.change {
+            Change::Engram(engram) => {
+                assert_eq!(engram.path, "topic/a.md");
+                assert_eq!(
+                    engram.permalink, "topic/a",
+                    "the path's slug when none was read"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the listing was dropped");
+
+        // A report of nothing but listings announces nothing at all.
+        engine.announce_paths("eng", vec![change(PathChangeKind::Added, "index.md")], None);
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -253,6 +253,9 @@ impl Engine {
         // what stayed behind.
         let mut carried: Vec<AttachmentCarry> = Vec::new();
         let mut attachment_warnings: Vec<String> = Vec::new();
+        // The checksum of the text that landed at the destination, for the
+        // change this move announces at its tail.
+        let moved_checksum: String;
 
         if cross {
             // Index the content into the destination source, then remove the
@@ -280,6 +283,7 @@ impl Engine {
             // some other domain is untouched by it and would otherwise cross
             // domains still spelled however it was written.
             let (content, _) = self.normalize_domain_spellings(&content, &hidden).await;
+            moved_checksum = sha256_hex(content.as_bytes());
             match &dest_source {
                 ContentSource::File { root } => {
                     let dest_abs = join_rel(root, &dest_rel);
@@ -333,6 +337,13 @@ impl Engine {
                 Some(text) => Some(self.normalize_domain_spellings(&text, &hidden).await.0),
                 None => None,
             };
+            // A plain rename carries `original` across byte for byte; a
+            // readdressing one lands `moved_text`.
+            moved_checksum = sha256_hex(
+                moved_text
+                    .as_deref()
+                    .map_or(original.as_bytes(), str::as_bytes),
+            );
             if let ContentSource::File { root } = &src_source {
                 let src_abs = join_rel(root, &src.path);
                 let dest_abs = join_rel(root, &dest_rel);
@@ -454,6 +465,49 @@ impl Engine {
                 });
             receipt_permalink(found, new_permalink.clone())
         };
+
+        // A subscriber may see only one of two domains, so a cross-domain
+        // move is a `deleted` in the source and an `added` in the
+        // destination; a rename inside one domain, a permalink-only rename in
+        // place included, is one `moved` with `from`. The linkers the move
+        // rewrote announced themselves in `relink_engram`.
+        let label = change_label(scope);
+        if cross {
+            self.announce(Change::Engram(EngramChanged {
+                domain: p.domain.clone(),
+                permalink: src.permalink.clone(),
+                path: src.path.clone(),
+                kind: ChangeKind::Deleted,
+                from: None,
+                checksum: None,
+                actor: label.clone(),
+                draft_of: None,
+            }));
+            self.announce(Change::Engram(EngramChanged {
+                domain: dest_domain.clone(),
+                permalink: dest_permalink.clone(),
+                path: dest_rel.clone(),
+                kind: ChangeKind::Added,
+                from: None,
+                checksum: Some(moved_checksum),
+                actor: label,
+                draft_of: None,
+            }));
+        } else {
+            self.announce(Change::Engram(EngramChanged {
+                domain: p.domain.clone(),
+                permalink: dest_permalink.clone(),
+                path: dest_rel.clone(),
+                kind: ChangeKind::Moved,
+                from: Some(MovedFrom {
+                    path: src.path.clone(),
+                    permalink: src.permalink.clone(),
+                }),
+                checksum: Some(moved_checksum),
+                actor: label,
+                draft_of: None,
+            }));
+        }
 
         // `links_rewritten` counts engrams, as it always has; the references
         // inside them are `references_rewritten`, and `rewritten` names the
@@ -723,6 +777,19 @@ impl Engine {
             .and_then(|engram| engram.frontmatter.permalink)
             .filter(|permalink| !permalink.is_empty())
             .unwrap_or_else(|| crystalline_core::path_permalink(&linker.path));
+        drop(store);
+        // The linker's own text changed, possibly in another domain, so its
+        // page follows too.
+        self.announce(Change::Engram(EngramChanged {
+            domain: linker.domain.clone(),
+            permalink: permalink.clone(),
+            path: linker.path.clone(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(sha256_hex(replaced.as_bytes())),
+            actor: Some(actor.to_string()),
+            draft_of: None,
+        }));
         Ok(Some((count, permalink)))
     }
 
@@ -846,6 +913,18 @@ impl Engine {
 
         // Rewrite each engram, mirroring move_engram's file-vs-virtual branches.
         let mut rewritten = 0usize;
+        // What each domain saw rewritten, announced once per domain after every
+        // store lock is released, through the collapse rule a sync goes
+        // through: a tag across a hundred engrams is one `domain` event.
+        let mut changed: IndexMap<String, Vec<PathChange>> = IndexMap::new();
+        let retagged = |desc: &EngramDescriptor, edited: &str| PathChange {
+            kind: crystalline_index::PathChangeKind::Modified,
+            path: desc.path.clone(),
+            from: None,
+            from_permalink: None,
+            permalink: Some(desc.permalink.clone()),
+            checksum: Some(sha256_hex(edited.as_bytes())),
+        };
         for desc in &targets {
             match self.read_source(&desc.domain) {
                 ContentSource::File { root } => {
@@ -861,6 +940,10 @@ impl Engine {
                     self.reindex_file(&*store, desc.domain_id, &root, &desc.path)
                         .await?;
                     rewritten += 1;
+                    changed
+                        .entry(desc.domain.clone())
+                        .or_default()
+                        .push(retagged(desc, &edited));
                 }
                 ContentSource::Virtual => {
                     let current = {
@@ -884,6 +967,10 @@ impl Engine {
                     )
                     .await?;
                     rewritten += 1;
+                    changed
+                        .entry(desc.domain.clone())
+                        .or_default()
+                        .push(retagged(desc, &edited));
                 }
             }
         }
@@ -923,6 +1010,10 @@ impl Engine {
                                 self.reindex_file(&*store, *domain_id, &root, "MANIFEST.md")
                                     .await?;
                                 alias_recorded.push(name.clone());
+                                changed
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(manifest_change(&edited));
                             }
                             AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
                             AliasRecord::Conflict => alias_conflict.push(name.clone()),
@@ -953,6 +1044,10 @@ impl Engine {
                                 .await?;
                                 virtual_manifest_changed = true;
                                 alias_recorded.push(name.clone());
+                                changed
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(manifest_change(&edited));
                             }
                             AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
                             AliasRecord::Conflict => alias_conflict.push(name.clone()),
@@ -974,6 +1069,10 @@ impl Engine {
             }
         }
 
+        // Retag carries no scope and stamps nobody.
+        for (name, changes) in changed {
+            self.announce_paths(&name, changes, None);
+        }
         Ok(response)
     }
 
@@ -1001,5 +1100,21 @@ impl Engine {
             )));
         }
         Ok(())
+    }
+}
+
+/// A MANIFEST rewrite as a path change: its permalink is left to the
+/// announce's path fallback, since the alias recording never touches it.
+fn manifest_change(edited: &str) -> PathChange {
+    PathChange {
+        kind: crystalline_index::PathChangeKind::Modified,
+        path: "MANIFEST.md".to_string(),
+        from: None,
+        from_permalink: None,
+        permalink: parse_engram(edited)
+            .ok()
+            .and_then(|engram| engram.frontmatter.permalink)
+            .filter(|permalink| !permalink.is_empty()),
+        checksum: Some(sha256_hex(edited.as_bytes())),
     }
 }

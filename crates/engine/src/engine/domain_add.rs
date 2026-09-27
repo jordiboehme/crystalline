@@ -949,11 +949,17 @@ impl Engine {
             .flatten()
             .map(|per_actor| per_actor.values().sum())
             .unwrap_or(0);
+        // Who could read the domain a moment before it goes, read while the
+        // privacy records still name it (ruled 2026-09-27): the removal's
+        // event carries this snapshot, never a registry the removal is about
+        // to empty.
+        let audience = self.domain_audience(name).await?;
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,
         };
         let mut report = self.domain_remove(name).await?;
+        self.announce_domain(name, None, Some(audience));
         self.forget_domain_records(name).await;
         // Every draft in this domain has just ended, whichever way each one
         // ended, so every link on one and every session inside one ends with

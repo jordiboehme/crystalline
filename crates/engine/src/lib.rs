@@ -3,6 +3,7 @@
 //! or in-process for a brief standalone open; the MCP tools, the control
 //! commands, the JSON API and the CLI data commands all funnel through it.
 
+pub mod changes;
 pub mod collab;
 #[doc(hidden)]
 pub mod domain_view;

@@ -58,6 +58,7 @@ use crystalline_index::{
 use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
 
+use crate::changes::{Change, ChangeKind, EngramChanged};
 use crate::engine::{
     ContentSource, Engine, EngineError, EngramText, OVERLAY_NEEDS_IDENTITY, Result, asset_claim,
     folder_slash_lower, is_within_domain, join_rel, note_unmirrored, overlay_descriptor,
@@ -510,6 +511,19 @@ impl<'a> DomainView<'a> {
         self.engine
             .commit_overlay_row(domain_id, actor, &record)
             .await?;
+        // A draft moved: the owner's own sessions refetch, nobody else hears
+        // it (`draft_of` is what the route filters on). `modified` whether
+        // the draft is new or not: the counts a listing draws are the base's.
+        self.engine.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: record.permalink.clone(),
+            path: path.to_string(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(record.stamp.sha256.clone()),
+            actor: Some(actor.to_string()),
+            draft_of: Some(actor.to_string()),
+        }));
         let warning = match crate::overlay_journal::journal_write(
             &state_dir,
             domain,
@@ -624,6 +638,20 @@ impl<'a> DomainView<'a> {
         match done {
             Ok(()) => {
                 store.commit().await?;
+                drop(store);
+                // The row is gone, so its permalink is the path's slug: the
+                // owner is on the page that dropped it and the tree row is
+                // right either way.
+                self.engine.announce(Change::Engram(EngramChanged {
+                    domain: domain.to_string(),
+                    permalink: path.trim_end_matches(".md").to_string(),
+                    path: path.to_string(),
+                    kind: ChangeKind::Deleted,
+                    from: None,
+                    checksum: None,
+                    actor: Some(actor.to_string()),
+                    draft_of: Some(actor.to_string()),
+                }));
                 Ok(())
             }
             Err(e) => {

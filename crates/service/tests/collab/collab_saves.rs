@@ -206,6 +206,45 @@ async fn a_pause_lands_the_save_with_the_separator_reapplied() {
     );
 }
 
+/// The room's save is a feed point: one `modified` per landed save, and
+/// nothing for a tick that had nothing to save.
+#[tokio::test]
+async fn a_room_save_announces_once() {
+    let (_tmp, engine, _scratch) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let mut rx = engine.changes().subscribe();
+    append_line(&joined, &doc, "typed in the room").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    let saved = next_control(&mut joined.rx).await;
+    assert!(matches!(saved, Control::Saved { .. }));
+    let first = rx.try_recv().expect("the save announced");
+    match &first.change {
+        crystalline_service::changes::Change::Engram(change) => {
+            assert_eq!(change.permalink, "alpha");
+            assert_eq!(
+                change.kind,
+                crystalline_service::changes::ChangeKind::Modified
+            );
+            assert_eq!(
+                change.actor, None,
+                "a room saves as the machine owner, who has no label"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "once");
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    assert!(rx.try_recv().is_err(), "a quiet tick announces nothing");
+}
+
 #[tokio::test]
 async fn an_untouched_session_never_writes() {
     let (tmp, engine, _scratch) = engine_fixture().await;

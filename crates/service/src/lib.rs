@@ -25,8 +25,8 @@ pub mod ui;
 
 pub use crystalline_engine::{PendingRename, RenameOwner, pending_rename};
 pub use crystalline_engine::{
-    engine, harness_cli, maintenance, nudge, overlay, overlay_journal, params, settings, similar,
-    subscribers, temp_store, web_url,
+    changes, engine, harness_cli, maintenance, nudge, overlay, overlay_journal, params, settings,
+    similar, subscribers, temp_store, web_url,
 };
 // Were crate-private modules of this crate; still only this crate's business.
 pub(crate) use crystalline_engine::{domain_view, review, serving, toon};

@@ -2407,7 +2407,8 @@ impl Engine {
             // The targeted pass the import already takes: exactly these paths,
             // which is also what rebuilds a folder's listing beside a discarded
             // engram in a domain that shares its listings.
-            self.sync_paths(domain, touched).await?;
+            self.sync_paths_as(domain, touched, share_actor_label(actor).as_deref())
+                .await?;
             if !self.request_embed()
                 && let Err(e) = self.embed_pending().await
             {
