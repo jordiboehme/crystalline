@@ -104,6 +104,16 @@ pub struct DomainView<'a> {
     /// rather than from an inference, and the receipt, which tells the caller
     /// whose draft their work landed in.
     joined: Option<String>,
+    /// Who is writing through the join, when this is one: the label the
+    /// change bus names on the owner's page, since `actor` names the owner
+    /// and the owner is not who made the change. `None` on every other view,
+    /// where the writer is the actor.
+    writer: Option<String>,
+    /// When a pass drops many drafts through this view, the changes its drops
+    /// made, collected instead of announced so the pass announces them once
+    /// and a large one collapses (see [`DomainView::collect_drops`]). `None`,
+    /// the ordinary case, announces each drop as it happens.
+    collected: std::sync::Mutex<Option<Vec<EngramChanged>>>,
     /// The count of this write in its domain, held for as long as the view
     /// lives, so a rename of the domain waits for the write to finish rather
     /// than moving the domain's stores out from under it. `None` on every
@@ -128,6 +138,8 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: None,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -161,6 +173,8 @@ impl<'a> DomainView<'a> {
             base: Some(base),
             actor,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -190,6 +204,8 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: Some(actor.to_string()),
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -260,6 +276,8 @@ impl<'a> DomainView<'a> {
             base: engine.content_source(name).ok(),
             actor,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: Some(ticket),
         };
         if !engine.reviews_changes(name) {
@@ -314,6 +332,7 @@ impl<'a> DomainView<'a> {
         engine.refuse_hidden_domain(name, scope).await?;
         let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
         view.joined = Some(join.owner.clone());
+        view.writer = crate::scope::overlay_actor(scope);
         view._writing = Some(ticket);
         Ok(view)
     }
@@ -514,6 +533,7 @@ impl<'a> DomainView<'a> {
         // A draft moved: the owner's own sessions refetch, nobody else hears
         // it (`draft_of` is what the route filters on). `modified` whether
         // the draft is new or not: the counts a listing draws are the base's.
+        // The label is whoever wrote, a joined writer included.
         self.engine.announce(Change::Engram(EngramChanged {
             domain: domain.to_string(),
             permalink: record.permalink.clone(),
@@ -521,8 +541,9 @@ impl<'a> DomainView<'a> {
             kind: ChangeKind::Modified,
             from: None,
             checksum: Some(record.stamp.sha256.clone()),
-            actor: Some(actor.to_string()),
+            actor: Some(self.writer_label(actor)),
             draft_of: Some(actor.to_string()),
+            audience: None,
         }));
         let warning = match crate::overlay_journal::journal_write(
             &state_dir,
@@ -578,7 +599,8 @@ impl<'a> DomainView<'a> {
     /// is gone is what makes ending its grants the truth.
     pub(crate) async fn drop(&self, domain_id: DomainId, path: &str) -> Result<()> {
         let actor = self.writing_actor()?.to_string();
-        self.clear_row(domain_id, path).await?;
+        let change = self.clear_row(domain_id, path).await?;
+        self.announce_drop(change);
         self.engine
             .end_draft_grants(self.domain.as_str(), &actor, path)
             .await;
@@ -601,7 +623,47 @@ impl<'a> DomainView<'a> {
     /// caller that took a row away and ended nothing would leave a link
     /// standing on a draft that is not there.
     pub(crate) async fn drop_mid_move(&self, domain_id: DomainId, path: &str) -> Result<()> {
-        self.clear_row(domain_id, path).await
+        let change = self.clear_row(domain_id, path).await?;
+        self.engine.announce(Change::Engram(change));
+        Ok(())
+    }
+
+    /// From now on, collect what [`DomainView::drop`] removes instead of
+    /// announcing each one, for a pass that drops many drafts (leaving review
+    /// mode, a convergence): the pass takes the batch with
+    /// [`DomainView::take_drops`] and announces it once through
+    /// [`Engine::announce_draft_drops`], so a large pass collapses rather
+    /// than evicting the ring.
+    pub(crate) fn collect_drops(&self) {
+        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
+        collected.get_or_insert_with(Vec::new);
+    }
+
+    /// The drops collected since [`DomainView::collect_drops`], and back to
+    /// announcing each one.
+    pub(crate) fn take_drops(&self) -> Vec<EngramChanged> {
+        self.collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+
+    fn announce_drop(&self, change: EngramChanged) {
+        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
+        match collected.as_mut() {
+            Some(batch) => batch.push(change),
+            None => {
+                drop(collected);
+                self.engine.announce(Change::Engram(change));
+            }
+        }
+    }
+
+    /// The label a change through this view is announced under: the joined
+    /// writer when there is one, the actor otherwise.
+    fn writer_label(&self, actor: &str) -> String {
+        self.writer.clone().unwrap_or_else(|| actor.to_string())
     }
 
     /// The removal itself: the mirror, the row and this actor's edges onto it.
@@ -610,7 +672,9 @@ impl<'a> DomainView<'a> {
     /// from, so "an overlay row goes away" is one piece of code with two
     /// callers rather than a rule each verb remembers. Whether the draft it
     /// held is OVER is the callers' question, not this one's.
-    async fn clear_row(&self, domain_id: DomainId, path: &str) -> Result<()> {
+    ///
+    /// Answers the change it made, for the caller to announce or batch.
+    async fn clear_row(&self, domain_id: DomainId, path: &str) -> Result<EngramChanged> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
         let state_dir = self.engine.journal_state_dir()?;
@@ -624,6 +688,18 @@ impl<'a> DomainView<'a> {
         let store = store.lock().await;
         store.begin().await?;
         let done = async {
+            // The address the owner's page is keyed on, read before the row
+            // goes: the draft's own permalink, or for a tombstone (whose
+            // permalink column holds its path) the base row's it stood over.
+            let permalink = match store.overlay_entry(domain_id, actor, path).await? {
+                Some(entry) if !entry.tombstone => Some(entry.permalink),
+                _ => store
+                    .list_engrams(domain, Some(path), None)
+                    .await?
+                    .into_iter()
+                    .find(|row| row.path == path)
+                    .map(|row| row.permalink),
+            };
             store.clear_overlay_entry(domain_id, actor, path).await?;
             // In the same transaction, because a row that is gone and an edge
             // that still names it are one fact told two ways: this author's
@@ -632,27 +708,23 @@ impl<'a> DomainView<'a> {
             // where none does. The fold, the discard and a settled convergence
             // all end a draft through here, so all three get it.
             store.reresolve_actor_references(domain_id, actor).await?;
-            Ok::<(), EngineError>(())
+            Ok::<Option<String>, EngineError>(permalink)
         }
         .await;
         match done {
-            Ok(()) => {
+            Ok(permalink) => {
                 store.commit().await?;
-                drop(store);
-                // The row is gone, so its permalink is the path's slug: the
-                // owner is on the page that dropped it and the tree row is
-                // right either way.
-                self.engine.announce(Change::Engram(EngramChanged {
+                Ok(EngramChanged {
                     domain: domain.to_string(),
-                    permalink: path.trim_end_matches(".md").to_string(),
+                    permalink: permalink.unwrap_or_else(|| crystalline_core::path_permalink(path)),
                     path: path.to_string(),
                     kind: ChangeKind::Deleted,
                     from: None,
                     checksum: None,
-                    actor: Some(actor.to_string()),
+                    actor: Some(self.writer_label(actor)),
                     draft_of: Some(actor.to_string()),
-                }));
-                Ok(())
+                    audience: None,
+                })
             }
             Err(e) => {
                 let _ = store.rollback().await;

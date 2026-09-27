@@ -953,7 +953,11 @@ impl Engine {
         // privacy records still name it (ruled 2026-09-27): the removal's
         // event carries this snapshot, never a registry the removal is about
         // to empty.
-        let audience = self.domain_audience(name).await?;
+        let audience = self.domain_audience(name).await;
+        // From here every event under this name carries that snapshot: the
+        // last room saves just below, the ring's earlier entries for it, and
+        // the domain event itself (ruling K2).
+        let _captured = self.capture_audience(name, audience.clone());
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,

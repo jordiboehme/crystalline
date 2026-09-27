@@ -490,36 +490,40 @@ impl Engine {
             return Ok(receipt);
         }
 
-        match &source {
+        // Whether an engram stood at the destination before this write, read
+        // under the write lock: an overwrite that creates is `added`, so the
+        // switcher's counts follow, and only a replacement is `modified`.
+        let replaced = match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &rel);
+                let replaced = abs.exists();
                 write_file(&abs, &markdown)?;
                 let store = self.store.lock().await;
                 let domain_id = store
                     .upsert_domain(&p.domain, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
                 self.reindex_file(&*store, domain_id, root, &rel).await?;
+                replaced
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
                 let domain_id = store
                     .upsert_domain(&p.domain, None, DomainKind::Virtual)
                     .await?;
+                let replaced = store.engram_content(domain_id, &rel).await?.is_some();
                 let stamp = virtual_stamp(&markdown);
                 self.index_markdown(&*store, domain_id, &rel, &markdown, stamp, None, true)
                     .await?;
+                replaced
             }
-        }
+        };
 
-        // A virtual write may have landed or replaced this domain's MANIFEST
-        // engram, the source of its routing bullets, so refresh the cache the
-        // sync `routing_text` reads; a MANIFEST of either kind may declare a
-        // new name. The store locks above are all released.
+        // The store locks above are all released.
         self.announce(Change::Engram(EngramChanged {
             domain: p.domain.clone(),
             permalink: permalink.clone(),
             path: rel.clone(),
-            kind: if p.overwrite {
+            kind: if replaced {
                 ChangeKind::Modified
             } else {
                 ChangeKind::Added
@@ -528,7 +532,12 @@ impl Engine {
             checksum: Some(sha256_hex(markdown.as_bytes())),
             actor: Some(actor.clone()),
             draft_of: None,
+            audience: None,
         }));
+        // A virtual write may have landed or replaced this domain's MANIFEST
+        // engram, the source of its routing bullets, so refresh the cache the
+        // sync `routing_text` reads; a MANIFEST of either kind may declare a
+        // new name.
         self.after_source_write(&source, &rel).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
@@ -829,6 +838,7 @@ impl Engine {
             checksum: Some(sha256_hex(content.as_bytes())),
             actor: change_label(scope),
             draft_of: None,
+            audience: None,
         }));
 
         // A save can rewrite a MANIFEST or the titles a folder index lists,
@@ -1148,6 +1158,7 @@ impl Engine {
             checksum: Some(sha256_hex(content.as_bytes())),
             actor: None,
             draft_of: None,
+            audience: None,
         }));
         self.nudge_embed();
         Ok(json!({

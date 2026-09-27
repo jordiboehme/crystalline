@@ -49,6 +49,7 @@ impl Engine {
             checksum: Some(sha256_hex(markdown.as_bytes())),
             actor: None,
             draft_of: None,
+            audience: None,
         }));
 
         // The MANIFEST engram just landed; its Scope and When to Use bullets are

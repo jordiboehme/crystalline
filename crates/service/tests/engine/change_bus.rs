@@ -76,6 +76,11 @@ async fn engine_fixture(
 }
 
 /// Everything announced since the receiver subscribed, in order.
+/// The fail-closed audience: the machine owner only.
+fn nobody() -> DomainAudience {
+    DomainAudience::Accounts(std::collections::HashSet::new())
+}
+
 fn drain(rx: &mut broadcast::Receiver<Envelope>) -> Vec<Change> {
     let mut out = Vec::new();
     while let Ok(envelope) = rx.try_recv() {
@@ -272,7 +277,7 @@ async fn save_engram_announces_modified_under_the_accounts_name() {
 
 #[tokio::test]
 async fn a_move_inside_a_domain_is_one_moved_with_from_and_across_domains_is_deleted_plus_added() {
-    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
     let mut rx = engine.changes().subscribe();
     engine
         .move_engram(
@@ -304,7 +309,12 @@ async fn a_move_inside_a_domain_is_one_moved_with_from_and_across_domains_is_del
         (from.path.as_str(), from.permalink.as_str()),
         ("alpha.md", "alpha")
     );
-    assert!(moved.checksum.is_some());
+    let landed = std::fs::read(tmp.path().join("notes/topics/alpha.md")).unwrap();
+    assert_eq!(
+        moved.checksum.as_deref(),
+        Some(support::sha256_hex(&landed).as_str()),
+        "the checksum is the stored file's, the rewritten permalink line included"
+    );
 
     engine
         .move_engram(
@@ -332,7 +342,11 @@ async fn a_move_inside_a_domain_is_one_moved_with_from_and_across_domains_is_del
         (landed.domain.as_str(), landed.kind, landed.path.as_str()),
         ("oak", ChangeKind::Added, "beta.md")
     );
-    assert!(landed.checksum.is_some());
+    let stored = std::fs::read(tmp.path().join("oak/beta.md")).unwrap();
+    assert_eq!(
+        landed.checksum.as_deref(),
+        Some(support::sha256_hex(&stored).as_str())
+    );
 }
 
 #[tokio::test]
@@ -597,12 +611,13 @@ async fn a_domain_removal_and_a_rename_announce_domain_events() {
     // Section J (k), ruled 2026-09-27: only the old name's audience is
     // captured, since it is the one leaving the privacy records; the new
     // name is re-keyed, not destroyed, so it keeps the ordinary lazy check.
-    // Neither `oak` nor `elm` is private in this fixture, so the captured
-    // snapshot is `Everyone`; the member-set case is T2's, which has an
-    // `AuthStore` to make a domain private against.
+    // This engine has no `DomainAccess` installed, so the capture fails
+    // closed: nobody but the machine owner (fix round 1, I3). The rename is
+    // not vetoed for it. The member-set case is
+    // `a_private_domains_rename_and_removal_carry_the_captured_audience`.
     let old = domains.iter().find(|d| d.domain == "oak").unwrap();
     let new = domains.iter().find(|d| d.domain == "elm").unwrap();
-    assert_eq!(old.audience, Some(DomainAudience::Everyone), "{old:?}");
+    assert_eq!(old.audience, Some(nobody()), "{old:?}");
     assert_eq!(new.audience, None, "{new:?}");
 
     engine
@@ -611,7 +626,9 @@ async fn a_domain_removal_and_a_rename_announce_domain_events() {
         .unwrap();
     let heard = drain(&mut rx);
     assert!(
-        heard.iter().any(|c| matches!(c, Change::Domain(d) if d.domain == "elm" && d.audience == Some(DomainAudience::Everyone))),
+        heard.iter().any(
+            |c| matches!(c, Change::Domain(d) if d.domain == "elm" && d.audience == Some(nobody()))
+        ),
         "{heard:?}"
     );
 }
@@ -671,5 +688,430 @@ async fn a_registration_that_binds_pending_links_announces_the_linking_domain() 
             .iter()
             .any(|c| matches!(c, Change::Domain(d) if d.domain == "notes" && d.audience.is_none())),
         "{heard:?}"
+    );
+}
+
+// --- fix round 1 ------------------------------------------------------------
+
+/// `oak` made private to `keeper` with `mem` as a viewer, `boss` an instance
+/// admin and `out` a stranger, on an auth store installed on the engine.
+async fn private_oak(engine: &Engine, dir: &Path) {
+    use crystalline_service::rest::{AuthStore, MemberLevel, Role};
+    let auth = Arc::new(AuthStore::open(&dir.join("web-auth.db")).await.unwrap());
+    for (name, role) in [
+        ("keeper", Role::Editor),
+        ("boss", Role::Admin),
+        ("mem", Role::Viewer),
+        ("out", Role::Editor),
+    ] {
+        auth.add_user(name, name, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("oak", true, "keeper")
+        .await
+        .unwrap();
+    auth.upsert_domain_member("oak", "mem", MemberLevel::Viewer, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+}
+
+fn oak_readers() -> DomainAudience {
+    DomainAudience::Accounts(
+        ["keeper", "boss", "mem"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn oak_write(title: &str) -> WriteParams {
+    WriteParams {
+        domain: "oak".to_string(),
+        ..write_params(title, false)
+    }
+}
+
+/// Ruling k and K2: a private domain's rename captures who could read it
+/// before the records move, and every event under the old name carries that
+/// snapshot: the domain event, the engram event of the rename's own MANIFEST
+/// step, and (the replay path) an event the ring held from before the
+/// rename. The new name keeps the ordinary check. Catches a capture that
+/// answers `Everyone`, one taken after the records moved, and a ring that
+/// replays old entries unstamped.
+#[tokio::test]
+async fn a_private_domains_rename_and_removal_carry_the_captured_audience() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    private_oak(&engine, tmp.path()).await;
+    // An event from before the rename, which the ring keeps for replay.
+    engine.write_engram(&oak_write("Acorn")).await.unwrap();
+    let before = engine.changes().last_id().unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .rename_domain("oak", "elm", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    let under_old: Vec<&Change> = heard.iter().filter(|c| c.domain() == "oak").collect();
+    assert!(
+        under_old
+            .iter()
+            .any(|c| matches!(c, Change::Engram(e) if e.path == "MANIFEST.md")),
+        "the MANIFEST step announced under the old name: {heard:?}"
+    );
+    assert!(
+        under_old.iter().any(|c| matches!(c, Change::Domain(_))),
+        "{heard:?}"
+    );
+    for change in &under_old {
+        assert_eq!(change.audience(), Some(&oak_readers()), "{change:?}");
+    }
+    for change in heard.iter().filter(|c| c.domain() == "elm") {
+        assert_eq!(
+            change.audience(),
+            None,
+            "the new name is re-keyed: {change:?}"
+        );
+    }
+
+    // Replay: the entry written before the capture is stamped too.
+    let replayed = match engine
+        .changes()
+        .replay_after(crystalline_service::changes::EventId {
+            epoch: before.epoch,
+            seq: before.seq - 1,
+        }) {
+        crystalline_service::changes::Replay::Events(events) => events,
+        other => panic!("{other:?}"),
+    };
+    let acorn = replayed
+        .iter()
+        .find(|e| matches!(&e.change, Change::Engram(c) if c.path == "acorn.md"))
+        .expect("the earlier write is still in the ring");
+    assert_eq!(acorn.change.audience(), Some(&oak_readers()));
+
+    // A removal captures the same way: `elm` carries oak's records now.
+    let mut rx = engine.changes().subscribe();
+    engine
+        .unregister_domain("elm", &Scope::Unrestricted, false, &[])
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    let gone = heard
+        .iter()
+        .find(|c| matches!(c, Change::Domain(d) if d.domain == "elm"))
+        .expect("the removal announced");
+    assert_eq!(gone.audience(), Some(&oak_readers()));
+
+    // The capture ended with the change: a later event under the old name
+    // is back on the ordinary check.
+    engine.changes().announce(Change::Domain(DomainChanged {
+        domain: "oak".to_string(),
+        actor: None,
+        audience: None,
+    }));
+    let after = drain(&mut rx);
+    assert_eq!(after.last().unwrap().audience(), None);
+}
+
+/// A capture whose record read fails answers nobody, never `Everyone`, and
+/// never vetoes the removal. `oak` is private, and the membership table is
+/// replaced by one the store cannot read before the store opens (the breaker
+/// `mcp_auth.rs` uses for the visibility table), so the capture's member read
+/// errs while the removal's own steps, which swallow a record error, run on.
+#[tokio::test]
+async fn a_capture_that_cannot_read_the_records_fails_closed_and_the_removal_proceeds() {
+    use crystalline_service::rest::{AuthStore, Role};
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let path = tmp.path().join("broken-auth.db");
+    {
+        let auth = AuthStore::open(&path).await.unwrap();
+        auth.add_user("keeper", "keeper", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.set_domain_visibility("oak", true, "keeper")
+            .await
+            .unwrap();
+    }
+    // Sequential, like `domain_admin.rs`'s breaker: the store is closed
+    // before this connection opens, and this one before the store re-opens.
+    {
+        let name = path.to_string_lossy().to_string();
+        let db = match turso::Builder::new_local(&name)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+        {
+            Ok(db) => db,
+            Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+        };
+        let conn = db.connect().unwrap();
+        conn.execute_batch("ALTER TABLE domain_member RENAME COLUMN principal TO junk;")
+            .await
+            .unwrap();
+    }
+    let broken = Arc::new(AuthStore::open(&path).await.unwrap());
+    engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(broken)));
+    let mut rx = engine.changes().subscribe();
+    engine
+        .unregister_domain("oak", &Scope::Unrestricted, false, &[])
+        .await
+        .expect("a notification never vetoes the removal");
+    let heard = drain(&mut rx);
+    let gone = heard
+        .iter()
+        .find(|c| matches!(c, Change::Domain(d) if d.domain == "oak"))
+        .expect("the removal announced");
+    assert_eq!(gone.audience(), Some(&nobody()));
+}
+
+/// An `overwrite` write whose title nobody held creates an engram, so it is
+/// `added` (the switcher's counts follow); only a replacement is `modified`.
+#[tokio::test]
+async fn an_overwrite_that_creates_is_added_and_a_replacement_is_modified() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .write_engram(&write_params("Gamma", true))
+        .await
+        .unwrap();
+    assert_eq!(engram_of(&drain(&mut rx)[0]).kind, ChangeKind::Added);
+    engine
+        .write_engram(&write_params("Gamma", true))
+        .await
+        .unwrap();
+    assert_eq!(engram_of(&drain(&mut rx)[0]).kind, ChangeKind::Modified);
+}
+
+/// Retag is a feed point: every rewritten engram is announced, and a merge's
+/// alias recording announces the MANIFEST it rewrote.
+#[tokio::test]
+async fn a_retag_merge_announces_every_rewritten_engram_and_the_manifest() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .retag("t", "manifest", Some("notes"), true, false, true)
+        .await
+        .unwrap();
+    let mut paths: Vec<String> = drain(&mut rx)
+        .iter()
+        .map(|c| {
+            let e = engram_of(c);
+            assert_eq!(e.kind, ChangeKind::Modified);
+            assert!(e.checksum.is_some());
+            e.path.clone()
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["MANIFEST.md", "alpha.md", "beta.md"]);
+}
+
+/// A restore is a feed point: `added`, with the restored bytes' checksum.
+#[tokio::test]
+async fn a_restore_announces_added() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    let content = engram("Gamma", "gamma", "Restored.");
+    engine
+        .restore_engram("notes", "gamma.md", &content, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let change = engram_of(&heard[0]);
+    assert_eq!(
+        (change.kind, change.permalink.as_str()),
+        (ChangeKind::Added, "gamma")
+    );
+    assert_eq!(
+        change.checksum.as_deref(),
+        Some(support::sha256_hex(content.as_bytes()).as_str())
+    );
+}
+
+/// A reindex is a feed point through `DaemonReindexHooks::after_apply`.
+#[tokio::test]
+async fn a_reindex_announces_what_it_changed() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let revised = engram("Alpha", "alpha", "Changed on disk, found by a reindex.");
+    seed(&tmp.path().join("notes"), "alpha.md", &revised);
+    let mut rx = engine.changes().subscribe();
+    engine.reindex(false).await.unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let change = engram_of(&heard[0]);
+    assert_eq!(
+        (change.kind, change.path.as_str()),
+        (ChangeKind::Modified, "alpha.md")
+    );
+}
+
+/// The virtual-domain writes that skip the verbs: a scaffolded MANIFEST, an
+/// archive import's rows and a MANIFEST save on a virtual domain.
+#[tokio::test]
+async fn a_virtual_domains_scaffold_import_and_manifest_save_announce() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    // `domain_add_virtual` scaffolds the domain's MANIFEST through
+    // `scaffold_virtual_manifest`.
+    engine.domain_add_virtual("vault").await.unwrap();
+    let heard = drain(&mut rx);
+    assert!(
+        heard.iter().any(|c| matches!(c, Change::Engram(e)
+            if e.domain == "vault" && e.path == "MANIFEST.md" && e.kind == ChangeKind::Added)),
+        "{heard:?}"
+    );
+    // A scaffold that finds one already there announces nothing.
+    engine
+        .scaffold_virtual_manifest("vault", &manifest("vault"))
+        .await
+        .unwrap();
+    assert!(drain(&mut rx).is_empty());
+
+    engine
+        .import_domain_files(
+            "vault",
+            &[("one.md".to_string(), engram("One", "one", "imported"))],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(
+        (
+            engram_of(&heard[0]).kind,
+            engram_of(&heard[0]).path.as_str()
+        ),
+        (ChangeKind::Added, "one.md")
+    );
+
+    let current = engine.manifest_markdown("vault").await.unwrap();
+    let revised = format!("{current}\n- one more routing line\n");
+    engine
+        .save_manifest("vault", &revised, &support::sha256_hex(current.as_bytes()))
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Modified);
+}
+
+/// Dropping a draft that stands over nothing (`clear_row`) announces a
+/// draft-scoped `deleted` under the row's own permalink.
+#[tokio::test]
+async fn dropping_a_draft_only_engram_announces_deleted_with_its_permalink() {
+    let (_tmp, engine, _scratch) = engine_fixture(true).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    engine
+        .write_engram_as(&write_params("Gamma", false), None, &ada)
+        .await
+        .unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "gamma".to_string(),
+                domain: "notes".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &ada,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let change = engram_of(&heard[0]);
+    assert_eq!(
+        (
+            change.kind,
+            change.permalink.as_str(),
+            change.draft_of.as_deref()
+        ),
+        (ChangeKind::Deleted, "gamma", Some("ada"))
+    );
+}
+
+/// The late cross-domain resolve at the end of a multi-domain sync binds a
+/// reference into a domain synced later in the same run, and announces the
+/// domain holding it.
+#[tokio::test]
+async fn a_late_cross_domain_resolve_announces_the_referring_domain() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    seed(
+        &tmp.path().join("notes"),
+        "pointer.md",
+        &engram("Pointer", "pointer", "- relates_to [[oak:acorn]]"),
+    );
+    seed(
+        &tmp.path().join("oak"),
+        "acorn.md",
+        &engram("Acorn", "acorn", "An acorn."),
+    );
+    let mut rx = engine.changes().subscribe();
+    engine.sync(None).await.unwrap();
+    let heard = drain(&mut rx);
+    assert!(
+        heard
+            .iter()
+            .any(|c| matches!(c, Change::Domain(d) if d.domain == "notes")),
+        "{heard:?}"
+    );
+}
+
+/// Leaving review mode drops every draft, and each drop names the address
+/// the owner's page is keyed on: the draft's own permalink, even where it
+/// differs from the path's slug.
+#[tokio::test]
+async fn leaving_review_mode_announces_each_dropped_draft_under_its_own_permalink() {
+    let (tmp, engine, _scratch) = engine_fixture(true).await;
+    seed(
+        &tmp.path().join("notes"),
+        "odd.md",
+        &engram("Odd", "not-the-slug", "A permalink of its own."),
+    );
+    engine
+        .sync_paths("notes", vec!["odd.md".to_string()])
+        .await
+        .unwrap();
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    engine
+        .edit_engram_as(&append_edit("not-the-slug", "ada's line"), None, &ada)
+        .await
+        .unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .set_review_mode(
+            "notes",
+            None,
+            crystalline_service::ReviewModeConfirm::Confirmed {
+                folds: vec![("ada".to_string(), crystalline_service::FoldChoice::Discard)],
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    let dropped = heard
+        .iter()
+        .find(|c| matches!(c, Change::Engram(e) if e.path == "odd.md"))
+        .unwrap_or_else(|| panic!("{heard:?}"));
+    let dropped = engram_of(dropped);
+    assert_eq!(
+        (
+            dropped.kind,
+            dropped.permalink.as_str(),
+            dropped.draft_of.as_deref()
+        ),
+        (ChangeKind::Deleted, "not-the-slug", Some("ada"))
     );
 }

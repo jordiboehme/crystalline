@@ -525,6 +525,7 @@ impl Engine {
             checksum: Some(checksum),
             actor: Some(actor.to_string()),
             draft_of: None,
+            audience: None,
         }));
 
         // An edit may have rewritten this domain's MANIFEST, its routing and

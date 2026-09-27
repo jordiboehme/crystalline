@@ -482,6 +482,7 @@ impl Engine {
                 checksum: None,
                 actor: label.clone(),
                 draft_of: None,
+                audience: None,
             }));
             self.announce(Change::Engram(EngramChanged {
                 domain: dest_domain.clone(),
@@ -492,6 +493,7 @@ impl Engine {
                 checksum: Some(moved_checksum),
                 actor: label,
                 draft_of: None,
+                audience: None,
             }));
         } else {
             self.announce(Change::Engram(EngramChanged {
@@ -506,6 +508,7 @@ impl Engine {
                 checksum: Some(moved_checksum),
                 actor: label,
                 draft_of: None,
+                audience: None,
             }));
         }
 
@@ -789,6 +792,7 @@ impl Engine {
             checksum: Some(sha256_hex(replaced.as_bytes())),
             actor: Some(actor.to_string()),
             draft_of: None,
+            audience: None,
         }));
         Ok(Some((count, permalink)))
     }

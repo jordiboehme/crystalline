@@ -200,6 +200,7 @@ impl Engine {
             checksum: None,
             actor: change_label(scope),
             draft_of: None,
+            audience: None,
         }));
 
         // Deleting a MANIFEST empties a virtual domain's routing bullets and

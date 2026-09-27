@@ -2469,8 +2469,10 @@ impl Engine {
     }
 
     /// Announce one committed change. Never awaits, never blocks, never
-    /// fails: called after the store call returned and outside every lock,
-    /// at every feed point the spec's Part A lists and nowhere else.
+    /// fails: called after the store call returned and with the store lock
+    /// released (a verb's own per-path write lock may still be held; the
+    /// bus takes only its own short mutex), at every feed point the spec's
+    /// Part A lists and nowhere else.
     pub(crate) fn announce(&self, change: Change) {
         if let Some(id) = self.changes.announce(change) {
             tracing::trace!(%id, "announced a change");
@@ -2499,13 +2501,13 @@ impl Engine {
             let permalink = change
                 .permalink
                 .clone()
-                .unwrap_or_else(|| change.path.trim_end_matches(".md").to_string());
+                .unwrap_or_else(|| crystalline_core::path_permalink(&change.path));
             let from = change.from.as_ref().map(|path| MovedFrom {
                 path: path.clone(),
                 permalink: change
                     .from_permalink
                     .clone()
-                    .unwrap_or_else(|| path.trim_end_matches(".md").to_string()),
+                    .unwrap_or_else(|| crystalline_core::path_permalink(path)),
             });
             self.announce(Change::Engram(EngramChanged {
                 domain: name.to_string(),
@@ -2516,6 +2518,7 @@ impl Engine {
                 checksum: change.checksum.clone(),
                 actor: actor.map(str::to_string),
                 draft_of: None,
+                audience: None,
             }));
         }
     }
@@ -2529,6 +2532,20 @@ impl Engine {
             ..SyncReport::default()
         };
         self.announce_report(name, &report, actor);
+    }
+
+    /// Announce the drafts one pass dropped in `domain`, collapsed the way a
+    /// sync report is: each one at or below `COLLAPSE_THRESHOLD`, one
+    /// `domain` event above it, so leaving review mode over a large overlay
+    /// does not evict the ring and reset every other tab.
+    pub(crate) fn announce_draft_drops(&self, domain: &str, batch: Vec<EngramChanged>) {
+        if batch.len() > crate::changes::COLLAPSE_THRESHOLD {
+            self.announce_domain(domain, None, None);
+            return;
+        }
+        for change in batch {
+            self.announce(Change::Engram(change));
+        }
     }
 
     /// Announce that a whole domain moved, when nothing finer can be said.
@@ -2558,20 +2575,47 @@ impl Engine {
     /// and membership records through [`crate::scope::DomainAccess::readers_of`].
     /// Used only to capture a rename's old name and a removal's audience in
     /// the instant before the change takes the name out of those records
-    /// (ruled 2026-09-27). `Everyone` on an engine with no resolver
-    /// installed, which is the machine owner's engine and filters nothing.
-    pub(crate) async fn domain_audience(&self, name: &str) -> Result<DomainAudience> {
+    /// (ruled 2026-09-27).
+    ///
+    /// Fails closed and never fails the caller: with no resolver installed
+    /// (a daemonless engine, or a daemon whose HTTP surface has not installed
+    /// one yet when a startup rename runs) or a record read that errs, the
+    /// answer is `Accounts` with nobody in it. The owner still hears the
+    /// event and nobody else does, and a notification never vetoes the
+    /// rename or the removal it describes.
+    pub(crate) async fn domain_audience(&self, name: &str) -> DomainAudience {
+        let nobody = || DomainAudience::Accounts(HashSet::new());
         let Some(access) = self.domain_access.get() else {
-            return Ok(DomainAudience::Everyone);
+            return nobody();
         };
-        let readers = access
-            .readers_of(name)
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        Ok(match readers {
-            None => DomainAudience::Everyone,
-            Some(accounts) => DomainAudience::Accounts(accounts),
-        })
+        match access.readers_of(name).await {
+            Ok(None) => DomainAudience::Everyone,
+            Ok(Some(accounts)) => DomainAudience::Accounts(accounts),
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    "reading who may see '{name}' failed ({e}); its rename or removal is announced to the machine owner only"
+                );
+                nobody()
+            }
+        }
+    }
+
+    /// Capture `name`'s audience on the bus for as long as the returned hold
+    /// lives: every event under that name, the domain event and the engram
+    /// events a rename or removal emits under it alike, carries the snapshot,
+    /// and so does every event the ring already holds for it (ruling K2).
+    /// Taken before the change starts; dropped once its last event is out.
+    pub(crate) fn capture_audience(
+        &self,
+        name: &str,
+        audience: DomainAudience,
+    ) -> AudienceHold<'_> {
+        self.changes.capture(name, audience);
+        AudienceHold {
+            bus: &self.changes,
+            name: name.to_string(),
+        }
     }
 
     /// How the shipped agent skills are served over MCP: the value this engine
@@ -3053,6 +3097,7 @@ impl Engine {
             checksum: None,
             actor: Some(actor.to_string()),
             draft_of: Some(actor.to_string()),
+            audience: None,
         }));
         let warning = match crate::overlay_journal::journal_tombstone(
             &state_dir, domain, actor, &desc.path,
@@ -3316,6 +3361,8 @@ impl Engine {
         let addresses = pulled_addresses(&state_dir, &touched)?;
 
         let mut cleared = 0u64;
+        // The drafts this pass ended, announced once at the end, collapsed.
+        let mut dropped = Vec::new();
         for ActorHolding {
             actor,
             entries,
@@ -3328,6 +3375,7 @@ impl Engine {
             // over the other. The view is used only as the writer that ends a
             // converged draft, which is why it screens nothing.
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+            view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
@@ -3369,6 +3417,7 @@ impl Engine {
                     }
                 }
             }
+            dropped.extend(view.take_drops());
             // And their files, in the same pass and into the same record: a
             // conflict is one actor's conflict at one path, whatever kind of
             // thing stands there.
@@ -3413,6 +3462,7 @@ impl Engine {
                 store.reresolve_actor_references(domain_id, actor).await?;
             }
         }
+        self.announce_draft_drops(domain, dropped);
         record.cleared = cleared;
         let report = ConvergenceReport {
             cleared,
@@ -5495,6 +5545,19 @@ fn dir_is_nonempty(dir: &Path) -> bool {
 /// second walk of the domain.
 fn changed_anything(report: &SyncReport) -> bool {
     report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
+}
+
+/// A captured audience on the change bus, released when dropped, so a
+/// rename or removal that stops half way never leaves a name captured.
+pub(crate) struct AudienceHold<'a> {
+    bus: &'a crate::changes::ChangeBus,
+    name: String,
+}
+
+impl Drop for AudienceHold<'_> {
+    fn drop(&mut self) {
+        self.bus.release(&self.name);
+    }
 }
 
 /// The label a share actor's own changes are announced under: the account,
@@ -8768,6 +8831,72 @@ mod announce_tests {
 
         // A report of nothing but listings announces nothing at all.
         engine.announce_paths("eng", vec![change(PathChangeKind::Added, "index.md")], None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The collapse sits exactly above the threshold: 32 announced paths are
+    /// 32 engram events, 33 are one domain event.
+    #[tokio::test]
+    async fn thirty_two_paths_announce_each_and_thirty_three_collapse() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let paths = |n: usize| {
+            (0..n)
+                .map(|i| change(PathChangeKind::Added, &format!("p{i}.md")))
+                .collect::<Vec<_>>()
+        };
+        let mut rx = engine.changes().subscribe();
+        engine.announce_paths("eng", paths(crate::changes::COLLAPSE_THRESHOLD), None);
+        let mut heard = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            heard.push(envelope.change);
+        }
+        assert_eq!(heard.len(), crate::changes::COLLAPSE_THRESHOLD);
+        assert!(heard.iter().all(|c| matches!(c, Change::Engram(_))));
+
+        engine.announce_paths("eng", paths(crate::changes::COLLAPSE_THRESHOLD + 1), None);
+        let heard = rx.try_recv().unwrap();
+        assert!(matches!(heard.change, Change::Domain(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A pass that drops many drafts collapses the same way, so leaving
+    /// review mode over a large overlay does not evict the ring.
+    #[tokio::test]
+    async fn a_large_batch_of_draft_drops_collapses_to_one_domain_event() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let drop = |i: usize| EngramChanged {
+            domain: "eng".to_string(),
+            permalink: format!("p{i}"),
+            path: format!("p{i}.md"),
+            kind: ChangeKind::Deleted,
+            from: None,
+            checksum: None,
+            actor: Some("ada".to_string()),
+            draft_of: Some("ada".to_string()),
+            audience: None,
+        };
+        let mut rx = engine.changes().subscribe();
+        engine.announce_draft_drops("eng", (0..3).map(drop).collect());
+        for _ in 0..3 {
+            assert!(matches!(rx.try_recv().unwrap().change, Change::Engram(_)));
+        }
+        engine.announce_draft_drops(
+            "eng",
+            (0..=crate::changes::COLLAPSE_THRESHOLD).map(drop).collect(),
+        );
+        assert!(matches!(rx.try_recv().unwrap().change, Change::Domain(_)));
         assert!(rx.try_recv().is_err());
     }
 }

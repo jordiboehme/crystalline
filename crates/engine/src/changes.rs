@@ -10,10 +10,10 @@
 //! nothing else, and a send nobody listens to is not an error. A daemonless
 //! engine carries a bus with no subscriber and pays one `send` per change.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -86,14 +86,29 @@ pub struct EngramChanged {
     /// Set when the change landed in this actor's draft overlay. Delivered to
     /// that actor's own sessions and to nobody else.
     pub draft_of: Option<String>,
+    /// Who may hear this event, when that was captured for its domain's name:
+    /// set by the bus, never by a feed point, while the domain is being
+    /// renamed or removed (ruling K2, 2026-09-27: a path under the old name
+    /// leaks the name as surely as the domain event does). `None` keeps the
+    /// ordinary per-session check. Never on the wire.
+    #[serde(skip)]
+    pub audience: Option<DomainAudience>,
 }
 
 /// The identities that may read a domain, captured once by the engine at the
 /// moment of a change that takes the domain's name out of the privacy records
-/// (a removal, and the old name of a rename; ruled 2026-09-27). `Everyone`
-/// when the domain is not private; `Accounts` naming exactly its members when
-/// it is. The machine owner always reads regardless, so it is never in the
-/// set.
+/// (a removal, and the old name of a rename; ruled 2026-09-27).
+///
+/// `Everyone` when the domain is not private. `Accounts` when it is, naming
+/// every account that may read it: its owner, every member at any level and
+/// every instance admin by the role the accounts store records, disabled
+/// accounts left out. The names are the store's folded spelling (trimmed and
+/// lowercased), so a check folds `Scope::User.account` the same way, and a
+/// scope that carries `admin: true` reads too, since the surface's own admin
+/// flag outranks the stored role. The machine owner always reads, so it is
+/// never in the set. When the engine cannot read the records (no resolver
+/// installed yet, or a read error) it captures `Accounts` with nobody in it:
+/// the owner still hears the event, nobody else does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DomainAudience {
     Everyone,
@@ -138,6 +153,17 @@ impl Change {
         }
     }
 
+    /// Stamp a captured audience onto a change that carries none of its own.
+    fn stamp(&mut self, audience: &DomainAudience) {
+        let slot = match self {
+            Change::Engram(change) => &mut change.audience,
+            Change::Domain(change) => &mut change.audience,
+        };
+        if slot.is_none() {
+            *slot = Some(audience.clone());
+        }
+    }
+
     pub fn draft_of(&self) -> Option<&str> {
         match self {
             Change::Engram(change) => change.draft_of.as_deref(),
@@ -145,11 +171,11 @@ impl Change {
         }
     }
 
-    /// The audience captured at the moment of the change, when there is one:
-    /// `None` for an engram change, the domain change's own field otherwise.
+    /// The audience captured at the moment of the change, when there is one.
+    /// `None` keeps the ordinary per-session visibility check.
     pub fn audience(&self) -> Option<&DomainAudience> {
         match self {
-            Change::Engram(_) => None,
+            Change::Engram(change) => change.audience.as_ref(),
             Change::Domain(change) => change.audience.as_ref(),
         }
     }
@@ -211,6 +237,9 @@ struct Ring {
     entries: VecDeque<Envelope>,
     /// The last `engram` announcement and when, for the duplicate window.
     last_engram: Option<(EngramChanged, Instant)>,
+    /// The audiences captured for domain names being renamed or removed,
+    /// stamped onto every event under that name until the capture ends.
+    captured: HashMap<String, DomainAudience>,
 }
 
 /// The bus itself. See the module doc for the discipline on its mutex.
@@ -241,6 +270,7 @@ impl ChangeBus {
             ring: Mutex::new(Ring {
                 entries: VecDeque::with_capacity(RING_CAPACITY),
                 last_engram: None,
+                captured: HashMap::new(),
             }),
         }
     }
@@ -252,8 +282,11 @@ impl ChangeBus {
     /// Stamp, ring and send. `None` when the change was a duplicate inside
     /// [`DUPLICATE_WINDOW`] and nothing was announced. The sequence moves
     /// under the ring's mutex, so ring order and id order are one order.
-    pub fn announce(&self, change: Change) -> Option<EventId> {
-        let mut ring = self.ring.lock().unwrap();
+    pub fn announce(&self, mut change: Change) -> Option<EventId> {
+        let mut ring = self.lock();
+        if let Some(audience) = ring.captured.get(change.domain()) {
+            change.stamp(audience);
+        }
         if let Change::Engram(engram) = &change {
             let now = Instant::now();
             if let Some((last, at)) = &ring.last_engram
@@ -268,7 +301,7 @@ impl ChangeBus {
             }
             ring.last_engram = Some((engram.clone(), now));
         }
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let id = EventId {
             epoch: self.epoch,
             seq,
@@ -278,10 +311,41 @@ impl ChangeBus {
         }
         let envelope = Envelope { id, change };
         ring.entries.push_back(envelope.clone());
-        drop(ring);
-        // A send with no receiver is the ordinary case on a daemonless engine.
+        // Sent under the guard, so the channel's order is the id order: two
+        // announces racing on two threads never deliver 6 before 5. A send
+        // never blocks, and one with no receiver is the ordinary case on a
+        // daemonless engine.
         let _ = self.tx.send(envelope);
+        drop(ring);
         Some(id)
+    }
+
+    /// Capture who may hear events under `domain` from now until
+    /// [`ChangeBus::release`]: every later announcement under that name is
+    /// stamped with `audience`, and so is every entry the ring already holds
+    /// for it, so a replay after the privacy records moved never reaches an
+    /// outsider (ruling K2). One pass over at most [`RING_CAPACITY`] entries.
+    pub fn capture(&self, domain: &str, audience: DomainAudience) {
+        let mut ring = self.lock();
+        for entry in ring.entries.iter_mut() {
+            if entry.change.domain() == domain {
+                entry.change.stamp(&audience);
+            }
+        }
+        ring.captured.insert(domain.to_string(), audience);
+    }
+
+    /// End a capture: events under `domain` go back to the ordinary check.
+    /// Entries the capture stamped keep their audience.
+    pub fn release(&self, domain: &str) {
+        self.lock().captured.remove(domain);
+    }
+
+    /// The ring, whatever a panicking holder left behind: every mutation
+    /// under this guard leaves the ring consistent, so a poisoned lock is
+    /// taken over rather than turned into a panic in every later write verb.
+    fn lock(&self) -> MutexGuard<'_, Ring> {
+        self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {
@@ -294,9 +358,14 @@ impl ChangeBus {
         if last.epoch != self.epoch {
             return Replay::Reset;
         }
-        let ring = self.ring.lock().unwrap();
+        // An id this process never issued (a forged or garbled header) is
+        // answered like one from another process.
+        if last.seq > self.seq.load(Ordering::Relaxed) {
+            return Replay::Reset;
+        }
+        let ring = self.lock();
         if let Some(oldest) = ring.entries.front()
-            && oldest.id.seq > last.seq + 1
+            && oldest.id.seq > last.seq.saturating_add(1)
         {
             return Replay::Reset;
         }
@@ -319,7 +388,7 @@ impl ChangeBus {
     }
 
     pub fn ring_len(&self) -> usize {
-        self.ring.lock().unwrap().entries.len()
+        self.lock().entries.len()
     }
 }
 
@@ -348,6 +417,7 @@ mod tests {
             checksum: Some(checksum.to_string()),
             actor: None,
             draft_of: None,
+            audience: None,
         })
     }
 
@@ -449,6 +519,87 @@ mod tests {
         ));
         let value: serde_json::Value = serde_json::from_str(&change.data().unwrap()).unwrap();
         assert_eq!(value, serde_json::json!({ "domain": "eng", "actor": null }));
+    }
+
+    /// A forged `Last-Event-ID` at the top of the id space answers a reset
+    /// and leaves the bus working: no overflow while the ring mutex is held
+    /// (which in a build with overflow checks poisoned it and turned every
+    /// later write verb into a panic).
+    #[test]
+    fn a_forged_last_id_at_u64_max_resets_and_the_bus_keeps_working() {
+        let bus = ChangeBus::new();
+        bus.announce(modified("eng", "a.md", "1"));
+        let forged = EventId {
+            epoch: bus.epoch(),
+            seq: u64::MAX,
+        };
+        assert_eq!(bus.replay_after(forged), Replay::Reset);
+        assert!(bus.announce(modified("eng", "b.md", "2")).is_some());
+        assert_eq!(bus.ring_len(), 2);
+        // An id ahead of anything issued is a reset too, not an empty replay
+        // that would leave the client skipping what comes next.
+        let ahead = EventId {
+            epoch: bus.epoch(),
+            seq: 3,
+        };
+        assert_eq!(bus.replay_after(ahead), Replay::Reset);
+    }
+
+    /// The channel delivers in id order even with announces racing on many
+    /// threads: the id and the send happen under one guard.
+    #[test]
+    fn concurrent_announces_arrive_in_id_order() {
+        let bus = std::sync::Arc::new(ChangeBus::new());
+        let mut rx = bus.subscribe();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let bus = bus.clone();
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        bus.announce(modified("eng", &format!("{t}-{i}.md"), "x"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut last = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            assert!(envelope.id.seq > last, "{} after {last}", envelope.id.seq);
+            last = envelope.id.seq;
+        }
+        assert_eq!(last, 800);
+    }
+
+    /// A capture stamps what the ring already holds under that name and
+    /// every later announcement under it, and nothing else; a release ends it.
+    #[test]
+    fn a_capture_stamps_the_ring_and_later_events_until_released() {
+        let bus = ChangeBus::new();
+        bus.announce(modified("eng", "a.md", "1"));
+        bus.announce(modified("ops", "b.md", "1"));
+        let nobody = DomainAudience::Accounts(HashSet::new());
+        bus.capture("eng", nobody.clone());
+        bus.announce(modified("eng", "c.md", "1"));
+        let Replay::Events(events) = bus.replay_after(EventId {
+            epoch: bus.epoch(),
+            seq: 0,
+        }) else {
+            panic!("the ring holds seq 1")
+        };
+        let audiences: Vec<Option<&DomainAudience>> =
+            events.iter().map(|e| e.change.audience()).collect();
+        assert_eq!(audiences, vec![Some(&nobody), None, Some(&nobody)]);
+        bus.release("eng");
+        let id = bus.announce(modified("eng", "d.md", "1")).unwrap();
+        let Replay::Events(events) = bus.replay_after(EventId {
+            epoch: id.epoch,
+            seq: id.seq - 1,
+        }) else {
+            panic!()
+        };
+        assert_eq!(events[0].change.audience(), None);
     }
 
     #[test]

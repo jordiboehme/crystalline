@@ -230,9 +230,18 @@ impl Engine {
                 let _origins = self.lock_both_origins(old, new).await;
                 self.close_editors(old).await;
                 // A resumed journal may already have carried the old name's
-                // privacy records over, so no audience can be captured for it
-                // now: the old name goes unannounced, the new one is.
-                let mut report = self.finish_rename(journal, &state_dir, true, None).await?;
+                // privacy records over, so who could read it is no longer
+                // known: its events fail closed, to the machine owner only.
+                let _captured =
+                    self.capture_audience(old, DomainAudience::Accounts(HashSet::new()));
+                let mut report = self
+                    .finish_rename(
+                        journal,
+                        &state_dir,
+                        true,
+                        DomainAudience::Accounts(HashSet::new()),
+                    )
+                    .await?;
                 if let Value::Object(map) = &mut report {
                     map.entry("shadows").or_insert_with(|| json!([]));
                 }
@@ -287,7 +296,11 @@ impl Engine {
         // carry it and before anything is paused (ruled 2026-09-27): the
         // rename's event for the old name carries this snapshot, never the
         // registry after the rename re-keyed it.
-        let old_audience = self.domain_audience(old).await?;
+        let old_audience = self.domain_audience(old).await;
+        // Every event under the old name from here on (the MANIFEST and
+        // relink edits inside it, the room saves `close_editors` lands) and
+        // every one the ring holds for it carries the snapshot (ruling K2).
+        let _captured = self.capture_audience(old, old_audience.clone());
 
         // An origin pull or share of this domain finishes first, and none
         // starts until the rename is done, under either name: the lock is
@@ -392,7 +405,7 @@ impl Engine {
             return Err(io_error(e));
         }
         let mut report = self
-            .finish_rename(journal, &state_dir, true, Some(old_audience))
+            .finish_rename(journal, &state_dir, true, old_audience)
             .await?;
         if let Value::Object(map) = &mut report {
             if !shadows.is_empty() {
@@ -518,9 +531,12 @@ impl Engine {
         // No sync here: every opener runs its own first sync after this,
         // and the daemon calls this before its socket binds, where a scan of
         // the whole domain would hold every client back.
-        // Finished at a start, after the records may already have moved: no
-        // audience for the old name can be captured any more.
-        self.finish_rename(journal, &state_dir, false, None)
+        // Finished at a start, after the records may already have moved: who
+        // could read the old name is no longer known, so its events fail
+        // closed, to the machine owner only.
+        let nobody = DomainAudience::Accounts(HashSet::new());
+        let _captured = self.capture_audience(&journal.old, nobody.clone());
+        self.finish_rename(journal, &state_dir, false, nobody)
             .await
             .map(Some)
     }
@@ -764,15 +780,16 @@ impl Engine {
     /// Run every step of `journal` it does not list as done, re-key what
     /// memory holds, write the configuration, publish the names, drop the
     /// journal, lift the pause and, when `sync_after`, sync the domain under
-    /// its new name. Announces the new name, and the old one too when
-    /// `old_audience` carries who could read it, captured before the first
-    /// step (a journal resumed later has none, and announces only the new).
+    /// its new name. Announces both names: the old one under `old_audience`,
+    /// captured before the first step (or nobody, for a journal resumed
+    /// after the records may have moved), the new one under the ordinary
+    /// per-session check, since its records were re-keyed, not destroyed.
     async fn finish_rename(
         &self,
         mut journal: RenameJournal,
         state_dir: &Path,
         sync_after: bool,
-        old_audience: Option<DomainAudience>,
+        old_audience: DomainAudience,
     ) -> Result<Value> {
         let (old, new) = (journal.old.clone(), journal.new.clone());
         let mut moved: Vec<&'static str> = Vec::new();
@@ -858,9 +875,7 @@ impl Engine {
         // switcher picks up the new name; the old name's frame is filtered
         // against the snapshot, the new one's against each session's own
         // check, since its records were re-keyed rather than destroyed.
-        if let Some(audience) = old_audience {
-            self.announce_domain(&old, None, Some(audience));
-        }
+        self.announce_domain(&old, None, Some(old_audience));
         self.announce_domain(&new, None, None);
 
         let entry = self.domain_entry(&new)?;

@@ -431,6 +431,7 @@ impl Engine {
             checksum: Some(sha256_hex(markdown.as_bytes())),
             actor: None,
             draft_of: None,
+            audience: None,
         }));
 
         self.refresh_routing_cache().await;
