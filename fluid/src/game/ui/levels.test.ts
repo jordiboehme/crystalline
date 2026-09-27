@@ -127,6 +127,20 @@ describe("hereKey", () => {
     ]);
     expect(hereKey(levels, "moon")).toBe("lune");
   });
+
+  // Two domains claim one canonical name and no local name holds it: the
+  // name resolves nowhere, as a link written with it does, and it keeps a
+  // third domain's alias of the same spelling from answering. Taking the
+  // first claimant would mark "north" here.
+  it("marks no row for a contested canonical name", () => {
+    const levels = levelsOf([
+      domain("north", "moon"),
+      domain("south", "moon"),
+      domain("lune", null, ["moon"]),
+    ]);
+    expect(hereKey(levels, "moon")).toBeNull();
+    expect(hereKey(levels, "north")).toBe("north");
+  });
 });
 
 describe("levelWindow (C15)", () => {

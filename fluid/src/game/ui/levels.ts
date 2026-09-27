@@ -14,6 +14,7 @@
  */
 
 import type { DomainSummary } from "../../api/domains";
+import { domainSpellings } from "../../domainNames";
 
 /** The title line: the word that opens the select. */
 export const LEVELS_TITLE = "IDCLEV";
@@ -82,20 +83,26 @@ export function levelsOf(
 }
 
 /**
- * The key of the row `current` names, so only one row is ever marked: the
- * row whose local name it is, else the one whose canonical name it is and
- * that is not shadowed, else the first that has it as an alias; null when
- * none does (C14).
+ * The key of the row `current` names, so only one row is ever marked, by
+ * the same spelling table links resolve through (`domainSpellings`): a
+ * local name first, then a canonical name one domain alone claims, then an
+ * alias one domain alone lists and no other name takes; null when `current`
+ * resolves nowhere, as a contested canonical name does (C14). A canonical
+ * name the listing marks shadowed is left out: a local name holds it.
  */
 export function hereKey(
   levels: readonly Level[],
   current: string,
 ): string | null {
-  const level =
-    levels.find((l) => l.key === current) ??
-    levels.find((l) => l.canonical === current && !l.shadowed) ??
-    levels.find((l) => l.aliases.includes(current));
-  return level?.key ?? null;
+  const spellings = domainSpellings(
+    levels.map((l) => ({
+      name: l.key,
+      canonicalName: l.shadowed ? null : l.canonical,
+      aliases: [...l.aliases],
+      shadowed: l.shadowed,
+    })),
+  );
+  return spellings.get(current) ?? null;
 }
 
 /** The items sorted by lowercased label, then by code point (C12). */
