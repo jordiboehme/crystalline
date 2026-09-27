@@ -531,4 +531,18 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/crystalline.rb
           git commit -m "Update crystalline to ${VERSION}"
-          git push
+          # The dev channel (dev.yml) writes Formula/crystalline-dev.rb in the
+          # same tap, and a release merge and this tag push can race on it.
+          # The two never touch the same file, so a rejected push rebases onto
+          # the other one's commit and tries again; what is written does not
+          # change.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt), rebasing onto the tap and trying again"
+            sleep $((attempt * 5))
+            git pull --rebase
+          done
+          echo "::error::could not push Formula/crystalline.rb to the tap"
+          exit 1
