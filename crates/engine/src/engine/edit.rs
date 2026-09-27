@@ -77,6 +77,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,
@@ -133,6 +134,7 @@ impl Engine {
                 p.expected_checksum.as_deref(),
                 &actor,
                 model.as_deref(),
+                scope,
                 peer,
                 |current| {
                     // The REPORTED model here, not the one resolved against
@@ -184,6 +186,7 @@ impl Engine {
             response["present"] = json!(live.participants);
         }
         note_unmirrored(&mut response, edited.warning);
+        note_domain_names_normalized(&mut response, edited.normalized);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
@@ -216,6 +219,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         model: Option<&str>,
+        scope: &crate::scope::Scope,
         apply: F,
     ) -> Result<Option<String>>
     where
@@ -239,6 +243,7 @@ impl Engine {
             expected_checksum,
             actor,
             model,
+            scope,
             None,
             apply,
         )
@@ -265,6 +270,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         model: Option<&str>,
+        scope: &crate::scope::Scope,
         peer: Option<&AgentPeer>,
         apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
@@ -313,6 +319,10 @@ impl Engine {
                 // later, for a reason nobody watching could connect to this.
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, normalized) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 let applied = rooms
                     .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
                     .await
@@ -322,6 +332,7 @@ impl Engine {
                 return Ok(SourceEdited {
                     warning: None,
                     live: Some(applied),
+                    normalized,
                 });
             }
         }
@@ -369,6 +380,10 @@ impl Engine {
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
             let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+            let (edited, normalized) = self
+                .normalize_domain_spellings_for(&edited, scope)
+                .await
+                .map_err(SourceEditFailure::before)?;
             if self.take_armed_failure() {
                 return Err(SourceEditFailure::before(EngineError::Internal(
                     "reindex failed (test seam)".to_string(),
@@ -385,10 +400,13 @@ impl Engine {
             return Ok(SourceEdited {
                 warning,
                 live: None,
+                normalized,
             });
         }
 
-        match source {
+        // Answered by whichever arm below runs, so the tail's `SourceEdited`
+        // reports the count whichever kind of source this write landed on.
+        let normalized = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
@@ -413,6 +431,10 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, count) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 // The last step that can fail with the file as it was:
                 // `write_bytes` renames a sibling temp into place, and a rename
                 // either happens or does not, so a refusal here leaves the
@@ -427,6 +449,7 @@ impl Engine {
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await
                     .map_err(SourceEditFailure::after)?;
+                count
             }
             ContentSource::Virtual => {
                 let current = {
@@ -448,6 +471,10 @@ impl Engine {
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let (edited, count) = self
+                    .normalize_domain_spellings_for(&edited, scope)
+                    .await
+                    .map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
                 // The seam, on this arm: a token nothing can match, so the
                 // store raises its own compare-and-swap conflict and rolls the
@@ -477,14 +504,13 @@ impl Engine {
                 )
                 .await
                 .map_err(SourceEditFailure::before)?;
+                count
             }
-        }
+        };
 
-        // A virtual edit may have rewritten this domain's MANIFEST engram, so
-        // refresh the routing cache. The store locks above are all released.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // An edit may have rewritten this domain's MANIFEST, its routing and
+        // its declared name. The store locks above are all released.
+        self.after_source_write(source, &desc.path).await;
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
@@ -496,6 +522,7 @@ impl Engine {
         Ok(SourceEdited {
             warning: None,
             live: None,
+            normalized,
         })
     }
 

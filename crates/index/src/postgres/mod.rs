@@ -110,10 +110,65 @@ use crate::store::{
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
     Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
-    Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window,
-    reference_match,
+    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
+    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
+    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    spelled_references_sql, spelling_plan,
 };
-use crate::sweep::UnresolvedRef;
+use crate::sweep::{SpelledRef, UnresolvedRef};
+
+/// `$from` through `$(from + count - 1)`, comma separated: an `IN` list's
+/// placeholders.
+fn placeholders(from: usize, count: usize) -> String {
+    (from..from + count)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Give `spelling` to domain `id` as its own name, taking it from any domain
+/// that held it as a canonical name or alias: local names win.
+async fn claim_own_spelling(conn: &mut PgConnection, spelling: &str, id: DomainId) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+         ON CONFLICT(spelling) DO UPDATE SET domain_id=EXCLUDED.domain_id",
+    )
+    .bind(spelling)
+    .bind(id.0)
+    .execute(&mut *conn)
+    .await
+    .map_err(IndexError::from)?;
+    Ok(())
+}
+
+/// [`claim_own_spelling`] for a renamed row. When another domain held the
+/// spelling, the references bound through it pointed at that domain, so they
+/// are unbound here for the next resolve pass: the spelling table changes
+/// under them in this call, and no later diff would see it.
+async fn take_spelling_for_rename(
+    conn: &mut PgConnection,
+    spelling: &str,
+    id: DomainId,
+) -> Result<()> {
+    let holder: Option<(i64,)> =
+        sqlx::query_as("SELECT domain_id FROM domain_spelling WHERE spelling=$1")
+            .bind(spelling)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(IndexError::from)?;
+    if holder.is_some_and(|(h,)| h != id.0) {
+        let list = placeholders(1, 1);
+        for table in ["relation", "link"] {
+            let sql = reset_spelled_references_sql(table, &list);
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(spelling)
+                .execute(&mut *conn)
+                .await
+                .map_err(IndexError::from)?;
+        }
+    }
+    claim_own_spelling(conn, spelling, id).await
+}
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
 pub struct PostgresStore {
@@ -835,7 +890,7 @@ fn kind_str(kind: DomainKind) -> &'static str {
 
 /// Strip the scheme, any credentials and the query string from a connection url,
 /// leaving `host:port/dbname` for display. Never returns credentials.
-fn sanitize_url(url: &str) -> Option<String> {
+pub(crate) fn sanitize_url(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1)?;
     let after_at = after_scheme
         .rsplit_once('@')
@@ -1016,7 +1071,292 @@ impl Store for PostgresStore {
         .fetch_one(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
+        // The row answers to its own name. A spelling another domain already
+        // holds is left with it; the name table's refresh settles precedence.
+        // No transaction of its own: a sync may already be inside one.
+        sqlx::query(
+            "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+             ON CONFLICT(spelling) DO NOTHING",
+        )
+        .bind(name)
+        .bind(row.0)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
         Ok(DomainId(row.0))
+    }
+
+    async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT spelling, domain_id FROM domain_spelling ORDER BY spelling COLLATE \"C\"",
+        )
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(spelling, id)| (spelling, DomainId(id)))
+            .collect())
+    }
+
+    async fn replace_domain_spellings(
+        &self,
+        spellings: &[(String, DomainId)],
+    ) -> Result<Vec<String>> {
+        // Every statement below runs on the pinned transaction connection, and
+        // each block drops its guard before the next `domain_spellings` read
+        // (which pins the same connection) and before the commit.
+        let SpellingPlan { rows, scope } = spelling_plan(spellings)?;
+        in_transaction(self, async {
+            {
+                let mut conn = self.acquire().await?;
+                for id in &scope {
+                    let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM domain WHERE id=$1")
+                        .bind(id.0)
+                        .fetch_optional(conn.as_mut())
+                        .await
+                        .map_err(IndexError::from)?;
+                    if known.is_none() {
+                        return Err(IndexError::Invalid(format!(
+                            "no domain row has id {}; sync the domain before recording its spellings",
+                            id.0
+                        )));
+                    }
+                }
+            }
+            let before = self.domain_spellings().await?;
+            {
+                let mut conn = self.acquire().await?;
+                let c = conn.as_mut();
+                // The listed domains' spellings go, all but each row's own name.
+                for id in &scope {
+                    sqlx::query(
+                        "DELETE FROM domain_spelling WHERE domain_id=$1 \
+                         AND spelling <> (SELECT name FROM domain WHERE id=$1)",
+                    )
+                    .bind(id.0)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                }
+                // The list, each spelling taken for its domain from whoever held it.
+                for (spelling, id) in &rows {
+                    claim_own_spelling(&mut *c, spelling, *id).await?;
+                }
+                // Then every row's own name, last, so a local name wins over any
+                // canonical name or alias on the same spelling - the list's or
+                // one recorded earlier, by this instance or another.
+                let displaced: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT d.name, d.id FROM domain d WHERE NOT EXISTS \
+                     (SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name AND s.domain_id=d.id)",
+                )
+                .fetch_all(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+                for (name, id) in displaced {
+                    claim_own_spelling(&mut *c, &name, DomainId(id)).await?;
+                }
+            }
+            let after = self.domain_spellings().await?;
+            Ok(changed_spellings(&before, &after))
+        })
+        .await
+    }
+
+    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        // -- actor: all - a draft's reference named the spelling too, and binds
+        // again through the actor's own resolve pass.
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut reset = 0;
+            for table in ["relation", "link"] {
+                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
+                let sql = reset_spelled_references_sql(table, &list);
+                reset += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(reset)
+        })
+        .await
+    }
+
+    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            let old_id = self.domain_id(old).await?;
+            let new_id = self.domain_id(new).await?;
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            match (old_id, new_id) {
+                (Some(_), Some(_)) => return Err(rename_onto_taken_row(old, new)),
+                (Some(id), None) => {
+                    sqlx::query("UPDATE domain SET name=$2 WHERE id=$1")
+                        .bind(id.0)
+                        .bind(new)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(IndexError::from)?;
+                    // The old name stays an alias of the row, so every
+                    // reference spelled with it keeps resolving; one another
+                    // domain holds is left with that domain.
+                    sqlx::query(
+                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+                         ON CONFLICT(spelling) DO NOTHING",
+                    )
+                    .bind(old)
+                    .bind(id.0)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                    take_spelling_for_rename(&mut *c, new, id).await?;
+                }
+                // Renamed already: make sure the own name is in place, and
+                // leave `old` alone - by now it may be an alias on purpose, or
+                // it was never this row's name and must not become one.
+                (None, Some(id)) => take_spelling_for_rename(&mut *c, new, id).await?,
+                (None, None) => {}
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            // -- actor: all - one actor's draft is content too, so any row of
+            // any actor keeps the domain row. `FOR UPDATE` holds the row until
+            // the commit, so a registration of the same name waits for it.
+            let id: Option<(i64,)> = sqlx::query_as(
+                "SELECT d.id FROM domain d WHERE d.name=$1 \
+                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
+                 FOR UPDATE OF d",
+            )
+            .bind(name)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+            let Some((id,)) = id else {
+                return Ok(false);
+            };
+            // `domain_lock` and `tag_alias` name the row without a cascade,
+            // and `relation` and `link` carry its id with no key at all, so
+            // each is cleared before the row itself.
+            for sql in [
+                "DELETE FROM domain_spelling WHERE domain_id=$1",
+                "DELETE FROM tag_alias WHERE domain_id=$1",
+                "DELETE FROM domain_lock WHERE domain_id=$1",
+                "DELETE FROM relation WHERE domain_id=$1",
+                "DELETE FROM link WHERE domain_id=$1",
+                "DELETE FROM domain WHERE id=$1",
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn engrams_referencing_domains(
+        &self,
+        spellings: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        if spellings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = placeholders(1, spellings.len());
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
+        let mut found: std::collections::BTreeSet<(String, String)> =
+            query_all(&mut *c, &referencing_domains_sql(&list), params)
+                .await?
+                .iter()
+                .map(|r| {
+                    (
+                        cell_text(r, 0).unwrap_or_default(),
+                        cell_text(r, 1).unwrap_or_default(),
+                    )
+                })
+                .collect();
+        // The URL half. `strpos` for the reason `engrams_mentioning` gives, and
+        // the body is read back only for the rows whose text holds a needle, so
+        // the scan can rule out a longer name that starts with a spelling.
+        let needles = domain_url_needles(spellings);
+        let predicate = (1..=needles.len())
+            .map(|i| format!("strpos(ec.content, ${i}) > 0"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let rows = query_all(
+            &mut *c,
+            &format!(
+                "SELECT d.name, e.path, ec.content \
+                 FROM engram e JOIN engram_content ec ON ec.engram_id=e.id \
+                      JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND ({predicate})"
+            ),
+            needles.into_iter().map(Param::Text).collect(),
+        )
+        .await?;
+        for r in &rows {
+            if names_a_domain_url(&cell_text(r, 2).unwrap_or_default(), spellings) {
+                found.insert((
+                    cell_text(r, 0).unwrap_or_default(),
+                    cell_text(r, 1).unwrap_or_default(),
+                ));
+            }
+        }
+        Ok(found.into_iter().collect())
+    }
+
+    async fn spelled_references(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+    ) -> Result<Vec<SpelledRef>> {
+        if spellings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = placeholders(2, spellings.len());
+        let mut params = vec![Param::Int(domain.0)];
+        params.extend(spellings.iter().map(|s| Param::Text(s.clone())));
+        let mut conn = self.acquire().await?;
+        let rows = query_all(conn.as_mut(), &spelled_references_sql("$1", &list), params).await?;
+        // Sorted here rather than in SQL, so the order is byte order on both
+        // backends without a collation clause.
+        let mut refs: Vec<(String, SpelledRef)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    cell_text(r, 4).unwrap_or_default(),
+                    SpelledRef {
+                        from: EngramId(cell_i64(r, 0).unwrap_or(0)),
+                        line: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                        spelling: cell_text(r, 2).unwrap_or_default(),
+                        raw: cell_text(r, 3).unwrap_or_default(),
+                    },
+                )
+            })
+            .collect();
+        refs.sort_by(|(pa, a), (pb, b)| (pa, a.line, &a.raw).cmp(&(pb, b.line, &b.raw)));
+        Ok(refs.into_iter().map(|(_, r)| r).collect())
     }
 
     async fn domain_id(&self, name: &str) -> Result<Option<DomainId>> {
@@ -1165,6 +1505,10 @@ impl Store for PostgresStore {
             "DELETE FROM attachment_blob WHERE attachment_id IN \
              (SELECT id FROM attachment WHERE domain_id=$1)",
             "DELETE FROM attachment WHERE domain_id=$1",
+            // Every spelling but the row's own name, which stays with the row.
+            // The declared cascade never fires: the row is kept.
+            "DELETE FROM domain_spelling WHERE domain_id=$1 \
+             AND spelling <> (SELECT name FROM domain WHERE id=$1)",
         ] {
             sqlx::query(sql)
                 .bind(domain.0)

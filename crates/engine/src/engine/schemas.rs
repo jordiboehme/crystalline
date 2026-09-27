@@ -16,6 +16,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let descs = store
@@ -65,6 +66,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let vocab = self.scoped_vocabulary(p.domain.as_deref(), &hidden).await?;
         // Every count list is present unconditionally, empty when nothing is in
         // use, so a client reads a list rather than testing for a missing key.

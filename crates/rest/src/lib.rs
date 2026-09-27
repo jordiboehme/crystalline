@@ -30,6 +30,7 @@ mod auth;
 mod schemas;
 use crystalline_identity::auth_store;
 mod discovery;
+mod domain_path;
 mod domains;
 mod domains_admin;
 mod draft_links;
@@ -142,6 +143,8 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::rename,
+        domains_admin::github_domain_name,
         domains_admin::set_review_mode,
         domains_admin::drafts,
         domains_admin::set_visibility,
@@ -240,6 +243,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::PolicyView,
         domains::SetPoliciesBody,
         domains_admin::CreateDomainBody,
+        domains_admin::RenameBody,
         domains_admin::FoldArg,
         domains_admin::ReviewBody,
         domains_admin::ReviewModeArg,
@@ -557,7 +561,27 @@ pub const ARCHIVE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// guarded the moment they are registered. Every route therefore belongs
 /// *above* the `.layer` call: axum only wraps what was declared before it, so a
 /// route added below would serve unguarded.
+///
+/// The routes sit behind one more step that runs BEFORE they are matched:
+/// `domain_path::localize_domain_path` spells a domain named in the path by
+/// its canonical name or an alias as its local name. A `Router::layer` runs
+/// after routing, when the path parameters are already captured, so the
+/// routes are served as a whole, as the fallback of an outer router that
+/// holds nothing else: the layer on that outer router runs once its fallback
+/// matched, which is before the routes inside have matched anything. A `nest`
+/// mounts the fallback under its prefix like any route.
 pub fn router(state: RestState) -> Router {
+    let routes = routes(state.clone());
+    Router::new()
+        .fallback_service(routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            domain_path::localize_domain_path,
+        ))
+}
+
+/// The routes [`router`] serves, guarded; see there.
+fn routes(state: RestState) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi_json))
         .route("/auth/login", post(auth::login))
@@ -626,6 +650,10 @@ pub fn router(state: RestState) -> Router {
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
+        // The domain's write gate, then the engine's own owner-or-admin
+        // rule: see [`domains_admin::rename`]. Refused on a read-only
+        // instance like every other mutation here.
+        .route("/domains/{domain}/rename", post(domains_admin::rename))
         // Whether a domain is private, and the two directions are gated
         // differently. PRIVATIZING is admin only: it hands the domain to the
         // caller, so a shared domain would otherwise be seized by whoever
@@ -832,6 +860,13 @@ pub fn router(state: RestState) -> Router {
         )
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // The same admin gate a team-domain create answers to, and a pure
+        // read: a peek at a repository's MANIFEST that never registers
+        // anything. See [`domains_admin::github_domain_name`].
+        .route(
+            "/github/domain-name",
+            get(domains_admin::github_domain_name),
+        )
         // The self-service half of the same surface, and the one settings
         // path that is not admin-only: an account's OWN GitHub identity, the
         // credential its shares go out on when this instance shares
@@ -1198,6 +1233,68 @@ mod tests {
             "at most {LOGIN_SLOTS} may hash at once, saw {peak}"
         );
         assert!(peak > 1, "and the limiter must not serialize them either");
+    }
+
+    /// How many times a request through the whole router resolved its
+    /// caller, and the status it was answered with.
+    async fn resolves_for(state: &RestState, path: &str) -> (usize, http::StatusCode) {
+        use tower_service::Service;
+        let request = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        auth::RESOLVE_COUNT
+            .scope(std::cell::Cell::new(0), async {
+                let status = router(state.clone()).call(request).await.unwrap().status();
+                (auth::RESOLVE_COUNT.with(|count| count.get()), status)
+            })
+            .await
+    }
+
+    /// A request resolves its caller once, also when its path names a domain
+    /// by an alias, where the step ahead of routing has to know the caller
+    /// to decide whether to spell the local name: the guard takes that
+    /// answer, the refusal of a caller nobody signed in included.
+    #[tokio::test]
+    async fn a_request_resolves_its_caller_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("platform");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = crystalline_core::config::GlobalConfig::default();
+        config.domains.insert(
+            "platform".to_string(),
+            crystalline_core::config::DomainEntry {
+                path: Some(root),
+                aliases: vec!["eng".to_string()],
+                ..Default::default()
+            },
+        );
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            config,
+            None,
+            None,
+        ));
+        let auth = Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        let state = RestState::new(engine, auth, &[]).unwrap();
+        assert_eq!(
+            state.engine.local_domain_name("eng").await.as_deref(),
+            Some("platform"),
+            "the alias is what the step ahead of routing rewrites"
+        );
+
+        for path in ["/domains/eng/tree", "/domains/platform/tree", "/search"] {
+            let (resolves, status) = resolves_for(&state, path).await;
+            assert_eq!(resolves, 1, "{path}");
+            assert_eq!(status, http::StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
 
     #[test]

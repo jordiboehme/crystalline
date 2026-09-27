@@ -66,6 +66,7 @@ impl Engine {
         // Resolved once, before anything is written, and used twice below: to
         // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         let (src, src_source) = view.resolve(&p.identifier).await?;
@@ -99,6 +100,14 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
+        // A move into another domain writes there too, so it is counted there
+        // for the whole move: a rename of the destination waits for it, and a
+        // destination a rename has paused is waited for first.
+        let _dest_ticket = if cross {
+            Some(self.enter_write(&dest_domain).await?)
+        } else {
+            None
+        };
         let new_permalink = Self::moved_permalink(&src, &dest_rel, p.permalink.as_deref())?;
         let in_place = !cross && dest_rel == src.path;
         if in_place && new_permalink == src.permalink {
@@ -263,6 +272,14 @@ impl Engine {
             if !renames.is_empty() {
                 content = rewrite_carried_refs(&content, &renames);
             }
+            // The moved engram's own text passes through the same funnel
+            // every other write's final text does: a cross-domain link it
+            // carries, spelled with an alias or a non-canonical local name,
+            // is written with the canonical one instead. The move's own
+            // relink pass above only follows THIS engram's address; a link to
+            // some other domain is untouched by it and would otherwise cross
+            // domains still spelled however it was written.
+            let (content, _) = self.normalize_domain_spellings(&content, &hidden).await;
             match &dest_source {
                 ContentSource::File { root } => {
                     let dest_abs = join_rel(root, &dest_rel);
@@ -303,6 +320,19 @@ impl Engine {
             // row its new path and permalink in place, keeping its id. A move
             // that did not change the text needs no reparse; one that did is
             // reindexed from what was written, so the row reads the file.
+            //
+            // When the move DID change the text (a permalink line, or a
+            // relinked self-reference), that text passes through the same
+            // funnel every other write's final text does: a cross-domain
+            // link it carries to some other domain, spelled with an alias or
+            // a non-canonical local name, is written with the canonical one
+            // instead. Byte-identical carries (`None`) are untouched, so an
+            // ordinary rename never rewrites content the move itself did not
+            // touch.
+            let moved_text = match moved_text {
+                Some(text) => Some(self.normalize_domain_spellings(&text, &hidden).await.0),
+                None => None,
+            };
             if let ContentSource::File { root } = &src_source {
                 let src_abs = join_rel(root, &src.path);
                 let dest_abs = join_rel(root, &dest_rel);
@@ -370,7 +400,10 @@ impl Engine {
         let mut rewritten: Vec<Value> = Vec::new();
         let mut references = 0usize;
         for linker in &linkers {
-            match self.relink_engram(linker, &spec, &linker_actor).await {
+            match self
+                .relink_engram(linker, &spec, &linker_actor, &hidden)
+                .await
+            {
                 Ok(Some((count, permalink))) => {
                     references += count;
                     rewritten.push(json!({ "domain": linker.domain, "permalink": permalink }));
@@ -632,6 +665,7 @@ impl Engine {
         linker: &MoveLinker,
         spec: &Relink<'_>,
         actor: &str,
+        hidden: &HashSet<String>,
     ) -> Result<Option<(usize, String)>> {
         let source = self.read_source(&linker.domain);
         let text = match &source {
@@ -656,6 +690,14 @@ impl Engine {
             return Ok(None);
         }
         let replaced = touch_generated(&relinked, actor, None, now_offset());
+        // The rewritten reference passes through the same funnel every other
+        // write's final text does: `spec.to_domain` is the destination's
+        // local name (moves are localized before they reach here), so
+        // without this a linker would carry `[[<local-name>:...]]` even where
+        // that local name is only an alias or a non-canonical spelling of the
+        // domain's declared name. Called before the store lock below is
+        // taken, since it may itself need the store.
+        let (replaced, _) = self.normalize_domain_spellings(&replaced, hidden).await;
         let store = self.store.lock().await;
         match &source {
             ContentSource::File { root } => {

@@ -8,12 +8,11 @@
 //! being off refuses before an engine method ever tries to build a GitHub
 //! provider. The successful connect/update/status paths against a real (or
 //! mocked) origin are covered at the engine level by
-//! `crates/service/tests/origins/origin.rs`, which injects a mock provider; there is
-//! no HTTP-mocking harness in this crate to exercise them here, and
-//! `connect github` needs a live GitHub connection to test end to end, so it
-//! is not covered by an automated test in this crate (noted as a gap; its
-//! auth building blocks are covered by `crates/remote`'s own
-//! `github_auth.rs`/`github_client.rs` tests).
+//! `crates/service/tests/origins/origin.rs`, which injects a mock provider.
+//! One scenario here does run a real connect, against `StandInForge`, a
+//! small local HTTP stand-in the config's `github.api_url` points at: the
+//! nameless `--origin` connect that adopts an existing domain, which only a
+//! real connect reaches.
 
 use std::path::{Path, PathBuf};
 
@@ -657,6 +656,14 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
 /// `trunk` at `root`, with `github.enabled`. Written through the core's own
 /// serializer so the path is valid YAML on every platform.
 fn already_connected_team_config(config: &Path, root: &Path) {
+    already_connected_team_config_named(config, root, "eng");
+}
+
+/// [`already_connected_team_config`], registered under `local_name` instead
+/// of the fixed `eng` - for the nameless `domain add --origin` scenario,
+/// where the domain the retry must match is whatever name the engine
+/// derives from the repository, not a name this test gets to pick.
+fn already_connected_team_config_named(config: &Path, root: &Path, local_name: &str) {
     use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig, OriginConfig};
     let mut cfg = GlobalConfig::default();
     let mut entry = DomainEntry::file(std::fs::canonicalize(root).unwrap());
@@ -666,7 +673,7 @@ fn already_connected_team_config(config: &Path, root: &Path) {
         branch: Some("trunk".to_string()),
         poll_secs: None,
     });
-    cfg.domains.insert("eng".to_string(), entry);
+    cfg.domains.insert(local_name.to_string(), entry);
     cfg.github = Some(GitHubConfig {
         enabled: Some(true),
         ..Default::default()
@@ -679,17 +686,14 @@ fn already_connected_team_config(config: &Path, root: &Path) {
 /// "not adopted" and go on to close whatever `domain add` had just touched,
 /// even an existing registration). Here the retry is exact - same repo,
 /// branch and folder as the entry already on file - so the engine answers
-/// `already_connected` lock-free, with no GitHub call: the one shape this
-/// crate can drive without a GitHub mock (see the file header).
+/// `already_connected` lock-free, with no GitHub call.
 ///
 /// The other half of the fix's `true` condition - a fresh, origin-less
 /// domain adopted in place by `--origin`, which needs a real connect to
-/// reach - is covered at the engine level by the `adopted: true` assertion
-/// in `crates/service/tests/origins/origin.rs`, against a mock provider this crate
-/// has no harness for; both conditions feed the same `already_registered ||
-/// already_connected` return in `domain_add_origin_dispatch`, and this test
-/// exercises the CLI-only half of the fix, the `--private` refusal in
-/// `run_domain`, that neither engine-level test reaches.
+/// reach - runs against the stand-in forge below, in
+/// `domain_add_origin_with_no_name_adopting_an_origin_less_domain_refuses_private_and_keeps_it_shared`;
+/// both conditions feed the same `already_registered || already_connected`
+/// return in `domain_add_origin_dispatch`.
 #[test]
 fn domain_add_origin_on_an_already_connected_domain_refuses_private_and_does_not_close_it() {
     let home = tempfile::tempdir().unwrap();
@@ -754,6 +758,406 @@ fn domain_add_origin_on_an_already_connected_domain_refuses_private_and_does_not
     assert!(out.status.success(), "{out:?}");
     let listed = String::from_utf8(out.stdout).unwrap();
     assert!(listed.contains("is shared"), "{listed}");
+}
+
+/// The same refusal, with no name given: `domain add --origin` derives one
+/// from the repository (`acme/kb` -> `kb`), and the domain already
+/// registered under exactly that derived name must not be mistaken for a
+/// fresh one `--private` may close, even though nothing was typed for
+/// `domain_add_dispatch` to compare against ahead of the connect.
+#[test]
+fn domain_add_origin_with_no_name_on_an_already_connected_domain_refuses_private_and_does_not_close_it()
+ {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "kb"])
+        .assert()
+        .success();
+    already_connected_team_config_named(&config, &root, "kb");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "users",
+        "add",
+        "ada",
+        "--role",
+        "editor",
+        "--password-stdin",
+    ])
+    .write_stdin("s3cret\n")
+    .assert()
+    .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "domain",
+        "add",
+        "--origin",
+        "acme/kb",
+        "--branch",
+        "trunk",
+        "--private",
+        "--owner",
+        "ada",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("domain visibility"));
+
+    // The refusal ran before any close: the domain is still shared.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["domain", "members", "kb", "list", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(listed.contains("is shared"), "{listed}");
+}
+
+// --- domain add --origin against a stand-in forge -----------------------------
+
+/// A stand-in for GitHub answering exactly what a nameless connect of
+/// `acme/kb` asks, over plain HTTP on a local port the config's
+/// `github.api_url` points at: the token check (`/user`), the repository's
+/// default branch (`trunk`), the MANIFEST read (`manifest` when given, else
+/// 404: then the repository declares no name, and the connect falls back to
+/// the repository's own, `kb`), the branch head and the tarball. Every path
+/// asked is recorded.
+struct StandInForge {
+    url: String,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl StandInForge {
+    const HEAD: &'static str = "c0ffee";
+
+    fn start(tarball: Vec<u8>, manifest: Option<&str>) -> StandInForge {
+        let manifest = manifest.map(|m| m.as_bytes().to_vec());
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let asked: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen = asked.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                // Drain the headers; every request here is a bodiless GET.
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let path = target.split('?').next().unwrap_or_default().to_string();
+                seen.lock().unwrap().push(target.clone());
+                let (status, kind, body): (&str, &str, Vec<u8>) = match path.as_str() {
+                    "/user" => (
+                        "200 OK",
+                        "application/json",
+                        br#"{"login":"probe"}"#.to_vec(),
+                    ),
+                    "/repos/acme/kb" => (
+                        "200 OK",
+                        "application/json",
+                        br#"{"default_branch":"trunk"}"#.to_vec(),
+                    ),
+                    "/repos/acme/kb/git/ref/heads/trunk" => (
+                        "200 OK",
+                        "application/json",
+                        format!(r#"{{"object":{{"sha":"{}"}}}}"#, Self::HEAD).into_bytes(),
+                    ),
+                    "/repos/acme/kb/contents/MANIFEST.md" if manifest.is_some() => (
+                        "200 OK",
+                        "application/vnd.github.raw+json",
+                        manifest.clone().unwrap(),
+                    ),
+                    p if p == format!("/repos/acme/kb/tarball/{}", Self::HEAD) => {
+                        ("200 OK", "application/x-gzip", tarball.clone())
+                    }
+                    _ => (
+                        "404 Not Found",
+                        "application/json",
+                        br#"{"message":"Not Found"}"#.to_vec(),
+                    ),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        StandInForge {
+            url,
+            asked,
+            _thread: thread,
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// `files` as GitHub serves a repository tarball: gzipped, every entry under
+/// one top-level `<owner>-<repo>-<sha>/` directory.
+fn github_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    {
+        let encoder = flate2::write::GzEncoder::new(&mut archive, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, text) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(text.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("acme-kb-{}/{path}", StandInForge::HEAD),
+                    text.as_bytes(),
+                )
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+    archive
+}
+
+/// The scenario the nameless `--private` fix exists for, end to end through
+/// a real connect: `domain add --origin acme/kb` with no name lands on the
+/// repository's own name, `kb`, which is already somebody's origin-less,
+/// shared file domain. The connect adopts it in place - so `--private` must
+/// refuse rather than close it, and the domain stays shared.
+#[test]
+fn domain_add_origin_with_no_name_adopting_an_origin_less_domain_refuses_private_and_keeps_it_shared()
+ {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let team_manifest = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- kb\n\n## When to Use\n\n- kb\n";
+    let team_note = "---\ntype: engram\ntitle: Team note\npermalink: team-note\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nwhat the team knows\n";
+    let forge = StandInForge::start(
+        github_tarball(&[("MANIFEST.md", team_manifest), ("team-note.md", team_note)]),
+        None,
+    );
+
+    // Somebody's own local domain `kb`, shared, with no origin.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "kb"])
+        .assert()
+        .success();
+    {
+        use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
+        let mut cfg = GlobalConfig::default();
+        cfg.domains.insert(
+            "kb".to_string(),
+            DomainEntry::file(std::fs::canonicalize(&root).unwrap()),
+        );
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(forge.url.clone()),
+            ..Default::default()
+        });
+        crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+    }
+
+    // The machine's own credential, validated against the stand-in. The
+    // isolation keeps it out of the login keychain: it lands in the file
+    // store under the isolated state directory, where the connect reads it.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["connect", "github", "--token", "gho_probe", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "users",
+        "add",
+        "ada",
+        "--role",
+        "editor",
+        "--password-stdin",
+    ])
+    .write_stdin("s3cret\n")
+    .assert()
+    .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "domain",
+        "add",
+        "--origin",
+        "acme/kb",
+        "--private",
+        "--owner",
+        "ada",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains(
+        "domain 'kb' was already registered, so --private changed nothing",
+    ));
+
+    // A real connect ran: the MANIFEST was asked for before the name was
+    // chosen, on the branch the repository calls its default, and the
+    // download followed.
+    let asked = forge.asked();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p == "/repos/acme/kb/contents/MANIFEST.md?ref=trunk"),
+        "{asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|p| p == &format!("/repos/acme/kb/tarball/{}", StandInForge::HEAD)),
+        "{asked:?}"
+    );
+
+    // Adopted in place: the same entry, the same folder, now with the origin,
+    // and the team's knowledge arrived beside the local files.
+    let saved: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&config).unwrap();
+    let names: Vec<&String> = saved.domains.keys().collect();
+    assert_eq!(names, vec!["kb"], "no second registration");
+    let entry = &saved.domains["kb"];
+    assert_eq!(entry.origin.as_ref().unwrap().repo, "acme/kb");
+    assert_eq!(
+        entry.file_path().as_deref(),
+        Some(std::fs::canonicalize(&root).unwrap().as_path())
+    );
+    assert!(root.join("team-note.md").exists());
+
+    // And the refusal ran before any close: the domain is still shared.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["domain", "members", "kb", "list", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(listed.contains("is shared"), "{listed}");
+}
+
+/// A nameless connect whose repository declares a name already taken here
+/// lands on `<name>-2`, leaves the holder alone, and says so plainly.
+#[test]
+fn domain_add_origin_with_no_name_says_so_when_the_declared_name_is_taken() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("mine");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let team_manifest = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: eng\n---\n\n# kb\n\n## Scope\n\n- kb\n\n## When to Use\n\n- kb\n";
+    let forge = StandInForge::start(
+        github_tarball(&[("MANIFEST.md", team_manifest)]),
+        Some(team_manifest),
+    );
+
+    // A local domain of this machine already holds `eng`.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    {
+        use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
+        let mut cfg = GlobalConfig::default();
+        cfg.domains.insert(
+            "eng".to_string(),
+            DomainEntry::file(std::fs::canonicalize(&root).unwrap()),
+        );
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(forge.url.clone()),
+            ..Default::default()
+        });
+        cfg.domains_root = Some(work.path().join("domains"));
+        crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+    }
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["connect", "github", "--token", "gho_probe", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "add", "--origin", "acme/kb", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Connected team domain 'eng-2' to acme/kb",
+        ))
+        .stdout(predicates::str::contains(
+            "'eng' is already a domain here, so this one is registered as 'eng-2'",
+        ));
+
+    let saved: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&config).unwrap();
+    assert!(
+        saved.domains["eng"].origin.is_none(),
+        "the holder is untouched"
+    );
+    assert_eq!(
+        saved.domains["eng-2"].origin.as_ref().unwrap().repo,
+        "acme/kb"
+    );
 }
 
 // --- chain rendering, against a stand-in daemon ------------------------------

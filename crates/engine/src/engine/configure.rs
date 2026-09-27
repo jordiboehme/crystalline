@@ -172,7 +172,14 @@ impl Engine {
         };
         crystalline_core::config::save_yaml(&path, config).map_err(|e| {
             EngineError::Internal(format!("failed to save config {}: {e}", path.display()))
-        })
+        })?;
+        // A saved configuration may register, remove or re-alias a domain,
+        // and the name table is built from the registrations. Marked here,
+        // the one place every configuration write goes through, so a verb
+        // that fails after its write (a sync after a registration) still
+        // leaves the next lookup building from what the file says.
+        self.mark_names_stale();
+        Ok(())
     }
 
     // --- provision ---------------------------------------------------------

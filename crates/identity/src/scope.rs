@@ -450,9 +450,10 @@ impl DomainAccess {
     /// Retire the visibility and membership records of a domain that no longer
     /// exists.
     ///
-    /// **The one write on this type, and it is here rather than beside the
-    /// reads by accident of ownership.** Everything else on `DomainAccess`
-    /// answers a question; this ends the records the answers are computed from.
+    /// **One of the two writes on this type, and it is here rather than beside
+    /// the reads by accident of ownership.** Everything else on `DomainAccess`
+    /// but [`DomainAccess::rename_domain`] answers a question; this ends the
+    /// records the answers are computed from.
     /// It lives here because the engine holds exactly one handle onto the
     /// accounts database - this one - and the removal verb is the engine's, so
     /// the alternative was handing the engine the whole store. A narrow method
@@ -465,6 +466,19 @@ impl DomainAccess {
     #[doc(hidden)]
     pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
         self.auth.forget_domain(domain).await
+    }
+
+    /// Carry the visibility, membership and share-link records of domain
+    /// `old` over to `new`, for a domain that is being renamed.
+    ///
+    /// The second write on this type, here for the reason
+    /// [`DomainAccess::forget_domain`] is: the rename verb is the engine's and
+    /// this is its one handle onto the accounts database. It decides nothing;
+    /// [`AuthStore::rename_domain`] says what moves and why a second call is
+    /// fine.
+    #[doc(hidden)]
+    pub async fn rename_domain(&self, old: &str, new: &str) -> Result<()> {
+        self.auth.rename_domain(old, new).await
     }
 
     /// Which domains are private, and which of those `scope` may not read.
@@ -603,6 +617,44 @@ mod tests {
             account: account.into(),
             admin,
         }
+    }
+
+    /// A renamed domain keeps who may do what: the rights answered for the
+    /// new name are the ones the old name had, and the old name is an
+    /// ordinary shared domain afterwards.
+    #[tokio::test]
+    async fn a_renamed_domain_keeps_its_rights_under_the_new_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.set_domain_visibility("eng", true, "keeper")
+            .await
+            .unwrap();
+        auth.upsert_domain_member("eng", "mem", MemberLevel::Editor, "keeper")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth);
+        access.rename_domain("eng", "platform").await.unwrap();
+        assert_eq!(
+            access
+                .right(&user("keeper", false), "platform")
+                .await
+                .unwrap(),
+            DomainRight::Own
+        );
+        assert_eq!(
+            access.right(&user("mem", false), "platform").await.unwrap(),
+            DomainRight::Write
+        );
+        assert_eq!(
+            access.right(&user("out", false), "platform").await.unwrap(),
+            DomainRight::None
+        );
+        assert_eq!(
+            access.right(&user("out", false), "eng").await.unwrap(),
+            DomainRight::Write,
+            "nothing private is left under the old name"
+        );
     }
 
     #[tokio::test]

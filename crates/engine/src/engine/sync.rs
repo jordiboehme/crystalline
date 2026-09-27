@@ -129,6 +129,15 @@ impl Engine {
         // heartbeat into staleness. The apply window is bounded db work, so no
         // extra renew before it is needed.
         for (name, root) in &targets {
+            // A domain a rename has paused is skipped: its index row may
+            // already carry the new name, and a pass under the old one would
+            // register a second row. The sync that ends the rename covers it.
+            // Held for the whole pass, so a rename waits for a pass already
+            // running.
+            let Some(_pass) = self.try_enter_sync(name) else {
+                skipped.push(json!({ "domain": name, "renaming": true }));
+                continue;
+            };
             let (domain, snapshot) = {
                 let store = self.store.lock().await;
                 if collab {
@@ -196,6 +205,9 @@ impl Engine {
                     EngineError::Internal(format!("resolving forward references failed: {e}"))
                 })?;
         }
+        // A synced MANIFEST may declare a new name, and a domain synced for
+        // the first time has just been given the row its spellings hang on.
+        self.refresh_names().await;
         let reports: Vec<SyncReport> = applied.into_iter().map(|(_, report)| report).collect();
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
@@ -229,6 +241,13 @@ impl Engine {
                 ..SyncReport::default()
             });
         };
+        // Skipped while a rename has the domain paused; see `sync_take_over`.
+        let Some(_pass) = self.try_enter_sync(name) else {
+            return Ok(SyncReport {
+                domain: name.to_string(),
+                ..SyncReport::default()
+            });
+        };
         let collab = !self.instance_id.is_empty();
         let (domain, snapshot) = {
             let store = self.store.lock().await;
@@ -253,6 +272,7 @@ impl Engine {
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
+        let manifest_touched = Self::touches_manifest(&paths);
         let scan = scan_paths(name, &root, snapshot, paths, &self.chunk_params).await;
         let report = {
             let store = self.store.lock().await;
@@ -264,6 +284,11 @@ impl Engine {
         // generated index should say.
         if changed_anything(&report) {
             self.refresh_index_files(name).await;
+        }
+        // An edit of the MANIFEST outside any verb may change the name the
+        // domain declares.
+        if manifest_touched {
+            self.refresh_names().await;
         }
         Ok(report)
     }
@@ -288,7 +313,9 @@ impl Engine {
     /// generated index files after one changed.
     pub async fn reindex(&self, full: bool) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "reindex", None);
-        let targets = self.sync_targets(None)?;
+        // A domain a rename has paused is left to the sync that ends it.
+        let mut targets = self.sync_targets(None)?;
+        targets.retain(|(name, _)| !self.is_renaming(name));
         let hooks = DaemonReindexHooks {
             engine: self,
             collab: !self.instance_id.is_empty(),
@@ -399,6 +426,16 @@ impl Engine {
                 v
             })
             .collect();
+        // Every registered virtual domain's declared name, which lives in its
+        // MANIFEST engram in the database: `domain list` over the daemon reads
+        // it from here, beside the counts, in the one call it makes.
+        let table = self.name_table_now().await;
+        let virtual_names: serde_json::Map<String, Value> = self
+            .registered_domain_entries()
+            .iter()
+            .filter(|(_, entry)| entry.is_virtual())
+            .map(|(name, _)| (name.clone(), json!(table.canonical(name).unwrap_or(name))))
+            .collect();
         let registered: Vec<String> = self
             .config
             .read()
@@ -422,6 +459,7 @@ impl Engine {
             "instance_id": if self.instance_id.is_empty() { Value::Null } else { json!(self.instance_id) },
             "registered": registered,
             "domains": serde_json::to_value(&domains).unwrap_or(Value::Null),
+            "virtual_names": Value::Object(virtual_names),
             "embeddings": {
                 "active_model": self.model_id,
                 "provider": self.provider().is_some(),

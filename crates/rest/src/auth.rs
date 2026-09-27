@@ -501,7 +501,16 @@ pub async fn guard(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let identity = resolve(&state, req.headers()).await?;
+    // The domain-path step ahead of routing may have resolved the caller
+    // already; its answer, success or refusal, is this request's answer.
+    let identity = match req
+        .extensions_mut()
+        .remove::<ResolvedIdentity>()
+        .and_then(ResolvedIdentity::take)
+    {
+        Some(resolved) => resolved?,
+        None => resolve(&state, req.headers()).await?,
+    };
     check_csrf(&identity, &req)?;
     if !PUBLIC_PATHS.contains(&req.uri().path()) {
         identity.require_viewer()?;
@@ -510,8 +519,38 @@ pub async fn guard(
     Ok(next.run(req).await)
 }
 
+/// The caller a step ahead of [`guard`] already resolved for this request,
+/// handed on through the request extensions so a request resolves its caller
+/// once: resolving reads the accounts store, and a header mode may even
+/// provision an account. Taken out exactly once, by the guard; a request
+/// extension is set only by this server, never by a client.
+#[derive(Clone)]
+pub(crate) struct ResolvedIdentity(
+    std::sync::Arc<std::sync::Mutex<Option<Result<Identity, ApiError>>>>,
+);
+
+impl ResolvedIdentity {
+    /// Wrap one resolution.
+    pub(crate) fn new(resolved: Result<Identity, ApiError>) -> ResolvedIdentity {
+        ResolvedIdentity(std::sync::Arc::new(std::sync::Mutex::new(Some(resolved))))
+    }
+
+    /// The resolution, the first time it is asked for.
+    fn take(self) -> Option<Result<Identity, ApiError>> {
+        self.0.lock().ok()?.take()
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// How many times [`resolve`] ran inside the task a test scoped it to.
+    pub(crate) static RESOLVE_COUNT: std::cell::Cell<usize>;
+}
+
 /// A header mode, then the session cookie, then anonymous, then nothing.
-async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
+pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
+    #[cfg(test)]
+    let _ = RESOLVE_COUNT.try_with(|count| count.set(count.get() + 1));
     if let Some(name) = &state.auth_cfg.trusted_header
         && let Some(raw) = headers.get(name)
         && let Ok(value) = raw.to_str()

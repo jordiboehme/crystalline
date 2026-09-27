@@ -432,7 +432,7 @@ impl DomainKind {
 
 /// A registered domain. A file domain carries its root `path`; a virtual domain
 /// carries no path and elects the database as its source of truth.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DomainEntry {
     /// The domain kind. Absent (the default `file`) is never serialized, so a
     /// file-domain entry writes only its `path` exactly as before.
@@ -458,6 +458,36 @@ pub struct DomainEntry {
     /// saying what the team reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewMode>,
+    /// How this domain got its name: explicitly named at registration, or
+    /// derived from the repository or folder default. Absent means this
+    /// domain was registered before 0.20.0 and has not been inferred yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_origin: Option<NameOrigin>,
+    /// Former names this domain answered to on this machine. Machine-local,
+    /// input only: a link written with one of these still resolves, but
+    /// nothing here is ever written back to a MANIFEST or shared with a team.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// The last canonical name this machine adopted for this domain. Kept so
+    /// a later change to the canonical name (a MANIFEST `domain_name` edit)
+    /// is detected: the previous value in this field becomes a new alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_seen: Option<String>,
+}
+
+/// How a domain came to have the name it is registered under: named on
+/// purpose, or worked out from the repository or folder default. Recorded at
+/// every registration; an entry from before 0.20.0 carries `None` until it is
+/// inferred once (see `infer_name_origin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameOrigin {
+    /// The name was given on purpose: typed on the command line, sent by a
+    /// caller, or set by an environment variable.
+    Explicit,
+    /// The name was worked out for the caller: the MANIFEST's `domain_name`,
+    /// the repository's default name, or the folder name.
+    Derived,
 }
 
 /// How a domain takes changes.
@@ -483,6 +513,9 @@ impl DomainEntry {
             origin: None,
             provision: None,
             review: None,
+            name_origin: None,
+            aliases: Vec::new(),
+            canonical_seen: None,
         }
     }
 
@@ -494,7 +527,18 @@ impl DomainEntry {
             origin: None,
             provision: None,
             review: None,
+            name_origin: None,
+            aliases: Vec::new(),
+            canonical_seen: None,
         }
+    }
+
+    /// Records how this domain got its name. Used at registration, once
+    /// `name_origin` is known: [`NameOrigin::Explicit`] for a name given on
+    /// purpose, [`NameOrigin::Derived`] for one worked out for the caller.
+    pub fn with_name_origin(mut self, origin: NameOrigin) -> DomainEntry {
+        self.name_origin = Some(origin);
+        self
     }
 
     /// Whether this domain keeps its engrams in the database rather than on disk.
@@ -2013,5 +2057,47 @@ mod tests {
         assert!(yaml.contains("free_attempts: 1"), "{yaml}");
         let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn an_entry_without_the_new_fields_round_trips_byte_for_byte() {
+        let yaml = "domains:\n  eng:\n    path: /tmp/eng\n";
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let entry = &cfg.domains["eng"];
+        assert_eq!(entry.name_origin, None);
+        assert!(entry.aliases.is_empty());
+        assert_eq!(entry.canonical_seen, None);
+        let back = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert_eq!(back, yaml);
+    }
+
+    #[test]
+    fn name_origin_and_aliases_are_written_only_when_set() {
+        let mut entry = DomainEntry::file("/tmp/eng").with_name_origin(NameOrigin::Derived);
+        entry.aliases.push("eng-knowledge".to_string());
+        let mut cfg = GlobalConfig::default();
+        cfg.domains.insert("eng".to_string(), entry);
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("name_origin: derived"), "{yaml}");
+        assert!(yaml.contains("- eng-knowledge"), "{yaml}");
+        assert!(!yaml.contains("canonical_seen"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn a_canonical_seen_value_round_trips() {
+        let mut entry = DomainEntry::file("/tmp/eng");
+        entry.canonical_seen = Some("platform".to_string());
+        let mut cfg = GlobalConfig::default();
+        cfg.domains.insert("eng".to_string(), entry);
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("canonical_seen: platform"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            back.domains["eng"].canonical_seen.as_deref(),
+            Some("platform")
+        );
+        assert_eq!(back, cfg);
     }
 }

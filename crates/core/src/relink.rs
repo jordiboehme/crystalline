@@ -81,6 +81,22 @@ pub fn relink(source: &str, read_in: &str, written_in: &str, spec: &Relink<'_>) 
     if !spec.changes_address() && read_in == written_in {
         return (source.to_string(), 0);
     }
+    rewrite_body(source, &|line| relink_line(line, read_in, written_in, spec))
+}
+
+/// Rewrite the domain part of every `[[x:target]]` wikilink and every
+/// `crystalline://x...` URL in the body where `respell(x)` answers a
+/// different name. Same scan as [`relink`]: body only, fences and inline
+/// code untouched, every other byte kept.
+pub fn respell_domains(source: &str, respell: &dyn Fn(&str) -> Option<String>) -> (String, usize) {
+    rewrite_body(source, &|line| respell_line(line, respell))
+}
+
+/// Walk the body one line at a time exactly as [`relink`] and
+/// [`respell_domains`] both need to: frontmatter kept verbatim, a fenced or
+/// unparseable source left untouched, and a line handed to `line_fn` only
+/// when it can plausibly hold a wikilink or a `crystalline://` URL.
+fn rewrite_body(source: &str, line_fn: &dyn Fn(&str) -> (String, usize)) -> (String, usize) {
     let Ok(lossless) = parse_engram_lossless(source) else {
         return (source.to_string(), 0);
     };
@@ -102,7 +118,7 @@ pub fn relink(source: &str, read_in: &str, written_in: &str, spec: &Relink<'_>) 
             out.push_str(raw);
             continue;
         }
-        let (rewritten, n) = relink_line(raw, read_in, written_in, spec);
+        let (rewritten, n) = line_fn(raw);
         out.push_str(&rewritten);
         count += n;
     }
@@ -235,6 +251,96 @@ fn relink_wikilink(
         Some(domain) => format!("{domain}:{new_target}"),
         None => new_target.to_string(),
     })
+}
+
+/// One body line, outside any fence, for [`respell_domains`]. Same char-based
+/// walk as [`relink_line`], over the same masked text, but the only question
+/// asked of each construct is whether its domain part reads differently now.
+fn respell_line(line: &str, respell: &dyn Fn(&str) -> Option<String>) -> (String, usize) {
+    let original: Vec<char> = line.chars().collect();
+    let masked: Vec<char> = if line.contains('`') {
+        mask_inline_code(line).chars().collect()
+    } else {
+        original.clone()
+    };
+    let scheme: Vec<char> = SCHEME.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let n = masked.len();
+    while i < n {
+        if masked[i] == '['
+            && masked.get(i + 1) == Some(&'[')
+            && let Some(close) = find_close(&masked, i + 2)
+        {
+            let inner: String = masked[i + 2..close].iter().collect();
+            let raw_inner: String = original[i + 2..close].iter().collect();
+            if let Some(new_inner) = respell_wikilink(&inner, &raw_inner, respell) {
+                out.push_str("[[");
+                out.push_str(&new_inner);
+                out.push_str("]]");
+                count += 1;
+            } else {
+                out.extend(&original[i..close + 2]);
+            }
+            i = close + 2;
+            continue;
+        }
+        if masked[i] == 'c' && starts_with(&masked, i, &scheme) {
+            let run_start = i + scheme.len();
+            let mut end = run_start;
+            while end < n && is_domain_char(masked[end]) {
+                end += 1;
+            }
+            let run: String = original[run_start..end].iter().collect();
+            let trimmed = run.trim_end_matches('.');
+            if !trimmed.is_empty()
+                && let Some(new_name) = respell(trimmed)
+                && new_name != trimmed
+            {
+                out.push_str(SCHEME);
+                out.push_str(&new_name);
+                count += 1;
+                i = run_start + trimmed.chars().count();
+                continue;
+            }
+        }
+        out.push(original[i]);
+        i += 1;
+    }
+    (out, count)
+}
+
+/// A char that can be part of the bare domain run right after `crystalline://`.
+fn is_domain_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// The new bracket text for one wikilink under [`respell_domains`], or `None`
+/// when it carries no domain prefix or `respell` leaves it as it reads.
+///
+/// `masked_inner` (the same masked text the caller walked to find the target)
+/// is parsed for structure; `raw_inner` is the original bracket text, whose
+/// first colon and surrounding whitespace are kept exactly as written, with
+/// only the trimmed domain segment before it replaced.
+fn respell_wikilink(
+    masked_inner: &str,
+    raw_inner: &str,
+    respell: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let target = LinkTarget::parse(masked_inner);
+    let domain = target.domain.as_deref()?;
+    let new_domain = respell(domain)?;
+    if new_domain == domain {
+        return None;
+    }
+    let colon = raw_inner.find(':')?;
+    let (left, rest) = raw_inner.split_at(colon);
+    let lead_len = left.len() - left.trim_start().len();
+    let trail_len = left.trim_end().len();
+    let leading = &left[..lead_len];
+    let trailing = &left[trail_len..];
+    Some(format!("{leading}{new_domain}{trailing}{rest}"))
 }
 
 #[cfg(test)]
@@ -371,5 +477,66 @@ mod tests {
         let (out, n) = relink(source, "eng", "eng", &SAME);
         assert_eq!(n, 0);
         assert_eq!(out, source);
+    }
+
+    fn spell_doc(body: &str) -> String {
+        format!(
+            "---\ntype: note\ntitle: T\npermalink: t\nstatus: stable\nrecorded_at: 2026-01-01\nsource: crystalline://old/x\n---\n\n{body}"
+        )
+    }
+
+    fn old_to_new(x: &str) -> Option<String> {
+        (x == "old").then(|| "new".to_string())
+    }
+
+    #[test]
+    fn a_prefixed_wikilink_and_a_url_are_respelled() {
+        let (out, n) = respell_domains(
+            &spell_doc("See [[old:runbook]] and crystalline://old/runbook#steps.\n"),
+            &old_to_new,
+        );
+        assert_eq!(n, 2);
+        assert!(
+            out.ends_with("See [[new:runbook]] and crystalline://new/runbook#steps.\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("source: crystalline://old/x"),
+            "frontmatter is not touched"
+        );
+    }
+
+    #[test]
+    fn spacing_inside_the_brackets_is_kept() {
+        let (out, n) = respell_domains(&spell_doc("[[ old : Runbook ]]\n"), &old_to_new);
+        assert_eq!(n, 1);
+        assert!(out.ends_with("[[ new : Runbook ]]\n"), "{out}");
+    }
+
+    #[test]
+    fn globs_bare_domain_urls_and_sentence_dots_work() {
+        let (out, n) = respell_domains(
+            &spell_doc("crystalline://old/* and crystalline://old. And crystalline://older/x\n"),
+            &old_to_new,
+        );
+        assert_eq!(n, 2);
+        assert!(
+            out.ends_with("crystalline://new/* and crystalline://new. And crystalline://older/x\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn code_bare_links_and_other_domains_are_left_alone() {
+        let body = "`[[old:x]]`\n\n```\n[[old:x]]\n```\n\n[[old]] [[other:x]] [[Log: old notes]]\n";
+        let (out, n) = respell_domains(&spell_doc(body), &old_to_new);
+        assert_eq!(n, 0);
+        assert_eq!(out, spell_doc(body));
+    }
+
+    #[test]
+    fn an_unparseable_source_comes_back_unchanged() {
+        let src = "---\nnot: [valid\n---\n[[old:x]]\n";
+        assert_eq!(respell_domains(src, &old_to_new), (src.to_string(), 0));
     }
 }

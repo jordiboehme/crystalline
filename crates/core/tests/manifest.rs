@@ -4,8 +4,9 @@ mod common;
 
 use common::{fixtures_dir, read};
 use crystalline_core::manifest::{
-    ArtifactType, GeneratedIndexes, Manifest, PolicyKey, PolicyRole, ProblemKind, SHARING_KEY,
-    Sharing, TagAliasProblemKind, append_tag_alias, generated_indexes_at, in_root_artifact_dirs,
+    ArtifactType, DOMAIN_NAME_KEY, GeneratedIndexes, Manifest, PolicyKey, PolicyKind, PolicyRole,
+    ProblemKind, SHARING_KEY, Sharing, TagAliasProblemKind, append_tag_alias, domain_name_at,
+    domain_name_of_source, generated_indexes_at, in_root_artifact_dirs, manifest_template,
     policy_registry, sharing_at, starter_stanzas, tag_alias_pairs,
 };
 use crystalline_core::parse_engram;
@@ -821,6 +822,65 @@ fn sharing_at_reads_the_domain_root_and_falls_back_to_proposal() {
     assert_eq!(sharing_at(root), Sharing::Direct);
 }
 
+// --- The domain_name declaration ---------------------------------------------
+
+fn manifest_declaring_domain_name(value: Option<&str>) -> String {
+    let line = value
+        .map(|v| format!("domain_name: {v}\n"))
+        .unwrap_or_default();
+    format!(
+        "---\ntype: manifest\ntitle: t\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n{line}---\n\n# t\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n"
+    )
+}
+
+#[test]
+fn domain_name_is_read_only_when_it_is_a_valid_string() {
+    let ok = manifest_from_source(&manifest_declaring_domain_name(Some("platform")));
+    assert_eq!(ok.domain_name(), Some("platform"));
+    assert_eq!(
+        ok.policy(DOMAIN_NAME_KEY),
+        Some((Some("platform"), "platform"))
+    );
+    for bad in ["../up", "1.0", "true", "123", "null", "'a b'", "[a, b]"] {
+        let m = manifest_from_source(&manifest_declaring_domain_name(Some(bad)));
+        assert_eq!(m.domain_name(), None, "{bad}");
+        assert!(m.declared_domain_name().is_some(), "{bad}");
+    }
+    let quoted = manifest_from_source(&manifest_declaring_domain_name(Some("'123'")));
+    assert_eq!(quoted.domain_name(), Some("123"));
+    let silent = manifest_from_source(&manifest_declaring_domain_name(None));
+    assert_eq!(silent.policy(DOMAIN_NAME_KEY), Some((None, "")));
+}
+
+#[test]
+fn domain_name_at_reads_the_root_and_falls_back_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(domain_name_at(dir.path()), None);
+    std::fs::write(
+        dir.path().join("MANIFEST.md"),
+        manifest_declaring_domain_name(Some("eng")),
+    )
+    .unwrap();
+    assert_eq!(domain_name_at(dir.path()).as_deref(), Some("eng"));
+}
+
+#[test]
+fn the_template_declares_a_valid_name_so_it_reads_back_as_the_same_string() {
+    for name in ["eng", "1.0", "true", "123", "a.b"] {
+        let source = manifest_template(name, "2026-09-25");
+        assert_eq!(
+            domain_name_of_source(&source).as_deref(),
+            Some(name),
+            "{source}"
+        );
+    }
+    let source = manifest_template("My Notes", "2026-09-25");
+    assert!(
+        !source.contains("domain_name"),
+        "an invalid name is not declared: {source}"
+    );
+}
+
 // --- The policy registry ----------------------------------------------------
 
 /// Every key the registry names answers through `Manifest::policy`, its
@@ -829,13 +889,30 @@ fn sharing_at_reads_the_domain_root_and_falls_back_to_proposal() {
 #[test]
 fn every_registry_key_answers_through_manifest_policy() {
     let silent = manifest_from_source(&manifest_declaring_sharing(None));
-    assert_eq!(policy_registry().len(), 2, "generated_indexes and sharing");
+    assert_eq!(
+        policy_registry().len(),
+        3,
+        "generated_indexes, sharing and domain_name"
+    );
     for spec in policy_registry() {
-        assert!(
-            spec.values.contains(&spec.default),
-            "{}: default is a value",
-            spec.key
-        );
+        if spec.kind == PolicyKind::Choice {
+            assert!(
+                spec.values.contains(&spec.default),
+                "{}: default is a value",
+                spec.key
+            );
+        } else {
+            assert!(
+                spec.values.is_empty(),
+                "{}: a text key has no values",
+                spec.key
+            );
+            assert_eq!(
+                spec.default, "",
+                "{}: a text key defaults to empty",
+                spec.key
+            );
+        }
         assert!(
             !spec.meaning.is_empty() && !spec.meaning.contains('\n'),
             "{}: one line",
@@ -858,7 +935,7 @@ fn every_registry_key_answers_through_manifest_policy() {
     assert_eq!(typo.policy(SHARING_KEY), Some((Some("dirct"), "proposal")));
 }
 
-/// The two rows, as the card and the doctor read them.
+/// The three rows, as the card and the doctor read them.
 #[test]
 fn the_registry_rows_say_who_changes_what_and_to_which_values() {
     let by_key = |key: &str| -> PolicyKey {
@@ -868,15 +945,25 @@ fn the_registry_rows_say_who_changes_what_and_to_which_values() {
             .unwrap_or_else(|| panic!("{key} is registered"))
     };
     let indexes = by_key("generated_indexes");
+    assert_eq!(indexes.kind, PolicyKind::Choice);
     assert_eq!(indexes.values, &["local", "shared"]);
     assert_eq!(indexes.default, "local");
     assert_eq!(indexes.changed_by, PolicyRole::Owner);
     let sharing = by_key(SHARING_KEY);
+    assert_eq!(sharing.kind, PolicyKind::Choice);
     assert_eq!(sharing.values, &["proposal", "direct"]);
     assert_eq!(sharing.default, "proposal");
     assert_eq!(sharing.changed_by, PolicyRole::Owner);
     assert_eq!(PolicyRole::Owner.as_str(), "owner");
     assert_eq!(PolicyRole::Admin.as_str(), "admin");
+
+    let name = by_key(DOMAIN_NAME_KEY);
+    assert_eq!(name.kind, PolicyKind::Text);
+    assert_eq!(name.changed_by, PolicyRole::Owner);
+    assert!(name.accepts("platform"));
+    assert!(!name.accepts("../up"));
+    assert!(by_key(SHARING_KEY).accepts("direct"));
+    assert!(!by_key(SHARING_KEY).accepts("dirct"));
 }
 
 /// Every `pub const *_KEY` the parser declares is in the registry, and every

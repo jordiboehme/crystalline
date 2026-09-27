@@ -218,6 +218,15 @@ impl Provider for PinnedHead<'_> {
         self.inner.blob(origin, sha).await
     }
 
+    async fn read_file(
+        &self,
+        origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        self.inner.read_file(origin, reference, path).await
+    }
+
     async fn tarball(&self, origin: &OriginSpec, commit: &str) -> Result<Vec<u8>, RemoteError> {
         self.inner.tarball(origin, commit).await
     }
@@ -410,6 +419,14 @@ mod tests {
         }
         async fn blob(&self, _: &OriginSpec, _: &str) -> Result<Vec<u8>, RemoteError> {
             unreachable!()
+        }
+        async fn read_file(
+            &self,
+            _: &OriginSpec,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Vec<u8>>, RemoteError> {
+            Ok(None)
         }
         async fn tarball(&self, _: &OriginSpec, _: &str) -> Result<Vec<u8>, RemoteError> {
             unreachable!()

@@ -100,6 +100,13 @@ function registrations(): number {
   ).length;
 }
 
+/** Every call the app made to the domain-name peek. */
+function peekCalls(): unknown[] {
+  return apiMock.mock.calls.filter(([path]) =>
+    String(path).startsWith("/github/domain-name"),
+  );
+}
+
 /**
  * Open the dialog from the frame's own launcher.
  *
@@ -612,5 +619,315 @@ describe("registering a domain", () => {
     );
 
     expect(settingsCalls()).toHaveLength(before);
+  });
+});
+
+describe("previewing a repository's declared name", () => {
+  it("peeks once typing settles, and shows the MANIFEST's own name as the placeholder", async () => {
+    const peeked = vi.fn(() => ({
+      domain_name: "engineering",
+      default_name: "kb",
+    }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": peeked,
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    // Nothing yet: the debounce has not settled.
+    expect(peeked).not.toHaveBeenCalled();
+
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    });
+    // One settle, one peek - not one per keystroke.
+    expect(peeked).toHaveBeenCalledTimes(1);
+    // The helper text names both fallbacks, MANIFEST first.
+    expect(
+      within(dialog).getByText(
+        "Optional; the repository's MANIFEST name when left empty, else its repository name.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("falls back to the repository's own name when the MANIFEST declares none", async () => {
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => ({
+        domain_name: null,
+        default_name: "kb",
+      }),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "kb",
+      );
+    });
+  });
+
+  it("never blocks typing or shows an error when the peek fails", async () => {
+    const peeked = vi.fn(() => {
+      throw new ApiProblem(409, "conflict", "no GitHub credential on file");
+    });
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": peeked,
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+
+    await waitFor(() => {
+      expect(peeked).toHaveBeenCalledTimes(1);
+    });
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+    expect(within(dialog).getByLabelText("Name")).not.toHaveAttribute(
+      "placeholder",
+    );
+    // Typing is still live: nothing about the failed peek disabled the field.
+    await userEvent.type(within(dialog).getByLabelText("Name"), "custom");
+    expect(within(dialog).getByLabelText("Name")).toHaveValue("custom");
+  });
+
+  it("never peeks a repository that does not yet look like owner/name", async () => {
+    const peeked = vi.fn(() => ({ domain_name: "x", default_name: "y" }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": peeked,
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme",
+    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 600);
+    });
+
+    expect(peeked).not.toHaveBeenCalled();
+  });
+
+  it("never peeks while the form is in local or virtual mode", async () => {
+    const peeked = vi.fn(() => ({ domain_name: "x", default_name: "y" }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": peeked,
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.type(within(dialog).getByLabelText("Name"), "scratch");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 600);
+    });
+
+    expect(peeked).not.toHaveBeenCalled();
+  });
+
+  it("a newer peek always wins over a slower, older one", async () => {
+    let resolveFirst: (value: unknown) => void = () => {
+      throw new Error("resolveFirst called before the request was made");
+    };
+    const first = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": (path) =>
+        String(path).includes("aa")
+          ? first
+          : { domain_name: "second", default_name: "kb2" },
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    const repoInput = await within(dialog).findByLabelText("Repository");
+    await userEvent.type(repoInput, "acme/aa");
+    await waitFor(() => {
+      expect(peekCalls()).toHaveLength(1);
+    });
+
+    // A second edit, before the first request ever answers.
+    await userEvent.clear(repoInput);
+    await userEvent.type(repoInput, "acme/bb");
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "second",
+      );
+    });
+
+    // The older, slower answer lands after the newer one already won - and
+    // changes nothing, because nothing here is reading its cache entry any
+    // more.
+    resolveFirst({ domain_name: "first", default_name: "kb1" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+      "placeholder",
+      "second",
+    );
+  });
+
+  it("drops the peeked placeholder when the form leaves team mode", async () => {
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => ({
+        domain_name: "engineering",
+        default_name: "kb",
+      }),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    });
+
+    for (const mode of ["Local folder", "Virtual"]) {
+      await userEvent.click(within(dialog).getByRole("radio", { name: mode }));
+      expect(within(dialog).getByLabelText("Name")).not.toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    }
+  });
+
+  it("leaves nothing behind when the dialog closes while a peek waits", async () => {
+    let answer: (value: unknown) => void = () => {
+      throw new Error("answer called before the request was made");
+    };
+    const pending = new Promise((resolve) => {
+      answer = resolve;
+    });
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => pending,
+    });
+    const errors = vi.spyOn(console, "error");
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(peekCalls()).toHaveLength(1);
+    });
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Cancel" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /new domain/i })).toBeNull();
+    });
+    // The answer lands after the dialog is gone: no update of an unmounted
+    // form, and nothing of it in the next dialog.
+    answer({ domain_name: "late", default_name: "kb" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+
+    const reopened = await openFromSidebar();
+    expect(within(reopened).getByLabelText("Name")).not.toHaveAttribute(
+      "placeholder",
+      "late",
+    );
+  });
+
+  it("submits no name when the field is left blank, even once a peek fills its placeholder", async () => {
+    const created = vi.fn(() => ({ domain: "engineering", root: null }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/github/domain-name": () => ({
+        domain_name: "engineering",
+        default_name: "kb",
+      }),
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText("Name")).toHaveAttribute(
+        "placeholder",
+        "engineering",
+      );
+    });
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Create domain" }),
+    );
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains", "POST")).toEqual({
+      mode: "github",
+      repo: "acme/kb",
+    });
   });
 });

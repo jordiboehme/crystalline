@@ -21,11 +21,12 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use crystalline_core::config::registration::{
-    Registration, RegistrationRequest, decide_registration, validate_domain_name,
+    Registration, RegistrationRequest, choose_domain_name, decide_registration, infer_name_origin,
+    needs_manifest_write_back, validate_domain_name,
 };
 use crystalline_core::config::{
-    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
-    ShareIdentityMode, VerifyConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, NameOrigin, OriginConfig,
+    ResponseFormat, ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section_reporting, insert_before_section, prepend_body,
@@ -35,8 +36,9 @@ use crystalline_core::emit::{
 use crystalline_core::relink::Relink;
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind, LinkTarget,
-    Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
+    CrystallineUrl, DOMAIN_NAME_KEY, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind,
+    LinkTarget, Manifest, YamlValue, domain_name_at, domain_name_of_source, is_lower_hyphen,
+    parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
@@ -902,6 +904,37 @@ pub struct Engine {
     // virtual-source write, and read here under the lock. Empty at construction
     // and for an engine that never serves MCP.
     routing_virtual: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
+    // The name table over every registered domain: local names, the canonical
+    // names MANIFESTs declare and machine-local aliases, each resolved to one
+    // local name. Rebuilt from the registrations when `names_stale` is set and
+    // read everywhere else, so a lookup never touches the store. Never held
+    // while `store` or `config` is taken: the Arc is cloned out first. See
+    // `Engine::name_table`. Stored with the generation of the build that made
+    // it, so a slower build that started earlier never overwrites a newer one.
+    names: std::sync::RwLock<(u64, Arc<crystalline_core::names::NameTable>)>,
+    // The ticket every table build takes before it reads its inputs; see
+    // `names` above.
+    names_generation: std::sync::atomic::AtomicU64,
+    // Set when a registration or a declared name may have changed; the next
+    // `Engine::name_table` rebuilds. Starts `true`, so the first lookup builds.
+    names_stale: std::sync::atomic::AtomicBool,
+    // Whether `virtual_domain_names` below has been read from the store at
+    // least once. A verb's first lookup reads it when nothing else has (a
+    // one-shot command, a REST request before any MCP connection).
+    virtual_names_loaded: std::sync::atomic::AtomicBool,
+    // Each virtual domain's declared valid `domain_name`, keyed by local name.
+    // A virtual MANIFEST lives in the database, so the sync table build cannot
+    // read it; `Engine::refresh_names` reads it in the same pass that caches
+    // the routing bullets above.
+    virtual_domain_names: std::sync::RwLock<BTreeMap<String, String>>,
+    // The test seam for the spelling push: how many times it replaced the
+    // index's spellings. See `Engine::spelling_replaces_issued`.
+    #[cfg(any(test, feature = "testing"))]
+    spelling_replaces: std::sync::atomic::AtomicU64,
+    // The test seam for the name adoption: how many times it ran. See
+    // `Engine::adoptions_run`.
+    #[cfg(any(test, feature = "testing"))]
+    adoptions: std::sync::atomic::AtomicU64,
     // A live view of what this engine is doing (sync, embed, reindex), fed by
     // RAII guards from the maintenance operations and read by `status_report`'s
     // activity block. Behind an `Arc` so a guard owns its own handle and a
@@ -961,6 +994,50 @@ pub struct Engine {
     // [`crate::join`] for why a join belongs to a session and not to an
     // account.
     joins: Arc<crate::join::Joins>,
+    // The domains a rename has paused and the writes running in each: a
+    // write, sync or watcher pass into a paused domain waits or is skipped,
+    // and a rename waits for the writes already running. See
+    // [`crate::rename::RenamePause`] and `Engine::rename_domain_local`.
+    rename_pause: crate::rename::RenamePause,
+    // The one rename this engine runs at a time, as the local name it
+    // renames and the name it gets; a second one is refused while it is
+    // taken.
+    rename_slot: std::sync::Mutex<Option<(String, String, bool)>>,
+    // Why the last adoption of a declared name failed, by the local name that
+    // keeps waiting: set when the rename after a sync fails, cleared when it
+    // lands or waits for a known reason. `crystalline doctor` reads it.
+    adoption_failures: std::sync::Mutex<HashMap<String, String>>,
+    // Set while a rename is between its index row step and its config step:
+    // a spelling push then would drop the alias the index row step left for
+    // the old name, since the configuration does not list it yet. A refresh
+    // in that window only marks the table stale.
+    names_frozen: std::sync::atomic::AtomicBool,
+    // Whether this process holds the ownership of the state directory (the
+    // lock a daemon holds for its whole life). True for every engine but the
+    // one-shot standalone command's, which takes the lock only for the
+    // moment it needs it: a rename journal is run, and a MANIFEST name
+    // adopted, only while it is held, so no two processes do either at once.
+    holds_state_dir: std::sync::atomic::AtomicBool,
+    // This machine's own index, configuration and state directory, as a
+    // plain command opens them, when the opener said so
+    // ([`Engine::with_machine_owner`]). A rename and a name adoption move
+    // this machine's state folders and configuration, so they run only when
+    // the engine opened exactly these; with none set (an engine built by a
+    // test) nothing is compared, and with a lookup that failed nothing runs.
+    machine_owner: Option<crate::rename::MachineOwner>,
+    // The rename test seams: a failure after one step, and a hold after one.
+    #[cfg(any(test, feature = "testing"))]
+    rename_fail_after: std::sync::Mutex<Option<crate::rename::RenameStep>>,
+    // And a hold on the next write right after it is counted.
+    #[cfg(any(test, feature = "testing"))]
+    write_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
+    #[cfg(any(test, feature = "testing"))]
+    rename_hold:
+        std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
+    // How long a rename waits for the writes running in a domain before it
+    // gives up, when a test wants less than the real limit.
+    #[cfg(any(test, feature = "testing"))]
+    rename_drain_wait: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 /// One drafted engram, as the share-link surface hands it to the account a
@@ -1181,6 +1258,9 @@ pub enum PreviewCredential {
     ReadScopeFallback,
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub use crate::rename::RenameHold;
+pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
 
 /// What a write is told when it reaches a domain that reviews changes before
@@ -1622,6 +1702,15 @@ impl Engine {
             github_tokens: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
+            names: std::sync::RwLock::new((0, Arc::default())),
+            names_generation: std::sync::atomic::AtomicU64::new(0),
+            names_stale: std::sync::atomic::AtomicBool::new(true),
+            virtual_names_loaded: std::sync::atomic::AtomicBool::new(false),
+            virtual_domain_names: std::sync::RwLock::new(BTreeMap::new()),
+            #[cfg(any(test, feature = "testing"))]
+            spelling_replaces: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
             domain_admin: tokio::sync::Mutex::new(()),
@@ -1630,6 +1719,20 @@ impl Engine {
             domain_access: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
+            rename_pause: crate::rename::RenamePause::default(),
+            rename_slot: std::sync::Mutex::new(None),
+            adoption_failures: std::sync::Mutex::new(HashMap::new()),
+            names_frozen: std::sync::atomic::AtomicBool::new(false),
+            holds_state_dir: std::sync::atomic::AtomicBool::new(true),
+            machine_owner: None,
+            #[cfg(any(test, feature = "testing"))]
+            rename_fail_after: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            write_hold: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            rename_hold: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            rename_drain_wait: std::sync::Mutex::new(None),
         }
     }
 
@@ -2143,6 +2246,33 @@ impl Engine {
     /// domain held by another live instance is skipped on a full sync and refused
     /// on a named one and this instance renews its locks on the heartbeat timer.
     /// An empty id (the default) leaves collaboration off.
+    /// Tell the engine which index, configuration and state directory are
+    /// this machine's own ([`crate::machine_rename_owner`]). The daemon, the
+    /// embedded stack and the standalone opener set it: a rename, a name
+    /// adoption and the finishing of a rename journal then run only when
+    /// the engine opened exactly those, never over an index `--db` or
+    /// `--config` named instead. An engine without it compares nothing.
+    pub fn with_machine_owner(mut self, owner: Option<crate::rename::RenameOwner>) -> Engine {
+        self.machine_owner = owner.map(crate::rename::MachineOwner::Known);
+        self
+    }
+
+    /// [`Engine::with_machine_owner`] for a production opener, from the
+    /// lookup itself ([`crate::machine_rename_owner`]). A lookup that failed
+    /// is kept as such, never as "nothing told": a rename is then refused
+    /// with the reason, and a name adoption and the finishing of a rename
+    /// journal are skipped, until this machine's own index can be named.
+    pub fn with_machine_owner_lookup(
+        mut self,
+        lookup: anyhow::Result<crate::rename::RenameOwner>,
+    ) -> Engine {
+        self.machine_owner = Some(match lookup {
+            Ok(owner) => crate::rename::MachineOwner::Known(owner),
+            Err(e) => crate::rename::MachineOwner::Unknown(format!("{e:#}")),
+        });
+        self
+    }
+
     pub fn with_instance_id(mut self, instance_id: String) -> Engine {
         self.label = instance_id.clone();
         self.instance_id = instance_id;
@@ -2441,13 +2571,29 @@ impl Engine {
     /// domain this instance has no registration for may be another's current
     /// work, and another instance's live registration is a registration.
     fn hosted_elsewhere(&self, row: &DomainStats, now: DateTime<Utc>) -> bool {
-        let Some(holder) = row.host_instance_id.as_deref().filter(|h| !h.is_empty()) else {
+        self.held_elsewhere(
+            row.host_instance_id.as_deref(),
+            row.host_heartbeat_at.as_deref(),
+            now,
+        )
+    }
+
+    /// [`Engine::hosted_elsewhere`] over a holder and its heartbeat as read,
+    /// for a caller that has a [`crystalline_index::DomainHost`] rather than
+    /// a stats row.
+    pub(super) fn held_elsewhere(
+        &self,
+        holder: Option<&str>,
+        beat: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(holder) = holder.filter(|h| !h.is_empty()) else {
             return false;
         };
         if holder == self.instance_id {
             return false;
         }
-        let Some(beat) = row.host_heartbeat_at.as_deref() else {
+        let Some(beat) = beat else {
             return false;
         };
         match DateTime::parse_from_rfc3339(beat) {
@@ -2464,7 +2610,9 @@ impl Engine {
     /// reports `Acquired` when collaboration is off or the domain is virtual, so
     /// the caller arms the watch uniformly.
     pub async fn claim_host(&self, name: &str, take_over: bool) -> Result<HostClaim> {
-        if self.instance_id.is_empty() {
+        // A domain a rename has paused is claimed by the sync that ends the
+        // rename, under the name it ends with.
+        if self.instance_id.is_empty() || self.is_renaming(name) {
             return Ok(HostClaim::Acquired);
         }
         let ContentSource::File { root } = self.content_source(name)? else {
@@ -3488,6 +3636,7 @@ impl Engine {
             .write()
             .unwrap()
             .insert(name.to_string(), entry.clone());
+        self.mark_names_stale();
         if let Some(tx) = &self.watch_tx
             && let Some(root) = entry.file_path()
             && !entry.is_virtual()
@@ -3508,9 +3657,7 @@ impl Engine {
     /// deliberately does neither. Keep the two together: they read the same
     /// file the same way and only differ in what they do with the answer.
     fn reread_config(&self) -> Option<GlobalConfig> {
-        let path = self.config_file_path()?;
-        let file = overlay::load_file(&path).ok()?;
-        Some(self.overlay.apply(&file))
+        reread_config_at(self.config_file_path(), &self.overlay)
     }
 
     /// The configuration file this engine reads and persists to: its
@@ -3526,7 +3673,35 @@ impl Engine {
             None => crystalline_core::config::global_config_path().ok(),
         }
     }
+}
 
+/// [`Engine::reread_config`] over its two inputs, so the read can run where the
+/// engine cannot be borrowed (the blocking pool).
+fn reread_config_at(path: Option<PathBuf>, overlay: &EnvOverlay) -> Option<GlobalConfig> {
+    let file = overlay::load_file(&path?).ok()?;
+    Some(overlay.apply(&file))
+}
+
+/// [`Engine::registered_domain_entries`] over its three tiers: the startup
+/// snapshot, then the discovered overlay, then what the file says now, each
+/// adding only the names the tiers before it lack.
+fn union_registrations(
+    mut entries: IndexMap<String, DomainEntry>,
+    discovered: &HashMap<String, DomainEntry>,
+    fresh: Option<GlobalConfig>,
+) -> IndexMap<String, DomainEntry> {
+    for (name, entry) in discovered {
+        entries.entry(name.clone()).or_insert_with(|| entry.clone());
+    }
+    if let Some(fresh) = fresh {
+        for (name, entry) in fresh.domains {
+            entries.entry(name).or_insert(entry);
+        }
+    }
+    entries
+}
+
+impl Engine {
     /// The file domains a diagnostic read covers, as `(name, root)` pairs:
     /// everything [`Engine::sync_targets`] would sync, plus every file domain
     /// the config file names right now, so a domain registered after this
@@ -3610,16 +3785,9 @@ impl Engine {
     /// hit, until the daemon restarted - which is what Fluid's home screen and
     /// the `list_domains` tool showed a user who had just added one.
     fn registered_domain_entries(&self) -> IndexMap<String, DomainEntry> {
-        let mut entries = self.config.read().unwrap().domains.clone();
-        for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-            entries.entry(name.clone()).or_insert_with(|| entry.clone());
-        }
-        if let Some(fresh) = self.reread_config() {
-            for (name, entry) in fresh.domains {
-                entries.entry(name).or_insert(entry);
-            }
-        }
-        entries
+        let snapshot = self.config.read().unwrap().domains.clone();
+        let discovered = self.discovered_domains.read().unwrap().clone();
+        union_registrations(snapshot, &discovered, self.reread_config())
     }
 
     /// [`Engine::registered_domain_names`] for the one caller that may not
@@ -3688,6 +3856,7 @@ impl Engine {
     /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
         self.discovered_domains.write().unwrap().remove(name);
+        self.mark_names_stale();
         if let Some(tx) = &self.watch_tx {
             let _ = tx.send(WatchEvent::Remove(name.to_string()));
         }
@@ -4080,6 +4249,7 @@ impl Engine {
 
 // The `impl Engine` sections, one file each; FILES in the split script
 // lists them in the order they stood in the single engine.rs.
+mod adopt_names;
 mod attachments;
 mod configure;
 mod context;
@@ -4090,8 +4260,11 @@ mod edit;
 mod evolve;
 mod github;
 mod move_;
+mod name_report;
+mod names;
 mod origins;
 mod read;
+mod rename_domain;
 mod review_mode;
 mod schemas;
 mod search;
@@ -4678,6 +4851,10 @@ pub async fn open_standalone(
     let mut engine = Engine::new(store, file, None, Some(path))
         .with_read_only(read_only)
         .with_env_overlay(overlay);
+    // A one-shot command does not hold the state directory the way a daemon
+    // does; the service's opener sets this while it takes the lock for a
+    // recovery.
+    engine.set_holds_state_dir(false);
     // The daemonless engine is told where this machine's state directory is,
     // rather than leaving [`Engine::journal_state_dir`] to resolve it. Both
     // halves matter. In production it is the same path either way, and saying
@@ -4690,6 +4867,10 @@ pub async fn open_standalone(
     if let Ok(state) = crystalline_core::config::state_dir() {
         engine = engine.with_state_dir(state);
     }
+    // A rename a stopped daemon or command left half done is NOT finished
+    // here: that needs the ownership of the state directory a daemon holds,
+    // which lives above this crate. The service's standalone opener takes it
+    // and then calls [`Engine::finish_leftover_rename`].
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back
@@ -4930,6 +5111,9 @@ struct SourceEdited {
     warning: Option<String>,
     /// The live document this edit composed into, when one was open.
     live: Option<crate::collab::session::LiveApplied>,
+    /// How many domain spellings the final text had rewritten to their
+    /// canonical name, `0` when none were.
+    normalized: usize,
 }
 
 /// A source edit that failed, and whether the source may already carry the new
@@ -6111,6 +6295,16 @@ fn assets_reserved_error(rel: &str) -> String {
 pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
     if let Some(text) = warning {
         receipt["draft_warning"] = json!(text);
+    }
+}
+
+/// Put the domain-spelling normalization count on a receipt, only when a
+/// write actually rewrote one: a caller reads no key at all as "nothing was
+/// respelled", the same silence [`note_unmirrored`] keeps for an ordinary
+/// write.
+pub(crate) fn note_domain_names_normalized(receipt: &mut Value, normalized: usize) {
+    if normalized > 0 {
+        receipt["domain_names_normalized"] = json!(normalized);
     }
 }
 

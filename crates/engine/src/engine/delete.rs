@@ -38,6 +38,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         if let Some(path) = attachment_identifier(&p.identifier) {
@@ -191,11 +192,10 @@ impl Engine {
         }
         drop(store);
 
-        // Deleting a virtual domain's MANIFEST engram empties its routing
-        // bullets, so refresh the cache once the store lock is released.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // Deleting a MANIFEST empties a virtual domain's routing bullets and
+        // takes back the name either kind declared, so refresh once the store
+        // lock is released.
+        self.after_source_write(&source, &desc.path).await;
         // The deleted engram must leave its folder's generated index, and an
         // emptied folder loses the index file altogether.
         self.refresh_index_files(&desc.domain).await;
@@ -270,6 +270,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         if let Some(path) = attachment_identifier(&p.identifier) {
             if p.expected_checksum.is_some() {
                 return Err(EngineError::Invalid(format!(

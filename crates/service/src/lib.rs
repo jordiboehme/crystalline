@@ -23,6 +23,7 @@ mod tool_schema;
 #[cfg(feature = "fluid-ui")]
 pub mod ui;
 
+pub use crystalline_engine::{PendingRename, RenameOwner, pending_rename};
 pub use crystalline_engine::{
     engine, harness_cli, maintenance, nudge, overlay, overlay_journal, params, settings, similar,
     subscribers, temp_store, web_url,
@@ -41,14 +42,16 @@ pub use crystalline_rest::collab;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
-    collect_orphaned_domains, configure, ctl_if_running, ctl_if_running_passive, ctl_required,
-    domain_export, domain_import, domain_remove, domain_review, origin_add, origin_changes,
-    origin_discard, origin_resolve, origin_share, origin_status, origin_update, origin_withdraw,
-    run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
+    adopt_domain_names_direct, collect_orphaned_domains, configure, ctl_if_running,
+    ctl_if_running_passive, ctl_required, discard_rename_journal, domain_export, domain_import,
+    domain_remove, domain_rename, domain_review, machine_rename_owner, name_report, origin_add,
+    origin_changes, origin_discard, origin_resolve, origin_share, origin_status, origin_update,
+    origin_withdraw, run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon,
+    virtual_routing_bullets,
 };
 pub use crystalline_engine::engine::{
-    ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
-    WrittenAttachment,
+    ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, RenameStep,
+    ShareActor, WrittenAttachment,
 };
 pub use crystalline_engine::harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,

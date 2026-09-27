@@ -83,6 +83,13 @@ pub struct LockInfo {
     /// pre-0.18.0 record; the pair with `started_by` tells those apart.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Set when the holder is not a daemon but a one-shot command that took
+    /// the state directory for a moment (a rename, the name adoption after a
+    /// sync), naming that command, for example `crystalline domain rename`.
+    /// Such a holder serves no socket and leaves on its own: a client and a
+    /// starting daemon wait for it, and nothing ever signals it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<String>,
 }
 
 pub use crate::serving::{
@@ -236,8 +243,33 @@ impl Ownership {
             started_by: intent.map(|i| i.started_by),
             http: intent.map(|i| i.http.clone()).unwrap_or_default(),
             allowed_hosts: intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
+            standalone: None,
         };
-        let json = serde_json::to_string(&info).unwrap_or_default();
+        self.write_record(&info)
+    }
+
+    /// Publish the record of a one-shot command that holds the state
+    /// directory for a moment, naming `command` (for example `crystalline
+    /// domain rename`), so a starting daemon and a connecting client can say
+    /// what they wait for instead of meeting a holder nobody can name.
+    pub fn publish_standalone(&self, command: &str) -> io::Result<()> {
+        let info = LockInfo {
+            pid: std::process::id(),
+            socket_path: String::new(),
+            version: crystalline_core::VERSION.to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: false,
+            started_by: None,
+            http: HttpBinding::default(),
+            allowed_hosts: Vec::new(),
+            standalone: Some(command.to_string()),
+        };
+        self.write_record(&info)
+    }
+
+    /// Write `info` to the record file beside the lock, renamed into place.
+    fn write_record(&self, info: &LockInfo) -> io::Result<()> {
+        let json = serde_json::to_string(info).unwrap_or_default();
         let tmp = self.info_path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, &self.info_path)
@@ -259,12 +291,55 @@ impl Ownership {
 impl Drop for Ownership {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.info_path);
-        let _ = FileExt::unlock(&self.lock_file);
         #[cfg(unix)]
         {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+        // The lock file goes while it is still locked, and only then is the
+        // lock let go. A process that opened the file before it went waits
+        // on the lock, then finds that the file it locked is no longer the
+        // one at the path ([`locked_file_is_current`]) and opens it again,
+        // so it can never own a file that is about to disappear while a
+        // third process creates a fresh one beside it.
         let _ = std::fs::remove_file(&self.lock_path);
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
+/// Whether `file`, just locked, is still the file at `path`.
+///
+/// Every owner removes `service.lock` when it leaves, and `doctor --fix`
+/// removes one nobody holds. A process that opened the file just before
+/// that and locked it just after holds a lock on a file with no name any
+/// more, while the next opener creates a new file at the path and locks
+/// that one too: two owners of one state directory. Comparing the locked
+/// handle with the path closes that: a lock on a file that is no longer
+/// there is let go and the path opened again. Compared by the file's
+/// identity (device and inode on unix, volume and file index on Windows),
+/// never by its name; a path that is gone reads as not current. A check
+/// that cannot be made at all (the identity of either side cannot be read)
+/// keeps the lock, which is what every owner did before this check existed:
+/// a start must never fail over a question it could not ask.
+fn locked_file_is_current(file: &File, path: &Path) -> bool {
+    let held = match file.try_clone().and_then(same_file::Handle::from_file) {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::debug!("the locked service.lock could not be identified: {e}");
+            return true;
+        }
+    };
+    match same_file::Handle::from_path(path) {
+        Ok(named) => held == named,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        // On Windows a file removed while a handle to it is still open (the
+        // one just locked, here) keeps its name until that handle closes,
+        // and opening it by that name is refused: the file is on its way
+        // out, so the lock on it is not the current one.
+        Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => false,
+        Err(e) => {
+            tracing::debug!("{} could not be identified: {e}", path.display());
+            true
+        }
     }
 }
 
@@ -335,7 +410,9 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
     let Some(info) = read_lock_info() else {
         return (None, false);
     };
-    if !process_alive(info.pid) {
+    // A one-shot command holding the state directory is no daemon: nothing
+    // to attach to and, whatever its version, nothing to displace.
+    if !process_alive(info.pid) || info.standalone.is_some() {
         return (None, false);
     }
     if attach_policy(&info.version, crystalline_core::VERSION) == AttachPolicy::Displace {
@@ -387,7 +464,7 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
 /// the version's own behaviour.
 pub async fn try_attach_passive() -> Option<Connection> {
     let info = read_lock_info()?;
-    if !process_alive(info.pid) {
+    if !process_alive(info.pid) || info.standalone.is_some() {
         return None;
     }
     connect_socket().await
@@ -710,6 +787,16 @@ pub enum HolderState {
         /// How long the socket probe waited before giving up.
         probe: Duration,
     },
+    /// The lock is held by a one-shot command that published a record
+    /// naming itself ([`LockInfo::standalone`]) and is still running. It
+    /// serves no socket and leaves when it finishes: wait for it, and never
+    /// signal it.
+    Standalone {
+        /// The command's pid.
+        pid: u32,
+        /// The command, for example `crystalline domain rename`.
+        command: String,
+    },
     /// The lock is held, nothing answered, and who holds it could not be
     /// established: no record, a record naming a dead pid, a pid whose
     /// executable could not be read, or one that is not a crystalline binary.
@@ -924,6 +1011,11 @@ pub async fn diagnose_holder() -> HolderState {
         }
     }
 
+    // A one-shot command serves no socket, so there is nothing to probe.
+    if let Some(holder) = standalone_holder() {
+        return holder;
+    }
+
     let started = Instant::now();
     if probe_socket_responds().await {
         return HolderState::Responsive;
@@ -954,6 +1046,117 @@ pub async fn diagnose_holder() -> HolderState {
         None => HolderState::Unknown {
             detail: format!("what pid {} is could not be verified", info.pid),
         },
+    }
+}
+
+/// The one-shot command holding the lock, when the record names one and its
+/// pid is alive. Read from the record alone: the caller has already found
+/// the lock held.
+fn standalone_holder() -> Option<HolderState> {
+    let info = read_lock_info()?;
+    let command = info.standalone?;
+    process_alive(info.pid).then_some(HolderState::Standalone {
+        pid: info.pid,
+        command,
+    })
+}
+
+/// How long a starting daemon and a connecting client wait for a one-shot
+/// command to let go of the state directory: as long as a rename waits for
+/// the writes already running in its domain, its longest step.
+const STANDALONE_WAIT: Duration = Duration::from_secs(30);
+
+/// [`STANDALONE_WAIT`], or the test seam's value in milliseconds, so a test
+/// of the timeout does not wait out the real one.
+fn standalone_wait() -> Duration {
+    std::env::var("CRYSTALLINE_TEST_STANDALONE_WAIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(STANDALONE_WAIT)
+}
+
+/// Why a daemon could not start while a one-shot command held the state
+/// directory, naming the command and its pid.
+fn standalone_holder_words(pid: u32, command: &str, waited: Duration) -> String {
+    format!(
+        "the standalone command `{command}` (pid {pid}) holds this machine's state directory, \
+         and it did not let go within {} s. A daemon starts once it has finished: wait for it, \
+         or stop it, and try again",
+        waited.as_secs().max(1)
+    )
+}
+
+/// Wait up to `budget` for a one-shot command to let go of the lock. `Ok`
+/// once the lock is free or held by someone else (a daemon that just won
+/// the race is the caller's to handle); the refusal naming the command when
+/// it still holds the lock at the end.
+async fn wait_for_standalone(pid: u32, command: &str, budget: Duration) -> anyhow::Result<()> {
+    let Ok(lock_path) = config::service_lock_path() else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + budget;
+    loop {
+        let still_held = !lock_is_free(&lock_path).unwrap_or(false)
+            && matches!(standalone_holder(), Some(HolderState::Standalone { pid: p, .. }) if p == pid);
+        if !still_held {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(standalone_holder_words(pid, command, budget));
+        }
+        tokio::time::sleep(DISLODGE_POLL).await;
+    }
+}
+
+/// [`acquire_ownership`] for a one-shot command: takes the lock and
+/// publishes a record naming `command` (for example `crystalline domain
+/// rename`), which dropping the ownership removes again. A record that
+/// cannot be written costs only the name in someone else's message, so it
+/// never fails the command.
+pub fn acquire_standalone_ownership(command: &str) -> anyhow::Result<Ownership> {
+    let ownership = acquire_ownership()?;
+    if let Err(e) = ownership.publish_standalone(command) {
+        tracing::debug!("the record naming this command could not be written: {e}");
+    }
+    Ok(ownership)
+}
+
+/// [`acquire_ownership`] for a starting daemon: when a one-shot command
+/// holds the state directory, wait for it (bounded, and logged, so the wait
+/// is visible in the daemon's log) instead of giving up after the usual
+/// second. A holder that is not a one-shot command, or one that does not let
+/// go in time, is a [`LockHeld`] refusal as before; the latter names the
+/// command and its pid.
+pub async fn acquire_ownership_after_standalone() -> anyhow::Result<Ownership> {
+    let budget = standalone_wait();
+    let deadline = Instant::now() + budget;
+    let mut told = false;
+    loop {
+        let err = match acquire_ownership() {
+            Ok(ownership) => return Ok(ownership),
+            Err(err) => err,
+        };
+        if err.downcast_ref::<LockHeld>().is_none() {
+            return Err(err);
+        }
+        let Some(HolderState::Standalone { pid, command }) = standalone_holder() else {
+            return Err(err);
+        };
+        if Instant::now() >= deadline {
+            return Err(anyhow::Error::new(LockHeld {
+                message: standalone_holder_words(pid, &command, budget),
+            }));
+        }
+        if !told {
+            tracing::info!(
+                "waiting up to {} s for the standalone command `{command}` (pid {pid}) to let go \
+                 of this machine's state directory",
+                budget.as_secs().max(1)
+            );
+            told = true;
+        }
+        tokio::time::sleep(DISLODGE_POLL).await;
     }
 }
 
@@ -1064,7 +1267,10 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
     let lock_path = config::service_lock_path()
         .map_err(|e| anyhow::anyhow!("could not resolve the service lock path: {e}"))?;
     match diagnose_holder().await {
-        HolderState::Free | HolderState::Responsive => Ok(DislodgeOutcome::NotNeeded),
+        // A one-shot command leaves on its own and is never signalled.
+        HolderState::Free | HolderState::Responsive | HolderState::Standalone { .. } => {
+            Ok(DislodgeOutcome::NotNeeded)
+        }
         HolderState::Unknown { detail } => Err(unknown_holder_error(&detail)),
         HolderState::Unresponsive { pid, probe } => {
             // Two last safety gates on the kill path itself, deliberately
@@ -1149,6 +1355,12 @@ pub async fn ensure_daemon(
             Ok(DislodgeOutcome::Dislodged { .. }) | Ok(DislodgeOutcome::NotNeeded) => {}
             Err(e) => unknown_holder = Some(e),
         },
+        // A one-shot command leaves on its own and is never signalled. The
+        // daemon spawned below would wait for it too, but longer than the
+        // readiness poll does, so the wait happens here, before the spawn.
+        HolderState::Standalone { pid, command } => {
+            wait_for_standalone(pid, &command, standalone_wait()).await?;
+        }
         HolderState::Unknown { detail } => {
             // Doubt never signals. A daemon that is starting up right now
             // looks exactly like this (lock taken, record not published yet),
@@ -1188,6 +1400,16 @@ pub async fn ensure_daemon(
     // owns it, instead of pointing at a daemon log the spawn never reached.
     if let Some(e) = unknown_holder {
         return Err(e);
+    }
+    // A one-shot command that took the state directory after the check
+    // above: the daemon spawned for this call is still waiting for it, and
+    // this is what it waits for.
+    if let Some(HolderState::Standalone { pid, command }) = standalone_holder() {
+        anyhow::bail!(
+            "the standalone command `{command}` (pid {pid}) took this machine's state directory \
+             while a daemon was starting, and the daemon was not ready after 15 s of waiting. \
+             It starts once the command has finished: wait for it, or stop it, and try again"
+        );
     }
     anyhow::bail!(
         "spawned a daemon but it did not become ready within 15s (see daemon.log in the state directory)"
@@ -1399,6 +1621,11 @@ pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>
         _ => String::new(),
     };
     let held = match holder {
+        Some(h) if h.standalone.is_some() => format!(
+            "the standalone command `{}` (pid {}) holds it until it finishes",
+            h.standalone.as_deref().unwrap_or_default(),
+            h.pid
+        ),
         Some(h) => {
             let started = match h.started_by {
                 Some(mode) => format!(", started by {}", mode.as_str()),
@@ -1493,10 +1720,19 @@ pub const BYPASS_NOTE: &str = "bypassed (--db/--config override); reading the in
 /// [`lock_held_message`] because both answer "somebody else has the index" and
 /// both must keep saying it the same way.
 pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
-    let holder = read_lock_info()
-        .filter(|info| process_alive(info.pid))
-        .map(|info| info.pid);
-    words_for_holder(holder, location, error, bypassed)
+    let info = read_lock_info().filter(|info| process_alive(info.pid));
+    // A one-shot command is no daemon to ask or to stop: it lets go when it
+    // finishes.
+    if let Some(info) = &info
+        && let Some(command) = &info.standalone
+        && !crystalline_index::is_schema_too_new_text(error)
+    {
+        return format!(
+            "the standalone command `{command}` (pid {}) holds the index at {location} right now; run this again once it has finished. The index reported: {error}",
+            info.pid
+        );
+    }
+    words_for_holder(info.map(|info| info.pid), location, error, bypassed)
 }
 
 /// [`index_unreachable_words`] with the holder already looked up, so the three
@@ -1542,24 +1778,44 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     let info_path = config::service_info_path()?;
     let socket_path = config::service_sock_path()?;
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-
-    let mut acquired = false;
+    let mut acquired = None;
     for attempt in 0..20 {
+        // Opened afresh on every attempt: a file an owner removed while this
+        // process waited is not the one the next owner locks.
+        let opened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path);
+        let file = match opened {
+            Ok(file) => file,
+            // A lock file its owner has just removed stays pending on Windows
+            // until every handle to it is closed, and opening or creating it
+            // is refused meanwhile: wait and try again, as for a held lock.
+            Err(e)
+                if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied && attempt < 19 =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if FileExt::try_lock(&file).is_ok() {
-            acquired = true;
-            break;
+            if locked_file_is_current(&file, &lock_path) {
+                acquired = Some(file);
+                break;
+            }
+            let _ = FileExt::unlock(&file);
+            tracing::debug!(
+                "the service.lock this process locked was removed meanwhile; opening it again"
+            );
         }
         if attempt < 19 {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    if !acquired {
+    let Some(file) = acquired else {
         // Composed here, from the intent this process recorded before it
         // reached the lock, so the two other callers - the embedded MCP stack
         // and the `hold-lock` test command - get the no-intent wording and
@@ -1568,7 +1824,7 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
         return Err(anyhow::Error::new(LockHeld {
             message: lock_held_message(serve_intent(), read_lock_info().as_ref()),
         }));
-    }
+    };
 
     // The lock is held. Empty any legacy record bytes (pre-split daemons wrote
     // the record into the lock file itself) through this same handle, the only
@@ -1859,6 +2115,7 @@ mod tests {
             started_by: None,
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
+            standalone: None,
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -2400,6 +2657,7 @@ mod tests {
             started_by: None,
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
+            standalone: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2451,6 +2709,7 @@ mod tests {
             started_by: None,
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
+            standalone: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2522,6 +2781,7 @@ mod tests {
             started_by: None,
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
+            standalone: None,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -2548,6 +2808,159 @@ mod tests {
             "no service.json and the legacy bytes are gone"
         );
         drop(ownership);
+        drop(home);
+    }
+
+    /// A one-shot command that holds the state directory is named as what
+    /// it is, never mistaken for a wedged daemon: no socket probe, no
+    /// signal, nothing to attach to.
+    #[tokio::test]
+    async fn a_standalone_holder_is_named_and_never_attached_to() {
+        let home = ScratchHome::new("standalone-holder");
+        let ownership = acquire_standalone_ownership("crystalline domain rename").unwrap();
+        let info = read_lock_info().expect("the command published a record");
+        assert_eq!(
+            info.standalone.as_deref(),
+            Some("crystalline domain rename")
+        );
+        assert_eq!(
+            diagnose_holder().await,
+            HolderState::Standalone {
+                pid: std::process::id(),
+                command: "crystalline domain rename".to_string(),
+            }
+        );
+        assert_eq!(
+            dislodge_unresponsive().await.unwrap(),
+            DislodgeOutcome::NotNeeded,
+            "nothing is signalled"
+        );
+        assert!(try_attach().await.is_none());
+        drop(ownership);
+        assert!(read_lock_info().is_none(), "the record goes with the lock");
+        drop(home);
+    }
+
+    /// A connecting client waits for a one-shot command, bounded, and then
+    /// refuses in words naming it, without spawning or signalling anything
+    /// (the holder is this very test process, so a signal would end it).
+    #[tokio::test]
+    async fn ensure_daemon_waits_for_a_standalone_holder_and_names_it() {
+        let home = ScratchHome::new("standalone-ensure");
+        let ownership = acquire_standalone_ownership("crystalline sync").unwrap();
+        unsafe { std::env::set_var("CRYSTALLINE_TEST_STANDALONE_WAIT_MS", "200") };
+        let started = Instant::now();
+        let refused = ensure_daemon(true, None, None, false).await;
+        unsafe { std::env::remove_var("CRYSTALLINE_TEST_STANDALONE_WAIT_MS") };
+        let err = refused.err().expect("the holder never let go").to_string();
+        assert!(
+            err.contains("`crystalline sync`")
+                && err.contains(&format!("pid {}", std::process::id())),
+            "{err}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200), "it waited");
+        assert!(
+            read_lock_info().is_some_and(|info| info.standalone.is_some()),
+            "the holder's record is untouched"
+        );
+        drop(ownership);
+        drop(home);
+    }
+
+    /// A starting daemon that meets a one-shot command which does not let
+    /// go in time refuses with [`LockHeld`], naming the command and its pid.
+    #[tokio::test]
+    async fn a_starting_daemon_names_a_standalone_holder_it_waited_for() {
+        let home = ScratchHome::new("standalone-daemon");
+        let ownership = acquire_standalone_ownership("crystalline domain rename").unwrap();
+        unsafe { std::env::set_var("CRYSTALLINE_TEST_STANDALONE_WAIT_MS", "100") };
+        let refused = acquire_ownership_after_standalone().await;
+        unsafe { std::env::remove_var("CRYSTALLINE_TEST_STANDALONE_WAIT_MS") };
+        let err = refused.err().expect("the holder never let go");
+        let held = err
+            .downcast_ref::<LockHeld>()
+            .expect("typed for exit code 3");
+        let text = held.to_string();
+        assert!(
+            text.contains("`crystalline domain rename`")
+                && text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        drop(ownership);
+        let owned = acquire_ownership_after_standalone().await;
+        assert!(owned.is_ok(), "free once the command let go");
+        drop(owned);
+        drop(home);
+    }
+
+    /// A lock on a file that is no longer the one at the path is told apart
+    /// from a lock on the current one, whether the path is gone or names a
+    /// new file.
+    #[test]
+    fn a_lock_on_a_removed_lock_file_is_not_current() {
+        let home = ScratchHome::new("lock-current");
+        let path = config::service_lock_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
+        let file = open();
+        FileExt::try_lock(&file).unwrap();
+        assert!(locked_file_is_current(&file, &path));
+        let _ = FileExt::unlock(&file);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!locked_file_is_current(&file, &path), "the path is gone");
+        // A new file beside a removed one that is still open: unix allows
+        // it, and so does Windows with the delete semantics current NTFS
+        // uses, but with the older ones the removed name stays taken until
+        // `file` closes, so this half is unix only.
+        #[cfg(unix)]
+        {
+            let fresh = open();
+            assert!(!locked_file_is_current(&file, &path), "a new file is there");
+            assert!(locked_file_is_current(&fresh, &path));
+        }
+        drop(home);
+    }
+
+    /// The race an owner's departure leaves open, forced: a process opened
+    /// `service.lock` while the owner still held it and locks it the moment
+    /// the owner lets go. The owner removed the file before letting go, so
+    /// what that process locked is not the file at the path, and the next
+    /// `acquire_ownership` owns the file that is.
+    #[test]
+    fn a_file_locked_as_its_owner_leaves_is_seen_as_gone() {
+        let home = ScratchHome::new("lock-race");
+        let ownership = acquire_ownership().unwrap();
+        let path = config::service_lock_path().unwrap();
+        let waiting = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            FileExt::try_lock(&waiting).is_err(),
+            "held while the owner is there"
+        );
+        drop(ownership);
+        FileExt::try_lock(&waiting).expect("the departed owner let the lock go");
+        assert!(
+            !locked_file_is_current(&waiting, &path),
+            "the owner removed the file before letting it go"
+        );
+        // Closed before the next owner comes: on Windows with the older
+        // delete semantics the removed file keeps its name while this handle
+        // is open, and the next owner waits for it to go.
+        drop(waiting);
+        let next = acquire_ownership().expect("the next owner takes the file at the path");
+        assert!(locked_file_is_current(&next.lock_file, &path));
+        drop(next);
         drop(home);
     }
 
@@ -2714,6 +3127,7 @@ mod tests {
             started_by: None,
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
+            standalone: None,
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -2852,6 +3266,7 @@ mod tests {
             started_by,
             http,
             allowed_hosts: vec![],
+            standalone: None,
         }
     }
 

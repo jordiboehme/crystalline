@@ -648,6 +648,25 @@ impl Provider for MockProvider {
         })
     }
 
+    async fn read_file(
+        &self,
+        _origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        // A reference is a branch name or a commit id, as on the forge.
+        let inner = self.inner.lock().unwrap();
+        let commit = inner
+            .branches
+            .get(reference)
+            .cloned()
+            .unwrap_or_else(|| reference.to_string());
+        Ok(inner
+            .commits
+            .get(&commit)
+            .and_then(|c| c.files.get(path).cloned()))
+    }
+
     async fn blob(&self, _origin: &OriginSpec, sha: &str) -> Result<Vec<u8>, RemoteError> {
         let inner = self.inner.lock().unwrap();
         inner

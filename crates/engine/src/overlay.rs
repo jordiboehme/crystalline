@@ -58,7 +58,9 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
-use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig, ReviewMode};
+use crystalline_core::config::{
+    self, DomainEntry, GlobalConfig, NameOrigin, OriginConfig, ReviewMode,
+};
 
 use crate::origin;
 use crate::settings;
@@ -539,7 +541,8 @@ fn resolve_env_domains(
         // hyphens, so it never collides with a slug Crystalline itself
         // generates (slugs never carry underscores).
         let name = fragment.to_ascii_lowercase().replace('_', "-");
-        let entry = DomainEntry::file(config::expand_tilde(&value));
+        let entry =
+            DomainEntry::file(config::expand_tilde(&value)).with_name_origin(NameOrigin::Explicit);
         fragment_to_name.insert(fragment.to_string(), name.clone());
         domains.insert(
             name,
@@ -659,6 +662,20 @@ pub struct LoadedConfig {
     pub effective: GlobalConfig,
     /// The parsed environment overlay.
     pub overlay: EnvOverlay,
+}
+
+impl LoadedConfig {
+    /// The name table this configuration alone gives, for a command that
+    /// opens no index: over the effective configuration, environment domains
+    /// included, each file domain's canonical name read off its MANIFEST and
+    /// a virtual domain's local name only (its declared name lives in the
+    /// database).
+    pub fn name_table(&self) -> crystalline_core::names::NameTable {
+        crystalline_core::names::NameTable::from_config(
+            &self.effective,
+            &std::collections::BTreeMap::new(),
+        )
+    }
 }
 
 /// The single load chokepoint every `GlobalConfig` load routes through: parse
@@ -1461,6 +1478,23 @@ mod tests {
         assert!(names.iter().any(|n| n.as_str() == "team"));
         assert!(names.iter().any(|n| n.as_str() == "brand"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn an_environment_domain_is_always_explicitly_named() {
+        let domains = resolve_env_domains(
+            vec![(
+                "CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE".to_string(),
+                "/tmp/tk".to_string(),
+            )],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            domains["team-knowledge"].entry.name_origin,
+            Some(crystalline_core::config::NameOrigin::Explicit)
+        );
     }
 
     #[test]

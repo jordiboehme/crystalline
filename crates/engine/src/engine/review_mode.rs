@@ -921,10 +921,12 @@ impl Engine {
     /// Files are never touched - for a file domain they stay on disk exactly
     /// as they are (re-adding the folder re-adopts them); a virtual domain's
     /// rows ARE its truth, so callers should export first and their
-    /// confirmation copy must say the knowledge is gone. "Index rows cleared"
-    /// means the engram rows only: the store's domain row itself is left in
-    /// place (`Store::clear_domain` keeps it by design), so a later re-add of
-    /// the same name adopts the same row rather than minting a new one.
+    /// confirmation copy must say the knowledge is gone. Once the engram
+    /// rows are cleared the empty domain row goes too
+    /// (`Store::drop_empty_domain_row`), so the name is free for a rename or
+    /// an adoption onto it; a later re-add of the same name mints a new row.
+    /// The row stays only while another live instance on a shared index
+    /// still hosts the domain.
     ///
     /// Known race: the config write (name freed) is persisted and both config
     /// locks release before the tail runs `forget_domain` and `clear_domain`.
@@ -1003,8 +1005,7 @@ impl Engine {
         self.forget_domain(name);
 
         // Index rows: resolve the DomainId the way `reindex(full)` does
-        // before it calls `clear_domain` and clear them. The domain row
-        // stays either way (idempotent upsert); only the engram rows matter.
+        // before it calls `clear_domain` and clear them.
         let kind = if removed.is_virtual() {
             DomainKind::Virtual
         } else {
@@ -1015,6 +1016,36 @@ impl Engine {
         let store = self.store.lock().await;
         let domain_id = store.upsert_domain(name, path_str.as_deref(), kind).await?;
         store.clear_domain(domain_id).await?;
+        // Then the row itself, so the name is free for a rename or an
+        // adoption onto it - unless another live instance on a shared index
+        // still hosts the domain, whose registration is a registration. The
+        // host lock this instance held goes with the row. Best effort: the
+        // removal has happened, a host lock that cannot be read keeps the row
+        // (the safe direction), and a row left behind is what
+        // `crystalline doctor --fix` drops.
+        let elsewhere = match store.domain_host(domain_id).await {
+            Ok(host) => host.as_ref().is_some_and(|h| {
+                self.held_elsewhere(Some(&h.instance_id), Some(&h.heartbeat_at), Utc::now())
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    "the host lock of the removed domain could not be read, so its empty index \
+                     row stays; `crystalline doctor --fix` drops it: {e}"
+                );
+                true
+            }
+        };
+        if !elsewhere {
+            self.hosted.write().unwrap().remove(name);
+            if let Err(e) = store.drop_empty_domain_row(name).await {
+                tracing::warn!(
+                    domain = name,
+                    "the empty index row of the removed domain could not be dropped; \
+                     `crystalline doctor --fix` drops it: {e}"
+                );
+            }
+        }
         drop(store);
 
         self.refresh_routing_cache().await;
@@ -1101,10 +1132,16 @@ impl Engine {
     /// reports the same set a real run would collect, on both paths. It is the
     /// only argument that silences the stamp.
     ///
-    /// The domain row itself always stays, exactly as `domain_remove` leaves
-    /// it, so nothing downstream sees a dangling reference. The routing cache
-    /// is deliberately not refreshed: it is built from registered domains, and
-    /// nothing touched here is one.
+    /// The domain row of a domain this collects goes with its rows, on either
+    /// path, so the name is free for a rename or an adoption onto it. On the
+    /// on-demand path (`grace` is `None`, a person running `crystalline
+    /// doctor --fix`) an empty row an older version's `domain remove` left
+    /// behind goes too, a file domain's or a virtual one's. Such a row
+    /// reports `row_dropped: true`, and a preview reports `row_droppable:
+    /// true` for one a real run would drop. A row with drafts in the journal,
+    /// or a journal nobody could read, is never dropped as left behind. The
+    /// routing cache is deliberately not refreshed: it is built from
+    /// registered domains, and nothing touched here is one.
     ///
     /// The report:
     ///
@@ -1154,7 +1191,7 @@ impl Engine {
         let stamps = !dry_run;
         let removes = !dry_run && !self.read_only;
 
-        let Some(registered) = self.registered_domain_names_checked() else {
+        let Some(mut registered) = self.registered_domain_names_checked() else {
             return Ok(json!({
                 "grace_seconds": grace.map(|g| g.num_seconds()),
                 "on_demand": grace.is_none(),
@@ -1169,6 +1206,11 @@ impl Engine {
                             collected",
             }));
         };
+
+        // Both names of a rename in flight, or one a crash left half done,
+        // are registered: the index row may carry either while the
+        // configuration still says the other.
+        registered.extend(self.names_being_renamed());
 
         // The registered set is stamped FIRST, before a single domain is
         // considered. A registered domain that went unstamped would age like
@@ -1351,6 +1393,30 @@ impl Engine {
                 "age_days": age.map(|a| a.num_days()),
                 "collected": collect,
             });
+            // The empty row itself. A row this pass collects goes on either
+            // path: the stamps and the grace period already decided the
+            // domain is gone. A row that already held nothing - what `domain
+            // remove` left behind before it dropped its own, a file domain's
+            // or a virtual one's - goes only when a person asks, since no
+            // stamp or grace period has spoken for it, and never while the
+            // journal might still hold drafts for it. The store drops nothing
+            // that holds a row of any actor, whatever this decides.
+            let word = kept.map(|(word, _)| word);
+            let left_empty = grace.is_none()
+                && !drafts_unknown
+                && drafts == 0
+                && row.engrams == 0
+                && matches!(word, Some("no_rows") | Some("virtual"));
+            if !self.read_only && (collect || left_empty) {
+                if removes {
+                    let store = self.store.lock().await;
+                    let dropped = store.drop_empty_domain_row(&row.name).await?;
+                    drop(store);
+                    entry["row_dropped"] = json!(dropped);
+                } else {
+                    entry["row_droppable"] = json!(true);
+                }
+            }
             if let Some((kept, reason)) = kept {
                 entry["kept"] = json!(kept);
                 entry["reason"] = json!(reason);

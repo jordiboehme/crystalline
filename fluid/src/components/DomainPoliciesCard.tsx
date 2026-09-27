@@ -22,6 +22,16 @@
  * press hands the focus back to the select it came from. Every other change
  * posts at once. After a write the answer's `policies` go straight into the
  * manifest query, so the card holds the new values without a second read.
+ *
+ * `domain_name` is the one row with no select at all: a `PolicyKind::Text`
+ * key changes through a rename, not a PATCH, so its row carries a "Change
+ * name" button instead - gated by the same `own` this card already derives
+ * for every select, and disabled with the same reason "Rename domain" on the
+ * page itself carries (read-only, or a rename already running). Pressing it
+ * does not open a dialog of its own: `onRename` is the screen's own callback,
+ * so the one `RenameDomainDialog` mount the page already owns - and the
+ * post-rename summary that rides with it - answers both buttons rather than
+ * a second dialog answering only this one.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -40,8 +50,12 @@ import type { ManifestView, PolicyView } from "../api/domain";
 import { domainEngramsRoot } from "../api/engrams";
 import { fetchMembers, membersKey, sameAccount } from "../api/members";
 import { useAuth } from "../auth/AuthContext";
-import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
-import { FIELD } from "./primitives";
+import {
+  DestructiveAction,
+  READ_ONLY_REASON,
+  RENAMING_REASON,
+} from "./DestructiveAction";
+import { BUTTON, FIELD } from "./primitives";
 
 /** The refusal face, the same one every other screen announces a problem in. */
 const ALERT_CLASSES =
@@ -61,11 +75,26 @@ export function DomainPoliciesCard({
   domain,
   policies,
   branch,
+  onRename,
+  renaming = false,
 }: {
   domain: string;
   policies: PolicyView[];
   /** The branch a direct share would commit onto, or null when none is known. */
   branch: string | null;
+  /**
+   * Open the rename dialog. The screen owns the one mount of it - and the
+   * post-rename summary that rides with it - so this card never mounts a
+   * second `RenameDomainDialog` of its own.
+   */
+  onRename: () => void;
+  /**
+   * Whether a rename has this domain paused right now, which disables
+   * "Change name" with `RENAMING_REASON` the same way the page's own
+   * "Rename domain" button is disabled. Defaults to false for a caller that
+   * has no rename state to report.
+   */
+  renaming?: boolean;
 }): ReactElement {
   const { user, capabilities } = useAuth();
   const queryClient = useQueryClient();
@@ -162,8 +191,25 @@ export function DomainPoliciesCard({
             // differs from effective" - a known word the server reads
             // differently is the server's business, not a typo to report.
             const unrecognized =
-              row.declared !== null && !row.values.includes(row.declared);
+              row.kind !== "text" &&
+              row.declared !== null &&
+              !row.values.includes(row.declared);
             const shown = arming === row.key ? "direct" : row.effective;
+            // The exact reason "Rename domain" is disabled for on the page
+            // itself: read-only first, since that holds whatever a rename
+            // is doing, then a rename already in flight. The read-only span
+            // below is rendered for every row already, so this reuses its id
+            // rather than adding a second span with the same words; a rename
+            // in flight has no such span yet, so one is added only when this
+            // row draws the button that needs it.
+            const changeNameDisabledReason = capabilities.readOnly
+              ? READ_ONLY_REASON
+              : renaming
+                ? RENAMING_REASON
+                : undefined;
+            const changeNameReasonId = capabilities.readOnly
+              ? `${rowId}-readonly`
+              : `${rowId}-renaming`;
             return (
               // The roles are spelled out because the row stacks below `sm`:
               // a `tr` laid out as a flex column is no longer a row to a
@@ -185,7 +231,47 @@ export function DomainPoliciesCard({
                   {row.declared ?? "not declared"}
                 </td>
                 <td role="cell" className="pr-3">
-                  {mayChange(row) ? (
+                  {row.kind === "text" ? (
+                    // A free-text key changes through a different flow
+                    // entirely: `domain_name` through the "Change name"
+                    // button below, which opens the rename dialog, never
+                    // this card's own select - so the value itself is
+                    // read-only here whatever `mayChange` would otherwise
+                    // say.
+                    <>
+                      <output aria-labelledby={rowId}>{row.effective}</output>
+                      {row.key === "domain_name" && own && (
+                        <>
+                          {" "}
+                          <button
+                            type="button"
+                            aria-disabled={
+                              changeNameDisabledReason !== undefined
+                            }
+                            aria-describedby={
+                              changeNameDisabledReason !== undefined
+                                ? changeNameReasonId
+                                : undefined
+                            }
+                            onClick={() => {
+                              if (changeNameDisabledReason !== undefined) {
+                                return;
+                              }
+                              onRename();
+                            }}
+                            className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
+                          >
+                            Change name
+                          </button>
+                          {renaming && !capabilities.readOnly && (
+                            <span id={changeNameReasonId} className="sr-only">
+                              {RENAMING_REASON}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </>
+                  ) : mayChange(row) ? (
                     <select
                       ref={(el) => {
                         selects.current[row.key] = el;

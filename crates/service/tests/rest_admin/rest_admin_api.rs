@@ -162,7 +162,10 @@ async fn serve(opts: Options) -> Fixture {
         .with_read_only(opts.read_only)
         .with_token_store_dir(root.join("tokens"))
         .with_connect_auth(connect_auth)
-        .with_origins_dir(root.join("origins"));
+        .with_origins_dir(root.join("origins"))
+        // Where a rename keeps its journal: a name adoption after a pull
+        // renames a derived team domain.
+        .with_state_dir(root.join("state"));
     if let Some(provider) = opts.origin_provider {
         engine = engine.with_origin_provider(provider);
     }
@@ -363,6 +366,337 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
         .await
         .unwrap();
     assert_eq!(nonsense.status(), 422);
+}
+
+/// `repo` and `path` are validated before anything is asked of the forge - on
+/// this instance, before even the not-connected check, since a malformed
+/// request is refused ahead of a state check either way answers with
+/// "anything but success". A `repo` carrying a `..` segment through an extra
+/// slash, or a `path` that is absolute or climbs out with `..`, is a 422
+/// naming the field, never a request that reaches `origin_add` and a GitHub
+/// API path built from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_repo_or_path_is_refused_before_the_connection_is_asked_about() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for repo in [
+        "acme/kb/../../secret",
+        "acme",
+        "acme/kb/extra",
+        "../acme/kb",
+        "acme/..",
+        "ac me/kb",
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&serde_json::json!({"mode": "github", "repo": repo}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
+    }
+
+    for path in [
+        "/etc/passwd",
+        "../../secret",
+        "domains/../../secret",
+        "a\\b",
+        "%2e%2e",
+        "domains%2f..%2fsecret",
+        "a/./b",
+        "a//b",
+        ".",
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&serde_json::json!({"mode": "github", "repo": "acme/kb", "path": path}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "path {path:?} must be refused");
+    }
+
+    // A well-formed repo still answers the ordinary not-connected 409: the
+    // validation added nothing but a 422 for genuinely bad input.
+    let ready = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 409);
+}
+
+/// The GitHub domain-name peek is admin only, refuses a missing `repo` with
+/// the same 422 a nameless team-domain create's own repo check answers, and
+/// is a 409 pointing at the settings screen when no credential is on file -
+/// the same gate and the same wording a team-domain create answers to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_needs_admin_and_a_connection() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // `repo` is a required query parameter (the OpenAPI document and the
+    // generated Fluid types say so too), so an
+    // entirely absent one fails query deserialization before this handler
+    // runs at all - a 400, axum's own rejection status, rather than the
+    // handler's 422.
+    let missing_repo = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing_repo.status(), 400);
+
+    // Present but empty is the handler's own 422, the same one create's
+    // repo check answers.
+    let empty_repo = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(empty_repo.status(), 422);
+
+    let forbidden = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(forbidden.status(), 403);
+
+    let not_ready = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(not_ready.status(), 409);
+    let problem: serde_json::Value = not_ready.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("settings"),
+        "the refusal points at the fix: {problem}"
+    );
+}
+
+/// `repo` and `path` are validated the same way for the peek as for create,
+/// before anything is asked of the forge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_refuses_a_malformed_repo_or_path() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for repo in ["acme/kb/../../secret", "acme", "acme/..", "ac me/kb"] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo={repo}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "repo {repo:?} must be refused");
+    }
+
+    for path in [
+        "../../secret",
+        // Percent-decodes once (the query string layer, ahead of this
+        // handler) to `a\b`, a backslash - `validate_repo_path` must reject
+        // the decoded value, not only a literal `..`.
+        "a%5Cb",
+        // Decodes once to `a%b`: a literal `%` character reaching the
+        // validator, the shape a caller could otherwise use to smuggle a
+        // second round of percent-decoding past this check and into
+        // whatever reads the forge's answer.
+        "a%25b",
+        "a/./b",
+        "a//b",
+    ] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo=acme/kb&path={path}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "path {path:?} must be refused");
+    }
+}
+
+/// An empty `path` and one that is nothing but a trailing slash both name the
+/// repository root and pass validation: both used to reach past this check before the
+/// traversal guard tightened the rule. Neither repo nor GitHub is actually
+/// reachable in this fixture, so a valid path clears the 422 and lands on the
+/// same 409 "not ready" the bare `repo=acme/kb` case above answers with,
+/// which is what proves the path was accepted rather than refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_accepts_an_empty_or_trailing_slash_path_as_the_repo_root() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for path in ["", "domains/eng/"] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            &format!("/api/v1/github/domain-name?repo=acme/kb&path={path}"),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "path {path:?} must be accepted as the repo root"
+        );
+    }
+}
+
+/// With `branch` omitted, the peek asks the forge for the repository's
+/// default branch before it can read anything; when that call fails (the
+/// repository is unreadable, or gone), the answer is a 4xx that names the
+/// problem rather than a 500 or a silent success, exactly like a nameless
+/// team-domain create's own default-branch lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_reports_an_unreadable_repository() {
+    let (fx, mock) = serve_team_with_mock_manifest(false, KB_MANIFEST).await;
+    mock.fail_default_branch();
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    // `default_branch_refusal` (crates/engine/src/engine/mod.rs) maps
+    // anything but a credential/authorization failure to
+    // `RemoteError::Refused`, which the generic `From<EngineError>`
+    // conversion answers 422: a caller-fault refusal naming the branch flag,
+    // never a 500 or a silent success.
+    assert_eq!(status, 422, "{text}");
+}
+
+/// The peek reads the MANIFEST through the forge exactly as a nameless team
+/// create does, and registers nothing: a repository whose MANIFEST declares
+/// `domain_name` reports it beside the repository's own default, and one
+/// that declares none reports `null` there instead - and either way, nothing
+/// is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_domain_name_peek_reads_the_manifest_without_registering() {
+    const KB_MANIFEST_NAMED: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: engineering\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+    let (fx, _mock) = serve_team_with_mock_manifest(false, KB_MANIFEST_NAMED).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let named = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(named.status(), 200, "{}", named.text().await.unwrap());
+    let body: serde_json::Value = named.json().await.unwrap();
+    assert_eq!(body["domain_name"], "engineering");
+    assert_eq!(body["default_name"], "kb");
+
+    // A path and a branch travel through unchanged; the mock forge only
+    // seeded `main`, so a different branch answers with nothing to read
+    // rather than a stack trace.
+    let other_branch = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb&branch=topic",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        other_branch.status(),
+        200,
+        "{}",
+        other_branch.text().await.unwrap()
+    );
+    assert_eq!(
+        other_branch.json::<serde_json::Value>().await.unwrap()["domain_name"],
+        serde_json::Value::Null
+    );
+
+    // Nothing was ever registered: the peek reads, it never writes.
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !listing.contains("engineering") && !listing.contains("\"kb\""),
+        "the peek registered something: {listing}"
+    );
+
+    // `KB_MANIFEST` (used by the team fixtures below) declares no
+    // `domain_name`: the peek answers `null`, never the repository's own
+    // name in that slot - `default_name` is the one that carries it.
+    let (fx2, _mock2) = serve_team_with_mock_manifest(false, KB_MANIFEST).await;
+    let admin2 = login(fx2.addr, "root", "rootpw").await;
+    let undeclared = as_session(
+        fx2.addr,
+        reqwest::Method::GET,
+        "/api/v1/github/domain-name?repo=acme/kb",
+        &admin2,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(undeclared.status(), 200);
+    let body2: serde_json::Value = undeclared.json().await.unwrap();
+    assert_eq!(body2["domain_name"], serde_json::Value::Null);
+    assert_eq!(body2["default_name"], "kb");
 }
 
 /// A team domain registers under the name the validator handed back, not the
@@ -645,6 +979,53 @@ async fn team_sync_status_and_sync_now_walk_the_contract() {
     }
 }
 
+/// `POST /domains/{domain}/sync` pulls, and once the pull has finished the
+/// name adoption runs: a `domain_name` the owner added upstream renames the
+/// derived team domain on this machine. The response is the pull's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_now_adopts_a_pulled_domain_name() {
+    let (fx, mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+
+    let declaring = String::from_utf8(KB_MANIFEST.to_vec()).unwrap().replacen(
+        "status: current\n",
+        "status: current\ndomain_name: team-kb\n",
+        1,
+    );
+    let head = mock.branch_commit("main").unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("MANIFEST.md".to_string(), declaring.into_bytes());
+    files.insert(
+        "shared.md".to_string(),
+        mock.commit_file(&head, "shared.md").unwrap(),
+    );
+    let next = mock.add_commit_on(files, Some(&head));
+    mock.set_branch("main", &next);
+
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+    let pulled: serde_json::Value = pulled.json().await.unwrap();
+    assert_eq!(pulled["domain"], "kb", "{pulled}");
+
+    let cfg: GlobalConfig =
+        crystalline_core::config::load_yaml(&fx._tmp.path().join("config.yaml")).unwrap();
+    assert!(!cfg.domains.contains_key("kb"), "{:?}", cfg.domains.keys());
+    assert!(
+        cfg.domains["team-kb"].aliases.contains(&"kb".to_string()),
+        "{:?}",
+        cfg.domains["team-kb"]
+    );
+}
+
 /// The share half of the sync surface, walked end to end against the mock
 /// forge: preview what a share would do, share it, read the enriched status
 /// the card renders, share again into the same proposal, then withdraw it.
@@ -906,8 +1287,9 @@ async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
     assert_eq!(
         body["sections"]["policies"],
         serde_json::json!([
-            { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-            { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+            { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+            { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+            { "key": "domain_name", "kind": "text", "declared": null, "effective": "kb", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
         ]),
         "{body}"
     );
@@ -1034,6 +1416,42 @@ async fn the_policy_patch_validates_the_whole_body_before_it_writes() {
             "{body}: {problem}"
         );
     }
+    assert_eq!(
+        std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap(),
+        before,
+        "nothing was written"
+    );
+}
+
+/// `domain_name` is a `PolicyKind::Text` key: it changes through a rename,
+/// which also moves this machine's local name and rewrites links, never
+/// through the policy patch. A PATCH naming it is refused before anything is
+/// written, pointing at the rename command instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_refuses_domain_name_and_points_at_rename() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let before = std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap();
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"domain_name": "x"}))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 422, "{problem}");
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(detail.contains("rename"), "{problem}");
+    assert!(detail.contains("crystalline domain rename"), "{problem}");
+
     assert_eq!(
         std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap(),
         before,

@@ -190,6 +190,22 @@ pub trait Provider: Send + Sync {
     /// Fetches the raw content of a blob by sha.
     async fn blob(&self, origin: &OriginSpec, sha: &str) -> Result<Vec<u8>, RemoteError>;
 
+    /// The bytes of one file at `path` (relative to the repository root; the
+    /// caller joins the origin's subpath) on `reference` (a branch or a commit
+    /// sha), or `None` when no such file exists there.
+    ///
+    /// One small read, for a caller that needs a single file before it
+    /// decides anything - the MANIFEST a connect takes the domain's name from
+    /// - and would otherwise have to download the whole tarball first. Like
+    /// [`Provider::branch_ref`], a missing answer is `None` whatever the
+    /// cause, so it is never the sole basis for "the repository is fine".
+    async fn read_file(
+        &self,
+        origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError>;
+
     /// The tar.gz archive of the repository at a commit, as raw bytes.
     async fn tarball(&self, origin: &OriginSpec, commit: &str) -> Result<Vec<u8>, RemoteError>;
 
@@ -394,6 +410,15 @@ mod tests {
 
         async fn blob(&self, _origin: &OriginSpec, _sha: &str) -> Result<Vec<u8>, RemoteError> {
             Err(RemoteError::Offline)
+        }
+
+        async fn read_file(
+            &self,
+            _origin: &OriginSpec,
+            _reference: &str,
+            _path: &str,
+        ) -> Result<Option<Vec<u8>>, RemoteError> {
+            Ok(None)
         }
 
         async fn tarball(

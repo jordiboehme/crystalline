@@ -2696,6 +2696,8 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     let domains = out["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], json!("brand"));
+    // The local file: connecting as `brand` writes nothing into the team's
+    // MANIFEST.
     assert_eq!(domains[0]["local_changes"], json!(1));
     assert!(
         domains[0].get("detail").is_none(),

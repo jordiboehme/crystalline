@@ -21,6 +21,13 @@ pub mod overlay_journal;
 pub mod params;
 #[doc(hidden)]
 pub mod poller;
+mod rename;
+#[cfg(any(test, feature = "testing"))]
+pub use rename::RenameHold;
+pub use rename::{
+    MachineOwner, PendingRename, RenameOwner, RenameStep, discard_pending_rename,
+    machine_rename_owner, pending_rename,
+};
 #[doc(hidden)]
 pub mod review;
 #[doc(hidden)]

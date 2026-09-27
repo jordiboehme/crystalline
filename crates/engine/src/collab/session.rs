@@ -1612,6 +1612,38 @@ impl CollabSession {
             return SaveOutcome::Done(None);
         }
         state.last_attempt = Some(now);
+        // Normalize before the save ever sees this text, and converge the
+        // document to match: a cross-domain link spelled with an alias or a
+        // non-canonical local name is rewritten to its canonical one, the
+        // same funnel every other write's final text passes through. Done
+        // HERE rather than left to the engine's own pass inside `save_engram`
+        // for two reasons. Every connected client has to see the same bytes
+        // that are about to land, not keep showing the spelling as typed
+        // while the file already reads differently. And `last_saved_text`
+        // below has to agree with the checksum the receipt hands back: both
+        // are set from the SAME normalized text, so the next tick's compare
+        // (`file == state.last_saved_text`, above) can go quiet once nothing
+        // new has been typed. Setting `last_saved_text` to the room's own
+        // pre-normalization text instead - without converging the document -
+        // would leave that compare false forever, since the live text itself
+        // never gained the respelling, and the room would save on every
+        // debounce window for good.
+        let file = match self
+            .engine
+            .normalize_domain_spellings_for(&file, &crate::scope::Scope::Unrestricted)
+            .await
+        {
+            Ok((normalized, count)) => {
+                if count > 0 {
+                    self.converge(state, &session_text(&normalized));
+                }
+                normalized
+            }
+            Err(err) => {
+                self.fail_save(state, err.to_string());
+                return SaveOutcome::Done(None);
+            }
+        };
         let params = crate::params::SaveParams {
             domain: self.domain.clone(),
             identifier: state.permalink.clone(),
@@ -1961,6 +1993,36 @@ impl CollabSession {
         // save_engram refuses a missing file by design, so the room's text
         // goes back through the restore verb instead.
         let file = Self::file_text_locked(state);
+        // Normalized and converged first, exactly as `save_attempt` does and
+        // for the same reason: `restore_engram` itself is deliberately exempt
+        // (it restores prior bytes exactly, see its own doc comment), so this
+        // is the one place that has to make sure what gets restored, what the
+        // document shows and what `last_saved_text` is set to below all agree
+        // on the canonical spelling, rather than restoring - and then living
+        // with - whatever the room typed before it ever saved.
+        let file = match self
+            .engine
+            .normalize_domain_spellings_for(&file, &crate::scope::Scope::Unrestricted)
+            .await
+        {
+            Ok((normalized, count)) => {
+                if count > 0 {
+                    self.converge(state, &session_text(&normalized));
+                }
+                normalized
+            }
+            Err(err) => {
+                state.pending = Some(PendingConflict::Deleted);
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    to: None,
+                    bytes: Bytes::from(control::encode(&Control::SaveFailed {
+                        detail: err.to_string(),
+                    })),
+                });
+                return None;
+            }
+        };
         // Through the room's own view when the room is over a draft - it puts
         // its text back in that actor's draft - and through the scope its save
         // uses otherwise. The two arms have to agree, and the save's `None`

@@ -12,17 +12,23 @@ import type { ReactElement } from "react";
 import { useId } from "react";
 
 import { archiveDownloadUrl } from "../api/admin";
+import { RENAMING_REASON } from "./DestructiveAction";
 import { BUTTON } from "./primitives";
 
 export function BackupCard({
   domain,
   onImport,
+  renaming = false,
 }: {
   domain: string;
   /** Open the import dialog, which the screen owns because its palette row opens it too. */
   onImport: () => void;
+  /** Whether a rename has this domain paused, which withholds Import archive only. */
+  renaming?: boolean;
 }): ReactElement {
   const headingId = useId();
+  const reasonId = useId();
+  const disabledReason = renaming ? RENAMING_REASON : undefined;
   return (
     <section
       aria-labelledby={headingId}
@@ -42,7 +48,7 @@ export function BackupCard({
           cookie-authenticated GET, so the browser saves the file itself and
           this app never holds a whole domain in memory to hand it back.
           `download` is what makes it a save rather than a navigation into a
-          zip.
+          zip. A read rather than a write, so it is never disabled here.
         */}
         <a
           href={archiveDownloadUrl(domain)}
@@ -51,9 +57,25 @@ export function BackupCard({
         >
           Download archive
         </a>
-        <button type="button" onClick={onImport} className={BUTTON.secondary}>
+        <button
+          type="button"
+          aria-disabled={disabledReason !== undefined}
+          aria-describedby={disabledReason !== undefined ? reasonId : undefined}
+          onClick={() => {
+            if (disabledReason !== undefined) {
+              return;
+            }
+            onImport();
+          }}
+          className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
+        >
           Import archive
         </button>
+        {disabledReason !== undefined && (
+          <span id={reasonId} className="sr-only">
+            {disabledReason}
+          </span>
+        )}
       </div>
     </section>
   );

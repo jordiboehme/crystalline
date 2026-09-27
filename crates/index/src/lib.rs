@@ -35,7 +35,7 @@ pub use embed::{
     prune_model_cache, run_embedding_pass, run_embedding_pass_with_page,
 };
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
-pub use factory::open_store;
+pub use factory::{open_store, store_location};
 pub use store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
@@ -61,11 +61,14 @@ pub use store::{
 /// `resolve_pending_sql`, which is the statement the registry names, and its
 /// own argument type is crate-private.
 #[doc(hidden)]
-pub use store::{link_frontier_sql, relation_frontier_sql, resolve_pending_sql};
+pub use store::{
+    link_frontier_sql, referencing_domains_sql, relation_frontier_sql,
+    reset_spelled_references_sql, resolve_pending_sql, spelled_references_sql,
+};
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
-    RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SweepInput, SweepOptions, SweepReport,
-    UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
+    RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SpelledRef, SweepInput, SweepOptions,
+    SweepReport, UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
     DomainScan, NoReindexHooks, ReindexHooks, SyncReport, apply_scan, apply_scan_with_slab,

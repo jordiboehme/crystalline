@@ -960,8 +960,8 @@ async fn a_domain_unregistered_past_the_grace_period_is_collected() {
 
     assert_eq!(
         engrams_of(&store, "gone").await,
-        Some(0),
-        "its engram rows are gone and its domain row is not"
+        None,
+        "its engram rows are gone, and its empty domain row with them"
     );
     assert!(
         engrams_of(&store, "keep").await.unwrap() >= 2,
@@ -1105,7 +1105,7 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
         "the real run collects the set the preview named: {wet}"
     );
     assert_eq!(wet["engrams_removed"], before, "this time for real: {wet}");
-    assert_eq!(engrams_of(&store, "gone").await, Some(0));
+    assert_eq!(engrams_of(&store, "gone").await, None);
 }
 
 /// A read-only instance collects nothing and says so, rather than refusing: a
@@ -1440,9 +1440,11 @@ async fn a_person_asking_collects_a_never_stamped_orphan_and_a_sweep_does_not() 
     assert_eq!(asked["engrams_removed"], before);
     assert_eq!(
         engrams_of(&store, "gone").await,
-        Some(0),
-        "its rows are gone and its domain row is not"
+        None,
+        "its rows are gone, and a person asking drops the empty domain row too, so \
+         the name is free: {asked}"
     );
+    assert_eq!(considered(&asked, "gone").unwrap()["row_dropped"], true);
     assert!(
         engrams_of(&store, "keep").await.unwrap() >= 2,
         "and the registered domain is untouched"
@@ -1482,7 +1484,16 @@ async fn an_on_demand_dry_run_lists_the_orphan_and_removes_nothing() {
         collected(&dry),
         "the ask collects the set the preview named: {asked}"
     );
-    assert_eq!(engrams_of(&store, "gone").await, Some(0));
+    assert_eq!(
+        considered(&dry, "gone").unwrap()["row_droppable"],
+        true,
+        "the preview says the empty row would go too: {dry}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        None,
+        "and the ask dropped it"
+    );
 }
 
 /// Give `name`'s domain row a host lock held by another instance, heartbeating
@@ -1652,8 +1663,8 @@ async fn a_domain_whose_host_lock_went_stale_is_collected() {
     );
     assert_eq!(
         engrams_of(&store, "gone").await,
-        Some(0),
-        "its rows are gone and its domain row is not"
+        None,
+        "its rows are gone, and its empty domain row with them"
     );
 }
 
@@ -1700,7 +1711,7 @@ async fn the_daemon_sweep_collects_a_stale_orphan() {
     ));
 
     within("the sweep collects the stale orphan", || async {
-        engrams_of(&store, "gone").await == Some(0)
+        engrams_of(&store, "gone").await.is_none()
     })
     .await;
     assert!(

@@ -869,6 +869,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         if !Self::RETIREMENT_STATUSES.contains(&p.status.as_str()) {
             return Err(EngineError::Invalid(format!(
                 "retire_engram accepts status deprecated, superseded or archived, got '{}'; \
@@ -970,7 +971,16 @@ impl Engine {
         // retirement composes like every other in-place rewrite, and
         // `a_retirement_in_a_direct_domain_composes_into_the_open_room` says so.
         let mut warning = self
-            .apply_source_edit(&desc, &source, &view, None, &actor, None, retire_target)
+            .apply_source_edit(
+                &desc,
+                &source,
+                &view,
+                None,
+                &actor,
+                None,
+                scope,
+                retire_target,
+            )
             .await?;
 
         // -- successor: reciprocal supersedes line, appended once --
@@ -1002,9 +1012,16 @@ impl Engine {
             };
             if !already(&current) {
                 let succ_warning = self
-                    .apply_source_edit(succ_desc, succ_source, &view, None, &actor, None, |c| {
-                        Ok(append_body(c, &line))
-                    })
+                    .apply_source_edit(
+                        succ_desc,
+                        succ_source,
+                        &view,
+                        None,
+                        &actor,
+                        None,
+                        scope,
+                        |c| Ok(append_body(c, &line)),
+                    )
                     .await?;
                 warning = warning.or(succ_warning);
             }
@@ -1154,6 +1171,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write(self, &p.domain, scope).await?;
         let overlay = view.actor();
         let actor = self.actor_for(client, overlay);
@@ -1259,6 +1277,7 @@ impl Engine {
                 // A split moves words it did not write, so its tail records
                 // the agent without a model, exactly as it records the actor.
                 None,
+                scope,
                 None,
                 move |_| Ok(remaining),
             )

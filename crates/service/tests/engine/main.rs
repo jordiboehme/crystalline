@@ -12,6 +12,7 @@ mod support;
 
 mod activity;
 mod attachments;
+mod domain_names;
 mod embed_tick;
 mod engine_writes;
 mod file_stamps;
@@ -19,6 +20,7 @@ mod graph;
 mod index_files;
 mod model_upgrade;
 mod move_permalink;
+mod name_report;
 mod orphaned_rows;
 mod similar;
 #[cfg(unix)]

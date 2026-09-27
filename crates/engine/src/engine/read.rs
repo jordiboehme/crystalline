@@ -265,6 +265,7 @@ impl Engine {
         peer: Option<&AgentPeer>,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         // The one path a read crosses between two overlays on: a draft this
         // caller was handed a link to. Asked first, so the grant stands over
         // whatever the team's own folder holds at that path - a draft always
@@ -352,12 +353,20 @@ impl Engine {
         // A parsed reference resolves when a matching indexed row (same source
         // line, kind and target) is resolved. An unmatched parsed entry, which a
         // just-edited or non-host read can produce, is reported as unresolved.
+        // The domain is matched by meaning, not by bytes: a row recorded under
+        // one spelling of a domain and text that now spells it another way
+        // (its canonical name, an alias, a former local name) are one link.
+        let names = self.name_table_now().await;
         let resolves = |kind: EdgeKind, line: usize, target: &LinkTarget| -> bool {
             outbound.iter().any(|o| {
                 o.kind == kind
                     && o.line == line
                     && o.to_target == target.target
-                    && o.to_domain == target.domain
+                    && super::names::same_domain(
+                        &names,
+                        o.to_domain.as_deref(),
+                        target.domain.as_deref(),
+                    )
                     && o.resolved
             })
         };
@@ -536,6 +545,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let (desc, _) = self
             .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
             .await?;

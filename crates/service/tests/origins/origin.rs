@@ -497,6 +497,7 @@ async fn origin_add_connects_a_registered_domain_in_place() {
             origin: None,
             provision: None,
             review: None,
+            ..Default::default()
         },
     );
     let eng = Engine::new(
@@ -556,6 +557,7 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
             origin: None,
             provision: Some(false),
             review: Some(crystalline_core::config::ReviewMode::Overlay),
+            ..Default::default()
         },
     );
     let eng = Engine::new(
@@ -638,6 +640,7 @@ async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
             origin: None,
             provision: None,
             review: None,
+            ..Default::default()
         },
     );
     let eng = Engine::new(
@@ -1485,7 +1488,10 @@ async fn origin_status_reports_behind_and_connection() {
     assert_eq!(domains[0]["domain"], "brand");
     assert_eq!(domains[0]["repo"], "acme/brand-knowledge");
     assert_eq!(domains[0]["behind"], false);
-    assert_eq!(domains[0]["local_changes"], 0);
+    assert_eq!(
+        domains[0]["local_changes"], 0,
+        "connecting as `brand` writes nothing into the team's MANIFEST"
+    );
 
     // A local edit shows up as "ahead" (a local change against the base).
     std::fs::create_dir_all(root.join("notes")).unwrap();
@@ -1570,7 +1576,6 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
     )
     .await
     .unwrap();
-
     // One of each kind, plus two refreshed folder listings that ride along.
     std::fs::write(
         root.join("notes/added.md"),
@@ -1763,7 +1768,10 @@ async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
         domains[0]["behind"].is_null(),
         "behind must degrade to unknown, not error: {status}"
     );
-    assert_eq!(domains[0]["local_changes"], 1);
+    assert_eq!(
+        domains[0]["local_changes"], 1,
+        "the local edit; connecting as `brand` writes nothing into the team's MANIFEST"
+    );
     let probe_error = domains[0]["probe_error"]
         .as_str()
         .expect("probe_error must carry the offline message");
@@ -2182,7 +2190,6 @@ async fn a_pulled_manifest_flips_the_policy_for_the_next_share_with_no_state_cha
     )
     .await
     .unwrap();
-
     // Upstream flips the policy; the pull brings it down as an ordinary edit.
     let flipped = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
     mock.set_branch("main", &flipped);
@@ -2251,7 +2258,16 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
     assert_eq!(plan["branch"], "main");
     assert_eq!(plan["sharing"], "direct");
     assert_eq!(plan["repo"], "acme/brand-knowledge");
-    assert_eq!(plan["changes"][0]["path"], "notes/new.md");
+    // The new engram is this domain's only unshared work: connecting as
+    // `brand` writes nothing into the team's MANIFEST.
+    let mut paths: Vec<&str> = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["notes/new.md"], "{plan}");
 
     // A proposal this machine recorded stands in the way, by number and url.
     let state_dir = origins_dir.join("brand");
@@ -2422,7 +2438,6 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     )
     .await
     .unwrap();
-
     let found = |needle: &'static str| {
         let eng = &eng;
         async move {
@@ -2901,7 +2916,9 @@ async fn origin_withdraw_with_revert_restores_files() {
         .origin_withdraw("kb", Some(number), true, ShareActor::Owner)
         .await
         .unwrap();
-    assert_eq!(v["restored"][0], "notes/a.md");
+    // The share carried only the engram edit: connecting as `kb` writes
+    // nothing into the team's MANIFEST, so the revert puts back the one file.
+    assert_eq!(v["restored"], serde_json::json!(["notes/a.md"]), "{v}");
     let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
     assert!(!text.contains("alpha v2"), "restored to base: {text}");
 }
@@ -4380,10 +4397,15 @@ async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        direct_plan["changes"][0]["last_author"], "human:ada",
-        "{direct_plan}"
-    );
+    // Looked up by path: the MANIFEST connecting as `kb` wrote the name into
+    // travels in the same plan.
+    let authored = direct_plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "notes/authored.md")
+        .unwrap_or_else(|| panic!("the authored engram is in the plan: {direct_plan}"));
+    assert_eq!(authored["last_author"], "human:ada", "{direct_plan}");
 }
 
 /// A base path the state directory holds no copy of is an error naming the way
@@ -5821,7 +5843,6 @@ async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
     )
     .await
     .unwrap();
-
     // One substantive change the team has not seen.
     std::fs::write(
         root.join("added.md"),
@@ -5894,7 +5915,6 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
     )
     .await
     .unwrap();
-
     // Counted for this domain's own folder, which is this test's tempdir: a
     // sibling test in this binary walks its own team domain, and `cargo test`
     // runs the two as threads in one process.
@@ -5927,4 +5947,78 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         1,
         "and it pays for no second walk inside the memo window"
     );
+}
+
+/// A full rename of a local domain respells the link a team domain holds to
+/// it, and that rewrite is a local change of the team domain like any other
+/// edit: it waits for the next share, and the rename opens no proposal.
+#[tokio::test]
+async fn a_full_rename_rewrites_a_team_domains_link_as_a_local_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/link.md",
+            engram("Link", "link", "See [[eng:alpha]] first."),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    let eng_dir = tmp.path().join("eng");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(eng_dir.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        eng_dir.join("alpha.md"),
+        engram("Alpha", "alpha", "the runbook"),
+    )
+    .unwrap();
+    eng.domain_add_local(Some("eng"), Some(eng_dir.to_str().unwrap()))
+        .await
+        .unwrap();
+    let calls_before = mock.calls().len();
+
+    let report = eng
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        report["rewritten"],
+        serde_json::json!([{ "domain": "brand", "engrams": 1, "references": 1 }]),
+        "{report}"
+    );
+    let text = std::fs::read_to_string(root.join("notes/link.md")).unwrap();
+    assert!(text.contains("[[platform:alpha]]"), "{text}");
+    let new_calls = mock.calls()[calls_before..].to_vec();
+    assert!(
+        !new_calls
+            .iter()
+            .any(|c| c.starts_with("create_") || c.contains("proposal")),
+        "the rename opened nothing upstream: {new_calls:?}"
+    );
+
+    let status = eng
+        .origin_status(Some("brand"), true, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let entry = &status["domains"][0];
+    assert_eq!(
+        entry["detail"]["modified"],
+        serde_json::json!(["notes/link.md"]),
+        "{entry}"
+    );
+    assert_eq!(entry["local_changes"], 1, "{entry}");
 }

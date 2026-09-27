@@ -7,11 +7,13 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::SearchOrder;
 use crystalline_index::TursoStore;
+use crystalline_service::DomainAccess;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::{
-    DeleteParams, ReadParams, RetireParams, SaveParams, SearchParams, SplitParams,
+    DeleteParams, EditParams, ReadParams, RetireParams, SaveParams, SearchParams, SplitParams,
 };
+use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -2347,4 +2349,268 @@ async fn a_capture_titled_manifest_never_replaces_the_domains_manifest() {
         before,
         "the MANIFEST is untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// domain name normalization: every write stores a cross-domain
+// link with the canonical domain name, wherever the registrations resolve it
+// back to the same domain.
+// ---------------------------------------------------------------------------
+
+/// Three domains: `eng-knowledge` (its MANIFEST declares `domain_name: eng`,
+/// with the machine-local alias `engineering`), a plain `platform`, and
+/// `platform-2`, whose MANIFEST also declares `domain_name: platform` - taken
+/// already by the local name `platform`, so it is shadowed. Synced.
+async fn normalize_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let eng_dir = root.join("eng-knowledge");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(
+        eng_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-01-01"),
+    )
+    .unwrap();
+    let mut eng_entry = DomainEntry::file(eng_dir);
+    eng_entry.aliases = vec!["engineering".to_string()];
+    cfg.domains.insert("eng-knowledge".to_string(), eng_entry);
+
+    let platform_dir = root.join("platform");
+    std::fs::create_dir_all(&platform_dir).unwrap();
+    std::fs::write(
+        platform_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("platform", "2026-01-01"),
+    )
+    .unwrap();
+    cfg.domains
+        .insert("platform".to_string(), DomainEntry::file(platform_dir));
+
+    let platform2_dir = root.join("platform-2");
+    std::fs::create_dir_all(&platform2_dir).unwrap();
+    std::fs::write(
+        platform2_dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("platform", "2026-01-01"),
+    )
+    .unwrap();
+    cfg.domains
+        .insert("platform-2".to_string(), DomainEntry::file(platform2_dir));
+
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// Every spelling of `eng-knowledge` a body can carry - its own local name,
+/// its alias, and inside a `crystalline://` URL - is stored as the canonical
+/// `eng`; the fourth, already canonical, is left exactly as written.
+#[tokio::test]
+async fn write_engram_normalizes_every_cross_domain_spelling_to_the_canonical_name() {
+    let (tmp, engine) = normalize_fixture().await;
+
+    let written = engine
+        .write_engram(&write_params(
+            "eng-knowledge",
+            "Cross Links",
+            "[[eng-knowledge:a]] [[engineering:b]] crystalline://eng-knowledge/c [[eng:d]]",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(written["domain_names_normalized"], 3, "{written}");
+
+    let stored = std::fs::read_to_string(tmp.path().join("eng-knowledge/cross-links.md")).unwrap();
+    assert!(
+        stored.contains("[[eng:a]] [[eng:b]] crystalline://eng/c [[eng:d]]"),
+        "{stored}"
+    );
+}
+
+/// `edit_engram`'s `append` introduces a fresh cross-domain link spelled with
+/// the local name that a MANIFEST shadows behind its canonical one; the
+/// appended text lands normalized, and the receipt says so.
+#[tokio::test]
+async fn edit_engram_normalizes_a_newly_introduced_cross_domain_link() {
+    let (tmp, engine) = normalize_fixture().await;
+    engine
+        .write_engram(&write_params("eng-knowledge", "Target", "the body"))
+        .await
+        .unwrap();
+
+    let edited = engine
+        .edit_engram(&EditParams {
+            identifier: "target".to_string(),
+            domain: "eng-knowledge".to_string(),
+            operation: "append".to_string(),
+            content: Some("See [[eng-knowledge:x]] for more.".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(edited["domain_names_normalized"], 1, "{edited}");
+
+    let stored = std::fs::read_to_string(tmp.path().join("eng-knowledge/target.md")).unwrap();
+    assert!(stored.contains("[[eng:x]]"), "{stored}");
+}
+
+/// A body with no cross-domain link at all is written byte for byte, and the
+/// receipt carries no `domain_names_normalized` key rather than a zero.
+#[tokio::test]
+async fn a_body_with_no_cross_domain_link_carries_no_receipt_field() {
+    let (_tmp, engine) = normalize_fixture().await;
+    let written = engine
+        .write_engram(&write_params(
+            "eng-knowledge",
+            "Plain",
+            "Nothing here points at another domain.",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        written.get("domain_names_normalized").is_none(),
+        "{written}"
+    );
+}
+
+/// `platform-2` declares `domain_name: platform`, but the local name
+/// `platform` is already somebody else's: the canonical is shadowed, so
+/// `NameTable::normalize` answers `None` for it, and a link spelled with the
+/// local name it was actually written in is left exactly as it was. No
+/// receipt field either, since nothing was rewritten.
+#[tokio::test]
+async fn a_shadowed_canonical_name_is_never_normalized_into() {
+    let (tmp, engine) = normalize_fixture().await;
+    let written = engine
+        .write_engram(&write_params(
+            "platform-2",
+            "Shadowed Link",
+            "[[platform-2:x]]",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        written.get("domain_names_normalized").is_none(),
+        "{written}"
+    );
+    let stored = std::fs::read_to_string(tmp.path().join("platform-2/shadowed-link.md")).unwrap();
+    assert!(stored.contains("[[platform-2:x]]"), "{stored}");
+}
+
+/// `save_engram`, the Fluid editor's full-document PUT, normalizes the same
+/// way as `write_engram` and `edit_engram`: it is the funnel every other
+/// write's final text passes through, not a route around it.
+#[tokio::test]
+async fn save_engram_normalizes_cross_domain_links_too() {
+    let (tmp, engine) = normalize_fixture().await;
+    engine
+        .write_engram(&write_params("eng-knowledge", "Target", "the body"))
+        .await
+        .unwrap();
+    let (checksum, content) = checksum_of(&engine, "eng-knowledge", "target").await;
+    let edited = content.replace("the body", "the body, see [[engineering:x]].");
+
+    let saved = engine
+        .save_engram(
+            &SaveParams {
+                domain: "eng-knowledge".to_string(),
+                identifier: "target".to_string(),
+                content: edited,
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["domain_names_normalized"], 1, "{saved}");
+
+    let stored = std::fs::read_to_string(tmp.path().join("eng-knowledge/target.md")).unwrap();
+    assert!(stored.contains("[[eng:x]]"), "{stored}");
+}
+
+fn user(account: &str) -> Scope {
+    Scope::User {
+        account: account.to_string(),
+        admin: false,
+    }
+}
+
+/// A caller who cannot see `eng-knowledge` writes `[[eng-knowledge:x]]` and
+/// `[[engineering:y]]` (its alias) into a domain they CAN write, and gets
+/// back exactly what writing `[[nobody:x]]` would: the text unchanged, byte
+/// for byte, and no `domain_names_normalized` key at all. Rewriting either
+/// spelling would tell a stranger both that `eng-knowledge` exists and what
+/// its canonical name is - the same oracle `localize_visible` and
+/// `localized_for` exist to close for every other spelling a caller types.
+///
+/// The same body, written by a caller who CAN see it (`keeper`, who holds the
+/// domain), still normalizes ordinarily - the guard is about visibility, not
+/// about breaking normalization for everyone once one domain is private.
+#[tokio::test]
+async fn a_hidden_domain_is_never_normalized_into() {
+    let (tmp, engine) = normalize_fixture().await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "out"] {
+        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng-knowledge", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    let stranger = user("out");
+    let written = engine
+        .write_engram_as(
+            &write_params(
+                "platform",
+                "Stranger Link",
+                "[[eng-knowledge:x]] [[engineering:y]]",
+            ),
+            None,
+            &stranger,
+        )
+        .await
+        .unwrap();
+    assert!(
+        written.get("domain_names_normalized").is_none(),
+        "a caller who cannot see eng-knowledge gets no oracle about it: {written}"
+    );
+    let stored = std::fs::read_to_string(tmp.path().join("platform/stranger-link.md")).unwrap();
+    assert!(
+        stored.contains("[[eng-knowledge:x]] [[engineering:y]]"),
+        "unchanged, byte for byte, exactly as an unknown domain would be: {stored}"
+    );
+
+    // The domain's owner still gets the ordinary rewrite: the guard is about
+    // this caller's own visibility, not a global switch normalization is
+    // turned off by once any domain anywhere is private.
+    let keeper = user("keeper");
+    let seen = engine
+        .write_engram_as(
+            &write_params("platform", "Keeper Link", "[[eng-knowledge:x]]"),
+            None,
+            &keeper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen["domain_names_normalized"], 1, "{seen}");
+    let stored = std::fs::read_to_string(tmp.path().join("platform/keeper-link.md")).unwrap();
+    assert!(stored.contains("[[eng:x]]"), "{stored}");
 }

@@ -1007,7 +1007,7 @@
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.",
+            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1020,14 +1020,19 @@
                   ],
                   "domains": [
                     {
+                      "aliases": [],
+                      "canonical_name": "eng",
                       "engrams": 4,
                       "kind": "file",
                       "last_sync": "2026-08-05T09:14:22Z",
                       "name": "eng",
+                      "name_origin": "derived",
                       "observations": 12,
                       "path": "/Users/ada/Documents/Crystalline/eng",
                       "private": false,
                       "relations": 3,
+                      "renaming": false,
+                      "shadowed": false,
                       "when_to_use": [
                         "Route here for eng questions."
                       ]
@@ -1135,7 +1140,7 @@
             }
           },
           "422": {
-            "description": "An unknown mode, a name that could escape the domains root, or a field that does not belong to the mode asked for.",
+            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4468,6 +4473,117 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/rename": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Rename a domain, everywhere or on this machine only.",
+        "description": "The caller's write gate on the domain, then the engine's own rule for who may rename it - an instance admin, or a private domain's owner. `local_only: true` touches only this machine's own records; a full rename also writes the MANIFEST and respells links in every domain the caller can write, leaving one they can only read as it is and listing it under `left_behind`.",
+        "operationId": "rename_domain",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain's current name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The engine's own rename report, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "aliases": [
+                    "eng"
+                  ],
+                  "domain": "engineering",
+                  "left_behind": [],
+                  "local_only": false,
+                  "manifest_draft": false,
+                  "manifest_written": true,
+                  "moved": [
+                    "index_row",
+                    "auth_tables",
+                    "config"
+                  ],
+                  "previous": "eng",
+                  "rewritten": [],
+                  "shadows": []
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not write the domain, may write it but is neither its owner nor an instance admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The new name is already a domain here, another rename is still running, the domain is defined by an environment variable, or the index is shared with another live instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The new name is invalid, or (a full rename only) the MANIFEST cannot be written here - the detail says \"This machine only\" runs the rename instead.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/retire": {
       "post": {
         "tags": [
@@ -6107,6 +6223,114 @@
           },
           "422": {
             "description": "`families` or `rules` names something the catalog does not have.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/domain-name": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Peek at the domain_name a repository's MANIFEST declares.",
+        "description": "Admin only, read-only: never registers anything. Reads the MANIFEST at `path` (the repository root when absent) on `branch` (the repository's default when absent) through the forge and reports its `domain_name` (`null` when it declares none, is missing or cannot be read) alongside `default_name`, the repository's own name segment a nameless create falls back to.",
+        "operationId": "github_domain_name",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "query",
+            "description": "owner/name. Required (an absent or unparseable query string is a\n400 before this handler runs; present and empty or malformed is a\n422 from the handler's own check, the same one a nameless\nteam-domain create answers).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "acme/knowledge"
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch to read from; defaults to the repository's default branch.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "main"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Subfolder within the repository the domain would root at.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "domains/eng"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the MANIFEST declares, and the fallback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "default_name": "knowledge",
+                  "domain_name": "engineering"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse - `repo` is a required parameter and an entirely absent one lands here rather than in the 422 below.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "GitHub is not connected on this instance - the detail points at the settings screen.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`repo` is present and empty or not owner/name, or `path` is absolute or holds a `..` segment.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10052,6 +10276,7 @@
         "description": "One MANIFEST policy key: the registry row beside what this MANIFEST says.",
         "required": [
           "key",
+          "kind",
           "effective",
           "values",
           "default",
@@ -10079,13 +10304,18 @@
           },
           "effective": {
             "type": "string",
-            "description": "The value that holds: absent and unrecognized both fall to `default`.",
+            "description": "The value that holds: absent and unrecognized both fall to `default`\nfor a `\"choice\"` key. For the `\"text\"` key `domain_name`, an absent or\ninvalid declaration falls to this domain's local name instead - there\nis no single stand-in value the way `default` is for a choice.",
             "example": "direct"
           },
           "key": {
             "type": "string",
             "description": "The frontmatter key.",
             "example": "sharing"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`\"choice\"` (a closed set, shown as a dropdown) or `\"text\"` (free text,\nchanged by a different flow: `domain_name` changes through a rename).",
+            "example": "choice"
           },
           "meaning": {
             "type": "string",
@@ -10096,7 +10326,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The values the key takes, in display order."
+            "description": "The values the key takes, in display order. Empty for a `\"text\"` key."
           }
         }
       },
@@ -10327,6 +10557,25 @@
             "type": "string",
             "description": "Always `none`: a public client presents no secret.",
             "example": "none"
+          }
+        }
+      },
+      "RenameBody": {
+        "type": "object",
+        "description": "The new name, and whether the rename stays on this machine only.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "local_only": {
+            "type": "boolean",
+            "description": "Rename on this machine only: the MANIFEST and every link stay as\nthey are, and only this machine's own records move. Defaults to\n`false`, a full rename that also writes the MANIFEST and respells\nlinks in every domain the caller can write.",
+            "example": false
+          },
+          "name": {
+            "type": "string",
+            "description": "The domain's new name.",
+            "example": "engineering"
           }
         }
       },

@@ -29,6 +29,7 @@ import type {
   CreateDomainWireBody,
   GithubIdentityResponse,
   GithubStatusResponse,
+  RenameWireBody,
 } from "./model";
 
 /**
@@ -148,6 +149,60 @@ export async function disconnectGithub(): Promise<GithubStatus> {
   return readGithubStatus(
     await api<GithubStatusResponse>("/settings/github", { method: "DELETE" }),
   );
+}
+
+/**
+ * What a peek at a GitHub repository's MANIFEST reports, before anything is
+ * registered.
+ */
+export interface GithubDomainNamePeek {
+  /**
+   * The MANIFEST's own `domain_name`, or null when it declares none, is
+   * missing, or could not be read - the create dialog falls back to
+   * {@link GithubDomainNamePeek.defaultName} in every one of those cases,
+   * exactly as a nameless create itself does.
+   */
+  domainName: string | null;
+  /** The repository's own name segment, the fallback a nameless create takes. */
+  defaultName: string;
+}
+
+/**
+ * Peek at the name a repository's MANIFEST declares, without registering
+ * anything: `GET /api/v1/github/domain-name`, admin only and read-only, the
+ * same gate a `github`-mode create is under.
+ *
+ * Not typed from the generated `components`: the route's 200 schema is an
+ * open object in the OpenAPI snapshot (an example, no shape), so this reads
+ * the two fields it actually promises the way the engine's own untyped JSON
+ * answers elsewhere in this file are read.
+ */
+export async function fetchGithubDomainNamePeek({
+  repo,
+  branch,
+  path,
+}: {
+  repo: string;
+  branch: string;
+  path: string;
+}): Promise<GithubDomainNamePeek> {
+  const query = new URLSearchParams({ repo });
+  // Left out when empty, the way every other optional field on this surface
+  // is: an absent field is "the repository's own default", and an empty one
+  // would be this app answering for it.
+  if (branch !== "") {
+    query.set("branch", branch);
+  }
+  if (path !== "") {
+    query.set("path", path);
+  }
+  const record = asObject(
+    await api<unknown>(`/github/domain-name?${query.toString()}`),
+  );
+  return {
+    domainName: asString(record?.domain_name),
+    defaultName: asString(record?.default_name) ?? "",
+  };
 }
 
 /**
@@ -358,6 +413,132 @@ export async function unregisterDomain(
     filesKept: report?.files_kept === true,
     roomsClosed: asNumber(report?.rooms_closed) ?? 0,
   };
+}
+
+/** The engrams and references a rename's relink step rewrote in one domain. */
+export interface RenameRewritten {
+  domain: string;
+  engrams: number;
+  references: number;
+}
+
+/**
+ * One engram a rename's relink step found and did not respell: in a domain
+ * the caller could only read, or one whose rewrite failed.
+ */
+export interface RenameLeftBehind {
+  domain: string;
+  path: string;
+  references: number;
+  /** Why it was left, when the server said; null otherwise. */
+  reason: string | null;
+}
+
+/**
+ * What renaming a domain reports back: the engine's own JSON, read the way
+ * every domain lifecycle report here is - field by field, since the OpenAPI
+ * document types it opaque.
+ */
+export interface RenameReport {
+  /** The domain's new name. */
+  domain: string;
+  /** The domain's name before this rename. */
+  previous: string;
+  /** Whether this machine's own records moved and nothing else did. */
+  localOnly: boolean;
+  /** Whether the MANIFEST was written with the new name. */
+  manifestWritten: boolean;
+  /** Whether the MANIFEST write is a draft still waiting to be shared. */
+  manifestDraft: boolean;
+  rewritten: RenameRewritten[];
+  leftBehind: RenameLeftBehind[];
+  /** Every former name this domain now answers to as well as its new one. */
+  aliases: string[];
+  /** Every domain whose own local name already held the new name. */
+  shadows: string[];
+}
+
+function readRenameRewritten(value: unknown): RenameRewritten | null {
+  const record = asObject(value);
+  const domain = asString(record?.domain);
+  if (domain === null) {
+    return null;
+  }
+  return {
+    domain,
+    engrams: asNumber(record?.engrams) ?? 0,
+    references: asNumber(record?.references) ?? 0,
+  };
+}
+
+function readRenameLeftBehind(value: unknown): RenameLeftBehind | null {
+  const record = asObject(value);
+  const domain = asString(record?.domain);
+  const path = asString(record?.path);
+  if (domain === null || path === null) {
+    return null;
+  }
+  return {
+    domain,
+    path,
+    references: asNumber(record?.references) ?? 0,
+    reason: asString(record?.reason),
+  };
+}
+
+/**
+ * Rename a domain: on this machine only (`localOnly`), or everywhere the
+ * caller can write - the MANIFEST included, with every link that spelled any
+ * of its former names respelled in the domains reached.
+ */
+export async function renameDomain(
+  domain: string,
+  name: string,
+  localOnly: boolean,
+): Promise<RenameReport> {
+  // Both fields always, unlike `CreateDomainBody`'s left-out-when-false
+  // `private`: `local_only` is not a default the server picks for itself
+  // here, it is the one choice this whole dialog exists to ask, so the
+  // request says what was chosen either way rather than a bare `name`
+  // reading as a silent "no" on this one.
+  const wire: RenameWireBody = { name, local_only: localOnly };
+  const report = asObject(
+    await api<unknown>(`/domains/${encodeSegment(domain)}/rename`, {
+      method: "POST",
+      body: JSON.stringify(wire),
+    }),
+  );
+  return {
+    domain: asString(report?.domain) ?? name,
+    previous: asString(report?.previous) ?? domain,
+    localOnly: report?.local_only === true,
+    manifestWritten: report?.manifest_written === true,
+    manifestDraft: report?.manifest_draft === true,
+    rewritten: asArray(report?.rewritten)
+      .map(readRenameRewritten)
+      .filter((row): row is RenameRewritten => row !== null),
+    leftBehind: asArray(report?.left_behind)
+      .map(readRenameLeftBehind)
+      .filter((row): row is RenameLeftBehind => row !== null),
+    aliases: asStrings(report?.aliases),
+    shadows: asStrings(report?.shadows),
+  };
+}
+
+/**
+ * Where a rename's own report waits for the domain page it lands on to read
+ * it once, keyed by the domain's new name.
+ *
+ * Not the navigation's own `location.state`: a screen this app's own
+ * old-address redirect might also send a competing, state-less navigation
+ * to (see `RenameDomainDialog`'s module doc) would otherwise have a real
+ * chance of winning that race and dropping the report on the floor. A slot
+ * in the query cache has no such race - whichever navigation actually lands
+ * the reader on this domain's page, the report is still sitting here for it
+ * to read and clear.
+ */
+export function renameReportKey(domain: string): readonly unknown[] {
+  return ["rename-report", domain] as const;
 }
 
 /** One comment or review left on a proposal, in the forge's own words. */

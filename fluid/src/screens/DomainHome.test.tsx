@@ -14,7 +14,7 @@
 
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -35,6 +35,15 @@ vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
+
+/**
+ * The graph renderer paints to a canvas, which jsdom has none of. Only the
+ * old-address redirect suite below lands on the engram screen, which draws
+ * this; every other test in this file never mounts it.
+ */
+vi.mock("../components/GraphCanvas", () => ({
+  default: () => <div data-testid="canvas" />,
+}));
 
 const apiMock = vi.mocked(api);
 
@@ -1917,5 +1926,617 @@ describe("the team sync card", () => {
     expect(
       requested().some((path) => path.startsWith("/domains/eng/sync")),
     ).toBe(false);
+  });
+});
+
+/**
+ * One domain listing row, in the engine's own wire shape, with the stable
+ * name fields: `canonical_name`, `aliases`, `name_origin`,
+ * `shadowed` and `renaming`. A function rather than a constant so a test
+ * maps over a fresh copy, the way the policy rows above do.
+ */
+function domainRow(overrides: Record<string, unknown> = {}) {
+  return {
+    name: "eng",
+    kind: "file",
+    engrams: 4,
+    when_to_use: ["Route here for eng questions."],
+    canonical_name: "eng",
+    aliases: [],
+    name_origin: "derived",
+    shadowed: false,
+    renaming: false,
+    ...overrides,
+  };
+}
+
+function listingOf(...rows: Record<string, unknown>[]) {
+  return {
+    behavior: ["Search before answering from memory."],
+    domains: rows,
+  };
+}
+
+describe("the domain's declared name", () => {
+  it("says nothing extra over an ordinary domain", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+    expect(screen.queryByText(/^Known everywhere as/)).toBeNull();
+    expect(screen.queryByText(/^Former names:/)).toBeNull();
+    expect(screen.queryByText(/^This domain calls itself/)).toBeNull();
+  });
+
+  it("names the canonical name and every former name in the header", async () => {
+    serve({
+      "/domains": () =>
+        listingOf(
+          domainRow({
+            canonical_name: "engineering",
+            aliases: ["old-eng", "eng-legacy"],
+          }),
+        ),
+    });
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByText("Known everywhere as engineering"),
+    ).toBeVisible();
+    expect(screen.getByText("Former names: old-eng, eng-legacy")).toBeVisible();
+  });
+
+  it("shows the shadowed banner and its Rename action to an admin", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "knowledge", shadowed: true })),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const sentence = await screen.findByText(
+      "This domain calls itself 'knowledge', but 'knowledge' is another domain here, so links that name 'knowledge' reach that one. Rename one of them to line them up.",
+    );
+    const banner = sentence.closest('[role="status"]');
+    expect(banner).not.toBeNull();
+    expect(
+      within(banner as HTMLElement).getByRole("button", { name: "Rename" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Rename domain" })).toBeVisible();
+  });
+
+  it("keeps Rename domain inert on a read-only instance, and says why", async () => {
+    serve({}, "admin", () =>
+      meResponse({
+        user: userFixture({ role: "admin" }),
+        read_only: true,
+      }),
+    );
+
+    renderApp("/d/eng");
+
+    const trigger = await screen.findByRole("button", {
+      name: "Rename domain",
+    });
+    expect(trigger).not.toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-disabled", "true");
+    expect(trigger).toHaveAccessibleDescription(
+      "This instance is read only, so nothing here can be changed.",
+    );
+
+    await userEvent.click(trigger);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(
+      requested().some((path) => path.startsWith("/domains/eng/rename")),
+    ).toBe(false);
+  });
+
+  it("hides both rename controls from a plain member of a private domain", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              canonical_name: "knowledge",
+              shadowed: true,
+              private: true,
+            }),
+          ),
+        "/domains/eng/members": () => ({
+          owner: "grace",
+          visibility: "private",
+          members: [],
+        }),
+      },
+      "editor",
+    );
+
+    renderApp("/d/eng");
+
+    await screen.findByText(/^This domain calls itself/);
+    expect(screen.queryByRole("button", { name: "Rename domain" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("shows Renaming... and disables every write control, each with the same reason", async () => {
+    serve(
+      {
+        "/domains": () => listingOf(domainRow({ renaming: true })),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByText("Renaming...")).toHaveAttribute(
+      "role",
+      "status",
+    );
+
+    const REASON = "A rename of this domain is already running.";
+
+    // New engram: `aria-disabled`, not the native attribute, the same trade
+    // every other control on this app makes - a control taken out of the tab
+    // order could never have its reason heard.
+    const newEngram = screen.getByRole("button", { name: "New engram" });
+    expect(newEngram).not.toBeDisabled();
+    expect(newEngram).toHaveAttribute("aria-disabled", "true");
+    expect(newEngram).toHaveAccessibleDescription(REASON);
+
+    // The launcher itself: the same reason as every other control here,
+    // not the read-only one - a rename in progress is what is disabling it.
+    const renameLauncher = screen.getByRole("button", {
+      name: "Rename domain",
+    });
+    expect(renameLauncher).not.toBeDisabled();
+    expect(renameLauncher).toHaveAttribute("aria-disabled", "true");
+    expect(renameLauncher).toHaveAccessibleDescription(REASON);
+
+    const editManifest = await screen.findByRole("link", {
+      name: "Edit MANIFEST",
+    });
+    expect(editManifest).toHaveAttribute("aria-disabled", "true");
+    expect(editManifest).toHaveAccessibleDescription(REASON);
+
+    const importArchive = await screen.findByRole("button", {
+      name: "Import archive",
+    });
+    expect(importArchive).toHaveAttribute("aria-disabled", "true");
+    expect(importArchive).toHaveAccessibleDescription(REASON);
+
+    const unregister = await screen.findByRole("button", {
+      name: "Unregister domain",
+    });
+    expect(unregister).toHaveAttribute("aria-disabled", "true");
+    expect(unregister).toHaveAccessibleDescription(REASON);
+
+    // Gated on the members read landing, the way the card itself gates it.
+    const share = await screen.findByRole("button", { name: "Make private" });
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    expect(share).toHaveAccessibleDescription(REASON);
+
+    // A click on any of them does nothing: guarded at the press, not merely
+    // painted as inert. New engram, Import archive and the launcher each
+    // open a dialog when they act, and Edit MANIFEST navigates to the
+    // editor; none of the four does either.
+    await userEvent.click(newEngram);
+    await userEvent.click(renameLauncher);
+    await userEvent.click(editManifest);
+    await userEvent.click(importArchive);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("heading", { name: /^Editing/ })).toBeNull();
+  });
+
+  it("polls only while THIS domain is renaming, and stops once it clears", async () => {
+    let renaming = true;
+    serve({
+      "/domains": () => listingOf(domainRow({ renaming })),
+    });
+
+    renderApp("/d/eng");
+    await screen.findByText("Renaming...");
+
+    const before = requested().filter((path) => path === "/domains").length;
+    renaming = false;
+    await waitFor(() => {
+      expect(
+        requested().filter((path) => path === "/domains").length,
+      ).toBeGreaterThan(before);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Renaming...")).toBeNull();
+    });
+
+    // Once it has cleared, waiting a poll interval brings no further read:
+    // the interval turned itself off rather than continuing to ask.
+    const settled = requested().filter((path) => path === "/domains").length;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(requested().filter((path) => path === "/domains").length).toBe(
+      settled,
+    );
+  });
+
+  it("resumes the poll on its own once a later fetch of the listing succeeds", async () => {
+    // Answered a refusal a real one would not retry on its own (`isDecided`
+    // in `query/client.ts`), so the query settles into an error state after
+    // exactly one failed attempt rather than this app's own retry policy
+    // spending several before it gives up.
+    let mode: "ok" | "fail" = "ok";
+    serve({
+      "/domains": () => {
+        if (mode === "fail") {
+          throw new ApiProblem(422, "invalid", "temporary failure");
+        }
+        return listingOf(domainRow({ renaming: true }));
+      },
+    });
+
+    renderApp("/d/eng");
+    await screen.findByText("Renaming...");
+
+    const domainsReads = () =>
+      requested().filter((path) => path === "/domains").length;
+    const before = domainsReads();
+    mode = "fail";
+    // A window-focus refetch, standing in for whatever asks the listing
+    // again first: the query's own `refetchInterval` re-evaluates on every
+    // settle regardless of what triggered it, and a failed one turns
+    // polling off (`query.state.status === "error"`).
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(domainsReads()).toBeGreaterThan(before);
+    });
+    const afterFailure = domainsReads();
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(domainsReads()).toBe(afterFailure);
+
+    // A later fetch that succeeds - again standing in for anything that
+    // would ask, a focus refetch here - resumes the once-a-second poll on
+    // its own: nothing needed to be told to restart it, since
+    // `refetchInterval` reads `renaming: true` off this very read and
+    // schedules the next one exactly as it would have all along. Waited
+    // for two reads beyond the failure, not one: the first is the recovery
+    // fetch itself succeeding, and only the second is the interval having
+    // actually resumed and fired again on its own.
+    mode = "ok";
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(
+      () => {
+        expect(domainsReads()).toBeGreaterThan(afterFailure + 1);
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("offers the rename controls to a non-admin owner of a private domain", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "eng", private: true })),
+        "/domains/eng/members": () => ({
+          owner: "ada",
+          visibility: "private",
+          members: [],
+        }),
+      },
+      "editor",
+    );
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByRole("button", { name: "Rename domain" }),
+    ).toBeVisible();
+  });
+
+  it("opens the rename dialog from the shadowed banner's own action", async () => {
+    serve(
+      {
+        "/domains": () =>
+          listingOf(domainRow({ canonical_name: "knowledge", shadowed: true })),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const sentence = await screen.findByText(/^This domain calls itself/);
+    const banner = sentence.closest('[role="status"]') as HTMLElement;
+    await userEvent.click(
+      within(banner).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("dialog", { name: "Rename domain" }),
+    ).toBeVisible();
+  });
+});
+
+describe("a domain's old address", () => {
+  /** The one graph node the neighborhood section needs to draw something. */
+  function soloGraph(domain: string, permalink: string, title: string) {
+    return {
+      nodes: [
+        { id: 1, domain, permalink, title, status: "stable", type: "engram" },
+      ],
+      edges: [],
+      truncated: false,
+    };
+  }
+
+  function runbookDetail() {
+    return {
+      domain: "eng-knowledge",
+      permalink: "runbook",
+      title: "Runbook",
+      type: "engram",
+      status: "stable",
+      path: "runbook.md",
+      url: "crystalline://eng-knowledge/runbook",
+      content: [
+        "---",
+        "title: Runbook",
+        "---",
+        "",
+        "# Runbook",
+        "",
+        "How to run it.",
+        "",
+      ].join("\n"),
+      checksum: "abc123",
+      frontmatter: {
+        engram_type: "engram",
+        title: "Runbook",
+        permalink: "runbook",
+        status: "stable",
+        tags: [],
+        extra: {},
+        valid_from: null,
+        valid_to: null,
+        stale_after: null,
+        verified: [],
+        last_verified: null,
+        review_after: null,
+        recorded_at: null,
+      },
+      observations: [],
+      relations: [],
+      links: [],
+      inbound: { count: 0, refs: [] },
+    };
+  }
+
+  it("sends an engram address under an old local name to the domain's local name now", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+        // The sidebar's own tree read fires for whatever domain the address
+        // names before the redirect lands, so both are stubbed.
+        "/domains/old-eng/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [
+            {
+              permalink: "runbook",
+              title: "Runbook",
+              type: "engram",
+              path: "runbook.md",
+            },
+          ],
+        }),
+        "/domains/eng-knowledge/engrams/runbook": runbookDetail,
+        "/graph": () => soloGraph("eng-knowledge", "runbook", "Runbook"),
+      }),
+    );
+
+    renderApp("/d/old-eng/e/runbook");
+
+    expect(
+      await screen.findByRole("heading", { name: "Runbook" }),
+    ).toBeVisible();
+  });
+
+  it("shows today's not-found state for a segment nobody answers to", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+      }),
+    );
+
+    renderApp("/d/nope");
+
+    expect(
+      await screen.findByRole("heading", { name: "Domain not found" }),
+    ).toBeVisible();
+  });
+
+  it("keeps the query string and the hash across the redirect", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () =>
+          listingOf(
+            domainRow({
+              name: "eng-knowledge",
+              canonical_name: "eng-knowledge",
+              aliases: ["old-eng"],
+              name_origin: "explicit",
+            }),
+          ),
+        "/domains/eng-knowledge/manifest": () => ({
+          domain: "eng-knowledge",
+          markdown: "# eng-knowledge",
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/engrams": () => ({
+          mode: "text",
+          total: 0,
+          page: 1,
+          limit: 50,
+          count: 0,
+          hits: [],
+        }),
+        "/vocabulary": () => ({
+          domain: "eng-knowledge",
+          tags: [],
+          categories: [],
+          relation_types: [],
+        }),
+        "/domains/eng-knowledge/members": () => ({
+          owner: null,
+          visibility: "shared",
+          members: [],
+        }),
+      }),
+    );
+
+    /** A sibling of `App`, under the same in-memory history, reading it. */
+    function LocationProbe() {
+      const location = useLocation();
+      return (
+        <div data-testid="probe">
+          {`${location.pathname}${location.search}${location.hash}`}
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/d/old-eng?tab=activity#section-2"]}>
+        <App />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("heading", { level: 1, name: "eng-knowledge" });
+    await waitFor(() => {
+      expect(screen.getByTestId("probe")).toHaveTextContent(
+        "/d/eng-knowledge?tab=activity#section-2",
+      );
+    });
+  });
+
+  it("tries again after a failed confirming fetch, once the listing is asked again", async () => {
+    let call = 0;
+    const listing = () =>
+      listingOf(
+        domainRow({
+          name: "eng-knowledge",
+          canonical_name: "eng-knowledge",
+          aliases: ["old-eng"],
+          name_origin: "explicit",
+        }),
+      );
+
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+        "/domains": () => {
+          call += 1;
+          // The second call is the redirect's own confirming `fetchQuery`,
+          // off the cache-level match the first (ordinary) read already
+          // supplied. Answered with a refusal a real one would not retry
+          // on its own (`isDecided` in `query/client.ts`), so this is one
+          // clean failed attempt rather than this app's own retry policy
+          // quietly turning it into several.
+          if (call === 2) {
+            throw new ApiProblem(422, "invalid", "temporary failure");
+          }
+          return listing();
+        },
+        "/domains/eng-knowledge/manifest": () => ({
+          domain: "eng-knowledge",
+          markdown: "# eng-knowledge",
+        }),
+        "/domains/eng-knowledge/tree": () => ({
+          domain: "eng-knowledge",
+          path: "/",
+          folders: [],
+          engrams: [],
+        }),
+        "/domains/eng-knowledge/engrams": () => ({
+          mode: "text",
+          total: 0,
+          page: 1,
+          limit: 50,
+          count: 0,
+          hits: [],
+        }),
+        "/vocabulary": () => ({
+          domain: "eng-knowledge",
+          tags: [],
+          categories: [],
+          relation_types: [],
+        }),
+        "/domains/eng-knowledge/members": () => ({
+          owner: null,
+          visibility: "shared",
+          members: [],
+        }),
+      }),
+    );
+
+    renderApp("/d/old-eng");
+
+    // The confirming fetch (the second read) has failed, and nothing
+    // redirects off a failure: still the not-found state for the address
+    // as typed, since "old-eng" answers to nothing under its own name.
+    await waitFor(() => {
+      expect(call).toBeGreaterThanOrEqual(2);
+    });
+    expect(
+      screen.getByRole("heading", { name: "Domain not found" }),
+    ).toBeVisible();
+
+    // A later read of the listing - a window-focus refetch here, standing
+    // in for any of the several ordinary things that would ask again - is
+    // what the failure cleared the guard for: this segment gets a fresh
+    // confirming fetch of its own rather than staying disabled for the
+    // rest of the session.
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "eng-knowledge" }),
+    ).toBeVisible();
   });
 });

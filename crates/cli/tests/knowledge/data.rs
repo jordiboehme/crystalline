@@ -894,6 +894,341 @@ fn domain_add_without_a_path_registers_at_the_default_domains_root() {
     );
 }
 
+/// A MANIFEST that declares no `domain_name`, for the nameless-add tests
+/// below: they write one by hand rather than through `domain init`, which
+/// always declares one (an explicit `--name`, or the folder's basename).
+fn manifest_without_a_declared_name(title: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: {title}\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# {title}\n"
+    )
+}
+
+/// The same, but declaring `domain_name: <name>`.
+fn manifest_declaring(title: &str, name: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: {title}\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ndomain_name: {name}\n---\n\n# {title}\n"
+    )
+}
+
+#[test]
+fn domain_add_without_a_name_takes_it_from_the_manifest() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("plat");
+    write(
+        &dir,
+        "MANIFEST.md",
+        &manifest_declaring("Platform", "platform"),
+    );
+
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["registered"], serde_json::json!("platform"));
+    assert_eq!(report["adopted"], serde_json::json!(false));
+
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        saved.contains("name_origin: derived"),
+        "a name worked out from the MANIFEST is recorded as derived: {saved}"
+    );
+}
+
+#[test]
+fn domain_add_without_a_name_steps_a_manifest_name_already_taken_and_says_so() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+
+    let first = work.path().join("first");
+    write(
+        &first,
+        "MANIFEST.md",
+        &manifest_declaring("Platform", "platform"),
+    );
+    bin()
+        .args(["domain", "add", "--path"])
+        .arg(&first)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .assert()
+        .success();
+
+    let second = work.path().join("second");
+    write(
+        &second,
+        "MANIFEST.md",
+        &manifest_declaring("Platform Two", "platform"),
+    );
+    let out = bin()
+        .args(["domain", "add", "--path"])
+        .arg(&second)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already a domain here"),
+        "the collision is explained: {stdout}"
+    );
+    assert!(
+        stdout.contains("platform-2"),
+        "the stepped name is named: {stdout}"
+    );
+
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(saved.contains("platform-2"), "{saved}");
+
+    // The MANIFEST that lost the name still declares what it always asked
+    // for; nothing here is rewritten to the stepped name.
+    let manifest = std::fs::read_to_string(second.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: platform"), "{manifest}");
+}
+
+/// A name is taken when it resolves to a registered domain at all, not
+/// merely when it is a literal config key - the one "taken" rule this path
+/// and the engine's own registration share. Here `eng` is registered under
+/// an explicit local name whose own MANIFEST
+/// still declares a different canonical name, `platform`; a naive
+/// `contains_key("platform")` check would miss the collision entirely, since
+/// `platform` is nobody's config key.
+#[test]
+fn domain_add_without_a_name_treats_another_domains_canonical_name_as_taken() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+
+    let eng_dir = work.path().join("eng-dir");
+    write(
+        &eng_dir,
+        "MANIFEST.md",
+        &manifest_declaring("Engineering", "platform"),
+    );
+    bin()
+        .args(["domain", "add", "eng"])
+        .arg(&eng_dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .assert()
+        .success();
+
+    let second = work.path().join("second");
+    write(
+        &second,
+        "MANIFEST.md",
+        &manifest_declaring("Platform Two", "platform"),
+    );
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&second)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["registered"], serde_json::json!("platform-2"));
+}
+
+#[test]
+fn domain_add_with_an_explicit_name_records_it_as_explicit() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("ops-dir");
+    bin()
+        .args(["domain", "init"])
+        .arg(&dir)
+        .args(["--name", "ops"])
+        .assert()
+        .success();
+
+    bin()
+        .args(["domain", "add", "ops"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .assert()
+        .success();
+
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        saved.contains("name_origin: explicit"),
+        "a typed name is recorded as explicit: {saved}"
+    );
+}
+
+/// A lone positional is always the NAME, never guessed at as a path, even
+/// when it looks like one and fails validation.
+#[test]
+fn domain_add_with_an_invalid_lone_positional_is_treated_as_a_name_and_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let out = bin()
+        .args(["domain", "add", "not/a/name"])
+        .args(["--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--path"),
+        "the refusal points at --path as the way to add a folder without a name: {stderr}"
+    );
+}
+
+#[test]
+fn domain_add_without_a_name_or_manifest_declaration_uses_the_basename_and_writes_it_back() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("notes");
+    write(
+        &dir,
+        "MANIFEST.md",
+        &manifest_without_a_declared_name("Notes"),
+    );
+
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["registered"], serde_json::json!("notes"));
+
+    let manifest = std::fs::read_to_string(dir.join("MANIFEST.md")).unwrap();
+    assert!(
+        manifest.contains("domain_name: notes"),
+        "the basename default is written back into the MANIFEST: {manifest}"
+    );
+}
+
+#[test]
+fn domain_add_without_a_name_adopts_an_existing_registration_of_the_same_folder() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("kb");
+    write(&dir, "MANIFEST.md", &manifest_declaring("KB", "kb"));
+
+    bin()
+        .args(["domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .assert()
+        .success();
+
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["registered"], serde_json::json!("kb"));
+    assert_eq!(report["adopted"], serde_json::json!(true));
+}
+
+/// Adopting an existing registration never writes its MANIFEST directly,
+/// even when it declares no name and would otherwise qualify for the
+/// write-back: a review-mode domain's folder changes only through a
+/// reviewed draft, and a raw byte write here would bypass that entirely.
+/// The write-back is for a genuinely new registration only.
+#[test]
+fn domain_add_without_a_name_adopting_a_review_mode_domain_never_touches_its_manifest() {
+    let work = tempfile::tempdir().unwrap();
+    let dir = work.path().join("team-kb");
+    write(
+        &dir,
+        "MANIFEST.md",
+        &manifest_without_a_declared_name("Team KB"),
+    );
+    let canonical = std::fs::canonicalize(&dir).unwrap();
+
+    let config = work.path().join("config.yaml");
+    let mut cfg = crystalline_core::config::GlobalConfig::default();
+    let mut entry = crystalline_core::config::DomainEntry::file(canonical);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team-kb".to_string(), entry);
+    crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+
+    let before = std::fs::read_to_string(dir.join("MANIFEST.md")).unwrap();
+
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["registered"], serde_json::json!("team-kb"));
+    assert_eq!(report["adopted"], serde_json::json!(true));
+
+    let after = std::fs::read_to_string(dir.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        before, after,
+        "an adopted review-mode domain's MANIFEST is never rewritten directly"
+    );
+}
+
+#[test]
+fn domain_add_with_a_nameless_virtual_flag_is_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let out = bin()
+        .args(["domain", "add", "--virtual", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("needs a name"),
+        "a virtual domain has no folder to derive one from: {stderr}"
+    );
+}
+
+#[test]
+fn domain_add_with_neither_a_name_nor_a_path_is_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let out = bin()
+        .args(["domain", "add"])
+        .args(["--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("name the domain, or point at its folder with --path"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
     let work = tempfile::tempdir().unwrap();

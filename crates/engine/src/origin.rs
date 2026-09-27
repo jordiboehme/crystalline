@@ -44,8 +44,7 @@ use crate::poller::DomainPollOutcome;
 /// suffixed when the result is not a valid domain name (a repository called
 /// `CON` becomes `con-2`).
 pub(crate) fn default_domain_name(repo: &str) -> String {
-    let segment = repo.rsplit('/').next().unwrap_or(repo);
-    crystalline_core::config::registration::derive_domain_name(segment, |_| false)
+    crystalline_core::config::registration::default_repo_domain_name(repo)
 }
 
 /// The domain folder a domain-creating call uses when the caller does not

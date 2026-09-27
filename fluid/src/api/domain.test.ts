@@ -140,6 +140,7 @@ describe("a manifest detail", () => {
 describe("the manifest policies", () => {
   const row = {
     key: "sharing",
+    kind: "choice",
     declared: "direct",
     effective: "direct",
     values: ["proposal", "direct"],
@@ -172,6 +173,7 @@ describe("the manifest policies", () => {
     expect(sections?.policies).toEqual([
       {
         key: "sharing",
+        kind: "choice",
         declared: "direct",
         effective: "direct",
         values: ["proposal", "direct"],
@@ -181,6 +183,10 @@ describe("the manifest policies", () => {
       },
       {
         key: "generated_indexes",
+        // No `kind` on the wire (an older daemon, or a row that omitted it
+        // above) reads as `"choice"`, the shape every row had before `"text"`
+        // existed.
+        kind: "choice",
         declared: null,
         effective: "local",
         values: [],

@@ -1777,6 +1777,23 @@ impl McpServer {
         }
     }
 
+    /// `p` with every domain it names spelled as a local name, for this
+    /// caller. First thing in every handler whose params name an existing
+    /// domain, because the checks a handler makes before the engine runs
+    /// (writability, joins, a hidden-domain refusal) key on the local name
+    /// too. A spelling of a domain this caller may not see stays as typed,
+    /// so it is refused in the caller's own words.
+    async fn localized<P: DomainArgs + Clone>(
+        &self,
+        p: P,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<P, ErrorData> {
+        self.engine
+            .localized_for(&p, &self.scope_of(ctx))
+            .await
+            .map_err(to_error)
+    }
+
     /// The gate every write verb passes before it touches a domain, answering
     /// the same two refusals the REST write routes answer and in the same
     /// order.
@@ -1995,10 +2012,11 @@ impl McpServer {
     )]
     async fn write_engram(
         &self,
-        Parameters(mut p): Parameters<WriteParams>,
+        Parameters(p): Parameters<WriteParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let mut p = self.localized(p, &ctx).await?;
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
         // sanitizes away counts as none reported. Belt and braces rather than
@@ -2230,6 +2248,7 @@ impl McpServer {
         Parameters(p): Parameters<ReadParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let scope = self.scope_of(&ctx);
         // A link presented here binds it to this account and opens the draft
         // for this holder, so the read below answers the draft it names and a
@@ -2284,10 +2303,11 @@ impl McpServer {
     )]
     async fn edit_engram(
         &self,
-        Parameters(mut p): Parameters<EditParams>,
+        Parameters(p): Parameters<EditParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let mut p = self.localized(p, &ctx).await?;
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
         // sanitizes away counts as none reported. Belt and braces rather than
@@ -2382,6 +2402,7 @@ impl McpServer {
         Parameters(p): Parameters<MoveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let scope = self.scope_of(&ctx);
         // Both ends, because a move writes at both: a caller who may write only
         // one of the two could otherwise carry knowledge out of a private
@@ -2435,6 +2456,7 @@ impl McpServer {
         Parameters(p): Parameters<SplitParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         // One domain, because a split writes twice inside it: the new engram
         // lands in the source's domain, so the source's gate is the whole gate.
         let scope = self.scope_of(&ctx);
@@ -2469,6 +2491,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         // Before the confirmation round, for the reason `edit_engram` states.
         let scope = self.scope_of(&ctx);
         if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
@@ -2518,6 +2541,7 @@ impl McpServer {
         Parameters(p): Parameters<SearchParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .search_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2540,6 +2564,7 @@ impl McpServer {
         Parameters(p): Parameters<ContextParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .build_context(&p, &self.scope_of(&ctx))
             .await
@@ -2562,6 +2587,7 @@ impl McpServer {
         Parameters(p): Parameters<RecentParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .recent_activity(&p, &self.scope_of(&ctx))
             .await
@@ -2602,6 +2628,7 @@ impl McpServer {
         Parameters(p): Parameters<BrowseParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .browse_domain(&p, &self.scope_of(&ctx))
             .await
@@ -2624,6 +2651,7 @@ impl McpServer {
         Parameters(p): Parameters<ValidateParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .validate_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2642,6 +2670,7 @@ impl McpServer {
         Parameters(p): Parameters<InferParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .infer_schema(&p, &self.scope_of(&ctx))
             .await
@@ -2660,6 +2689,7 @@ impl McpServer {
         Parameters(p): Parameters<VocabularyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .vocabulary(&p, &self.scope_of(&ctx))
             .await
@@ -2670,7 +2700,7 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs, and V109 a permalink off its folder - one whose folder part differs from the folder its file sits in, which a build_context folder glob silently misses; repair it with move_engram, destination the engram's own path and permalink \"path\") and redundancy (near-duplicate clusters, semantic twins, drifted tags). It detects by dates, links, graph shape and embedding similarity - V301 semantic twins names two current engrams that say the same thing in different words - and it still cannot find or confirm a contradiction between what two engrams say: similarity is agreement about a topic, not about a fact. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. In a review-mode domain the sweep covers your own drafts too. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs, V109 a permalink off its folder - one whose folder part differs from the folder its file sits in, which a build_context folder glob silently misses; repair it with move_engram, destination the engram's own path and permalink \"path\" - and V110 a link that spells a domain by this machine's local name instead of its canonical name; rewrite it with edit_engram) and redundancy (near-duplicate clusters, semantic twins, drifted tags). It detects by dates, links, graph shape and embedding similarity - V301 semantic twins names two current engrams that say the same thing in different words - and it still cannot find or confirm a contradiction between what two engrams say: similarity is agreement about a topic, not about a fact. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. In a review-mode domain the sweep covers your own drafts too. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
@@ -2678,6 +2708,7 @@ impl McpServer {
         Parameters(p): Parameters<EvolveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         self.engine
             .evolve_engrams(&p, &self.scope_of(&ctx))
             .await
@@ -2763,7 +2794,7 @@ impl McpServer {
     #[tool(
         name = "add_domain",
         title = "Add domain",
-        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Without an explicit domain name, the name defaults to the MANIFEST's domain_name, then the folder or repository name. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2824,6 +2855,19 @@ impl McpServer {
         // listed whatever is declared and refuses its mutating actions instead
         // - so nothing is announced; see [`McpServer::listen`].
         let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
+            // Caught here rather than left to the engine's own url building:
+            // the same shared check the JSON API's create and domain-name
+            // peek use (crates/remote/src/github/mod.rs), so a malformed
+            // `repo` or `path` is refused with one classification wherever
+            // it is caught, before anything is asked of the forge.
+            if let Err(e) = crystalline_remote::validate_repo(repo) {
+                return Err(to_error(e.into()));
+            }
+            if let Some(path) = p.path.as_deref()
+                && let Err(e) = crystalline_remote::validate_repo_path(path)
+            {
+                return Err(to_error(e.into()));
+            }
             self.engine
                 .origin_add_with_progress(
                     repo,
@@ -2873,6 +2917,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
         }
@@ -2938,6 +2983,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3031,6 +3077,7 @@ impl McpServer {
         Parameters(p): Parameters<UpdateDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
@@ -3061,6 +3108,7 @@ impl McpServer {
         Parameters(p): Parameters<OriginStatusParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("origin_status", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
@@ -3095,6 +3143,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3179,6 +3228,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3251,6 +3301,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("discard_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
@@ -3339,6 +3390,7 @@ impl McpServer {
         Parameters(p): Parameters<ProvisionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let p = self.localized(p, &ctx).await?;
         let action = match p.action.as_str() {
             "status" => ProvisionAction::Status,
             "apply" => ProvisionAction::Apply,
@@ -4252,14 +4304,16 @@ impl ServerHandler for McpServer {
                 // attachment path a caller can reach cold. A domain it may not
                 // see is refused exactly as an unregistered one - the same
                 // bytes, from the engine's own line - before the file is
-                // touched.
-                self.engine
-                    .require_domain(&url.domain, &self.scope_of(&context))
-                    .await
-                    .map_err(to_error)?;
+                // touched. The domain may be spelled by any of its names; one
+                // this caller may not see keeps the spelling they sent.
                 let scope = self.scope_of(&context);
                 let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
-                let (bytes, row) = DomainView::for_read(&self.engine, &url.domain, &hidden, &scope)
+                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
+                self.engine
+                    .require_domain(&domain, &scope)
+                    .await
+                    .map_err(to_error)?;
+                let (bytes, row) = DomainView::for_read(&self.engine, &domain, &hidden, &scope)
                     .map_err(to_error)?
                     .attachment_bytes(path)
                     .await

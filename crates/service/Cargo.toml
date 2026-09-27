@@ -68,6 +68,7 @@ rmcp = { workspace = true, features = [
 ] }
 interprocess = { workspace = true, features = ["tokio"] }
 fs4 = { workspace = true }
+same-file = { workspace = true }
 notify = { workspace = true }
 axum = { workspace = true }
 tower-service = { workspace = true }

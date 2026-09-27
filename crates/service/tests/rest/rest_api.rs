@@ -1762,6 +1762,18 @@ async fn domains_lists_every_domain_with_its_routing_bullets() {
             .any(|b| b.as_str().unwrap().contains("Route here for eng")),
         "the routing bullets come from the MANIFEST: {body}"
     );
+    // Every domain carries its canonical name, its aliases, how it got its
+    // name, whether that name is shadowed and whether a rename has it paused
+    // right now: neither seeded domain declares a `domain_name` of its own or
+    // clashes with the other, so both resolve to their local name, carry no
+    // aliases, are not shadowed and are not being renamed.
+    for row in domains {
+        assert_eq!(row["canonical_name"], row["name"], "{row}");
+        assert_eq!(row["aliases"], serde_json::json!([]), "{row}");
+        assert_eq!(row["name_origin"], serde_json::Value::Null, "{row}");
+        assert_eq!(row["shadowed"], false, "{row}");
+        assert_eq!(row["renaming"], false, "{row}");
+    }
 }
 
 /// The tree endpoint is `browse_domain` behind a query string: the defaults
@@ -2036,8 +2048,9 @@ async fn domain_manifest_carries_every_section_it_declares() {
                 "problems": []
             },
             "policies": [
-                { "key": "generated_indexes", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                { "key": "generated_indexes", "kind": "choice", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+                { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -2069,8 +2082,9 @@ async fn domain_manifest_names_what_it_lacks() {
             "provisioning": null,
             "tag_aliases": null,
             "policies": [
-                { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
-                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
+                { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -4635,4 +4649,83 @@ async fn concurrent_account_creations_all_answer() {
         13,
         "twelve new accounts beside the admin"
     );
+}
+
+/// A domain path answers to the domain's canonical name and to its alias
+/// exactly as it answers to its local name, the query string included.
+#[tokio::test]
+async fn a_domain_path_answers_to_the_canonical_name_and_an_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("eng-knowledge");
+    std::fs::create_dir_all(dir.join("ops")).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-01-01"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ops/runbook.md"),
+        "---\ntype: engram\ntitle: Runbook\npermalink: ops/runbook\ntags:\n  - t\n\
+         status: current\nrecorded_at: 2026-01-01\n---\n\n# Runbook\n\nthe rollback steps\n",
+    )
+    .unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.aliases = vec!["old-eng".to_string()];
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            anonymous: Some(true),
+            ..AuthConfig::default()
+        }),
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains.insert("eng-knowledge".to_string(), entry);
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let addr = serve_test_router(engine, auth);
+
+    let body = |path: String| async move {
+        let resp = get(addr, &path).await;
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 200, "GET {path}: {text}");
+        text
+    };
+    let local = body("/api/v1/domains/eng-knowledge/tree?depth=2".to_string()).await;
+    assert!(local.contains("ops/runbook"), "{local}");
+    for spelling in ["eng", "old-eng"] {
+        assert_eq!(
+            body(format!("/api/v1/domains/{spelling}/tree?depth=2")).await,
+            local,
+            "{spelling} is the same domain"
+        );
+    }
+    // Every other domain route too, the ones that hand the engine a bare name
+    // (the MANIFEST, the attachment list) as much as the ones whose params
+    // the engine localizes itself.
+    for route in ["engrams/ops/runbook", "manifest", "attachments"] {
+        let local = body(format!("/api/v1/domains/eng-knowledge/{route}")).await;
+        for spelling in ["eng", "old-eng"] {
+            assert_eq!(
+                body(format!("/api/v1/domains/{spelling}/{route}")).await,
+                local,
+                "{route} under {spelling}"
+            );
+        }
+    }
 }

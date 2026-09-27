@@ -89,8 +89,10 @@ async fn serve(opts: Options_) -> Fixture {
         "---\r\ntitle: Mixed\r\npermalink: mixed\r\ntags:\r\n  - eng\r\nstatus: stable\r\ntype: engram\r\n---\r\n\r\na CRLF file\nwith a lone LF\r\n",
     )
     .unwrap();
-    cfg.domains
-        .insert("eng".to_string(), DomainEntry::file(dir.clone()));
+    // A machine-local alias, so a join can name the domain by another name.
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.aliases = vec!["old-eng".to_string()];
+    cfg.domains.insert("eng".to_string(), entry);
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
@@ -432,6 +434,38 @@ async fn a_read_only_instance_refuses_the_upgrade() {
     .await
     .unwrap_err();
     assert_eq!(refusal_status(&err), Some(403));
+}
+
+/// The upgrade path names its domain by any of its names: a join through the
+/// alias opens the room of the local domain, and a name nobody answers to is
+/// the 404 a missing engram gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_through_an_alias_opens_the_domains_room() {
+    let fx = serve(Options_::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let mut socket = connect(
+        fx.addr,
+        "/api/v1/collab/old-eng/alpha",
+        Some(&editor.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("the alias upgrades like the local name");
+    let Control::Hello { permalink, .. } = decode_hello(&next_binary(&mut socket).await) else {
+        panic!("the greeting opens with hello");
+    };
+    assert_eq!(permalink, "alpha");
+
+    let err = connect(
+        fx.addr,
+        "/api/v1/collab/never-eng/alpha",
+        Some(&editor.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal_status(&err), Some(404));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

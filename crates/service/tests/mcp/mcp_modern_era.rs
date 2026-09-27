@@ -219,6 +219,13 @@ impl Harness {
             let bytes = std::fs::read(domain_root.join(&rel)).unwrap();
             origin_tree.insert(rel, bytes);
         }
+        // The same holds for the MANIFEST: connecting as `kb` wrote that
+        // name into it, a change the first share would carry, so the origin
+        // is seeded with it too.
+        origin_tree.insert(
+            "MANIFEST.md".to_string(),
+            std::fs::read(domain_root.join("MANIFEST.md")).unwrap(),
+        );
         let c2 = mock.add_commit(origin_tree);
         mock.set_branch("main", &c2);
         engine

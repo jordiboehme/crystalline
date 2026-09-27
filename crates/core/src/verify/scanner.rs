@@ -35,7 +35,9 @@ pub(crate) struct ScannedFile {
 
 /// One Domain root and its scanned files.
 pub(crate) struct Domain {
-    /// The domain name, derived from the root's final path component.
+    /// The domain name: the MANIFEST's declared
+    /// [`crate::manifest::Manifest::domain_name`] when it has one, otherwise
+    /// the root's final path component.
     pub name: String,
     /// The root path, exactly as given.
     pub root: PathBuf,
@@ -155,11 +157,16 @@ pub(crate) fn scanned_file_from_source(rel_path: &Path, source: &str) -> Scanned
     }
 }
 
+/// The domain's name: the `domain_name` its MANIFEST declares
+/// ([`crate::manifest::domain_name_at`]), or the root folder's name when the
+/// MANIFEST declares none.
 fn domain_name(root: &Path) -> String {
-    root.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| root.display().to_string())
+    crate::manifest::domain_name_at(root).unwrap_or_else(|| {
+        root.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| root.display().to_string())
+    })
 }
 
 fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
@@ -212,4 +219,45 @@ fn is_dotfile(name: &OsStr) -> bool {
 /// Whether `path` is one of the excluded artifact folders or lives inside one.
 fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
     excluded.iter().any(|dir| path.starts_with(dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn scan_names_a_domain_by_its_manifest_domain_name_else_the_folder_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a-knowledge");
+        let b = dir.path().join("b");
+        write(
+            &a,
+            "MANIFEST.md",
+            "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\ndomain_name: a\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+        );
+        write(
+            &b,
+            "MANIFEST.md",
+            "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+        );
+
+        let domains = scan([a.as_path(), b.as_path()], &VerifyOptions::default()).unwrap();
+
+        assert_eq!(
+            domains[0].name, "a",
+            "MANIFEST domain_name wins over the folder name"
+        );
+        assert_eq!(
+            domains[1].name, "b",
+            "the folder name is still the fallback when the MANIFEST declares no domain_name"
+        );
+    }
 }

@@ -14,13 +14,14 @@ impl Engine {
         p: &ContextParams,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let url = CrystallineUrl::parse(&p.anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
         let max_related = p.max_related.unwrap_or(10);
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
-        let hidden = self.hidden_for(scope).await?;
 
         // A hidden domain skips the lookup and keeps the branch: a glob over one
         // falls into the same "matched no engrams" an empty glob produces, and a
@@ -215,12 +216,13 @@ impl Engine {
         max_nodes: usize,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        let url = CrystallineUrl::parse(anchor).ok_or_else(|| {
+        let mut url = CrystallineUrl::parse(anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{anchor}' is not a crystalline:// URL"))
         })?;
         let depth = depth.clamp(1, 2);
         let max_nodes = max_nodes.clamp(1, MAX_GRAPH_NODES);
         let hidden = self.hidden_for(scope).await?;
+        url.domain = self.localize_visible(&url.domain, &hidden).await;
 
         let store = self.store.lock().await;
         // A hidden domain skips the lookup and keeps the branch, so it answers

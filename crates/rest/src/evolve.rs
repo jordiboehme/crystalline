@@ -257,6 +257,20 @@ async fn sweepable_domains(
     requested: Vec<String>,
 ) -> Result<Vec<String>, ApiError> {
     let scope = identity.scope();
+    // Each name as its local one, so the check below and the sweep see the
+    // names the registrations use; a name this caller may not see stays as
+    // typed and is refused like one nobody registered.
+    let requested = state
+        .engine
+        .localized_for(
+            &EvolveParams {
+                domains: requested,
+                ..EvolveParams::default()
+            },
+            &scope,
+        )
+        .await?
+        .domains;
     let hidden = state.engine.hidden_domains(&scope).await?;
     if hidden.is_none_or(|hidden| hidden.is_empty()) {
         return Ok(requested);

@@ -235,6 +235,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let source = self.content_source(&p.domain)?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
@@ -327,6 +328,14 @@ impl Engine {
             p.metadata.as_ref(),
             &p.content,
         )?;
+        // The single point this capture's text funnels through before it is
+        // stored, whichever of the three exits below takes it: a cross-domain
+        // link spelled with an alias or a non-canonical local name is written
+        // with the canonical one instead, wherever this caller's own
+        // visibility allows it.
+        let (markdown, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&markdown, scope)
+            .await?;
 
         let mut receipt = json!({
             "domain": p.domain,
@@ -344,6 +353,7 @@ impl Engine {
         if !notices.is_empty() {
             receipt["notices"] = json!(notices);
         }
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
 
         // **The live arm, and it stands ahead of every arm that writes**, the
         // way the edit's does (`Engine::apply_source_edit_staged`). While a
@@ -503,10 +513,9 @@ impl Engine {
 
         // A virtual write may have landed or replaced this domain's MANIFEST
         // engram, the source of its routing bullets, so refresh the cache the
-        // sync `routing_text` reads. The store locks above are all released.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // sync `routing_text` reads; a MANIFEST of either kind may declare a
+        // new name. The store locks above are all released.
+        self.after_source_write(&source, &rel).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
         self.nudge_embed();
@@ -563,6 +572,7 @@ impl Engine {
             return None;
         }
         let rooms = self.collab_rooms()?;
+        let p = &self.localized_for(p, scope).await.ok()?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join)
             .await
             .ok()?;
@@ -600,9 +610,12 @@ impl Engine {
     ///
     /// The full-document counterpart of [`Engine::edit_engram`], for the HTTP
     /// PUT: the client edited the whole file, so the whole file is what lands.
-    /// Nothing is rebuilt and `generated` is not touched - a save of what was
-    /// read must be byte-identical, which is the editor's fidelity contract,
-    /// and the text already carries whatever provenance its author put there.
+    /// Nothing is rebuilt and `generated` is not touched. The editor's
+    /// fidelity contract is that a save of what was read lands byte-identical,
+    /// with one deliberate exception: a cross-domain link is normalized to
+    /// its canonical spelling, the same funnel every other write's final text
+    /// passes through, wherever this caller's own visibility allows it. The
+    /// text already carries whatever provenance its author put there.
     ///
     /// `expected_checksum` is enforced on BOTH storage kinds. File domains get
     /// the comparison here (read, hash, compare, write), virtual domains get
@@ -648,6 +661,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let p = &self.localized_for(p, scope).await?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,
@@ -697,8 +711,20 @@ impl Engine {
 
         // The third place a save can land: this actor's own draft.
         if overlay.is_some() {
-            return self.save_into_overlay(&view, p, &desc, &source).await;
+            return self
+                .save_into_overlay(&view, p, &desc, &source, scope)
+                .await;
         }
+
+        // The single point this save's text funnels through before it lands:
+        // a cross-domain link spelled with an alias or a non-canonical local
+        // name is written with the canonical one instead, wherever this
+        // caller's own visibility allows it. The CAS token guards the version
+        // this caller read, not the bytes it is about to land, so it stays
+        // checked against `p.expected_checksum` unchanged.
+        let (content, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&p.content, scope)
+            .await?;
 
         match &source {
             ContentSource::File { root } => {
@@ -737,19 +763,19 @@ impl Engine {
                         &found,
                     )));
                 }
-                write_file(&abs, &p.content)?;
+                write_file(&abs, &content)?;
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await?;
             }
             ContentSource::Virtual => {
-                let stamp = virtual_stamp(&p.content);
+                let stamp = virtual_stamp(&content);
                 let store = self.store.lock().await;
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
                     &desc.path,
-                    &p.content,
+                    &content,
                     stamp,
                     Some(&p.expected_checksum),
                     true,
@@ -781,20 +807,20 @@ impl Engine {
             receipt_permalink(found, desc.permalink.clone())
         };
 
-        // A save can rewrite the MANIFEST engram of a virtual domain or the
-        // titles a folder index lists, same as an edit.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // A save can rewrite a MANIFEST or the titles a folder index lists,
+        // same as an edit.
+        self.after_source_write(&source, &desc.path).await;
         self.refresh_index_files(&desc.domain).await;
         self.nudge_embed();
 
-        Ok(json!({
+        let mut receipt = json!({
             "domain": desc.domain,
             "permalink": permalink,
             "path": desc.path,
-            "checksum": sha256_hex(p.content.as_bytes()),
-        }))
+            "checksum": sha256_hex(content.as_bytes()),
+        });
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
+        Ok(receipt)
     }
 
     /// Save a co-editing room's text into the overlay document the room is a
@@ -861,7 +887,17 @@ impl Engine {
         if is_assets_reserved(&desc.path) {
             return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
         }
-        self.save_into_overlay(view, p, &desc, &source).await
+        // No caller-carried scope reaches a room: this is the machine's own
+        // save of a document somebody has open, the same account every room
+        // writes as before there was anything else to be (see
+        // `Engine::save_engram_joined`'s own doc comment on `scope`). By the
+        // time this runs, the session has already normalized its own text
+        // under the same scope (see `CollabSession::save_attempt`), so this
+        // pass is ordinarily a no-op; passing it again here rather than
+        // skipping it is what keeps `save_into_overlay` one function with one
+        // contract for both its callers.
+        self.save_into_overlay(view, p, &desc, &source, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// The overlay arm of a save: the whole document into the view's own
@@ -876,6 +912,13 @@ impl Engine {
     /// it with a view it built itself over the owner of the document the room
     /// is a room over.
     ///
+    /// A save of what was read lands byte-identical but for one deliberate
+    /// rewrite: a cross-domain link spelled with an alias or a non-canonical
+    /// local name is normalized to the canonical one before it is stored,
+    /// wherever `scope` may see it, the same funnel every other write's final
+    /// text passes through. The receipt's `checksum` is of the bytes that
+    /// actually landed.
+    ///
     /// Everything a caller must decide BEFORE this is deliberately not here:
     /// whose view it is, whether the document parses, whether the path is
     /// writable, and - for a request - whether a grant or a join routes it.
@@ -886,15 +929,17 @@ impl Engine {
         p: &SaveParams,
         desc: &EngramDescriptor,
         source: &ContentSource,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let who = view.writing_actor()?;
         // Written directly rather than through `apply_source_edit`, and
         // that is the save's own contract rather than an omission: the
         // shared edit path stamps `generated`, and a save of what was read
-        // has to land byte-identical. The compare and the write are held
-        // apart from every other writer of the same draft by the one lock
-        // they all take, keyed on the draft's own mirror path. See
-        // `Engine::draft_lock`.
+        // has to land byte-identical but for the one normalization pass this
+        // function itself runs (see its own doc comment above). The compare
+        // and the write are held apart from every other writer of the same
+        // draft by the one lock they all take, keyed on the draft's own
+        // mirror path. See `Engine::draft_lock`.
         let lock = self.draft_lock(&desc.domain, who, &desc.path)?;
         let _guard = lock.lock().await;
         let current = view.text_at(source, desc).await?.ok_or_else(|| {
@@ -910,22 +955,26 @@ impl Engine {
                 &found,
             )));
         }
-        let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
+        let (content, domain_names_normalized) = self
+            .normalize_domain_spellings_for(&p.content, scope)
+            .await?;
+        let warning = view.write(desc.domain_id, &desc.path, &content).await?;
         // Where the draft now answers, derived exactly as the row's own
         // permalink is: an author who edited the frontmatter's permalink
         // line has just moved the address, and the receipt has to say so.
-        let permalink = parse_engram(&p.content)
+        let permalink = parse_engram(&content)
             .map(|engram| {
-                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content)).permalink
+                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&content)).permalink
             })
             .unwrap_or_else(|_| desc.permalink.clone());
         let mut receipt = json!({
             "domain": desc.domain,
             "permalink": permalink,
             "path": desc.path,
-            "checksum": sha256_hex(p.content.as_bytes()),
+            "checksum": sha256_hex(content.as_bytes()),
             "draft": true,
         });
+        note_domain_names_normalized(&mut receipt, domain_names_normalized);
         // Whose draft it landed in, when that is not the caller's own. The
         // one thing a joined save has to say that an ordinary one does
         // not: somebody typing inside a colleague's draft is owed a
@@ -947,6 +996,12 @@ impl Engine {
     /// PATH rather than by identifier: the engram is gone from the index, so
     /// there is nothing left to resolve. No CAS token either, for the same
     /// reason - there is no stored version to compare against.
+    ///
+    /// Deliberately exempt from domain-spelling normalization: this restores
+    /// the exact prior bytes a room held after an external deletion, a
+    /// recovery of what was already there rather than a new authoring act,
+    /// and `content` is what the caller already normalized (or chose not to)
+    /// on its way in.
     ///
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].
@@ -1037,9 +1092,7 @@ impl Engine {
                     .await?;
             }
         }
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        self.after_source_write(&source, path).await;
         self.refresh_index_files(domain).await;
 
         // Read back after the reindex, exactly as a save does: the index takes
@@ -1462,9 +1515,24 @@ impl Engine {
     /// way a create does. The domain-addressed half of what
     /// [`Engine::resolve`] does for an identifier, for a write path whose
     /// engram is not in the index to resolve.
+    ///
+    /// While a rename has the domain paused the row is looked up, never
+    /// created: a write that holds a ticket from before the pause still finds
+    /// it under the old name, and anything else (a read that waited past the
+    /// pause, or one of a domain a stopped rename keeps paused) must not
+    /// register a second row under a name the index row may already have
+    /// left.
     pub(crate) async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
         let source = self.content_source(domain)?;
         let store = self.store.lock().await;
+        if self.is_renaming(domain) {
+            return match store.domain_id(domain).await? {
+                Some(id) => Ok((id, source)),
+                None => Err(EngineError::Conflict(format!(
+                    "domain '{domain}' is being renamed; try again in a moment"
+                ))),
+            };
+        }
         let domain_id = match &source {
             ContentSource::File { root } => {
                 store

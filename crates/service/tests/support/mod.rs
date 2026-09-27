@@ -71,6 +71,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains",
     "POST /api/v1/domains",
     "DELETE /api/v1/domains/{domain}",
+    "POST /api/v1/domains/{domain}/rename",
     "PUT /api/v1/domains/{domain}/review",
     "GET /api/v1/domains/{domain}/drafts",
     "PUT /api/v1/domains/{domain}/visibility",
@@ -127,6 +128,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/settings/github",
     "POST /api/v1/settings/github/connect",
     "POST /api/v1/settings/github/token",
+    "GET /api/v1/github/domain-name",
     "GET /api/v1/me/github-identity",
     "DELETE /api/v1/me/github-identity",
     "POST /api/v1/me/github-identity/connect",
@@ -180,6 +182,11 @@ struct Inner {
     /// Whether `default_branch` fails with `RemoteError::Offline`. Set through
     /// `MockProvider::fail_default_branch`.
     default_branch_fails: bool,
+    /// Whether `read_file` fails with `RemoteError::Offline`. Set through
+    /// `MockProvider::fail_read_file`.
+    read_file_fails: bool,
+    /// Every `read_file` call as `(reference, path)`, in order.
+    read_file_calls: Vec<(String, String)>,
     /// Branches whose `branch_head` probe should fail with
     /// `RemoteError::Offline`, simulating a live network outage. Set through
     /// `MockProvider::fail_branch_head_offline`.
@@ -356,6 +363,16 @@ impl MockProvider {
     /// Makes every `default_branch` call fail with `RemoteError::Offline`.
     pub fn fail_default_branch(&self) {
         self.inner.lock().unwrap().default_branch_fails = true;
+    }
+
+    /// Makes every `read_file` call fail with `RemoteError::Offline`.
+    pub fn fail_read_file(&self) {
+        self.inner.lock().unwrap().read_file_fails = true;
+    }
+
+    /// Every `read_file` call so far as `(reference, path)`, in order.
+    pub fn read_file_calls(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().read_file_calls.clone()
     }
 
     /// Adds a commit built from repo-relative path to content pairs and
@@ -742,6 +759,33 @@ impl Provider for MockProvider {
             files,
             truncated: false,
         })
+    }
+
+    async fn read_file(
+        &self,
+        _origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        // Answered from the tree the reference names (a branch, else a commit
+        // id), so the file a connect reads first is the very one its download
+        // then lands on disk.
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .read_file_calls
+            .push((reference.to_string(), path.to_string()));
+        if inner.read_file_fails {
+            return Err(RemoteError::Offline);
+        }
+        let commit = inner
+            .branches
+            .get(reference)
+            .cloned()
+            .unwrap_or_else(|| reference.to_string());
+        Ok(inner
+            .commits
+            .get(&commit)
+            .and_then(|c| c.files.get(path).cloned()))
     }
 
     async fn blob(&self, _origin: &OriginSpec, sha: &str) -> Result<Vec<u8>, RemoteError> {

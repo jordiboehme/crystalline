@@ -813,3 +813,61 @@ async fn a_poll_tick_converges_a_merged_draft() {
     assert!(left.is_empty(), "the poller's pull converged the draft");
     assert!(!mirror.exists(), "row and mirror went together");
 }
+
+/// A poll tick that pulls a newly declared `domain_name` lines the derived
+/// team domain's name up with it, as an on-demand update does.
+#[tokio::test]
+async fn a_poll_tick_adopts_a_pulled_domain_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "version one")),
+    ]));
+    mock.set_branch("main", &c1);
+    let token_dir = tmp.path().join("token");
+    let config_path = tmp.path().join("config.yaml");
+    let eng = engine_with(
+        &config_path,
+        &tmp.path().join("origins"),
+        &token_dir,
+        mock.clone(),
+        Some(60),
+    )
+    .await;
+    write_fake_token(&token_dir);
+    let root = tmp.path().join("brand-knowledge");
+    let connected = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(connected["domain"], "brand-knowledge", "{connected}");
+
+    let declaring = String::from_utf8(manifest()).unwrap().replacen(
+        "status: current\n",
+        "status: current\ndomain_name: brand\n",
+        1,
+    );
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", declaring.into_bytes()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "version one")),
+    ]));
+    mock.set_branch("main", &c2);
+
+    eng.origin_poll_tick(Instant::now(), Utc::now()).await;
+
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(!cfg.domains.contains_key("brand-knowledge"));
+    let entry = &cfg.domains["brand"];
+    assert!(
+        entry.aliases.contains(&"brand-knowledge".to_string()),
+        "{entry:?}"
+    );
+    assert_eq!(entry.canonical_seen.as_deref(), Some("brand"));
+}

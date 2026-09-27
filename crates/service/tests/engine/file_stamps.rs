@@ -123,6 +123,7 @@ async fn a_virtual_domain_answers_with_nothing_rather_than_an_error() {
             origin: None,
             provision: None,
             review: None,
+            ..Default::default()
         },
     );
     config::save_yaml(&config_path, &cfg).unwrap();

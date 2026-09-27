@@ -48,6 +48,7 @@ impl Engine {
     ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let scoped = self.scoped_domains(&p.domains, &hidden).await?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {

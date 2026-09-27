@@ -188,6 +188,159 @@ describe("the domain policies card", () => {
     ).toBeVisible();
   });
 
+  it("renders a text-kind row as read-only text, never a select", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    expect(within(domainName).getByText("eng")).toBeVisible();
+    expect(within(domainName).queryByRole("combobox")).toBeNull();
+    expect(
+      within(card).queryByRole("combobox", { name: "domain_name" }),
+    ).toBeNull();
+  });
+
+  it("opens the rename dialog from a 'Change name' button beside domain_name, for the owner", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+
+    await userEvent.click(
+      within(domainName).getByRole("button", { name: "Change name" }),
+    );
+
+    // The one dialog the page already owns, not a second one this card
+    // mounts for itself: same title, same fields, as the header's own
+    // "Rename domain" opens.
+    const dialog = await screen.findByRole("dialog", { name: "Rename domain" });
+    expect(within(dialog).getByLabelText("New name")).toBeVisible();
+  });
+
+  it("renames exactly the domain whose card 'Change name' belongs to", async () => {
+    const renamed = vi.fn(() => ({
+      domain: "engineering",
+      previous: "eng",
+      local_only: false,
+      manifest_written: true,
+      manifest_draft: false,
+      rewritten: [],
+      left_behind: [],
+      aliases: ["eng"],
+      shadows: [],
+    }));
+    serve({
+      // A second domain beside it, so a dialog opened for the wrong one
+      // would show in the path it posts to.
+      "/domains": () => {
+        const listed = domainsResponse();
+        return {
+          ...listed,
+          domains: [
+            ...listed.domains,
+            { ...listed.domains[0], name: "ops", when_to_use: [] },
+          ],
+        };
+      },
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return renamed();
+      },
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    await userEvent.click(
+      within(domainName).getByRole("button", { name: "Change name" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Rename domain" });
+    await userEvent.type(
+      within(dialog).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Rename" }),
+    );
+
+    await waitFor(() => {
+      expect(renamed).toHaveBeenCalledTimes(1);
+    });
+    const renames = apiMock.mock.calls
+      .map(([path]) => path)
+      .filter((path) => String(path).endsWith("/rename"));
+    expect(renames).toEqual(["/domains/eng/rename"]);
+  });
+
+  it("withholds 'Change name' from a caller with neither the owner nor the admin right", async () => {
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "editor" }) }),
+      "/domains/eng/members": () => ({
+        owner: "somebody-else",
+        visibility: "shared",
+        members: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+
+    expect(
+      within(domainName).queryByRole("button", { name: "Change name" }),
+    ).toBeNull();
+  });
+
+  it("disables 'Change name' with the read-only reason on a read-only instance", async () => {
+    serve({
+      "/auth/me": () =>
+        meResponse({ user: userFixture({ role: "admin" }), read_only: true }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    const button = within(domainName).getByRole("button", {
+      name: "Change name",
+    });
+
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleDescription(
+      "This instance is read only, so nothing here can be changed.",
+    );
+  });
+
+  it("disables 'Change name' with the renaming reason while a rename runs", async () => {
+    serve({
+      "/domains": () => ({
+        ...domainsResponse(),
+        domains: domainsResponse().domains.map((entry) => ({
+          ...entry,
+          renaming: true,
+        })),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+    const domainName = within(card).getByRole("row", { name: /^domain_name/ });
+    const button = await within(domainName).findByRole("button", {
+      name: "Change name",
+    });
+
+    await waitFor(() => {
+      expect(button).toHaveAttribute("aria-disabled", "true");
+    });
+    expect(button).toHaveAccessibleDescription(
+      "A rename of this domain is already running.",
+    );
+  });
+
   it("says nothing about a declaration the registry knows, whatever holds", async () => {
     serve({
       "/domains/eng/manifest": () =>

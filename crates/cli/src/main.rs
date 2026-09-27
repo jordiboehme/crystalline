@@ -285,6 +285,11 @@ enum Command {
         /// stale service lock or socket files.
         #[arg(long)]
         fix: bool,
+        /// Delete the journal of a domain rename an earlier run left half
+        /// done, leaving the steps it already ran as they are. Never done by
+        /// --fix: the report names what is half moved first.
+        #[arg(long)]
+        discard_rename: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -309,6 +314,11 @@ enum Command {
         /// never leaves the lock held.
         #[arg(long, default_value_t = 30)]
         secs: u64,
+        /// Publish the record a one-shot command publishes, naming this
+        /// command, instead of a daemon's, and let go of the lock when the
+        /// time is up, as that command does when it finishes.
+        #[arg(long)]
+        standalone: Option<String>,
     },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, plus MCP, the JSON API and the web UI over HTTP at
@@ -1048,19 +1058,43 @@ enum DomainCommand {
     /// command is safe to repeat; a name registered at another folder or as
     /// the other kind is refused, naming what holds it. A new name uses
     /// letters, digits, hyphens, underscores and dots, 64 characters at most.
+    ///
+    /// A lone positional argument is always the NAME, never a path - naming a
+    /// file domain is optional, and pointing at its folder instead (the
+    /// second positional, or `--path`) is how you leave it unnamed. Without a
+    /// name, the folder's own MANIFEST.md `domain_name` is used (stepped with
+    /// a numeric suffix when something else here already answers to it),
+    /// else its basename; either way the MANIFEST is written to declare
+    /// whichever name it lands on, if it does not already. `--virtual` always
+    /// needs a name, since there is no folder to derive one from; `--origin`
+    /// needs neither name nor path, since it defaults both from the
+    /// repository.
     Add {
         /// The domain name used everywhere it is referenced. Adding a name
         /// that is already registered here adopts it as it is; a new name
-        /// must follow the naming rule above.
-        name: String,
+        /// must follow the naming rule above. Omitted for a file domain, the
+        /// name comes from the folder's own MANIFEST.md (or its basename)
+        /// instead - point at the folder with the second positional or
+        /// `--path` in that case.
+        name: Option<String>,
         /// The domain root directory. Omitted for a virtual domain. For a
         /// file domain, defaults to <domains_root>/<name>
-        /// (~/Documents/Crystalline/<name> unless configured) when omitted;
-        /// with `--origin` this is where the team domain lives on this
-        /// machine, and existing files there are kept.
+        /// (~/Documents/Crystalline/<name> unless configured) when a name is
+        /// given and this is omitted; with `--origin` this is where the team
+        /// domain lives on this machine, and existing files there are kept.
+        /// A lone argument on the command line is always the NAME: use
+        /// `--path` instead of this position to point at a folder without
+        /// naming it.
         path: Option<PathBuf>,
+        /// Point at the domain's folder instead of naming it positionally;
+        /// the name then comes from the folder, as described above.
+        /// Conflicts with the positional path. Required, together with the
+        /// name it lets you omit, unless `--origin` is given too.
+        #[arg(long = "path", value_name = "DIR", conflicts_with = "path")]
+        path_flag: Option<PathBuf>,
         /// Register a virtual domain: engrams live in the database, not on disk.
-        /// Incompatible with a path argument.
+        /// Incompatible with a path argument. Needs a name: there is no
+        /// folder to derive one from.
         #[arg(long = "virtual")]
         is_virtual: bool,
         /// Connect to a GitHub repository: owner/repo, or owner/repo/subpath
@@ -1153,6 +1187,26 @@ enum DomainCommand {
         /// refusal says who, and how many drafts each of them holds.
         #[arg(long = "end-drafts", value_name = "ACTOR")]
         end_drafts: Vec<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Rename a domain: its MANIFEST `domain_name` (unless `--local`), this
+    /// machine's registered name, and every link in a domain you can write
+    /// that spells one of its former names - the old local name, the old
+    /// canonical name, every alias. Every former name keeps resolving here
+    /// afterward. `--local` renames only this machine's own record: the
+    /// MANIFEST and every link are left exactly as they are.
+    Rename {
+        /// The domain to rename: its local name, its canonical name, or any
+        /// alias.
+        domain: String,
+        /// The new name.
+        new: String,
+        /// Rename only this machine's own record; leave the MANIFEST and
+        /// every link untouched.
+        #[arg(long)]
+        local: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1719,10 +1773,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Doctor {
             domain,
             fix,
+            discard_rename,
             config,
-        }) => on_runtime(move || run_doctor(domain, fix, config, cli.db, cli.json)),
+        }) => on_runtime(move || run_doctor(domain, fix, discard_rename, config, cli.db, cli.json)),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
-        Some(Command::HoldLock { secs }) => hold_lock(secs),
+        Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
         Some(Command::Serve {
             http,
             allowed_host,
@@ -1873,11 +1928,14 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// left on their default handling on purpose, so a `SIGTERM` ends this process
 /// without running the ownership drop, exactly as a killed daemon leaves its
 /// record and socket file behind.
-fn hold_lock(secs: u64) -> anyhow::Result<()> {
+fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = {
         let ownership = crystalline_service::instance::acquire_ownership()?;
-        ownership.publish()?;
+        match standalone {
+            Some(command) => ownership.publish_standalone(command)?,
+            None => ownership.publish()?,
+        }
         ownership
     };
     // The readiness line: a caller waits for it before treating the lock as
@@ -2016,6 +2074,11 @@ async fn status_dispatch(
                     crystalline_service::instance::unknown_holder_error(&detail)
                 );
             }
+            crystalline_service::instance::HolderState::Standalone { pid, command } => {
+                eprintln!(
+                    "note: the standalone command `{command}` (pid {pid}) holds this machine's state directory until it finishes; reporting from a direct index read instead"
+                );
+            }
             _ => {
                 // A live record with a free lock: no holder to name, but the
                 // daemon it describes is unreachable all the same.
@@ -2065,12 +2128,13 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    let cfg = cmd::load(config.as_deref())?.effective;
+    let loaded = cmd::load(config.as_deref())?;
+    let cfg = &loaded.effective;
     let route = cmd::reach_index(
         Some(
             json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
         ),
-        &cfg,
+        cfg,
         config.as_deref(),
         db.as_deref(),
         cmd::OpenAs::Write,
@@ -2113,14 +2177,65 @@ async fn sync_dispatch(
         }
         return Ok(());
     }
-    cmd::sync(
-        cmd::local_store(route, "sync")?,
-        &cfg,
-        domain.as_deref(),
-        embed,
-        json,
+    let store = cmd::local_store(route, "sync")?;
+    // Standalone (no daemon, or an explicit `--db`/`--config` override that
+    // bypasses one): `cmd::sync`'s own `select_domains` matches `domain`
+    // against `cfg.domains`'s local keys directly, with no resolution of its
+    // own - unlike the daemon path above, whose ctl `sync` is one of
+    // `control::DOMAIN_REFERENCE_COMMANDS` and so is pre-localized before it
+    // ever reaches the engine. Resolved here through the config-only name
+    // table, the same one every other standalone domain
+    // command now uses: a canonical name or a machine-local alias means the
+    // same domain here that it would with a daemon running.
+    let resolved_domain = domain
+        .as_deref()
+        .map(|d| loaded.name_table().resolve(d).unwrap_or(d).to_string());
+    cmd::sync(store.clone(), cfg, resolved_domain.as_deref(), embed, json).await?;
+    // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
+    // synced MANIFEST may declare a new name. A sync that failed says so and
+    // adopts nothing. The adoption cannot fail the sync that landed: its own
+    // failure is a warning. The JSON stays the report array it always was; a
+    // person reads what was renamed.
+    let names = match crystalline_service::adopt_domain_names_direct(
+        store,
+        db.as_deref(),
+        config.as_deref(),
     )
     .await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!("warning: lining the domain names up with their MANIFESTs failed: {e:#}");
+            serde_json::Value::Array(Vec::new())
+        }
+    };
+    // A sync of an index named by --db or --config never lines names up (the
+    // log says why at warn); this line says it whatever the log filter is.
+    if !crystalline_service::use_daemon(db.as_deref(), config.as_deref()) {
+        eprintln!(
+            "note: domain names were not lined up with their MANIFESTs; run `crystalline sync` \
+             without --db and --config to do it"
+        );
+    }
+    if !json {
+        for entry in names.as_array().into_iter().flatten() {
+            match entry["action"].as_str() {
+                Some("renamed") => println!(
+                    "renamed domain '{}' to '{}', the name its MANIFEST declares",
+                    entry["previous"].as_str().unwrap_or_default(),
+                    entry["domain"].as_str().unwrap_or_default()
+                ),
+                Some("failed") => eprintln!(
+                    "domain '{}' declares the name '{}' but could not be renamed: {}",
+                    entry["domain"].as_str().unwrap_or_default(),
+                    entry["canonical"].as_str().unwrap_or_default(),
+                    entry["error"].as_str().unwrap_or_default()
+                ),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `reindex`: route to the daemon when one owns the index and no explicit
@@ -3034,11 +3149,19 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
 async fn run_doctor(
     domain: Option<String>,
     fix: bool,
+    discard_rename: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let report = doctor::run(domain.as_deref(), fix, config.as_deref(), db.as_deref()).await?;
+    let report = doctor::run(
+        domain.as_deref(),
+        fix,
+        discard_rename,
+        config.as_deref(),
+        db.as_deref(),
+    )
+    .await?;
     if json {
         print_value(&serde_json::to_value(&report)?, true);
     } else {
@@ -3419,6 +3542,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         DomainCommand::Add {
             name,
             path,
+            path_flag,
             is_virtual,
             origin,
             branch,
@@ -3427,6 +3551,10 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             owner,
             config,
         } => on_runtime(move || async move {
+            // The positional path and `--path` are two spellings of the same
+            // value, mutually exclusive at the clap level (`conflicts_with`),
+            // so at most one is ever set here.
+            let path = path.or(path_flag);
             // The owner is resolved BEFORE anything is registered, so a name
             // nobody has an account for cannot leave a registered domain
             // standing shared - which is the opposite of what was asked for.
@@ -3436,8 +3564,12 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
-            let adopted = domain_add_dispatch(
-                name.clone(),
+            // The chosen name comes back from the dispatch rather than the
+            // caller's own `name`, which may be absent: a nameless add lands
+            // on a name worked out from the folder, and that is the name
+            // `--private` must close.
+            let (chosen_name, adopted) = domain_add_dispatch(
+                name,
                 path,
                 is_virtual,
                 origin,
@@ -3454,7 +3586,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 // private is its own decision, with its own verb.
                 if adopted {
                     anyhow::bail!(
-                        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+                        "domain '{chosen_name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {chosen_name} private --owner {owner}"
                     );
                 }
                 // The name is re-resolved against the config the registration
@@ -3462,7 +3594,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 // REST path does by reading the engine's own report: a name
                 // the registry does not hold must not get an acl row, whatever
                 // the command line said.
-                members::close_new_domain(&name, &owner, config.as_deref(), json).await?;
+                members::close_new_domain(&chosen_name, &owner, config.as_deref(), json).await?;
             }
             Ok(())
         }),
@@ -3493,6 +3625,12 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             end_drafts,
             config,
         } => on_runtime(move || domain_remove_dispatch(name, purge, end_drafts, config, db, json)),
+        DomainCommand::Rename {
+            domain,
+            new,
+            local,
+            config,
+        } => on_runtime(move || domain_rename_dispatch(domain, new, local, config, db, json)),
         DomainCommand::Members { domain, command } => {
             on_runtime(move || members::run(domain, command, json))
         }
@@ -3821,9 +3959,15 @@ async fn mcp_dispatch(
 /// running, else synced directly, the same dispatch `sync` itself uses.
 /// `--no-sync` registers only. `--virtual` registers a database-backed domain
 /// and scaffolds its MANIFEST into the index instead of syncing files.
+///
+/// `name` is optional for a file domain: absent, the name is worked out from
+/// the folder (`cmd::domain_add_register`'s own job) and the name actually
+/// registered is what this function returns, not necessarily `name` as
+/// given. `--virtual` always needs a name, since there is no folder to
+/// derive one from.
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
-    name: String,
+    name: Option<String>,
     path: Option<PathBuf>,
     is_virtual: bool,
     origin: Option<String>,
@@ -3832,7 +3976,7 @@ async fn domain_add_dispatch(
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(String, bool)> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
             name,
@@ -3857,6 +4001,11 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` takes no path; a virtual domain has no directory"
             );
         }
+        let name = name.ok_or_else(|| {
+            anyhow::anyhow!(
+                "`domain add --virtual` needs a name; there is no folder to derive one from"
+            )
+        })?;
         let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
         let scaffold = crystalline_service::scaffold_virtual_manifest(
             &name,
@@ -3866,17 +4015,20 @@ async fn domain_add_dispatch(
         )
         .await?;
         cmd::print_domain_add_virtual(&name, adopted, &scaffold, json);
-        return Ok(adopted);
+        return Ok((name, adopted));
     }
 
     // An absent path defaults to `<domains_root>/<name>` inside
     // `domain_add_register`, mirroring the MCP `add_domain` tool's default
-    // placement; the resolved directory still needs a pre-scaffolded
-    // MANIFEST.md either way.
-    let (abs, adopted) = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
+    // placement, when a name is given; without one, `domain_add_register`
+    // itself requires a path, since there is neither a repository nor a
+    // given name to place it under. Either way the resolved directory still
+    // needs a pre-scaffolded MANIFEST.md.
+    let (chosen_name, abs, adopted, shadowed) =
+        cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
     if no_sync {
-        cmd::print_domain_add_no_sync(&name, &abs, adopted, json);
-        return Ok(adopted);
+        cmd::print_domain_add_no_sync(&chosen_name, &abs, adopted, shadowed.as_deref(), json);
+        return Ok((chosen_name, adopted));
     }
 
     // Index over the daemon only when no explicit --config/--db override was
@@ -3887,7 +4039,7 @@ async fn domain_add_dispatch(
     let report: crystalline_index::SyncReport =
         if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
             && let Some(data) = crystalline_service::ctl_if_running(
-                j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+                j!({ "v": 1, "cmd": "sync", "domain": chosen_name, "embed": false }),
             )
             .await?
         {
@@ -3899,11 +4051,18 @@ async fn domain_add_dispatch(
             serde_json::from_value(first)
                 .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
         } else {
-            cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
+            cmd::sync_domain_direct(&chosen_name, &abs, config.as_deref(), db.as_deref()).await?
         };
 
-    cmd::print_domain_add(&name, &abs, adopted, &report, json);
-    Ok(adopted)
+    cmd::print_domain_add(
+        &chosen_name,
+        &abs,
+        adopted,
+        shadowed.as_deref(),
+        &report,
+        json,
+    );
+    Ok((chosen_name, adopted))
 }
 
 /// `domain add --origin`: connects a team domain to a GitHub repository
@@ -3913,9 +4072,14 @@ async fn domain_add_dispatch(
 /// daemon is running); the config write, the download and the indexing all
 /// happen on whichever side answers, never split across the CLI and the
 /// engine the way the local-folder path splits registration from sync.
+///
+/// `name` is optional here too: the engine's own `origin_add` already
+/// defaults it from the repository's name segment when none is given, so
+/// this dispatch only has to thread the option through and read back
+/// whichever name the connect actually landed on.
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_origin_dispatch(
-    name: String,
+    name: Option<String>,
     path: Option<PathBuf>,
     origin_spec: String,
     branch: Option<String>,
@@ -3924,7 +4088,7 @@ async fn domain_add_origin_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(String, bool)> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
     }
@@ -3934,23 +4098,29 @@ async fn domain_add_origin_dispatch(
         );
     }
     let (repo, subpath) = cmd::parse_origin_spec(&origin_spec)?;
+    cmd::validate_origin_repo(&repo)?;
+    if let Some(subpath) = subpath.as_deref() {
+        cmd::validate_origin_path(subpath)?;
+    }
     let folder = match path {
         Some(p) => Some(cmd::absolute_path(&p)?),
         None => None,
     };
     let folder_str = folder.as_ref().map(|p| p.display().to_string());
 
-    // Read before dispatching to the engine: a name already in the config
-    // file is an existing registration the origin connects to in place, not
-    // a new domain this command may close under `--private`.
-    let already_registered = cmd::load(config.as_deref())?
-        .file
-        .domains
-        .contains_key(&name);
+    // Read before dispatching to the engine: whatever this instance already
+    // has registered, before the connect can register or adopt anything -
+    // so an existing shared registration is never mistaken for a new domain
+    // this command may close under `--private`. Read against the CHOSEN
+    // name below rather than the caller's own `name`, since with none given
+    // the engine derives one from the repository, and that derived name can
+    // already be somebody's origin-less file domain (`origin_add` adopts it
+    // in place).
+    let snapshot = cmd::load(config.as_deref())?.file.domains;
 
     let data = crystalline_service::origin_add(
         &repo,
-        Some(&name),
+        name.as_deref(),
         subpath.as_deref(),
         branch.as_deref(),
         folder_str.as_deref(),
@@ -3959,12 +4129,14 @@ async fn domain_add_origin_dispatch(
     )
     .await?;
     cmd::print_origin_add(&repo, &data, json);
+    let chosen_name = data["domain"].as_str().unwrap_or_default().to_string();
+    let already_registered = snapshot.contains_key(&chosen_name);
     // Adopted when the name was already registered before this call (a
     // shared origin-less domain connected in place) or the engine answers a
     // retry with `already_connected`: either way `--private`'s caller must
     // refuse rather than close an existing domain.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
-    Ok(already_registered || already_connected)
+    Ok((chosen_name, already_registered || already_connected))
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
@@ -4088,6 +4260,21 @@ async fn domain_remove_dispatch(
     )
     .await?;
     cmd::print_domain_remove(&name, &report, json);
+    Ok(())
+}
+
+async fn domain_rename_dispatch(
+    domain: String,
+    new: String,
+    local: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report =
+        crystalline_service::domain_rename(&domain, &new, local, db.as_deref(), config.as_deref())
+            .await?;
+    cmd::print_domain_rename(&report, local, json);
     Ok(())
 }
 
@@ -4629,6 +4816,69 @@ mod tests {
         assert_eq!(
             unshared_file_lines(&json!({ "domain": "advisor", "local_changes": 2 })),
             vec!["  unshared files: unknown (the working tree could not be read)"]
+        );
+    }
+
+    /// A lone positional on `domain add` is always the NAME, never a path:
+    /// no heuristic guesses which one it is.
+    #[test]
+    fn domain_add_parses_a_lone_positional_as_the_name() {
+        let cli = Cli::try_parse_from(["crystalline", "domain", "add", "eng"]).unwrap();
+        let Some(Command::Domain {
+            command:
+                DomainCommand::Add {
+                    name,
+                    path,
+                    path_flag,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected `domain add`");
+        };
+        assert_eq!(name.as_deref(), Some("eng"));
+        assert_eq!(path, None);
+        assert_eq!(path_flag, None);
+    }
+
+    /// With no name, `--path` names the folder the name is worked out from.
+    #[test]
+    fn domain_add_parses_path_flag_with_no_name() {
+        let cli =
+            Cli::try_parse_from(["crystalline", "domain", "add", "--path", "./notes"]).unwrap();
+        let Some(Command::Domain {
+            command:
+                DomainCommand::Add {
+                    name,
+                    path,
+                    path_flag,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected `domain add`");
+        };
+        assert_eq!(name, None);
+        assert_eq!(path, None);
+        assert_eq!(path_flag, Some(PathBuf::from("./notes")));
+    }
+
+    /// A positional path and `--path` name the same thing twice; clap refuses
+    /// rather than picking one silently.
+    #[test]
+    fn domain_add_refuses_a_positional_path_together_with_path_flag() {
+        let result = Cli::try_parse_from([
+            "crystalline",
+            "domain",
+            "add",
+            "eng",
+            "./x",
+            "--path",
+            "./y",
+        ]);
+        assert!(
+            result.is_err(),
+            "the positional path and --path conflict and clap should refuse both at once"
         );
     }
 }

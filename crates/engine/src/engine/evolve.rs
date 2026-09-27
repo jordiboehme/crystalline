@@ -100,6 +100,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
@@ -109,20 +110,26 @@ impl Engine {
         let families = parse_families(&p.families)?;
         let rules = parse_rules(&p.rules)?;
 
-        // Every registered domain this caller may see, both as the default
-        // scope and as `V102`'s idea of which `[[domain:Target]]` prefixes name
-        // a real domain. Filtered on both counts deliberately: a finding names
-        // the domain, permalink and file path it fired on, and `V102`'s verdict
-        // on a cross-domain target is itself an answer about whether that
-        // domain exists.
-        let mut known_domains = self.known_domain_names();
-        known_domains.retain(|name| !hidden.contains(name));
-        known_domains.sort();
-        known_domains.dedup();
+        // Every LOCAL domain name this caller may see: the default sweep
+        // scope, one domain swept once whatever it also answers to.
+        let mut local_domains = self.known_domain_names();
+        local_domains.retain(|name| !hidden.contains(name));
+        local_domains.sort();
+        local_domains.dedup();
+
+        // Every spelling of every domain this caller may see - `V102`'s idea
+        // of which `[[domain:Target]]` prefixes name a real domain, so it no
+        // longer calls a target spelled by a canonical name or a
+        // machine-local alias unregistered - and, among those, the pairs
+        // `V110` reads: a spelling the name table would rewrite on write to
+        // its domain's canonical name. Both are filtered by `hidden` the way
+        // a write's own normalization is, so a finding never names a domain
+        // this caller may not see (see [`Engine::sweep_domain_names`]).
+        let (known_domains, respell) = self.sweep_domain_names(&hidden).await;
 
         let mut swept_scope: Vec<String> = Vec::new();
         if p.domains.is_empty() {
-            swept_scope = known_domains.clone();
+            swept_scope = local_domains.clone();
         } else {
             for name in &p.domains {
                 // The same resolution every other tool uses, so an unknown name
@@ -147,7 +154,14 @@ impl Engine {
         // unscoped sweep needs to whatever the largest domain costs.
         for name in &swept_scope {
             let Some(swept) = self
-                .sweep_domain(name, today, &known_domains, p.include_acknowledged, scope)
+                .sweep_domain(
+                    name,
+                    today,
+                    &known_domains,
+                    &respell,
+                    p.include_acknowledged,
+                    scope,
+                )
                 .await?
             else {
                 continue;
@@ -495,12 +509,11 @@ impl Engine {
         rule: &str,
         scope: &crate::scope::Scope,
     ) -> Result<Vec<Finding>> {
-        let mut known_domains = self.known_domain_names();
-        known_domains.sort();
-        known_domains.dedup();
+        let hidden = self.hidden_for(scope).await?;
+        let (known_domains, respell) = self.sweep_domain_names(&hidden).await;
         let today = Utc::now().date_naive();
         let Some(swept) = self
-            .sweep_domain(domain, today, &known_domains, true, scope)
+            .sweep_domain(domain, today, &known_domains, &respell, true, scope)
             .await?
         else {
             return Ok(Vec::new());
@@ -511,6 +524,42 @@ impl Engine {
             .into_iter()
             .filter(|f| f.rule == rule && f.permalink == permalink)
             .collect())
+    }
+
+    /// Every spelling of every domain this caller may see, and, among those,
+    /// the `(spelling, canonical name)` pairs `V110` reads: the ones the
+    /// name table would rewrite on write
+    /// ([`crystalline_core::names::NameTable::normalize`] answers `Some` for
+    /// them).
+    ///
+    /// Filtered by `hidden` the same way a write's own normalization is
+    /// ([`Engine::normalize_domain_spellings`]): a spelling that resolves to
+    /// a domain in `hidden` is left out of both lists, so neither a `V102`
+    /// nor a `V110` finding ever names a domain this caller may not see.
+    /// Every registered domain's own local name is a spelling of itself, so
+    /// the first list is always a superset of
+    /// [`Engine::known_domain_names`] - which is the whole of what makes
+    /// `V102` stop calling a target spelled by a canonical name or a
+    /// machine-local alias unregistered.
+    async fn sweep_domain_names(
+        &self,
+        hidden: &HashSet<String>,
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let table = self.name_table_now().await;
+        let mut known_domains: Vec<String> = Vec::new();
+        let mut respell: Vec<(String, String)> = Vec::new();
+        for (spelling, local) in table.spellings() {
+            if hidden.contains(&local) {
+                continue;
+            }
+            known_domains.push(spelling.clone());
+            if let Some(canonical) = table.normalize(&spelling) {
+                respell.push((spelling, canonical.to_string()));
+            }
+        }
+        known_domains.sort();
+        known_domains.dedup();
+        (known_domains, respell)
     }
 
     /// Acknowledge a finding: record on the engram that this rule's finding was
@@ -632,9 +681,16 @@ impl Engine {
         }
         // The answer here is a bool, so a mirror warning has nowhere to ride
         // out; `write_overlay_entry` has already logged it.
-        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
-            Ok(without_ack(current, &rule, scope))
-        })
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            acting,
+            |current| Ok(without_ack(current, &rule, scope)),
+        )
         .await?;
         Ok(true)
     }
@@ -690,6 +746,7 @@ impl Engine {
         name: &str,
         today: NaiveDate,
         known_domains: &[String],
+        respell: &[(String, String)],
         include_acknowledged: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Option<DomainSweep>> {
@@ -805,6 +862,19 @@ impl Engine {
         } else {
             HashMap::new()
         };
+        // `V110`'s whole input: this domain's own base references whose
+        // written prefix is one of `respell`'s spellings. Base rows only,
+        // like the store call it reuses; empty when `respell` is empty,
+        // which costs no read at all.
+        let spellings: Vec<String> = respell
+            .iter()
+            .map(|(spelling, _)| spelling.clone())
+            .collect();
+        let spelled_refs = if spellings.is_empty() {
+            Vec::new()
+        } else {
+            store.spelled_references(domain_id, &spellings).await?
+        };
         drop(store);
 
         let verify_config = domain_verify_config(&source);
@@ -910,6 +980,8 @@ impl Engine {
             tags: vocab.tags,
             tag_aliases: vocab.aliases,
             known_domains: known_domains.to_vec(),
+            respell: respell.to_vec(),
+            spelled_refs,
             attachments,
             shadowed_asset_refs,
             share: self.share_facts(name).await,

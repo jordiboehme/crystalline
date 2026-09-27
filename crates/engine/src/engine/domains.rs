@@ -16,6 +16,7 @@ impl Engine {
     ) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         let domains = match self.scoped_domains(&p.domains, &hidden).await? {
             ScopedDomains::AsAsked => Some(p.domains.clone()).filter(|d| !d.is_empty()),
             ScopedDomains::Only(domains) => Some(domains),
@@ -114,6 +115,16 @@ impl Engine {
     /// That is not the same fact as the one above and it is not a leak of it:
     /// a caller who may not see a domain never gets a row for it to read.
     ///
+    /// Each row also carries `canonical_name`, `aliases`, `name_origin` and
+    /// `shadowed` from the name table (see [`crystalline_core::names::NameTable`]),
+    /// and `renaming`, whether a rename has this domain paused right now (see
+    /// [`Engine::is_renaming`]). `shadowed` is a bool and never names the other
+    /// domain that holds the canonical name, and it is `false` when that
+    /// domain is hidden from the caller - a caller who may not see that other
+    /// domain must not learn of it this way either. `renaming` is always
+    /// present, `false` when nothing is paused, so a list-shaped rendering of
+    /// this array keeps one uniform set of columns.
+    ///
     /// The rows come back sorted by name, case-insensitively, so the sidebar
     /// and the CLI inherit one order rather than settling it three times.
     /// Registration order is what the config map preserves and it is
@@ -133,6 +144,14 @@ impl Engine {
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
+        // The name table as it stands, read once for every row: each domain's
+        // canonical name, its effective aliases and whether its canonical name
+        // is shadowed by another domain's local name. A caller who may not see
+        // a domain never gets a row for it (filtered below, same as every
+        // other field here), so `shadowed` never names the domain that holds
+        // the name - it is a bool, and that is the whole of what a caller who
+        // cannot see the holder is told.
+        let table = self.name_table_now().await;
 
         let mut out = Vec::new();
         // Every registration this instance has, not the startup snapshot
@@ -177,6 +196,27 @@ impl Engine {
                 // that takes changes directly, which is how a domain starts
                 // out.
                 "review": entry.is_overlay().then_some("overlay"),
+                // The name this domain's content carries (its MANIFEST
+                // `domain_name`, else its local name), its machine-local former
+                // names still accepted as input, how this registration got its
+                // name (`null` for a legacy entry nothing has inferred yet),
+                // whether its own canonical name is shadowed by another
+                // domain's local name here, and whether a rename has this
+                // domain paused right now. `renaming` is always a bool, never
+                // left out when false, so every row keeps the same columns.
+                "canonical_name": table.canonical(name).unwrap_or(name),
+                "aliases": table.aliases(name),
+                "name_origin": entry.name_origin,
+                // Only when the domain holding the name is one this caller
+                // may see: for a hidden holder the name reaches nothing this
+                // caller can read, and a `true` would tell them a domain of
+                // that name exists here.
+                "shadowed": table.is_shadowed(name)
+                    && table
+                        .canonical(name)
+                        .and_then(|canonical| table.resolve(canonical))
+                        .is_some_and(|holder| !hidden.contains(holder)),
+                "renaming": self.is_renaming(name),
             });
             // What THIS caller is holding in a domain that reviews changes, so
             // a screen can say "you have work waiting here" off the listing it
@@ -422,7 +462,12 @@ impl Engine {
                     known.join(", ")
                 )));
             };
-            if !spec.values.contains(&value.as_str()) {
+            if spec.kind == crystalline_core::PolicyKind::Text {
+                return Err(EngineError::Invalid(format!(
+                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
+                )));
+            }
+            if !spec.accepts(value) {
                 return Err(EngineError::Invalid(format!(
                     "`{key}: {value}` is not a value `{key}` takes; write one of {}",
                     spec.values.join(", ")
@@ -444,13 +489,22 @@ impl Engine {
         let actor = self.actor_for(None, overlay.as_deref());
         let (desc, source) = view.resolve("manifest").await?;
         let edits: Vec<(String, String)> = changes.to_vec();
-        self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
-            let mut out = current.to_string();
-            for (key, value) in &edits {
-                out = set_frontmatter_field(&out, key, value);
-            }
-            Ok(out)
-        })
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            scope,
+            move |current| {
+                let mut out = current.to_string();
+                for (key, value) in &edits {
+                    out = set_frontmatter_field(&out, key, value);
+                }
+                Ok(out)
+            },
+        )
         .await?;
         self.refresh_routing_cache().await;
         let markdown = match overlay.as_deref() {
@@ -478,26 +532,7 @@ impl Engine {
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
     /// engram in the database. Empty when there is no MANIFEST engram yet.
     async fn virtual_routing_bullets_for(&self, name: &str) -> Vec<String> {
-        let content = {
-            let store = self.store.lock().await;
-            match store.find_engram(name, "manifest").await.ok().flatten() {
-                Some(d) => store
-                    .engram_content(d.domain_id, &d.path)
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
-            }
-        };
-        let Some(source) = content else {
-            return Vec::new();
-        };
-        let Ok(engram) = parse_engram(&source) else {
-            return Vec::new();
-        };
-        Manifest::from_engram(&engram, &source)
-            .routing_bullets()
-            .to_vec()
+        self.virtual_manifest_facts(name).await.0
     }
 
     /// Routing bullets for every virtual domain, keyed by domain name. Supplied
@@ -566,9 +601,13 @@ impl Engine {
     /// the embedded stdio stack call this off the async path (at each MCP
     /// connection's initialize, and after every write that touches a virtual
     /// source) so the sync render only ever reads the cache under the lock.
+    ///
+    /// The same MANIFEST read carries the domain's declared name, so this is
+    /// [`Engine::refresh_names`]: both caches from one pass, then the name
+    /// table and its spellings in the index. The push writes only when the
+    /// table changed, so a refresh per connection costs reads.
     pub async fn refresh_routing_cache(&self) {
-        let bullets = self.virtual_routing_bullets().await;
-        *self.routing_virtual.write().unwrap() = bullets;
+        self.refresh_names().await;
     }
 
     /// The routing instructions a fresh MCP connection is handed at initialize:
@@ -745,6 +784,7 @@ impl Engine {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
         let hidden = self.hidden_for(scope).await?;
+        let p = &self.localized(p, &hidden).await;
         self.domain_entry_scoped(&p.domain, &hidden)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
         let prefix = folder_prefix(&raw);

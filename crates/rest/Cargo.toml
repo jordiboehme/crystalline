@@ -51,4 +51,5 @@ zip = { workspace = true }
 # crate boundary (see crystalline-identity's `testing` feature).
 crystalline-identity = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
+tower-service = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

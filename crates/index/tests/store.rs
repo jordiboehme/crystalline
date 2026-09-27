@@ -662,6 +662,1042 @@ parity!(
     reference_match_tie_break_prefers_the_lower_id
 );
 
+/// Every domain row answers to its own name through `domain_spelling`, which is
+/// what keeps resolution by local name independent of the engine: the store
+/// records the spelling itself when it records the domain. An upsert of a name
+/// it already knows adds nothing, and a wipe that takes the table away gets the
+/// spelling back from the next upsert of the domain.
+async fn a_new_domain_row_is_its_own_spelling(store: &dyn Store) {
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "the new row is its own spelling"
+    );
+
+    let again = store
+        .upsert_domain("eng", Some("/tmp/eng2"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(again, eng, "the same name keeps its id");
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "a second upsert of the same name adds no second spelling"
+    );
+
+    let notes = store
+        .upsert_domain("notes", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng), ("notes".to_string(), notes)],
+        "a virtual domain is its own spelling too, and the read is sorted"
+    );
+
+    store.wipe().await.unwrap();
+    assert!(
+        store.domain_spellings().await.unwrap().is_empty(),
+        "a wipe clears the spellings with the domains they point at"
+    );
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "and the sync that re-creates the row restores its own name"
+    );
+}
+parity!(
+    a_new_domain_row_is_its_own_spelling_on_both_backends,
+    a_new_domain_row_is_its_own_spelling
+);
+
+/// A reference that names its target domain by a spelling other than the
+/// domain's local name - a canonical name or an alias - resolves once that
+/// spelling is recorded. Before it is, `eng` names no domain at all, so the
+/// link stays pending (the fallback reading of the whole bracket text as a
+/// permalink in `ops` finds nothing either); after it, the resolve pass reads
+/// the target domain through the spelling table and lands on the runbook.
+async fn a_reference_spelled_by_an_extra_spelling_resolves(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "See [[eng:runbook]] before paging.\n",
+        ),
+    );
+    sync_domain(store, "eng-knowledge", eng_dir.path())
+        .await
+        .unwrap();
+    let synced = sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    assert_eq!(
+        synced.links_resolved, 0,
+        "`eng` is nobody's spelling yet, so the link stays pending"
+    );
+
+    let eng = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("eng".to_string(), eng),
+            ("eng-knowledge".to_string(), eng),
+            ("ops".to_string(), ops),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "the extra spelling reaches the domain the link means"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let runbook = store
+        .lookup_id("eng-knowledge", "runbook")
+        .await
+        .unwrap()
+        .unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == runbook),
+        "the resolved link is an edge to the runbook: {slice:?}"
+    );
+}
+parity!(
+    a_reference_spelled_by_an_extra_spelling_resolves_on_both_backends,
+    a_reference_spelled_by_an_extra_spelling_resolves
+);
+
+/// `clear_domain` is the store path behind `domain remove` and the orphan
+/// sweep, and it keeps the domain row by design, so the declared cascade never
+/// fires on either backend. The extra spellings go with the clear anyway: a
+/// removed domain's canonical name or alias left behind would still resolve to
+/// it and would keep that spelling from any domain registered under it later.
+/// Its own name stays, because the row stays and every row answers to its name.
+async fn a_removed_domain_takes_its_spellings_along(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let kept = store
+        .upsert_domain("kept", Some("/tmp/kept"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("gone-canonical".to_string(), gone),
+            ("gone-former".to_string(), gone),
+            ("kept-former".to_string(), kept),
+        ])
+        .await
+        .unwrap();
+
+    store.clear_domain(gone).await.unwrap();
+
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("gone".to_string(), gone),
+            ("kept".to_string(), kept),
+            ("kept-former".to_string(), kept),
+        ],
+        "the cleared domain keeps only its own name; the other domain keeps all of its spellings"
+    );
+}
+parity!(
+    a_removed_domain_takes_its_spellings_along_on_both_backends,
+    a_removed_domain_takes_its_spellings_along
+);
+
+/// The spelling table is replaced from the name table, and the answer is every
+/// spelling whose mapping moved: added, removed or pointing at another domain.
+/// Each domain's own name stays through every replace, listed or not.
+async fn replace_reports_added_removed_and_remapped_spellings(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/tmp/b"), DomainKind::File)
+        .await
+        .unwrap();
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), a), ("y".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec!["x".to_string(), "y".to_string()],
+        "both added"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), a),
+            ("y".to_string(), b),
+        ]
+    );
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec!["x".to_string(), "y".to_string()],
+        "x now points at b and y is gone"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), b),
+        ],
+        "the own names stay although the list left them out"
+    );
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), b)])
+        .await
+        .unwrap();
+    assert!(changed.is_empty(), "the same list again changes nothing");
+
+    assert!(
+        store
+            .replace_domain_spellings(&[("x".to_string(), a), ("x".to_string(), b)])
+            .await
+            .is_err(),
+        "one spelling for two domains is refused"
+    );
+    assert!(
+        store
+            .replace_domain_spellings(&[("z".to_string(), DomainId(9999))])
+            .await
+            .is_err(),
+        "a spelling for a domain row that does not exist is refused"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), b),
+        ],
+        "a refused replace leaves the table as it was"
+    );
+}
+parity!(
+    replace_reports_added_removed_and_remapped_spellings_on_both_backends,
+    replace_reports_added_removed_and_remapped_spellings
+);
+
+/// The spelling writes open their own transaction, so a caller already inside
+/// one is refused rather than having its work committed early by the inner
+/// commit. The caller's transaction is still there to roll back.
+async fn spelling_writes_refuse_to_nest_in_a_transaction(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    store.begin().await.unwrap();
+    // Refused because a transaction is already open, and for nothing else:
+    // each backend says so in its own words, both of them naming it.
+    let refused_for_nesting = |what: &str, result: crystalline_index::Result<()>| {
+        let err = result.expect_err(what).to_string().to_lowercase();
+        assert!(
+            err.contains("transaction"),
+            "{what} is refused for the open transaction: {err}"
+        );
+    };
+    refused_for_nesting(
+        "replace_domain_spellings",
+        store
+            .replace_domain_spellings(&[("x".to_string(), a)])
+            .await
+            .map(|_| ()),
+    );
+    refused_for_nesting(
+        "reset_references_to_spellings",
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .map(|_| ()),
+    );
+    refused_for_nesting(
+        "rename_domain_row",
+        store.rename_domain_row("a", "b").await.map(|_| ()),
+    );
+    store.rollback().await.unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("a".to_string(), a)]
+    );
+    assert_eq!(store.domain_id("a").await.unwrap(), Some(a));
+}
+parity!(
+    spelling_writes_refuse_to_nest_in_a_transaction_on_both_backends,
+    spelling_writes_refuse_to_nest_in_a_transaction
+);
+
+/// Instances that share one Postgres index each replace the spellings of the
+/// domains they list and nothing else: a replace from one instance never
+/// deletes the canonical names or aliases another instance recorded.
+async fn a_replace_leaves_unlisted_domains_alone(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/tmp/b"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[("a".to_string(), a), ("a-former".to_string(), a)])
+        .await
+        .unwrap();
+    let changed = store
+        .replace_domain_spellings(&[("b".to_string(), b), ("b-former".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(changed, vec!["b-former".to_string()]);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("a-former".to_string(), a),
+            ("b".to_string(), b),
+            ("b-former".to_string(), b),
+        ],
+        "the replace for b left a's former name alone"
+    );
+}
+parity!(
+    a_replace_leaves_unlisted_domains_alone_on_both_backends,
+    a_replace_leaves_unlisted_domains_alone
+);
+
+/// Push a name table into the store the way the engine does: every spelling
+/// mapped to the row of the local name it resolves to.
+async fn push_name_table(
+    store: &dyn Store,
+    inputs: &[crystalline_core::names::NameInput],
+) -> (crystalline_core::names::NameTable, Vec<String>) {
+    let table = crystalline_core::names::NameTable::build(inputs);
+    let mut rows = Vec::new();
+    for (spelling, local) in table.spellings() {
+        let id = store.domain_id(&local).await.unwrap().unwrap();
+        rows.push((spelling, id));
+    }
+    let changed = store.replace_domain_spellings(&rows).await.unwrap();
+    (table, changed)
+}
+
+/// What the spelling table resolves must be what the name table resolves,
+/// spelling for spelling: every spelling the name table answers maps to the
+/// row of that local name, and nothing else is in the table.
+async fn assert_sql_matches(store: &dyn Store, table: &crystalline_core::names::NameTable) {
+    let mut expected = Vec::new();
+    for (spelling, local) in table.spellings() {
+        expected.push((spelling, store.domain_id(&local).await.unwrap().unwrap()));
+    }
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        expected,
+        "the spelling table resolves exactly what the name table resolves"
+    );
+}
+
+fn name_input(
+    local: &str,
+    canonical: Option<&str>,
+    aliases: &[&str],
+) -> crystalline_core::names::NameInput {
+    crystalline_core::names::NameInput {
+        local: local.to_string(),
+        canonical: canonical.map(str::to_string),
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+    }
+}
+
+/// The name table's precedence, held by SQL. Local names always win, a
+/// canonical name another domain is registered under is shadowed, a canonical
+/// two domains claim resolves nowhere, and an alias gives way to a local name.
+/// The last is the case the upsert alone gets wrong: an alias recorded first
+/// keeps its spelling when a domain is registered under it later, because the
+/// upsert leaves a held spelling alone. The replace puts the local name first,
+/// and a link that went to the alias's domain goes to the new domain once its
+/// reference is reset and resolved again.
+async fn the_spelling_table_follows_the_name_table_precedence(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        ops_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the ops runbook\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram("Source", "source", "engram", "", "See [[x:runbook]].\n"),
+    );
+    let ek_dir = tempfile::tempdir().unwrap();
+    write(
+        ek_dir.path(),
+        "a.md",
+        &engram("A", "a", "engram", "", "body\n"),
+    );
+    sync_domain(store, "eng-knowledge", ek_dir.path())
+        .await
+        .unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    for name in ["platform", "a1", "a2"] {
+        store
+            .upsert_domain(name, Some("/tmp/n"), DomainKind::File)
+            .await
+            .unwrap();
+    }
+    let mut inputs = vec![
+        name_input("eng-knowledge", Some("eng"), &["old-eng"]),
+        name_input("ops", Some("platform"), &["x"]),
+        name_input("platform", None, &[]),
+        name_input("a1", Some("shared"), &[]),
+        name_input("a2", Some("shared"), &[]),
+    ];
+    let (table, _) = push_name_table(store, &inputs).await;
+    assert_sql_matches(store, &table).await;
+    let spellings = store.domain_spellings().await.unwrap();
+    assert!(
+        !spellings.iter().any(|(s, _)| s == "shared"),
+        "a contested canonical resolves nowhere: {spellings:?}"
+    );
+    let platform = store.domain_id("platform").await.unwrap().unwrap();
+    assert!(
+        spellings.contains(&("platform".to_string(), platform)),
+        "a shadowed canonical stays with the domain registered under it"
+    );
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        0,
+        "bound at sync time: a prefix that names no domain reads in the source's own"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let ops_runbook = store.lookup_id("ops", "runbook").await.unwrap().unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == ops_runbook),
+        "the link reaches the ops runbook: {slice:?}"
+    );
+
+    // A domain registered under `x` later: the upsert records its own name
+    // only where the spelling is free, and `x` is not.
+    let x_dir = tempfile::tempdir().unwrap();
+    write(
+        x_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the x runbook\n"),
+    );
+    sync_domain(store, "x", x_dir.path()).await.unwrap();
+    inputs.push(name_input("x", None, &[]));
+    let (table, changed) = push_name_table(store, &inputs).await;
+    assert_eq!(table.resolve("x"), Some("x"), "the name table: local wins");
+    assert_eq!(changed, vec!["x".to_string()]);
+    assert_sql_matches(store, &table).await;
+
+    assert_eq!(
+        store.reset_references_to_spellings(&changed).await.unwrap(),
+        1
+    );
+    assert_eq!(store.resolve_pending_links(ops).await.unwrap(), 1);
+    let x_runbook = store.lookup_id("x", "runbook").await.unwrap().unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == x_runbook)
+            && !slice.nodes.iter().any(|n| n.id == ops_runbook),
+        "the link now reaches the domain registered under `x`: {slice:?}"
+    );
+}
+parity!(
+    the_spelling_table_follows_the_name_table_precedence_on_both_backends,
+    the_spelling_table_follows_the_name_table_precedence
+);
+
+/// A domain's own name wins over an alias recorded for a different domain,
+/// even when that domain is not in the list: local names always win, whoever
+/// recorded the alias.
+async fn a_local_name_beats_an_alias_recorded_for_an_unlisted_domain(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[("a".to_string(), a), ("c".to_string(), a)])
+        .await
+        .unwrap();
+    let c = store
+        .upsert_domain("c", Some("/tmp/c"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("a".to_string(), a), ("c".to_string(), a)],
+        "the upsert leaves a held spelling where it is"
+    );
+    let changed = store
+        .replace_domain_spellings(&[("c-former".to_string(), c)])
+        .await
+        .unwrap();
+    assert_eq!(changed, vec!["c".to_string(), "c-former".to_string()]);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("c".to_string(), c),
+            ("c-former".to_string(), c),
+        ],
+    );
+    let changed = store
+        .replace_domain_spellings(&[("a".to_string(), a), ("c".to_string(), a)])
+        .await
+        .unwrap();
+    assert!(
+        changed.is_empty(),
+        "an alias on another domain's own name never takes it: {changed:?}"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("c".to_string(), c),
+            ("c-former".to_string(), c),
+        ],
+    );
+}
+parity!(
+    a_local_name_beats_an_alias_recorded_for_an_unlisted_domain_on_both_backends,
+    a_local_name_beats_an_alias_recorded_for_an_unlisted_domain
+);
+
+/// Resetting a spelling unbinds every reference that names it, so the next
+/// resolve pass binds it again through whatever the spelling means now.
+async fn resetting_a_spelling_unbinds_its_references(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram("Source", "source", "engram", "", "See [[x:runbook]].\n"),
+    );
+    sync_domain(store, "eng-knowledge", eng_dir.path())
+        .await
+        .unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    let eng = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    store
+        .replace_domain_spellings(&[("x".to_string(), eng)])
+        .await
+        .unwrap();
+    assert_eq!(store.resolve_pending_links(ops).await.unwrap(), 1);
+
+    assert_eq!(
+        store.reset_references_to_spellings(&[]).await.unwrap(),
+        0,
+        "no spellings, nothing to reset"
+    );
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["y".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "a spelling nobody wrote resets nothing"
+    );
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .unwrap(),
+        1
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let out = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].resolved, "the link is unbound: {out:?}");
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "an unbound reference is not counted twice"
+    );
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "the next pass binds it again"
+    );
+    assert!(store.outbound_refs(source, None).await.unwrap()[0].resolved);
+}
+parity!(
+    resetting_a_spelling_unbinds_its_references_on_both_backends,
+    resetting_a_spelling_unbinds_its_references
+);
+
+/// A row rename moves the name in place: the id stays, so every engram and
+/// every bound reference stays attached, and the own spelling follows. The
+/// stored `to_domain` text is left as written: the old name stays behind as an
+/// alias spelling of the same row, so a reference spelled with it keeps
+/// resolving, and so does one written after the rename.
+async fn renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "See [[eng:runbook]].\n\n- relates_to [[eng:runbook]]\n",
+        ),
+    );
+    write(
+        ops_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the ops runbook\n"),
+    );
+    let dev_dir = tempfile::tempdir().unwrap();
+    write(
+        dev_dir.path(),
+        "pointer.md",
+        &engram(
+            "Pointer",
+            "pointer",
+            "engram",
+            "",
+            "See [[platform:runbook]].\n",
+        ),
+    );
+    sync_domain(store, "eng", eng_dir.path()).await.unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    let eng = store.domain_id("eng").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    let dev = store.domain_id("dev").await.unwrap().unwrap();
+    // `platform` is an alias of ops until eng takes it as its local name, and
+    // dev's link binds through it to the ops runbook.
+    store
+        .replace_domain_spellings(&[("platform".to_string(), ops)])
+        .await
+        .unwrap();
+    assert_eq!(store.resolve_pending_links(dev).await.unwrap(), 1);
+    let pointer = store.lookup_id("dev", "pointer").await.unwrap().unwrap();
+    let ops_runbook = store.lookup_id("ops", "runbook").await.unwrap().unwrap();
+    let eng_runbook = store.lookup_id("eng", "runbook").await.unwrap().unwrap();
+    let reached =
+        |slice: &crystalline_index::GraphSlice, id| slice.nodes.iter().any(|n| n.id == id);
+    assert!(reached(
+        &store.neighbors(&[pointer], 1, None).await.unwrap(),
+        ops_runbook
+    ));
+
+    store.rename_domain_row("eng", "platform").await.unwrap();
+    assert_eq!(store.domain_id("platform").await.unwrap(), Some(eng));
+    assert_eq!(store.domain_id("eng").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("dev".to_string(), dev),
+            ("eng".to_string(), eng),
+            ("ops".to_string(), ops),
+            ("platform".to_string(), eng),
+        ],
+        "the own spelling moved with the row and took the name from the alias, \
+         and the old name stayed behind as an alias of the same row"
+    );
+    assert!(
+        !store.outbound_refs(pointer, None).await.unwrap()[0].resolved,
+        "a reference bound through the spelling the row took is unbound"
+    );
+    assert_eq!(store.resolve_pending_links(dev).await.unwrap(), 1);
+    let slice = store.neighbors(&[pointer], 1, None).await.unwrap();
+    assert!(
+        reached(&slice, eng_runbook) && !reached(&slice, ops_runbook),
+        "and binds again to the renamed domain: {slice:?}"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let out = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(
+        out.iter()
+            .all(|r| r.to_domain.as_deref() == Some("eng") && r.resolved),
+        "the relation and the link still say `eng` as written and stay bound: {out:?}"
+    );
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        reached(&slice, eng_runbook) && !reached(&slice, ops_runbook),
+        "and they still reach the renamed domain's runbook: {slice:?}"
+    );
+
+    // A reference written after the rename, spelled with the old name, binds
+    // through the alias to the renamed row.
+    write(
+        dev_dir.path(),
+        "later.md",
+        &engram("Later", "later", "engram", "", "See [[eng:runbook]].\n"),
+    );
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    store.resolve_pending_links(dev).await.unwrap();
+    let later = store.lookup_id("dev", "later").await.unwrap().unwrap();
+    let out = store.outbound_refs(later, None).await.unwrap();
+    assert!(
+        out.len() == 1 && out[0].resolved,
+        "a new `eng:` reference resolves through the alias: {out:?}"
+    );
+    assert!(reached(
+        &store.neighbors(&[later], 1, None).await.unwrap(),
+        eng_runbook
+    ));
+    assert!(
+        store
+            .lookup_id("platform", "runbook")
+            .await
+            .unwrap()
+            .is_some(),
+        "the engrams came along with the id"
+    );
+
+    store
+        .rename_domain_row("eng", "platform")
+        .await
+        .expect("a second identical call is fine");
+    assert_eq!(store.domain_id("platform").await.unwrap(), Some(eng));
+    store
+        .rename_domain_row("never", "seen")
+        .await
+        .expect("no row under either name is nothing to rename");
+    assert_eq!(store.domain_id("seen").await.unwrap(), None);
+
+    let err = store
+        .rename_domain_row("ops", "platform")
+        .await
+        .expect_err("renaming onto another row's name is refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("`ops`") && text.contains("`platform`"),
+        "the error names both rows: {text}"
+    );
+    assert_eq!(store.domain_id("ops").await.unwrap(), Some(ops));
+}
+parity!(
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias_on_both_backends,
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias
+);
+
+/// An empty domain row goes with everything that hangs off it - its spellings,
+/// its tag aliases and its host lock - and the name is free for the next
+/// registration or rename. A row that still holds anything, even one actor's
+/// draft or one attachment, stays, and so does every other row.
+async fn dropping_an_empty_domain_row(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let keep = store
+        .upsert_domain("keep", Some("/tmp/keep"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(gone, &[("old".to_string(), "new".to_string())])
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            gone,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("gone".to_string(), gone),
+            ("gone-alias".to_string(), gone),
+            ("keep".to_string(), keep),
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        store.drop_empty_domain_row("gone").await.unwrap(),
+        "an empty row is dropped"
+    );
+    assert_eq!(store.domain_id("gone").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("keep".to_string(), keep)],
+        "every spelling of the row went with it"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["keep".to_string()]
+    );
+    assert!(
+        !store.drop_empty_domain_row("gone").await.unwrap(),
+        "no row under the name is nothing to drop"
+    );
+
+    // The name is free again: a rename onto it works, and a fresh
+    // registration gets a clean row.
+    store.rename_domain_row("keep", "gone").await.unwrap();
+    assert_eq!(store.domain_id("gone").await.unwrap(), Some(keep));
+
+    // One actor's draft is a row, so the domain is not empty.
+    let drafted = store
+        .upsert_domain("drafted", Some("/tmp/drafted"), DomainKind::File)
+        .await
+        .unwrap();
+    let mut draft = record("a.md", "a", "draft", "sha-a");
+    draft.actor = "alice".to_string();
+    store.upsert_engram(drafted, &draft).await.unwrap();
+    assert!(
+        !store.drop_empty_domain_row("drafted").await.unwrap(),
+        "a row holding a draft stays"
+    );
+    assert_eq!(store.domain_id("drafted").await.unwrap(), Some(drafted));
+
+    // A base engram keeps it too.
+    let full = store
+        .upsert_domain("full", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(full, &record("b.md", "b", "base", "sha-b"))
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("full").await.unwrap());
+    assert_eq!(store.domain_id("full").await.unwrap(), Some(full));
+
+    // And so does one attachment.
+    let assets = store
+        .upsert_domain("assets", Some("/tmp/assets"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(
+            assets,
+            &AttachmentRow {
+                path: "assets/x.png".to_string(),
+                sha256: "abc".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                modified: "2026-09-26T10:00:00+00:00".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("assets").await.unwrap());
+    assert_eq!(store.domain_id("assets").await.unwrap(), Some(assets));
+
+    // A new registration under a dropped name holds no host lock of the
+    // row before it.
+    let first = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            first,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(store.drop_empty_domain_row("fresh").await.unwrap());
+    let second = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(store.domain_host(second).await.unwrap(), None);
+}
+parity!(
+    dropping_an_empty_domain_row_on_both_backends,
+    dropping_an_empty_domain_row
+);
+
+/// Names compare byte for byte, so a rename that only changes case is a real
+/// rename, and the old spelling stays behind as an alias like any other.
+async fn a_case_only_row_rename_works(store: &dyn Store) {
+    let id = store
+        .upsert_domain("Eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    store.rename_domain_row("Eng", "eng").await.unwrap();
+    assert_eq!(store.domain_id("eng").await.unwrap(), Some(id));
+    assert_eq!(store.domain_id("Eng").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("Eng".to_string(), id), ("eng".to_string(), id)]
+    );
+}
+parity!(
+    a_case_only_row_rename_works_on_both_backends,
+    a_case_only_row_rename_works
+);
+
+/// The engrams a rename has to respell: every base engram whose relations or
+/// links name one of the spellings, plus every one whose text holds a
+/// `crystalline://` URL on one of them, since no edge table records a URL. A
+/// longer name that merely starts with the spelling is not a match.
+async fn engrams_referencing_domains_lists_sources(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    let dev_dir = tempfile::tempdir().unwrap();
+    write(
+        ops_dir.path(),
+        "a.md",
+        &engram("A", "a", "engram", "", "See [[eng:x]].\n"),
+    );
+    write(
+        ops_dir.path(),
+        "b.md",
+        &engram("B", "b", "engram", "", "Read crystalline://eng/y first.\n"),
+    );
+    write(
+        dev_dir.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "Nothing here.\n"),
+    );
+    write(
+        dev_dir.path(),
+        "d.md",
+        &engram(
+            "D",
+            "d",
+            "engram",
+            "",
+            "See [[eng-other:z]] and crystalline://eng-other/z.\n",
+        ),
+    );
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+
+    assert_eq!(
+        store
+            .engrams_referencing_domains(&["eng".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            ("ops".to_string(), "a.md".to_string()),
+            ("ops".to_string(), "b.md".to_string()),
+        ]
+    );
+    assert!(
+        store
+            .engrams_referencing_domains(&[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+parity!(
+    engrams_referencing_domains_lists_sources_on_both_backends,
+    engrams_referencing_domains_lists_sources
+);
+
+/// One domain's references spelled by one of the given names, with the line
+/// and the bracket text as written, for the sweep's local-spelling finding.
+async fn spelled_references_lists_one_domains_references(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    let dev_dir = tempfile::tempdir().unwrap();
+    // Body line 1 of this helper's engram is file line 13.
+    write(
+        ops_dir.path(),
+        "a.md",
+        &engram(
+            "A",
+            "a",
+            "engram",
+            "",
+            "See [[eng-knowledge:runbook]] and [[other:z]].\n\n- relates_to [[eng-knowledge:guide]]\n",
+        ),
+    );
+    write(
+        dev_dir.path(),
+        "b.md",
+        &engram("B", "b", "engram", "", "See [[eng-knowledge:runbook]].\n"),
+    );
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    let a = store.lookup_id("ops", "a").await.unwrap().unwrap();
+
+    let refs = store
+        .spelled_references(ops, &["eng-knowledge".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        refs,
+        vec![
+            crystalline_index::SpelledRef {
+                from: a,
+                line: 13,
+                spelling: "eng-knowledge".to_string(),
+                raw: "eng-knowledge:runbook".to_string(),
+            },
+            crystalline_index::SpelledRef {
+                from: a,
+                line: 15,
+                spelling: "eng-knowledge".to_string(),
+                raw: "eng-knowledge:guide".to_string(),
+            },
+        ]
+    );
+    assert!(store.spelled_references(ops, &[]).await.unwrap().is_empty());
+}
+parity!(
+    spelled_references_lists_one_domains_references_on_both_backends,
+    spelled_references_lists_one_domains_references
+);
+
 /// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
 /// mentioned in prose (no relation type) stays unresolved until its target
 /// appears, then resolves on the later sync into a `links_to` graph edge. This
@@ -7938,13 +8974,16 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 152,
+        census.sites, 160,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         62 per backend in mod.rs (the move's `readdress_engram` and \
-         `engrams_mentioning` are the newest two, both on the base rows), 9 per \
-         backend in search.rs, 10 in the shared \
+         64 per backend in mod.rs (the emptiness probe of `drop_empty_domain_row` is \
+         the newest, waived because a draft keeps the row too; before it the URL half \
+         of `engrams_referencing_domains`, the move's `readdress_engram` and \
+         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 14 in the shared \
          statement builders in store.rs: the reference-resolution expression's four \
-         arms, plus the three engram hops of each of the two graph frontiers. Those \
+         arms, the three engram hops of each of the two graph frontiers, the two \
+         arms of the edge half of `engrams_referencing_domains` and the two arms of \
+         `spelled_references`, all four on the base rows. Those \
          six used to be six per backend in search.rs: one copy of each frontier \
          now, not one per dialect. One per \
          backend in search.rs is the anti-join inside `actor_screen_on`, which asks \
@@ -7959,9 +8998,10 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 18,
+        census.waived, 20,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Nine per backend: the six statements of `clear_domain` - the sixth is the one that \
+         Ten per backend: the emptiness probe of `drop_empty_domain_row`, where any \
+         actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \
          takes the bodies out of `engram_content`, which names the rows about to go because \
          that table has no domain of its own - the id-scoped delete inside `delete_engram` \
          and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \
