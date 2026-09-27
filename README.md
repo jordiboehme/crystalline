@@ -101,7 +101,7 @@ brew uninstall crystalline   # if you have the stable release
 brew install jordiboehme/tap/crystalline-dev
 ```
 
-Both formulae install the same `crystalline` binary, so your MCP registrations and the daemon keep working after a switch; `brew upgrade` moves to the newest dev build. To go back, `brew uninstall crystalline-dev && brew install jordiboehme/tap/crystalline`. The dev channel only moves forward: a dev build may migrate your index, and going back to an older stable release is not supported.
+Both formulae install the same `crystalline` binary, so your MCP registrations and the daemon keep working after a switch; `brew upgrade` moves to the newest dev build. The dev channel only moves forward: a dev build may migrate your index, and going back to an older stable release is not supported. To return to stable, wait for a stable release newer than your dev build, then `brew uninstall crystalline-dev && brew install jordiboehme/tap/crystalline`; the newer release takes over the running daemon on its own.
 
 </details>
 

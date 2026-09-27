@@ -25,8 +25,20 @@ on:
 
 # A newer merge supersedes an older build still in flight: only the newest
 # commit is worth installing.
+#
+# The group is decided when a run starts, before any job `if` runs, and
+# workflow_run fires for every CI conclusion. So a run that will not ship (a
+# red or cancelled CI run, a pull request, a dispatch off main) gets a group
+# of its own; in the shared group it would cancel a green build and then skip
+# itself, and nothing would ship. The condition is the `version` job's guard.
 concurrency:
-  group: dev-channel
+  group: >-
+    ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+    (github.event_name == 'workflow_run' &&
+    github.event.workflow_run.conclusion == 'success' &&
+    github.event.workflow_run.event == 'push' &&
+    github.event.workflow_run.head_repository.full_name == github.repository))
+    && 'dev-channel' || format('dev-channel-skip-{0}', github.run_id) }}
   cancel-in-progress: true
 
 permissions:
