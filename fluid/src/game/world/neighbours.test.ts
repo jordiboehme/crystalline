@@ -20,8 +20,8 @@ describe("nearOf", () => {
   const seeds = Array.from({ length: 400 }, (_, i) => seedFor("near-test", i));
 
   it("holds exactly the neighbours' raw heroes and curios", () => {
-    // Mutation caught: a neighbour read with its full cap, its any draw
-    // counted though its pool slot took, or the curios' archetype dropped.
+    // Mutation caught: a neighbour's any draw counted though its pool slot
+    // took, or the curios' archetype dropped.
     const ns: Neighbour[] = seeds
       .slice(1, 7)
       .map((s, i) => ({ seed: s, archetype: i % 2 === 0 ? "lab" : null }));

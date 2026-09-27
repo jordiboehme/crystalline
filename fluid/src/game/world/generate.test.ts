@@ -768,11 +768,13 @@ describe("the neighbours (2.6f C5)", () => {
     );
   });
 
-  it("halves the heroes two neighbouring rooms share, over a station of rooms (2.6f C7, C8)", () => {
+  it("cuts the heroes two neighbouring rooms share to a third, over a station of rooms (2.6f C7, C8)", () => {
     // A ring of 300 typed rooms, each with ways to i+1 and i+3 and
     // hatches from i-1 and i-3. The planner forecast 6.0 percent of ways
     // sharing a hero without the skip and 2.0 with it. Mutation caught:
-    // generateRoom not handing its near on, or the skip dropped.
+    // generateRoom not handing its near on, the skip dropped, or the pool
+    // skip dropped with only the solo tie-break left (the turret alone
+    // takes the ring from 51 to 24 shared ways, half and not a third).
     const N = 300;
     const TYPES = ["manifest", "decision", "runbook", "reference", "guide"];
     const at = (i: number) => `ring-${String(((i % N) + N) % N)}`;
@@ -818,7 +820,7 @@ describe("the neighbours (2.6f C5)", () => {
       `2.6f ways sharing a hero: ${String(before)} -> ${String(after)} of ${String(2 * N)}`,
     );
     expect(before).toBeGreaterThan(15);
-    expect(after).toBeLessThanOrEqual(before / 2);
+    expect(after).toBeLessThanOrEqual(before / 3);
     expect(after).toBeLessThanOrEqual(0.04 * 2 * N);
   }, 30_000);
   it("keeps a shared solo draw in the lower-seeded room only, and moves both rooms off a shared pool pick (Review Focus 4)", () => {

@@ -36,12 +36,12 @@
  * 8. Last, the heroes and the set dressing. The heroes (`placeHeroes`,
  *    `heroes.ts`) stand after the scaffold and before the dressing, which
  *    keeps off what they reserve (`heroReserve`), skipping, by `near`
- *    (`nearFor`, 2.6f C5 to C8), what the rooms its ways lead to draw. Then `dressRoom`
- *    (`dress.ts`) reads the finished room, fixtures, furniture,
- *    scaffolding and heroes included, and adds its props. The dressing runs
- *    after everything else and only ever adds decoration, so a prop never
- *    moves a fixture, and the room states its entrance, bays and corridor
- *    so the dressing never has to work them out again.
+ *    (`nearFor`, 2.6f C5 to C8), what the rooms its ways lead to draw.
+ *    Then `dressRoom` (`dress.ts`) reads the finished room, fixtures,
+ *    furniture, scaffolding and heroes included, and adds its props. The
+ *    dressing runs after everything else and only ever adds decoration, so
+ *    a prop never moves a fixture, and the room states its entrance, bays
+ *    and corridor so the dressing never has to work them out again.
  * 9. Last, the curios (`placeCurios`, `curios.ts`), after the dressing,
  *    since shelves and cabinets are props; they read everything and move
  *    nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the

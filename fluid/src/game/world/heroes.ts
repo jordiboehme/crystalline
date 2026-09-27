@@ -43,10 +43,11 @@
  *    any-archetype draw a chance of `ANY_SHARE` and a roll from
  *    `seedFor(seed, "hero", "any")`.
  * 2. The slab, when drawn, unless a lower-seeded neighbour draws it (a
- *    solo draw, 2.6f C8: `near.heroesBelow`): one candidate, at the hall's centre x with its
- *    south face on the hall's centre line, facing the entrance (turn 2,
- *    H9). It stands only where the centre is free: its box grown by
- *    `HERO_CLEAR` also keeps off every pipe run's box.
+ *    solo draw, 2.6f C8: `near.heroesBelow`): one candidate, at the
+ *    hall's centre x with its south face on the hall's centre line,
+ *    facing the entrance (turn 2, H9). It stands only where the centre is
+ *    free: its box grown by `HERO_CLEAR` also keeps off every pipe run's
+ *    box.
  * 3. The turret, when drawn and a slot is left, unless a lower-seeded
  *    neighbour draws it (C8, as in step 2): the cells of the hall's
  *    corner zones that kept all four spots, centred on the cell and turned
