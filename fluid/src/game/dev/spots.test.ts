@@ -29,6 +29,7 @@ import {
   PROP_SURFACES,
   hostSurfaces,
 } from "../world/curios";
+import { plainFinish } from "../world/finish";
 import {
   HERO_FRONT,
   heroFootprint,
@@ -517,6 +518,7 @@ describe("frameCurio's sight line", () => {
       heroes,
       props: [],
       curios,
+      finish: plainFinish(0),
       lights: [],
       dropped: 0,
       inboundMore: 0,

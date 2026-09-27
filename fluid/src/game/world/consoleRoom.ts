@@ -6,7 +6,9 @@
  *
  * It is a 6 by 6 cell hall (12 m across), 4 m high, with nothing a
  * generated room carries: no fixtures, decor, scaffold, heroes, props or
- * curios, and no title. What it holds instead are its fittings,
+ * curios, no title and a plain finish (`plainFinish`: accent 0, wall
+ * pattern 0; its shell keeps its own tints and draws no accent stripe
+ * whatever the finish says). What it holds instead are its fittings,
  * `RoomSpec.interior` (C2): every wall edge carries one flush piece (the
  * inner doors across the south row's cells 2 and 3, the scanner on cell
  * 4's south edge, a wall of roundels on each of the other 21 edges), and
@@ -21,12 +23,14 @@
  *
  * A pure constant: no clock and no counter, so the same call gives the same
  * room byte for byte. Like `canned.ts` it may import the seeds, the version,
- * the layout, the sites, the footprints, the types and the units, never
+ * the layout, the sites, the footprints, the finish, the types and the
+ * units, never
  * `move.ts`, `interact.ts` or `render/`.
  */
 
 import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
+import { plainFinish } from "./finish";
 import { turnedBox } from "./footprints";
 import { wallAnchor } from "./sites";
 import type {
@@ -272,6 +276,7 @@ export function consoleRoom(): RoomSpec {
     heroes: [],
     props: [],
     curios: [],
+    finish: plainFinish(0),
     interior: interiorOf(seed),
     lights: lightsOf(seed),
     dropped: 0,

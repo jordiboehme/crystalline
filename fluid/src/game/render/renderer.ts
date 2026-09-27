@@ -6,7 +6,8 @@
  * texture array (procedural layers, the pictogram set, and the text layers
  * of `layerPlan`: one per screen, poster and placard, one per six labels),
  * makes the room's light grid texture, uploads the set dressing and keeps
- * the look's numbers - and `draw` is then a handful of uniform uploads, one
+ * the look's numbers - and `draw` is then a handful of uniform uploads
+ * (the room's accent among them, `uAccent` from `accentFor`, 2.7 C8), one
  * small light upload, the blink gains (`uBlink`, the blink banks of
  * `blink.ts`, H11), the room and its moving parts (each mover drawn with
  * the uniforms `moverDraw` in `parts.ts` gives it), one instanced draw per
@@ -72,7 +73,13 @@ import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
 import { instanceGroups } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
-import { C64_PALETTE, applyCondition, type Look, type LookId } from "./looks";
+import {
+  C64_PALETTE,
+  accentFor,
+  applyCondition,
+  type Look,
+  type LookId,
+} from "./looks";
 import type { MoverPart } from "./models";
 import { buildCurioMesh } from "./models/curios";
 import { buildHeroMesh } from "./models/heroes";
@@ -569,6 +576,7 @@ export function createRenderer(
         light.grid.width,
         light.grid.depth,
       );
+      gl.uniform3f(scene.uniform("uAccent"), ...accentFor(room, look));
       gl.uniform1f(scene.uniform("uLightScale"), look.lightScale);
       gl.uniform1f(scene.uniform("uFalloff"), look.falloff);
       gl.uniform1f(scene.uniform("uMinLight"), look.minLight);

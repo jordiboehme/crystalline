@@ -40,6 +40,10 @@
  * along its host's local `a` axis, the wall-parallel one, whatever its own
  * length against the surface's `d` axis, and the rows are grouped to fit
  * that budget.
+ *
+ * The gallery and the hero hall take a plain finish (`plainFinish`: accent
+ * 0, wall pattern 0 everywhere); the variants hall shows every wall
+ * pattern (`variantsHallRoom`).
  */
 
 import { seedFor } from "../core/seed";
@@ -54,6 +58,7 @@ import {
   type HostSurface,
 } from "./curios";
 import { PROP_ORDER } from "./dress";
+import { plainFinish } from "./finish";
 import { FOOTPRINTS, PIPE_HALF } from "./footprints";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
 import { faceCentre, HERO_ORDER } from "./heroes";
@@ -580,6 +585,7 @@ export function galleryRoom(): RoomSpec {
     heroes: [],
     props,
     curios: [],
+    finish: plainFinish(layout.bays.length),
     lights,
     dropped: 0,
     inboundMore: 0,
@@ -1171,6 +1177,7 @@ export function heroHallRoom(): RoomSpec {
     heroes,
     props: [],
     curios: [],
+    finish: plainFinish(layout.bays.length),
     lights: heroHallLights(seed, layout),
     dropped: 0,
     inboundMore: 0,
@@ -1328,7 +1335,10 @@ const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
  * but the machines, the terminals and the decor fills the hall. Condition
  * clean, so no scaffold; no heroes, props or curios. One steady light zone
  * per four by four block that holds any floor, as `galleryRoom`'s and
- * `heroHallRoom`'s. The same call gives the same room byte for byte.
+ * `heroHallRoom`'s. Accent 0, and its hall, bays and corridor in wall
+ * patterns 0, then 1, 2, 1, 2 bay by bay and 1, so the hall and its bays
+ * show all three patterns (2.7 C11). The same call gives the same room
+ * byte for byte.
  */
 export function variantsHallRoom(): RoomSpec {
   const seed = seedFor(GAME_VERSION, "variants-hall");
@@ -1446,6 +1456,12 @@ export function variantsHallRoom(): RoomSpec {
     heroes: [],
     props: [],
     curios: [],
+    finish: {
+      accent: 0,
+      hallWalls: 0,
+      bayWalls: [1, 2, 1, 2].slice(0, layout.bays.length),
+      corridorWalls: 1,
+    },
     lights,
     dropped: 0,
     inboundMore: 0,

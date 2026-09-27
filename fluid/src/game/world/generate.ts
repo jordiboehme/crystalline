@@ -46,6 +46,9 @@
  *    since shelves and cabinets are props; they read everything and move
  *    nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the
  *    rooms its ways lead to draw.
+ * 10. The finish (`finishFor`, `finish.ts`, 2.7 C8, C11): the room's accent
+ *    and the wall pattern of its hall, each bay and its corridor, by seed
+ *    alone, so it moves nothing else.
  *
  * The forced-hero seam (2.6e C15): `withHeroes` stands a given set of
  * heroes in a room the generator built and re-runs steps 8 and 9 round
@@ -70,6 +73,7 @@ import {
 } from "./layout";
 import { dressRoom } from "./dress";
 import { curioDraws, placeCurios } from "./curios";
+import { finishFor } from "./finish";
 import { decorFootprint } from "./footprints";
 import { HERO_ORDER, heroDraws, placeHeroes } from "./heroes";
 import { nearOf, type Neighbour } from "./neighbours";
@@ -693,7 +697,8 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   };
   // The heroes stand before the dressing, which keeps off what they
   // reserve. They replace the empty list in place, so the keys (and the
-  // goldens) read fixtures, decor, scaffold, heroes, props, curios, lights.
+  // goldens) read fixtures, decor, scaffold, heroes, props, curios, finish,
+  // lights.
   const near = nearFor(place);
   const room: RoomBase = {
     ...base,
@@ -707,6 +712,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     ...head,
     props: dressed.props,
     curios: placeCurios(dressed, curioDraws(dressed), near),
+    finish: finishFor(seed, layout.bays.length),
     lights,
     dropped: left,
     inboundMore: more,
@@ -721,8 +727,8 @@ export function generateRoom(place: PlaceInput): RoomSpec {
  * reserve), then the curios placed afresh on those props with the room's
  * own draws (`curioDraws`) and its neighbours (`nearFor(place)`), as
  * `generateRoom` places them. Nothing else of the room moves: the layout,
- * the fixtures, the furniture, the scaffold and the lights are the room's
- * own, and the fields keep their order. The heroes are taken as given:
+ * the fixtures, the furniture, the scaffold, the finish and the lights are
+ * the room's own, and the fields keep their order. The heroes are taken as given:
  * nothing here checks that they fit, so the caller stands them where the
  * hero pass would allow. `withHeroes(place, generateRoom(place),
  * generateRoom(place).heroes)` is `generateRoom(place)` again.

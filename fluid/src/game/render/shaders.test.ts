@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
-import { FLAG } from "./geometry";
+import { ACCENT_MARK, FLAG } from "./geometry";
 import rendererSource from "./renderer.ts?raw";
 import { SCENE_FS, SCENE_VS, SIGNAL_GAIN } from "./shaders";
 
@@ -105,4 +105,14 @@ it("turns a mover about its pivot with uModelYaw, the map swungPoint mirrors (2.
   expect(SCENE_VS).toContain(
     "mat2(uModelYaw.x, -uModelYaw.y, uModelYaw.y, uModelYaw.x)",
   );
+});
+
+it("swaps the accent mark for uAccent in the vertex shader (2.7 C8)", () => {
+  // Mutation caught: the tint passed through untouched (the stripe would
+  // draw with a negative red), or the mark tested on the wrong channel.
+  expect(SCENE_VS).toContain("uniform vec3 uAccent;");
+  expect(SCENE_VS).toContain(
+    "vTint = aTint.x < 0.0 ? uAccent * aTint.y : aTint;",
+  );
+  expect(ACCENT_MARK).toBeLessThan(0);
 });

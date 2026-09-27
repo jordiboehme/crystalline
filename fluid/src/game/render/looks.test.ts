@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ACCENT_COUNT } from "../world/variants";
 import {
   C64_PALETTE,
   LOOKS,
@@ -12,7 +13,7 @@ import {
 import type { Condition } from "../world/types";
 
 function allColours(look: (typeof LOOKS)["day"]): Rgb[] {
-  return [...Object.values(look.palette), look.edge.colour];
+  return [...Object.values(look.palette), look.edge.colour, ...look.accents];
 }
 
 describe("looks", () => {
@@ -63,6 +64,25 @@ describe("looks", () => {
         p.every((v, i) => Math.abs(v - (c[i] ?? -1)) < 1e-6),
       );
     for (const c of Object.values(f.palette)) expect(inPalette(c)).toBe(true);
+    for (const c of f.accents) expect(inPalette(c)).toBe(true);
+  });
+
+  it("gives every look five accents, clear of the colours that mark a way (2.7 C7)", () => {
+    // Mutation caught: an accent too near a door, portal or cross-domain
+    // portal colour (an accent would read as a way), or a look short of one.
+    const dist = (a: Rgb, b: Rgb) =>
+      Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    for (const id of LOOK_ORDER) {
+      const look = LOOKS[id];
+      expect(look.accents).toHaveLength(ACCENT_COUNT);
+      for (const a of look.accents)
+        for (const way of [
+          look.palette.door,
+          look.palette.portal,
+          look.palette.portalAlt,
+        ])
+          expect(dist(a, way)).toBeGreaterThanOrEqual(0.25);
+    }
   });
 
   it("have exactly sixteen C64 colours", () => {

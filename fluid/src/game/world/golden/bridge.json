@@ -475,6 +475,12 @@
     }
   ],
   "curios": [],
+  "finish": {
+    "accent": 2,
+    "hallWalls": 0,
+    "bayWalls": [],
+    "corridorWalls": 2
+  },
   "lights": [
     {
       "x0": 0,

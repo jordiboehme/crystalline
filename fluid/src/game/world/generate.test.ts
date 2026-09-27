@@ -101,14 +101,24 @@ describe("the goldens", () => {
     expect(generateRoom(CANNED_BRIDGE).corridor).toBeNull();
   });
 
-  it("puts heroes right after decor and scaffold, then props and curios, before the lights", () => {
+  it("puts heroes right after decor and scaffold, then props, curios and the finish, before the lights", () => {
     const keys = Object.keys(generateRoom(CANNED_WORKSHOP));
     const at = (k: string) => keys.indexOf(k);
     expect(at("decor")).toBeLessThan(at("scaffold"));
     expect(at("heroes")).toBe(at("scaffold") + 1);
     expect(at("props")).toBe(at("heroes") + 1);
     expect(at("curios")).toBe(at("props") + 1);
-    expect(at("lights")).toBe(at("curios") + 1);
+    expect(at("finish")).toBe(at("curios") + 1);
+    expect(at("lights")).toBe(at("finish") + 1);
+  });
+
+  it("gives every overflow bay a wall pattern of its own (2.7 C11)", () => {
+    // Mutation caught: the finish drawn for a fixed number of bays instead
+    // of the layout's.
+    const hub = generateRoom(CANNED_HUB);
+    expect(hub.bays.length).toBeGreaterThan(0);
+    expect(hub.finish.bayWalls).toHaveLength(hub.bays.length);
+    expect(generateRoom(CANNED_BRIDGE).finish.bayWalls).toEqual([]);
   });
 });
 

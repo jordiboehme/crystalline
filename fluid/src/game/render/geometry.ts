@@ -38,8 +38,10 @@
  * the seams run on unbroken across cells. A room with `interior` (the
  * console room, 2.6e C4) draws its shell in `CONSOLE_SHELL`'s fixed tints
  * on the same layers, whatever the look; its flush fittings cover the
- * walls. The models themselves are built
- * by the recipes in `models/`, with the modelling kit of `kit.ts`.
+ * walls. Every other room's full wall quads carry the accent stripe
+ * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
+ * fixture edges, the entrance edge and lintels. The models themselves are
+ * built by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
 import { lampBoxes } from "../world/lamps";
@@ -47,7 +49,7 @@ import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import { BLINK_GROUPS } from "./blink";
-import { createKit } from "./kit";
+import { DECAL_LIFT, createKit } from "./kit";
 import { LAYER, layerPlan } from "./layers";
 import type { Look, Rgb } from "./looks";
 import {
@@ -127,6 +129,36 @@ export interface Surface {
   tint: Rgb;
   flag: Flag;
 }
+
+/**
+ * The accent mark (2.7 C8): a tint whose first channel is this negative
+ * number is no colour but "the room's accent, times the second channel".
+ * No real colour has a negative channel, so the vertex shader tells the two
+ * apart by the first channel's sign and swaps a marked tint for `uAccent`
+ * (the look's accent at the room's index, `accentFor` in `looks.ts`) times
+ * `k`. So a mesh that carries the accent stays one mesh per look: the
+ * static room and the instanced families take the room's accent at draw
+ * time, never at build time.
+ */
+export const ACCENT_MARK = -1;
+
+/**
+ * The accent mark's tint (2.7 C8): `[ACCENT_MARK, k, 0]`, the room's
+ * accent scaled by `k` (1 the accent itself, below 1 a darker shade of it).
+ * A surface carrying it is drawn in the room's accent in every look.
+ */
+export function accentTint(k: number): Rgb {
+  return [ACCENT_MARK, k, 0];
+}
+
+/**
+ * The accent stripe (2.7 C9): a band 0.08 m tall, from `h0` to `h1`
+ * metres, one `DECAL_LIFT` proud of every full wall quad of the hall, the
+ * bays and the corridor, except fixture edges, the entrance edge and
+ * lintels. It carries the accent mark, so it takes the room's accent in
+ * every look.
+ */
+export const ACCENT_STRIPE = { h0: 1.2, h1: 1.28 } as const;
 
 /** Floats the builder reserves at first: room for 1024 vertices. */
 const INITIAL_FLOATS = 1024 * FLOATS_PER_VERTEX;
@@ -454,7 +486,9 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  * quad from the floor to the ceiling, facing into the cell, so no wall ever
  * stands between two floor cells. Where a doorway cell (see
  * `doorwayColumns`) meets the hall, a bay or the corridor, a lintel runs
- * from `LINTEL` to the ceiling on both faces of the edge. Lamps and
+ * from `LINTEL` to the ceiling on both faces of the edge. A full wall quad
+ * on an edge that is neither a fixture's slot nor the entrance's carries
+ * the accent stripe, unless the room has fittings (`interior`). Lamps and
  * scaffolding share the hall's ceiling height, which bays and the corridor
  * share too.
  */
@@ -487,6 +521,18 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
     tint: [1, 1, 1] as Rgb,
     flag: FLAG.lit,
   };
+  // The accent stripe (2.7 C9) runs on the wall's own layer in the room's
+  // accent, and skips every fixture's edge and the entrance's. A room with
+  // fittings draws none.
+  const stripe: Surface = {
+    layer: wall.layer,
+    tint: accentTint(1),
+    flag: FLAG.lit,
+  };
+  const fixtureEdges = new Set(
+    room.fixtures.map((f) => `${f.slot.x},${f.slot.y},${f.slot.side}`),
+  );
+  const entranceEdge = `${room.entrance.x},${room.entrance.y},s`;
   // Wall slots that are ways through keep their wall clear of baseboards.
   const openings = new Set(
     room.fixtures
@@ -509,6 +555,18 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
         const ny = y + dy;
         if (!isFloor(room.grid, nx, ny)) {
           edgeQuad(b, x, y, side, 0, H, 0, wall);
+          const key = `${x},${y},${side}`;
+          if (!fitted && !fixtureEdges.has(key) && key !== entranceEdge)
+            edgeQuad(
+              b,
+              x,
+              y,
+              side,
+              ACCENT_STRIPE.h0,
+              ACCENT_STRIPE.h1,
+              DECAL_LIFT,
+              stripe,
+            );
           if (building && !openings.has(`${x},${y},${side}`))
             edgeQuad(b, x, y, side, 0, BASEBOARD, BASEBOARD_INSET, hazard);
         } else if (doorways.has(x) !== doorways.has(nx) && H > LINTEL) {

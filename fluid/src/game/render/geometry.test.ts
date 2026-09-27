@@ -3,19 +3,24 @@ import { describe, expect, it } from "vitest";
 import { boxKey } from "../world/box";
 import { CANNED_BRIDGE, CANNED_HUB, heroHallRoom } from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
+import { plainFinish } from "../world/finish";
 import { generateRoom } from "../world/generate";
-import { BAY, isFloor } from "../world/layout";
-import type { PlaceInput, RoomSpec } from "../world/types";
+import { BAY, isFloor, wallRuns } from "../world/layout";
+import { edgeKey } from "../world/sites";
+import type { PlaceInput, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import {
+  ACCENT_MARK,
+  ACCENT_STRIPE,
   FLAG,
   FLOATS_PER_VERTEX,
   LINTEL,
+  accentTint,
   buildRoomMesh,
   type MeshData,
 } from "./geometry";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
-import { LOOKS, type Rgb } from "./looks";
+import { LOOKS, accentFor, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
 import { buildInteriorMesh } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
@@ -427,5 +432,83 @@ describe("the console room's movers and size (2.6e C9, C19)", () => {
     const total =
       (s.count + pieces + movers.reduce((n, m) => n + m.mesh.count, 0)) / 3;
     expect(total).toBeLessThan(60_000);
+  });
+});
+
+/**
+ * The accent stripe's quads in a mesh: walked six vertices at a time, the
+ * vertical quads whose tint carries the accent mark, each with its tint,
+ * its bottom and top height and the key of the cell edge it lies on (read
+ * back from its world x and z and its normal, as `edgeQuad` places it).
+ */
+function stripeQuads(
+  m: MeshData,
+): { tint: number[]; h0: number; h1: number; edge: string }[] {
+  const vs = all(m);
+  const out: { tint: number[]; h0: number; h1: number; edge: string }[] = [];
+  for (let q = 0; q + 5 < vs.length; q += 6) {
+    const quad = vs.slice(q, q + 6);
+    const first = quad[0];
+    if (first === undefined) continue;
+    if (!quad.every((v) => v.tint[0] === ACCENT_MARK)) continue;
+    if (!quad.every((v) => Math.abs(v.normal[1]) < EPS)) continue;
+    const [nx, , nz] = first.normal;
+    const side: Side = nz > 0.5 ? "n" : nz < -0.5 ? "s" : nx > 0.5 ? "w" : "e";
+    const mid = (k: 0 | 2) =>
+      quad.reduce((sum, v) => sum + v.pos[k], 0) / quad.length;
+    const ys = quad.map((v) => v.pos[1]);
+    out.push({
+      tint: first.tint,
+      h0: Math.min(...ys),
+      h1: Math.max(...ys),
+      edge: edgeKey({
+        x: Math.floor(mid(0) / CELL),
+        y: Math.floor(mid(2) / CELL),
+        side,
+      }),
+    });
+  }
+  return out;
+}
+
+describe("the accent stripe (2.7 C8, C9)", () => {
+  it("runs the accent stripe on every full wall but fixture edges and the entrance (2.7 C9)", () => {
+    // Mutation caught: a stripe on a door's edge, on the entrance, on a
+    // lintel, at the wrong height, or tinted with a real colour instead of
+    // the accent mark.
+    const room = generateRoom(CANNED_BRIDGE);
+    const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    expect(stripes.length).toBeGreaterThan(0);
+    const fixtureEdges = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
+    const entrance = edgeKey({ ...room.entrance, side: "s" });
+    for (const q of stripes) {
+      expect(q.tint).toEqual(accentTint(1));
+      expect(q.h0).toBeCloseTo(ACCENT_STRIPE.h0, 6);
+      expect(q.h1).toBeCloseTo(ACCENT_STRIPE.h1, 6);
+      expect(fixtureEdges.has(q.edge)).toBe(false);
+      expect(q.edge).not.toBe(entrance);
+    }
+    // Every free wall edge carries one.
+    const walls = wallRuns(room.grid).flat().map(edgeKey);
+    const expected = walls.filter(
+      (e) => !fixtureEdges.has(e) && e !== entrance,
+    );
+    expect(new Set(stripes.map((q) => q.edge))).toEqual(new Set(expected));
+  });
+
+  it("uploads the look's accent at the room's index, and draws no stripe in the console room (Review Focus 5)", () => {
+    // Mutation caught: the stripe drawn in a room with fittings, or the
+    // accent read from the wrong look after a switch.
+    expect(
+      stripeQuads(buildRoomMesh(consoleRoom(), LOOKS.aperture).static),
+    ).toEqual([]);
+    const room = {
+      ...generateRoom(CANNED_BRIDGE),
+      finish: { ...plainFinish(0), accent: 3 },
+    };
+    expect(accentFor(room, LOOKS.freescape)).toEqual(
+      LOOKS.freescape.accents[3],
+    );
+    expect(accentFor(room, LOOKS.aperture)).toEqual(LOOKS.aperture.accents[3]);
   });
 });

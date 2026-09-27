@@ -579,6 +579,25 @@ export interface LightZone {
 }
 
 /**
+ * A room's finish (2.7 C8, C11): its accent's index in the look's accent
+ * set, and the wall pattern of its hall, each overflow bay and its
+ * corridor.
+ *
+ * `accent` is 0 to `ACCENT_COUNT - 1` (`variants.ts`), an index into
+ * `Look.accents`, so the room keeps its colour family in every look. The
+ * wall patterns are 0 to `WALL_PATTERNS - 1` (`finish.ts`): `bayWalls` has
+ * one entry per overflow bay, in `RoomSpec.bays` order, and neither a bay's
+ * nor the corridor's pattern is ever the hall's in a generated room. A room
+ * with no corridor still carries `corridorWalls`.
+ */
+export interface Finish {
+  accent: number;
+  hallWalls: number;
+  bayWalls: number[];
+  corridorWalls: number;
+}
+
+/**
  * A room, ready to be meshed.
  *
  * The room is a grid of cells (see `world/layout.ts`): a main hall, and
@@ -650,6 +669,13 @@ export interface RoomSpec {
    * last, after the dressing. They never collide and move nothing.
    */
   curios: Curio[];
+  /**
+   * The room's finish (`finishFor` in `finish.ts`, 2.7 C8, C11): its
+   * accent and the wall pattern of its hall, each overflow bay and its
+   * corridor. Written after the curios and before the lights, the goldens'
+   * key order. A hand-built room takes `plainFinish`.
+   */
+  finish: Finish;
   /**
    * The console room's fittings, 2.6e C2; absent on every generated room.
    * Drawn instanced as their own family (`interiorInstances`), and the

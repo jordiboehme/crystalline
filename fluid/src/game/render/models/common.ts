@@ -15,6 +15,7 @@
 import type { Rect } from "../../world/types";
 import {
   FLAG,
+  accentTint,
   blinkFlag,
   type MeshData,
   type Surface,
@@ -277,7 +278,9 @@ export function shade(c: Rgb, k: number): Rgb {
  * `signal` for a light that shines by itself whatever the room's light
  * (H12: a warning lamp, a hero's steady light) and `blink` for a signal
  * light in group `group` (0 to 7) of its hero's blink bank (H11), whose
- * gain the bank moves.
+ * gain the bank moves, and `accent` for a part in the room's accent times
+ * `k` (the accent mark, `accentTint`, 2.7 C8), which the vertex shader
+ * swaps for the room's accent at draw time.
  */
 export function surfaces(look: Look) {
   const p = look.palette;
@@ -305,6 +308,11 @@ export function surfaces(look: Look) {
     tinted: (tint: Rgb, layer: number = LAYER.panel): Surface => ({
       layer,
       tint,
+      flag: FLAG.lit,
+    }),
+    accent: (k = 1): Surface => ({
+      layer: LAYER.panel,
+      tint: accentTint(k),
       flag: FLAG.lit,
     }),
   } satisfies Record<string, Surface | ((...args: never[]) => Surface)>;

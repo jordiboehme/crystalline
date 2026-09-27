@@ -145,31 +145,32 @@ import { CELL } from "./units";
 /**
  * A room as the dressing pass sees it: everything of a `RoomSpec` except
  * its props, which are what the pass is about to make, and its curios,
- * which come after it (C2). It carries the heroes, which the dressing reads
- * to keep off what they reserve (`heroReserve` in `heroes.ts`, H3). Every
- * `RoomBase` is a `SiteBase`.
+ * which come after it (C2), and its finish (2.7 C8, C11), which the
+ * generator writes last and no pass reads. It carries the heroes, which the
+ * dressing reads to keep off what they reserve (`heroReserve` in
+ * `heroes.ts`, H3). Every `RoomBase` is a `SiteBase`.
  */
-export type RoomBase = Omit<RoomSpec, "props" | "curios">;
+export type RoomBase = Omit<RoomSpec, "props" | "curios" | "finish">;
 
 /**
  * A room as the site rules and the hero pass see it: the sites are worked
  * out from fixtures, decor and scaffolding alone, so this type leaves out
- * the props, the heroes and the curios. The hero pass (`heroes.ts`) reads
+ * the props, the heroes, the curios and the finish. The hero pass (`heroes.ts`) reads
  * the sites before any hero stands, and the dressing reads the same sites
  * and then keeps off what the heroes reserved (`heroReserve`).
  */
-export type SiteBase = Omit<RoomSpec, "props" | "heroes" | "curios">;
+export type SiteBase = Omit<RoomSpec, "props" | "heroes" | "curios" | "finish">;
 
 /**
  * A room as the curio pass (`placeCurios` in `curios.ts`) sees it (C2):
  * everything of a `RoomSpec` but the curios, which are what the pass is
- * about to make. The pass runs last, after the dressing, and reads the
+ * about to make, and the finish, which no pass reads. The pass runs last, after the dressing, and reads the
  * fixtures, decor, heroes and props it stands curios on without changing
  * any of them. Since neither `SiteBase` nor `RoomBase` carries the curios,
  * neither the hero pass nor the dressing can see one, so a curio never
  * moves anything else in a room.
  */
-export type CurioBase = Omit<RoomSpec, "curios">;
+export type CurioBase = Omit<RoomSpec, "curios" | "finish">;
 
 /** A floor cell a floor prop may stand in, centred on it or backed to a wall. */
 export interface FloorSpot {

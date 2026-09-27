@@ -25,6 +25,7 @@ import {
   propFootprint,
   turnedBox,
 } from "./footprints";
+import { plainFinish } from "./finish";
 import { generateRoom } from "./generate";
 import {
   ANY_POOL,
@@ -659,7 +660,13 @@ const reseeded = (base: SiteBase, n = 1000): SiteBase[] =>
 
 /** A room with these heroes, dressed around them. */
 function withHeroes(base: SiteBase, heroes: Hero[]): RoomSpec {
-  const room: RoomSpec = { ...base, heroes, props: [], curios: [] };
+  const room: RoomSpec = {
+    ...base,
+    heroes,
+    props: [],
+    curios: [],
+    finish: plainFinish(base.bays.length),
+  };
   return { ...room, props: dressRoom(room) };
 }
 

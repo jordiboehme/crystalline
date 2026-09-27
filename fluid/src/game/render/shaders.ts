@@ -109,6 +109,15 @@ const TURN_TABLE = [0, 1, 2, 3]
  * shader compares whole numbers. The fragment shader is unchanged by
  * instancing, so the light grid, the bands, the grime, the edge lines and
  * the dither apply to props as to everything else.
+ *
+ * The tint may carry the accent mark (`ACCENT_MARK` and `accentTint` in
+ * `geometry.ts`, 2.7 C8): a negative first channel, which no real colour
+ * has, means "the room's accent times the second channel". The shader
+ * swaps such a tint for `uAccent` times `aTint.y` before it goes on flat
+ * as `vTint`, so the fragment shader only ever sees real colours. The
+ * renderer uploads `uAccent` on every draw from the look and the room
+ * (`accentFor` in `looks.ts`), so a mesh built once per look takes each
+ * room's accent, and a look switch or a restored context keeps it.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;
@@ -128,6 +137,8 @@ uniform float uModelScale;
 // (cos, sin) of the turn about uModelPivot's vertical; (1, 0) for everything
 // but a swinging leaf
 uniform vec2 uModelYaw;
+// The room's accent (2.7 C8), taken by every tint carrying the accent mark
+uniform vec3 uAccent;
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;
@@ -149,7 +160,7 @@ void main() {
   vNormal = vec3(nxz.x, aNormal.y, nxz.y);
   vUv = aUv;
   vLayer = aLayer;
-  vTint = aTint;
+  vTint = aTint.x < 0.0 ? uAccent * aTint.y : aTint;
   vFlag = int(aFlag + 0.5);
   vSlot = aInstanceTurn.y;
   gl_Position = uViewProjection * vec4(world, 1.0);

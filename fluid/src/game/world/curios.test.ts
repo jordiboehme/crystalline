@@ -833,7 +833,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     for (const { name, room } of ROOMS) {
       const b = base(room);
       const curios = placeCurios(b, ALL_FORCED);
-      const withCurios: RoomSpec = { ...b, curios };
+      const withCurios: RoomSpec = { ...b, curios, finish: room.finish };
       expect(blockersFor(withCurios), name).toEqual(
         blockersFor({ ...withCurios, curios: [] }),
       );

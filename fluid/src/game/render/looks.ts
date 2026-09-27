@@ -4,9 +4,9 @@
  * A look changes nothing about what is in a room, only how it is drawn: the
  * palette, how bright the light is and how far it carries, how much grime,
  * how strong the neon edge lines are and where they appear, whether surfaces
- * are textured or flat, and whether the picture is dithered down to the C64's
- * sixteen colours. The renderer reads nothing else, so a look costs a few
- * dozen numbers.
+ * are textured or flat, whether the picture is dithered down to the C64's
+ * sixteen colours, and the five accents a room is picked out in (2.7 C7).
+ * The renderer reads nothing else, so a look costs a few dozen numbers.
  *
  * - Day shift: beige and off-white panels in bright light, neon only on
  *   doors, portals and tag strips.
@@ -19,9 +19,13 @@
  * behind a hidden key only if they cost almost nothing.
  */
 
-import type { Condition } from "../world/types";
+import type { Condition, Finish } from "../world/types";
 
-/** A colour, each channel in [0, 1]. */
+/**
+ * A colour, each channel in [0, 1]. The one exception is a surface's
+ * accent mark (`accentTint` in `geometry.ts`), a negative first channel the
+ * vertex shader swaps for the room's accent.
+ */
 export type Rgb = readonly [number, number, number];
 
 /** Which look. */
@@ -74,6 +78,15 @@ export interface Look {
   bloom: { threshold: number; strength: number };
   /** The terminal screens' style. */
   terminal: "phosphor" | "petscii";
+  /**
+   * The look's accent set (2.7 C7): `ACCENT_COUNT` colours, index `i` in
+   * the same colour family in every look (0 yellow, 1 red, 2 green, 3 blue,
+   * cyan in the C64 palette, 4 teal), each at least 0.25 (RGB distance)
+   * from the look's `door`, `portal` and `portalAlt`, so an accent never
+   * reads as a way. A room picks one by index (`Finish.accent`) and
+   * `accentFor` reads it.
+   */
+  accents: readonly Rgb[];
 }
 
 const C64_RAW: readonly (readonly [number, number, number])[] = [
@@ -147,6 +160,14 @@ export const LOOKS: Record<LookId, Look> = {
     dither: false,
     bloom: { threshold: 1, strength: 0.55 },
     terminal: "phosphor",
+    // Mustard, rust red, olive, navy, teal green.
+    accents: [
+      hex(0xd8c040),
+      hex(0xa83d28),
+      hex(0x72803a),
+      hex(0x2e4276),
+      hex(0x338070),
+    ],
   },
   aperture: {
     id: "aperture",
@@ -181,6 +202,14 @@ export const LOOKS: Record<LookId, Look> = {
     dither: false,
     bloom: { threshold: 0.9, strength: 0.8 },
     terminal: "phosphor",
+    // Safety yellow, signal red, leaf green, violet, teal.
+    accents: [
+      hex(0xf0d830),
+      hex(0xd8382e),
+      hex(0x5a9a40),
+      hex(0x845cc8),
+      hex(0x1f9e8c),
+    ],
   },
   freescape: {
     id: "freescape",
@@ -210,8 +239,23 @@ export const LOOKS: Record<LookId, Look> = {
     dither: true,
     bloom: { threshold: 1.2, strength: 0.2 },
     terminal: "petscii",
+    // Yellow, light red, green, cyan, light green. The blue family takes
+    // cyan: the palette's blue (6) sits 0.247 from the cross-domain portal
+    // (4) and its light blue (14) is the portal itself.
+    accents: [c64(7), c64(10), c64(5), c64(3), c64(13)],
   },
 };
+
+/**
+ * The colour a room's accent takes in `look` (2.7 C8): the look's accent at
+ * the room's index, `look.accents[room.finish.accent]`. The renderer
+ * uploads it as `uAccent` on every draw, so a look switch or a restored
+ * context, which hand the same room back, give the new look's colour of
+ * the same family. Black for an index past the set, which no finish holds.
+ */
+export function accentFor(room: { finish: Finish }, look: Look): Rgb {
+  return look.accents[room.finish.accent] ?? [0, 0, 0];
+}
 
 /** The looks in key order. */
 export const LOOK_ORDER: readonly LookId[] = ["day", "aperture", "freescape"];
