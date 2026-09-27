@@ -158,6 +158,10 @@ impl Engine {
             );
         }
         self.refresh_names().await;
+        // A reference elsewhere may already name this domain, and it waited
+        // pending while nothing answered to the prefix. Its own domain's next
+        // sync is not coming on its own, so it is bound here.
+        self.resolve_pending_everywhere().await;
         if !self.request_embed()
             && let Err(e) = self.embed_pending().await
         {
@@ -248,6 +252,9 @@ impl Engine {
         // declare a name, and a virtual domain's declared name is only read
         // by a refresh.
         self.refresh_names().await;
+        // As for a file domain: a reference elsewhere that already named this
+        // one binds now rather than on its own domain's next sync.
+        self.resolve_pending_everywhere().await;
 
         let mut result = json!({
             "domain": name,

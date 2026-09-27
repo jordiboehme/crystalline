@@ -495,19 +495,24 @@ impl Engine {
     }
 
     /// Bind every pending reference in every domain the index knows, for a
-    /// change that may have unbound references without a spelling push to
-    /// notice it: a rename that took a spelling another domain held. Best
-    /// effort, like the push.
-    pub(super) async fn resolve_pending_everywhere(&self) {
+    /// change that may have left references pending where no sync of their
+    /// own domain will come to bind them: a rename that took a spelling
+    /// another domain held, a newly registered domain that a prefix elsewhere
+    /// already named, and the start of a daemon or server, after an index
+    /// upgrade may have unbound references in a virtual domain or a draft.
+    /// Each actor's drafts are bound in that actor's own view first, then the
+    /// rest against the base. Best effort, like the push.
+    pub async fn resolve_pending_everywhere(&self) {
         let store = self.store.lock().await;
         if let Err(e) = resolve_pending_in_every_domain(&*store).await {
-            tracing::warn!("binding the references a rename left pending failed: {e}");
+            tracing::warn!("binding the pending references in every domain failed: {e}");
         }
     }
 }
 
 /// One resolve pass over every domain row the index's spellings reach, in
-/// one transaction.
+/// one transaction: each drafting actor's rows in that actor's own view, as a
+/// draft write binds them, and then every row still pending against the base.
 async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index::Result<()> {
     let mut every: Vec<DomainId> = store
         .domain_spellings()
@@ -520,6 +525,9 @@ async fn resolve_pending_in_every_domain(store: &dyn Store) -> crystalline_index
     store.begin().await?;
     let pass = async {
         for id in &every {
+            for (actor, _) in store.overlay_counts(*id).await? {
+                store.reresolve_actor_references(*id, &actor).await?;
+            }
             store.resolve_pending_relations(*id).await?;
             store.resolve_pending_links(*id).await?;
         }

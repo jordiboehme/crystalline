@@ -550,9 +550,10 @@ pub async fn run_serve(
                 tracing::warn!("initial sync failed: {err}");
             }
             // Once the first sync has returned: the one-time catch-up for a
-            // configuration from before 0.20.0, and any domain_name a
-            // MANIFEST gained while the daemon was down.
-            e.adopt_domain_names_after("the initial sync").await;
+            // configuration from before 0.20.0, any domain_name a MANIFEST
+            // gained while the daemon was down, and one resolve pass over
+            // every domain for what an index upgrade left pending.
+            e.settle_after_initial_sync().await;
             // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on

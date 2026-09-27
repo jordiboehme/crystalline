@@ -208,6 +208,19 @@ impl Engine {
         }
     }
 
+    /// What a daemon or an embedded server runs once its first sync has
+    /// returned. The names are lined up with the MANIFESTs first (the one-time
+    /// catch-up for a configuration from before 0.20.0, and any `domain_name`
+    /// a MANIFEST gained while nothing ran), then every domain gets one
+    /// resolve pass: an index upgrade may have unbound references in a
+    /// virtual domain or a draft, which no sync from disk reaches, and a
+    /// domain registered while nothing ran may be what a pending reference
+    /// elsewhere names.
+    pub async fn settle_after_initial_sync(&self) {
+        self.adopt_domain_names_after("the initial sync").await;
+        self.resolve_pending_everywhere().await;
+    }
+
     /// How many times [`Engine::adopt_domain_names`] ran on this engine.
     #[cfg(any(test, feature = "testing"))]
     pub fn adoptions_run(&self) -> u64 {

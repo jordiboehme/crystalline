@@ -104,7 +104,9 @@ pub struct ObservationRecord {
 /// the first two readings find nothing and the bare target is never looked up
 /// at home; only the whole bracket text is. `[[ops:Runbook]]` written where
 /// `ops` is not registered stays unresolved even when the home domain holds a
-/// Runbook, and heals once `ops` is registered and its spelling resets the row.
+/// Runbook. It heals on the next resolve pass over home after `ops` is
+/// registered; the engine runs one over every domain right after a
+/// registration, so the link does not wait for home's next sync.
 ///
 /// "Target domain" and "registered" both mean a row of `domain_spelling`: a
 /// reference may name its domain by the local name, the canonical name its

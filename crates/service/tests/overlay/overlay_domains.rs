@@ -7573,3 +7573,58 @@ async fn a_full_rename_of_a_reviewing_domain_writes_the_manifest_as_a_draft() {
     assert!(cfg.domains.contains_key("platform"), "{:?}", cfg.domains);
     assert!(!cfg.domains.contains_key("team"));
 }
+
+/// A draft's reference that an index upgrade unbound is bound again by the
+/// engine's startup pass, in the drafting actor's own view: `[[typo:Plan]]`
+/// names no domain, so it reads the whole bracket text at home, and only
+/// alice's own draft carries that title. A pass against the base alone would
+/// leave it pending. The upgrade is stood in for by the reset that unbinds
+/// every reference spelled `typo`.
+#[tokio::test]
+async fn the_startup_pass_binds_a_drafts_reference_in_its_actors_view() {
+    let f = review_fixture().await;
+    const COLON: &str = "---\ntype: engram\ntitle: typo:Plan\npermalink: typo-plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# typo:Plan\n\n- [idea] a colon title only alice has #team\n";
+    const SRC: &str = "---\ntype: engram\ntitle: Src\npermalink: src\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Src\n\n- relates_to [[typo:Plan]]\n";
+    let (colon, src) = {
+        let store = f.store.lock().await;
+        let id = f.domain_id(&*store, "team").await;
+        let colon = store
+            .upsert_overlay(id, "alice", &record(COLON, "typo-plan.md"))
+            .await
+            .unwrap();
+        let src = store
+            .upsert_overlay(id, "alice", &record(SRC, "src.md"))
+            .await
+            .unwrap();
+        store.reresolve_actor_references(id, "alice").await.unwrap();
+        (colon, src)
+    };
+    async fn bound(store: &dyn Store, src: crystalline_index::EngramId) -> bool {
+        let refs = store.outbound_refs(src, None).await.unwrap();
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        refs[0].resolved
+    }
+    assert!(
+        bound(&*f.store.lock().await, src).await,
+        "bound to alice's draft"
+    );
+
+    let unbound = f
+        .store
+        .lock()
+        .await
+        .reset_references_to_spellings(&["typo".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(unbound, 1);
+    assert!(!bound(&*f.store.lock().await, src).await);
+
+    f.engine.settle_after_initial_sync().await;
+    let store = f.store.lock().await;
+    assert!(bound(&*store, src).await, "bound again without a write");
+    let slice = store.neighbors(&[src], 1, Some("alice")).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == colon),
+        "to alice's own draft: {slice:?}"
+    );
+}

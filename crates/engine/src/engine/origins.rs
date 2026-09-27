@@ -307,6 +307,8 @@ impl Engine {
         progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
         self.refresh_names().await;
+        // A reference elsewhere that already named this domain binds now.
+        self.resolve_pending_everywhere().await;
         // Embedding a whole freshly connected repo can outlast any client
         // timeout, so a daemon or in-process MCP server runs it on the embed
         // worker; without a worker (standalone one-shot commands, tests) the
