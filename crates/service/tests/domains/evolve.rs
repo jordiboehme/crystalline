@@ -613,7 +613,7 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
         "{e}"
     );
     // The catalog's last id, so the error names the whole of it.
-    assert!(e.ends_with("V301"), "{e}");
+    assert!(e.ends_with("V302"), "{e}");
 
     let e = engine
         .evolve_engrams(

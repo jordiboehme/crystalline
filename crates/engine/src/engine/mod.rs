@@ -183,7 +183,7 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
      Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
-     Act only on the evidence stated: this sweep detects by dates, links, graph shape and embedding similarity, and similarity is not a contradiction - it cannot confirm that two engrams disagree. \
+     Act only on the evidence stated: this sweep detects by dates, links, graph shape, embedding similarity and stored model scores; similarity is not a contradiction, and a V302 row is a possible contradiction a local model read, a question and never proof that two engrams disagree. \
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
@@ -1771,6 +1771,26 @@ pub(crate) struct SettledDomain {
     pub(crate) failing: bool,
 }
 
+/// What a walk counted for one domain it parsed, kept for the sweep. The
+/// digest and coverage are the walk's own, so the sweep can tell whether the
+/// domain still looks the way it did when it was counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DomainCount {
+    /// The walk digest at that walk (see [`SettledDomain::digest`]).
+    pub(crate) digest: String,
+    /// The embedded-chunk count, kept only when an engram that could take
+    /// part had no lead vector yet (see [`SettledDomain::coverage`]).
+    pub(crate) coverage: Option<usize>,
+    /// Related pairs left unscored after that walk, known failures included.
+    pub(crate) pending: usize,
+    /// More related pairs cleared the line than the per-domain cap.
+    pub(crate) capped: bool,
+    /// The lead vectors met when the scope was over the vector cap.
+    pub(crate) vectors_capped: Option<usize>,
+    /// Current engrams with observations and no lead vector yet.
+    pub(crate) unembedded: usize,
+}
+
 /// One engram pair the scorer or the store failed on, at the checksums and
 /// under the model it failed with. A pair that fails the same way twice is
 /// not worth a walk on every write: it is retried once per tick at most, and
@@ -1805,6 +1825,11 @@ pub(crate) struct ContradictionState {
     /// Per domain, what the last walk that left it at zero saw, so a walk
     /// skips a domain nothing changed in.
     pub(crate) settled: HashMap<String, SettledDomain>,
+    /// Per domain, what the last walk that parsed it counted, which is what
+    /// the sweep's `V302` truncation lines read instead of walking the
+    /// candidates again. Read only while its digest and coverage still
+    /// match: a stale record is "not counted", never a quiet domain.
+    pub(crate) counted: HashMap<String, DomainCount>,
     /// Why the model could not be loaded or a batch could not be scored.
     /// A load failure stays until the setting is set again; a batch failure
     /// until the next walk that loads nothing new and fails nothing.
@@ -6212,8 +6237,9 @@ fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
 /// reads. The replacement keeps the original position, which keeps a
 /// hand-ordered list hand-ordered.
 ///
-/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
-/// exists because a twin finding is about a pair rather than about the engram:
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` and `V302` -
+/// and it exists because a twin finding, like a possible contradiction, is
+/// about a pair rather than about the engram:
 /// an engram that twins two others carries two twin findings and neither is the
 /// engram's answer about the rule. Keying those by rule alone made the second
 /// acknowledgment overwrite the first, which silenced one pair and left the

@@ -160,6 +160,7 @@ impl Engine {
                     &known_domains,
                     &respell,
                     p.include_acknowledged,
+                    true,
                     scope,
                 )
                 .await?
@@ -240,16 +241,25 @@ impl Engine {
                     "evidence": f.evidence,
                     "fix": f.fix,
                 });
-                // The pair a twin row is about, which is the value an
-                // acknowledgment for it is given for and the value the ack
-                // route takes back. Only a pair-scoped rule carries it: it is
-                // the one rule that fires more than once on an engram, so it
-                // is the one whose rows a caller has to be able to tell apart.
+                // The pair a twin or line-pair row is about, which is the value
+                // an acknowledgment for it is given for and the value the ack
+                // route takes back. Only a pair-scoped rule carries it: those
+                // are the rules that fire more than once on an engram, so they
+                // are the ones whose rows a caller has to be able to tell apart.
                 // Every other rule's acknowledgment is named by the engram and
                 // the rule alone, and a column repeating what those two fields
                 // already say would cost every queue tokens for nothing.
                 if crystalline_index::is_pair_scoped(f.rule) && !f.scope.is_empty() {
                     row["scope"] = Value::String(f.scope.clone());
+                }
+                // A V302 row names its counterpart flat, so a renderer links
+                // the other engram and shows the probability without parsing
+                // the evidence. Rounded to two decimals, as the text says it.
+                if let Some(c) = &f.counterpart {
+                    row["counterpart"] = Value::String(c.permalink.clone());
+                    row["counterpart_title"] = Value::String(c.title.clone());
+                    row["counterpart_line"] = json!(c.line);
+                    row["probability"] = json!((f64::from(c.probability) * 100.0).round() / 100.0);
                 }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
@@ -475,9 +485,10 @@ impl Engine {
     /// dropping to a scope-less entry.
     ///
     /// **The unacknowledged finding wins when the rule fires more than once
-    /// here**, which only the pair-scoped rule does
+    /// here**, which only the pair-scoped rules do
     /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
-    /// carries two `V301` findings and neither one is "the" finding. Taking
+    /// carries two `V301` findings, one whose lines two others contradict
+    /// carries two `V302` findings, and neither one is "the" finding. Taking
     /// the first row every time made the second acknowledgment re-record the
     /// pair the first already covered, so the other pair could never be
     /// acknowledged at all. With every pair acknowledged the first row wins
@@ -515,7 +526,7 @@ impl Engine {
         let (known_domains, respell) = self.sweep_domain_names(&hidden).await;
         let today = Utc::now().date_naive();
         let Some(swept) = self
-            .sweep_domain(domain, today, &known_domains, &respell, true, scope)
+            .sweep_domain(domain, today, &known_domains, &respell, true, false, scope)
             .await?
         else {
             return Ok(Vec::new());
@@ -638,8 +649,8 @@ impl Engine {
     /// and like the recording half it speaks only for a
     /// [pair-scoped](crystalline_index::is_pair_scoped) rule: every other rule
     /// keeps one entry, so there is nothing to narrow. `None` takes every
-    /// entry the rule has, which is the whole of it for the ten and all pairs
-    /// at once for the one.
+    /// entry the rule has, which is the whole of it for a rule acknowledged
+    /// per engram and all pairs at once for `V301` and `V302`.
     ///
     /// Fluid's half of the take-back an agent asks for with the `remove
     /// <rule-id>` value form; both filter through [`without_ack`]. They differ
@@ -743,6 +754,12 @@ impl Engine {
     ///
     /// `Ok(None)` for a domain with no engrams: no domain row to query against
     /// and nothing to detect. An empty domain is quiet, not an error.
+    ///
+    /// `count_pending` asks for `V302`'s truncation counts, which only a sweep
+    /// that renders a queue needs; the acknowledgment path passes `false`.
+    // Eight, and the two flags are read by different halves of the sweep; a
+    // struct around them would sit between two private callers for no reader.
+    #[allow(clippy::too_many_arguments)]
     async fn sweep_domain(
         &self,
         name: &str,
@@ -750,6 +767,7 @@ impl Engine {
         known_domains: &[String],
         respell: &[(String, String)],
         include_acknowledged: bool,
+        count_pending: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Option<DomainSweep>> {
         let mut unparsed = 0usize;
@@ -973,6 +991,16 @@ impl Engine {
             });
         }
 
+        // `V302`'s input, only with the check on: the stored rows for the
+        // configured model and, on a sweep that renders a queue, what the
+        // daemon's last walk counted for the domain (or "not counted" when it
+        // changed since). Read, never scored or walked, and an off check
+        // reads nothing. The acknowledgment path passes
+        // `count_pending: false`, since it only needs the findings.
+        let meaning = self
+            .sweep_contradictions(domain_id, name, count_pending)
+            .await?;
+
         let input = SweepInput {
             domain: name.to_string(),
             today,
@@ -987,6 +1015,13 @@ impl Engine {
             attachments,
             shadowed_asset_refs,
             share: self.share_facts(name).await,
+            contradictions: meaning.rows,
+            contradiction_model: meaning.model.map(|m| m.id.to_string()).unwrap_or_default(),
+            contradictions_uncounted: meaning.uncounted,
+            contradictions_pending: meaning.pending,
+            contradiction_candidates_capped: meaning.capped,
+            contradiction_unembedded: meaning.unembedded,
+            contradiction_vectors_capped: meaning.vectors_capped,
             include_acknowledged,
             // The sweep module's own constants, never literals repeated here:
             // the thresholds and the twin caps are one place, and nothing
@@ -994,7 +1029,16 @@ impl Engine {
             // satisfy and a future settings surface has to keep - the pairs
             // retained bound the findings emitted, so `max_twin_pairs` stays
             // above `max_twin_findings` or the cap on findings is unreachable.
-            options: SweepOptions::default(),
+            options: SweepOptions {
+                // The `V302` finding line is per model: score distributions
+                // differ.
+                contradiction_threshold: meaning
+                    .model
+                    .map_or(SweepOptions::default().contradiction_threshold, |m| {
+                        m.threshold
+                    }),
+                ..SweepOptions::default()
+            },
         };
         let report = detect(&input);
         Ok(Some(DomainSweep { report, unparsed }))

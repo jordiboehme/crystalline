@@ -649,10 +649,12 @@ enum Command {
     },
     /// Sweep for the maintenance the knowledge needs and print a ranked queue.
     ///
-    /// Read-only: it detects temporal and lifecycle debt, structural gaps and
-    /// redundancy by dates, links, graph shape and embedding similarity
-    /// (semantic twins), never confirming a contradiction, and
-    /// changes nothing itself. Work the queue with the write verbs and re-run
+    /// Read-only: it detects temporal and lifecycle debt, structural gaps,
+    /// redundancy and meaning by dates, links, graph shape, embedding
+    /// similarity (semantic twins) and, with the contradiction check on, a
+    /// local model's reading of two observation lines as a possible
+    /// contradiction; it never confirms a contradiction and changes nothing
+    /// itself. Work the queue with the write verbs and re-run
     /// the same scope to confirm it shrank.
     Evolve {
         /// Restrict the sweep to these domains (repeatable). Omit to sweep

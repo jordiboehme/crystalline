@@ -11,10 +11,11 @@ use crystalline_index::nli::{
 };
 use crystalline_index::{ContradictionRow, EmbeddingProvider, IndexError, TursoStore};
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::engine::{
     ConfigureAction, ContradictionOutcome, NLI_IDLE_DROP, ScorerLoader,
 };
-use crystalline_service::params::{EditParams, WriteParams};
+use crystalline_service::params::{EditParams, EvolveParams, MoveParams, WriteParams};
 use tokio::sync::Mutex;
 
 /// One virtual domain `notes` on an engine with the topic provider, so two
@@ -1461,4 +1462,395 @@ async fn shutdown_steps(engine: &Engine) {
     let _held = tokio::time::timeout(bound, store.lock())
         .await
         .expect("waiting for the store");
+}
+
+// --- the sweep's V302 read -------------------------------------------------
+
+/// The detection half of the sweep, which records no maintenance run, so a
+/// test never writes the developer's state file.
+async fn sweep(engine: &Engine) -> serde_json::Value {
+    engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["notes".to_string()],
+                families: vec!["meaning".to_string()],
+                limit: Some(50),
+                today: Some("2026-09-27".to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+}
+
+fn v302(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    value["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["rule"] == "V302")
+        .collect()
+}
+
+fn v302_truncations(value: &serde_json::Value) -> Vec<String> {
+    value["truncations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.as_str())
+        .filter(|t| t.contains("V302"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn ack(permalink: &str, value: &str, scope: Option<&str>) -> EditParams {
+    EditParams {
+        identifier: permalink.to_string(),
+        domain: "notes".to_string(),
+        operation: "set_frontmatter".to_string(),
+        key: Some("evolve_ack".to_string()),
+        value: Some(value.to_string()),
+        ack_scope: scope.map(str::to_string),
+        ..EditParams::default()
+    }
+}
+
+/// The stored markdown of `permalink` in `notes`.
+async fn content_of(engine: &Engine, permalink: &str) -> String {
+    let store = engine.store();
+    let store = store.lock().await;
+    let d = store
+        .list_engrams("notes", None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.permalink == permalink)
+        .unwrap();
+    store
+        .engram_content(d.domain_id, &d.path)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// A loader whose first load fails and every later one hands out `stub`: a
+/// walk that counts and cannot score, then one that scores.
+fn offline_once(stub: Arc<StubScorer>) -> ScorerLoader {
+    let first = Arc::new(AtomicBool::new(true));
+    Arc::new(move |_model: &'static NliModel| {
+        if first.swap(false, Ordering::SeqCst) {
+            ready(Err(IndexError::Nli("offline".to_string())))
+        } else {
+            ready(Ok(stub.clone() as Arc<dyn ContradictionScorer>))
+        }
+    })
+}
+
+const NOT_COUNTED: &str =
+    "notes - V302: related pairs not counted yet (the daemon counts them after embedding)";
+
+#[tokio::test]
+async fn evolve_raises_v302_from_stored_rows_and_never_scores_inline() {
+    let s = stub();
+    let (_tmp, engine) = engine_with(offline_once(s.clone())).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+
+    // No walk yet: the count is unknown, and says so.
+    let unknown = sweep(&engine).await;
+    assert!(v302(&unknown).is_empty());
+    assert_eq!(
+        v302_truncations(&unknown),
+        vec![NOT_COUNTED.to_string()],
+        "{unknown}"
+    );
+
+    // A walk that counts and cannot load the model: the count is known.
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    let before = sweep(&engine).await;
+    assert!(v302(&before).is_empty());
+    assert_eq!(
+        v302_truncations(&before),
+        vec![
+            "notes - V302: 1 related pairs not scored yet (the daemon scores them after embedding)"
+                .to_string()
+        ],
+        "{before}"
+    );
+    assert_eq!(s.forwards(), 0, "a sweep never scores");
+
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.score_contradictions().await.unwrap();
+    let forwards = s.forwards();
+    let after = sweep(&engine).await;
+    assert_eq!(s.forwards(), forwards, "a sweep never scores");
+    let rows = v302(&after);
+    assert_eq!(rows.len(), 1, "{after}");
+    let row = rows[0];
+    assert_eq!(row["class"], "judgment");
+    assert!(
+        row["finding"]
+            .as_str()
+            .unwrap()
+            .contains("read as a contradiction at probability 0.93"),
+        "{row}"
+    );
+    assert_eq!(row["probability"], 0.93);
+    assert!(
+        matches!(row["counterpart"].as_str(), Some("eighteen" | "twenty")),
+        "{row}"
+    );
+    assert_ne!(row["counterpart"], row["permalink"]);
+    assert!(row["counterpart_title"].as_str().is_some());
+    assert!(row["counterpart_line"].as_u64().is_some(), "{row}");
+    assert!(
+        row["scope"].as_str().is_some(),
+        "pair-scoped rows carry their scope"
+    );
+    assert!(
+        after["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["family"] == "meaning")
+    );
+    assert!(v302_truncations(&after).is_empty(), "{after}");
+    let legend = after["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["rule"] == "V302")
+        .expect("the legend names the rule on the page");
+    assert_eq!(legend["summary"], "possible contradiction");
+
+    // Acknowledge the pair of lines through the row's scope: silent.
+    let permalink = row["permalink"].as_str().unwrap().to_string();
+    let scope = row["scope"].as_str().unwrap().to_string();
+    engine
+        .edit_engram(&ack(&permalink, "V302 different builds", Some(&scope)))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    let silenced = sweep(&engine).await;
+    assert!(v302(&silenced).is_empty(), "{silenced}");
+    assert_eq!(silenced["acknowledged"]["by_family"]["meaning"], 1);
+
+    // Take it back: the finding resurfaces.
+    engine
+        .edit_engram(&ack(&permalink, "remove V302", None))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(v302(&sweep(&engine).await).len(), 1);
+    assert_eq!(
+        s.forwards(),
+        forwards,
+        "no sweep and no acknowledgment ever scored"
+    );
+}
+
+#[tokio::test]
+async fn an_off_check_is_silent_in_the_sweep_even_with_rows_stored() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    set(&engine, "evolve.contradictions", "off").await;
+    let walks = engine.contradiction_fact_walks();
+    let value = sweep(&engine).await;
+    assert!(v302(&value).is_empty());
+    assert!(v302_truncations(&value).is_empty(), "{value}");
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        walks,
+        "an off check costs the sweep no second parse"
+    );
+}
+
+/// The performance ruling: a sweep with the check on reads what the walk
+/// counted and never parses the domain or walks the candidates a second time,
+/// and neither does the sweep the acknowledgment path runs to resolve a scope.
+#[tokio::test]
+async fn a_sweep_and_an_acknowledgment_never_walk_the_candidates() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    let walks = engine.contradiction_fact_walks();
+    let row = v302(&sweep(&engine).await)[0].clone();
+    engine
+        .edit_engram(&ack(row["permalink"].as_str().unwrap(), "V302 fine", None))
+        .await
+        .unwrap();
+    assert_eq!(engine.contradiction_fact_walks(), walks);
+}
+
+/// The stale zero the digest exists for: the walk counted nothing pending,
+/// then an edit made a new question. Until the next walk the sweep says the
+/// count is unknown, never that nothing is pending.
+#[tokio::test]
+async fn an_edit_since_the_last_walk_reads_as_not_counted_never_as_quiet() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert!(v302_truncations(&sweep(&engine).await).is_empty());
+
+    engine.edit_engram(&append_to_twenty()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        v302_truncations(&sweep(&engine).await),
+        vec![NOT_COUNTED.to_string()]
+    );
+
+    engine.score_contradictions().await.unwrap();
+    assert!(v302_truncations(&sweep(&engine).await).is_empty());
+}
+
+/// Lesson 40: the acknowledgment is a frontmatter write and leaves the body
+/// and every other key as they were, apart from the edit stamp every write
+/// makes (see the note below). Lesson 41: it holds for the two lines wherever they
+/// move, and a move of the engram resurfaces the finding as a plain one rather
+/// than silencing it under an address that no longer exists.
+#[tokio::test]
+async fn a_line_pair_acknowledgment_survives_a_renumbering_and_resurfaces_after_a_move() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    let row = v302(&sweep(&engine).await)[0].clone();
+    let permalink = row["permalink"].as_str().unwrap().to_string();
+    let other = row["counterpart"].as_str().unwrap().to_string();
+
+    let before = content_of(&engine, &permalink).await;
+    engine
+        .edit_engram(&ack(
+            &permalink,
+            "V302 different builds",
+            row["scope"].as_str(),
+        ))
+        .await
+        .unwrap();
+    let after = content_of(&engine, &permalink).await;
+    let strip = |text: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_ack = false;
+        for line in text.lines() {
+            if line.starts_with("evolve_ack:") {
+                in_ack = true;
+                continue;
+            }
+            if in_ack && line.starts_with(' ') {
+                continue;
+            }
+            in_ack = false;
+            // Known gap against lesson 40, left for a ruling: every edit
+            // restamps the `generated` block, an acknowledgment of any rule
+            // included, and evolve.rs's
+            // `an_edit_and_an_ack_both_survive_a_block_form_generated_mapping`
+            // pins that. Here only its `at` moves; everything else holds.
+            match line.split_once(", at: ") {
+                Some((by, _)) if line.starts_with("generated:") => out.push(by.to_string()),
+                _ => out.push(line.to_string()),
+            }
+        }
+        out
+    };
+    assert!(after.contains("evolve_ack:"), "{after}");
+    assert_eq!(
+        strip(&after),
+        strip(&before),
+        "only the evolve_ack key and the edit stamp changed:\n{before}\n---\n{after}"
+    );
+
+    // A line inserted above the pair on the other engram: the lines move, the
+    // hashes do not, and the acknowledgment still holds.
+    engine
+        .edit_engram(&EditParams {
+            identifier: other.clone(),
+            domain: "notes".to_string(),
+            operation: "prepend".to_string(),
+            content: Some("A line above everything.\n".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    let moved = sweep(&engine).await;
+    assert!(v302(&moved).is_empty(), "{moved}");
+    assert_eq!(moved["acknowledged"]["by_family"]["meaning"], 1, "{moved}");
+
+    // A move changes the address the scope names: the pair is asked again,
+    // plain, never marked stale.
+    engine
+        .move_engram(
+            &MoveParams {
+                identifier: other.clone(),
+                domain: "notes".to_string(),
+                destination: "archive/renamed".to_string(),
+                destination_domain: None,
+                permalink: Some("path".to_string()),
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    // The daemon's pass after embedding: the move rewrote the file, so the
+    // pair is scored again under its new checksum.
+    engine.score_contradictions().await.unwrap();
+    let resurfaced = sweep(&engine).await;
+    let rows = v302(&resurfaced);
+    assert_eq!(rows.len(), 1, "{resurfaced}");
+    assert!(rows[0]["ack_stale"].is_null(), "{}", rows[0]);
+}
+
+/// Lesson 66: the queue is TOON for an agent, and a V302 row's four extra
+/// columns sit beside a V301 row that has none. The encoder fills the missing
+/// cells with null, so the queue stays one table; pinned byte for byte.
+#[tokio::test]
+async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    let value = sweep(&engine).await;
+    let rules: Vec<&str> = value["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(rules, vec!["V302", "V301"], "{value}");
+    let text = crystalline_engine::toon::render(&value);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with("queue["))
+        .unwrap_or_else(|| panic!("no tabular queue: {text}"));
+    let v302_scope = value["queue"][0]["scope"].as_str().unwrap();
+    let v301_scope = value["queue"][1]["scope"].as_str().unwrap();
+    assert_eq!(
+        lines[at..at + 3].to_vec(),
+        vec![
+            "queue[2]{class,counterpart,counterpart_line,counterpart_title,domain,evidence,finding,fix,line,n,permalink,priority,probability,rule,scope,title}:".to_string(),
+            format!(
+                "  judgment,twenty,14,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.93; model mdeberta-v3-base-xnli-2mil7,\"\\\"The build uses Node 18\\\" (Eighteen) against \\\"The build uses Node 20\\\" (Twenty) read as a contradiction at probability 0.93\",read both then supersede or close a window or acknowledge V302,14,1,eighteen,85,0.93,V302,\"{v302_scope}\",Eighteen"
+            ),
+            format!(
+                "  judgment,null,null,null,notes,\"lead-vector cosine 1.00 at or above 0.94; twin: notes/twenty\",semantic twin of notes/twenty,read both then merge and supersede or link and acknowledge,null,2,eighteen,75,null,V301,\"{v301_scope}\",Eighteen"
+            ),
+        ],
+        "{text}"
+    );
 }

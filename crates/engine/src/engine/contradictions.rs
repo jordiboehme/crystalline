@@ -17,12 +17,12 @@
 //! through a download would keep the process alive until the watchdog.
 
 use super::*;
-use crystalline_index::ScoredPair;
 use crystalline_index::nli::{
     CandidateFacts, CandidatePair, ContradictionScorer, MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE,
     NliModel, NliProfile, contradiction_candidates, eligible, line_pairs, max_related_pairs,
     nli_model, pending_pairs, related_threshold, score_rows, scorer_inputs,
 };
+use crystalline_index::{ContradictionRow, ScoredPair};
 
 /// The key whose change lifts a failed load and makes pending unknown again.
 const CONTRADICTIONS_KEY: &str = "evolve.contradictions";
@@ -63,6 +63,27 @@ impl ContradictionFact {
     }
 }
 
+/// What [`Engine::sweep_contradictions`] hands the sweep for one domain.
+/// Everything empty, zero and `false` when the check is off.
+#[derive(Default)]
+pub(crate) struct SweepContradictions {
+    /// The configured model, `None` when the check is off.
+    pub(crate) model: Option<&'static NliModel>,
+    /// The stored rows for that model at or above the store floor.
+    pub(crate) rows: Vec<ContradictionRow>,
+    /// No walk has counted the domain as it stands now, so the counts below
+    /// are unknown rather than zero.
+    pub(crate) uncounted: bool,
+    /// Related pairs with no scored row at their current checksums.
+    pub(crate) pending: usize,
+    /// The related pairs reached the per-domain cap.
+    pub(crate) capped: bool,
+    /// Current engrams with observations and no lead vector yet.
+    pub(crate) unembedded: usize,
+    /// The lead vectors met when the scope is over the vector cap.
+    pub(crate) vectors_capped: Option<usize>,
+}
+
 /// One domain's share of a walk.
 struct DomainWork {
     name: String,
@@ -76,6 +97,10 @@ struct DomainWork {
     /// started.
     failures: HashSet<FailedPair>,
     settle: SettledDomain,
+    /// What this walk counted for the sweep, its `pending` filled in when the
+    /// walk publishes. `None` for a domain skipped as settled, whose earlier
+    /// record still holds.
+    count: Option<DomainCount>,
 }
 
 impl Engine {
@@ -390,6 +415,7 @@ impl Engine {
                     }
                     state.last_error = Some(e.to_string());
                     state.load_failed = Some(model.repo);
+                    record_counts(&mut state, &work, &pending);
                     state.pending = Some(pending);
                 }
                 return Ok(ContradictionOutcome::ModelUnavailable);
@@ -553,6 +579,7 @@ impl Engine {
                 state.failed.insert(w.name.clone(), failing);
             }
         }
+        record_counts(&mut state, work, &pending);
         state.pending = Some(pending);
         match batch_error {
             Some(e) => state.last_error = Some(e),
@@ -632,6 +659,7 @@ impl Engine {
                     known_failing: known.len(),
                     failures: known,
                     settle,
+                    count: None,
                 });
                 continue;
             }
@@ -646,10 +674,24 @@ impl Engine {
             let waiting = facts.iter().any(|f| {
                 f.lead_vector.is_none() && eligible(&f.status) && !f.observations.is_empty()
             });
+            let unembedded = facts
+                .iter()
+                .filter(|f| {
+                    f.lead_vector.is_none() && eligible(&f.status) && !f.observations.is_empty()
+                })
+                .count();
             let settle = SettledDomain {
                 digest,
                 coverage: waiting.then_some(coverage),
                 failing: false,
+            };
+            let mut count = DomainCount {
+                digest: settle.digest.clone(),
+                coverage: settle.coverage,
+                pending: 0,
+                capped: false,
+                vectors_capped: None,
+                unembedded,
             };
             let scored = {
                 let store = self.store.lock().await;
@@ -668,6 +710,8 @@ impl Engine {
                         "contradiction candidates skipped: over the lead-vector cap"
                     );
                 }
+                count.capped = found.full;
+                count.vectors_capped = found.capped.then_some(found.compared);
                 pending_pairs(&views, &found.pairs, &scored)
             };
             // A known failure counts only while its pair is still pending at
@@ -692,6 +736,7 @@ impl Engine {
                 known_failing,
                 failures,
                 settle,
+                count: Some(count),
             });
         }
         Ok(out)
@@ -701,9 +746,10 @@ impl Engine {
     /// listing, each engram parsed through `source` (frontmatter status and
     /// window, observations), its checksum from `stamps`, and, when
     /// `with_lead_vectors`, its lead vector for the active embedding model.
-    /// The daemon pass and the sweep's read share it, so both see one
-    /// candidate set. An engram with no stamp or that no longer parses is
-    /// left out, as the sweep leaves it out.
+    /// The one assembly of the check: the sweep never builds its own, it
+    /// reads the counts the walk kept from this one
+    /// ([`Engine::sweep_contradictions`]). An engram with no stamp or that no
+    /// longer parses is left out, as the sweep leaves it out.
     ///
     /// The lead-vector fetch is the whole domain's, unbounded (see
     /// [`Store::lead_vectors`]); a caller that only needs statuses, windows,
@@ -770,6 +816,83 @@ impl Engine {
         Ok(facts)
     }
 
+    /// `V302`'s input for one domain's sweep: the stored rows for the
+    /// configured model and, when `count_pending`, what the last walk counted
+    /// for the domain. Read, never scored: a sweep never runs the model and
+    /// never walks the candidates itself.
+    ///
+    /// An off check reads nothing at all, so it costs the sweep nothing and
+    /// says nothing. With the check on, the counts are the pass's own (one
+    /// assembly, [`Engine::contradiction_facts`], and one candidate walk),
+    /// kept per domain when the walk publishes. They are used only while the
+    /// domain still looks the way the walk saw it - the same digest over the
+    /// stamps and, when an engram was still waiting for its lead vector, the
+    /// same embedding coverage - and otherwise the domain is `uncounted`: a
+    /// write since the last walk, a standalone process that never walked, or
+    /// a walk that has not run yet reads as not counted, never as zero
+    /// (lesson 37). Measured on a 2000-engram domain, walking the candidates
+    /// here instead would have cost the sweep about 60 percent more.
+    ///
+    /// The acknowledgment path, which only needs the findings, passes
+    /// `count_pending: false` and reads the rows alone.
+    pub(crate) async fn sweep_contradictions(
+        &self,
+        domain_id: DomainId,
+        domain: &str,
+        count_pending: bool,
+    ) -> Result<SweepContradictions> {
+        let Some(model) = self.contradiction_model() else {
+            return Ok(SweepContradictions::default());
+        };
+        let (rows, now) = {
+            let store = self.store.lock().await;
+            let rows = store
+                .contradictions(
+                    domain_id,
+                    model.repo,
+                    crystalline_index::sweep::CONTRADICTION_STORE_FLOOR,
+                )
+                .await?;
+            let now = if count_pending {
+                let stamps = store.file_stamps(domain_id).await?;
+                let coverage = store
+                    .embedding_coverage()
+                    .await?
+                    .embedded_for(&self.model_id);
+                Some((
+                    walk_digest(model, related_threshold(), &self.model_id, &stamps),
+                    coverage,
+                ))
+            } else {
+                None
+            };
+            (rows, now)
+        };
+        let mut out = SweepContradictions {
+            model: Some(model),
+            rows,
+            ..SweepContradictions::default()
+        };
+        let Some((digest, coverage)) = now else {
+            return Ok(out);
+        };
+        let state = self.contradiction_state.lock().unwrap();
+        match state
+            .counted
+            .get(domain)
+            .filter(|c| c.digest == digest && c.coverage.is_none_or(|c| c == coverage))
+        {
+            Some(c) => {
+                out.pending = c.pending;
+                out.capped = c.capped;
+                out.vectors_capped = c.vectors_capped;
+                out.unembedded = c.unembedded;
+            }
+            None => out.uncounted = true,
+        }
+        Ok(out)
+    }
+
     /// The scorer for `model`, loaded on first use. Another profile's model is
     /// dropped before the new one loads, so two never sit in memory together.
     /// Handing out a loaded scorer does not count as use: only a walk that
@@ -792,6 +915,36 @@ impl Engine {
             last_used: tokio::time::Instant::now(),
         });
         Ok(loaded)
+    }
+}
+
+/// Keep what a walk counted for the sweep: a domain it parsed gets a fresh
+/// record, a domain it skipped as settled keeps its record with the pending
+/// count moved to what is left. Called only under the walk's generation
+/// guard, so a walk under an old profile never writes one.
+fn record_counts(
+    state: &mut ContradictionState,
+    work: &[DomainWork],
+    pending: &BTreeMap<String, usize>,
+) {
+    for w in work {
+        let left = pending.get(&w.name).copied().unwrap_or(0);
+        match &w.count {
+            Some(count) => {
+                state.counted.insert(
+                    w.name.clone(),
+                    DomainCount {
+                        pending: left,
+                        ..count.clone()
+                    },
+                );
+            }
+            None => {
+                if let Some(kept) = state.counted.get_mut(&w.name) {
+                    kept.pending = left;
+                }
+            }
+        }
     }
 }
 

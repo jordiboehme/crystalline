@@ -101,11 +101,15 @@ pub struct EvolveQuery {
 /// `include_acknowledged` to see the suppressed rows themselves, each marked
 /// `acknowledged` and carrying the same two fields.
 ///
-/// A `V301` row carries one column the others do not: its own `scope`, the
-/// twin pair it fired on. It is the one rule that fires more than once on an
-/// engram, so naming the engram and the rule does not name the finding - send
-/// this value back on the acknowledgment route to silence the pair that was
-/// read rather than whichever one the server would have picked.
+/// A `V301` or `V302` row carries its own `scope`: the twin pair, or the pair
+/// of observation lines, it fired on. They are the two rules that fire more
+/// than once on an engram, so naming the engram and the rule does not name the
+/// finding - send this value back on the acknowledgment route to silence the
+/// pair that was read rather than whichever one the server would have picked.
+/// A `V302` row also carries `counterpart` (the other engram's permalink),
+/// `counterpart_title`, `counterpart_line` and `probability`, so a page can
+/// link the other engram and show the model's score without parsing the
+/// evidence.
 ///
 /// `today` is not exposed. The temporal rules are evaluated as of now, which is
 /// the only question a page asks; the tool takes a pinned date for a run that
@@ -340,14 +344,16 @@ pub struct AckBody {
     /// The evidence this acknowledgment is for, copied from the queue row's
     /// own `scope`.
     ///
-    /// Only `V301` sends one: it is the one rule that fires more than once on
-    /// an engram (an engram can be the semantic twin of several others), so it
-    /// is the one where naming the rule does not name the finding. On `POST`
+    /// Only `V301` and `V302` send one: they are the two rules that fire more
+    /// than once on an engram (an engram can be the semantic twin of several
+    /// others, and several of its lines can read as contradicting another's),
+    /// so they are the ones where naming the rule does not name the finding.
+    /// On `POST`
     /// the server checks the scope is really firing and refuses with a 422 if
     /// it is not, which is what a queue read too long ago looks like; on
     /// `DELETE` it takes back that pair's entry and leaves the engram's other
     /// pairs silenced. Every other rule ignores it, and omitting it on `V301`
-    /// means the whole rule: the server's own pick on `POST`, every pair at
+    /// or `V302` means the whole rule: the server's own pick on `POST`, every pair at
     /// once on `DELETE`.
     #[serde(default)]
     #[schema(example = "notes/backoff-lesson, notes/retry-queue-gotcha")]
@@ -382,8 +388,8 @@ pub struct AckBody {
                    changes the finding returns marked `ack_stale`. The \
                    evidence is the server's, either picked by running \
                    detection or - when the body names the row's `scope`, which \
-                   is how a caller says which of an engram's two `V301` \
-                   findings it read - checked against it.",
+                   is how a caller says which of an engram's `V301` or \
+                   `V302` findings it read - checked against it.",
     params(("domain" = String, Path, description = "The engram's domain.")),
     request_body = AckBody,
     responses(
@@ -473,7 +479,7 @@ pub async fn acknowledge(
     summary = "Withdraw an acknowledgment.",
     description = "Removes the engram's `evolve_ack` entries for that rule, \
                    leaving the other rules' alone. A rule has one entry, except \
-                   `V301`, which has one per twin pair: name the row's `scope` \
+                   `V301` and `V302`, which have one per pair: name the row's `scope` \
                    to take one pair back and leave the engram's other pairs \
                    silenced, or send none to take every pair at once. 404 when \
                    the engram carries no entry the body names, rather than \

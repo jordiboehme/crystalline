@@ -18,9 +18,10 @@
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
 //!   sit at or above the twin threshold: knowledge that says the same thing
-//!   twice in different words. It compares meaning to find twins and never
-//!   confirms a contradiction: two texts close in embedding space agree about
-//!   their topic, not about what is true.
+//!   twice in different words; and `V302`, two observation lines a local NLI
+//!   model read as a possible contradiction, from scores the daemon stored.
+//!   `V302` names a possible contradiction the model read; `V301` still only
+//!   says two engrams are about the same thing. Neither confirms one.
 //!
 //! # Detect and guide, never auto-consolidate
 //!
@@ -46,6 +47,7 @@
 //! follows the tag clusterer, which is likewise a store-free detector library
 //! living in the index crate because its inputs speak the index's vocabulary.
 
+mod contradictions;
 pub mod dedupe;
 pub mod twins;
 
@@ -57,8 +59,8 @@ use serde::Serialize;
 
 use crate::nli::OrderAggregation;
 use crate::store::{
-    AttachmentRow, EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice, TagAlias, TagCount,
-    is_current_status, is_retired_status,
+    AttachmentRow, ContradictionRow, EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice,
+    TagAlias, TagCount, is_current_status, is_retired_status,
 };
 use crate::vocab::{tag_clusters, tag_clusters_with_aliases};
 
@@ -354,7 +356,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 24] = [
+pub const RULES: [RuleInfo; 25] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -521,7 +523,14 @@ pub const RULES: [RuleInfo; 24] = [
         family: Family::Meaning,
         base: 75,
         summary: "semantic twins",
-        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: this sweep still cannot confirm one. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: V302 names a possible contradiction the model read; V301 still only says two engrams are about the same thing. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+    },
+    RuleInfo {
+        id: "V302",
+        family: Family::Meaning,
+        base: 85,
+        summary: "possible contradiction",
+        instruction: "The model read these two observations as contradicting each other. It can be wrong, and it cannot see dates. Read both engrams. If one is false going forward, supersede it per the capture skill's falsification test. If both held in different periods, close the older one's validity window. If they do not contradict, acknowledge it with edit_engram set_frontmatter evolve_ack 'V302 <note>' and it stays silent for these two lines.",
     },
 ];
 
@@ -538,23 +547,25 @@ const SCOPE_SEPARATOR: &str = ", ";
 
 /// Whether `rule` is acknowledged **per pair** rather than per engram.
 ///
-/// `V301` is the one, and the distinction is about what an acknowledgment
-/// answers for rather than about how often a rule fires. Every other rule's
-/// acknowledgment is the engram's answer about that rule: re-acknowledging
-/// replaces the entry, and an entry whose scope no longer matches is that
-/// answer gone stale, which is what [`apply_acknowledgments`] reports. That
-/// holds even where such a rule fires more than once on one engram, as `V103`
-/// does over the three [`RECIPROCAL_PAIRS`]: those findings share the one
-/// answer, so acknowledging the second replaces the first and leaves the other
-/// marked stale wearing its note. An engram that twins two others carries two
-/// `V301` findings and neither one is an answer about the engram, so a twin
-/// acknowledgment is stored per pair and a pair with no entry of its own is a
-/// plain finding rather than a stale one - nobody has answered it yet.
+/// `V301` and `V302` are the two, and the distinction is about what an
+/// acknowledgment answers for rather than about how often a rule fires. Every
+/// other rule's acknowledgment is the engram's answer about that rule:
+/// re-acknowledging replaces the entry, and an entry whose scope no longer
+/// matches is that answer gone stale, which is what [`apply_acknowledgments`]
+/// reports. That holds even where such a rule fires more than once on one
+/// engram, as `V103` does over the three [`RECIPROCAL_PAIRS`]: those findings
+/// share the one answer, so acknowledging the second replaces the first and
+/// leaves the other marked stale wearing its note. An engram that twins two
+/// others carries two `V301` findings, and one whose lines two other engrams
+/// contradict carries two `V302` findings; neither is an answer about the
+/// engram, so those acknowledgments are stored per pair (a twin pair, or a
+/// pair of observation lines) and a pair with no entry of its own is a plain
+/// finding rather than a stale one - nobody has answered it yet.
 ///
 /// Read by the sweep here and by the engine's `evolve_ack` write path, which
 /// keys its entries the same way. One predicate, so the two cannot drift.
 pub fn is_pair_scoped(rule: &str) -> bool {
-    rule.eq_ignore_ascii_case("V301")
+    rule.eq_ignore_ascii_case("V301") || rule.eq_ignore_ascii_case("V302")
 }
 
 /// The stable discriminator for a finding: the evidence an acknowledgment was
@@ -580,6 +591,10 @@ pub fn is_pair_scoped(rule: &str) -> bool {
 ///   an acknowledgment of a deliberate custom permalink holds exactly as long
 ///   as neither changes, and re-filing the engram or renaming the permalink
 ///   asks the question again;
+/// - `V302` names **a pair of lines**: the two engram addresses, lower first,
+///   then the hash of each one's line in the same order. Joined as given and
+///   never sorted, so each hash stays beside its engram and two swapped lines
+///   are a different scope;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
 ///   rules, orphans, stubs, size, tag drift and the anchorless orphaned
 ///   attachment - and carries an empty scope, which matches whatever the engram
@@ -592,7 +607,7 @@ fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
             parts.join(SCOPE_SEPARATOR)
         }
         "V007" | "V008" | "V110" => parts.into_iter().next().unwrap_or_default(),
-        "V109" => parts.join(SCOPE_SEPARATOR),
+        "V109" | "V302" => parts.join(SCOPE_SEPARATOR),
         _ => String::new(),
     }
 }
@@ -929,6 +944,13 @@ pub struct SweepOptions {
     pub max_twin_pairs: usize,
     /// See [`MAX_TWIN_FINDINGS`].
     pub max_twin_findings: usize,
+    /// The `V302` finding line for the aggregated score: the configured
+    /// model's `threshold` from the NLI table.
+    pub contradiction_threshold: f32,
+    /// See [`ORDER_AGGREGATION`].
+    pub order_aggregation: OrderAggregation,
+    /// See [`MAX_CONTRADICTION_FINDINGS`].
+    pub max_contradiction_findings: usize,
 }
 
 impl Default for SweepOptions {
@@ -950,6 +972,9 @@ impl Default for SweepOptions {
             max_twin_vectors: MAX_TWIN_VECTORS,
             max_twin_pairs: MAX_TWIN_PAIRS,
             max_twin_findings: MAX_TWIN_FINDINGS,
+            contradiction_threshold: crate::nli::NLI_MODELS[0].threshold,
+            order_aggregation: ORDER_AGGREGATION,
+            max_contradiction_findings: MAX_CONTRADICTION_FINDINGS,
         }
     }
 }
@@ -1041,6 +1066,31 @@ pub struct SweepInput {
     /// same thing as far as a detector is concerned: nothing is known to be
     /// unshared).
     pub share: Option<ShareFacts>,
+    /// The stored contradiction rows for the configured NLI model, `V302`'s
+    /// input. Empty when the check is off, which keeps the rule silent.
+    pub contradictions: Vec<ContradictionRow>,
+    /// The short id of the model the rows came from, for the evidence.
+    pub contradiction_model: String,
+    /// No walk of the daemon's has counted the domain as it stands now (a
+    /// write since the last walk, or a process that never walked), so the
+    /// counts below are unknown rather than zero. A truncation line of its
+    /// own: an unknown count never reads as a clean domain.
+    pub contradictions_uncounted: bool,
+    /// Related pairs the daemon has not scored yet; a non-zero count is a
+    /// truncation line, so a quiet `V302` never reads as a clean domain.
+    pub contradictions_pending: usize,
+    /// The related pairs reached the per-domain cap, so the least related are
+    /// never scored.
+    pub contradiction_candidates_capped: bool,
+    /// Current engrams with observations that have no lead vector yet: they
+    /// can take part in a related pair once embedded, so a non-zero count is
+    /// a truncation line too (lesson 37: partial coverage never reads as a
+    /// clean domain).
+    pub contradiction_unembedded: usize,
+    /// How many lead vectors the candidate walk met when the scope is over
+    /// [`SweepOptions::max_twin_vectors`] and nothing was compared, reported
+    /// the way `V301` reports its own skip. `None` when the walk ran.
+    pub contradiction_vectors_capped: Option<usize>,
     /// Return the findings acknowledgments suppressed anyway, each marked
     /// [`Finding::acknowledged`] with the scope and note that silenced it. An
     /// audit view: the queue a run hands out drops them.
@@ -1067,6 +1117,13 @@ impl SweepInput {
             attachments: Vec::new(),
             shadowed_asset_refs: Vec::new(),
             share: None,
+            contradictions: Vec::new(),
+            contradiction_model: String::new(),
+            contradictions_uncounted: false,
+            contradictions_pending: 0,
+            contradiction_candidates_capped: false,
+            contradiction_unembedded: 0,
+            contradiction_vectors_capped: None,
             include_acknowledged: false,
             options: SweepOptions::default(),
         }
@@ -1142,6 +1199,25 @@ pub struct Finding {
     /// finding, or when the one that did carries no scope and so acknowledged
     /// nothing in particular.
     pub ack_scope: Option<String>,
+    /// The other engram of a pair finding. `V302` fills it; every other rule
+    /// leaves `None`. Skipped by the derived serialization: the engine renders
+    /// it as flat queue columns.
+    #[serde(skip)]
+    pub counterpart: Option<Counterpart>,
+}
+
+/// The other engram of a `V302` finding, flat, so a renderer can link it and
+/// show the score without parsing the evidence column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Counterpart {
+    /// The other engram's permalink, in the finding's own domain.
+    pub permalink: String,
+    /// Its title.
+    pub title: String,
+    /// The one-based line of its observation.
+    pub line: usize,
+    /// The aggregated contradiction probability.
+    pub probability: f32,
 }
 
 impl Finding {
@@ -1171,6 +1247,7 @@ impl Finding {
             ack_stale: false,
             ack_note: None,
             ack_scope: None,
+            counterpart: None,
         }
     }
 
@@ -1195,6 +1272,7 @@ impl Finding {
             ack_stale: false,
             ack_note: None,
             ack_scope: None,
+            counterpart: None,
         }
     }
 
@@ -1229,6 +1307,12 @@ impl Finding {
     /// nothing here keeps the empty scope, which any acknowledgment matches.
     fn scoped(mut self, parts: impl IntoIterator<Item = String>) -> Finding {
         self.scope = scope_for(self.rule, parts.into_iter().collect());
+        self
+    }
+
+    /// Name the other engram of a pair finding.
+    fn with_counterpart(mut self, counterpart: Counterpart) -> Finding {
+        self.counterpart = Some(counterpart);
         self
     }
 }
@@ -1288,7 +1372,7 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
 /// deterministic order keep that order when every key ties.
 ///
 /// **That stability is load-bearing, not a convenience.** Two `V301` findings
-/// on one engram tie on every key here - same anchor, so the same priority -
+/// on one engram tie on every key here, and so do two `V302` findings - same anchor, so the same priority -
 /// and the engine's `evolve_ack` write path acknowledges "the first finding
 /// still standing" for a rule on an engram. A switch to `sort_unstable_by`
 /// would make which twin pair an acknowledgment lands on depend on the sort's
@@ -1322,6 +1406,7 @@ pub fn detect(input: &SweepInput) -> SweepReport {
     detect_lifecycle(input, &graph, &mut report);
     detect_structure(input, &graph, &mut report);
     detect_redundancy(input, &mut report);
+    contradictions::detect_contradictions(input, &mut report);
     detect_attachments(input, &mut report);
 
     apply_acknowledgments(input, &mut report);
@@ -1343,7 +1428,8 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///   different thing to read than a fresh finding. One entry is what a rule
 ///   acknowledged per engram always has, since the write path replaces it;
 /// - nothing matches and the rule is pair-scoped ([`is_pair_scoped`], which is
-///   `V301`): **returned plain**. A twin acknowledgment answers one pair, so a
+///   `V301` and `V302`): **returned plain**. A twin or line-pair acknowledgment
+///   answers one pair, so a
 ///   pair with no entry of its own is unanswered rather than stale, and lending
 ///   it another pair's note would tell a reader they have seen evidence they
 ///   have not;

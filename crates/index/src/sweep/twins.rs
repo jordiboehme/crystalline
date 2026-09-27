@@ -14,7 +14,9 @@
 //! its finding cap off the top.
 //!
 //! What this is not: a contradiction detector. Two texts close in embedding
-//! space agree about their topic and nothing else; the finding text says so.
+//! space agree about their topic and nothing else; `V302` names a possible
+//! contradiction a model read, and `V301` still only says two engrams are
+//! about the same thing.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
