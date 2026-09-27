@@ -130,7 +130,8 @@ describe("floating hero models", () => {
 
   it("prints the wordmark on the board's deck between the pads, over the floor (2.6f C13)", () => {
     // Mutation caught: the wordmark missing, set from the wrong lines, on
-    // a kick instead of the flat, or below the floor.
+    // a kick instead of the flat, off its patch (sunk into it or floating
+    // over it), or below the floor.
     expect(runsOfLines(MARKS.boardLogo)).toBeGreaterThan(3);
     const ink = inked(partsOf("hoverboard"), DECK_LOGO_INK);
     expect(ink).toHaveLength(runsOfLines(MARKS.boardLogo));
@@ -139,8 +140,8 @@ describe("floating hero models", () => {
       for (const q of local(p)) {
         expect(Math.abs(q[0])).toBeLessThanOrEqual(FLAT.a + 1e-9);
         expect(Math.abs(q[1])).toBeLessThanOrEqual(FLAT.d + 1e-9);
-        expect(q[2]).toBeGreaterThanOrEqual(FLAT.top - 1e-9);
-        expect(q[2]).toBeLessThanOrEqual(FLAT.top + DECAL_LIFT + 1e-9);
+        expect(q[2]).toBeGreaterThanOrEqual(FLAT.top + DECAL_LIFT - 1e-9);
+        expect(q[2]).toBeLessThanOrEqual(FLAT.top + 2 * DECAL_LIFT + 1e-9);
       }
     }
   });

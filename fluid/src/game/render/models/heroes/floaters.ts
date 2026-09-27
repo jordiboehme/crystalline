@@ -26,7 +26,7 @@ import type { Rgb } from "../../looks";
 import { MARKS } from "../marks";
 import { yawed, type Surfaces } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
-import { fit, pixelPanel, runsOf, textBlock } from "./pixels";
+import { pixelPanel, pixelRuns, textBlock } from "./pixels";
 
 /** The recipe's own frame: the origin, facing north. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
@@ -219,13 +219,12 @@ const BOARD = {
 
 /**
  * Lays the board's wordmark flat on its deck's top at height `h`: the
- * lines of `MARKS.boardLogo` as one block (`textBlock`) with one dark
- * pixel of border, fitted along `a` into `-half..half` and centred across
- * `d`, the first line at `-d` so the mark reads from the board's front
- * (`+d`). A frame cannot tilt, so no quad can face up; each run is a thin
- * `k.box` one `DECAL_LIFT` thick instead, the lit runs in `ink` and the
- * dark ones in `patch`, side by side, so the patch and the letters are one
- * flat layer with no face over another.
+ * lines of `MARKS.boardLogo` as one block (`textBlock`) on a patch one
+ * pixel larger all round, fitted along `a` into `-half..half` and centred
+ * across `d`, the first line at `-d` so the mark reads from the board's
+ * front (`+d`). A frame cannot tilt, so no quad can face up: the patch is
+ * one `k.box` one `DECAL_LIFT` thick on the deck and each lit run a
+ * `k.box` one more `DECAL_LIFT` on the patch (C17's sticker, laid flat).
  */
 function deckLogo(
   k: Kit,
@@ -235,19 +234,21 @@ function deckLogo(
   patch: Surface,
 ): void {
   const block = textBlock(MARKS.boardLogo);
-  const w = (block[0]?.length ?? 0) + 2;
-  const rows = [".".repeat(w), ...block.map((r) => `.${r}.`), ".".repeat(w)];
-  const { px, left } = fit(rows, -half, half, -half, half);
-  const far = -(rows.length * px) / 2;
-  for (const r of runsOf(rows))
+  const cols = (block[0]?.length ?? 0) + 2;
+  const rows = block.length + 2;
+  const px = Math.min((2 * half) / cols, (2 * half) / rows);
+  const left = -(cols * px) / 2;
+  const far = -(rows * px) / 2;
+  k.box(left, -left, far, -far, h, h + DECAL_LIFT, patch);
+  for (const r of pixelRuns(block))
     k.box(
-      left + r.col * px,
-      left + (r.col + r.len) * px,
-      far + r.row * px,
+      left + (r.col + 1) * px,
+      left + (r.col + 1 + r.len) * px,
       far + (r.row + 1) * px,
-      h,
+      far + (r.row + 2) * px,
       h + DECAL_LIFT,
-      r.ch === "#" ? ink : patch,
+      h + 2 * DECAL_LIFT,
+      ink,
     );
 }
 
