@@ -30,12 +30,14 @@ import {
   type RendererFactory,
   type Session,
 } from "./session";
-import { CANNED_BRIDGE, galleryRoom } from "./world/canned";
+import { boxFront } from "./world/box";
+import { CANNED_BRIDGE, galleryRoom, heroHallRoom } from "./world/canned";
 import { NOT_FOUND, generateRoom } from "./world/generate";
-import { wallFacingSpawn, wallPoint } from "./world/interact";
+import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
 import type { Fixture, RoomSpec } from "./world/types";
+import { CELL } from "./world/units";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -1912,5 +1914,71 @@ describe("malfunctions", () => {
     }
     expect(seen[0]?.size).toBeGreaterThan(0);
     expect(seen[1]).toEqual(seen[0]);
+  });
+});
+
+describe("the police box's doors", () => {
+  /**
+   * The hero hall with the player at its first police box's front, and
+   * that box's hero index.
+   *
+   * `spotView`'s own front spot stands about 2.48 m out (`FRAME_BASE` plus
+   * `FRAME_SCALE` times the box's 1.3 m footprint), farther than `REACH`
+   * (2.2 m), so the box would never come into focus there. The spawn is
+   * put `REACH - 0.4` m out along `boxFront`'s own frame instead.
+   */
+  function standAtBox(session: Session): number {
+    const room = heroHallRoom();
+    const index = room.heroes.findIndex((h) => h.kind === "police-box");
+    if (index < 0) throw new Error("no police box in the hero hall");
+    const front = boxFront(room.heroes[index]!);
+    const dist = REACH - 0.4;
+    const wx = front.x + front.inward[0] * dist;
+    const wz = front.z + front.inward[1] * dist;
+    const spawn = {
+      x: wx / CELL - 0.5,
+      y: wz / CELL - 0.5,
+      yaw: Math.atan2(front.inward[0], front.inward[1]),
+    };
+    session.showRoom({ ...room, spawn }, { pitch: 0 });
+    frames(1);
+    return index;
+  }
+
+  /** The door fractions the last frame was drawn with. */
+  const lastDoors = () =>
+    renderer.draw.mock.calls.at(-1)?.[3] ?? new Map<string, number>();
+
+  it("opens and closes on Space and draws the leaves by their fraction (2.6e C10)", () => {
+    // Mutation caught: the box focus never read (the press drained by the
+    // fixture branch), or doorOpen missing the box's key.
+    const session = start();
+    const i = standAtBox(session);
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE OPEN");
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    expect(lastDoors().get(`box:${String(i)}`)).toBe(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE CLOSE");
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    expect(lastDoors().get(`box:${String(i)}`)).toBe(0);
+  });
+
+  it("never walks in without the console room option (2.6e C21)", () => {
+    // Mutation caught: a walk-in on a dev route.
+    const session = start();
+    standAtBox(session);
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    const before = session.current;
+    key("keydown", "ArrowUp");
+    frames(60);
+    key("keyup", "ArrowUp");
+    expect(renderer.setRoom).toHaveBeenCalledTimes(1);
+    expect(session.current).toEqual(before);
   });
 });

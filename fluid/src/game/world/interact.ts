@@ -22,6 +22,10 @@
  *
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
+ *
+ * A police box is not a fixture and leads nowhere the generator ever
+ * built, so it is offered and stepped on its own: a police box's doors are
+ * `world/box.ts`'s (`boxFocus`, `stepBoxDoors`), not this module's.
  */
 
 import type { Player } from "./move";

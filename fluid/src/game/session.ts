@@ -31,6 +31,13 @@
  * same way wherever it stands. Its gains go to the renderer as `draw`'s
  * sixth argument.
  *
+ * Space at a police box's front opens or closes its doors too
+ * (`world/box.ts`'s `boxFocus` and `stepBoxDoors`), like a bulkhead door: a
+ * fixture in focus always wins over a box, since the two rarely compete. Its
+ * door state is kept under `boxKey(index)`, alongside the fixture doors'
+ * `door:<index>` keys, in the same map the renderer draws every mover's
+ * fraction from.
+ *
  * Malfunctions belong to one visit of a room. A travel that settles as
  * missing (404) or denied (403) marks the way it went through as failed
  * (`failed`, the fixture index to its seal label): the way then says
@@ -79,6 +86,7 @@ import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
+import { boxFocus, boxKey, stepBoxDoors } from "./world/box";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
@@ -386,6 +394,8 @@ export function createSession(opts: SessionOptions): Session {
   /** The blink banks' gains, one state for the whole session (H11). */
   const blink = createBlink();
   let doors = new Map<number, DoorState>();
+  /** Every police box's doors, keyed by its index in `room.heroes` (`boxKey`). */
+  let boxes = new Map<number, DoorState>();
   let doorOpen = new Map<string, number>();
   let player: Player | null = null;
   let previous: Player | null = null;
@@ -560,6 +570,7 @@ export function createSession(opts: SessionOptions): Session {
       const spawn = arrivalSpawn(room, arrival);
       player = { ...spawn, vx: 0, vz: 0, pitch: 0, bob: 0 };
       doors = new Map();
+      boxes = new Map();
       doorOpen = new Map();
       failed = new Map();
       faults = new Map();
@@ -931,9 +942,13 @@ export function createSession(opts: SessionOptions): Session {
     );
 
     const focus = modal() ? null : focusOf(room, player, doors, failed);
+    const boxAt =
+      modal() || focus !== null ? null : boxFocus(room, player, boxes);
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
-    if (!still && input.pressed(USE_KEY) && focus !== null) {
+    let pressedBox: number | null = null;
+    const used = !still && input.pressed(USE_KEY);
+    if (used && focus !== null) {
       if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
       if (focus.kind === "terminal") {
         openReader(focus.index);
@@ -944,14 +959,20 @@ export function createSession(opts: SessionOptions): Session {
         const travel = hatchTravel(room, focus.index, failed);
         if (travel !== null) takeTravel(travel);
       }
+    } else if (used && boxAt !== null) {
+      pressedBox = boxAt.index;
     }
     doors = stepDoors(room, player, doors, pressedDoor, failed);
+    boxes = stepBoxDoors(room, boxes, pressedBox);
     faults = stepFaults(room, player, faults, failed, pressedWay, doors);
     faultNow = faultFrames(faults);
     doorOpen = new Map();
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
-    setPrompt(modal() || loading ? null : (focus?.prompt ?? null));
+    for (const [index, state] of boxes) doorOpen.set(boxKey(index), state.open);
+    setPrompt(
+      modal() || loading ? null : (focus?.prompt ?? boxAt?.prompt ?? null),
+    );
 
     if (!loading && !modal()) {
       const travel = travelOf(room, player, doors, failed);
