@@ -28,8 +28,7 @@
  * hero or a curio does. Every kind is `steady` but the canister cluster
  * (`breathe`) and the gravity console (`status`). A steady kind has no
  * blink parts, and a blinking kind has at least one in every variant (the
- * prop test holds both). `rareBlockout` is the checked stand-in box a
- * rare kind is drawn as until its real model is built.
+ * prop test holds both).
  *
  * Kept apart from `index.ts` so the recipe files can import it without an
  * import cycle through the dispatcher.
@@ -40,7 +39,7 @@ import type { PropKind } from "../../../world/types";
 import { CELL } from "../../../world/units";
 import type { BlinkBank } from "../../blink";
 import type { Kit } from "../../kit";
-import type { Look, Rgb } from "../../looks";
+import type { Look } from "../../looks";
 import type { KitAt, Surfaces } from "../common";
 
 export { SPAN_HALF, WIDE_REACH };
@@ -218,41 +217,3 @@ export const PROP_BANK = {
   "span-duct": "steady",
   "span-tray": "steady",
 } as const satisfies Record<PropKind, BlinkBank>;
-
-/** A blinking rare blockout's cap: its side, in metres. */
-const CAP_SIDE = 0.06;
-
-/** A blinking rare blockout's cap: its height, in metres; the box stops this far under the top. */
-const CAP_HEIGHT = 0.02;
-
-/**
- * The blockout cap's colour: a plain warm white, a stand-in light that
- * belongs to no look and no finished model.
- */
-const CAP_TINT: Rgb = [1.0, 0.92, 0.8];
-
-/**
- * The blockout a rare kind starts as (2.6d, like `curioBlockout`): the
- * bevelled box over `a`, `d` and `h`, less `CAP_HEIGHT` for a kind whose
- * bank blinks (`PROP_BANK`), which gets a blink-group-0 cap sitting on the
- * box's top in the middle, so every check (glow contact, the bank rule)
- * runs on it from the start. The cap is `CAP_SIDE` square and
- * `CAP_HEIGHT` thick, so it ends exactly at `h[1]`.
- */
-export function rareBlockout(
-  k: Kit,
-  s: Surfaces,
-  kind: PropKind,
-  a: readonly [number, number],
-  d: readonly [number, number],
-  h: readonly [number, number],
-): void {
-  const blinks = PROP_BANK[kind] !== "steady";
-  const top = blinks ? h[1] - CAP_HEIGHT : h[1];
-  blockout(k, s, a, d, [h[0], top]);
-  if (!blinks) return;
-  const c = CAP_SIDE / 2;
-  const am = (a[0] + a[1]) / 2;
-  const dm = (d[0] + d[1]) / 2;
-  k.box(am - c, am + c, dm - c, dm + c, top, h[1], s.blink(CAP_TINT, 0));
-}
