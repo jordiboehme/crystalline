@@ -479,7 +479,7 @@ describe("a load in flight", () => {
     ],
   };
 
-  it("forgets an E pressed while loading instead of using it in the new room", async () => {
+  it("forgets a use pressed while loading instead of using it in the new room", async () => {
     const alpha = deferred<unknown>();
     serve({
       "/domains/eng/engrams/alpha": () => alpha.promise,
@@ -493,22 +493,22 @@ describe("a load in flight", () => {
       { via: "door", from: { domain: "eng", permalink: "beta" } },
     );
     frames(2);
-    key("keydown", "KeyE");
-    key("keyup", "KeyE");
+    key("keydown", "Space");
+    key("keyup", "Space");
     frames(2);
     alpha.resolve(detailResponse("alpha", "Alpha"));
     await vi.waitFor(() => {
       expect(session.current?.permalink).toBe("alpha");
     });
-    // Turn round to the hatch: a stale E would crawl back the moment it is
+    // Turn round to the hatch: a stale use would crawl back the moment it is
     // in front of the player.
     const offered = () =>
-      hud.prompt.mock.calls.at(-1)?.[0] === "E CRAWL Beta relates_to";
+      hud.prompt.mock.calls.at(-1)?.[0] === "SPACE CRAWL Beta relates_to";
     key("keydown", "ArrowLeft");
     for (let i = 0; i < 60 && !offered(); i++) frames(1);
     key("keyup", "ArrowLeft");
     frames(5);
-    expect(hud.prompt).toHaveBeenLastCalledWith("E CRAWL Beta relates_to");
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE CRAWL Beta relates_to");
     expect(hud.connector).toHaveBeenLastCalledWith(
       false,
       "alpha",
@@ -516,8 +516,8 @@ describe("a load in flight", () => {
     );
     expect(roomsSet()).toEqual(["alpha"]);
 
-    // A fresh E in the new room still crawls back.
-    key("keydown", "KeyE");
+    // A fresh use in the new room still crawls back.
+    key("keydown", "Space");
     frames(1);
     expect(hud.connector).toHaveBeenLastCalledWith(
       true,
@@ -526,7 +526,7 @@ describe("a load in flight", () => {
     );
   });
 
-  it("forgets an E pressed while loading when the load fails", async () => {
+  it("forgets a use pressed while loading when the load fails", async () => {
     const beta = deferred<unknown>();
     serve({ "/domains/eng/engrams/beta": () => beta.promise });
     const session = start();
@@ -535,21 +535,21 @@ describe("a load in flight", () => {
     walkToScope();
     session.go({ domain: "eng", permalink: "beta" });
     frames(2);
-    key("keydown", "KeyE");
-    key("keyup", "KeyE");
+    key("keydown", "Space");
+    key("keyup", "Space");
     frames(2);
     beta.resolve(Promise.reject(new ApiProblem(403, "no", "denied")));
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
     });
-    // Still in front of the Scope terminal: the E pressed for the load's
+    // Still in front of the Scope terminal: the use pressed for the load's
     // room must not open the reader here.
     frames(5);
     expect(session.current?.permalink).toBe("manifest");
     expect(hud.reader).not.toHaveBeenCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
     );
-    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ Scope");
   });
 });
 
@@ -780,20 +780,20 @@ function walkToScope() {
   frames(10);
   key("keydown", "KeyW");
   const offered = () =>
-    hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("E READ") === true;
+    hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("SPACE READ") === true;
   for (let i = 0; i < 80 && !offered(); i++) frames(1);
   key("keyup", "KeyW");
   frames(15);
-  expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+  expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ Scope");
 }
 
 describe("the reader", () => {
-  it("opens at E, takes the keys while open and gives them back on close", () => {
+  it("opens at Space, takes the keys while open and gives them back on close", () => {
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     walkToScope();
-    key("keydown", "KeyE");
+    key("keydown", "Space");
     frames(1);
     expect(hud.reader).toHaveBeenLastCalledWith({
       title: "Station Crystalline",
@@ -837,7 +837,7 @@ describe("the reader", () => {
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     walkToScope();
-    key("keydown", "KeyE");
+    key("keydown", "Space");
     frames(1);
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
@@ -845,7 +845,7 @@ describe("the reader", () => {
     session.go({ domain: "station", permalink: "old-bridge" });
     expect(hud.reader).toHaveBeenLastCalledWith(null);
 
-    key("keydown", "KeyE");
+    key("keydown", "Space");
     frames(1);
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
@@ -933,6 +933,21 @@ describe("the classic controls", () => {
     return Math.hypot(to[0] - from[0], to[1] - from[1]);
   }
 
+  it("uses on Space, and E does nothing", () => {
+    onBridge();
+    walkToScope();
+    key("keydown", "KeyE");
+    frames(2);
+    key("keyup", "KeyE");
+    expect(hud.reader).not.toHaveBeenCalled();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+  });
+
   it("runs at about twice the walk while Shift is held", () => {
     // Each from the entrance, on a session of its own, so no wall ahead
     // cuts a run short.
@@ -1006,29 +1021,22 @@ describe("the level cheat", () => {
     expect(window.localStorage.getItem(INVERT_KEY)).toBe("1");
   });
 
-  it("swallows only the E right after i d c l, in front of a terminal", () => {
-    const session = onBridge();
+  it("types the word in front of a terminal without reading it", () => {
+    onBridge();
     walkToScope();
     hud.reader.mockClear();
+    // E is no use any more: no E, inside the word or alone, reads.
     type("idcle");
     frames(2);
-    expect(hud.reader).not.toHaveBeenCalled();
-    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
-
     type("e");
-    frames(1);
-    expect(hud.reader).toHaveBeenLastCalledWith(
-      expect.objectContaining({ title: "Station Crystalline" }),
-    );
-    session.closeReader();
-    hud.reader.mockClear();
+    frames(2);
+    expect(hud.reader).not.toHaveBeenCalled();
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ Scope");
 
-    type("idcxe");
+    type("idclev");
     frames(1);
-    expect(hud.reader).toHaveBeenLastCalledWith(
-      expect.objectContaining({ title: "Station Crystalline" }),
-    );
-    expect(levels).not.toHaveBeenCalled();
+    expect(levels).toHaveBeenLastCalledWith(true);
+    expect(hud.reader).not.toHaveBeenCalled();
   });
 
   it("does nothing without onLevels, as on the look demo and the gallery", () => {
@@ -1043,6 +1051,9 @@ describe("the level cheat", () => {
 
     walkToScope();
     type("idcle");
+    frames(1);
+    expect(hud.reader).not.toHaveBeenCalled();
+    key("keydown", "Space");
     frames(1);
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
@@ -1088,11 +1099,11 @@ describe("the level cheat", () => {
   // Review Focus 2.
   it("ignores every key typed while the level select is open", () => {
     const session = onBridge();
-    // In front of the Scope, so an E that got through would read it. The
+    // In front of the Scope, so a use that got through would read it. The
     // walk's momentum runs out before the select opens.
     walkToScope();
     frames(20);
-    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ Scope");
     type("idclev");
     frames(1);
     expect(levels).toHaveBeenLastCalledWith(true);
@@ -1109,7 +1120,7 @@ describe("the level cheat", () => {
       "KeyD",
       "ArrowLeft",
       "ArrowUp",
-      "KeyE",
+      "Space",
       "KeyF",
       "KeyI",
       "Digit1",
@@ -1149,8 +1160,8 @@ describe("the level cheat", () => {
   it("reads no word while the CRT reader is open", () => {
     const session = onBridge();
     walkToScope();
-    key("keydown", "KeyE");
-    key("keyup", "KeyE");
+    key("keydown", "Space");
+    key("keyup", "Space");
     frames(1);
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
@@ -1308,11 +1319,11 @@ describe("malfunctions", () => {
     return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
   };
 
-  /** Presses E for one frame. */
-  const pressE = () => {
-    key("keydown", "KeyE");
+  /** Presses Space, the use key, for one frame. */
+  const pressUse = () => {
+    key("keydown", "Space");
     frames(1);
-    key("keyup", "KeyE");
+    key("keyup", "Space");
   };
 
   /**
@@ -1400,7 +1411,7 @@ describe("malfunctions", () => {
   it("shuts a door that failed on travel, runs it once, then keeps it sealed", async () => {
     const session = start({ client: null, load: failing("denied") });
     session.showRoom(before(gallery, door1));
-    pressE();
+    pressUse();
     frames(15);
     expect(lastDoors().get(`door:${String(door1)}`)).toBe(1);
     walkIn();
@@ -1435,9 +1446,9 @@ describe("malfunctions", () => {
     expect(peak).toBeLessThanOrEqual(0.54);
     expect(hud.prompt).toHaveBeenCalledWith("SEALED ACCESS DENIED");
 
-    // E at the sealed door starts no travel and opens nothing.
+    // A use at the sealed door starts no travel and opens nothing.
     const ups = connectorUps();
-    pressE();
+    pressUse();
     frames(20);
     expect(connectorUps()).toBe(ups);
     expect(lastDoors().get(`door:${String(door1)}`)).toBe(0);
@@ -1448,9 +1459,9 @@ describe("malfunctions", () => {
     session.showRoom(before(gallery, hatch0));
     frames(2);
     expect(hud.prompt).toHaveBeenLastCalledWith(
-      expect.stringMatching(/^E CRAWL /),
+      expect.stringMatching(/^SPACE CRAWL /),
     );
-    pressE();
+    pressUse();
     expect(connectorUps()).toBe(1);
     await flush();
     const mark = renderer.draw.mock.calls.length;
@@ -1459,7 +1470,7 @@ describe("malfunctions", () => {
     expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
 
     // The failed hatch carries no one: hatchTravel reads the failed map.
-    pressE();
+    pressUse();
     frames(5);
     expect(connectorUps()).toBe(1);
   });
@@ -1671,17 +1682,17 @@ describe("malfunctions", () => {
     })();
 
     /**
-     * Walks from the entrance up to the blast door, opens it with E, walks
+     * Walks from the entrance up to the blast door, opens it with Space, walks
      * in and lets the failed answer land.
      */
     const failBlast = async () => {
       key("keydown", "KeyW");
       const offered = () =>
-        hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("E OPEN") === true;
+        hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("SPACE OPEN") === true;
       for (let i = 0; i < 120 && !offered(); i++) frames(1);
       key("keyup", "KeyW");
       expect(offered()).toBe(true);
-      pressE();
+      pressUse();
       frames(15);
       walkIn();
       await flush();

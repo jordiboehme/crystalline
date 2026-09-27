@@ -60,7 +60,7 @@ export interface Input {
   /**
    * Forgets every unconsumed press and leaves held keys and the mouse as
    * they are. The session calls it when it enters a room, so a command key
-   * pressed for the room left behind (an E hit while the next room was
+   * pressed for the room left behind (a use hit while the next room was
    * loading) is not replayed in the new one, while a W held through the
    * door keeps walking.
    */

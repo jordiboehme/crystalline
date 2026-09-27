@@ -120,7 +120,7 @@ describe("focusOf", () => {
     expect(focus).toEqual({
       kind: "terminal",
       index: scopeIndex,
-      prompt: "E READ Scope",
+      prompt: "SPACE READ Scope",
     });
   });
 
@@ -142,18 +142,18 @@ describe("focusOf", () => {
     expect(focus).toEqual({
       kind: "hatch",
       index: hatchIndex,
-      prompt: "E CRAWL Crew Handbook links_to",
+      prompt: "SPACE CRAWL Crew Handbook links_to",
     });
   });
 
   it("offers to open a blast door and then to close it", () => {
     const player = inFront(bridge, blastIndex, 1.5);
     expect(focusOf(bridge, player)?.prompt).toBe(
-      "E OPEN depends_on Reactor Core",
+      "SPACE OPEN depends_on Reactor Core",
     );
     const open = new Map([[blastIndex, { open: 1, target: 1 as const }]]);
     expect(focusOf(bridge, player, open)?.prompt).toBe(
-      "E CLOSE depends_on Reactor Core",
+      "SPACE CLOSE depends_on Reactor Core",
     );
   });
 });
@@ -499,8 +499,10 @@ describe("ways in the failed map", () => {
         new Map([[hatchI, ACCESS_DENIED]]),
       )?.prompt,
     ).toBe(`SEALED ${ACCESS_DENIED}`);
-    expect(focusOf(room, facing(room, doorI))?.prompt).toMatch(/^E OPEN /);
-    expect(focusOf(room, facing(room, hatchI))?.prompt).toMatch(/^E CRAWL /);
+    expect(focusOf(room, facing(room, doorI))?.prompt).toMatch(/^SPACE OPEN /);
+    expect(focusOf(room, facing(room, hatchI))?.prompt).toMatch(
+      /^SPACE CRAWL /,
+    );
   });
 
   it("heads a failed door shut, even a sliding one the player stands at", () => {

@@ -82,10 +82,10 @@ const OPEN_ENOUGH = 0.9;
  *
  * `index` is the fixture's index in `room.fixtures`, and `prompt` the line
  * the HUD shows for it:
- * - `E READ <heading>` at a terminal;
- * - `E OPEN <label>` or `E CLOSE <label>` at a bulkhead or blast door,
- *   after where the door is heading;
- * - `E CRAWL <label>` at a hatch;
+ * - `SPACE READ <heading>` at a terminal;
+ * - `SPACE OPEN <label>` or `SPACE CLOSE <label>` at a bulkhead or blast
+ *   door, after where the door is heading;
+ * - `SPACE CRAWL <label>` at a hatch;
  * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing;
  * - `SEALED <label>` at a way in `failed`.
  */
@@ -207,13 +207,17 @@ function offer(
 ): Interactable | null {
   switch (fixture.kind) {
     case "terminal":
-      return { kind: "terminal", index, prompt: `E READ ${fixture.heading}` };
+      return {
+        kind: "terminal",
+        index,
+        prompt: `SPACE READ ${fixture.heading}`,
+      };
     case "hatch": {
       const seal = failed.get(index);
       if (seal !== undefined) {
         return { kind: "hatch", index, prompt: `SEALED ${seal}` };
       }
-      return { kind: "hatch", index, prompt: `E CRAWL ${fixture.label}` };
+      return { kind: "hatch", index, prompt: `SPACE CRAWL ${fixture.label}` };
     }
     case "door": {
       const seal = failed.get(index) ?? fixture.sealedLabel;
@@ -222,7 +226,7 @@ function offer(
       }
       if (fixture.style === "sliding") return null;
       const verb = doors.get(index)?.target === 1 ? "CLOSE" : "OPEN";
-      return { kind: "door", index, prompt: `E ${verb} ${fixture.label}` };
+      return { kind: "door", index, prompt: `SPACE ${verb} ${fixture.label}` };
     }
     case "portal": {
       const seal = failed.get(index) ?? fixture.sealedLabel;

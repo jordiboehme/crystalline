@@ -23,7 +23,7 @@
  * stand in yet, the notice stays over the dark screen.
  *
  * Each tick, in order: the typed keys for the level cheat's word, the look
- * and command keys, movement, what the player faces and E at it, the doors,
+ * and command keys, movement, what the player faces and a use of it, the doors,
  * the faults of the broken ways, the HUD prompt, the ways out of the room,
  * warming the cache for the places behind the doors the player walks up to,
  * the room's light specials and the blink banks (`render/blink.ts`, H11).
@@ -55,8 +55,8 @@
  *
  * Typed with no pause longer than a second, `idclev` opens the level select
  * when the host passed `onLevels` (the game route): the word's I toggle is
- * taken back on the match, and its E is swallowed right after `I D C L`, so
- * the word never opens a terminal. While the select is open the session
+ * taken back on the match, and its D strafes for a moment; its E is a plain
+ * letter, since Space is the use key. While the select is open the session
  * reads no keys, exactly as with the CRT reader, until the host calls
  * `closeLevels` or `jump` goes somewhere.
  */
@@ -126,7 +126,7 @@ export interface ReaderState {
 /**
  * Where the session writes what the player sees besides the room.
  *
- * - `prompt`: the line for what the player faces (`E READ Scope`), null
+ * - `prompt`: the line for what the player faces (`SPACE READ Scope`), null
  *   when nothing.
  * - `status`: the room, the look, its condition and the mouse hint.
  * - `frame`: the frame time and the render targets' colour format, with
@@ -289,11 +289,14 @@ const LOAD_ERROR = "?LOAD ERROR";
 /** How much one tick of an arrow key looks up or down, in mouse pixels. */
 const ARROW_LOOK = 12;
 
+/** The use key: doors, terminals, the hatch. */
+const USE_KEY = "Space";
+
 /** The look keys, in the order they are read. */
 const LOOK_KEYS = ["Digit1", "Digit2", "Digit4"] as const;
 
 /** Every key that commands the session, drained while the reader is open. */
-const COMMAND_KEYS = ["KeyE", "KeyF", "KeyI", ...LOOK_KEYS] as const;
+const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", ...LOOK_KEYS] as const;
 
 /** The renderer on a real WebGL2 context. */
 const defaultFactory: RendererFactory = (canvas, options) => {
@@ -826,17 +829,13 @@ export function createSession(opts: SessionOptions): Session {
       let matched = false;
       if (cheat !== null) {
         for (const code of typed) {
-          const step = cheat.feed(code, ticks);
-          // The word's E is not a use: typed in front of a terminal it
-          // never opens the reader (C7).
-          if (step === "swallow") input.pressed("KeyE");
-          if (step === "match") matched = true;
+          if (cheat.feed(code, ticks)) matched = true;
         }
       }
-      // Nothing takes E while a place loads. Its press is dropped here
+      // Nothing takes a use while a place loads. Its press is dropped here
       // rather than kept for the room that loads or, when the load fails,
       // for this one.
-      if (loading) input.pressed("KeyE");
+      if (loading) input.pressed(USE_KEY);
       for (const code of LOOK_KEYS) {
         if (!input.pressed(code)) continue;
         const next = lookForKey(code);
@@ -887,7 +886,7 @@ export function createSession(opts: SessionOptions): Session {
     const focus = modal() ? null : focusOf(room, player, doors, failed);
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
-    if (!still && input.pressed("KeyE") && focus !== null) {
+    if (!still && input.pressed(USE_KEY) && focus !== null) {
       if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
       if (focus.kind === "terminal") {
         openReader(focus.index);

@@ -3,13 +3,11 @@
  * no prompt, opens the level select (the spec's IDCLEV section).
  *
  * The session feeds it every code the player types (`Input.typed`), in
- * order, with the tick it was read on, and it answers what that key means
- * for the word:
- *
- * - `swallow` for the E right after `I D C L`, so the word typed in front
- *   of a terminal never opens the CRT reader (every other E is a use);
- * - `match` for the V that completes it;
- * - `none` for everything else.
+ * order, with the tick it was read on, and it answers true for the V that
+ * completes the word and false for everything else. No letter of the word
+ * is swallowed: E is no longer the use key (Space is), so the word typed in
+ * front of a terminal never opens the CRT reader, and its D strafes for a
+ * moment, as in the classic game.
  *
  * Letters are `KeyboardEvent.code`s, the physical positions the game reads
  * all its keys by (C1). A letter more than `CHEAT_GAP_TICKS` after the one
@@ -29,22 +27,16 @@ export const IDCLEV = ["KeyI", "KeyD", "KeyC", "KeyL", "KeyE", "KeyV"] as const;
  */
 export const CHEAT_GAP_TICKS = 35;
 
-/** The index of the word's E, the letter that is swallowed. */
-const E_AT = IDCLEV.indexOf("KeyE");
-
-/** What one typed key means for the word. See the module doc. */
-export type CheatStep = "none" | "swallow" | "match";
-
 /**
  * Reads the word out of the keys typed, one at a time.
  *
  * - `feed` takes one code and the tick it was read on (never decreasing)
- *   and answers its `CheatStep`.
+ *   and answers whether it completed the word.
  * - `reset` forgets a half-typed word: the session calls it whenever an
  *   overlay opens or closes (C4).
  */
 export interface CheatReader {
-  feed(code: string, tick: number): CheatStep;
+  feed(code: string, tick: number): boolean;
   reset(): void;
 }
 
@@ -61,11 +53,9 @@ export function createCheatReader(): CheatReader {
       } else {
         typed = code === IDCLEV[0] ? 1 : 0;
       }
-      if (typed === IDCLEV.length) {
-        typed = 0;
-        return "match";
-      }
-      return typed === E_AT + 1 ? "swallow" : "none";
+      if (typed < IDCLEV.length) return false;
+      typed = 0;
+      return true;
     },
     reset() {
       typed = 0;
