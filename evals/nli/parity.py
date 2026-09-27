@@ -2,8 +2,9 @@
 """Write the NLI parity fixtures the Rust loader is checked against.
 
 For every model in the contradiction check's table (or the one --model names)
-this loads the checkpoint with Python transformers in float32, scores twenty
-fixed pairs (English, German and mixed), one pair per forward pass with no
+this loads the checkpoint with Python transformers in float32, scores 21
+fixed pairs (English, German and mixed, one German line cut at 254 tokens),
+one pair per forward pass with no
 padding, after cutting each line the way the Rust loader does (first to
 254 x 16 characters, then to 254 tokens), and writes the token ids and the raw
 logits to crates/index/tests/fixtures/nli-parity-<id>.json together with the
@@ -63,6 +64,13 @@ PAIRS = [
     ("mixed-same", "The cache is enabled by default", "Der Cache ist standardmäßig aktiviert"),
     ("mixed-negation", "Der Server braucht keinen Neustart", "The server needs a restart"),
     ("mixed-unrelated", "Die Toleranz liegt bei 1,5 mm", "Deployments run on Fridays"),
+    # Far past 254 tokens with umlauts throughout, so the token cut is under
+    # the gate and Rust's byte offsets and Python's char offsets differ at it.
+    (
+        "de-long-cut",
+        " ".join(["Die Kühlkettenüberwachung meldet stündlich größere Störungen an die Leitstelle."] * 30),
+        "Die Kühlkettenüberwachung meldet täglich",
+    ),
 ]
 
 

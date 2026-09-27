@@ -8,8 +8,11 @@
 //! Point `CRYSTALLINE_MODELS_DIR` at a directory of its own: a daemon sharing
 //! the cache prunes checkpoints its setting does not name.
 //!
+//! Run it on the release profile: an unoptimized candle takes many minutes
+//! over the 270-token parity batch, the release build about twenty seconds.
+//!
 //! ```text
-//! CRYSTALLINE_TEST_NLI=1 cargo nextest run -p crystalline-index --test nli_model --no-capture -j 1
+//! CRYSTALLINE_TEST_NLI=1 cargo nextest run --cargo-profile release -p crystalline-index --test nli_model --no-capture -j 1
 //! ```
 
 #![cfg(feature = "local-embeddings")]

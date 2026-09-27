@@ -54,6 +54,16 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 filter = '(package(crystalline) & binary(daemon) & test(/^service::/)) | (package(crystalline-index) & test(embed::remote))'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
+# The real NLI checkpoints (`CRYSTALLINE_TEST_NLI=1`): a cold cache downloads
+# up to 1.4 GB, which measured 198s cold for the lighter of the two tests.
+# The documented run uses `--cargo-profile release` (about 20s warm); an
+# unoptimized candle over the 270-token parity batch runs past even this
+# ceiling. Without the variable both tests return at once, so the longer
+# ceiling costs nothing elsewhere.
+[[profile.default.overrides]]
+filter = 'package(crystalline-index) & binary(nli_model)'
+slow-timeout = { period = "120s", terminate-after = 15 }
+
 # The CI profile: the default one, plus one retry.
 #
 # Windows runners have twice in four days failed a test on the environment
