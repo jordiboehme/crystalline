@@ -365,7 +365,16 @@
       "z1": 9.432479894207791
     }
   ],
-  "heroes": [],
+  "heroes": [
+    {
+      "kind": "hoverboard",
+      "variant": 0,
+      "x": 1.5,
+      "y": 10.5,
+      "turn": 1,
+      "seed": 451937118939874
+    }
+  ],
   "props": [
     {
       "kind": "sign-plate",

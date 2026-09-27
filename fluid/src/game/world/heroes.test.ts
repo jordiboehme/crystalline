@@ -226,24 +226,24 @@ describe("the hero catalogue", () => {
     // 2.6d C9, C17: the slab walker appended at the end of the engineering
     // pool, after the spider tank.
     expect(HERO_POOLS.engineering.slice(-4)).toEqual([
-      ["mech-head", 1],
-      ["red-bike", 1],
-      ["spider-tank", 1],
-      ["slab-walker", 1],
+      ["mech-head", 2],
+      ["red-bike", 2],
+      ["spider-tank", 2],
+      ["slab-walker", 2],
     ]);
-    expect(HERO_POOLS.archive.at(-1)).toEqual(["stone-hand", 1]);
+    expect(HERO_POOLS.archive.at(-1)).toEqual(["stone-hand", 2]);
     expect(HERO_POOLS.lab.slice(-2)).toEqual([
-      ["stone-hand", 1],
-      ["garden-robot", 1],
+      ["stone-hand", 2],
+      ["garden-robot", 2],
     ]);
   });
 
-  it("draws the slab walker from the bridge and engineering pools at weight 1 (2.6d C9, C17)", () => {
+  it("draws the slab walker from the bridge and engineering pools at weight 2 (2.6d C9, 2.6f C3)", () => {
     // Mutation caught: the walker missing from a pool, or put in another
     // archetype's.
     for (const [a, pool] of Object.entries(HERO_POOLS)) {
       const w = pool.find(([k]) => k === "slab-walker")?.[1] ?? 0;
-      expect(w, a).toBe(a === "bridge" || a === "engineering" ? 1 : 0);
+      expect(w, a).toBe(a === "bridge" || a === "engineering" ? 2 : 0);
     }
     expect(HERO_CATALOGUE["slab-walker"]).toMatchObject({
       placement: "band",
@@ -730,6 +730,80 @@ describe("the hero pass", () => {
   const forcedPoolRoll = (archetype: Archetype, kind: HeroKind) =>
     middleRoll(HERO_POOLS[archetype], kind);
 
+  it("holds a hero in about nine halls in ten (2.6f C2)", () => {
+    // Measured by the planner: 1821 of 2000 (0.910) at 3/5 and 3/4; 1577
+    // (0.788) at the old 1/2 and 1/2. Mutation caught: ANY_SHARE back to
+    // 1/2 (about 0.85), both shares back (0.788), or the any draw not
+    // filling empty slots. The shares are pinned too, since HERO_SHARE
+    // alone back at 1/2 stays inside the band (about 0.905).
+    expect(HERO_SHARE).toBe(3 / 5);
+    expect(ANY_SHARE).toBe(3 / 4);
+    const bases = [...WORKSHOP_BASES, ...BRIDGE_BASES];
+    expect(bases).toHaveLength(10);
+    let halls = 0;
+    let held = 0;
+    for (const { base } of bases)
+      for (const r of reseeded(base, 200)) {
+        halls++;
+        if (place(base, r).length > 0) held++;
+      }
+    expect(halls).toBe(2000);
+    expect(held).toBeGreaterThanOrEqual(1760);
+    expect(held).toBeLessThanOrEqual(1880);
+  }, 30_000);
+
+  it("doubles the archetype-only heroes' weights and leaves every other weight (2.6f C3)", () => {
+    // The whole pools, as C3 states them. Mutation caught: a weight left
+    // at 1, a cabinet or a 2.6a member doubled, or an entry moved (order
+    // is part of the seeded result).
+    expect(HERO_POOLS).toEqual({
+      bridge: [
+        ["eye-panel", 4],
+        ["photo-console", 4],
+        ["laser-desk", 1],
+        ["arcade-cabinet", 1],
+        ["recruit-cabinet", 1],
+        ["slab-walker", 2],
+      ],
+      council: [
+        ["mess-table", 6],
+        ["arcade-cabinet", 1],
+        ["recruit-cabinet", 1],
+      ],
+      engineering: [
+        ["helper-robot", 3],
+        ["sleep-ring", 3],
+        ["gun-rack", 2],
+        ["gun-bench", 1],
+        ["tube-bench", 2],
+        ["field-pack", 1],
+        ["arcade-cabinet", 1],
+        ["recruit-cabinet", 1],
+        ["mech-head", 2],
+        ["red-bike", 2],
+        ["spider-tank", 2],
+        ["slab-walker", 2],
+      ],
+      archive: [
+        ["core-wall", 6],
+        ["arcade-cabinet", 1],
+        ["recruit-cabinet", 1],
+        ["stone-hand", 2],
+      ],
+      lab: [
+        ["photo-console", 3],
+        ["laser-desk", 2],
+        ["dome-planters", 3],
+        ["tube-bench", 2],
+        ["field-pack", 1],
+        ["arcade-cabinet", 1],
+        ["recruit-cabinet", 1],
+        ["stone-hand", 2],
+        ["garden-robot", 2],
+      ],
+    });
+  });
+
   it("places at most heroCap heroes, two only in halls of 16 by 16 or more", () => {
     let two = 0;
     for (const { base } of EVERY_BASE)
@@ -904,13 +978,13 @@ describe("the hero pass", () => {
     expect(added).toBeGreaterThan(0);
   }, 60_000);
 
-  it("lands each any-archetype kind in about 1 hall in 27 in the workshop", () => {
-    // Expected about 37 per 1000 (ANY_SHARE / 5 of the ~37 percent of halls
-    // left empty; measured 34 to 45). Mutation caught: a kind that never
-    // fits, or the draw taking twice as often (about 74) or never. The
-    // share itself is pinned too, since doubling it only just crosses a
-    // loose bound.
-    expect(ANY_SHARE).toBe(1 / 2);
+  it("lands each any-archetype kind in about 1 hall in 20 in the workshop", () => {
+    // The planner measured 39 to 64 per 1000 (thunder hammer 64, cloud 56,
+    // rocket 50, hoverboard 41, police box 39). Mutation caught: a kind
+    // that never fits, or the draw taking twice as often or never.
+    // Doubling is impossible above 1, so the constant pin carries the
+    // share.
+    expect(ANY_SHARE).toBe(3 / 4);
     const counts = new Map<HeroKind, number>();
     for (const { base } of WORKSHOP_BASES)
       for (const r of reseeded(base, 200))
@@ -918,8 +992,8 @@ describe("the hero pass", () => {
           counts.set(h.kind, (counts.get(h.kind) ?? 0) + 1);
     for (const [kind] of ANY_POOL) {
       const n = counts.get(kind) ?? 0;
-      expect(n, kind).toBeGreaterThanOrEqual(12);
-      expect(n, kind).toBeLessThanOrEqual(60);
+      expect(n, kind).toBeGreaterThanOrEqual(25);
+      expect(n, kind).toBeLessThanOrEqual(85);
     }
     console.info(
       `2.6c kinds per 1000 workshop rooms: ${JSON.stringify([...counts])}`,

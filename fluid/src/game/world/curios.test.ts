@@ -887,7 +887,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(archive.laptop).toBe(0);
   });
 
-  it("the laptop lands now and then, and a ball about 1 room in 30", () => {
+  it("the laptop lands now and then, and a ball about 1 room in 20", () => {
     const wide = WORKSHOPS.filter(
       (m) => m.archetype === "council" || m.archetype === "lab",
     );
@@ -918,7 +918,7 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     expect(within(balls, 1500, BALL_SHARE), `balls ${balls}`).toBe(true);
   });
 
-  it("places an under curio in about 1 generated room in 11 across all archetypes", () => {
+  it("places an under curio in about 1 in 7 across all archetypes", () => {
     // The realized rate, counted on what `generateRoom` actually placed,
     // over 1000 rooms: the three canned places in turn, each permalink its
     // own (so its own room seed), with 0 to 5 made-up tags (so the machine
@@ -1377,12 +1377,48 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
       ["fuel-case", 1],
       ["soot-puffs", 1],
     ]);
-    expect(TECH_SHARE).toBe(1 / 10);
-    expect(RADAR_SHARE).toBe(1 / 24);
+    expect(TECH_SHARE).toBe(3 / 20);
+    expect(RADAR_SHARE).toBe(1 / 16);
     expect(RADAR_BESIDE_BALL).toBe(1 / 2);
-    expect(CAPSULE_SHARE).toBe(1 / 24);
+    expect(CAPSULE_SHARE).toBe(1 / 16);
     expect(CAPSULE_BESIDE).toBe(1 / 3);
   });
+
+  it("takes the curios half as often again (2.6f C4)", () => {
+    // Measured by the planner: 3516 curios in 4000 rooms (0.879) at the
+    // 2.6f shares, 2321 (0.580) at the old ones. Mutation caught: any
+    // share left at its old value moves the count by 120 or more, and
+    // the pins below catch each alone.
+    expect([
+      RETRO_SHARE,
+      GEAR_SHARE,
+      BALL_SHARE,
+      UNDER_SHARE,
+      TECH_SHARE,
+      RADAR_SHARE,
+      CAPSULE_SHARE,
+    ]).toEqual([1 / 4, 3 / 16, 1 / 20, 3 / 20, 3 / 20, 1 / 16, 1 / 16]);
+    expect([RADAR_BESIDE_BALL, CAPSULE_BESIDE, BALL_FLOOR]).toEqual([
+      1 / 2,
+      1 / 3,
+      1 / 4,
+    ]);
+    const rooms = [...WORKSHOPS, ...matrix(CANNED_BRIDGE)];
+    expect(rooms.length).toBeGreaterThan(0);
+    let n = 0;
+    let curios = 0;
+    for (const made of rooms)
+      for (let i = 0; i < 100; i++) {
+        n++;
+        curios += placeCurios(reseed(made.room, "rate-f", made.name, i)).length;
+      }
+    const perRoom = curios / n;
+    console.info(
+      `2.6f curios per room: ${perRoom.toFixed(3)} over ${String(n)}`,
+    );
+    expect(perRoom).toBeGreaterThanOrEqual(0.83);
+    expect(perRoom).toBeLessThanOrEqual(0.93);
+  }, 30_000);
 
   it("hovers the drone over a terminal's desk end first, where the room has one (2.6d C8, Review Focus 2)", () => {
     // Mutation caught: the terminal preference dropped, so a lab bench's

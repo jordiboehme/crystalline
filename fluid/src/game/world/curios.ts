@@ -52,7 +52,7 @@
  *   hall's corners at `BALL_FLOOR`. The radar takes at
  *   `RADAR_BESIDE_BALL` in a room that holds a star ball, and the capsule
  *   case at `CAPSULE_BESIDE` in a room that holds a star ball or the
- *   radar.
+ *   radar (2.6f C4: each share 1.5 times its 2.6b and 2.6d share).
  * - **C8. The laptop is too big for a terminal end** and stands on the
  *   wider tops only; nothing is widened for it.
  * - **C9. Seeds by anchor.** A candidate's seed is made from its host's
@@ -553,24 +553,24 @@ export const CAPSULE_POOL = [
   ["capsule-case", 1],
 ] as const satisfies readonly (readonly [CurioKind, number])[];
 
-/** Chance a room draws a retro curio (C7). */
-export const RETRO_SHARE = 1 / 6;
-/** Chance a room draws a gear curio (C7). */
-export const GEAR_SHARE = 1 / 8;
-/** Chance a room draws a ball (spec: about 1 room in 30). */
-export const BALL_SHARE = 1 / 30;
+/** Chance a room draws a retro curio (C7, 2.6f C4): about 1 room in 4. */
+export const RETRO_SHARE = 1 / 4;
+/** Chance a room draws a gear curio (C7, 2.6f C4): about 3 in 16. */
+export const GEAR_SHARE = 3 / 16;
+/** Chance a room draws a ball (2.6f C4): about 1 room in 20. */
+export const BALL_SHARE = 1 / 20;
 /** Chance a drawn ball tries the hall's corners instead of the surfaces (C7). */
 export const BALL_FLOOR = 1 / 4;
-/** Chance a room draws an under-desk curio (C7). */
-export const UNDER_SHARE = 1 / 10;
-/** Chance a room draws the tech slot (2.6d C9). */
-export const TECH_SHARE = 1 / 10;
-/** Chance a room draws the radar (2.6d C9)... */
-export const RADAR_SHARE = 1 / 24;
+/** Chance a room draws an under-desk curio (C7, 2.6f C4): about 3 in 20. */
+export const UNDER_SHARE = 3 / 20;
+/** Chance a room draws the tech slot (2.6d C9, 2.6f C4): about 3 in 20. */
+export const TECH_SHARE = 3 / 20;
+/** Chance a room draws the radar (2.6d C9, 2.6f C4: about 1 room in 16)... */
+export const RADAR_SHARE = 1 / 16;
 /** ...and its chance in a room that holds a star ball (2.6d C5). */
 export const RADAR_BESIDE_BALL = 1 / 2;
-/** Chance a room draws the capsule case (2.6d C9)... */
-export const CAPSULE_SHARE = 1 / 24;
+/** Chance a room draws the capsule case (2.6d C9, 2.6f C4: about 1 room in 16)... */
+export const CAPSULE_SHARE = 1 / 16;
 /**
  * ...and its chance in a room that holds a star ball or the radar (2.6d
  * C5).

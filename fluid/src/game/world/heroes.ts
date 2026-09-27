@@ -547,7 +547,9 @@ export const HERO_CATALOGUE = {
  * Each archetype's weighted pool (H7); the turret, the slab, the question
  * block and the any-archetype kinds (`ANY_POOL`) are drawn apart. The pools
  * are listed in catalogue order, and that order is part of the seeded result,
- * so do not reorder them.
+ * so do not reorder them. The archetype-only heroes stand at weight 2 (2.6f
+ * C3): stone-hand (archive, lab), mech-head, red-bike, spider-tank
+ * (engineering), garden-robot (lab) and slab-walker (bridge, engineering).
  */
 export const HERO_POOLS = {
   bridge: [
@@ -556,7 +558,7 @@ export const HERO_POOLS = {
     ["laser-desk", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
-    ["slab-walker", 1],
+    ["slab-walker", 2],
   ],
   council: [
     ["mess-table", 6],
@@ -572,16 +574,16 @@ export const HERO_POOLS = {
     ["field-pack", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
-    ["mech-head", 1],
-    ["red-bike", 1],
-    ["spider-tank", 1],
-    ["slab-walker", 1],
+    ["mech-head", 2],
+    ["red-bike", 2],
+    ["spider-tank", 2],
+    ["slab-walker", 2],
   ],
   archive: [
     ["core-wall", 6],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
-    ["stone-hand", 1],
+    ["stone-hand", 2],
   ],
   lab: [
     ["photo-console", 3],
@@ -591,15 +593,15 @@ export const HERO_POOLS = {
     ["field-pack", 1],
     ["arcade-cabinet", 1],
     ["recruit-cabinet", 1],
-    ["stone-hand", 1],
-    ["garden-robot", 1],
+    ["stone-hand", 2],
+    ["garden-robot", 2],
   ],
 } satisfies Record<Archetype, readonly (readonly [HeroKind, number])[]>;
 
 /** Both hall sides at least this many cells: a second hero (H6). */
 export const HERO_BIG_HALL = 16;
-/** Chance a pool slot draws a hero (H7). */
-export const HERO_SHARE = 1 / 2;
+/** Chance a pool slot draws a hero (H7, 2.6f C2). */
+export const HERO_SHARE = 3 / 5;
 /** Chance a room draws the turret (spec: about 1 room in 6). */
 export const TURRET_SHARE = 1 / 6;
 /** Chance a room draws the slab (spec: about 1 room in 40, where the centre is free). */
@@ -621,8 +623,8 @@ export const ANY_POOL = [
   ["police-box", 1],
 ] as const satisfies readonly (readonly [HeroKind, number])[];
 
-/** Chance the any-archetype draw takes (C9). */
-export const ANY_SHARE = 1 / 2;
+/** Chance the any-archetype draw takes (C9, 2.6f C2). */
+export const ANY_SHARE = 3 / 4;
 /** The moat around a free or backed hero, in metres (H19, H20): wider than the player (0.7 m). */
 export const HERO_CLEAR = 1.0;
 /** How deep the clear view box in front of a flush wall hero is, in metres (H19). */

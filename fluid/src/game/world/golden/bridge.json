@@ -185,12 +185,12 @@
   "scaffold": [],
   "heroes": [
     {
-      "kind": "flying-cloud",
+      "kind": "photo-console",
       "variant": 0,
-      "x": 4.5,
-      "y": 3.5,
-      "turn": 3,
-      "seed": 117700435699395
+      "x": 1.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 2529401834272219
     }
   ],
   "props": [
@@ -333,15 +333,6 @@
       "kind": "cable-tray",
       "variant": 0,
       "anchor": "wall",
-      "x": 1.5,
-      "y": 6,
-      "turn": 0,
-      "seed": 4398412402821368
-    },
-    {
-      "kind": "cable-tray",
-      "variant": 0,
-      "anchor": "wall",
       "x": 6.5,
       "y": 6,
       "turn": 0,
@@ -463,24 +454,6 @@
       "y": 6,
       "turn": 0,
       "seed": 1234190892904149
-    },
-    {
-      "kind": "cable-loop",
-      "variant": 1,
-      "anchor": "ceiling",
-      "x": 1.5,
-      "y": 6,
-      "turn": 0,
-      "seed": 5084798574664765
-    },
-    {
-      "kind": "ceiling-tray",
-      "variant": 1,
-      "anchor": "ceiling",
-      "x": 1.5,
-      "y": 6,
-      "turn": 0,
-      "seed": 4067821934942528
     },
     {
       "kind": "beacon",
