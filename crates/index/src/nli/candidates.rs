@@ -282,6 +282,9 @@ pub fn score_rows(
     lines: &[LinePair<'_>],
     probabilities: &[f32],
 ) -> Vec<ContradictionRow> {
+    // Two scores per line pair, one per reading order. A short answer would
+    // zip away the tail silently and store the pair as scored.
+    debug_assert_eq!(probabilities.len(), lines.len() * 2);
     lines
         .iter()
         .zip(probabilities.as_chunks::<2>().0)
@@ -584,6 +587,16 @@ mod tests {
             r.hash_a,
             observation_hash("Since 2024 the build uses Node 18")
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn score_rows_refuses_a_short_answer_in_a_debug_build() {
+        let a = vec![obs(1, "The build uses Node 18")];
+        let b = vec![obs(7, "The build uses Node 20")];
+        let lines = line_pairs(&a, &b);
+        score_rows(EngramId(1), EngramId(2), &lines, &[0.9]);
     }
 
     #[test]

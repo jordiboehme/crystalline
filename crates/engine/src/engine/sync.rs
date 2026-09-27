@@ -663,7 +663,7 @@ impl Engine {
     /// virtual domain (whose single source of truth is the shared database, so
     /// every instance is jointly responsible for keeping them embedded). An empty
     /// set is returned as `Some([])`, which the store treats as "nothing to do".
-    async fn embed_scope(&self, store: &dyn Store) -> Result<Option<Vec<DomainId>>> {
+    pub(super) async fn embed_scope(&self, store: &dyn Store) -> Result<Option<Vec<DomainId>>> {
         if self.instance_id.is_empty() {
             return Ok(None);
         }

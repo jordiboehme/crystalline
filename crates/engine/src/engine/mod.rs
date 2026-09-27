@@ -761,6 +761,22 @@ pub struct Engine {
     // One embedding pass at a time, whoever asks: the worker, a verb that just
     // wrote, the daemon's startup task or the self-heal tick. See [`EmbedGate`].
     embed_gate: Arc<std::sync::Mutex<EmbedGate>>,
+    // The channel the contradiction worker listens on. `None` outside the
+    // daemon, where nothing scores.
+    contradiction_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    // One contradiction pass at a time. See [`ContradictionGate`].
+    contradiction_gate: Arc<std::sync::Mutex<ContradictionGate>>,
+    // Pending per domain, the settled digests and the last error.
+    contradiction_state: std::sync::Mutex<ContradictionState>,
+    // The NLI model, loaded lazily and dropped after ten idle minutes.
+    scorer: std::sync::Mutex<Option<LoadedScorer>>,
+    // How a scorer is built; a test seam, the real loader otherwise.
+    scorer_loader: ScorerLoader,
+    // A test seam like `detection_walks`: how many times the contradiction
+    // pass has parsed a domain's engrams. A settled domain is skipped, and a
+    // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_fact_walks: std::sync::atomic::AtomicU64,
     // What the last successful embedding-model load pruned from the model
     // cache, so `ctl status` after a start says what that start freed. Empty on
     // every install that had nothing to prune, which is every install that
@@ -1642,6 +1658,151 @@ impl Drop for EmbedPass {
     }
 }
 
+/// The single-flight state of the contradiction pass, the shape of
+/// [`EmbedGate`] for the same reason: two passes over one pending set would
+/// score the same pairs twice.
+#[derive(Default)]
+pub(crate) struct ContradictionGate {
+    running: bool,
+    again: bool,
+}
+
+/// Holds the claim on the contradiction pass, releasing it on drop.
+pub(crate) struct ContradictionPass {
+    gate: Arc<std::sync::Mutex<ContradictionGate>>,
+    released: bool,
+}
+
+impl ContradictionPass {
+    /// Claim the pass, or `None` when one is already running, which is then
+    /// told to walk once more.
+    fn claim(gate: &Arc<std::sync::Mutex<ContradictionGate>>) -> Option<ContradictionPass> {
+        let mut state = gate.lock().unwrap();
+        if state.running {
+            state.again = true;
+            return None;
+        }
+        state.running = true;
+        state.again = false;
+        drop(state);
+        Some(ContradictionPass {
+            gate: Arc::clone(gate),
+            released: false,
+        })
+    }
+
+    /// `true` to walk again because a request arrived during the walk just
+    /// finished; `false` ends the pass and releases the claim.
+    fn walk_again(&mut self) -> bool {
+        let mut state = self.gate.lock().unwrap();
+        if state.again {
+            state.again = false;
+            true
+        } else {
+            state.running = false;
+            self.released = true;
+            false
+        }
+    }
+}
+
+impl Drop for ContradictionPass {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.lock().unwrap().running = false;
+        }
+    }
+}
+
+/// What a request for a contradiction pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionOutcome {
+    /// `evolve.contradictions` is off: nothing was read, loaded or scored.
+    Off,
+    /// A pass was already running; it walks once more for this request.
+    AlreadyRunning,
+    /// Pairs were pending and the model could not be loaded. Logged once and
+    /// reported by status; the load is tried again only once the setting is
+    /// set again or the daemon starts again.
+    ModelUnavailable,
+    /// This call scored `pairs` engram pairs over `line_pairs` line pairs and
+    /// left `remaining` pending for the next pass.
+    Scored {
+        pairs: usize,
+        line_pairs: usize,
+        remaining: usize,
+    },
+}
+
+/// How long the loaded NLI model may sit unused before the tick drops it.
+pub const NLI_IDLE_DROP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Builds the scorer for a model. The daemon's is
+/// [`crystalline_index::nli::load_scorer`]; a test hands in a stub.
+pub type ScorerLoader = Arc<
+    dyn Fn(
+            &'static crystalline_index::nli::NliModel,
+        ) -> futures::future::BoxFuture<
+            'static,
+            crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>>,
+        > + Send
+        + Sync,
+>;
+
+/// What a walk that left a domain with nothing pending saw of it, so the next
+/// walk can skip the domain without parsing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettledDomain {
+    /// The digest of the NLI model, the related line, the embedding model and
+    /// every path with its checksum.
+    pub(crate) digest: String,
+    /// The active model's embedded-chunk count at that walk, kept only when a
+    /// possible candidate (current, with observations) had no lead vector
+    /// yet: then a later embedding can add a pair without moving a stamp, so
+    /// a moved count walks the domain again. `None` when every possible
+    /// candidate had its vector, where only a stamp can change the pairs.
+    pub(crate) coverage: Option<usize>,
+}
+
+/// What the contradiction pass remembers between walks.
+#[derive(Default)]
+pub(crate) struct ContradictionState {
+    /// Related pairs left unscored per domain after the last walk. `None`
+    /// until a walk has run, and again once the check is turned off: unknown,
+    /// which is what makes the tick ask.
+    pub(crate) pending: Option<BTreeMap<String, usize>>,
+    /// Per domain, what the last walk that left it at zero saw, so a walk
+    /// skips a domain nothing changed in.
+    pub(crate) settled: HashMap<String, SettledDomain>,
+    /// Why the model could not be loaded or a batch could not be scored.
+    /// A load failure stays until the setting is set again; a batch failure
+    /// until the next walk that loads nothing new and fails nothing.
+    pub(crate) last_error: Option<String>,
+    /// Whether that failure has been logged, so it is logged once.
+    pub(crate) error_logged: bool,
+    /// The model repo whose load failed. The loader wipes the checkpoint and
+    /// downloads it again on any build error, so the pass never asks for that
+    /// model again by itself: only a set `evolve.contradictions`, another
+    /// profile or a daemon start does.
+    pub(crate) load_failed: Option<&'static str>,
+}
+
+/// The loaded scorer and when it last scored.
+pub(crate) struct LoadedScorer {
+    pub(crate) repo: &'static str,
+    pub(crate) scorer: Arc<dyn crystalline_index::nli::ContradictionScorer>,
+    pub(crate) last_used: tokio::time::Instant,
+}
+
+fn default_scorer_loader() -> ScorerLoader {
+    Arc::new(
+        |model: &'static crystalline_index::nli::NliModel| -> futures::future::BoxFuture<
+            'static,
+            crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>>,
+        > { Box::pin(crystalline_index::nli::load_scorer(model)) },
+    )
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -1671,6 +1832,13 @@ impl Engine {
             watch_tx: None,
             embed_tx: None,
             embed_gate: Arc::default(),
+            contradiction_tx: None,
+            contradiction_gate: Arc::default(),
+            contradiction_state: std::sync::Mutex::default(),
+            scorer: std::sync::Mutex::new(None),
+            scorer_loader: default_scorer_loader(),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
             model_cache_pruned: std::sync::RwLock::new(Vec::new()),
             provider: std::sync::RwLock::new(provider),
             model_id,
@@ -2294,6 +2462,24 @@ impl Engine {
     /// inline, so a connect request returns without waiting on the model.
     pub fn with_embed_channel(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Engine {
         self.embed_tx = Some(tx);
+        self
+    }
+
+    /// Wire the contradiction worker's channel. The daemon's builder does
+    /// this; nothing else scores.
+    pub fn with_contradiction_channel(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Engine {
+        self.contradiction_tx = Some(tx);
+        self
+    }
+
+    /// Replace how the NLI scorer is built, for tests: a stub, a counting
+    /// loader or a failing one, so no test downloads a model.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_scorer_loader(mut self, loader: ScorerLoader) -> Engine {
+        self.scorer_loader = loader;
         self
     }
 
@@ -4254,6 +4440,7 @@ mod attachments;
 mod configure;
 mod context;
 mod contradictions;
+pub use contradictions::run_contradiction_worker;
 mod delete;
 mod domain_add;
 mod domains;
@@ -4925,20 +5112,32 @@ pub async fn run_embed_worker(
 ) {
     while rx.recv().await.is_some() {
         while rx.try_recv().is_ok() {}
-        match engine.embed_pending().await {
-            Ok(0) => {}
-            Ok(n) => {
-                // The count the daemon's startup pass used to log itself. It
-                // belongs here now that every pass comes through the worker,
-                // and stays at info: the worker coalesces a burst of requests
-                // into one pass, so a large first index is one line, not
-                // thousands.
-                tracing::info!("embedded {n} chunk(s)");
-                // The engine passive-checkpoints on its own past a hardcoded
-                // un-backfilled-frame threshold, so this is disk reclamation
-                // of the post-bulk-embed high-water mark, not growth control.
-                engine.checkpoint_wal().await;
+        match engine.embed_pending_outcome().await {
+            Ok(EmbedOutcome::Embedded { chunks, .. }) => {
+                if chunks > 0 {
+                    // The count the daemon's startup pass used to log itself.
+                    // It belongs here now that every pass comes through the
+                    // worker, and stays at info: the worker coalesces a burst
+                    // of requests into one pass, so a large first index is
+                    // one line, not thousands.
+                    tracing::info!("embedded {chunks} chunk(s)");
+                    // The engine passive-checkpoints on its own past a
+                    // hardcoded un-backfilled-frame threshold, so this is disk
+                    // reclamation of the post-bulk-embed high-water mark, not
+                    // growth control.
+                    engine.checkpoint_wal().await;
+                }
+                // The contradiction pass follows every completed embed pass:
+                // a pair is a candidate only once both lead vectors exist, and
+                // a status or window edit that embedded nothing can still add
+                // or retire one. A pass whose batches were all rejected hands
+                // over too, since on an install whose backlog never drains
+                // this is the only way in. A domain nothing changed in is
+                // skipped by its settled digest, so asking after every pass
+                // stays cheap.
+                engine.request_contradictions();
             }
+            Ok(EmbedOutcome::AlreadyRunning) => {}
             Err(e) => tracing::warn!("background embed failed: {e}"),
         }
     }
