@@ -807,6 +807,13 @@ describe("the hero pass", () => {
     for (let i = 0; i < 2000; i++) {
       const d = heroDrawsOf(seedFor("unknown-type", i), 1);
       const raw = rawHero(d, null);
+      // A taking pool slot cannot be resolved for an unknown archetype, so
+      // it must return null rather than fall through to the any draw, but
+      // only when it is actually the deciding draw: an earlier solo draw
+      // (the slab, the turret or the block) still wins over it, as it does
+      // for a known archetype.
+      if (d.picks[0]?.take === true && !d.slab && !d.turret && d.block !== true)
+        expect(raw, String(i)).toBeNull();
       if (raw === null) {
         // A pool slot that takes hides the any draw, known or not.
         expect(d.slab || d.turret || d.block === true).toBe(false);

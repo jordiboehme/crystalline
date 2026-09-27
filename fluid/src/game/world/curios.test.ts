@@ -1229,9 +1229,24 @@ describe("the 2.6d curios (2.6d C3 to C9)", () => {
   const HUB_ROOMS = matrix(CANNED_HUB);
 
   it("makes a room's curio draws from its seed alone (2.6f C6)", () => {
-    // Mutation caught: curioDrawsOf reading another stream or order.
-    for (const { room } of ROOMS.slice(0, 20))
-      expect(curioDraws(base(room))).toEqual(curioDrawsOf(room.seed));
+    // Mutation caught: curioDrawsOf reading another stream or order. Every
+    // room's own seed depends only on its domain and permalink (never its
+    // archetype or condition), so a room's own `room.seed` would repeat
+    // across ROOMS' matrix of archetypes and conditions; `reseed` mints a
+    // fresh seed per sample instead, the way the hero test's `reseeded`
+    // does, to exercise many distinct seeds across every archetype, the
+    // bridge and the hub.
+    const seeds = new Set<number>();
+    let n = 0;
+    for (const made of ROOMS)
+      for (let i = 0; i < 5; i++) {
+        const b = reseed(made.room, "draws-f", made.name, i);
+        seeds.add(b.seed);
+        n++;
+        expect(curioDraws(b)).toEqual(curioDrawsOf(b.seed));
+      }
+    expect(n).toBeGreaterThan(0);
+    expect(seeds.size).toBeGreaterThan(100);
   });
 
   it("lists a room's raw curios slot by slot from the whole pools (2.6f C6)", () => {
