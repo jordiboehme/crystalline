@@ -24,8 +24,10 @@ import { LOOKS } from "../../looks";
 import {
   cross,
   dot,
+  inked,
   positions,
   recordingKitAt,
+  runsOfLines,
   sub,
   toLocal,
   type Part,
@@ -39,7 +41,7 @@ import {
   RECRUIT_TITLE,
 } from "./arcade";
 import { heroHalf } from "./common";
-import { pixelRuns, textRows } from "./pixels";
+import { textRows } from "./pixels";
 
 const CABINETS = ["arcade-cabinet", "recruit-cabinet"] as const;
 
@@ -58,17 +60,6 @@ function partsOf(kind: HeroKind, variant: number): Part[] {
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** The parts of `parts` painted exactly `ink`, whatever primitive drew them. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.tint?.join() === ink.join());
 
 /**
  * The recruitment cabinet's hood face in the side view, as its profile

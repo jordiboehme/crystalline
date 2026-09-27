@@ -19,31 +19,21 @@ import { HERO_CATALOGUE } from "../../../world/heroes";
 import { FLAG, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
 import {
+  inked,
   partsOf,
   reaches,
+  runsOfLines,
   shape,
   sub,
   toLocal,
   type Part,
 } from "../../modelChecks";
 import { MARKS } from "../marks";
-import { pixelRuns, textRows } from "./pixels";
 import { LABEL_INK, LABEL_TAPE } from "./workshop";
 
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** The panels of `parts` painted exactly `ink`. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
 
 /** The height of a panel part: its pixel size, for a mark's run. */
 const heightOf = (p: Part): number => {
@@ -259,7 +249,7 @@ describe("workshop hero models", () => {
     // the wrong string, or below the floor.
     const [low = "", high = ""] = MARKS.benchLabels;
     expect(runsOfLines(MARKS.benchLabels)).toBeGreaterThan(3);
-    const ink = inked(partsOf("tube-bench"), LABEL_INK);
+    const ink = inked(partsOf("tube-bench"), LABEL_INK, "panel");
     expect(ink).toHaveLength(runsOfLines(MARKS.benchLabels));
     const within = (p: Part, h0: number, h1: number) =>
       local(p).every(
@@ -301,7 +291,7 @@ describe("workshop hero models", () => {
         ] as const;
       });
     expect(tapes).toHaveLength(MARKS.benchLabels.length);
-    for (const p of inked(parts, LABEL_INK)) {
+    for (const p of inked(parts, LABEL_INK, "panel")) {
       const ps = local(p);
       for (const q of ps)
         expect(q[1]).toBeCloseTo(BOX_FRONT.d + 2 * DECAL_LIFT, 9);

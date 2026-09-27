@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { FLAG, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
-import { GLOWING, partsOf, toLocal, type Part } from "../../modelChecks";
+import { GLOWING, inked, partsOf, toLocal, type Part } from "../../modelChecks";
 import { HAMMER_RUNES } from "../marks";
 import { FLOOR_CRACK, HAMMER, HAMMER_HEAD, ROCKET, RUNE_INK } from "./exhibits";
 import { runsOf } from "./pixels";
@@ -19,9 +19,6 @@ const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
 const extent = (pts: V3[], i: 0 | 1 | 2) =>
   Math.max(...pts.map((q) => q[i])) - Math.min(...pts.map((q) => q[i]));
-/** The panels of `parts` painted exactly `ink`. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
 
 /**
  * The head faces the runes are cut into: the two long sides (`+d` and
@@ -130,7 +127,7 @@ describe("exhibit hero models", () => {
     // `pixelPanel` lays one quad per run of equal characters (`runsOf`).
     const runs = runsOf(HAMMER_RUNES).filter((r) => r.ch !== ".").length;
     expect(runs).toBeGreaterThan(3);
-    const ink = inked(partsOf("thunder-hammer"), RUNE_INK);
+    const ink = inked(partsOf("thunder-hammer"), RUNE_INK, "panel");
     expect(ink).toHaveLength(RUNE_FACES * runs);
     for (const p of ink)
       for (const q of local(p)) {
@@ -144,7 +141,7 @@ describe("exhibit hero models", () => {
   it("sets one rune band on each long side, one lift proud, between the knotwork bands (2.6f C17)", () => {
     // Mutation caught: both bands on the same side, a band floating off
     // its face or sunk into it, and a band run over a knotwork band.
-    const ink = inked(partsOf("thunder-hammer"), RUNE_INK);
+    const ink = inked(partsOf("thunder-hammer"), RUNE_INK, "panel");
     expect(ink.length).toBeGreaterThan(0);
     const face = HAMMER_HEAD.side / 2 + DECAL_LIFT;
     const inner = Math.min(...HAMMER.bands.map(Math.abs)) - HAMMER.bandHalf;

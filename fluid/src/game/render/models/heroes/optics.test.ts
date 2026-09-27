@@ -19,16 +19,17 @@ import { blinkFlag, FLAG, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
 import { LOOKS } from "../../looks";
 import {
+  inked,
   partsOf,
   placeMesh,
   positions,
+  runsOfLines,
   toLocal,
   type Part,
 } from "../../modelChecks";
 import { MARKS } from "../marks";
 import { buildHeroMesh } from ".";
 import { BADGE_BLUE, BADGE_INK, DESK_BADGE_INK, OFFICE_CHAIR } from "./optics";
-import { pixelRuns, textRows } from "./pixels";
 
 /**
  * How high the laser desk's catalogue top must stay clear of a part, in
@@ -40,17 +41,6 @@ const CLEAR_TO = 1.9;
 /** A part's points in the recipe's local `[a, d, h]`. */
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** The panels of `parts` painted exactly `ink`. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
 
 /** The height of a panel part: its pixel size, for a mark's run. */
 const heightOf = (p: Part): number => {
@@ -231,7 +221,7 @@ describe("optics hero models", () => {
     // the words below the floor.
     expect(runsOfLines(MARKS.panelName)).toBeGreaterThan(3);
     const parts = partsOf("eye-panel");
-    const ink = inked(parts, BADGE_INK);
+    const ink = inked(parts, BADGE_INK, "panel");
     expect(ink).toHaveLength(runsOfLines(MARKS.panelName));
     const badge = parts
       .filter((p) => p.tint?.join() === BADGE_BLUE.join())
@@ -253,7 +243,7 @@ describe("optics hero models", () => {
     // different sizes.
     const [first = "", last = ""] = MARKS.panelName;
     const parts = partsOf("eye-panel");
-    const ink = inked(parts, BADGE_INK);
+    const ink = inked(parts, BADGE_INK, "panel");
     const blue = parts
       .filter((p) => p.tint?.join() === BADGE_BLUE.join())
       .flatMap(local);
@@ -288,7 +278,7 @@ describe("optics hero models", () => {
     // Mutation caught: the wordmark missing or set from the wrong string,
     // over the slot, off the lip, floating or sunk, or below the floor.
     expect(runsOfLines(MARKS.deskBadge)).toBeGreaterThan(3);
-    const ink = inked(partsOf("photo-console"), DESK_BADGE_INK);
+    const ink = inked(partsOf("photo-console"), DESK_BADGE_INK, "panel");
     expect(ink).toHaveLength(runsOfLines(MARKS.deskBadge));
     for (const p of ink) {
       expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);

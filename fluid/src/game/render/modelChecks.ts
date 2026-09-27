@@ -19,7 +19,10 @@
  * `recordingKitAt` records for a model built through a kit factory, and which
  * the fixture tests record for the movers too; `heroAt`, `anchorOf` and
  * `partsOf` are the one way every hero test builds a hero and its recorded
- * parts at the origin.
+ * parts at the origin. The mark tests read printed marks back from those
+ * parts the same ways: the parts in one ink (`inked`), the runs a line sets
+ * in the font (`runsOfLines`), a picture cut to its lit cells (`trimmed`)
+ * and a mark's cells rebuilt from its parts (`cellsOf`).
  */
 
 import type { Box, Hero, HeroKind } from "../world/types";
@@ -38,6 +41,7 @@ import { createKit, turnPoint, type Frame, type Kit } from "./kit";
 import { LOOKS, type Rgb } from "./looks";
 import type { KitAt } from "./models";
 import { buildHero } from "./models/heroes";
+import { pixelRuns, textRows } from "./models/heroes/pixels";
 
 /**
  * One kit call, as a recording kit saw it: the builder it emitted into
@@ -580,4 +584,82 @@ export function recordingKitAt(builder: Builder, parts: Part[]): KitAt {
     }
     return wrapped as unknown as Kit;
   };
+}
+
+/**
+ * The parts of `parts` painted exactly `ink`: drawn by any primitive, or
+ * only by `method` when one is given.
+ */
+export const inked = (
+  parts: readonly Part[],
+  ink: readonly number[],
+  method?: Part["method"],
+): Part[] =>
+  parts.filter(
+    (p) =>
+      (method === undefined || p.method === method) &&
+      p.tint?.join() === ink.join(),
+  );
+
+/** How many lit runs `lines` make in the font. */
+export const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** A picture with its all-dark rows and columns round the edge cut off. */
+export function trimmed(rows: readonly string[]): string[] {
+  const lit = (r: string) => r.includes("#");
+  const inRows = rows.filter(lit);
+  const cols = inRows[0]?.length ?? 0;
+  const litCol = (c: number) => inRows.some((r) => r[c] === "#");
+  let c0 = 0;
+  while (c0 < cols && !litCol(c0)) c0++;
+  let c1 = cols;
+  while (c1 > c0 && !litCol(c1 - 1)) c1--;
+  const first = rows.findIndex(lit);
+  const last = rows.length - [...rows].reverse().findIndex(lit);
+  return rows.slice(first, last).map((r) => r.slice(c0, c1));
+}
+
+/**
+ * A mark's lit cells rebuilt from its parts: `at` puts a part's recorded
+ * point into the reader's `[x, y]`, `x` to the right along the mark and
+ * `y` down it. The pixel is the smallest extent any part has there (some
+ * piece is one cell), and every part covers whole cells from the mark's
+ * top left. A mark turned about, mirrored or scrambled comes out as other
+ * rows than its own.
+ */
+export function cellsOf(
+  parts: readonly Part[],
+  at: (q: V3) => readonly [x: number, y: number],
+): { rows: string[]; px: number } {
+  const boxes = parts.map((p) => {
+    const xy = p.points.map(at);
+    const xs = xy.map((q) => q[0]);
+    const ys = xy.map((q) => q[1]);
+    return {
+      x0: Math.min(...xs),
+      x1: Math.max(...xs),
+      y0: Math.min(...ys),
+      y1: Math.max(...ys),
+    };
+  });
+  const px = Math.min(...boxes.map((b) => Math.min(b.x1 - b.x0, b.y1 - b.y0)));
+  const x0 = Math.min(...boxes.map((b) => b.x0));
+  const y0 = Math.min(...boxes.map((b) => b.y0));
+  const cell = (v: number, o: number) => Math.round((v - o) / px);
+  const cols = Math.max(...boxes.map((b) => cell(b.x1, x0)));
+  const height = Math.max(...boxes.map((b) => cell(b.y1, y0)));
+  const grid = Array.from({ length: height }, () =>
+    Array.from({ length: cols }, () => "."),
+  );
+  for (const b of boxes)
+    for (let r = cell(b.y0, y0); r < cell(b.y1, y0); r++)
+      for (let c = cell(b.x0, x0); c < cell(b.x1, x0); c++) {
+        const row = grid[r];
+        if (row) row[c] = "#";
+      }
+  return { rows: grid.map((r) => r.join("")), px };
 }

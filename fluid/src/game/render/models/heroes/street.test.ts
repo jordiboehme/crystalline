@@ -9,7 +9,13 @@ import { describe, expect, it } from "vitest";
 
 import { FLAG, blinkFlag, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { partsOf, toLocal, type Part } from "../../modelChecks";
+import {
+  inked,
+  partsOf,
+  runsOfLines,
+  toLocal,
+  type Part,
+} from "../../modelChecks";
 import { MARKS } from "../marks";
 import {
   BIKE,
@@ -20,21 +26,10 @@ import {
   NOTICE_INK,
   boxSignLayout,
 } from "./street";
-import { pixelRuns, textRows } from "./pixels";
+import { textRows } from "./pixels";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** The panels of `parts` painted exactly `ink`. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.method === "panel" && p.tint?.join() === ink.join());
 
 /** The height of a panel part: its pixel size, for a mark's run. */
 const heightOf = (p: Part): number => {
@@ -163,7 +158,7 @@ describe("street hero models", () => {
     for (const s of BIKE_STICKERS) {
       const text = MARKS.bikeStickers[s.text] ?? "";
       expect(runsOfLines(text)).toBeGreaterThan(3);
-      const ink = inked(parts, s.ink);
+      const ink = inked(parts, s.ink, "panel");
       expect(ink, text).toHaveLength(2 * runsOfLines(text));
       const sides = new Set(
         ink.map((p) => Math.sign(Math.max(...local(p).map((q) => q[1])))),
@@ -186,7 +181,7 @@ describe("street hero models", () => {
     // line dropped.
     expect(runsOfLines(MARKS.boxNotice)).toBeGreaterThan(20);
     const parts = partsOf("police-box");
-    const ink = inked(parts, NOTICE_INK);
+    const ink = inked(parts, NOTICE_INK, "panel");
     expect(ink).toHaveLength(runsOfLines(MARKS.boxNotice));
     const pts = ink.flatMap(local);
     expect(Math.min(...pts.map((q) => q[2]))).toBeGreaterThanOrEqual(

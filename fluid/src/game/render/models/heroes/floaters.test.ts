@@ -10,24 +10,19 @@ import { describe, expect, it } from "vitest";
 import { heroLift } from "../../../world/footprints";
 import { FLAG, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
-import { partsOf, toLocal, type Part } from "../../modelChecks";
+import {
+  inked,
+  partsOf,
+  runsOfLines,
+  toLocal,
+  type Part,
+} from "../../modelChecks";
 import { MARKS } from "../marks";
 import { DECK_LOGO_INK, QUESTION_MARK } from "./floaters";
-import { pixelRuns, textBlock, textRows } from "./pixels";
+import { textBlock } from "./pixels";
 
 const local = (p: Part): V3[] =>
   p.points.map((q) => toLocal(frameAt([0, 0, 0], 0), q));
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** The parts of `parts` painted exactly `ink`, whatever primitive drew them. */
-const inked = (parts: readonly Part[], ink: readonly number[]): Part[] =>
-  parts.filter((p) => p.tint?.join() === ink.join());
 
 /**
  * A flat mark's pixel size: the smaller of its run's two extents across

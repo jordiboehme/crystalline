@@ -16,15 +16,19 @@ import type { CurioKind } from "../../../world/types";
 import { createBuilder, type V3 } from "../../geometry";
 import { frameAt, type Frame } from "../../kit";
 import { LAYER } from "../../layers";
-import { LOOKS, type Rgb } from "../../looks";
+import { LOOKS } from "../../looks";
 import {
+  cellsOf,
+  inked,
   recordingKitAt,
+  runsOfLines,
   shape,
   toLocal,
+  trimmed,
   type Part,
   type Shape,
 } from "../../modelChecks";
-import { MARK_PROUD, pixelRuns, textRows } from "../heroes/pixels";
+import { MARK_PROUD, textRows } from "../heroes/pixels";
 import { MARKS } from "../marks";
 import { curioHalf } from "./common";
 import { buildCurio } from "./index";
@@ -54,71 +58,11 @@ function localShape(p: Part): Shape {
 /** A part's points in the recipe's own local `(a, d, h)` terms. */
 const local = (p: Part): V3[] => p.points.map((q) => toLocal(ORIGIN, q));
 
-/** The parts of `parts` painted exactly `ink`. */
-const inked = (parts: readonly Part[], ink: Rgb): Part[] =>
-  parts.filter((p) => p.tint?.join() === ink.join());
-
-/** How many lit runs `lines` make in the font. */
-const runsOfLines = (lines: string | readonly string[]): number =>
-  (typeof lines === "string" ? [lines] : lines).reduce(
-    (n, l) => n + pixelRuns(textRows(l)).length,
-    0,
-  );
-
-/** A picture with its all-dark rows and columns round the edge cut off. */
-function trimmed(rows: readonly string[]): string[] {
-  const lit = (r: string) => r.includes("#");
-  const inRows = rows.filter(lit);
-  const cols = inRows[0]?.length ?? 0;
-  const litCol = (c: number) => inRows.some((r) => r[c] === "#");
-  let c0 = 0;
-  while (c0 < cols && !litCol(c0)) c0++;
-  let c1 = cols;
-  while (c1 > c0 && !litCol(c1 - 1)) c1--;
-  const first = rows.findIndex(lit);
-  const last = rows.length - [...rows].reverse().findIndex(lit);
-  return rows.slice(first, last).map((r) => r.slice(c0, c1));
-}
-
-/**
- * A mark's lit cells rebuilt from its parts: `at` puts a local point into
- * the reader's `[x, y]`, `x` to the right along the mark and `y` down it.
- * The pixel is the smallest extent any part has there, and every part
- * covers whole cells from the mark's top left. A mark turned about,
- * mirrored or scrambled comes out as other rows than its own.
- */
-function cellsOf(
-  parts: readonly Part[],
-  at: (q: V3) => readonly [x: number, y: number],
-): { rows: string[]; px: number } {
-  const boxes = parts.map((p) => {
-    const xy = local(p).map(at);
-    const xs = xy.map((q) => q[0]);
-    const ys = xy.map((q) => q[1]);
-    return {
-      x0: Math.min(...xs),
-      x1: Math.max(...xs),
-      y0: Math.min(...ys),
-      y1: Math.max(...ys),
-    };
-  });
-  const px = Math.min(...boxes.map((b) => Math.min(b.x1 - b.x0, b.y1 - b.y0)));
-  const x0 = Math.min(...boxes.map((b) => b.x0));
-  const y0 = Math.min(...boxes.map((b) => b.y0));
-  const cell = (v: number, o: number) => Math.round((v - o) / px);
-  const cols = Math.max(...boxes.map((b) => cell(b.x1, x0)));
-  const height = Math.max(...boxes.map((b) => cell(b.y1, y0)));
-  const grid = Array.from({ length: height }, () =>
-    Array.from({ length: cols }, () => "."),
-  );
-  for (const b of boxes)
-    for (let r = cell(b.y0, y0); r < cell(b.y1, y0); r++)
-      for (let c = cell(b.x0, x0); c < cell(b.x1, x0); c++) {
-        const row = grid[r];
-        if (row) row[c] = "#";
-      }
-  return { rows: grid.map((r) => r.join("")), px };
-}
+/** A reader's `at` over local points, taking the recorded ones. */
+const inLocal =
+  (at: (q: V3) => readonly [x: number, y: number]) =>
+  (q: V3): readonly [x: number, y: number] =>
+    at(toLocal(ORIGIN, q));
 
 describe("star ball", () => {
   it("sets four stars into the surface, its lowest point at 0", () => {
@@ -237,7 +181,10 @@ describe("fuel case", () => {
     expect(trefoil).toHaveLength(4);
     const trefoilLow = Math.min(...trefoil.flatMap(local).map((q) => q[2]));
     const line = onPlane(inked(parts, CASE_LABEL_INK), 1, label.hi[1]);
-    const text = cellsOf(line, (q) => [q[0], -q[2]]);
+    const text = cellsOf(
+      line,
+      inLocal((q) => [q[0], -q[2]]),
+    );
     expect(text.rows).toEqual(trimmed(textRows(MARKS.caseLabels[0])));
     expect(text.px).toBeGreaterThanOrEqual(0.001 - 1e-9);
     for (const q of line.flatMap(local)) {
@@ -260,7 +207,10 @@ describe("fuel case", () => {
         .map((q) => q[2]),
     );
     const line = onPlane(inked(parts, CASE_LABEL_INK), 1, front);
-    const text = cellsOf(line, (q) => [q[0], -q[2]]);
+    const text = cellsOf(
+      line,
+      inLocal((q) => [q[0], -q[2]]),
+    );
     expect(text.rows).toEqual(trimmed(textRows(MARKS.caseLabels[2])));
     expect(text.px).toBeGreaterThanOrEqual(0.001 - 1e-9);
     for (const q of line.flatMap(local)) expect(q[2]).toBeLessThan(stripeLow);
@@ -276,7 +226,10 @@ describe("fuel case", () => {
     // The case faces `+d`, so its own right is `-a`.
     expect(sticker.hi[0]).toBeLessThan(0);
     const line = onPlane(inked(parts, CASE_LABEL_INK), 0, sticker.lo[0], -1);
-    const text = cellsOf(line, (q) => [q[1], -q[2]]);
+    const text = cellsOf(
+      line,
+      inLocal((q) => [q[1], -q[2]]),
+    );
     expect(text.rows).toEqual(trimmed(textRows(MARKS.caseLabels[1])));
     expect(text.px).toBeGreaterThanOrEqual(0.001 - 1e-9);
     for (const q of line.flatMap(local)) {
