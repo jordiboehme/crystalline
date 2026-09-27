@@ -319,6 +319,19 @@ describe("GameRoute", () => {
     view.unmount();
   });
 
+  it("shows the classic keys first in its key legend", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    expect(
+      screen.getByText(/^ARROWS MOVE · ALT STRAFE · SPACE USE · SHIFT RUN · /),
+    ).toBeInTheDocument();
+    view.unmount();
+  });
+
   it("refuses a device without WebGL2", async () => {
     serve();
     renderAt("/%CF%80/d/eng/e/alpha");

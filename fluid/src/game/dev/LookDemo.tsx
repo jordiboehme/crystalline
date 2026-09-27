@@ -59,6 +59,7 @@ import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import type { Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
+import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../world/canned";
@@ -69,8 +70,7 @@ import type { CurioKind, HeroKind, PlaceInput } from "../world/types";
 import { startDemo } from "./demo";
 
 /** The keys, along the top of the screen. */
-const LEGEND =
-  "STATION LOOK DEMO · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64 · R RETIRED · WASD ARROWS MOUSE · E USE · F FLUID · I INVERT";
+const LEGEND = `STATION LOOK DEMO · ${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64 · R RETIRED`;
 
 /** The places `?room=` picks between. */
 const ROOMS: Record<string, PlaceInput> = {

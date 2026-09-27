@@ -16,8 +16,10 @@
  *
  * Keys: 1, 2 and 4 pick the look, R toggles the retired condition (the
  * place's own status; retired shows `archived`, the derelict end of the
- * scale), WASD walks, the arrows turn, the mouse looks once the canvas is
- * clicked, E uses what the player faces and I inverts the vertical look.
+ * scale), and the rest are the game's own (`session.ts`): the arrows or
+ * WASD walk, Alt with the arrows, comma and period strafe, Shift runs, the
+ * mouse looks once the canvas is clicked, Space uses what the player faces
+ * and I inverts the vertical look.
  *
  * `options.props` false shows the place undressed: `session.showRoom` with
  * `generateRoom`'s props, heroes and curios stripped, rather than `session.showCanned`, which

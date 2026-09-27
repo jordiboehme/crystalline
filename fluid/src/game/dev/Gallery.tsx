@@ -48,14 +48,14 @@ import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import { createSession, type PlaceLoader, type Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
+import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { galleryRoom, heroHallRoom } from "../world/canned";
 import { spotView } from "./spots";
 
 /** The keys, along the top of the screen. */
-const LEGEND =
-  "MODEL GALLERY · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64 · WASD ARROWS MOUSE · E USE · I INVERT";
+const LEGEND = `MODEL GALLERY · ${CLASSIC_KEYS} · WASD MOUSE · I INVERT · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64`;
 
 /** F goes nowhere from the gallery: there is no engram to open. */
 function openNothing() {}

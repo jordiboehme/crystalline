@@ -47,6 +47,7 @@ import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
 import { createSession, type Session } from "./session";
 import { DeviceRefusal } from "./ui/DeviceRefusal";
+import { GAME_LEGEND } from "./ui/keys";
 import { LevelSelect } from "./ui/LevelSelect";
 import { StationView } from "./ui/StationView";
 import { useHud } from "./ui/useHud";
@@ -165,6 +166,7 @@ export default function GameRoute() {
         reader={reader}
         onCloseReader={closeReader}
         onOpenFluid={readerOpenFluid}
+        legend={GAME_LEGEND}
       />
       {levels && (
         <LevelSelect current={domain} onJump={jump} onClose={closeLevels} />
