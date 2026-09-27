@@ -409,9 +409,12 @@ export type HeroKind =
  * Where a hero kind stands (H8): flush on one or two hall wall edges
  * (`wall`, no collision), on the floor against a hall wall edge (`backed`),
  * free in the hall's interior band (`band`), centred on a hall corner zone
- * (`corner`), or at the hall centre (`centre`, the slab).
+ * (`corner`), at the hall centre (`centre`, the slab), or free on the
+ * hall's floor with a walkway all round it and its front to the hall's
+ * centre (`open`, the police box, 2.6e).
  */
-export type HeroPlacement = "wall" | "backed" | "band" | "corner" | "centre";
+export type HeroPlacement =
+  "wall" | "backed" | "band" | "corner" | "centre" | "open";
 
 /**
  * One hero prop. `x` and `y` follow `Decor`'s continuous cell units: the

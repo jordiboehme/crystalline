@@ -18,10 +18,12 @@ import {
   HERO_WALK_UNDER,
   footprint,
   heroBlocker,
+  HERO_FRONT,
   heroFootprint,
   heroLift,
   pipeRunBox,
   propFootprint,
+  turnedBox,
 } from "./footprints";
 import { generateRoom } from "./generate";
 import {
@@ -37,6 +39,7 @@ import {
   HERO_SHARE,
   HERO_USE_OUT,
   HERO_VIEW,
+  HERO_WALKWAY,
   HERO_WALL_TOP,
   LOWEST_CEILING,
   SLAB_SHARE,
@@ -54,6 +57,7 @@ import {
   isTallHero,
   placeHeroes,
   rawHero,
+  standsFree,
   type HeroDraws,
 } from "./heroes";
 import heroesSource from "./heroes.ts?raw";
@@ -82,11 +86,14 @@ import {
   type RoomBase,
   type SiteBase,
 } from "./sites";
+import { WALL_PROP_DEPTH } from "./props";
 import type {
   Archetype,
+  Box,
   Hero,
   HeroKind,
   PlaceInput,
+  Prop,
   RoomSpec,
   Side,
 } from "./types";
@@ -119,6 +126,7 @@ describe("the hero catalogue", () => {
       band: "free",
       corner: "free",
       centre: "free",
+      open: "free",
     } as const;
     for (const kind of HERO_KINDS) {
       const e = HERO_CATALOGUE[kind];
@@ -158,13 +166,27 @@ describe("the hero catalogue", () => {
     expect(SLAB_TOP / slab.depth).toBeCloseTo(9);
   });
 
-  it("stands a tall hero only in the band, at the centre or backed against a wall (C6)", () => {
+  it("stands a tall hero only in the band, at the centre, free in the open or backed against a wall (C6)", () => {
     // Mutation caught: the police box made a corner hero, where ceiling
     // props hang through its roof.
     for (const kind of HERO_KINDS.filter(isTallHero))
-      expect(["band", "centre", "backed"], kind).toContain(
+      expect(["band", "centre", "open", "backed"], kind).toContain(
         HERO_CATALOGUE[kind].placement,
       );
+  });
+
+  it("stands the police box free, never backed against a wall (2.6e)", () => {
+    // Mutation caught: the police box left "backed" (its footing or its
+    // placement), or another kind moved to the open placement unasked.
+    expect(HERO_CATALOGUE["police-box"].placement).toBe("open");
+    expect(HERO_FOOTING["police-box"]).toBe("free");
+    expect(
+      HERO_KINDS.filter((k) => HERO_CATALOGUE[k].placement === "open"),
+    ).toEqual(["police-box"]);
+    expect(HERO_WALKWAY).toBe(0.9);
+    // The moat is wider than the walkway, so the dressing's reserve keeps
+    // the walkway clear of props.
+    expect(HERO_CLEAR).toBeGreaterThanOrEqual(HERO_WALKWAY);
   });
 
   it("names exactly three floating heroes and their lifts (C4)", () => {
@@ -1604,4 +1626,227 @@ describe("the hero pass", () => {
       }
     expect(heroUsePoint(heroAt("turret", 0))).toBeNull();
   });
+});
+
+/**
+ * The share of hero-pass tries that stand the police box, less a margin.
+ * The probe (2.6e Task 13) forced the box's draw over 1500 rooms on
+ * fifteen layouts (narrow halls of 5 to 19 cells, the bridge, the
+ * workshop and the hub with fewer and more ways, every condition): backed
+ * against a wall it stood in 1100 (0.733; never in the hub or the 5 by 6
+ * bridge, whose inner wall edges all lie beside a way or too near a
+ * terminal), free-standing in all 1500 (1.0).
+ */
+const OPEN_BOX_RATE = 0.97;
+
+/**
+ * Places of many hall shapes and crowds, for the police box's sweeps: the
+ * narrowest hall with 0 to 8 hatches on its south wall (5 to 19 cells
+ * wide), the bridge with one relation (5 by 6), the bridge, the workshop
+ * and the hub with some of their ways and with all of them.
+ */
+function boxSweepPlaces(): PlaceInput[] {
+  const inbound = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      address: { domain: CANNED_BRIDGE.domain, permalink: `in-${String(i)}` },
+      title: `In ${String(i)}`,
+      relType: "relates_to",
+    }));
+  const narrow = [0, 4, 8].map((n) => ({
+    ...CANNED_BRIDGE,
+    permalink: `narrow-${String(n)}`,
+    relations: [],
+    links: [],
+    inbound: inbound(n),
+    inboundTotal: n,
+  }));
+  return [
+    ...narrow,
+    { ...CANNED_BRIDGE, relations: CANNED_BRIDGE.relations.slice(0, 1) },
+    CANNED_BRIDGE,
+    { ...CANNED_WORKSHOP, relations: CANNED_WORKSHOP.relations.slice(0, 2) },
+    CANNED_WORKSHOP,
+    {
+      ...CANNED_HUB,
+      relations: CANNED_HUB.relations.slice(0, 8),
+      inbound: CANNED_HUB.inbound.slice(0, 8),
+      inboundTotal: 8,
+    },
+    CANNED_HUB,
+  ];
+}
+
+/**
+ * The box a wall prop stands in: the whole edge it hangs on, the wall
+ * band (`WALL_PROP_DEPTH`) deep out from the wall.
+ */
+function wallPropBox(p: Prop): Box {
+  return turnedBox(p.x, p.y, p.turn, {
+    a0: -CELL / 2,
+    a1: CELL / 2,
+    d0: 0,
+    d1: WALL_PROP_DEPTH,
+  });
+}
+
+describe("the free-standing police box (2.6e)", () => {
+  const roll = (() => {
+    const i = ANY_POOL.findIndex(([k]) => k === "police-box");
+    const total = ANY_POOL.reduce((n, [, w]) => n + w, 0);
+    const before = ANY_POOL.slice(0, i).reduce((n, [, w]) => n + w, 0);
+    return (before + (ANY_POOL[i]?.[1] ?? 0) / 2) / total;
+  })();
+  const draws: HeroDraws = {
+    slab: false,
+    turret: false,
+    picks: [],
+    any: { take: true, roll },
+  };
+
+  it("stands it with a walkway all round, clear of the walls, its front to the hall's centre, at all four turns", () => {
+    // Mutation caught: `standsFree` dropped from the pass (the box against
+    // a wall), the wall band left out of it (a wall prop in the walkway),
+    // the turn not the one towards the hall's centre (a box facing a wall),
+    // or a candidate grid that finds no spot on a crowded layout (the rate
+    // falls under the pin).
+    let tried = 0;
+    let stood = 0;
+    const turns = new Set<number>();
+    for (const { base } of EVERY_BASE)
+      for (const r of reseeded(base, 40)) {
+        tried++;
+        const h = place(base, r, draws).find((x) => x.kind === "police-box");
+        if (h === undefined) continue;
+        stood++;
+        turns.add(h.turn);
+        const box = heroFootprint(h);
+        expect(standsFree(base, box)).toBe(true);
+        // The walkway and the wall band, measured here on their own.
+        const ring = grow(box, HERO_WALKWAY + WALL_PROP_DEPTH);
+        const hall = base.hall;
+        expect(ring.x0).toBeGreaterThanOrEqual(hall.x0 * CELL - 1e-9);
+        expect(ring.x1).toBeLessThanOrEqual(hall.x1 * CELL + 1e-9);
+        expect(ring.z0).toBeGreaterThanOrEqual(hall.y0 * CELL - 1e-9);
+        expect(ring.z1).toBeLessThanOrEqual(hall.y1 * CELL + 1e-9);
+        expect(fitsFloor(base, ring)).toBe(true);
+        // The front points at the hall's centre, as near as a quarter turn
+        // allows: towards it along the axis the centre lies farther along.
+        const [fx, fz] = HERO_FRONT[h.turn] ?? [0, -1];
+        const dx = (hall.x0 + hall.x1) / 2 - h.x;
+        const dy = (hall.y0 + hall.y1) / 2 - h.y;
+        const along = fx * dx + fz * dy;
+        const across = Math.abs(fz * dx - fx * dy);
+        expect(along).toBeGreaterThanOrEqual(0);
+        expect(along).toBeGreaterThanOrEqual(across - 1e-9);
+      }
+    expect(turns).toEqual(new Set([0, 1, 2, 3]));
+    console.info(
+      `2.6e police box stood in ${String(stood)} of ${String(tried)} tries`,
+    );
+    expect(stood / tried).toBeGreaterThanOrEqual(OPEN_BOX_RATE);
+  }, 30_000);
+
+  it("keeps every wall and the wall band out of the walkway, on all four sides", () => {
+    // Mutation caught: the wall band left out of "standsFree" (a box 1.0 m
+    // off a wall, with a wall prop hanging in its walkway, counted free),
+    // or a side of the hall not measured. The half-cell candidates never
+    // stand a box between 0.9 and 1.2 m off a wall, so only a box put
+    // there by hand shows the band.
+    const bridge = BRIDGE_BASES[0];
+    if (bridge === undefined) throw new Error("no bridge base");
+    const base = bridge.base;
+    const hall = base.hall;
+    const half = 0.65;
+    const at = (x: number, z: number): Box => ({
+      x0: x - half,
+      x1: x + half,
+      z0: z - half,
+      z1: z + half,
+    });
+    const cx = ((hall.x0 + hall.x1) / 2) * CELL;
+    const cz = ((hall.y0 + hall.y1) / 2) * CELL;
+    expect(standsFree(base, at(cx, cz))).toBe(true);
+    const band = HERO_WALKWAY + WALL_PROP_DEPTH;
+    for (const gap of [HERO_WALKWAY + 0.1, band + 0.05]) {
+      const sides = [
+        at(hall.x0 * CELL + gap + half, cz),
+        at(hall.x1 * CELL - gap - half, cz),
+        at(cx, hall.y0 * CELL + gap + half),
+        at(cx, hall.y1 * CELL - gap - half),
+      ];
+      for (const [i, box] of sides.entries())
+        expect(
+          standsFree(base, box),
+          `side ${String(i)} gap ${String(gap)}`,
+        ).toBe(gap >= band);
+    }
+  });
+
+  it("never stands it against a wall: nothing in the walkway of a finished room, over a sweep of halls", () => {
+    // Mutation caught: the box backed against a wall again, the walkway
+    // checked against the floor only (a fixture, a scaffold frame or
+    // furniture in it), the dressing's reserve not kept round a free hero
+    // (a prop in the walkway), or the wall band left out (a wall prop in
+    // it).
+    let rooms = 0;
+    let boxes = 0;
+    const statuses = ["stable", "draft", "archived", "deprecated"];
+    for (const p of boxSweepPlaces())
+      for (const type of Object.values(TYPES))
+        for (let i = 0; i < 8; i++) {
+          const place: PlaceInput = {
+            ...p,
+            type,
+            status: statuses[i % 4] ?? null,
+            permalink: `${p.permalink}-${String(i)}`,
+          };
+          rooms++;
+          const { room, placed } = roomWithForcedHero(place, "police-box");
+          if (placed === null) continue;
+          const h = room.heroes.find((x) => x.kind === "police-box");
+          if (h === undefined) throw new Error("placed but not in the room");
+          boxes++;
+          const walk = grow(heroFootprint(h), HERO_WALKWAY);
+          const label = `${place.permalink} ${type}`;
+          const hall = room.hall;
+          expect(
+            walk.x0 >= hall.x0 * CELL &&
+              walk.x1 <= hall.x1 * CELL &&
+              walk.z0 >= hall.y0 * CELL &&
+              walk.z1 <= hall.y1 * CELL &&
+              fitsFloor(room, walk),
+            `${label}: a wall in the walkway`,
+          ).toBe(true);
+          const sites = dressingSites(room);
+          expect(
+            sites.taken.some((t) => overlaps(walk, t)),
+            `${label}: a fixture, decor or scaffold in the walkway`,
+          ).toBe(false);
+          for (const o of room.heroes)
+            if (o !== h)
+              expect(
+                overlaps(walk, heroFootprint(o)),
+                `${label}: ${o.kind} in the walkway`,
+              ).toBe(false);
+          for (const prop of room.props) {
+            const f =
+              prop.anchor === "wall" ? wallPropBox(prop) : propFootprint(prop);
+            if (f !== null)
+              expect(overlaps(walk, f), `${label}: ${prop.kind}`).toBe(false);
+          }
+          for (const c of room.curios) {
+            const x = c.x * CELL;
+            const z = c.y * CELL;
+            expect(
+              x > walk.x0 && x < walk.x1 && z > walk.z0 && z < walk.z1,
+              `${label}: ${c.kind} in the walkway`,
+            ).toBe(false);
+          }
+        }
+    expect(boxes).toBeGreaterThan(0);
+    console.info(
+      `2.6e police box stood free in ${String(boxes)} of ${String(rooms)} finished rooms`,
+    );
+    expect(boxes / rooms).toBeGreaterThanOrEqual(OPEN_BOX_RATE);
+  }, 30_000);
 });

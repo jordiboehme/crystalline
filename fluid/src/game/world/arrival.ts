@@ -3,125 +3,121 @@
  * player on another domain's bridge, stepping out of a police box that
  * stands beside the bridge's entrance for that one visit.
  *
- * The box stands on the hall's south wall, backed against it and facing
- * into the hall (turn 0), in the first of `arrivalBoxCandidates` where it
- * fits. The candidates are the hall's south-row cells in order of their
- * distance from the entrance cell, east before west at equal distance
- * (`x+1`, `x+2`, `x-2`, `x+3`, `x-3`, ...), leaving out the entrance and
- * the placard cells, every cell whose south edge holds a fixture and any
- * cell whose south edge is not a wall. `placeArrivalBox` takes a
- * candidate when the box's floor (`heroFootprint`) fits the hall
- * (`fitsFloor`), enters no lane of `dressingSites(room)` and overlaps
- * none of its taken boxes (the fixtures' footprints, the furniture and
- * the scaffold frames), and when the player's circle at the box's use
- * point (`heroUsePoint`, 1.75 m out) is on floor and clear of the same
- * taken boxes. It reads nothing of the room's heroes, props or curios:
- * those move round the box, not the box round them.
+ * The box stands free near the entrance, never against a wall (2.6e,
+ * "free-standing, always"), facing north into the hall (turn 0: a
+ * generated hall's entrance is always in its south wall, so north is
+ * away from it and into the hall), at the first of
+ * `arrivalBoxCandidates` where it fits. The candidates are the hall's
+ * half-cell points within `ARRIVAL_REACH` cells of the entrance's doorway
+ * (the middle of the entrance cell's south edge), nearest first, the east
+ * one first where two lie equally far. `placeArrivalBox` takes a candidate when the box stands free
+ * (`standsFree` in `heroes.ts`: a walkway of `HERO_WALKWAY` all round it,
+ * clear of every wall and of what hangs on the walls), its floor
+ * (`heroFootprint`) enters no lane of `dressingSites(room)`, its moat
+ * (`HERO_CLEAR`, wider than the walkway) overlaps none of its taken boxes
+ * (the fixtures' footprints, the furniture and the scaffold frames) and
+ * no pipe run hanging where the tall box would reach. The player's
+ * circle at the box's use point (`heroUsePoint`, `HERO_USE_OUT` in front
+ * of it) then lies inside the walkway and the moat, so it is on floor and
+ * clear of the same boxes. It reads nothing of the room's heroes, props or
+ * curios: those move round the box, not the box round them.
  *
  * `withArrivalBox` then drops the room's own heroes whose floor overlaps
- * the box's grown by `HERO_CLEAR` (two heroes never stand inside each
- * other's moat), keeps the rest, and re-dresses the room round the box
- * and the kept heroes through the shared forced-hero seam (`withHeroes`
- * in `generate.ts`, C15), so props and curios keep off the box as they
- * keep off any hero the generator drew. The rule that keeps a backed hero
- * off the edges beside a way is not applied: the box is 1.3 m wide in a
- * 2 m cell, so a hatch beside it keeps its lane and its arrival spot. The
- * player's spawn is the box's use point, facing the way the box faces.
- * When no candidate fits there is no box: the room comes back as it was
- * handed in, the spawn is null and the player arrives at the entrance, as
- * on any other visit.
+ * the box's moat (grown by `HERO_CLEAR`), keeps the rest, and re-dresses
+ * the room round the box and the kept heroes through the shared
+ * forced-hero seam (`withHeroes` in `generate.ts`, C15), so props and
+ * curios keep off the box's moat as they keep off any hero the generator
+ * drew: the walkway round it holds nothing. The player's spawn is the
+ * box's use point, facing the way the box faces. When no candidate fits
+ * there is no box: the room comes back as it was handed in, the spawn is
+ * null and the player arrives at the entrance, as on any other visit.
  *
  * This is the session side (C15): nothing on the generator side imports
  * it, so a bridge entered any other way (a door, a reload, the level
  * select) is generated plain, and the box lives only in the room object
  * the session holds for that visit. It imports `generate.ts`,
- * `heroes.ts`, `footprints.ts`, `sites.ts` and `move.ts` (for the
- * player's radius).
+ * `heroes.ts`, `footprints.ts` and `sites.ts`.
  */
 
 import { seedFor } from "../core/seed";
-import { HERO_FRONT, heroFootprint } from "./footprints";
+import { HERO_FRONT, heroFootprint, pipeRunBox } from "./footprints";
 import { withHeroes } from "./generate";
-import { HERO_CLEAR, heroUsePoint } from "./heroes";
-import { PLAYER_RADIUS } from "./move";
-import {
-  dressingSites,
-  edgeKey,
-  fitsFloor,
-  grow,
-  overlaps,
-  wallAnchor,
-} from "./sites";
-import type { Box, Hero, PlaceInput, RoomSpec, WallSlot } from "./types";
+import { HERO_CLEAR, heroUsePoint, standsFree } from "./heroes";
+import { dressingSites, grow, overlaps } from "./sites";
+import type { Hero, PlaceInput, RoomSpec } from "./types";
 
 /**
- * The hall's south-row edges the arrival box may stand on, best first
- * (C14): every south wall edge of the hall's last row, less the entrance's
- * and the placard's (the placard sits one cell west of the entrance) and
- * every edge a fixture holds, sorted by distance from the entrance's
- * column, the east one first where two lie equally far. An edge that is
- * not a wall of the grid (none on a generated hall's south row, which
- * only the entrance opens) is left out too.
+ * How far from the entrance's doorway an arrival box may stand, in cells
+ * (the box's centre, measured from the middle of the entrance cell's south
+ * edge): near enough that the player plainly steps out beside the way in.
  */
-export function arrivalBoxCandidates(room: RoomSpec): WallSlot[] {
+export const ARRIVAL_REACH = 4;
+
+/** One point the arrival box may stand at: its centre, in cell units. */
+export interface ArrivalSpot {
+  x: number;
+  y: number;
+}
+
+/**
+ * The points the arrival box may stand at, best first (C14): every
+ * half-cell point of the hall within `ARRIVAL_REACH` cells of the
+ * entrance's doorway (the middle of the entrance cell's south edge,
+ * `(e.x + 0.5, e.y + 1)`), nearest first, the east one first where two
+ * lie equally far (two points equally far on one column would lie either
+ * side of the doorway, and the hall has only the north side). Whether the
+ * box fits there is `placeArrivalBox`'s business.
+ */
+export function arrivalBoxCandidates(room: RoomSpec): ArrivalSpot[] {
   const e = room.entrance;
-  const held = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
-  const walls = new Set(dressingSites(room).runs.flat().map(edgeKey));
-  const y = room.hall.y1 - 1;
-  const out: WallSlot[] = [];
-  for (let x = room.hall.x0; x < room.hall.x1; x++) {
-    if (x === e.x || x === e.x - 1) continue;
-    const edge: WallSlot = { x, y, side: "s" };
-    const key = edgeKey(edge);
-    if (held.has(key) || !walls.has(key)) continue;
-    out.push(edge);
-  }
-  const far = (c: WallSlot) => Math.abs(c.x - e.x);
-  return out.sort((a, b) => far(a) - far(b) || b.x - a.x);
-}
-
-/** The box a circle of the player's radius at `(x, z)` fits inside, in metres. */
-function circleBounds(x: number, z: number): Box {
-  return {
-    x0: x - PLAYER_RADIUS,
-    x1: x + PLAYER_RADIUS,
-    z0: z - PLAYER_RADIUS,
-    z1: z + PLAYER_RADIUS,
-  };
-}
-
-/** True when a circle of the player's radius at `(x, z)` overlaps `b`: `move.ts`'s collision test. */
-function circleHits(x: number, z: number, b: Box): boolean {
-  const nx = Math.max(b.x0, Math.min(x, b.x1));
-  const nz = Math.max(b.z0, Math.min(z, b.z1));
-  const dx = x - nx;
-  const dz = z - nz;
-  return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
+  const ex = e.x + 0.5;
+  const ey = e.y + 1;
+  const h = room.hall;
+  const out: (ArrivalSpot & { far: number })[] = [];
+  for (let y2 = 2 * h.y0; y2 <= 2 * h.y1; y2++)
+    for (let x2 = 2 * h.x0; x2 <= 2 * h.x1; x2++) {
+      const x = x2 / 2;
+      const y = y2 / 2;
+      const far = Math.hypot(x - ex, y - ey);
+      if (far <= ARRIVAL_REACH) out.push({ x, y, far });
+    }
+  out.sort((a, b) => a.far - b.far || b.x - a.x);
+  return out.map(({ x, y }) => ({ x, y }));
 }
 
 /**
  * The arrival box for `room`, or null when none fits (C14): a police box,
- * variant 0, seed `seedFor(room.seed, "arrival-box")`, anchored at the
- * wall point (`wallAnchor`) of the first of `arrivalBoxCandidates(room)`
- * whose box fits the hall's floor, enters no lane, overlaps no taken box
- * (fixture footprints, furniture, scaffold) and leaves the player's
- * circle at its use point on floor and clear of the same taken boxes.
- * The room's heroes, props and curios are not read.
+ * variant 0, seed `seedFor(room.seed, "arrival-box")`, turn 0 (facing
+ * north, into the hall), centred on the first of
+ * `arrivalBoxCandidates(room)` where it stands free (`standsFree`), its
+ * floor enters no lane, its moat (`HERO_CLEAR`) overlaps no taken box
+ * (fixture footprints, furniture, scaffold) and no pipe run. The
+ * player's circle at its use point (`HERO_USE_OUT` in front, the player's
+ * radius round it) lies inside the walkway and the moat, so it is on floor
+ * and clear of those boxes with no check of its own. The room's heroes,
+ * props and curios are not read.
  */
 export function placeArrivalBox(room: RoomSpec): Hero | null {
   const sites = dressingSites(room);
   const seed = seedFor(room.seed, "arrival-box");
+  const pipes = room.decor
+    .map((d) => pipeRunBox(d, room.hall))
+    .filter((b) => b !== null);
   for (const c of arrivalBoxCandidates(room)) {
-    const { x, y, turn } = wallAnchor(c);
-    const box: Hero = { kind: "police-box", variant: 0, x, y, turn, seed };
+    const box: Hero = {
+      kind: "police-box",
+      variant: 0,
+      x: c.x,
+      y: c.y,
+      turn: 0,
+      seed,
+    };
     const floor = heroFootprint(box);
-    if (!fitsFloor(room, floor)) continue;
+    if (!standsFree(room, floor)) continue;
     if (sites.lanes.some((l) => overlaps(l, floor))) continue;
-    if (sites.taken.some((t) => overlaps(t, floor))) continue;
-    const use = heroUsePoint(box);
-    if (use === null) continue;
-    if (!fitsFloor(room, circleBounds(use.x, use.z))) continue;
-    if (sites.taken.some((t) => circleHits(use.x, use.z, t))) continue;
+    const moat = grow(floor, HERO_CLEAR);
+    if (sites.taken.some((t) => overlaps(t, moat))) continue;
+    if (pipes.some((p) => overlaps(p, moat))) continue;
     return box;
   }
   return null;

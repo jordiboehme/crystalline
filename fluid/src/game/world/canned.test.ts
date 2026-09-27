@@ -18,7 +18,13 @@ import {
   HERO_FOOTING,
   propFootprint,
 } from "./footprints";
-import { HERO_CATALOGUE, HERO_KINDS, heroEdges } from "./heroes";
+import {
+  HERO_CATALOGUE,
+  HERO_KINDS,
+  faceCentre,
+  heroEdges,
+  standsFree,
+} from "./heroes";
 import { blockersFor, PLAYER_RADIUS, spawnPlayer } from "./move";
 import { PROP_CATALOGUE, PROP_KINDS } from "./props";
 import {
@@ -461,6 +467,16 @@ describe("heroHallRoom", () => {
         expect(wallEdges.has(edgeKey(e)), h.kind).toBe(true);
       }
     }
+  });
+
+  it("stands its police box free, a walkway all round it, facing the hall's centre (2.6e)", () => {
+    // Mutation caught: the box put back on a wall's edge, or turned away
+    // from the hall.
+    const room = heroHallRoom();
+    const box = room.heroes.find((h) => h.kind === "police-box");
+    if (box === undefined) throw new Error("no police box");
+    expect(standsFree(room, heroFootprint(box))).toBe(true);
+    expect(box.turn).toBe(faceCentre(room.hall, box.x, box.y));
   });
 
   it("keeps the entrance and the spawn clear", () => {

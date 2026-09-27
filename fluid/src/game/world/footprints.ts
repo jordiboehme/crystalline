@@ -415,7 +415,7 @@ export const HERO_FOOTING = {
   "garden-robot": "free",
   "moon-rocket": "free",
   "thunder-hammer": "free",
-  "police-box": "backed",
+  "police-box": "free",
   "slab-walker": "free",
 } as const satisfies Record<HeroKind, "flush" | "backed" | "free">;
 

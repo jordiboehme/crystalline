@@ -40,7 +40,7 @@
 import { seedFor, createRng } from "../core/seed";
 import { domainSpellings } from "../../domainNames";
 import { REACH, FACING, type DoorState, type WallPoint } from "./interact";
-import { HERO_FRONT, heroTurn, turnedPoint } from "./footprints";
+import { FOOTPRINTS, HERO_FRONT, heroTurn, turnedPoint } from "./footprints";
 import type { Player } from "./move";
 import type { Hero, RoomSpec } from "./types";
 
@@ -76,16 +76,18 @@ export const BOX_OPEN_ENOUGH = 0.9;
 
 /**
  * A police box's front wall, in world metres, in `wallPoint`'s own terms:
- * the centre of the front face at floor level (the local point `(0, 1.3)`
- * through `turnedPoint`, the same point `heroFootprint`'s outer face sits
- * on), `inward` the hero's front direction (`HERO_FRONT[heroTurn(h)]`,
- * pointing away from the box into the room) and `along` the direction
- * across it, in the same terms `wallPoint` gives a fixture's wall.
+ * the centre of the front face at floor level (the local point `(0,
+ * depth / 2)` through `turnedPoint`, the box standing free and centred on
+ * its anchor, so the same point `heroFootprint`'s front face sits on),
+ * `inward` the hero's front direction (`HERO_FRONT[heroTurn(h)]`, pointing
+ * away from the box into the room) and `along` the direction across it,
+ * in the same terms `wallPoint` gives a fixture's wall.
  */
 export function boxFront(h: Hero): WallPoint {
   const turn = heroTurn(h);
   const [fx, fz] = HERO_FRONT[turn] ?? [0, -1];
-  const p = turnedPoint(h.x, h.y, turn, 0, 1.3);
+  const depth = FOOTPRINTS.hero[h.kind][h.variant]?.depth ?? 0;
+  const p = turnedPoint(h.x, h.y, turn, 0, depth / 2);
   return { x: p.x, z: p.z, inward: [fx, fz], along: [fz, -fx] };
 }
 

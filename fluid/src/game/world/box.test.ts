@@ -16,9 +16,9 @@ import {
   stepBoxDoors,
   type DomainRow,
 } from "./box";
+import { heroFootprint } from "./footprints";
 import type { Player } from "./move";
-import { wallAnchor } from "./sites";
-import type { Hero, RoomSpec, WallSlot } from "./types";
+import type { Hero, RoomSpec } from "./types";
 
 /** One domain row, defaulting to no canonical name and no aliases. */
 const row = (
@@ -28,24 +28,27 @@ const row = (
 ): DomainRow => ({ name, canonicalName, aliases });
 
 /**
- * The hero hall with its heroes replaced by four police boxes, one backed
- * against the middle of each wall of its hall, so every turn is covered.
+ * The hero hall with its heroes replaced by four police boxes standing
+ * free on its floor (2.6e), one at each turn, far enough apart that only
+ * one is ever in reach.
  */
 function fourBoxes(): RoomSpec {
   const room = heroHallRoom();
   const { x0, y0, x1, y1 } = room.hall;
-  const mx = Math.floor((x0 + x1) / 2);
-  const my = Math.floor((y0 + y1) / 2);
-  const edges: WallSlot[] = [
-    { x: mx, y: y1 - 1, side: "s" },
-    { x: x0, y: my, side: "w" },
-    { x: mx, y: y0, side: "n" },
-    { x: x1 - 1, y: my, side: "e" },
+  const mx = (x0 + x1) / 2;
+  const my = (y0 + y1) / 2;
+  const spots: [number, number][] = [
+    [mx, my + 4],
+    [mx - 4, my],
+    [mx, my - 4],
+    [mx + 4, my],
   ];
-  const heroes: Hero[] = edges.map((e, i) => ({
+  const heroes: Hero[] = spots.map(([x, y], i) => ({
     kind: "police-box",
     variant: 0,
-    ...wallAnchor(e),
+    x,
+    y,
+    turn: i,
     seed: i,
   }));
   return { ...room, heroes };
@@ -99,6 +102,23 @@ describe("the police box's doors and front (2.6e C10, C11)", () => {
         new Map([[0, { open: 1, target: 1 }]]),
       )?.prompt,
     ).toBe("SPACE CLOSE");
+  });
+
+  it("puts the front on the free-standing box's front face, at its middle, at every turn (2.6e)", () => {
+    // Mutation caught: the front taken a whole depth out from the anchor
+    // (a backed box's), or on the box's centre, so the doors would be
+    // offered and walked through half a box away from where they stand.
+    for (const h of fourBoxes().heroes) {
+      const f = boxFront(h);
+      const box = heroFootprint(h);
+      const [ix, iz] = f.inward;
+      const edge = ix > 0 ? box.x1 : ix < 0 ? box.x0 : iz > 0 ? box.z1 : box.z0;
+      expect(ix !== 0 ? f.x : f.z).toBeCloseTo(edge, 9);
+      expect(ix !== 0 ? f.z : f.x).toBeCloseTo(
+        ix !== 0 ? (box.z0 + box.z1) / 2 : (box.x0 + box.x1) / 2,
+        9,
+      );
+    }
   });
 
   it("covers all four turns", () => {

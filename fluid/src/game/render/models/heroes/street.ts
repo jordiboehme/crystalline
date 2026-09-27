@@ -22,8 +22,8 @@
  *   on the cowl's side under the windscreen, one small on the upper panel
  *   behind it, and two on the lower panels, over the chassis and over the
  *   rear wheel, each on a plate of its own or printed straight on the red.
- * - The police box is backed against a wall, its doors facing `+d`
- *   (C3, C10): deep blue painted wood on a low plinth, a corner post from
+ * - The police box stands free, centred on its anchor like any free hero
+ *   (2.6e: never against a wall), its doors facing `+d` (C3, C10): deep blue painted wood on a low plinth, a corner post from
  *   the plinth to the roof at each corner, a black sign band under the
  *   roof on all four sides with its words in white block pixels
  *   (`BOX_SIGN`, laid out by `boxSignLayout`), a roof in two steps under
@@ -33,8 +33,10 @@
  *   each built by `boxDoor` as a slab of its own; the left one carries the
  *   white door notice with its lines in black (`MARKS.boxNotice`, 2.6f
  *   C13), which swings with it.
- *   The body stands `BOX_BACK` off the wall, so the back sign stays in
- *   front of the wall plane.
+ *   It is built in its own terms (`BOX_BODY`), `d` running from its back
+ *   (0) to the posts' front (`BOX.front`), half its depth behind the
+ *   anchor, so the whole box, the back sign included, stays inside its
+ *   footprint.
  * - The police box's body is hollow (2.6e C10): a back wall, two side
  *   walls lined in a pale white on the inside, a roof slab over the
  *   doorway and a floor on the plinth, and on the back wall's inner face a
@@ -667,14 +669,8 @@ const SHELL = 0.04;
 const LINING = 0.005;
 
 /**
- * How far the police box's body stands off its wall, in metres: the back
- * sign band and its words stand this side of the wall plane (C10).
- */
-export const BOX_BACK = 0.06;
-
-/**
- * The police box's measures, in metres, `a` across its front and `d` out
- * from the wall:
+ * The police box's measures, in metres, `a` across its front and `d` from
+ * its back (0) to its front, in the box's own terms (`BOX_BODY`):
  * - `half`: the half width of the plinth, the posts' outer faces and the
  *   cornice; `front`: their front, the footprint's depth;
  * - `plinth`: the plinth's height;
@@ -713,6 +709,14 @@ const BOX = {
   inset2: 0.15,
   signW: 1.0,
 } as const;
+
+/**
+ * The frame the police box's body is built in: the recipe's origin moved
+ * half the box's depth back, so `BOX`'s `d` from 0 (the back) to
+ * `BOX.front` spans the free footprint (`heroFootprint`, centred on the
+ * anchor) exactly.
+ */
+const BOX_BODY: Frame = offset(ORIGIN, 0, -BOX.front / 2);
 
 /** Half the width of the meeting stile between the two door leaves, in metres. */
 const STILE = 0.02;
@@ -890,14 +894,18 @@ function facePanels(
 }
 
 /**
- * Where a door leaf's hinge stands in the recipe's terms: the vertical
- * line at the leaf's outer edge, just inside its corner post, on the
- * leaf's inner face (the body's front, `BOX.face - BOX.leaf`). `a` is at
- * `+a` for the right leaf, `-a` for the left.
+ * Where a door leaf's hinge stands in the recipe's terms (the hero's own,
+ * centred on its anchor): the vertical line at the leaf's outer edge,
+ * just inside its corner post, on the leaf's inner face (the body's front,
+ * `BOX.face - BOX.leaf` in `BOX_BODY`'s terms, half the box's depth less
+ * in the hero's). `a` is at `+a` for the right leaf, `-a` for the left.
  */
 export function boxHinge(leaf: "left" | "right"): { a: number; d: number } {
   const edge = BOX.half - BOX.post + 0.01;
-  return { a: (leaf === "right" ? 1 : -1) * edge, d: BOX.face - BOX.leaf };
+  return {
+    a: (leaf === "right" ? 1 : -1) * edge,
+    d: BOX.face - BOX.leaf - BOX.front / 2,
+  };
 }
 
 /**
@@ -961,17 +969,17 @@ export function boxDoor(
  * `boxLeafMovers` builds them) and the matching panels on the other three
  * sides, the roof's three steps and the lamp in its cage on top.
  */
-const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
+const policeBox: HeroRecipe = ({ kitAt, s, variant, kind, movers }) => {
   const { top } = heroHalf(kind, variant);
   const B = BOX;
-  const back = BOX_BACK;
+  const k = kitAt(BOX_BODY);
   const blue = (f: number) => s.tinted(shade(BLUE, f));
-  k.box(-B.half, B.half, back, B.front, 0, B.plinth, blue(0.8));
+  k.box(-B.half, B.half, 0, B.front, 0, B.plinth, blue(0.8));
   // The body, hollow: its outside faces where a solid body's would be (the
   // front behind the door leaves, the top under the cornice), a back wall,
   // two side walls whose inner faces stand on the hinge line, a floor on
   // the plinth and a roof slab down to the top of the doorway.
-  const d0 = back + B.post / 2;
+  const d0 = B.post / 2;
   const front = B.face - B.leaf;
   const inner = B.wall - SHELL;
   const floor = B.plinth + DECAL_LIFT;
@@ -1003,7 +1011,7 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
   const ph = B.half - B.post;
   for (const a of [-1, 1])
     for (const [p0, p1] of [
-      [back, back + B.post],
+      [0, B.post],
       [B.front - B.post, B.front],
     ] as const)
       k.box(a * ph, a * B.half, p0, p1, B.plinth, B.eave, blue(1.0));
@@ -1011,10 +1019,10 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
   // Every face seen from the body's middle: the front, the back and the
   // two sides, each with its half width to the posts and its depth.
   const mid = (d0 + B.face) / 2;
-  const centre = offset(ORIGIN, 0, mid);
+  const centre = offset(BOX_BODY, 0, mid);
   const halfD = (B.face - d0) / 2;
   const faces: { f: Frame; depth: number; clear: number; front: boolean }[] = [
-    { f: ORIGIN, depth: B.face, clear: ph, front: true },
+    { f: BOX_BODY, depth: B.face, clear: ph, front: true },
     { f: yawed(centre, 0, 0, Math.PI), depth: halfD, clear: ph, front: false },
     {
       f: yawed(centre, 0, 0, Math.PI / 2),
@@ -1057,12 +1065,12 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
   }
 
   // The roof: the cornice over the posts, then two smaller steps.
-  k.box(-B.half, B.half, back, B.front, B.eave, B.cornice, blue(1.0));
+  k.box(-B.half, B.half, 0, B.front, B.eave, B.cornice, blue(1.0));
   const i1 = B.inset1;
   k.box(
     -B.half + i1,
     B.half - i1,
-    back + i1,
+    i1,
     B.front - i1,
     B.cornice,
     B.tier1,
@@ -1072,7 +1080,7 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
   k.box(
     -B.half + i2,
     B.half - i2,
-    back + i2,
+    i2,
     B.front - i2,
     B.tier1,
     B.tier2,
@@ -1081,7 +1089,7 @@ const policeBox: HeroRecipe = ({ k, kitAt, s, variant, kind, movers }) => {
 
   // The lamp in its white cage.
   const L = ROOF_LAMP;
-  const lampD = (back + B.front) / 2;
+  const lampD = B.front / 2;
   const cage = s.tinted(WHITE);
   k.cylinder(0, lampD, B.tier2, L.glass0, L.rim, 10, blue(0.9));
   k.cylinder(0, lampD, L.glass0, L.glass1, L.glass, 10, s.blink(LAMP, 0));

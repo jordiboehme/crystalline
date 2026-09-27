@@ -79,7 +79,12 @@
  *    - `band`: every half-cell point of the interior band, token `band`,
  *      its box inside the band, turned by its second draw;
  *    - `corner`: as in step 3, token `corner`;
- *    - `centre`: as in step 2, token `centre`.
+ *    - `centre`: as in step 2, token `centre`;
+ *    - `open` (the police box, 2.6e): every half-cell point of the hall,
+ *      token `open`, turned to face the hall's centre (`faceCentre`), and
+ *      standing only where it stands free (`standsFree`: its box grown by
+ *      `HERO_WALKWAY` and the wall band inside the hall and on its floor),
+ *      so it never stands against a wall and a walkway runs all round it.
  *    Each candidate's first draw is the variant. The first candidate whose
  *    hero's box fits the hall's floor and enters no lane is placed when,
  *    for a free or backed hero, the box grown by `HERO_CLEAR` overlaps no
@@ -117,6 +122,7 @@
  */
 
 import { createRng, seedFor, type Rng } from "../core/seed";
+import { WALL_PROP_DEPTH } from "./props";
 import {
   FOOTPRINTS,
   HERO_FOOTING,
@@ -236,8 +242,8 @@ export const HERO_USE_OUT = 0.45;
  * hero's top plus `HERO_CEILING_GAP` stays under the lowest ceiling it
  * may stand under (`heroMinCeiling`), a wall hero's top under
  * `HERO_WALL_TOP`; a top over `HERO_FLOOR_TOP` makes the kind tall
- * (`isTallHero`, C6), and a tall kind stands in the band, at the centre or
- * backed against a wall, never in a corner. An arcade cabinet's three
+ * (`isTallHero`, C6), and a tall kind stands in the band, at the centre,
+ * free in the open or backed against a wall, never in a corner. An arcade cabinet's three
  * variants are its three games, one size.
  */
 export const HERO_CATALOGUE = {
@@ -547,13 +553,13 @@ export const HERO_CATALOGUE = {
     use: { a: 0, d: 0.4 + HERO_USE_OUT },
   },
   "police-box": {
-    placement: "backed",
+    placement: "open",
     variants: 1,
     top: 2.7,
     edges: 1,
     surfaces: [],
     under: [],
-    use: { a: 0, d: 1.3 + HERO_USE_OUT },
+    use: { a: 0, d: 0.65 + HERO_USE_OUT },
   },
   "slab-walker": {
     placement: "band",
@@ -650,6 +656,37 @@ export const ANY_POOL = [
 export const ANY_SHARE = 3 / 4;
 /** The moat around a free or backed hero, in metres (H19, H20): wider than the player (0.7 m). */
 export const HERO_CLEAR = 1.0;
+
+/**
+ * The walkway an `open` hero (the police box, 2.6e) keeps clear all round
+ * it, in metres: wide enough for the player (0.7 m) to walk round it, so
+ * it is plain that nothing lies behind it. Its moat (`HERO_CLEAR`) is
+ * wider still, so the walkway holds no fixture, decor, scaffold, prop or
+ * other hero; `standsFree` keeps the walls and what hangs on them out of
+ * it.
+ */
+export const HERO_WALKWAY = 0.9;
+
+/**
+ * Whether `box` (a footprint in metres) stands free in `room`'s hall
+ * (2.6e): grown by `HERO_WALKWAY` and the wall band (`WALL_PROP_DEPTH`,
+ * the deepest a wall prop or a flush wall hero stands out), it lies inside
+ * the hall and on its floor. So no wall, and nothing hung on a wall,
+ * reaches the walkway round it, whichever way the box faces. The hero
+ * pass holds an `open` hero to it, and the arrival box (`world/arrival.ts`)
+ * too.
+ */
+export function standsFree(room: SiteBase, box: Box): boolean {
+  const ring = grow(box, HERO_WALKWAY + WALL_PROP_DEPTH);
+  const h = room.hall;
+  return (
+    ring.x0 >= h.x0 * CELL - EPS &&
+    ring.x1 <= h.x1 * CELL + EPS &&
+    ring.z0 >= h.y0 * CELL - EPS &&
+    ring.z1 <= h.y1 * CELL + EPS &&
+    fitsFloor(room, ring)
+  );
+}
 /** How deep the clear view box in front of a flush wall hero is, in metres (H19). */
 export const HERO_VIEW = 1.5;
 /** The slab's height (H9): nine of its 0.3 m depth. */
@@ -1017,6 +1054,7 @@ export function placeHeroes(
         box.z1 > band.y1 * CELL + EPS)
     )
       return false;
+    if (placement === "open" && !standsFree(room, box)) return false;
     if (HERO_FOOTING[kind] === "flush") {
       // The moat rule run the other way: a flush hero stays out of the
       // moat of every blocking hero placed before it.
@@ -1122,6 +1160,21 @@ export function placeHeroes(
             });
           }
         }
+        break;
+      case "open":
+        for (let y2 = 2 * hall.y0; y2 <= 2 * hall.y1; y2++)
+          for (let x2 = 2 * hall.x0; x2 <= 2 * hall.x1; x2++) {
+            const seed = seedFor(room.seed, "hero", x2, y2, "open");
+            const x = x2 / 2;
+            const y = y2 / 2;
+            const turn = faceCentre(hall, x, y);
+            list.push({
+              seed,
+              x,
+              y,
+              make: (rng) => hero(kind, rng, seed, () => ({ x, y, turn })),
+            });
+          }
         break;
       case "centre": {
         const seed = seedFor(room.seed, "hero", "centre");
