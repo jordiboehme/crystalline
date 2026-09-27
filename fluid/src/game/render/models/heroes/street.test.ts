@@ -18,11 +18,13 @@ import {
   inked,
   partsOf,
   positions,
+  recordingKitAt,
   runsOfLines,
   toLocal,
   type Part,
 } from "../../modelChecks";
 import { swungPoint } from "../../parts";
+import { surfaces } from "../common";
 import { MARKS } from "../marks";
 import { buildHero, buildHeroMesh } from ".";
 import { heroHalf } from "./common";
@@ -32,6 +34,7 @@ import {
   BOX_SIGN,
   BRAKE_STEEL,
   NOTICE_INK,
+  boxDoor,
   boxLeafMovers,
   boxSignLayout,
 } from "./street";
@@ -212,6 +215,29 @@ describe("street hero models", () => {
     expect(Math.sign(mid)).toBe(LEFT_LEAF_SIGN);
     for (const p of ink)
       expect(heightOf(p)).toBeGreaterThanOrEqual(0.003 - 1e-9);
+    // Mutation caught: the notice built into the body instead of the left
+    // leaf, which the position check above cannot tell apart from the leaf
+    // sitting at the same spot. Built apart: the body without its leaves
+    // (`movers: false`) carries no notice ink, and the left leaf alone
+    // (`boxDoor`) carries all of it.
+    const bodyParts: Part[] = [];
+    buildHero(
+      recordingKitAt(createBuilder(), bodyParts),
+      "police-box",
+      0,
+      LOOKS.aperture,
+      false,
+    );
+    expect(inked(bodyParts, NOTICE_INK, "panel")).toHaveLength(0);
+    const leafParts: Part[] = [];
+    boxDoor(
+      recordingKitAt(createBuilder(), leafParts),
+      surfaces(LOOKS.aperture),
+      "left",
+    );
+    expect(inked(leafParts, NOTICE_INK, "panel")).toHaveLength(
+      runsOfLines(MARKS.boxNotice),
+    );
   });
 });
 
