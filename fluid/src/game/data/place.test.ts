@@ -96,7 +96,6 @@ const DOMAINS = domainSpellings(
     name,
     canonicalName: name,
     aliases: [],
-    shadowed: false,
   })),
 );
 
@@ -423,12 +422,11 @@ describe("a portal spelled with a domain's other names", () => {
   // `lunar`; `eng` is another domain. No graph, so no portal has an address
   // and the colour rests on the prefix alone.
   const NAMES = domainSpellings([
-    { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
+    { name: "eng", canonicalName: "eng", aliases: [] },
     {
       name: "moonbase",
       canonicalName: "moon",
       aliases: ["lunar"],
-      shadowed: false,
     },
   ]);
   const detail: EngramDetail = {

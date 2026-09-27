@@ -99,7 +99,6 @@ export function hereKey(
       name: l.key,
       canonicalName: l.shadowed ? null : l.canonical,
       aliases: [...l.aliases],
-      shadowed: l.shadowed,
     })),
   );
   return spellings.get(current) ?? null;

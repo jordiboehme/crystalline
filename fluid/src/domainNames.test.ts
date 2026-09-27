@@ -15,9 +15,8 @@ function row(
   name: string,
   canonicalName: string | null = null,
   aliases: string[] = [],
-  shadowed = false,
 ): DomainNameRow {
-  return { name, canonicalName, aliases, shadowed };
+  return { name, canonicalName, aliases };
 }
 
 describe("domain spellings", () => {
@@ -39,16 +38,13 @@ describe("domain spellings", () => {
   });
 
   it("gives a shadowed canonical name to the domain registered under it", () => {
-    const names = domainSpellings([
-      row("moon"),
-      row("moonbase", "moon", [], true),
-    ]);
+    const names = domainSpellings([row("moon"), row("moonbase", "moon")]);
     expect(names.get("moon")).toBe("moon");
   });
 
-  it("keeps a local name ahead of a canonical name the listing did not flag", () => {
-    // The same rule without the flag: the order of the listing and the flag
-    // do not decide it, the local name does.
+  it("keeps a local name ahead of a canonical name listed before it", () => {
+    // The same rule in the other order: the order of the listing does not
+    // decide it, the local name does.
     const names = domainSpellings([row("moonbase", "moon"), row("moon")]);
     expect(names.get("moon")).toBe("moon");
   });

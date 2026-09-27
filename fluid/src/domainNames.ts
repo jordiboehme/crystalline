@@ -17,6 +17,14 @@
  *    is a contested canonical name, or is listed by two domains.
  *
  * Matching is on the exact spelling: no case folding and no trimming.
+ *
+ * One limit is on purpose. The listing leaves out every domain this caller may
+ * not see, and its `shadowed` flag stays false when the holder is one of
+ * them, so a hidden domain that holds a spelling as its local name, or claims
+ * the same canonical name as a visible one, is not in this table: the client
+ * may then map a spelling the server binds elsewhere or to nothing. Nothing
+ * here can learn of that domain without the listing revealing it, and
+ * reading `shadowed` would not help, so this is accepted rather than fixed.
  */
 
 import type { DomainSummary } from "./api/domains";
@@ -24,7 +32,7 @@ import type { DomainSummary } from "./api/domains";
 /** The part of one listing row the table is built from. */
 export type DomainNameRow = Pick<
   DomainSummary,
-  "name" | "canonicalName" | "aliases" | "shadowed"
+  "name" | "canonicalName" | "aliases"
 >;
 
 /** Every spelling a domain answers to, mapped to its local name. */

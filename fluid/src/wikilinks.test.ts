@@ -99,8 +99,8 @@ function graph() {
 
 /** The domain listing the app already holds, as the resolver takes it. */
 const DOMAINS = domainSpellings([
-  { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
-  { name: "ops", canonicalName: "ops", aliases: [], shadowed: false },
+  { name: "eng", canonicalName: "eng", aliases: [] },
+  { name: "ops", canonicalName: "ops", aliases: [] },
 ]);
 
 describe("parsing what is inside the brackets", () => {
@@ -228,19 +228,17 @@ describe("the wikilink resolver", () => {
  * the domain as it was written, and the server binds every spelling.
  */
 const NAMED = domainSpellings([
-  { name: "eng", canonicalName: "eng", aliases: [], shadowed: false },
+  { name: "eng", canonicalName: "eng", aliases: [] },
   {
     name: "moonbase",
     canonicalName: "moon",
     aliases: ["lunar"],
-    shadowed: false,
   },
-  { name: "sky", canonicalName: "sky", aliases: [], shadowed: false },
+  { name: "sky", canonicalName: "sky", aliases: [] },
   {
     name: "skybase",
     canonicalName: "sky",
     aliases: ["moonbase"],
-    shadowed: true,
   },
 ]);
 
