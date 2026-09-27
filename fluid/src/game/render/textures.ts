@@ -84,21 +84,10 @@ function layer(
 }
 
 /**
- * True within `width` texels of the top or the bottom of the layer (`y`
- * near 0 or `size - 1`): the ribbed pattern darkens there, so its vertical
- * wrap (2.7 C11: a repeat every 2 m up) reads as a seam. Its six ribs tile
- * seamlessly along `x` already (an integer number of cosine periods across
- * the whole layer), so no `x` band is darkened, or a rib centred on the
- * layer's left or right edge would read as two half ribs instead of one.
- */
-function nearTopOrBottom(y: number, size: number, width: number) {
-  return y < width || y >= size - width;
-}
-
-/**
- * True within `width` texels of any of the layer's four edges: the plated
- * pattern's one plate darkens there all round, so both its wraps (2.7 C11:
- * every 2 m along, every 1 m up) read as a seam.
+ * True within `width` texels of any of the layer's four edges: the ribbed
+ * and the plated pattern both darken there all round, so every wrap (2.7
+ * C11: the ribbed pattern's every 0.5 m along and 2 m up, the plated
+ * pattern's every 2 m along and 1 m up) reads as a seam.
  */
 function nearLayerEdge(x: number, y: number, size: number, width: number) {
   return x < width || x >= size - width || y < width || y >= size - width;
@@ -185,10 +174,13 @@ export function baseLayers(size: number, seed: number): Pixels[] {
   });
   const pictogram = layer(size, () => [255, 255, 255]);
   const ribbed = layer(size, (x, y) => {
+    // The cosine is phase-shifted (a leading minus) so a trough, not a
+    // peak, sits on the x wrap at 0 and size: the edge darkening below
+    // would otherwise cut a rib centred there into two half ribs.
     let v =
-      212 + 26 * Math.cos((2 * Math.PI * 6 * x) / size) + (g(x, y) - 0.5) * 20;
+      212 - 26 * Math.cos((2 * Math.PI * 6 * x) / size) + (g(x, y) - 0.5) * 20;
     if (Math.abs(y - size / 2) <= 1) v -= 45;
-    if (nearTopOrBottom(y, size, 2)) v -= 40;
+    if (nearLayerEdge(x, y, size, 2)) v -= 40;
     return [v, v, v];
   });
   const plated = layer(size, (x, y) => {
