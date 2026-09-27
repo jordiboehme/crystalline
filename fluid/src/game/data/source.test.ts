@@ -189,6 +189,58 @@ describe("loadPlace", () => {
     expect(inboundCall?.[0]).toContain("page=1");
   });
 
+  it("routes a door written with a domain's canonical name", async () => {
+    // Registered here as `moonbase`, its MANIFEST calls it `moon`: the door
+    // is written the way the content spells it and the route is the local one.
+    const listing = domainsResponse();
+    serve({
+      "/domains": () => ({
+        ...listing,
+        domains: [
+          ...listing.domains,
+          {
+            name: "moonbase",
+            kind: "file",
+            canonical_name: "moon",
+            aliases: [],
+            shadowed: false,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse("alpha", "Alpha", 5, [
+          {
+            line: 3,
+            rel_type: "depends_on",
+            resolved: true,
+            target: { domain: "moon", target: "Crater Base" },
+          },
+        ]),
+      "/graph": () => ({
+        ...GRAPH,
+        nodes: [
+          ...GRAPH.nodes,
+          {
+            id: 4,
+            domain: "moonbase",
+            permalink: "crater-base",
+            title: "Crater Base",
+          },
+        ],
+      }),
+      "/domains/moonbase/engrams/crater-base": () =>
+        detailResponse("crater-base", "Crater Base", 3),
+    });
+    const loaded = await loadPlace(client, "eng", "alpha");
+    expect(loaded.kind).toBe("place");
+    if (loaded.kind !== "place") {
+      return;
+    }
+    expect(loaded.place.relations.map((r) => r.address)).toEqual([
+      { domain: "moonbase", permalink: "crater-base" },
+    ]);
+  });
+
   it("still builds the room when the graph fails, with no address known", async () => {
     serve({
       "/graph": () => {

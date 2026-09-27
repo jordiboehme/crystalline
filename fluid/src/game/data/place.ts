@@ -32,6 +32,7 @@
 import type { EngramDetail, EngramReference } from "../../api/engram";
 import type { GraphNeighborhood } from "../../api/graph";
 import type { InboundRefPage } from "../../api/inbound";
+import type { DomainSpellings } from "../../domainNames";
 import {
   buildWikilinkResolver,
   innerOf,
@@ -55,8 +56,10 @@ import {
  * holds each located target's salience keyed by `placeKeyOf`, null (or no
  * entry) where it could not be fetched; it picks the door style.
  *
- * `domains` is undefined when the domain listing could not be read. That is
- * not the same as an empty list: an empty list tells the resolver that no
+ * `domains` is every spelling of every domain in the listing (`domainNames.ts`),
+ * so a door written with a canonical name or an alias finds its route, and it
+ * is undefined when the listing could not be read. That is
+ * not the same as an empty table: an empty one tells the resolver that no
  * prefix names a domain, while undefined tells it this caller cannot tell, and
  * it falls back to the behaviour the reading screen has before its listing
  * lands. A listing outage therefore degrades the room instead of failing it.
@@ -64,7 +67,7 @@ import {
 export interface PlaceSources {
   detail: EngramDetail;
   graph: GraphNeighborhood | null;
-  domains: readonly string[] | undefined;
+  domains: DomainSpellings | undefined;
   inbound: InboundRefPage | null;
   targetSalience: ReadonlyMap<string, number | null>;
 }

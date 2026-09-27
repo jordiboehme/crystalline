@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { EngramDetail, EngramReference } from "../../api/engram";
 import type { GraphNeighborhood, GraphNode } from "../../api/graph";
 import type { InboundRefHit, InboundRefPage } from "../../api/inbound";
+import { domainSpellings } from "../../domainNames";
 import { placeKeyOf } from "../paths";
 import { HATCH_CAP, type PlaceReference } from "../world/types";
 import { placeFromDetail, type PlaceSources } from "./place";
@@ -89,7 +90,14 @@ const GRAPH: GraphNeighborhood = {
   hidden: 0,
 };
 
-const DOMAINS = ["eng", "ops", "e"] as const;
+const DOMAINS = domainSpellings(
+  ["eng", "ops", "e"].map((name) => ({
+    name,
+    canonicalName: name,
+    aliases: [],
+    shadowed: false,
+  })),
+);
 
 function hit(domain: string, permalink: string, rel: string): InboundRefHit {
   return {

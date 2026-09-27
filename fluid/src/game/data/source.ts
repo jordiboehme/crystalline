@@ -41,6 +41,7 @@ import {
 } from "../../api/engram";
 import { fetchGraph, graphKey, NEIGHBORHOOD_DEPTH } from "../../api/graph";
 import { fetchInbound } from "../../api/inbound";
+import { domainSpellings } from "../../domainNames";
 import { placeKeyOf } from "../paths";
 import { HATCH_CAP, type PlaceAddress, type PlaceInput } from "../world/types";
 import { placeFromDetail } from "./place";
@@ -251,7 +252,7 @@ export async function loadPlace(
     graph: valueOr(graphResult),
     domains:
       domainsResult.status === "fulfilled"
-        ? domainsResult.value.domains.map((entry) => entry.name)
+        ? domainSpellings(domainsResult.value.domains)
         : undefined,
     inbound: valueOr(inboundResult),
   };
