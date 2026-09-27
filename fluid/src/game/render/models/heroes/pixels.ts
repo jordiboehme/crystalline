@@ -203,13 +203,26 @@ export function pixelPanel(
 }
 
 /**
+ * How far a mark's quads stand proud of the face they print on, in
+ * metres (2.6d C16, C12): thin enough, at curio range, to read as
+ * printed on the face rather than glued on top of it. A curio's mark
+ * (`finds.ts`, `desktop.ts`) is a `pixelPanel` quad at this lift instead
+ * of the taller `DECAL_LIFT` (the Task 5 ruling, over the triangle
+ * budget `pixelBoxes` would cost there); the designer tower's badge and
+ * clock and the ooze canisters' letters (`props/rare.ts`) are
+ * `pixelBoxes` at this same lift, since a curved or angled face has no
+ * flat panel to lift off of.
+ */
+export const MARK_PROUD = 0.0015;
+
+/**
  * Draws a pixel picture as thin boxes standing on a face at depth `d0`:
  * the same runs `pixelPanel` lays, each one `k.box` from `d0` out to `d1`
  * (`surfaceOf` gives a run's surface, `null` leaves it dark), with the
- * same `a0`, `h1` and `px` placing. For a mark smaller than about 3 cm,
- * on a curio or on the designer tower (2.6d C16), where a panel lifted
- * `DECAL_LIFT` off its face would stand as far out as the mark is tall:
- * a box 1.5 mm proud sits on its face and reads as printed on it.
+ * same `a0`, `h1` and `px` placing. Only the designer tower's badge and
+ * clock and the ooze canisters' letters call it (`props/rare.ts`, 2.6d
+ * C16), each a box `MARK_PROUD` proud of its face; a curio's mark is a
+ * `pixelPanel` at the same lift instead, so no curio calls this.
  */
 export function pixelBoxes(
   k: Kit,

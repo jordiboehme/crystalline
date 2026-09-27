@@ -2,9 +2,12 @@
  * The originals' own text and marks the station draws (2.6d C16). Where an
  * original's letters, marks or logo make a prop more recognisable, the
  * station uses them, as on the original (the text-and-logos rule, Jordi,
- * 2026-09-26). Every such string and picture of 2.6d lives here and
- * nowhere else: the recipes import these constants and never spell a
- * readable literal, and `heroText.test.ts` allows exactly these strings.
+ * 2026-09-26). Every string of 2.6d, and every picture that is a logo or
+ * a badge, lives here and nowhere else: the recipes import these
+ * constants and never spell a readable literal, and `heroText.test.ts`
+ * allows exactly these strings. The one exception is the saucer poster's
+ * photograph (`SAUCER_PICTURE`, `props/rare.ts`), which stays beside its
+ * recipe since it is the original's image, not a logo or a text mark.
  *
  * The block-pixel font has capitals, lower-case letters, digits, the
  * space, the period and `<`, `=`, `>`, so a badge is set as the original

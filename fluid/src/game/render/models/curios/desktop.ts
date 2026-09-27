@@ -68,15 +68,12 @@ import type { Surface } from "../../geometry";
 import { frameAt, type Frame, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import { profileAlong, yawed, type KitAt } from "../common";
-import { pixelPanel, textRows } from "../heroes/pixels";
+import { MARK_PROUD, pixelPanel, textRows } from "../heroes/pixels";
 import { COMPUTER_LOGO, MARKS, SPACE_BADGE } from "../marks";
 import { curioHalf, type CurioRecipe } from "./common";
 
 /** Every curio in this file is built in this frame, at the origin. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
-
-/** How far a mark's quads stand in front of the face they are printed on, in metres (C16). */
-const MARK_PROUD = 0.0015;
 
 /** A side profile, `[d, h]` points. */
 type Profile = readonly (readonly [number, number])[];

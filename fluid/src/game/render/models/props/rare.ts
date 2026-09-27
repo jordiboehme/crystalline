@@ -48,11 +48,13 @@
  *   signature squiggle (`SIGNATURE`) under it. The lights and the digits
  *   are steady `s.signal` lights; the bank is `steady`.
  *
- * Every string and picture comes from `../marks.ts` (C16). The small marks
- * (the canister's letters, the tower's digits and badge) are
- * `pixelBoxes` standing 1.5 mm proud of their faces; the poster's picture
- * and caption are quads at `DECAL_LIFT`, one per run of the font or the
- * picture.
+ * Every string, and every picture that is a logo or a badge, comes from
+ * `../marks.ts` (C16); the saucer's photograph (`SAUCER_PICTURE`) is
+ * defined here instead, since it is the original's image, not a logo or
+ * a text mark. The small marks (the canister's letters, the tower's
+ * digits and badge) are `pixelBoxes` standing `MARK_PROUD` proud of their
+ * faces; the poster's picture and caption are quads at `DECAL_LIFT`, one
+ * per run of the font or the picture.
  */
 
 import type { PropKind } from "../../../world/types";
@@ -67,15 +69,18 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import { pixelBoxes, pixelRuns, runsOf, textRows } from "../heroes/pixels";
+import {
+  MARK_PROUD,
+  pixelBoxes,
+  pixelRuns,
+  runsOf,
+  textRows,
+} from "../heroes/pixels";
 import { MARKS, SIGNATURE } from "../marks";
 import type { PropRecipe } from "./common";
 
 /** The frame every recipe here builds in. */
 const ORIGIN = frameAt([0, 0, 0], 0);
-
-/** How far a small mark's boxes stand proud of their face, in metres (C16). */
-const MARK_PROUD = 0.0015;
 
 // ---------------------------------------------------------------------------
 // The ooze canisters.
