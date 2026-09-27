@@ -3,7 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! file_stamps, collect_orphaned_domains, sessions, tool, configure, origin_add,
+//! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
+//! sessions, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
@@ -65,6 +66,8 @@ pub async fn serve_ctl(stream: IpcStream, shared: Arc<Shared>) {
 /// Handle one ctl request, returning the response envelope and whether the
 /// daemon should shut down after replying.
 async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
+    let localized = localized_request(req, &shared.engine).await;
+    let req = localized.as_ref().unwrap_or(req);
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
     match cmd {
         "status" => {
@@ -129,6 +132,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .unwrap_or(false);
             match shared.engine.sync_take_over(domain, take_over).await {
                 Ok(mut data) => {
+                    // After the sync has returned: a synced MANIFEST may
+                    // declare a new name, and a pre-0.20.0 entry is caught up.
+                    let names = shared.engine.adopt_domain_names_after("the sync").await;
+                    if let Value::Object(map) = &mut data {
+                        map.insert("names".to_string(), names);
+                    }
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)
                 }
@@ -161,6 +170,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // The domain name findings `crystalline doctor` shows, and the fix
+        // it runs for links spelled with a name only this machine uses.
+        // Served here for the reason `file_stamps` is: this daemon holds the
+        // index, and doctor must not have to stop it to ask or to fix.
+        "name_report" => match shared.engine.name_report().await {
+            Ok(data) => (envelope_ok(data), false),
+            Err(e) => (envelope_err(e.to_string()), false),
+        },
+        "fix_local_spellings" => match shared.engine.fix_local_spellings().await {
+            Ok(fixed) => (envelope_ok(json!({ "fixed": fixed })), false),
+            Err(e) => (envelope_err(e.to_string()), false),
+        },
         "reindex" => {
             let full = req.get("full").and_then(Value::as_bool).unwrap_or(false);
             let embed = req.get("embed").and_then(Value::as_bool).unwrap_or(false);
@@ -365,6 +386,29 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             match shared
                 .engine
                 .set_review_mode(domain, mode, confirm, &crate::scope::Scope::Unrestricted)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Rename a domain everywhere the caller can write, or (`local_only`)
+        // on this machine alone: the same entry point the JSON API's rename
+        // route calls. As the machine owner, for the reason `domain_remove`
+        // and `domain_review` above state; `domain` is not in
+        // `DOMAIN_REFERENCE_COMMANDS` because `Engine::rename_domain` already
+        // localizes it against the name table itself, before anything else it
+        // does.
+        "domain_rename" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let new = req.get("new").and_then(Value::as_str).unwrap_or("");
+            let local_only = req
+                .get("local_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match shared
+                .engine
+                .rename_domain(domain, new, local_only, &crate::scope::Scope::Unrestricted)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -610,10 +654,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
-                 domain_remove, retag, collect_orphaned_domains, \
-                 configure, origin_add, origin_update, origin_status, origin_share, \
-                 origin_withdraw, origin_changes, origin_discard, origin_resolve, provision, \
-                 forget_domain or shutdown"
+                 domain_remove, domain_review, domain_rename, retag, collect_orphaned_domains, \
+                 name_report, fix_local_spellings, configure, origin_add, origin_update, \
+                 origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
+                 origin_resolve, provision, forget_domain or shutdown"
             )),
             false,
         ),
@@ -779,6 +823,52 @@ fn folds_on_the_way_in(req: &Value) -> bool {
         && req.get("folds").is_some_and(Value::is_object)
 }
 
+/// The commands whose `domain` names a domain that already exists, so any of
+/// its names will do. `origin_add` is not one: the name it carries is the one
+/// a new registration takes, and mapping it through the table would let a new
+/// domain collide with the one an alias already points at. Nor is
+/// `forget_domain`: it names a domain that was just removed, and mapping that
+/// name could only land on a different, live domain.
+const DOMAIN_REFERENCE_COMMANDS: [&str; 16] = [
+    "sync",
+    "file_stamps",
+    "scaffold_manifest",
+    "domain_import",
+    "retag",
+    "domain_export",
+    "domain_remove",
+    "domain_review",
+    "origin_update",
+    "origin_status",
+    "origin_share",
+    "origin_withdraw",
+    "origin_changes",
+    "origin_discard",
+    "origin_resolve",
+    "provision",
+];
+
+/// `req` with its `domain` spelled as the local name, when it is a command
+/// that names an existing domain and names it by its canonical name or an
+/// alias; `None` when there is nothing to change. The control socket is the
+/// machine owner's, so every domain is visible to it.
+async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
+    let cmd = req.get("cmd").and_then(Value::as_str)?;
+    if !DOMAIN_REFERENCE_COMMANDS.contains(&cmd) {
+        return None;
+    }
+    let typed = req.get("domain").and_then(Value::as_str)?;
+    let local = engine
+        .localize_visible(typed, &std::collections::HashSet::new())
+        .await;
+    if local == typed {
+        return None;
+    }
+    let mut req = req.clone();
+    req["domain"] = Value::String(local);
+    Some(req)
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
@@ -790,6 +880,150 @@ fn envelope_err(message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's `domain add eng` beside a running daemon writes the config
+    /// file from its own process and then asks the daemon to `sync` `eng`.
+    /// `eng-knowledge` declares `domain_name: eng`, and the daemon's table was
+    /// built before the registration, but the new local name wins: the sync
+    /// reaches the new domain, not the one whose canonical name it shadows.
+    #[tokio::test]
+    async fn a_sync_after_another_process_registers_a_shadowing_name_syncs_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = |name: &str, declared: &str| {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("MANIFEST.md"),
+                crystalline_core::manifest_template(declared, "2026-01-01"),
+            )
+            .unwrap();
+            crystalline_core::config::DomainEntry::file(root)
+        };
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains
+            .insert("eng-knowledge".to_string(), folder("eng-knowledge", "eng"));
+        let config_path = tmp.path().join("config.yaml");
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg.clone(),
+                None,
+                Some(config_path.clone()),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+        let (before, _) = handle(&json!({ "cmd": "sync", "domain": "eng" }), &shared).await;
+        assert_eq!(before["data"]["reports"][0]["domain"], "eng-knowledge");
+
+        // What the CLI's registration writes, from outside this engine.
+        cfg.domains
+            .insert("eng".to_string(), folder("eng-new", "eng-new"));
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+        let (reply, _) = handle(&json!({ "cmd": "sync", "domain": "eng" }), &shared).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["reports"][0]["domain"], "eng", "{reply}");
+    }
+
+    /// A command naming an existing domain takes its canonical name or an
+    /// alias: `sync` with `eng` syncs `eng-knowledge`, whose MANIFEST
+    /// declares that name.
+    #[tokio::test]
+    async fn a_command_names_a_domain_by_its_canonical_name_or_an_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng-knowledge");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            crystalline_core::manifest_template("eng", "2026-01-01"),
+        )
+        .unwrap();
+        // Named on purpose, so the adoption after the first sync keeps the
+        // name rather than renaming the domain to the one it declares.
+        let mut entry = crystalline_core::config::DomainEntry::file(root)
+            .with_name_origin(crystalline_core::config::NameOrigin::Explicit);
+        entry.aliases = vec!["old-eng".to_string()];
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert("eng-knowledge".to_string(), entry);
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg,
+                None,
+                Some(tmp.path().join("config.yaml")),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+
+        for spelling in ["eng", "old-eng"] {
+            let (reply, shutdown) =
+                handle(&json!({ "cmd": "sync", "domain": spelling }), &shared).await;
+            assert!(!shutdown);
+            assert_eq!(reply["ok"], true, "{spelling}: {reply}");
+            assert_eq!(
+                reply["data"]["reports"][0]["domain"], "eng-knowledge",
+                "{spelling}: {reply}"
+            );
+        }
+    }
+
+    /// The ctl `sync` runs the name adoption once its sync has returned, and
+    /// answers what it did under `names`: a derived domain whose MANIFEST
+    /// declares another name is renamed to it on this machine.
+    #[tokio::test]
+    async fn a_ctl_sync_adopts_a_declared_name_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng-knowledge");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            crystalline_core::manifest_template("eng", "2026-01-01"),
+        )
+        .unwrap();
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert(
+            "eng-knowledge".to_string(),
+            crystalline_core::config::DomainEntry::file(root)
+                .with_name_origin(crystalline_core::config::NameOrigin::Derived),
+        );
+        let config_path = tmp.path().join("config.yaml");
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg,
+                None,
+                Some(config_path.clone()),
+            )
+            .with_state_dir(tmp.path().join("state")),
+        );
+        let shared = Arc::new(Shared::for_test(engine));
+
+        let (reply, _) = handle(&json!({ "cmd": "sync" }), &shared).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        let names = reply["data"]["names"].as_array().expect("a names list");
+        assert!(
+            names
+                .iter()
+                .any(|n| n["action"] == "renamed" && n["domain"] == "eng"),
+            "{reply}"
+        );
+        let saved: crystalline_core::config::GlobalConfig =
+            crystalline_core::config::load_yaml(&config_path).unwrap();
+        assert!(saved.domains.contains_key("eng"), "{reply}");
+        assert!(!saved.domains.contains_key("eng-knowledge"), "{reply}");
+    }
 
     /// `origin_share`'s amend target is the parameter this guards: absent
     /// means "stack a new layer", a number means "amend that layer", and a

@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.19.5"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1324,6 +1324,7 @@ dependencies = [
  "crystalline-remote",
  "crystalline-service",
  "dunce",
+ "flate2",
  "fs4 1.1.0",
  "insta",
  "predicates",
@@ -1332,6 +1333,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "similar 3.2.0",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
@@ -1341,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.19.5"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1361,8 +1363,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "crystalline-engine"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "crystalline-core",
+ "crystalline-identity",
+ "crystalline-index",
+ "crystalline-remote",
+ "diffy",
+ "futures",
+ "globset",
+ "http",
+ "indexmap 2.14.2",
+ "libc",
+ "percent-encoding",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "similar 3.2.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "yrs",
+]
+
+[[package]]
+name = "crystalline-identity"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "chrono",
+ "crystalline-index",
+ "futures",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turso",
+ "url",
+]
+
+[[package]]
 name = "crystalline-index"
-version = "0.19.5"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1390,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-remote"
-version = "0.19.5"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1400,6 +1456,7 @@ dependencies = [
  "diffy",
  "flate2",
  "keyring",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
@@ -1414,28 +1471,62 @@ dependencies = [
 ]
 
 [[package]]
-name = "crystalline-service"
-version = "0.19.5"
+name = "crystalline-rest"
+version = "0.20.0"
 dependencies = [
  "anyhow",
- "argon2",
- "async-trait",
  "axum",
  "axum-extra",
  "base64 0.23.1",
  "bytes",
  "chrono",
  "crystalline-core",
+ "crystalline-engine",
+ "crystalline-identity",
  "crystalline-index",
  "crystalline-remote",
+ "futures",
+ "getrandom 0.4.3",
+ "http",
+ "openidconnect",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower-service",
+ "tracing",
+ "utoipa",
+ "yrs",
+ "zip",
+]
+
+[[package]]
+name = "crystalline-service"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "crystalline-core",
+ "crystalline-engine",
+ "crystalline-identity",
+ "crystalline-index",
+ "crystalline-remote",
+ "crystalline-rest",
  "crystalline-service",
- "diffy",
  "flate2",
  "fs4 1.1.0",
  "futures",
  "getrandom 0.4.3",
- "globset",
- "indexmap 2.14.2",
+ "http",
  "interprocess",
  "jsonwebtoken",
  "libc",
@@ -1446,24 +1537,20 @@ dependencies = [
  "rmcp",
  "rsa",
  "rust-embed",
- "schemars 1.2.2",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
- "similar 3.2.0",
  "tar",
  "tempfile",
- "thiserror 2.0.20",
  "tiktoken-rs",
- "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tower-service",
  "tracing",
  "tracing-subscriber",
  "turso",
- "utoipa",
  "walkdir",
  "windows-sys 0.61.2",
  "yrs",

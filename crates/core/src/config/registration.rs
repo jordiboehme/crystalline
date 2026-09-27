@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::DomainEntry;
+use super::{DomainEntry, NameOrigin};
 
 /// The longest domain name, in characters (not bytes). The cap is about a
 /// readable folder segment and a readable piece of a `crystalline://`
@@ -164,23 +164,54 @@ pub fn derive_domain_name(raw: &str, taken: impl Fn(&str) -> bool) -> String {
     // Room for a `-NN` suffix inside the cap; a slug is ASCII, so chars and
     // bytes agree here.
     let base: String = slug.chars().take(MAX_DOMAIN_NAME_CHARS - 4).collect();
-    let base = base.trim_end_matches('-').to_string();
+    // A slug carries no `.`, so the stepping below trims exactly what this
+    // function always trimmed.
+    step_domain_name(base.trim_end_matches('-'), taken)
+}
+
+/// The default name for a domain rooted at GitHub repository `repo`
+/// (`owner/name`): the repository's own name segment, run through
+/// [`derive_domain_name`] against no existing names. Callers that must
+/// avoid a collision pass the result on to [`step_domain_name`] or
+/// [`choose_domain_name`], which take their own `taken` predicate.
+pub fn default_repo_domain_name(repo: &str) -> String {
+    let segment = repo.rsplit('/').next().unwrap_or(repo);
+    derive_domain_name(segment, |_| false)
+}
+
+/// The default name for a local file domain rooted at `root`: the folder's
+/// basename, slugified the same way [`default_repo_domain_name`] slugifies a
+/// repository segment.
+pub fn default_folder_domain_name(root: &Path) -> String {
+    let base = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    derive_domain_name(&base, |_| false)
+}
+
+/// `name` itself when it is a valid, free domain name, else `name-2`,
+/// `name-3`... cut to fit the length cap. Unlike [`derive_domain_name`] the
+/// spelling is kept exactly as given (no slugify): a MANIFEST's
+/// `domain_name` is already a valid name, and stepping must not silently
+/// rewrite it. `name` must already pass [`validate_domain_name`] itself, or
+/// no `-N` candidate built from it ever will either, and the search never
+/// terminates.
+pub fn step_domain_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
     let usable = |candidate: &str| validate_domain_name(candidate).is_ok() && !taken(candidate);
-    if usable(&base) {
-        return base;
+    if usable(name) {
+        return name.to_string();
     }
     let mut n = 2;
     loop {
-        // Shorten the base by the suffix's length, so a long base keeps every
-        // candidate inside the cap however far the counter climbs (a 60
-        // character base would otherwise overflow from `-1000` on and never
-        // validate again).
+        // Shorten the stem by the suffix's length so every candidate stays
+        // inside the cap however high the counter climbs.
         let suffix = format!("-{n}");
-        let stem: String = base
+        let stem: String = name
             .chars()
-            .take(MAX_DOMAIN_NAME_CHARS.saturating_sub(suffix.len()))
+            .take(MAX_DOMAIN_NAME_CHARS.saturating_sub(suffix.chars().count()))
             .collect();
-        let candidate = format!("{}{suffix}", stem.trim_end_matches('-'));
+        let candidate = format!("{}{suffix}", stem.trim_end_matches(['-', '.']));
         if usable(&candidate) {
             return candidate;
         }
@@ -188,9 +219,244 @@ pub fn derive_domain_name(raw: &str, taken: impl Fn(&str) -> bool) -> String {
     }
 }
 
+/// Whether `name` looks like it was worked out for `entry` rather than
+/// chosen on purpose, for a domain registered before `name_origin` existed.
+/// A name set by an environment variable (`env_defined`) is always
+/// [`NameOrigin::Explicit`], and so is a virtual domain's: it has no
+/// repository or folder to derive a default from. Otherwise `name` counts
+/// as [`NameOrigin::Derived`] when it equals the repository default (an
+/// entry with `origin` set) or the folder default (a plain file entry),
+/// matching either the folder's raw basename or its slugified form.
+pub fn infer_name_origin(name: &str, entry: &DomainEntry, env_defined: bool) -> NameOrigin {
+    if env_defined || entry.is_virtual() {
+        return NameOrigin::Explicit;
+    }
+    if let Some(origin) = &entry.origin
+        && name == default_repo_domain_name(&origin.repo)
+    {
+        return NameOrigin::Derived;
+    }
+    if let Some(root) = entry.file_path() {
+        let raw = root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == raw || name == default_folder_domain_name(&root) {
+            return NameOrigin::Derived;
+        }
+    }
+    NameOrigin::Explicit
+}
+
+/// The result of [`choose_domain_name`]: the name to register, how it was
+/// arrived at, and, when a MANIFEST-declared name had to step because it was
+/// already taken, the canonical name that stepping leaves shadowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameChoice {
+    /// The name to register.
+    pub name: String,
+    /// How `name` was arrived at.
+    pub origin: NameOrigin,
+    /// The MANIFEST-declared canonical name, when stepping moved away from
+    /// it because it was already taken.
+    pub shadowed_canonical: Option<String>,
+}
+
+/// Picks the name a new registration gets, in order: `explicit` when given
+/// (always [`NameOrigin::Explicit`]); else `manifest_name` when it is a
+/// valid domain name, stepped by [`step_domain_name`] if `taken` and
+/// reporting the original as `shadowed_canonical` when stepping changed it
+/// (always [`NameOrigin::Derived`]); else `default_name()`
+/// ([`NameOrigin::Derived`]). `validate_domain_name` is deliberately not
+/// applied to `explicit` here: callers keep today's order of running
+/// [`decide_registration`] first and [`validate_domain_name`] only after.
+pub fn choose_domain_name(
+    explicit: Option<&str>,
+    manifest_name: Option<&str>,
+    default_name: impl FnOnce() -> String,
+    taken: impl Fn(&str) -> bool,
+) -> NameChoice {
+    if let Some(name) = explicit {
+        return NameChoice {
+            name: name.to_string(),
+            origin: NameOrigin::Explicit,
+            shadowed_canonical: None,
+        };
+    }
+    if let Some(declared) = manifest_name.filter(|n| validate_domain_name(n).is_ok()) {
+        let name = step_domain_name(declared, &taken);
+        let shadowed_canonical = (name != declared).then(|| declared.to_string());
+        return NameChoice {
+            name,
+            origin: NameOrigin::Derived,
+            shadowed_canonical,
+        };
+    }
+    NameChoice {
+        name: default_name(),
+        origin: NameOrigin::Derived,
+        shadowed_canonical: None,
+    }
+}
+
+/// Whether a registration should write `domain_name` into the MANIFEST.
+/// Never when the MANIFEST already declares one (`manifest_declares`), and
+/// never for a team domain (`entry.origin` set) whatever its name's origin -
+/// explicit or derived. The owner adds the name upstream by hand; an
+/// automatic write would plant a pending local change that blocks review
+/// mode and conflicts once the owner adds the name upstream. Otherwise
+/// written for every plain local file or virtual domain (no `origin`),
+/// whatever its name's origin.
+pub fn needs_manifest_write_back(entry: &DomainEntry, manifest_declares: bool) -> bool {
+    !manifest_declares && entry.origin.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OriginConfig;
+
+    #[test]
+    fn the_repo_default_is_the_last_segment_slugified() {
+        assert_eq!(
+            default_repo_domain_name("acme/Eng-Knowledge"),
+            "eng-knowledge"
+        );
+        assert_eq!(default_repo_domain_name("acme/CON"), "con-2");
+    }
+
+    #[test]
+    fn the_folder_default_is_the_basename_slugified() {
+        assert_eq!(
+            default_folder_domain_name(Path::new("/x/My Notes")),
+            "my-notes"
+        );
+    }
+
+    #[test]
+    fn stepping_keeps_the_spelling_and_appends_a_counter() {
+        let taken = |n: &str| matches!(n, "Eng.Docs" | "Eng.Docs-2");
+        assert_eq!(step_domain_name("Eng.Docs", taken), "Eng.Docs-3");
+        assert_eq!(step_domain_name("free", |_| false), "free");
+        let long = "a".repeat(64);
+        let stepped = step_domain_name(&long, |n| n == long);
+        assert!(
+            stepped.chars().count() <= MAX_DOMAIN_NAME_CHARS,
+            "{stepped}"
+        );
+        assert!(stepped.ends_with("-2"));
+        assert!(validate_domain_name(&stepped).is_ok());
+    }
+
+    #[test]
+    fn an_explicit_name_wins_and_is_explicit() {
+        let c = choose_domain_name(Some("ops"), Some("platform"), || "repo".into(), |_| false);
+        assert_eq!(
+            c,
+            NameChoice {
+                name: "ops".into(),
+                origin: NameOrigin::Explicit,
+                shadowed_canonical: None
+            }
+        );
+    }
+
+    #[test]
+    fn the_manifest_name_comes_next_and_is_derived() {
+        let c = choose_domain_name(None, Some("platform"), || "repo".into(), |_| false);
+        assert_eq!(
+            c,
+            NameChoice {
+                name: "platform".into(),
+                origin: NameOrigin::Derived,
+                shadowed_canonical: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_taken_manifest_name_steps_and_reports_the_shadowed_canonical() {
+        let c = choose_domain_name(
+            None,
+            Some("platform"),
+            || "repo".into(),
+            |n| n == "platform",
+        );
+        assert_eq!(c.name, "platform-2");
+        assert_eq!(c.origin, NameOrigin::Derived);
+        assert_eq!(c.shadowed_canonical.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn an_invalid_manifest_name_is_ignored_for_the_default() {
+        let c = choose_domain_name(None, Some("../up"), || "repo".into(), |_| false);
+        assert_eq!(c.name, "repo");
+        assert_eq!(c.origin, NameOrigin::Derived);
+    }
+
+    #[test]
+    fn inference_counts_the_two_defaults_as_derived() {
+        let team = DomainEntry {
+            origin: Some(OriginConfig {
+                repo: "acme/eng-knowledge".into(),
+                path: None,
+                branch: None,
+                poll_secs: None,
+            }),
+            ..DomainEntry::file("/x/y")
+        };
+        assert_eq!(
+            infer_name_origin("eng-knowledge", &team, false),
+            NameOrigin::Derived
+        );
+        assert_eq!(infer_name_origin("eng", &team, false), NameOrigin::Explicit);
+        let local = DomainEntry::file("/x/My Notes");
+        assert_eq!(
+            infer_name_origin("my-notes", &local, false),
+            NameOrigin::Derived
+        );
+        assert_eq!(
+            infer_name_origin("My Notes", &local, false),
+            NameOrigin::Derived
+        );
+        assert_eq!(
+            infer_name_origin("journal", &local, false),
+            NameOrigin::Explicit
+        );
+        assert_eq!(
+            infer_name_origin("my-notes", &local, true),
+            NameOrigin::Explicit
+        );
+        assert_eq!(
+            infer_name_origin("scratch", &DomainEntry::virtual_domain(), false),
+            NameOrigin::Explicit
+        );
+    }
+
+    #[test]
+    fn write_back_skips_every_team_domain_explicit_or_derived() {
+        let team = DomainEntry {
+            origin: Some(OriginConfig {
+                repo: "acme/eng".into(),
+                path: None,
+                branch: None,
+                poll_secs: None,
+            }),
+            ..DomainEntry::file("/x")
+        };
+        assert!(!needs_manifest_write_back(&team, false));
+        let team_explicit = DomainEntry {
+            name_origin: Some(NameOrigin::Explicit),
+            ..team
+        };
+        assert!(!needs_manifest_write_back(&team_explicit, false));
+        assert!(needs_manifest_write_back(&DomainEntry::file("/x"), false));
+        assert!(needs_manifest_write_back(
+            &DomainEntry::virtual_domain(),
+            false
+        ));
+        assert!(!needs_manifest_write_back(&DomainEntry::file("/x"), true));
+    }
 
     #[test]
     fn a_domain_name_is_one_plain_segment() {

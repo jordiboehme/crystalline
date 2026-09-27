@@ -24,7 +24,7 @@ use crystalline_core::{Engram, slugify};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::sweep::UnresolvedRef;
+use crate::sweep::{SpelledRef, UnresolvedRef};
 
 /// A domain's primary key in the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -97,20 +97,28 @@ pub struct ObservationRecord {
 /// there, and - only when the row names a domain nobody registered - the whole
 /// bracket text as a permalink and then a title in the row's OWN domain.
 ///
+/// "Target domain" and "registered" both mean a row of `domain_spelling`: a
+/// reference may name its domain by the local name, the canonical name its
+/// MANIFEST declares or a former name, and every one of those that resolves
+/// is recorded there against the domain row. Every domain row is at least its
+/// own name, so a reference by local name reads what it read when this
+/// consulted `domain.name` directly; the lookup is a primary-key seek either
+/// way.
+///
 /// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
 /// reachable. The parser splits that into a domain and a target exactly as it
 /// splits `ops:Runbook`, because nothing inside the brackets says which it is,
-/// and only the registry can settle it. It stays a second question rather than
+/// and only the spelling table can settle it. It stays a second question rather than
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
 /// true, so it resolves exactly as it did before until its engram is reindexed.
 pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
     let target_domain = format!(
-        "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
+        "COALESCE((SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain), {table}.domain_id)"
     );
     let unregistered = format!(
         "{table}.to_domain IS NOT NULL \
-         AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
+         AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = {table}.to_domain)"
     );
     // The tie-break itself: a bare `LIMIT 1` with no secondary sort key leaves
     // a tie between two candidate rows unpinned, and the row it hands back
@@ -201,6 +209,191 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
          AND {resolved} IS NOT NULL",
         resolved = reference_match(table, ReferenceCandidates::Base)
     )
+}
+
+/// The reset behind [`Store::reset_references_to_spellings`], one statement
+/// per reference table: unbind the rows that name one of the spellings in
+/// `list` (the caller's placeholders) and are bound now.
+///
+/// A seek through the table's partial `to_domain` index. It runs only when a
+/// spelling changed meaning (a canonical name declared or changed, an alias
+/// added or dropped, a domain registered under a held spelling), never on a
+/// sync or a read.
+///
+/// The `to_domain IS NOT NULL` term repeats the partial index's own condition:
+/// turso uses a partial index only when the query states it, and does not read
+/// it off the `IN` list.
+#[doc(hidden)]
+pub fn reset_spelled_references_sql(table: &str, list: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = NULL WHERE to_domain IS NOT NULL AND to_domain IN ({list}) AND to_id IS NOT NULL"
+    )
+}
+
+/// The edge half of [`Store::engrams_referencing_domains`]: every base engram
+/// with a relation or link row naming one of the spellings in `list`.
+///
+/// Driven from the reference tables through their partial `to_domain`
+/// indexes, so it reads only the rows that carry one of the prefixes, and each
+/// source engram is reached by primary key. `UNION` keeps each engram once. No
+/// `ORDER BY`: the caller merges this with the URL half and sorts the union
+/// byte-wise in Rust, which is the order both backends owe.
+///
+/// The `to_domain IS NOT NULL` term repeats the partial index's own condition:
+/// turso uses a partial index only when the query states it, and does not read
+/// it off the `IN` list.
+#[doc(hidden)]
+pub fn referencing_domains_sql(list: &str) -> String {
+    format!(
+        "SELECT d.name, e.path FROM relation r JOIN engram e ON e.id=r.engram_id \
+         JOIN domain d ON d.id=e.domain_id \
+         WHERE r.to_domain IS NOT NULL AND r.to_domain IN ({list}) AND e.actor = '' \
+         UNION \
+         SELECT d.name, e.path FROM link l JOIN engram e ON e.id=l.engram_id \
+         JOIN domain d ON d.id=e.domain_id \
+         WHERE l.to_domain IS NOT NULL AND l.to_domain IN ({list}) AND e.actor = ''"
+    )
+}
+
+/// The read behind [`Store::spelled_references`]: one domain's base
+/// references whose domain prefix is one of the spellings in `list`, relation
+/// rows then link rows. `domain` is the caller's placeholder for the domain id.
+///
+/// Reaches each reference table through its partial `to_domain` index, so it
+/// reads only the rows that carry one of the prefixes, whichever domain they
+/// sit in, and keeps this domain's. The source path is selected to sort by;
+/// the caller sorts in Rust.
+///
+/// The `to_domain IS NOT NULL` term repeats the partial index's own condition:
+/// turso uses a partial index only when the query states it, and does not read
+/// it off the `IN` list.
+#[doc(hidden)]
+pub fn spelled_references_sql(domain: &str, list: &str) -> String {
+    format!(
+        "SELECT r.engram_id, r.line, r.to_domain, r.to_raw, e.path \
+         FROM relation r JOIN engram e ON e.id=r.engram_id \
+         WHERE r.to_domain IS NOT NULL AND r.to_domain IN ({list}) AND r.domain_id={domain} AND e.actor = '' \
+         UNION ALL \
+         SELECT l.engram_id, l.line, l.to_domain, l.to_raw, e.path \
+         FROM link l JOIN engram e ON e.id=l.engram_id \
+         WHERE l.to_domain IS NOT NULL AND l.to_domain IN ({list}) AND l.domain_id={domain} AND e.actor = ''"
+    )
+}
+
+/// The checked form of a [`Store::replace_domain_spellings`] list.
+pub(crate) struct SpellingPlan {
+    /// Each `(spelling, domain)` pair once, sorted by spelling.
+    pub(crate) rows: Vec<(String, DomainId)>,
+    /// The domain ids the replace is scoped to: every id the list names.
+    pub(crate) scope: Vec<DomainId>,
+}
+
+/// Check a [`Store::replace_domain_spellings`] list. One spelling listed for
+/// two domains is refused, since a spelling resolves to one domain.
+pub(crate) fn spelling_plan(spellings: &[(String, DomainId)]) -> Result<SpellingPlan> {
+    let mut rows: std::collections::BTreeMap<&str, DomainId> = std::collections::BTreeMap::new();
+    for (spelling, id) in spellings {
+        match rows.insert(spelling.as_str(), *id) {
+            Some(other) if other != *id => {
+                return Err(crate::IndexError::Invalid(format!(
+                    "the spelling `{spelling}` is listed for two domains ({} and {}); \
+                     a spelling resolves to one domain, so build the list from one name table",
+                    other.0, id.0
+                )));
+            }
+            _ => {}
+        }
+    }
+    let mut scope: Vec<DomainId> = rows.values().copied().collect();
+    scope.sort_by_key(|id| id.0);
+    scope.dedup();
+    Ok(SpellingPlan {
+        rows: rows
+            .into_iter()
+            .map(|(s, id)| (s.to_string(), id))
+            .collect(),
+        scope,
+    })
+}
+
+/// Every spelling whose mapping differs between two snapshots of the spelling
+/// table: added, removed or pointing at another domain. Sorted byte-wise.
+pub(crate) fn changed_spellings(
+    before: &[(String, DomainId)],
+    after: &[(String, DomainId)],
+) -> Vec<String> {
+    let before: HashMap<&str, DomainId> = before.iter().map(|(s, id)| (s.as_str(), *id)).collect();
+    let after: HashMap<&str, DomainId> = after.iter().map(|(s, id)| (s.as_str(), *id)).collect();
+    let mut changed: Vec<String> = before
+        .iter()
+        .filter(|(s, id)| after.get(*s) != Some(*id))
+        .map(|(s, _)| s.to_string())
+        .chain(
+            after
+                .keys()
+                .filter(|s| !before.contains_key(*s))
+                .map(|s| s.to_string()),
+        )
+        .collect();
+    changed.sort();
+    changed
+}
+
+/// The `crystalline://<spelling>` needles the URL half of
+/// [`Store::engrams_referencing_domains`] searches bodies for. A needle also
+/// matches a longer name that starts with the spelling, which
+/// [`names_a_domain_url`] then rules out.
+pub(crate) fn domain_url_needles(spellings: &[String]) -> Vec<String> {
+    spellings
+        .iter()
+        .map(|s| format!("{}{s}", crystalline_core::address::SCHEME))
+        .collect()
+}
+
+/// Whether `content` names one of `spellings` as a domain in a
+/// `crystalline://` URL or a wikilink, read with the scan a rename respells
+/// with, so a body counts here exactly when the rename would change it: code
+/// spans and fences are skipped, and `eng-other` is not `eng`.
+pub(crate) fn names_a_domain_url(content: &str, spellings: &[String]) -> bool {
+    let (_, count) = crystalline_core::relink::respell_domains(content, &|name| {
+        spellings
+            .iter()
+            .any(|s| s == name)
+            .then(|| format!("{name}-respelled"))
+    });
+    count > 0
+}
+
+/// The refusal of [`Store::rename_domain_row`] when another row already has
+/// the new name, naming both.
+pub(crate) fn rename_onto_taken_row(old: &str, new: &str) -> crate::IndexError {
+    crate::IndexError::Constraint(format!(
+        "cannot rename the index row of domain `{old}` to `{new}`: another domain row is \
+         already named `{new}`; rename or remove domain `{new}` first, or pick another name"
+    ))
+}
+
+/// Run `body` inside one write transaction on `store`: commit when it
+/// succeeds, roll back when it fails. `body` is a future, so nothing in it
+/// runs before the transaction is open. The store's own `begin` refuses to
+/// nest, so a caller already inside a transaction gets an error rather than a
+/// silent early commit of its own work.
+pub(crate) async fn in_transaction<S, T, F>(store: &S, body: F) -> Result<T>
+where
+    S: Store + ?Sized,
+    F: std::future::Future<Output = Result<T>>,
+{
+    store.begin().await?;
+    match body.await {
+        Ok(value) => {
+            store.commit().await?;
+            Ok(value)
+        }
+        Err(e) => {
+            let _ = store.rollback().await;
+            Err(e)
+        }
+    }
 }
 
 /// One step of the graph traversal over the `relation` table: every edge with
@@ -1673,7 +1866,9 @@ pub trait Store: Send + Sync {
 
     /// Register or update a domain by name, root path and kind, returning its
     /// id. A file domain passes `Some(path)`; a virtual domain passes `None`,
-    /// since its engrams live in the database with no filesystem root.
+    /// since its engrams live in the database with no filesystem root. The name
+    /// is recorded as one of the domain's spellings too, unless another domain
+    /// already holds that spelling.
     async fn upsert_domain(
         &self,
         name: &str,
@@ -1691,6 +1886,110 @@ pub trait Store: Send + Sync {
     /// without registering a domain on the way - and has to stay answerable on
     /// a read-only instance, where a write is refused outright.
     async fn domain_id(&self, name: &str) -> Result<Option<DomainId>>;
+
+    /// Every recorded spelling of every domain with the id it resolves to,
+    /// sorted byte-wise by spelling. The resolve pass reads the same table to
+    /// find the domain a reference names; each domain row is at least its own
+    /// name, which [`Store::upsert_domain`] records with the row.
+    #[doc(hidden)]
+    async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>>;
+
+    /// Replace the spellings of the domains `spellings` names with exactly
+    /// that list, and answer every spelling whose mapping changed - added,
+    /// removed or now pointing at a different domain - sorted byte-wise.
+    ///
+    /// The replace is scoped to the domain ids the list names, so instances
+    /// sharing one Postgres index never delete each other's canonical names or
+    /// aliases. The engine passes every `(spelling, local name)` pair of its
+    /// name table, and every registered domain is in it through its local name,
+    /// so the scope is exactly the domains this instance registers.
+    ///
+    /// Every domain row keeps its own name as a spelling whether or not the
+    /// list names it, and that name wins over any other claim on the spelling:
+    /// local names always win, which is the name table's first rule. A listed
+    /// spelling another domain holds as a canonical name or alias moves to the
+    /// listed domain. One spelling listed for two domains, or a domain id with
+    /// no row, is [`crate::IndexError::Invalid`] and changes nothing.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn replace_domain_spellings(
+        &self,
+        spellings: &[(String, DomainId)],
+    ) -> Result<Vec<String>>;
+
+    /// Unbind every relation and link row, every actor's included, whose
+    /// `to_domain` is one of `spellings`, so the next resolve pass binds it
+    /// through what the spelling means now. Answers the number of rows that
+    /// were bound and are not any more.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`]. The resolve passes that follow it are the caller's
+    /// to wrap, as [`crate::resolve_forward_refs`] does.
+    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Rename a domain row in place: `domain.name` becomes `new` and the id
+    /// stays, so every engram and every bound reference stays attached. The
+    /// row's own spelling follows it in the same transaction (taking `new`
+    /// from any domain that held it as a canonical name or alias, since local
+    /// names win), and `old` stays behind as an alias spelling of the same
+    /// row. `relation.to_domain` and `link.to_domain` keep the text as
+    /// written: a reference spelled `old` resolves through that alias, before
+    /// and after the rename, so no file reads as unresolved. When `new` was
+    /// another domain's spelling, the references bound through it are
+    /// unbound; the caller runs the resolve passes afterwards.
+    ///
+    /// The alias lasts until the next [`Store::replace_domain_spellings`] for
+    /// the row, which keeps only what its list names: the caller records `old`
+    /// among the domain's aliases before that runs.
+    ///
+    /// Idempotent, for a rename that is completed again after a crash: a row
+    /// already named `new` with none named `old` is fine, and so is no row
+    /// under either name (a domain that was never indexed has nothing to
+    /// rename). A different row already named `new` is
+    /// [`crate::IndexError::Constraint`] naming both.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()>;
+
+    /// Drop the domain row named `name` when it holds nothing: no engram row
+    /// of any actor (a draft counts) and no attachment. Its spellings, tag
+    /// aliases, host lock and any stray relation or link rows go with it.
+    /// Answers `true` when a row was dropped, `false` when there is no row
+    /// under the name or the row still holds something, which is left exactly
+    /// as it was.
+    ///
+    /// For a domain nobody registers any more: `domain remove` leaves an
+    /// empty row after [`Store::clear_domain`], and the row would otherwise
+    /// hold the name against a rename or a later adoption. The caller decides
+    /// that the domain is unregistered and not another instance's; this only
+    /// guarantees that nothing with content is ever dropped.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool>;
+
+    /// Every `(source domain name, engram path)` that names one of `spellings`
+    /// as a target domain: through a relation or link row, or through a
+    /// `crystalline://<spelling>` URL in its text, which no edge table records.
+    /// Base rows only, each once, sorted by domain then path, byte order.
+    ///
+    /// The engrams a rename has to respell. A name that merely starts with a
+    /// spelling (`eng-other` for `eng`) is not a match.
+    async fn engrams_referencing_domains(
+        &self,
+        spellings: &[String],
+    ) -> Result<Vec<(String, String)>>;
+
+    /// One domain's references whose domain prefix is one of `spellings`,
+    /// with the line and the bracket text as written. Base rows only, ordered
+    /// by source path, then line, then bracket text.
+    async fn spelled_references(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+    ) -> Result<Vec<SpelledRef>>;
 
     /// The recorded file stamps for a domain, keyed by domain-relative path.
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>>;
@@ -1728,6 +2027,11 @@ pub trait Store: Send + Sync {
     /// keeping the domain row itself. The scoped clear behind `domain remove`
     /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
     /// everything.
+    ///
+    /// The domain's spellings go too, all but its own name: the row stays and
+    /// still answers to that, while a canonical name or former name left behind
+    /// would keep resolving references to a domain nobody registers and would
+    /// hold the spelling against the next domain that claims it.
     ///
     /// A reindex does not use this, and deliberately: `--full` re-reads and
     /// re-upserts instead, so rows a reader is using are never absent between

@@ -4,7 +4,7 @@
  * What only this can prove is the whole loop: an invitation written by one
  * browser changes what a different browser's next listing contains. The
  * component tests cover the card's own controls and
- * `crates/service/tests/visibility.rs` covers the filter, but neither can put
+ * `crates/service/tests/domains/visibility.rs` covers the filter, but neither can put
  * two sessions on one instance and watch a domain appear in one of them.
  *
  * The cast `run-smoke.sh` seeds: the admin owns `smoke-vault`, the peer is

@@ -107,3 +107,65 @@ fn turso_path(cfg: &DatabaseConfig, db_override: Option<&Path>) -> Result<PathBu
     }
     config::index_db_path().map_err(|e| IndexError::Invalid(e.to_string()))
 }
+
+/// The index `open_store(cfg, db_override, _)` opens, named the way its
+/// store's `store_info().db_path` names it, without opening anything: the
+/// Turso file path as resolved, or the Postgres `host:port/db` with no
+/// credentials and no query. `None` when the location cannot be resolved (no
+/// state directory, a Postgres block with no url, or a build without the
+/// Postgres backend).
+///
+/// Lets a caller tell two indexes apart before it opens either, where
+/// opening the second would contend with the first for the same file.
+pub fn store_location(cfg: &DatabaseConfig, db_override: Option<&Path>) -> Option<String> {
+    match cfg.backend {
+        DatabaseBackend::Turso => turso_path(cfg, db_override)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string()),
+        DatabaseBackend::Postgres => postgres_location(cfg),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_location(cfg: &DatabaseConfig) -> Option<String> {
+    cfg.url.as_deref().and_then(crate::postgres::sanitize_url)
+}
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_location(_cfg: &DatabaseConfig) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The location named before opening is the one the opened store
+    /// reports.
+    #[tokio::test]
+    async fn a_turso_location_is_what_the_opened_store_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let cfg = DatabaseConfig::default();
+        let named = store_location(&cfg, Some(&db));
+        let store = open_store(&cfg, Some(&db), false).await.unwrap();
+        let info = store.lock().await.store_info().await.unwrap();
+        assert!(named.is_some());
+        assert_eq!(named, info.db_path);
+    }
+
+    /// A Postgres location is the url's host, port and database, with the
+    /// credentials and the query left out, and `--db` plays no part.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_postgres_location_leaves_out_credentials_and_query() {
+        let cfg = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("postgres://user:secret@db.example:5432/kb?sslmode=require".to_string()),
+        };
+        assert_eq!(
+            store_location(&cfg, Some(Path::new("/ignored.db"))).as_deref(),
+            Some("db.example:5432/kb")
+        );
+    }
+}

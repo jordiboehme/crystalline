@@ -1058,7 +1058,7 @@ describe("the SSO identity card", () => {
     });
     // Where the browser goes next is the server's answer, navigated to as a
     // whole page. jsdom cannot follow that, so what is asserted here is the
-    // request; `crates/service/tests/oidc.rs` drives the rest of the journey.
+    // request; `crates/service/tests/auth/oidc.rs` drives the rest of the journey.
   });
 
   it("shows the server's words when a link cannot be started", async () => {

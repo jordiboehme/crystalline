@@ -152,6 +152,53 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("the Rename dialog opens from the domain page and can be cancelled", async ({
+  page,
+}) => {
+  await page.goto(`/d/${DOMAIN}`);
+
+  // "Rename domain" is the launcher; the smoke signs in as the admin
+  // `run-smoke.sh` creates through setup, who sees it on every domain here.
+  await page.getByRole("button", { name: "Rename domain" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Rename domain" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("New name")).toBeVisible();
+  await expect(
+    dialog.getByRole("checkbox", { name: "This machine only" }),
+  ).toBeVisible();
+  // The confirm button is named "Rename", not "Rename domain": `exact` is
+  // what keeps this locator from also matching the launcher that opened it.
+  await expect(
+    dialog.getByRole("button", { name: "Rename", exact: true }),
+  ).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(
+    page.getByRole("heading", { level: 1, name: DOMAIN }),
+  ).toBeVisible();
+});
+
+test("the same rename dialog also opens from the policies card's 'Change name'", async ({
+  page,
+}) => {
+  await page.goto(`/d/${DOMAIN}`);
+
+  // A second launcher for the one dialog above, not a second dialog: the
+  // accessible name is distinct from the header's own "Rename domain" so
+  // this test can address it on its own.
+  const policies = page.getByRole("region", { name: "Domain policies" });
+  await policies.getByRole("button", { name: "Change name" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Rename domain" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("New name")).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+});
+
 test("an undeclared MANIFEST section explains itself and can be started", async ({
   page,
 }) => {

@@ -4,7 +4,7 @@
  * it behind the two-step confirm.
  *
  * What only a real browser proves here is the round trip with the actual
- * REST surface (`crates/service/tests/rest_mcp_tokens.rs` covers the routes
+ * REST surface (`crates/service/tests/rest/rest_mcp_tokens.rs` covers the routes
  * themselves): the token the server hands back really does match the shape
  * an agent's `Authorization: Bearer` header expects, and reloading the page
  * - a real navigation, not a re-render - never shows the secret again.

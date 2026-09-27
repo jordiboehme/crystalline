@@ -4,7 +4,7 @@
  *
  * Only the render, deliberately. The browser half of the OIDC dance - the
  * redirect out, the provider's own form, the callback and what it does to the
- * accounts database - is driven end to end in `crates/service/tests/oidc.rs`
+ * accounts database - is driven end to end in `crates/service/tests/auth/oidc.rs`
  * against a fake provider that process runs itself, which can rotate a signing
  * key or lie about an issuer on demand in a way no browser test could. What
  * only a browser can answer is that the button exists, wears the provider's

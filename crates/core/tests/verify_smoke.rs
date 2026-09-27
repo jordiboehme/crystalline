@@ -822,6 +822,64 @@ fn both_recognized_sharing_values_and_an_absent_key_are_clean() {
     );
 }
 
+// --- The domain_name declaration (M008) --------------------------------------
+
+fn manifest_declaring_domain_name(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_invalid_domain_name_is_m008_error() {
+    for (value, shown) in [("../up", "../up"), ("1.0", "1"), ("true", "true")] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        let m008 = report
+            .issues
+            .iter()
+            .find(|i| i.rule == "M008")
+            .expect("M008 present");
+        assert_eq!(m008.severity, Severity::Error, "{value}");
+        assert!(
+            m008.message
+                .starts_with(&format!("`domain_name: {shown}` cannot name a domain")),
+            "{}",
+            m008.message
+        );
+        assert_eq!(
+            m008.fix.as_deref(),
+            Some(
+                "ignored until fixed; write a quoted name of letters, digits, hyphens, underscores and dots, for example domain_name: 'platform'"
+            )
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+}
+
+#[test]
+fn a_valid_or_absent_domain_name_is_clean() {
+    for value in ["platform", "'1.0'", "eng.docs"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M008"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
@@ -885,4 +943,57 @@ fn the_manifest_rules_over_one_text_honour_the_domains_overrides() {
     );
     assert!(found.iter().all(|i| i.rule != "M103"), "{found:#?}");
     assert!(found.iter().any(|i| i.rule == "M004"), "{found:#?}");
+}
+
+#[test]
+fn cross_domain_links_resolve_against_the_manifest_domain_name() {
+    // `a-knowledge/` declares `domain_name: a`, so offline verify must judge
+    // cross-domain links against `a`, not the folder name: `[[a:runbook]]`
+    // resolves cleanly, while `[[a-knowledge:runbook]]` now names a domain
+    // outside the scan set (L006, informational) rather than the domain
+    // itself (which would be L001, a broken link within a known domain).
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a-knowledge");
+    let b = dir.path().join("b");
+    write(
+        &a,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\ndomain_name: a\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &a,
+        "runbook.md",
+        "---\ntype: engram\ntitle: Runbook\npermalink: runbook\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Runbook\n\nSome runbook content that is long enough to pass the quality checks.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &b,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &b,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[a:runbook]] and [[a-knowledge:runbook]] for details on this thing.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+
+    let report =
+        verify::verify_paths([a.as_path(), b.as_path()], &VerifyOptions::default()).unwrap();
+
+    let link_issues: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L001" || i.rule == "L006")
+        .collect();
+    assert_eq!(
+        link_issues.len(),
+        1,
+        "expected exactly one link issue: {:#?}",
+        report.issues
+    );
+    let issue = link_issues[0];
+    assert_eq!(issue.rule, "L006");
+    assert_eq!(
+        issue.message,
+        "link references domain `a-knowledge`, which is outside the scan set"
+    );
 }

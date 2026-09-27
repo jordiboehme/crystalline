@@ -13,12 +13,13 @@ max-threads = 4
 
 [[profile.default.overrides]]
 filter = '''
-    package(crystalline-remote) & (binary(github_client) | binary(github_auth))
-    | package(crystalline-service) & (binary(collab_ws) | binary(rest_draft_links) | binary(rest_admin_api)
-        | binary(rest_api) | binary(rest_evolve) | binary(rest_files)
-        | binary(rest_setup_api) | binary(rest_write_api) | binary(ui_serving)
-        | binary(oidc) | binary(oauth))
-    | package(crystalline) & binary(service)
+    (package(crystalline-remote) & (binary(github_client) | binary(github_auth)))
+    | (package(crystalline-service) & (
+        binary(collab_ws)
+        | (binary(rest_admin) & test(/^(rest_admin_api|rest_draft_links|rest_write_api)::/))
+        | (binary(rest) & test(/^(rest_api|rest_evolve|rest_files|rest_setup_api|ui_serving)::/))
+        | (binary(auth) & test(/^(oauth|oidc)::/))))
+    | (package(crystalline) & binary(daemon) & test(/^service::/))
 '''
 test-group = 'forge-wire'
 
@@ -45,12 +46,12 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 
 # The same environmental stall, observed on two more loopback users during
 # full-workspace runs on 2026-08-21 (post macOS update) while every one of them
-# passes per-crate: the CLI's `service` suite, whose `http_smoke_*` cases spawn
-# a daemon and talk to it over 127.0.0.1, and `embed::remote`'s retry tests,
-# which drive a local mock HTTP endpoint. Same ceiling, same guarantee: slow is
-# survivable, hung still dies.
+# passes per-crate: the CLI `daemon` binary's `service` module, whose
+# `http_smoke_*` cases spawn a daemon and talk to it over 127.0.0.1, and
+# `embed::remote`'s retry tests, which drive a local mock HTTP endpoint. Same
+# ceiling, same guarantee: slow is survivable, hung still dies.
 [[profile.default.overrides]]
-filter = 'package(crystalline) & binary(service) | package(crystalline-index) & test(embed::remote)'
+filter = '(package(crystalline) & binary(daemon) & test(/^service::/)) | (package(crystalline-index) & test(embed::remote))'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # The CI profile: the default one, plus one retry.

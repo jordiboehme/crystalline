@@ -1,7 +1,7 @@
 # Throwaway signing keys for the fake identity provider
 
 Two 2048-bit RSA key pairs, generated for this repository's test suite and used
-by `crates/service/tests/oidc.rs` alone. The fake provider in that file signs
+by `crates/service/tests/auth/oidc.rs` alone. The fake provider in that file signs
 its ID tokens with `test-idp-key.pem` and rotates to `test-idp-key-2.pem` to
 exercise the relying party's key-refetch path.
 

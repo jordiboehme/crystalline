@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, eighteen entries, each named by the function that issues it, so a
+//! One place, twenty-two entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -126,7 +126,7 @@ pub const GUARDED_TABLES: &[&str] = &["engram", "engram_content", "chunk", "rela
 ///
 /// Turso names the ALIAS in a plan line (`SEARCH e USING ...`), not the table,
 /// so without this a guarded table would hide behind every one-letter alias in
-/// the codebase. One map for all eighteen entries, because the aliases are used
+/// the codebase. One map for every entry, because the aliases are used
 /// consistently across both backends; a name absent here stands for itself.
 const ALIASES: &[(&str, &str)] = &[
     ("e", "engram"),
@@ -404,7 +404,10 @@ pub fn registry() -> Vec<HotStatement> {
             // can lose the title index to a rewrite that still has it seeking
             // something, and only that guard notices.
             turso_must_seek: &["idx_relation_unresolved"],
-            postgres_must_seek: &[],
+            // Each reference's domain spelling is looked up by its key, per
+            // row of the pass: a scan of `domain_spelling` there would be a
+            // full pass per reference.
+            postgres_must_seek: &["domain_spelling_pkey"],
         },
         HotStatement {
             issued_by: "Store::resolve_pending_links",
@@ -415,7 +418,7 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected: &[],
             scan_expected_pg: None,
             turso_must_seek: &["idx_link_unresolved"],
-            postgres_must_seek: &[],
+            postgres_must_seek: &["domain_spelling_pkey"],
         },
         HotStatement {
             issued_by: "Store::unresolved_refs",
@@ -492,6 +495,55 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             turso_must_seek: &[],
             postgres_must_seek: &[],
+        },
+        HotStatement {
+            // The sweep's local-spelling read, run per domain on every sweep.
+            // Both reference tables are reached through their partial
+            // `to_domain` index, so it reads only rows that carry a prefix.
+            issued_by: "Store::spelled_references",
+            turso: || crystalline_index::spelled_references_sql("?1", "?2"),
+            postgres: || crystalline_index::spelled_references_sql("$1", "$2"),
+            literals: &["1", "'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_to_domain", "idx_link_to_domain"],
+            postgres_must_seek: &["idx_relation_to_domain", "idx_link_to_domain"],
+        },
+        HotStatement {
+            // Only a rename asks this, across every domain; the partial
+            // `to_domain` indexes keep it to the rows that carry a prefix.
+            issued_by: "Store::engrams_referencing_domains (edge half)",
+            turso: || crystalline_index::referencing_domains_sql("?1"),
+            postgres: || crystalline_index::referencing_domains_sql("$1"),
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_to_domain", "idx_link_to_domain"],
+            postgres_must_seek: &["idx_relation_to_domain", "idx_link_to_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::reset_references_to_spellings (relation)",
+            turso: || crystalline_index::reset_spelled_references_sql("relation", "?1"),
+            postgres: || crystalline_index::reset_spelled_references_sql("relation", "$1"),
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_to_domain"],
+            postgres_must_seek: &["idx_relation_to_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::reset_references_to_spellings (link)",
+            turso: || crystalline_index::reset_spelled_references_sql("link", "?1"),
+            postgres: || crystalline_index::reset_spelled_references_sql("link", "$1"),
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_link_to_domain"],
+            postgres_must_seek: &["idx_link_to_domain"],
         },
         // The contradiction scorer wave (plans/2026-09-14-contradiction-scorer-plan.md)
         // adds two per-domain reads, and both belong here the day they land:

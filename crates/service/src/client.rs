@@ -17,7 +17,9 @@ use crystalline_remote::ops::DiscardTarget;
 
 use crate::daemon::{Departure, SHUTDOWN_DEADLINE, open_store, resolve_db};
 use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
-use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
+use crate::instance::{
+    Connection, acquire_ownership, acquire_standalone_ownership, ensure_daemon, try_attach,
+};
 use crate::mcp::McpServer;
 use crate::overlay;
 use crate::params::*;
@@ -626,18 +628,28 @@ async fn build_embedded(
     // added mid-session resolve for data operations, not for picking up external
     // file changes. The engine holds the file config and the overlay apart, so
     // its effective config drives reads while persistence stays env-free.
-    let engine = Arc::new(
-        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
-            .with_embed_channel(embed_tx)
-            .with_read_only(read_only)
-            .with_env_overlay(loaded.overlay.clone()),
-    );
+    let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+        .with_embed_channel(embed_tx)
+        .with_read_only(read_only)
+        .with_env_overlay(loaded.overlay.clone())
+        .with_machine_owner_lookup(machine_owner_for_engine());
+    // Told where the state directory is, as the daemon and the standalone
+    // opener are; see `open_standalone`.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    let engine = Arc::new(engine);
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
+    // A rename a stopped daemon left half done is finished before the first
+    // sync and before the routing cache reads a name, as the daemon does.
+    engine.finish_leftover_rename().await;
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();
     tokio::spawn(async move {
         let _ = bg.sync(None).await;
+        // As at the daemon's startup, once the first sync has returned.
+        bg.adopt_domain_names_after("the initial sync").await;
         if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
             // Schedule on the worker spawned just above rather than embedding
@@ -744,6 +756,21 @@ async fn open_standalone_reporting(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Engine> {
+    open_standalone_finishing(loaded, db_path, want_embeddings, db, config_path)
+        .await
+        .map(|(engine, _)| engine)
+}
+
+/// [`open_standalone_reporting`], also answering the report of a rename an
+/// earlier run left half done that the opener finished, so a command that
+/// was about to send that same rename again answers with it instead.
+async fn open_standalone_finishing(
+    loaded: overlay::LoadedConfig,
+    db_path: &Path,
+    want_embeddings: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<(Engine, Option<Value>)> {
     // Postgres has no local file, so naming one in a failure would point at a
     // path nothing lives at.
     let location = if loaded.effective.database().backend
@@ -764,11 +791,80 @@ async fn open_standalone_reporting(
                 &format!("{e:#}"),
                 bypassed
             ))
-        })?;
+        })?
+        .with_machine_owner_lookup(machine_owner_for_engine());
     if bypassed {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
-    Ok(engine)
+    let finished = finish_leftover_rename_owned(&engine).await;
+    Ok((engine, finished))
+}
+
+/// Finish a rename an earlier run left half done, from a standalone opener,
+/// only while this process holds the ownership of the state directory a
+/// daemon holds for its whole life ([`acquire_ownership`]): the journal lives
+/// in that directory, and two processes running it at once would move the
+/// same state folders and write the same configuration, on either backend.
+/// The engine itself then runs a journal only against the index it belongs
+/// to. No journal: nothing is locked. The lock held by someone else: the
+/// rename is left to that process and a log line says so. The report of a
+/// rename it finished is answered.
+async fn finish_leftover_rename_owned(engine: &Engine) -> Option<Value> {
+    if !engine.has_leftover_rename() {
+        return None;
+    }
+    match acquire_standalone_ownership("crystalline command finishing an earlier domain rename") {
+        Ok(ownership) => {
+            engine.set_holds_state_dir(true);
+            let finished = engine.finish_leftover_rename().await;
+            engine.set_holds_state_dir(false);
+            drop(ownership);
+            finished
+        }
+        Err(_) => {
+            tracing::warn!(
+                "a domain rename an earlier run left half done is not finished by this command: \
+                 another Crystalline process (the daemon) holds this machine's state directory, \
+                 and it finishes the rename itself; if it does not, stop it with `crystalline \
+                 ctl shutdown` and run this again"
+            );
+            None
+        }
+    }
+}
+
+/// The local name `spelling` means, once an engine is open: a canonical name
+/// or a machine-local alias resolves to its registration's own local name,
+/// the same resolution `control::localized_request` gives the daemon path
+/// for every command `control::DOMAIN_REFERENCE_COMMANDS` lists, before the
+/// request ever reaches the shared engine. A name nothing answers to comes
+/// back unchanged, so the caller's own not-found wording still fires.
+///
+/// The standalone branch below has no pre-pass of its own - only the daemon
+/// path gets one for free - so a function here that opens its own engine and
+/// then calls one that expects a registration's own local name outright
+/// (unlike a data verb's `DomainArgs` params struct, which localizes itself
+/// through `Engine::localized_for`) does this once, right after opening it.
+async fn localize_standalone(engine: &Engine, spelling: &str) -> String {
+    engine
+        .localize_visible(spelling, &std::collections::HashSet::new())
+        .await
+}
+
+/// [`localize_standalone`] for the handful of verbs (`provision` among them)
+/// that never open an engine at all: built straight from the loaded
+/// configuration through [`overlay::LoadedConfig::name_table`],
+/// the same inputs [`Engine::name_table_now`] itself reads for a file domain
+/// (a virtual domain's own declared name lives in the database, out of reach
+/// here, and is not needed by anything that calls this: none of them ever
+/// names a virtual domain by its canonical spelling, so an empty
+/// `virtual_names` map is always correct here).
+fn localize_in_config(loaded: &overlay::LoadedConfig, spelling: &str) -> String {
+    loaded
+        .name_table()
+        .resolve(spelling)
+        .unwrap_or(spelling)
+        .to_string()
 }
 
 /// Run a tool by name: over the socket when a daemon is up, else in-process
@@ -821,7 +917,8 @@ pub async fn scaffold_virtual_manifest(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.scaffold_virtual_manifest(domain, markdown).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.scaffold_virtual_manifest(&domain, markdown).await?)
 }
 
 /// Import engram files into a virtual domain: over the daemon when one owns the
@@ -847,8 +944,9 @@ pub async fn domain_import(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .import_domain(domain, src, overwrite, dry_run)
+        .import_domain(&domain, src, overwrite, dry_run)
         .await?)
 }
 
@@ -878,8 +976,12 @@ pub async fn tags_retag(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
     Ok(engine
-        .retag(old, new, domain, merge, dry_run, !no_alias)
+        .retag(old, new, domain.as_deref(), merge, dry_run, !no_alias)
         .await?)
 }
 
@@ -906,7 +1008,8 @@ pub async fn domain_export(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.export_domain(domain, dest, force, dry_run).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.export_domain(&domain, dest, force, dry_run).await?)
 }
 
 /// What the index still holds for domains nobody registers any more, and,
@@ -940,6 +1043,72 @@ pub async fn collect_orphaned_domains(
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine.collect_orphaned_domains(None, dry_run).await?)
+}
+
+/// The domain name findings `crystalline doctor` shows
+/// ([`Engine::name_report`]), after, when `fix` is set, respelling every link
+/// that names a domain by a name only this machine uses
+/// ([`Engine::fix_local_spellings`]); the report then carries `fixed`, how
+/// many links changed. A fix that is refused (a read-only instance) keeps the
+/// report and carries `fix_error` instead. Over the daemon when one owns the
+/// index (the ctl commands `fix_local_spellings` and `name_report`), else
+/// against one directly opened store.
+pub async fn name_report(
+    fix: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path) {
+        let fixed = if fix {
+            match ctl_if_running(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
+                Ok(answer) => {
+                    answer.map(|data| Ok(data.get("fixed").and_then(Value::as_u64).unwrap_or(0)))
+                }
+                Err(e) => Some(Err(format!("{e:#}"))),
+            }
+        } else {
+            None
+        };
+        if (!fix || fixed.is_some())
+            && let Some(mut data) = ctl_if_running(json!({ "v": 1, "cmd": "name_report" })).await?
+        {
+            attach_fix_outcome(&mut data, fixed);
+            return Ok(data);
+        }
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let fixed = if fix {
+        Some(
+            engine
+                .fix_local_spellings()
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    } else {
+        None
+    };
+    let mut report = engine.name_report().await?;
+    attach_fix_outcome(&mut report, fixed);
+    Ok(report)
+}
+
+/// Put what a `--fix` did into a name report: `fixed`, or `fix_error`.
+fn attach_fix_outcome(report: &mut Value, fixed: Option<Result<u64, String>>) {
+    let Value::Object(map) = report else {
+        return;
+    };
+    match fixed {
+        Some(Ok(n)) => {
+            map.insert("fixed".to_string(), Value::from(n));
+        }
+        Some(Err(e)) => {
+            map.insert("fix_error".to_string(), Value::from(e));
+        }
+        None => {}
+    }
 }
 
 /// Unregister a domain: over the daemon when one owns the index, else against a
@@ -1021,6 +1190,8 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    let name = localize_standalone(&engine, name).await;
+    let name = name.as_str();
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
         && auth_path.exists()
     {
@@ -1036,6 +1207,154 @@ pub async fn domain_remove(
         let _ = ctl_if_running(json!({ "v": 1, "cmd": "forget_domain", "domain": name })).await;
     }
     Ok(report)
+}
+
+/// Rename a domain everywhere this caller can write, or (`local_only`) on
+/// this machine alone: over the daemon when one owns the index, else against
+/// a directly opened store.
+///
+/// The same shape [`domain_remove`] has, and for the same reason: the CLI is
+/// the machine owner, so it passes [`Scope::Unrestricted`] and the gate
+/// resolves to `Own` on every domain. Unlike `domain_remove`, the standalone
+/// branch localizes nothing itself: [`crate::engine::Engine::rename_domain`]
+/// resolves `domain` against its own name table as the very first thing it
+/// does, before the privacy and ownership checks that follow, so a canonical
+/// name or an alias already works here exactly as it does over the daemon
+/// (`control::DOMAIN_REFERENCE_COMMANDS` never lists `domain_rename` for the
+/// same reason). It also needs no accounts database installed ahead of time:
+/// [`crate::engine::Engine::rename_domain`]'s own `rename_access` opens
+/// `web-auth.db` under the state directory itself when one exists and none
+/// was installed, the same fallback `domain_remove` has no equivalent of.
+pub async fn domain_rename(
+    domain: &str,
+    new: &str,
+    local_only: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_rename", "domain": domain, "new": new,
+            "local_only": local_only,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    // Refused before the index is even opened, so nothing can move.
+    if !use_daemon(db, config_path) {
+        refuse_rename_off_this_machine(domain, new, local_only, &loaded, &db_path)?;
+    }
+    let (engine, finished) =
+        open_standalone_finishing(loaded, &db_path, false, db, config_path).await?;
+    // The opener just finished this very rename, which an earlier run left
+    // half done: that is the answer, and sending it again would only be
+    // refused as a rename onto the name the domain already has.
+    if let Some(report) = finished
+        && report["previous"] == domain
+        && report["domain"] == new
+    {
+        return Ok(report);
+    }
+    // A rename runs only while this process holds the state directory, as a
+    // daemon does; the engine refuses it otherwise, in words that name the
+    // holder.
+    let ownership = acquire_standalone_ownership("crystalline domain rename").ok();
+    engine.set_holds_state_dir(ownership.is_some());
+    let report = engine
+        .rename_domain(domain, new, local_only, &Scope::Unrestricted)
+        .await;
+    engine.set_holds_state_dir(false);
+    drop(ownership);
+    Ok(report?)
+}
+
+/// Refuse a rename through `--db` or `--config` that did not open this
+/// machine's own index and configuration.
+///
+/// A rename moves this machine's state folders, auth records and provision
+/// receipt, and writes the configuration it persists to. Run against another
+/// index, it would move all of that while this machine's own index keeps the
+/// old name, and a virtual domain's engrams would stay behind on the old row.
+/// So the index, configuration and state directory the command opened are
+/// compared with the ones a plain command opens, the identity a rename
+/// journal records ([`crystalline_engine::RenameOwner`]), and any part that
+/// differs is named. `--db` or `--config` spelling this machine's own index
+/// or configuration differs in nothing and is allowed. The engine refuses the
+/// same rename too ([`crystalline_engine::Engine::with_machine_owner`]); this
+/// check runs first so the refusal can name the command, and so the opener
+/// never even looks at a journal.
+fn refuse_rename_off_this_machine(
+    domain: &str,
+    new: &str,
+    local_only: bool,
+    loaded: &overlay::LoadedConfig,
+    db_path: &Path,
+) -> anyhow::Result<()> {
+    let state_dir = crystalline_core::config::state_dir()?;
+    let opened = crystalline_engine::RenameOwner::for_opened(loaded, db_path, &state_dir);
+    let home = machine_rename_owner().map_err(|e| {
+        anyhow::anyhow!(
+            "this machine's own index and configuration cannot be named ({e:#}), so renames are \
+             off. Nothing was renamed. Fix the configuration so it loads, and run this again"
+        )
+    })?;
+    let differences = opened.differences_from(&home);
+    if differences.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "a rename moves this machine's state folders and writes its configuration, so it runs \
+         only against this machine's own index and configuration, and {}. Nothing was renamed. \
+         Run `crystalline domain rename {domain} {new}{}` without --db and --config",
+        differences.join(", and "),
+        if local_only { " --local" } else { "" }
+    )
+}
+
+pub use crystalline_engine::machine_rename_owner;
+
+/// [`machine_rename_owner`] for an opener to hand its engine
+/// ([`Engine::with_machine_owner_lookup`]): the daemon, the embedded stack,
+/// the standalone opener and the direct adoption. A lookup that fails (this
+/// machine's default configuration does not load, say) is handed on as it
+/// is, so the engine refuses a rename and skips a name adoption rather than
+/// running either unchecked; a warning says so once here.
+pub(crate) fn machine_owner_for_engine() -> anyhow::Result<crystalline_engine::RenameOwner> {
+    let lookup = machine_rename_owner();
+    if let Err(e) = &lookup {
+        tracing::warn!(
+            "this machine's own index could not be named ({e:#}); renames and the lining up \
+             of domain names are off in this process. Fix the configuration so it loads, then \
+             restart the daemon or the MCP server"
+        );
+    }
+    lookup
+}
+
+/// Delete this machine's pending rename journal, leaving every step it
+/// already ran as it is, and answer what it recorded; `None` when no rename
+/// is pending. Done only while this process holds the state directory, so a
+/// daemon that is running the journal right now is never cut off halfway:
+/// with the lock held elsewhere the journal stays and the error says why.
+pub fn discard_rename_journal() -> anyhow::Result<Option<crystalline_engine::PendingRename>> {
+    let state_dir = crystalline_core::config::state_dir()?;
+    let Some(pending) = crystalline_engine::pending_rename(&state_dir)? else {
+        return Ok(None);
+    };
+    let _ownership =
+        acquire_standalone_ownership("crystalline doctor --discard-rename").map_err(|_| {
+            anyhow::anyhow!(
+                "another Crystalline process (the daemon) holds this machine's state directory, \
+                 so the rename journal was left as it is; stop it with `crystalline ctl \
+                 shutdown` and run this again"
+            )
+        })?;
+    crystalline_engine::discard_pending_rename(&state_dir)?;
+    Ok(Some(pending))
 }
 
 /// The socket request one `domain_review` call sends.
@@ -1107,6 +1426,8 @@ pub async fn domain_review(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let name = localize_standalone(&engine, name).await;
+    let name = name.as_str();
     let mode = overlay_mode.then_some(crystalline_core::config::ReviewMode::Overlay);
     let confirm = if preview {
         crate::review::ReviewModeConfirm::Preview
@@ -1166,6 +1487,55 @@ pub async fn origin_add(
         .await?)
 }
 
+/// The name adoption a sync run without a daemon owes once it has returned
+/// ([`Engine::adopt_domain_names`]), over the store that sync opened: the
+/// daemon's ctl `sync` runs the same adoption after its own sync. A failure
+/// is logged and answered as an empty list; the sync has landed.
+///
+/// An adoption renames this machine's state folders and configuration keys,
+/// so it runs only where a daemon's would: never against an index `--db` or
+/// `--config` named instead of the daemon's, and only while this process
+/// holds the ownership of the state directory. Either way a skipped adoption
+/// says so in a log line and answers an empty list.
+pub async fn adopt_domain_names_direct(
+    store: Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    if !use_daemon(db, config_path) {
+        // At warn, which a command's own log filter shows by default: the
+        // person who ran this sync reads that the names were not lined up
+        // and which command does it.
+        tracing::warn!(
+            "domain names are not lined up with their MANIFESTs after this sync: --db or \
+             --config named the index, and lining them up renames this machine's own state \
+             and configuration; run `crystalline sync` without --db and --config to do it"
+        );
+        return Ok(Value::Array(Vec::new()));
+    }
+    let Ok(ownership) = acquire_standalone_ownership("crystalline sync") else {
+        tracing::warn!(
+            "domain names are not lined up with their MANIFESTs after this sync: another \
+             Crystalline process (the daemon) holds this machine's state directory, and it \
+             lines them up after its own next sync"
+        );
+        return Ok(Value::Array(Vec::new()));
+    };
+    let loaded = overlay::load(config_path)?;
+    let read_only = loaded.effective.read_only();
+    let mut engine = Engine::new(store, loaded.file, None, Some(loaded.path))
+        .with_read_only(read_only)
+        .with_env_overlay(loaded.overlay)
+        .with_machine_owner_lookup(machine_owner_for_engine());
+    // Where a rename keeps its journal, as every other opener says.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    let adopted = engine.adopt_domain_names_after("the sync").await;
+    drop(ownership);
+    Ok(adopted)
+}
+
 /// Bring one origin-connected domain (or every one) up to date: over the
 /// daemon when one owns the index, else against a directly opened store.
 pub async fn origin_update(
@@ -1183,7 +1553,13 @@ pub async fn origin_update(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(engine.origin_update(domain, &Scope::Unrestricted).await?)
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
+    Ok(engine
+        .origin_update(domain.as_deref(), &Scope::Unrestricted)
+        .await?)
 }
 
 /// Report where one origin-connected domain (or every one) stands relative to
@@ -1217,8 +1593,12 @@ pub async fn origin_status(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = match domain {
+        Some(d) => Some(localize_standalone(&engine, d).await),
+        None => None,
+    };
     Ok(engine
-        .origin_status(domain, detail, diff, &Scope::Unrestricted)
+        .origin_status(domain.as_deref(), detail, diff, &Scope::Unrestricted)
         .await?)
 }
 
@@ -1253,9 +1633,10 @@ pub async fn origin_share(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
         .origin_share(
-            domain,
+            &domain,
             title,
             description,
             proposal,
@@ -1287,8 +1668,9 @@ pub async fn origin_withdraw(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
+        .origin_withdraw(&domain, proposal, revert, ShareActor::Owner)
         .await?)
 }
 
@@ -1314,7 +1696,8 @@ pub async fn origin_changes(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
-    Ok(crate::control::origin_changes_inline(&engine, domain, path, sides).await?)
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(crate::control::origin_changes_inline(&engine, &domain, path, sides).await?)
 }
 
 /// Put named paths of one team domain back the way the team has them, for
@@ -1343,6 +1726,7 @@ pub async fn origin_discard(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     let targets: Vec<DiscardTarget> = targets
         .iter()
         .map(|(path, sha)| DiscardTarget {
@@ -1351,7 +1735,7 @@ pub async fn origin_discard(
         })
         .collect();
     Ok(engine
-        .discard_local_changes(domain, &targets, &ShareActor::Owner)
+        .discard_local_changes(&domain, &targets, &ShareActor::Owner)
         .await?)
 }
 
@@ -1384,8 +1768,9 @@ pub async fn origin_resolve(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_resolve(domain, path, keep, content, ShareActor::Owner)
+        .origin_resolve(&domain, path, keep, content, ShareActor::Owner)
         .await?)
 }
 
@@ -1510,6 +1895,12 @@ pub async fn provision(
     }
 
     let loaded = overlay::load(config_path)?;
+    // `provision` opens no engine at all (see the doc comment above), so it
+    // has no [`localize_standalone`] to call: a canonical name or alias is
+    // resolved straight from the loaded configuration instead, the same
+    // inputs an engine's own name table would read for a file domain.
+    let domain = domain.map(|d| localize_in_config(&loaded, d));
+    let domain = domain.as_deref();
     let install_receipt = crystalline_core::provision::install_receipt_path()
         .map_err(|e| anyhow::anyhow!("could not resolve the install receipt path: {e}"))?;
     let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
@@ -1631,6 +2022,9 @@ pub async fn virtual_routing_bullets(
         effective: config.clone(),
         overlay: overlay::EnvOverlay::default(),
     };
+    // No rename recovery here: this read-only render takes no ownership of
+    // the state directory, so a rename left half done waits for the next
+    // opener that does.
     match open_standalone(loaded, &db_path, false).await {
         Ok(engine) => engine.virtual_routing_bullets().await,
         Err(_) => std::collections::BTreeMap::new(),

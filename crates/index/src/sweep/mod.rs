@@ -12,7 +12,8 @@
 //!   retirement being finished, work that has sat unshared past its window;
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
 //!   reciprocal relations, orphans, stubs, oversized engrams, attachments
-//!   nothing references and permalinks that drifted off their folder;
+//!   nothing references, permalinks that drifted off their folder and links
+//!   that spell a domain by a name only this machine uses;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
@@ -318,7 +319,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 23] = [
+pub const RULES: [RuleInfo; 24] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -453,6 +454,13 @@ pub const RULES: [RuleInfo; 23] = [
         instruction: "The engram's permalink names a different folder than the one its file sits in, usually left over from an earlier reorganisation, so a build_context glob on the folder misses it. Repair it with move_engram, passing the engram's own current path as destination and permalink \"path\": the permalink becomes the path's own and every reference to the engram is rewritten with it. The new address breaks bookmarks outside Crystalline, so ask first. When the custom permalink is deliberate, acknowledge with evolve_ack V109; the acknowledgment holds until the permalink or the path changes.",
     },
     RuleInfo {
+        id: "V110",
+        family: Family::Structure,
+        base: 40,
+        summary: "domain spelled by a local-only name",
+        instruction: "The link's domain prefix is a name only this machine uses - a local config key or a machine-local alias - rather than the domain's canonical name. Rewrite it with edit_engram operation find_replace, find_text the link as written and content the same link with the prefix replaced by the domain's canonical name, so the reference reads the same on every machine that has this domain.",
+    },
+    RuleInfo {
         id: "V201",
         family: Family::Redundancy,
         base: 80,
@@ -528,8 +536,11 @@ pub fn is_pair_scoped(rule: &str) -> bool {
 ///   **sets**, so the parts are sorted and deduplicated before joining:
 ///   reordering the links in a body must not re-raise an acknowledged finding,
 ///   while a new member must;
-/// - `V007` and `V008` name **one attachment path**, so the first part is the
-///   whole scope;
+/// - `V007` and `V008` name **one attachment path**, and `V110` names **one
+///   spelling**, so the first part is the whole scope: two different
+///   local-only spellings on one engram are acknowledged separately, and
+///   acknowledging one leaves an ack for the other reading as stale rather
+///   than silently covering it;
 /// - `V109` names **a pair**, the permalink and the file path in that order:
 ///   an acknowledgment of a deliberate custom permalink holds exactly as long
 ///   as neither changes, and re-filing the engram or renaming the permalink
@@ -545,7 +556,7 @@ fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
         }
-        "V007" | "V008" => parts.into_iter().next().unwrap_or_default(),
+        "V007" | "V008" | "V110" => parts.into_iter().next().unwrap_or_default(),
         "V109" => parts.join(SCOPE_SEPARATOR),
         _ => String::new(),
     }
@@ -800,6 +811,22 @@ impl EngramFacts {
     }
 }
 
+/// A reference whose domain prefix is one of the spellings a caller asked
+/// about: the input of the finding that flags a link spelled with a name only
+/// this machine uses. The store fills it from
+/// [`crate::Store::spelled_references`], base rows only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpelledRef {
+    /// The engram the reference was written in.
+    pub from: EngramId,
+    /// The one-based line the reference sits on (0 when the parser had none).
+    pub line: usize,
+    /// The domain prefix as written: one of the spellings asked about.
+    pub spelling: String,
+    /// The bracket text exactly as it was written, colon and all.
+    pub raw: String,
+}
+
 /// A reference that names a target the index could not resolve: the `V102`
 /// input. The engine fills this from the store's unresolved-reference query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -937,6 +964,22 @@ pub struct SweepInput {
     /// Every registered domain name. `V102` uses it to tell an unregistered
     /// target domain apart from a target that simply does not exist.
     pub known_domains: Vec<String>,
+    /// Every `(spelling, canonical name)` pair the engine's name table would
+    /// rewrite on write - the same set [`NameTable::normalize`] answers
+    /// `Some` for, one entry per spelling. A spelling that is already
+    /// canonical, resolves nowhere, or is shadowed or contested is never in
+    /// here, and neither is one that resolves to a domain hidden from the
+    /// acting scope: the engine builds this list the way it builds
+    /// `known_domains`, filtered before the sweep ever sees it, so `V110`
+    /// never names a hidden domain's canonical name. Empty on a machine
+    /// where every domain's local name already is its canonical one.
+    pub respell: Vec<(String, String)>,
+    /// This domain's own references whose written prefix is one of
+    /// [`SweepInput::respell`]'s spellings, base rows only, from
+    /// [`crate::Store::spelled_references`]. `V110`'s whole input: a
+    /// reference here names a domain by a name only this machine uses, and
+    /// `respell` says what its canonical name is.
+    pub spelled_refs: Vec<SpelledRef>,
     /// Every attachment the domain holds, metadata only. The attachment rules
     /// compare this list against what the engrams reference and claim, in both
     /// directions.
@@ -981,6 +1024,8 @@ impl SweepInput {
             tags: Vec::new(),
             tag_aliases: Vec::new(),
             known_domains: Vec::new(),
+            respell: Vec::new(),
+            spelled_refs: Vec::new(),
             attachments: Vec::new(),
             shadowed_asset_refs: Vec::new(),
             share: None,
@@ -1972,6 +2017,7 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 
     detect_unresolved(input, graph, report);
     detect_reciprocal(input, graph, report);
+    detect_local_spellings(input, graph, report);
 }
 
 /// `V109`: the permalink's folder part differs from the folder the file sits
@@ -2023,6 +2069,79 @@ fn permalink_off_its_folder(fact: &EngramFacts) -> Option<Finding> {
             )
             .scoped([fact.permalink.clone(), fact.path.clone()]),
     )
+}
+
+/// `V110`: a link whose domain prefix is a name only this machine uses -
+/// its local config key or a machine-local alias - rather than the domain's
+/// canonical name.
+///
+/// Pure over what the engine already filtered: [`SweepInput::respell`] holds
+/// only the spellings [`crystalline_core::names::NameTable::normalize`]
+/// would rewrite (never one that is already canonical, resolves nowhere, is
+/// shadowed or contested, or resolves to a domain hidden from the acting
+/// scope), and [`SweepInput::spelled_refs`] holds only this domain's base
+/// references whose written prefix is one of those spellings. So a finding
+/// here can never name a hidden domain's canonical name, and an empty
+/// `respell` - a machine where every domain's local name already is its
+/// canonical one - answers with nothing to look at, whatever `spelled_refs`
+/// carries.
+///
+/// Mechanical, always: the reference already resolves through the local
+/// name (local names always win), so rewriting the prefix to the canonical
+/// spelling changes nothing the archive claims.
+///
+/// Scoped by the spelling alone ([`scope_for`]'s one-path arm, shared with
+/// `V007`/`V008`): an engram naming two different local-only domains draws
+/// two findings, and acknowledging one leaves the other's ack reading stale
+/// rather than silently covering it too.
+fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    if input.respell.is_empty() {
+        return;
+    }
+    let canonical_of: HashMap<&str, &str> = input
+        .respell
+        .iter()
+        .map(|(spelling, canonical)| (spelling.as_str(), canonical.as_str()))
+        .collect();
+
+    for reference in &input.spelled_refs {
+        let Some(canonical) = canonical_of.get(reference.spelling.as_str()) else {
+            continue;
+        };
+        let Some(fact) = graph.facts.get(&reference.from.0) else {
+            continue;
+        };
+        let prefix = format!("{}:", reference.spelling);
+        let Some(rest) = reference.raw.strip_prefix(prefix.as_str()) else {
+            // The stored raw does not carry the spelling it was matched on -
+            // a row from before `to_raw` existed. Nothing to quote a repair
+            // against, so the reference is left for a human to notice by
+            // other means rather than guessing the text to replace.
+            continue;
+        };
+        let new_raw = format!("{canonical}:{rest}");
+        report.findings.push(
+            Finding::about("V110", fact)
+                .with(
+                    Class::Mechanical,
+                    format!(
+                        "link spells domain `{}` by a name only this machine uses",
+                        reference.spelling
+                    ),
+                    format!(
+                        "`[[{}]]` names domain `{}`, a name only this machine uses; the domain's \
+                         name is `{canonical}`",
+                        reference.raw, reference.spelling
+                    ),
+                    format!(
+                        "edit_engram with operation find_replace, find_text \"[[{}]]\" and content \"[[{new_raw}]]\"",
+                        reference.raw
+                    ),
+                )
+                .at_line((reference.line > 0).then_some(reference.line))
+                .scoped([reference.spelling.clone()]),
+        );
+    }
 }
 
 /// `V102`: references the index could not resolve.

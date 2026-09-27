@@ -39,8 +39,7 @@ use serde_json::Value;
 
 use crate::mcp::CacheHinted;
 
-/// The install-channel marker env var. The mcpb manifest sets it to "mcpb".
-pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
+pub use crate::overlay::CHANNEL_ENV;
 /// The Claude Desktop extension channel value.
 pub const MCPB_CHANNEL: &str = "mcpb";
 

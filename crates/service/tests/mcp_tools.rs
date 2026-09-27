@@ -48,6 +48,17 @@ impl Harness {
     }
 
     async fn build(domains: &[&str], read_only: bool, pin_json: bool) -> Harness {
+        Harness::build_tweaked(domains, read_only, pin_json, |_, _| {}).await
+    }
+
+    /// [`Harness::build`], with `tweak` run over the configuration and the
+    /// root once the domain folders exist and before the engine is built.
+    async fn build_tweaked(
+        domains: &[&str],
+        read_only: bool,
+        pin_json: bool,
+        tweak: impl FnOnce(&mut GlobalConfig, &Path),
+    ) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -63,6 +74,7 @@ impl Harness {
             .unwrap();
             cfg.domains.insert(d.to_string(), DomainEntry::file(dir));
         }
+        tweak(&mut cfg, &root);
         if pin_json {
             cfg.service = Some(ServiceConfig {
                 response_format: Some(ResponseFormat::Json),
@@ -340,7 +352,7 @@ async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
 /// declaration mid-call - so `provision` is listed always and refuses its
 /// mutating actions. `github.enabled` is one shared setting, so hiding on it
 /// keeps every client's answer identical at any given instant; what a flip
-/// owes is an announcement, and `tests/mcp_subscriptions.rs` is where that is
+/// owes is an announcement, and `tests/mcp/mcp_subscriptions.rs` is where that is
 /// pinned. `read_only` gates the listing as it always did: fixed at engine
 /// construction (`Engine::with_read_only` takes `self` by value), no request
 /// can move it.
@@ -381,7 +393,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     // it are withheld rather than listed-and-refusing. Calling one by name
     // still reaches the handler and says how to turn it on
     // (`hidden_collab_tools_refuse_at_call_time_when_github_is_disabled` in
-    // tests/mcp_collab.rs).
+    // tests/collab/mcp_collab.rs).
     for hidden in [
         "share_changes",
         "update_domain",
@@ -450,7 +462,7 @@ async fn no_tool_administers_a_domains_membership() {
 /// behind it: the prohibition is on two clients getting different answers at
 /// the same moment, not on a shared setting changing what everybody is served
 /// from the next call on. The obligation the "MAY change over time" clause
-/// carries is the announcement, and `tests/mcp_subscriptions.rs` pins who
+/// carries is the announcement, and `tests/mcp/mcp_subscriptions.rs` pins who
 /// receives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_six() {
@@ -1011,6 +1023,36 @@ async fn list_domains_routing_carries_the_behavior_rules() {
     );
 }
 
+/// Every domain in `list_domains` carries its canonical name, its aliases,
+/// how it got its name, whether that name is shadowed and whether a rename
+/// has it paused right now - and `renaming` rides along even when false, so
+/// the rows stay uniform enough for the TOON encoder to render them as one
+/// tabular block rather than falling back to the expanded list form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_domains_carries_name_fields_as_uniform_toon_columns() {
+    let h = Harness::new_toon(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let text = call_text(peer, "list_domains", json!({})).await.unwrap();
+    let header = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("domains["))
+        .unwrap_or_else(|| panic!("no tabular domains header: {text}"));
+    for column in [
+        "canonical_name",
+        "aliases",
+        "name_origin",
+        "shadowed",
+        "renaming",
+    ] {
+        assert!(
+            header.contains(column),
+            "the tabular header names every column, {column} included: {header}"
+        );
+    }
+}
+
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
 /// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
 /// `["array", "null"]` union: some MCP clients (Claude Desktop) do not
@@ -1083,7 +1125,7 @@ async fn read_only_hides_the_write_gated_tools() {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
     // Read-only hides the five write-shaped collaboration tools and
-    // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
+    // `provision` (the full gating matrix lives in tests/collab/mcp_collab.rs).
     // `evolve_engrams` is hidden on its own gate: it is a read, but every
     // finding it returns prescribes a mutation, so the queue is noise where
     // mutation is impossible.
@@ -4578,7 +4620,7 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`, mirroring
-/// `tests/mcp_collab.rs`'s `NotifyClient` for the `configure` flip.
+/// `tests/collab/mcp_collab.rs`'s `NotifyClient` for the `configure` flip.
 #[derive(Clone, Default)]
 struct ProvisionNotifyClient {
     got_list_changed: Arc<tokio::sync::Notify>,
@@ -4606,7 +4648,7 @@ impl rmcp::ClientHandler for ProvisionNotifyClient {
 /// time, so the notification described a change that had not happened; and from
 /// MCP 2026-07-28 an unsolicited notification has no channel at all
 /// (`/basic/patterns/subscriptions`: a server "MUST NOT send notification types
-/// the client has not explicitly requested"). `tests/mcp_subscriptions.rs`
+/// the client has not explicitly requested"). `tests/mcp/mcp_subscriptions.rs`
 /// carries the same inversion for `configure` and the subscription path that
 /// replaces it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4681,6 +4723,25 @@ async fn add_domain_declaring_provisioning_announces_nothing() {
         .is_err(),
         "a declaration flip moves no list, so it must not be announced"
     );
+}
+
+/// `add_domain` validates a `repo` before anything reaches the engine's own
+/// url building: the same check the JSON API's team-domain create and
+/// domain-name peek use and the CLI's `domain add --origin` checks before
+/// it dispatches (`crystalline_remote::validate_repo`,
+/// crates/remote/src/github/mod.rs), so a malformed repo answers a
+/// caller-fault refusal on this surface too rather than a request that
+/// reaches `origin_add_with_progress` and a GitHub API path built from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_refuses_a_malformed_repo_before_the_engine() {
+    let h = Harness::new(&[]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({"repo": "acme/kb/../../secret"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("not a valid repository"), "{err}");
 }
 
 // --- tool schema sanitizer: advertised-shape sweep ---------------------------
@@ -5947,4 +6008,162 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
         names.contains(&"retry-secrets"),
         "the machine owner sees the private domain's neighbour: {machine}"
     );
+}
+
+/// A harness over `local`, whose MANIFEST declares `domain_name: canonical`
+/// and whose registration carries the machine-local `alias`, holding one
+/// engram `runbook`.
+async fn named_harness(
+    local: &'static str,
+    canonical: &'static str,
+    alias: &'static str,
+) -> Harness {
+    Harness::build_tweaked(&[local], false, true, move |cfg, root| {
+        let dir = root.join(local);
+        std::fs::write(
+            dir.join("MANIFEST.md"),
+            crystalline_core::manifest_template(canonical, "2026-01-01"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("runbook.md"),
+            "---\ntype: engram\ntitle: Runbook\npermalink: runbook\ntags:\n  - t\n\
+             status: current\nrecorded_at: 2026-01-01\n---\n\n# Runbook\n\nthe rollback steps\n",
+        )
+        .unwrap();
+        cfg.domains.get_mut(local).unwrap().aliases = vec![alias.to_string()];
+    })
+    .await
+}
+
+/// The text a tool answered with, whether it answered or refused.
+async fn answer_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> String {
+    match call_text(peer, tool, args).await {
+        Ok(text) | Err(text) => text,
+    }
+}
+
+/// Every tool that takes a domain takes the canonical name or an alias, and
+/// works on the local name behind it.
+#[tokio::test]
+async fn tools_accept_a_canonical_name_or_an_alias_for_a_domain() {
+    let h = named_harness("eng-knowledge", "eng", "old-eng").await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for args in [
+        json!({ "identifier": "crystalline://eng/runbook" }),
+        json!({ "identifier": "crystalline://old-eng/runbook" }),
+        json!({ "domain": "old-eng", "identifier": "runbook" }),
+    ] {
+        let read = call(peer, "read_engram", args.clone())
+            .await
+            .unwrap_or_else(|e| panic!("read_engram {args}: {e}"));
+        assert_eq!(read["domain"], "eng-knowledge", "{args}: {read}");
+    }
+
+    let found = call(
+        peer,
+        "search_engrams",
+        json!({ "query": "rollback", "domains": ["eng"], "search_type": "text" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !found["hits"].as_array().unwrap().is_empty(),
+        "the canonical name filters a search: {found}"
+    );
+    let nobody = call(
+        peer,
+        "search_engrams",
+        json!({ "query": "rollback", "domains": ["nobody"], "search_type": "text" }),
+    )
+    .await
+    .expect("an unknown filter entry is no error");
+    assert!(nobody["hits"].as_array().unwrap().is_empty(), "{nobody}");
+
+    // The writability check runs in the handler, before the engine: it must
+    // see the local name too.
+    let written = call(
+        peer,
+        "write_engram",
+        json!({ "domain": "old-eng", "title": "Canary", "content": "Roll out slowly.", "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written["domain"], "eng-knowledge", "{written}");
+    assert!(h.root.join("eng-knowledge/canary.md").is_file());
+
+    let browsed = call(peer, "browse_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(browsed["domain"], "eng-knowledge", "{browsed}");
+}
+
+/// A caller who may not see a private domain gets, for its canonical name
+/// and its alias, exactly what a name nobody registered gets: the same words
+/// with their own spelling echoed, and never the local name. The machine
+/// owner reaches it by both.
+#[tokio::test]
+async fn an_alias_of_a_hidden_domain_answers_like_an_unknown_name_over_mcp() {
+    let h = named_harness("hush-lab", "team-secret", "old-secret").await;
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("hush-lab", true, "keeper")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    let (anon, _s1) = h.connect_http().await;
+    let masked = |text: String, typed: &str| text.replace(typed, "<typed>");
+    fn browse(name: &str) -> Value {
+        json!({ "domain": name })
+    }
+    fn read(name: &str) -> Value {
+        json!({ "identifier": format!("crystalline://{name}/runbook") })
+    }
+    for (tool, arg) in [
+        ("browse_domain", browse as fn(&str) -> Value),
+        ("read_engram", read),
+    ] {
+        let unknown = answer_text(anon.peer(), tool, arg("never-registered")).await;
+        for typed in ["team-secret", "old-secret"] {
+            let text = answer_text(anon.peer(), tool, arg(typed)).await;
+            for other in ["hush-lab", "team-secret", "old-secret"]
+                .into_iter()
+                .filter(|other| *other != typed)
+            {
+                assert!(
+                    !text.contains(other),
+                    "{tool} {typed} names {other}: {text}"
+                );
+            }
+            assert_eq!(
+                masked(text, typed),
+                masked(unknown.clone(), "never-registered"),
+                "{tool} answers {typed} like a name nobody registered"
+            );
+        }
+    }
+
+    let (owner, _s2) = h.connect().await;
+    for typed in ["team-secret", "old-secret"] {
+        let browsed = call(owner.peer(), "browse_domain", json!({ "domain": typed }))
+            .await
+            .unwrap();
+        assert_eq!(browsed["domain"], "hush-lab", "{browsed}");
+    }
 }

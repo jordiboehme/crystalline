@@ -15,6 +15,21 @@
  * so with the way to fix it beside the sentence rather than by a submit that
  * fails on the wire.
  *
+ * Team mode also previews the name a create would take: once the repository
+ * (and the optional branch and folder) settle for `PEEK_DEBOUNCE_MS`, a peek
+ * at `GET /github/domain-name` becomes the Name field's placeholder -
+ * `domain_name` when the MANIFEST declares one, else the repository's own
+ * name segment, the same fallback an empty submit takes. The peek is read
+ * through `useQuery`, keyed by the settled repository, branch and path: a
+ * newer edit settles to a different key before an older one's answer can
+ * arrive, so whichever response lands, only the CURRENT key's data is ever
+ * read - an older, slower answer updates a cache entry nothing here looks at
+ * again. Never surfaced as an error and never blocking the form: `retry:
+ * false` keeps a 409 (no credential) or a 422 (an unreadable repository) from
+ * being retried, and this dialog reads only `.data`, never `.error`, so a
+ * failed peek leaves the Name field exactly as unplaceholdered as it is
+ * before the debounce ever fires.
+ *
  * Split from `CreateDomainDialog.tsx` behind a lazy import, for the reason the
  * other dialogs are: the Radix dialog is otherwise not in the entry bundle at
  * all, and every visit would pay for a form only an admin ever opens.
@@ -23,20 +38,43 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import {
   GITHUB_STATUS_KEY,
   createDomain,
+  fetchGithubDomainNamePeek,
   fetchGithubStatus,
 } from "../api/admin";
 import type { CreateDomainBody, DomainMode } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
+import { useAuth } from "../auth/AuthContext";
 import { domainRoute, githubSettingsRoute } from "../paths";
 import type { CreateDomainDialogProps } from "./CreateDomainDialog";
 import { BUTTON, FIELD, FOCUS_RING, Field } from "./primitives";
+
+/** How long a repository, branch or folder edit waits before it is peeked. */
+const PEEK_DEBOUNCE_MS = 400;
+
+/**
+ * Whether `value` has the shape a peek is worth asking about: exactly two
+ * `owner/name` segments, each made of the characters GitHub allows and
+ * neither segment `.` nor `..` - the same shape the server's own
+ * `validate_github_repo` requires, so this never asks about a repository the
+ * route would refuse before it even reached the forge.
+ */
+function looksLikeRepo(value: string): boolean {
+  const segments = value.split("/");
+  if (segments.length !== 2) {
+    return false;
+  }
+  const shape = /^[A-Za-z0-9._-]+$/;
+  return segments.every(
+    (segment) => shape.test(segment) && segment !== "." && segment !== "..",
+  );
+}
 
 /** The three kinds of domain, in the order they are worth considering. */
 const MODES: { mode: DomainMode; label: string; helper: string }[] = [
@@ -63,6 +101,7 @@ export default function CreateDomainDialogBody({
 }: CreateDomainDialogProps): ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { capabilities } = useAuth();
   const modeGroup = useId();
   const nameField = useId();
   const repoField = useId();
@@ -84,6 +123,59 @@ export default function CreateDomainDialogBody({
     queryFn: fetchGithubStatus,
     enabled: mode === "github",
   });
+
+  // What the repository, branch and folder fields last settled to, trimmed:
+  // the peek's own input, a beat behind what is actually typed. Debounced
+  // rather than fired on every keystroke, the way the search screen's own
+  // typing is - see the module doc for why a newer edit's settling is what
+  // makes a slower, older peek harmless rather than anything this effect
+  // has to cancel itself.
+  const [settled, setSettled] = useState({ repo: "", branch: "", path: "" });
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setSettled({
+        repo: repo.trim(),
+        branch: branch.trim(),
+        path: path.trim(),
+      });
+    }, PEEK_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [repo, branch, path]);
+
+  const peek = useQuery({
+    // A key of its own rather than one under `["settings", "github"]` or
+    // `["domains", ...]`: an unrelated invalidation of either of those - the
+    // connection settling, a domain registering - must not refetch a peek
+    // that has nothing to do with it.
+    queryKey: [
+      "github-domain-name-peek",
+      settled.repo,
+      settled.branch,
+      settled.path,
+    ],
+    queryFn: () => fetchGithubDomainNamePeek(settled),
+    // Admin only because the route itself is: this dialog is reached by
+    // admins alone today, but the check is made here anyway rather than
+    // trusted from how the dialog happens to be mounted.
+    enabled:
+      mode === "github" &&
+      capabilities.canAdminister &&
+      looksLikeRepo(settled.repo),
+    retry: false,
+  });
+  // Only once the debounce has actually caught up with what is typed: a peek
+  // still settling to an EARLIER repository must not flash that repository's
+  // name as the placeholder for the one now in the box.
+  const peekSettled =
+    settled.repo === repo.trim() &&
+    settled.branch === branch.trim() &&
+    settled.path === path.trim();
+  const namePlaceholder =
+    mode === "github" && peekSettled && peek.data !== undefined
+      ? (peek.data.domainName ?? peek.data.defaultName)
+      : undefined;
   // Only in team mode, and only once an answer is actually in hand. A probe
   // still in flight is not a disconnected instance, and saying so before the
   // server has spoken would put a refusal on screen that may be about to be
@@ -223,7 +315,7 @@ export default function CreateDomainDialogBody({
               label="Name"
               helper={
                 mode === "github"
-                  ? "Optional; the repository's own name when left empty."
+                  ? "Optional; the repository's MANIFEST name when left empty, else its repository name."
                   : "How it is addressed everywhere, this instance over."
               }
             >
@@ -235,6 +327,7 @@ export default function CreateDomainDialogBody({
                 onChange={(event) => {
                   setName(event.target.value);
                 }}
+                placeholder={namePlaceholder}
                 autoFocus
               />
             </Field>

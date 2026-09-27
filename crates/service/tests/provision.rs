@@ -2,7 +2,7 @@
 //! into the config file this engine owns and returns a report, and a
 //! read-only instance refuses allow but still answers status. There is no
 //! ctl-level (socket) test harness in this crate yet (`control.rs` has no
-//! dedicated test file - see `tests/configure.rs`'s own note), so this
+//! dedicated test file - see `tests/domains/configure.rs`'s own note), so this
 //! exercises the engine method directly, one layer below the ctl
 //! `provision` command that just forwards to it and serializes the same
 //! report `Engine::provision` already returns.
@@ -62,7 +62,7 @@ fn write(dir: &Path, rel: &str, content: &str) {
 
 /// A harbor-shaped MANIFEST declaring skills, commands and agents (no mcps -
 /// this engine-level suite never wants a real harness CLI on `PATH`, which
-/// `crates/cli/tests/provision.rs` already covers with a shim).
+/// `crates/cli/tests/setup/provision.rs` already covers with a shim).
 fn write_harbor(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(

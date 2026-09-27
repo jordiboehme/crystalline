@@ -20,15 +20,10 @@ use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::control::serve_ctl;
 use crate::engine::{Engine, WatchEvent};
-use crate::instance::{acquire_ownership, read_mode_line};
+use crate::instance::{acquire_ownership_after_standalone, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
-
-/// The default HTTP bind address: where the endpoint comes up when nothing asks
-/// for another one, which since the default flip is the plain `crystalline serve`
-/// case too. `crate::settings` reports it as the effective `service.http` value
-/// so `config show` and the daemon cannot drift apart.
-pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+use crate::settings::DEFAULT_HTTP_ADDR;
 
 /// How long a daemon asked to `--exit-when-idle` waits after its last socket
 /// session ends before it leaves. Long enough for Claude Desktop to restart its
@@ -90,9 +85,7 @@ const COPYRIGHT_LINE: &str = concat!(
 /// does, so the two spellings cannot drift apart unnoticed.
 pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
-/// The test-only variable that parks a blocking task in a daemon; see
-/// [`parked_blocking_task`].
-pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
+pub use crate::overlay::PARK_BLOCKING_ENV;
 
 /// How long a daemon parks one `spawn_blocking` task at startup, from
 /// [`PARK_BLOCKING_ENV`], or `None`.
@@ -149,6 +142,27 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// A daemon's shared state over `engine` with nothing else running, for a
+    /// test that drives the control socket's handler directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(engine: Arc<Engine>) -> Shared {
+        let (shutdown_tx, _) = watch::channel(false);
+        let (sessions_tx, _) = watch::channel(0usize);
+        Shared {
+            engine,
+            pid: std::process::id(),
+            http_addr: None,
+            started: Instant::now(),
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            next_session: AtomicU64::new(1),
+            http_sessions: Arc::new(AtomicUsize::new(0)),
+            shutdown_tx,
+            sessions_tx,
+            idle_exit: None,
+            shutdown_reason: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Seconds since the daemon started.
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
@@ -356,7 +370,8 @@ pub async fn run_serve(
     let instance_id = config::read_or_create_instance_id()?;
 
     // Take ownership first so a second daemon fails fast with the live pid.
-    let ownership = acquire_ownership()?;
+    // A one-shot command holding it for a moment is waited for instead.
+    let ownership = acquire_ownership_after_standalone().await?;
 
     // The lock is held, so this daemon is the only writer of the scratch
     // directory: reclaim whatever a killed predecessor left spilled there. The
@@ -378,14 +393,21 @@ pub async fn run_serve(
     // socket never wait on the model download. The engine holds the file config
     // and the overlay separately (persist and refresh hit the resolved file even
     // when it came from CRYSTALLINE_CONFIG); its effective config drives reads.
-    let engine = Arc::new(
-        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
-            .with_watch_channel(watch_tx)
-            .with_embed_channel(embed_tx)
-            .with_read_only(read_only)
-            .with_instance_id(instance_id)
-            .with_env_overlay(loaded.overlay.clone()),
-    );
+    let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+        .with_watch_channel(watch_tx)
+        .with_embed_channel(embed_tx)
+        .with_read_only(read_only)
+        .with_instance_id(instance_id)
+        .with_env_overlay(loaded.overlay.clone())
+        .with_machine_owner_lookup(crate::client::machine_owner_for_engine());
+    // Told where the state directory is, as the standalone opener is: the
+    // same path the engine resolves on its own in a release build, and under
+    // the test seam (which refuses to guess one) the isolated directory a
+    // test set, so the rename journal and the overlay journal are found.
+    if let Ok(state) = config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
+    let engine = Arc::new(engine);
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     if let Some(park) = parked_blocking_task() {
         // Said out loud, so the test that sets it can tell its own parked
@@ -393,6 +415,13 @@ pub async fn run_serve(
         tracing::info!("test hook: parking a blocking task for {}s", park.as_secs());
         tokio::task::spawn_blocking(move || std::thread::sleep(park));
     }
+
+    // A domain rename a stopped daemon left half done is finished before
+    // anything reads the names: before the routing cache, the watcher, the
+    // first sync and the orphan sweep, and before the socket is bound. A
+    // rename that cannot be finished keeps its domain paused and says why;
+    // every other domain is served.
+    engine.finish_leftover_rename().await;
 
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
@@ -520,6 +549,10 @@ pub async fn run_serve(
             if let Err(err) = e.sync_take_over(None, take_over).await {
                 tracing::warn!("initial sync failed: {err}");
             }
+            // Once the first sync has returned: the one-time catch-up for a
+            // configuration from before 0.20.0, and any domain_name a
+            // MANIFEST gained while the daemon was down.
+            e.adopt_domain_names_after("the initial sync").await;
             // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on
@@ -555,7 +588,9 @@ pub async fn run_serve(
     // The file watcher.
     {
         let e = engine.clone();
-        let watch_domains = domain_roots(&loaded.effective);
+        // From the engine rather than the startup load: a rename finished
+        // above changed the names.
+        let watch_domains = domain_roots(&engine.config());
         let rx = shared.watch();
         tokio::spawn(async move {
             if let Err(err) =
@@ -964,6 +999,9 @@ async fn run_watcher(
     // drops a change silently: the flag escalates the next flush to a full
     // rescan, so a full queue only costs coalescing, never a missed edit.
     let overflow = Arc::new(AtomicBool::new(false));
+    // The name adoptions a flush asks for, run on their own task: at most one
+    // running and one more queued however many flushes ask.
+    let adoptions = Arc::new(Coalesced::default());
     let cb_overflow = overflow.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
@@ -1097,6 +1135,12 @@ async fn run_watcher(
                     );
                 }
                 let touched = !dirty.is_empty();
+                // A full rescan or an edit of a MANIFEST may bring a new
+                // domain_name, which the adoption below lines up once every
+                // pass of this flush is done.
+                let names_may_move = dirty
+                    .values()
+                    .any(|work| work.full || work.paths.contains("MANIFEST.md"));
                 for (name, work) in dirty {
                     // full: today's walk-based rescan; otherwise a targeted pass
                     // over just the dirty paths. The full fallback plus the
@@ -1112,6 +1156,19 @@ async fn run_watcher(
                             tracing::warn!("targeted watch sync of '{name}' failed: {err}");
                         }
                     }
+                }
+                // Off this task: the adoption waits on `domain_admin`, which
+                // a registration holds across a whole download, and file
+                // watching must never wait on it. A rename it runs moves this
+                // watcher's watch through the unbounded `new_roots` channel.
+                if names_may_move {
+                    let engine = engine.clone();
+                    adoptions.request(move || {
+                        let engine = engine.clone();
+                        async move {
+                            engine.adopt_domain_names_after("the watch sync").await;
+                        }
+                    });
                 }
                 if touched
                     && !engine.request_embed()
@@ -1343,7 +1400,7 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// `tools/call` naming 2026-07-28 reaches the schema cache whatever we
 /// advertise - it did so while that call was still being refused, and it does
 /// so now that the call is served.
-/// `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
+/// `tests/mcp/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
 /// is the guard.
 ///
 /// # What the number means
@@ -1548,7 +1605,7 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
 /// without the `fluid-ui` feature) the fallback is the transport alone, exactly
 /// as it was before the UI existed.
 ///
-/// There is no CORS layer here and there must never be one (`tests/no_cors.rs`
+/// There is no CORS layer here and there must never be one (`tests/rest/no_cors.rs`
 /// fails the build over it): `GET /api/v1/auth/me` hands the caller their CSRF
 /// token, which is safe only because no other origin can read the answer. The
 /// UI adds no CORS surface at all - it is served from the same origin as the
@@ -2357,6 +2414,70 @@ fn domain_roots(config: &GlobalConfig) -> Vec<(String, PathBuf)> {
 /// cheaper way to reconcile, and the cap also bounds the memory one burst holds.
 const MAX_DIRTY_PATHS: usize = 256;
 
+/// A job run on its own task, at most one run at a time and at most one more
+/// queued: a request while a run is going queues exactly one follow-up, and
+/// further requests fold into it. The follow-up covers them all because the
+/// job reads the state as it stands when it starts.
+#[derive(Default)]
+struct Coalesced {
+    /// `(running, queued)`.
+    state: std::sync::Mutex<(bool, bool)>,
+}
+
+impl Coalesced {
+    /// Run `job` on a task of its own now, or queue one more run of it when a
+    /// run is already going. Never waits.
+    fn request<F, Fut>(self: &Arc<Self>, job: F)
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.0 {
+                state.1 = true;
+                return;
+            }
+            state.0 = true;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            // A job that panics must not leave the slot marked running for
+            // ever: the next request starts a fresh run.
+            let _reset = ResetOnPanic(this.clone());
+            loop {
+                job().await;
+                let again = {
+                    let mut state = this.state.lock().unwrap();
+                    if state.1 {
+                        state.1 = false;
+                        true
+                    } else {
+                        state.0 = false;
+                        false
+                    }
+                };
+                if !again {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Frees a [`Coalesced`] slot when its task unwinds.
+struct ResetOnPanic(Arc<Coalesced>);
+
+impl Drop for ResetOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Ok(mut state) = self.0.state.lock()
+        {
+            *state = (false, false);
+        }
+    }
+}
+
 /// One domain's pending watcher work for a single debounce flush: a set of dirty
 /// relative markdown paths, or `full` when the batch must fall back to a full
 /// rescan.
@@ -2824,6 +2945,61 @@ where
 mod tests {
     use super::*;
 
+    /// Five requests while the first run is held: one run at a time, and
+    /// exactly one follow-up for the four that came in during it. The caller
+    /// never waits.
+    #[tokio::test]
+    async fn a_coalesced_job_runs_once_at_a_time_and_queues_one_more() {
+        use std::sync::atomic::AtomicUsize;
+        let queue = Arc::new(Coalesced::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let job = {
+            let (runs, active, most) = (runs.clone(), active.clone(), most.clone());
+            move || {
+                let (runs, active, most) = (runs.clone(), active.clone(), most.clone());
+                let mut gate = gate_rx.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    while !*gate.borrow_and_update() {
+                        gate.changed().await.unwrap();
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        };
+        for _ in 0..5 {
+            queue.request(job.clone());
+        }
+        let settled = |want: usize| {
+            let runs = runs.clone();
+            let queue = queue.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let idle = *queue.state.lock().unwrap() == (false, false);
+                        if runs.load(Ordering::SeqCst) == want && (want == 1 || idle) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the queue settles");
+            }
+        };
+        settled(1).await;
+        assert_eq!(*queue.state.lock().unwrap(), (true, true));
+        gate_tx.send(true).unwrap();
+        settled(2).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(most.load(Ordering::SeqCst), 1, "never two at once");
+    }
+
     fn locked() -> crystalline_index::IndexError {
         // The shape turso actually raises, catch-all variant and all.
         crystalline_index::IndexError::Db(
@@ -2996,7 +3172,7 @@ mod tests {
     /// Every path rmcp ends a session on runs through `close_session`, so
     /// releasing the identity claim there is what keeps the gate's map in step
     /// with rmcp's own sessions. A client `DELETE` is one of those paths and is
-    /// covered end to end in `tests/mcp_auth.rs`; the other two - the 300 second
+    /// covered end to end in `tests/auth/mcp_auth.rs`; the other two - the 300 second
     /// idle keep-alive and a worker error - are reached from inside
     /// `spawn_session_worker`, with no seam a test can drive without standing up
     /// a real session and waiting out a timer that is not on a pausable clock
@@ -3029,7 +3205,7 @@ mod tests {
     /// A legacy session's draft join ends WITH THE SESSION, on every path rmcp
     /// ends one.
     ///
-    /// `tests/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
+    /// `tests/mcp/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
     /// that path the service object dies with the connection, so the join would
     /// also go through `SessionJoins`' own drop. The other two endings - the 300
     /// second idle keep-alive and a worker error - reach `close_session` from
@@ -3825,6 +4001,28 @@ mod tests {
         assert!(dirty["a"].paths.contains("note.md"));
     }
 
+    /// An edit of a domain's root MANIFEST reaches the targeted sync as the
+    /// exact relative path `MANIFEST.md`, which is what that pass looks for
+    /// to refresh the name the domain declares.
+    #[test]
+    fn a_root_manifest_edit_targets_the_manifest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("MANIFEST.md"), "---\ntype: manifest\n---\n").unwrap();
+        let domains = vec![("a".to_string(), root.clone())];
+        let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+        accumulate_tick(
+            &mut dirty,
+            WatchTick::Path(root.join("MANIFEST.md")),
+            &domains,
+        );
+        assert!(!dirty["a"].full);
+        assert_eq!(
+            dirty["a"].paths.iter().collect::<Vec<_>>(),
+            vec!["MANIFEST.md"]
+        );
+    }
+
     #[test]
     fn classify_ignores_the_okf_reserved_filenames() {
         let dir = tempfile::tempdir().unwrap();
@@ -4071,8 +4269,8 @@ mod tests {
     /// be noticed the day somebody fills it.
     const TOKEN_BEARING_SOURCES: [(&str, &str); 3] = [
         ("daemon.rs", include_str!("daemon.rs")),
-        ("rest/mod.rs", include_str!("rest/mod.rs")),
-        ("rest/auth.rs", include_str!("rest/auth.rs")),
+        ("rest/mod.rs", include_str!("../../rest/src/lib.rs")),
+        ("rest/auth.rs", include_str!("../../rest/src/auth.rs")),
     ];
 
     /// The output macros none of those three files may spell the token into.
@@ -4159,7 +4357,7 @@ mod tests {
     /// proves the comment blanking works at all.
     #[test]
     fn a_comment_naming_a_log_call_and_the_token_is_prose_the_guard_reads_past() {
-        let auth = include_str!("rest/auth.rs");
+        let auth = include_str!("../../rest/src/auth.rs");
         let warning = auth.lines().find(|line| {
             line.trim_start().starts_with("//")
                 && line.contains("token")

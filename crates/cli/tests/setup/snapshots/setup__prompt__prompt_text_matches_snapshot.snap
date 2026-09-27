@@ -1,0 +1,21 @@
+---
+source: crates/cli/tests/setup/prompt.rs
+expression: text
+---
+CRYSTALLINE KNOWLEDGE ROUTING
+
+You are being onboarded to the knowledge accumulated in this workspace. It is served by the crystalline MCP server; these instructions govern its tools (your harness may prefix tool names, for example mcp__crystalline__search_engrams). The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.
+
+- gardening (preferred): (routing information unavailable: MANIFEST.md is missing or unreadable)
+- astronomy: When asked about moons or planets; When comparing orbital periods
+
+Behavior:
+- Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess.
+- Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact.
+- Narrow question: search_engrams with domains=[that domain]; broad or unclear: no domains sweeps them all.
+- write_engram, edit_engram, move_engram and delete_engram always need an explicit domain.
+- Pass write_engram a folder from the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons.
+- Check vocabulary for tags and categories in use before inventing one.
+- Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge, raise it when one proves key.
+- build_context on a crystalline:// anchor gathers knowledge around a task.
+- Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.

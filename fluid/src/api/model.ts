@@ -148,6 +148,9 @@ export type OwnerBody = components["schemas"]["OwnerBody"];
 /** What `PUT /domains/{domain}/visibility` takes. */
 export type VisibilityBody = components["schemas"]["VisibilityBody"];
 
+/** What `POST /domains/{domain}/rename` takes. */
+export type RenameWireBody = components["schemas"]["RenameBody"];
+
 /**
  * What the consent screen shows: the client name, the redirect host (with
  * the loopback marker), and the account that is about to grant it. Never the

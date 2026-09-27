@@ -189,9 +189,9 @@ pub fn select_hits(
 ) -> Vec<Recalled> {
     // Text mode means the daemon has no provider or no vectors for its model
     // yet, and a text score is an unbounded term frequency: unrankable
-    // against a floor and, on prose, noise. The literal is what
-    // `engine.rs`'s `mode_str` emits (pinned by the service crate's own
-    // `origin.rs` search test).
+    // against a floor and, on prose, noise. The literal is what the engine
+    // crate's `mode_str` emits (pinned by the service crate's own
+    // `tests/origins/origin.rs` search test).
     if search.get("mode").and_then(Value::as_str) != Some("hybrid") {
         return Vec::new();
     }

@@ -27,6 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
@@ -43,6 +44,15 @@ use types::{
     ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
     UpdateProposalRequest, UpdateRefRequest,
 };
+
+/// What a single URL path segment or query value keeps unencoded: the
+/// alphanumerics and the RFC 3986 unreserved marks `- . _ ~`. Everything
+/// else, `/`, `&`, `?`, `#` and spaces included, is percent-encoded.
+const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// The default GitHub REST API base url.
 const DEFAULT_API_URL: &str = "https://api.github.com";
@@ -106,11 +116,25 @@ impl GitHubProvider {
     /// attaching the standard GitHub headers and the bearer token when one
     /// is configured.
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.request_accepting(method, path, "application/vnd.github+json")
+    }
+
+    /// [`request`](GitHubProvider::request) with a different `Accept` media
+    /// type, for the endpoints that answer another representation (the raw
+    /// bytes of a file). The one `Accept` is set here rather than added
+    /// afterwards: a second `.header("Accept", ..)` appends a second value
+    /// instead of replacing the first.
+    fn request_accepting(
+        &self,
+        method: Method,
+        path: &str,
+        accept: &str,
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}{path}", self.api_url);
         let mut builder = self
             .client
             .request(method, url)
-            .header("Accept", "application/vnd.github+json")
+            .header("Accept", accept)
             .header("X-GitHub-Api-Version", API_VERSION)
             .header("User-Agent", "crystalline");
         if let Some(token) = &self.token {
@@ -347,6 +371,44 @@ impl Provider for GitHubProvider {
         let response = self.check(response, Some(&origin.repo)).await?;
         let body: BlobResponse = parse_json(response).await?;
         decode_base64(&body.content)
+    }
+
+    async fn read_file(
+        &self,
+        origin: &OriginSpec,
+        reference: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        // Each path segment and the ref are encoded on their own, so a `/`
+        // between segments stays a separator while one inside the ref (a
+        // `release/x` branch) cannot split the query.
+        let encoded_path = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| utf8_percent_encode(segment, URL_COMPONENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let encoded_ref = utf8_percent_encode(reference, URL_COMPONENT);
+        let url = format!("/repos/{owner}/{name}/contents/{encoded_path}?ref={encoded_ref}");
+        let response = self
+            .send(self.request_accepting(Method::GET, &url, "application/vnd.github.raw+json"))
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // No such file on that ref is an answer: check() would map this
+            // 404 to RepoNotFound, so it is read here, as branch_ref does.
+            return Ok(None);
+        }
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let status = response.status().as_u16();
+        response
+            .bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| RemoteError::Api {
+                status,
+                message: format!("could not read the file response body: {e}"),
+            })
     }
 
     async fn tarball(&self, origin: &OriginSpec, commit: &str) -> Result<Vec<u8>, RemoteError> {
@@ -749,6 +811,90 @@ fn split_repo(repo: &str) -> Result<(&str, &str), RemoteError> {
         status: 0,
         message: format!("'{repo}' is not an owner/name GitHub repository"),
     })
+}
+
+/// Whether `segment` is one GitHub allows in an owner or a repository name:
+/// letters, digits, `-`, `_` and `.`, never empty and never `.` or `..` on
+/// their own (a real name is never exactly that, and refusing it here closes
+/// the one segment `..` could otherwise smuggle through the character
+/// allowlist).
+fn valid_repo_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Validate a caller-supplied `repo` as `owner/name` before it reaches this
+/// module's own url building (`split_repo` above splits on the first `/`
+/// only, and [`URL_COMPONENT`] keeps `.` unescaped), so every surface that
+/// takes a repository from a caller - the JSON API's team-domain create and
+/// domain-name peek, the `add_domain` MCP tool, the CLI's `domain add
+/// --origin` - answers a caller-fault refusal for `a/b/../../user` rather
+/// than letting it reach a GitHub API path that normalizes across a segment
+/// nobody named. Exactly one slash, and each side a single valid segment.
+///
+/// [`RemoteError::Refused`] is every caller-fault classifier's own class
+/// (`crate::error`'s doc comment; `mcp::to_error` and the JSON API's
+/// `From<EngineError>` both answer it 422/`invalid_params`), so a caller
+/// converts this with a plain `.map_err` rather than matching variants of
+/// its own.
+pub fn validate_repo(repo: &str) -> Result<(), RemoteError> {
+    let mut segments = repo.split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some(owner), Some(name), None)
+            if valid_repo_segment(owner) && valid_repo_segment(name) =>
+        {
+            Ok(())
+        }
+        _ => Err(RemoteError::Refused(format!(
+            "'{repo}' is not a valid repository: expected owner/name, letters, digits, '-', \
+             '_' and '.' only in each, and exactly one slash"
+        ))),
+    }
+}
+
+/// Validate a caller-supplied repository-relative `path` before it reaches
+/// this module's own url building: no leading slash (which would read as
+/// absolute once joined onto the `contents/` route), no backslash or `%`
+/// character (a caller's escape attempt this module's own percent-encoding
+/// would otherwise re-encode rather than refuse), and no segment that is
+/// empty, `.` or `..` (each a way to say "no real path component" rather
+/// than name one, `..` being the one that climbs out of the subtree this
+/// surface may read).
+///
+/// An empty path, or one that is nothing but a TRAILING slash
+/// (`"domains/eng/"`), names the repository root: trimmed away before the
+/// segment check runs, so a caller who types the folder name the way a shell
+/// completion or a form field leaves it does not meet a refusal that "" or a
+/// trailing `/` never used to trigger. The leading-slash check runs on the
+/// untrimmed path first and on its own, so a bare `"/"` (all trailing slashes,
+/// nothing else) is still refused rather than trimmed down to the same empty
+/// string a genuinely empty path answers to; a slash in the MIDDLE of the
+/// path is likewise still a real, empty segment and still refused.
+pub fn validate_repo_path(path: &str) -> Result<(), RemoteError> {
+    let refusal = || {
+        RemoteError::Refused(format!(
+            "'{path}' is not a valid path within the repository: no leading slash, no \
+             backslash, no '%' character, and no '.', '..' or empty segment"
+        ))
+    };
+    if path.starts_with('/') {
+        return Err(refusal());
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let bad_segment = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
+    let bad =
+        trimmed.contains('\\') || trimmed.contains('%') || trimmed.split('/').any(bad_segment);
+    if bad {
+        return Err(refusal());
+    }
+    Ok(())
 }
 
 /// The lowercased marker GitHub's SAML refusal body carries: "Resource
@@ -1267,5 +1413,72 @@ mod tests {
             Some("acme-enterprise")
         );
         assert_eq!(org_from_sso_url("https://github.com/settings"), None);
+    }
+
+    /// Every surface that takes a repository from a caller shares this one
+    /// check, so its rules are pinned here rather than through any one of
+    /// them: exactly one slash, both sides a real GitHub-legal segment.
+    #[test]
+    fn validate_repo_accepts_owner_name_and_refuses_everything_else() {
+        for good in ["acme/kb", "my.repo/name", "a-b_c/d.e", ".github/actions"] {
+            assert!(validate_repo(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "acme/kb/../../secret",
+            "acme",
+            "acme/kb/extra",
+            "../acme/kb",
+            "acme/..",
+            "ac me/kb",
+            "acme/.",
+            "/kb",
+            "acme/",
+            "",
+        ] {
+            assert!(validate_repo(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The path validator rejects every way N1 named to say "no real path
+    /// component" - an empty or a `.`/`..` segment - and every way a caller
+    /// could try to smuggle one past a naive check: a leading slash, a raw
+    /// backslash and a literal `%` (which this module's own encoder would
+    /// otherwise re-encode rather than treat as already-escaped). A middle
+    /// slash still makes a real, empty segment and is still refused.
+    #[test]
+    fn validate_repo_path_rejects_traversal_and_smuggled_separators() {
+        for good in ["domains/eng", "a", "a.b/c-d_e"] {
+            assert!(validate_repo_path(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "/etc/passwd",
+            "../../secret",
+            "domains/../../secret",
+            "a\\b",
+            "a%b",
+            "a/./b",
+            "a//b",
+            ".",
+            "..",
+            // A bare `/`, or one with more slashes behind it, is not the same
+            // as an empty path: the leading-slash check runs on it before the
+            // trailing slashes are trimmed away, so it is refused rather than
+            // silently read as the repository root.
+            "/",
+            "///",
+        ] {
+            assert!(validate_repo_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An empty path, or one that is nothing but a trailing slash, names the
+    /// repository root and is accepted: both used to work before the traversal guard
+    /// above tightened the rule, and a form field or a shell-completed folder
+    /// name commonly ends in either shape.
+    #[test]
+    fn validate_repo_path_accepts_empty_and_trailing_slash_as_the_repo_root() {
+        for good in ["", "domains/eng/", "a/"] {
+            assert!(validate_repo_path(good).is_ok(), "{good:?}");
+        }
     }
 }
