@@ -1513,8 +1513,8 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
 /// A full rename answers the engine's own report, unchanged; a name already
 /// taken is a conflict rather than a malformed request. The generic
 /// `EngineError` -> `ApiError` conversion folds `Conflict` into the same 422
-/// class as `Invalid`, which the handler overrides for exactly this reason
-/// (F11): a taken name, a running rename, an environment-defined domain and a
+/// class as `Invalid`, which the handler overrides for exactly this reason:
+/// a taken name, a running rename, an environment-defined domain and a
 /// shared index are all `Conflict`, and all four answer 409 through the one
 /// override rather than through four separate matches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1565,7 +1565,7 @@ async fn a_domain_is_renamed_and_a_taken_name_is_a_conflict() {
     assert_eq!(dup.status(), 409, "{}", dup.text().await.unwrap());
 }
 
-/// An invalid new name is a 422 (F11), an unregistered domain is a 404, and a
+/// An invalid new name is a 422, an unregistered domain is a 404, and a
 /// caller who may write the shared domain but does not own it - not an
 /// instance admin, and `eng` is shared, so nobody but an admin holds
 /// `DomainRight::Own` on it - is refused with the engine's own 403, worded by
@@ -1624,7 +1624,7 @@ async fn an_invalid_name_a_missing_domain_and_a_non_owner_are_refused_honestly()
     .unwrap();
     assert_eq!(forbidden.status(), 403);
 
-    // F11: the owner rule is the same for `local_only` - the engine checks
+    // The owner rule is the same for `local_only` - the engine checks
     // ownership before it branches on the flag (`rename_domain.rs:131-137`
     // runs ahead of the `local_only` split) - so the non-owner refusal is not
     // something a caller can dodge by asking for the local-only path.
@@ -1641,8 +1641,8 @@ async fn an_invalid_name_a_missing_domain_and_a_non_owner_are_refused_honestly()
     assert_eq!(forbidden_local.status(), 403);
 }
 
-/// A full rename whose MANIFEST cannot be written here (F11's ruling names
-/// the unix read-only folder as the test): a 422 that names `--local`, never
+/// A full rename whose MANIFEST cannot be written here (a read-only folder,
+/// which only unix can set up this way): a 422 that names `--local`, never
 /// a 409 or a wedged rename. `local_only: true` beside it needs no write at
 /// all and goes through on the very same folder.
 #[cfg(unix)]
@@ -1846,9 +1846,9 @@ async fn an_instance_on_this_machines_own_index_renames() {
 /// declares `domain_name: secretcanon` and is closed to `root` alone;
 /// `eddy` (an instance editor, not an admin, no membership on `scrap`) owns a
 /// private domain of his own, `mine`, and renames it onto `secretcanon`.
-/// Before the engine fix this leaked `scrap`'s local name through
-/// `shadows`/`note`, reachable over HTTP for the first time by this task
-/// (review focus: a hidden domain must name no spelling of itself).
+/// A hidden domain must name no spelling of itself: without that rule the
+/// report would leak `scrap`'s local name through `shadows` or `note`, over
+/// HTTP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rename_onto_a_hidden_domains_canonical_name_never_names_it() {
     let fx = serve(Options::default()).await;

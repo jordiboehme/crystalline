@@ -2914,7 +2914,8 @@ pub async fn rename(
         // and the caller may make it, the resource just cannot take it
         // right now. The generic conversion folds `Conflict` into the
         // malformed-request 422 alongside `Invalid`, which is right for
-        // most callers of it but wrong here (F11): every other variant
+        // most callers of it but wrong here, where a conflict is a 409: every
+        // other variant
         // `Engine::rename_domain` raises classifies correctly through it -
         // `Invalid` as 422, `Forbidden` as 403 (the non-owner refusal),
         // `ReadOnly` as 403.

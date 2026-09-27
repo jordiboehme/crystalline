@@ -296,8 +296,8 @@ async fn the_repo_default_name_still_adopts_an_origin_less_domain_in_place() {
     );
 }
 
-/// Ruling 2026-09-26 (option A): a team domain never gets `domain_name`
-/// written into its MANIFEST automatically, whatever `name_origin` is. An
+/// A team domain never gets `domain_name` written into its MANIFEST
+/// automatically, whatever `name_origin` is: the owner adds it upstream. An
 /// explicit name at connect lands in the config only; the MANIFEST that
 /// declares none stays exactly as the team has it, with no pending local
 /// change and no proposal.
@@ -468,8 +468,8 @@ async fn a_nameless_connect_is_not_answered_by_an_explicitly_named_connection() 
     assert_eq!(entry.origin.unwrap().branch(), "main");
 }
 
-/// Ruling 2026-09-26 (option A): a team domain never gets `domain_name`
-/// written into its MANIFEST automatically, whatever its name's origin. So
+/// A team domain never gets `domain_name` written into its MANIFEST
+/// automatically, whatever its name's origin. So
 /// an explicit name at connect leaves the MANIFEST exactly as the team has
 /// it - no pending local change - and review mode is available immediately,
 /// with nothing to discard first.
@@ -505,8 +505,8 @@ async fn review_mode_right_after_a_named_connect_starts_immediately() {
         .expect("nothing pending to block review mode");
 }
 
-/// Ruling 2026-09-26 (option A) resolved what used to be a pinned conflict
-/// here: with no automatic write-back, nothing of ours sits over the
+/// With no automatic write-back into a team domain's MANIFEST, nothing of
+/// ours sits over the
 /// MANIFEST's frontmatter after a named connect, so a later upstream edit to
 /// it pulls in clean instead of conflicting.
 #[tokio::test]

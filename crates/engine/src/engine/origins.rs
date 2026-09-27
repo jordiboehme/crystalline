@@ -159,7 +159,7 @@ impl Engine {
         // keep adopting an origin-less domain that holds them in place, as
         // they always have; a MANIFEST-declared name that is taken has
         // already stepped to `<name>-2` above and never adopts. This one
-        // flag is the whole ruling, so a different one flips it here.
+        // flag decides both cases.
         let adopts_in_place = !declared_by_manifest;
         // A registered name is adoptable when it is an origin-less file
         // domain and the caller does not point somewhere else: the origin

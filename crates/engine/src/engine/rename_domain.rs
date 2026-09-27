@@ -146,7 +146,8 @@ impl Engine {
         if let Some(crate::rename::MachineOwner::Unknown(reason)) = &self.machine_owner {
             return Err(EngineError::Conflict(format!(
                 "this machine's own index and configuration cannot be named ({}), so renames \
-                 are off until its configuration loads again. Nothing was renamed",
+                 are off in this Crystalline. Nothing was renamed. Fix the configuration so it \
+                 loads, then restart the daemon or the MCP server",
                 if may_see_server_paths(scope) {
                     reason.as_str()
                 } else {
@@ -432,17 +433,29 @@ impl Engine {
         // anything but this machine's own index and configuration: `crystalline
         // doctor` names such a journal and how to finish or drop it.
         if let Some(why) = self.off_machine().await? {
+            let hint = if matches!(
+                self.machine_owner,
+                Some(crate::rename::MachineOwner::Unknown(_))
+            ) {
+                "fix this machine's configuration so it loads, then restart the daemon or the \
+                 MCP server, which finishes it before serving"
+                    .to_string()
+            } else {
+                finish_elsewhere_hint(&journal)
+            };
             tracing::warn!(
                 "the rename of domain '{}' to '{}' that an earlier run left half done is left \
-                 alone here: {why}. To finish it, {}",
+                 alone here: {why}. To finish it, {hint}",
                 journal.old,
                 journal.new,
-                finish_elsewhere_hint(&journal)
             );
             return Ok(None);
         }
         if let Some(crate::rename::MachineOwner::Known(machine)) = &self.machine_owner
-            && journal.owner.as_ref() != Some(machine)
+            && !journal
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.same_as(machine))
         {
             tracing::warn!(
                 "the rename of domain '{}' to '{}' that an earlier run left half done is left \
@@ -599,7 +612,7 @@ impl Engine {
     ) -> Result<Option<String>> {
         let here = self.rename_owner(state_dir).await?;
         Ok(match &journal.owner {
-            Some(owner) if *owner == here => None,
+            Some(owner) if owner.same_as(&here) => None,
             Some(owner) => Some(format!(
                 "it belongs to {}, and this command opened {}",
                 owner.describe(),
@@ -1536,8 +1549,10 @@ fn finish_hint(journal: &RenameJournal) -> String {
 fn finish_elsewhere_hint(journal: &RenameJournal) -> String {
     format!(
         "run `crystalline domain rename {} {}{}` without --db and --config, or restart the \
-         daemon, which finishes it before serving; when neither does, `crystalline doctor` \
-         names the command that finishes it with the index and configuration it recorded",
+         daemon, which finishes it before serving. When it was recorded against another \
+         spelling of this machine's configuration or database, `crystalline doctor` says what \
+         to put back first, and `crystalline doctor --discard-rename` drops it, leaving the \
+         steps already done as they are",
         journal.old,
         journal.new,
         if journal.local_only { " --local" } else { "" }

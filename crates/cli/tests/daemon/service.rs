@@ -1809,6 +1809,97 @@ fn a_daemon_on_another_index_refuses_a_rename_and_lines_up_no_names() {
     let _ = child.wait();
 }
 
+/// A daemon started before this machine's configuration file exists, the
+/// way a fresh install starts one, then a domain added through it and
+/// renamed through it: the configuration written after the start is still
+/// this machine's own, so the rename goes through. `config_home` points
+/// `XDG_CONFIG_HOME` somewhere else for every command, when given.
+fn serve_before_the_configuration_exists_then_rename(env: &Env, config_home: Option<&Path>) {
+    let command = || {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        if let Some(home) = config_home {
+            cmd.env("XDG_CONFIG_HOME", home);
+        }
+        cmd
+    };
+    let config_file = config_home
+        .map(|home| home.join("crystalline/config.yaml"))
+        .unwrap_or_else(|| env.config_path());
+    assert!(!config_file.exists(), "no configuration yet");
+    let dir = env.dir.join("kb-eng");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n",
+    )
+    .unwrap();
+
+    let mut child = command()
+        .args(["serve"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !command()
+        .args(["ctl", "status", "--json"])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon not ready"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let run = |args: &[&str]| {
+        let out = command().args(args).output().unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (ok, out) = run(&["domain", "add", "eng", dir.to_str().unwrap()]);
+    assert!(ok, "{out}");
+    assert!(config_file.is_file(), "the daemon wrote the configuration");
+    let (ok, out) = run(&["domain", "rename", "eng", "platform", "--local"]);
+    assert!(ok, "this machine's own daemon renames: {out}");
+    let cfg: GlobalConfig = config::load_yaml(&config_file).unwrap();
+    assert!(cfg.domains.contains_key("platform") && !cfg.domains.contains_key("eng"));
+
+    let _ = run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
+/// The plain case: a daemon started with no configuration file yet renames
+/// once one was written through it. On macOS the test's `/tmp` is itself a
+/// symlink.
+#[test]
+fn a_daemon_started_before_the_configuration_exists_still_renames() {
+    let env = Env::new("svnocfg");
+    serve_before_the_configuration_exists_then_rename(&env, None);
+}
+
+/// The same with the configuration folder reached through a symlink, on
+/// every platform.
+#[test]
+fn a_daemon_started_before_a_symlinked_configuration_exists_still_renames() {
+    let env = Env::new("svlnkcfg");
+    let real = env.dir.join("real-config");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = env.dir.join("config-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    serve_before_the_configuration_exists_then_rename(&env, Some(&link));
+}
+
 /// A daemon that cannot name this machine's own index (its default
 /// configuration does not load, and it was started on another one with
 /// `--config`) refuses a rename and says why, and nothing moves: an unknown
@@ -1836,7 +1927,9 @@ fn a_daemon_that_cannot_name_this_machines_index_refuses_a_rename() {
     let (ok, out, err) = env.run_full(&["domain", "rename", "eng", "platform", "--local"]);
     assert!(!ok, "the rename is refused: {out}{err}");
     assert!(
-        err.contains("cannot be named") && err.contains("Nothing was renamed"),
+        err.contains("cannot be named")
+            && err.contains("Nothing was renamed")
+            && err.contains("restart the daemon"),
         "{err}"
     );
     assert!(

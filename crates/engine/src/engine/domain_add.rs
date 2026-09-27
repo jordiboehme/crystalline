@@ -74,7 +74,7 @@ impl Engine {
         // and how the name was arrived at. A caller-given name is always
         // explicit; a name derived from the folder's MANIFEST or, failing
         // that, its basename is derived. `taken` for the MANIFEST-declared
-        // name is the one rule every surface uses (F8): a registered local
+        // name is the one rule every surface uses: a registered local
         // name, or any spelling the name table already resolves - not just
         // another file domain at a different path, which is all
         // `unique_domain_name`'s own fallback checks.

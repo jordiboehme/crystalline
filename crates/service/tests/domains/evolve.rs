@@ -3094,7 +3094,7 @@ async fn f5_fixture() -> (tempfile::TempDir, Arc<Engine>) {
     .unwrap();
     std::fs::write(
         eng_dir.join("target.md"),
-        "---\ntype: engram\ntitle: Target\npermalink: target\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe shared target every spelling below points at.\n\n- [context] planted for the F5 fixture\n",
+        "---\ntype: engram\ntitle: Target\npermalink: target\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe shared target every spelling below points at.\n\n- [context] planted as the target every spelling reaches\n",
     )
     .unwrap();
     let mut eng_entry = DomainEntry::file(eng_dir);
@@ -3110,7 +3110,7 @@ async fn f5_fixture() -> (tempfile::TempDir, Arc<Engine>) {
     .unwrap();
     std::fs::write(
         ops_dir.join("cross-refs.md"),
-        "---\ntype: engram\ntitle: Cross refs\npermalink: cross-refs\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng:target]] (canonical) and [[engineering:target]] (alias), plus one broken [[eng:No Such Title]].\n\n- [context] planted for the F5 fixture\n",
+        "---\ntype: engram\ntitle: Cross refs\npermalink: cross-refs\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nSee [[eng:target]] (canonical) and [[engineering:target]] (alias), plus one broken [[eng:No Such Title]].\n\n- [context] planted with every spelling of the domain\n",
     )
     .unwrap();
     cfg.domains

@@ -1299,7 +1299,7 @@ fn refuse_rename_off_this_machine(
     let home = machine_rename_owner().map_err(|e| {
         anyhow::anyhow!(
             "this machine's own index and configuration cannot be named ({e:#}), so renames are \
-             off until its configuration loads again. Nothing was renamed"
+             off. Nothing was renamed. Fix the configuration so it loads, and run this again"
         )
     })?;
     let differences = opened.differences_from(&home);
@@ -1328,7 +1328,8 @@ pub(crate) fn machine_owner_for_engine() -> anyhow::Result<crystalline_engine::R
     if let Err(e) = &lookup {
         tracing::warn!(
             "this machine's own index could not be named ({e:#}); renames and the lining up \
-             of domain names are off until its configuration loads"
+             of domain names are off in this process. Fix the configuration so it loads, then \
+             restart the daemon or the MCP server"
         );
     }
     lookup

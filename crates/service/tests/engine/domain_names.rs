@@ -918,7 +918,7 @@ async fn readding_an_adopted_registration_writes_nothing_twice() {
     assert_eq!(after_first, after_second, "no second write");
 }
 
-/// Review Focus 5: an explicit name that looks like a bare YAML number
+/// An explicit name that looks like a bare YAML number
 /// (`1.0`) still round-trips as the string it is: the write-back writes it
 /// quoted, so the declared name reads back exactly as given.
 #[tokio::test]

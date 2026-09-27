@@ -1134,7 +1134,12 @@ fn rename_doctor(
     pending: &crystalline_service::PendingRename,
     here: Option<&crystalline_service::RenameOwner>,
 ) -> RenameDoctor {
-    let belongs_here = matches!((&pending.owner, here), (Some(owner), Some(here)) if owner == here);
+    // Both sides spelled canonically as of now, so a journal or an owner
+    // recorded before a file existed compares as the engine compares it.
+    let recorded = pending.owner.as_ref().map(|o| o.normalized());
+    let here_now = here.map(|h| h.normalized());
+    let here = here_now.as_ref();
+    let belongs_here = matches!((&recorded, here), (Some(owner), Some(here)) if owner == here);
     let local = if pending.local_only { " --local" } else { "" };
     let plain = format!(
         "crystalline domain rename {} {}{local}",
@@ -1148,7 +1153,7 @@ fn rename_doctor(
     let (finish, restore) = if belongs_here {
         (Some(plain), Vec::new())
     } else {
-        match (&pending.owner, here) {
+        match (&recorded, here) {
             (Some(owner), Some(here)) if owner.state_dir == here.state_dir => {
                 let mut restore = Vec::new();
                 let mut restorable = true;

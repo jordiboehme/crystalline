@@ -443,8 +443,8 @@ async fn github_domain_name_peek_needs_admin_and_a_connection() {
     let admin = login(fx.addr, "root", "rootpw").await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
-    // `repo` is a required query parameter now (F11's sibling fix: the
-    // OpenAPI document and the generated Fluid types must say so too), so an
+    // `repo` is a required query parameter (the OpenAPI document and the
+    // generated Fluid types say so too), so an
     // entirely absent one fails query deserialization before this handler
     // runs at all - a 400, axum's own rejection status, rather than the
     // handler's 422.

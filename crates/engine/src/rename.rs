@@ -197,6 +197,23 @@ impl RenameOwner {
         )
     }
 
+    /// The same owner with every path spelled canonically as of now: a
+    /// journal or a machine owner recorded before a file existed compares
+    /// equal to one recorded after. Applied to both sides of a comparison.
+    pub fn normalized(&self) -> RenameOwner {
+        RenameOwner {
+            index: self.index.as_deref().map(|i| canonical_text(Path::new(i))),
+            config: self.config.as_deref().map(|c| canonical_text(Path::new(c))),
+            state_dir: canonical_text(Path::new(&self.state_dir)),
+        }
+    }
+
+    /// Whether `self` and `other` name the same index, configuration and
+    /// state directory, each spelled canonically as of now.
+    pub fn same_as(&self, other: &RenameOwner) -> bool {
+        self.normalized() == other.normalized()
+    }
+
     /// The three, for a log line or a refusal.
     pub fn describe(&self) -> String {
         format!(
@@ -211,27 +228,29 @@ impl RenameOwner {
     /// both sides (`self` first as "this command opened", `other` second as
     /// "this machine's own"); empty when the two are the same.
     pub fn differences_from(&self, other: &RenameOwner) -> Vec<String> {
+        let (this, other) = (self.normalized(), other.normalized());
+        let (this, other) = (&this, &other);
         let side =
             |value: &Option<String>, none: &str| value.clone().unwrap_or_else(|| none.to_string());
         let mut parts = Vec::new();
-        if self.index != other.index {
+        if this.index != other.index {
             parts.push(format!(
                 "the index {} is not this machine's own index {}",
-                side(&self.index, "in memory"),
+                side(&this.index, "in memory"),
                 side(&other.index, "in memory")
             ));
         }
-        if self.config != other.config {
+        if this.config != other.config {
             parts.push(format!(
                 "the configuration {} is not this machine's own configuration {}",
-                side(&self.config, "none"),
+                side(&this.config, "none"),
                 side(&other.config, "none")
             ));
         }
-        if self.state_dir != other.state_dir {
+        if this.state_dir != other.state_dir {
             parts.push(format!(
                 "the state directory {} is not this machine's own state directory {}",
-                self.state_dir, other.state_dir
+                this.state_dir, other.state_dir
             ));
         }
         parts
@@ -311,13 +330,40 @@ pub fn discard_pending_rename(state_dir: &Path) -> io::Result<()> {
     RenameJournal::remove(state_dir)
 }
 
-/// `path` in its canonical form when it exists, as given otherwise (a
-/// Postgres location, or a file not created yet).
-fn canonical_text(path: &Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
+/// `path` in its canonical form, the same before and after the file exists.
+///
+/// An existing path is canonicalized whole. An absolute path to a file not
+/// created yet (a configuration a daemon started before its first `domain
+/// add`) is spelled as its nearest existing ancestor, canonicalized, with the
+/// rest appended: so a folder reached through a symlink (`/tmp` on macOS) or
+/// spelled with Windows' verbatim `\\?\` prefix once canonical compares
+/// equal to itself before and after the file is written. A relative path
+/// that does not exist (a Postgres `host:port/db` location among them) is
+/// kept as given.
+pub(crate) fn canonical_text(path: &Path) -> String {
+    canonical_path(path).display().to_string()
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let mut missing = Vec::new();
+    let mut current = path;
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        missing.push(name.to_os_string());
+        if let Ok(mut canonical) = std::fs::canonicalize(parent) {
+            for name in missing.iter().rev() {
+                canonical.push(name);
+            }
+            return canonical;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// What a full rename's relink step respelled and what it left alone.
@@ -714,6 +760,60 @@ fn entry_names(parent: &Path) -> io::Result<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configuration not written yet, below a folder reached through a
+    /// symlink (`/tmp` on macOS), is spelled the way it will be once it
+    /// exists, so an owner recorded before the first `domain add` compares
+    /// equal to one recorded after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_file_below_a_symlinked_folder_is_spelled_as_it_will_be() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let path = tmp.path().join("link/crystalline/config.yaml");
+
+        let before = canonical_text(&path);
+        assert_eq!(
+            before,
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .join("crystalline/config.yaml")
+                .display()
+                .to_string()
+        );
+        std::fs::create_dir_all(real.join("crystalline")).unwrap();
+        std::fs::write(real.join("crystalline/config.yaml"), "").unwrap();
+        assert_eq!(canonical_text(&path), before);
+
+        let owner = |config: &str| RenameOwner {
+            index: None,
+            config: Some(config.to_string()),
+            state_dir: "/state".to_string(),
+        };
+        assert!(owner(&path.display().to_string()).same_as(&owner(&before)));
+        // A Postgres location is no path and stays as given.
+        assert_eq!(
+            canonical_text(Path::new("localhost:5432/kb")),
+            "localhost:5432/kb"
+        );
+    }
+
+    /// On Windows a canonical path carries the verbatim `\\?\` prefix; a
+    /// file not written yet gets it too, the same spelling it has once it
+    /// exists.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_file_carries_the_verbatim_prefix_it_will_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("crystalline").join("config.yaml");
+        let before = canonical_text(&path);
+        assert!(before.starts_with(r"\\?\"), "{before}");
+        std::fs::create_dir_all(tmp.path().join("crystalline")).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(canonical_text(&path), before);
+    }
 
     fn listing(parent: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(parent)
