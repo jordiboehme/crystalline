@@ -322,19 +322,24 @@ describe("a link that names its domain by another name", () => {
     expect(resolve("moonbase:Crater Base")).toEqual(CRATER);
   });
 
-  it("leaves a name no domain answers to as prose", () => {
-    // The `resolved: true` is the index's verdict: its resolve pass
-    // (`reference_match` in `index/src/store.rs`) falls back to the home
-    // domain for a prefix no spelling names, so it binds this link to home's
-    // `Crater Base`. `core/src/address.rs` instead reads the whole bracket
-    // text as a title at home. The two disagree, and this pins what Fluid does
-    // until that is settled: it follows core, and the link stays prose.
+  it("marks a name no domain answers to as unresolved", () => {
+    // The `resolved: false` is the server's verdict. An explicit prefix
+    // resolves only in the domain it names, in the index's resolve pass
+    // (`reference_match` in `index/src/store.rs`) as in core
+    // (`core/src/address.rs`). `mars` names no domain, so only the whole
+    // bracket text is tried at home, and no engram there is titled
+    // `mars:Crater Base`. Home's own `Crater Base` does not count. The link
+    // is drawn as unresolved, never as a link to home's `Crater Base`.
     const detail = namedDetail("moonbase", [
-      resolvedLink(1, "mars", "Crater Base"),
+      {
+        line: 1,
+        resolved: false,
+        target: { domain: "mars", target: "Crater Base" },
+      },
     ]);
     const resolve = buildWikilinkResolver(detail, namedGraph(), NAMED);
 
-    expect(resolve("mars:Crater Base")).toBeNull();
+    expect(resolve("mars:Crater Base")).toEqual({ kind: "unresolved" });
   });
 
   it("treats the home domain's canonical name as the home domain", () => {
