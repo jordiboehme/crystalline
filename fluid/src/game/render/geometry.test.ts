@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { boxKey } from "../world/box";
 import { CANNED_BRIDGE, CANNED_HUB, heroHallRoom } from "../world/canned";
+import { consoleRoom } from "../world/consoleRoom";
 import { generateRoom } from "../world/generate";
 import { BAY, isFloor } from "../world/layout";
 import type { PlaceInput, RoomSpec } from "../world/types";
@@ -14,8 +15,9 @@ import {
   type MeshData,
 } from "./geometry";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
-import { LOOKS } from "./looks";
+import { LOOKS, type Rgb } from "./looks";
 import { worstWinding } from "./modelChecks";
+import { CONSOLE_SHELL } from "./models/interior/common";
 
 const EPS = 1e-4;
 
@@ -344,5 +346,53 @@ describe("buildRoomMesh's hero movers", () => {
     expect(new Set(wings.map((m) => m.key))).toEqual(
       new Set(boxes.map(boxKey)),
     );
+  });
+});
+
+describe("the console room's shell (2.6e C4)", () => {
+  /** The shell's floor: upward faces at height 0 on the floor layer. */
+  const floorOf = (m: MeshData) =>
+    all(m).filter(
+      (v) =>
+        v.layer === LAYER.floor &&
+        Math.abs(v.pos[1]) < EPS &&
+        Math.abs(v.normal[1] - 1) < EPS,
+    );
+  const expectTint = (tint: readonly number[], want: Rgb) => {
+    expect(tint[0]).toBeCloseTo(want[0], 5);
+    expect(tint[1]).toBeCloseTo(want[1], 5);
+    expect(tint[2]).toBeCloseTo(want[2], 5);
+  };
+
+  it("draws the floor, the ceiling and the walls in the room's own tints in every look", () => {
+    // Mutation caught: the shell of a room with fittings drawn in the
+    // look's palette, so the console room's colours change with the look.
+    for (const look of Object.values(LOOKS)) {
+      const m = buildRoomMesh(consoleRoom(), look).static;
+      const floor = floorOf(m);
+      expect(floor.length).toBeGreaterThan(0);
+      for (const v of floor) expectTint(v.tint, CONSOLE_SHELL.floor);
+      const ceiling = all(m).filter((v) => v.layer === LAYER.ceiling);
+      const panels = ceiling.filter((v) => v.flag === FLAG.lit);
+      expect(panels.length).toBeGreaterThan(0);
+      for (const v of panels) expectTint(v.tint, CONSOLE_SHELL.ceiling);
+      const walls = all(m).filter(
+        (v) => v.layer === LAYER.panel && Math.abs(v.normal[1]) < EPS,
+      );
+      expect(walls.length).toBeGreaterThan(0);
+      for (const v of walls) expectTint(v.tint, CONSOLE_SHELL.wall);
+    }
+  });
+
+  it("leaves a generated room's floor in the look's own colour", () => {
+    // Mutation caught: every room's shell drawn in the console room's
+    // tints.
+    for (const look of Object.values(LOOKS)) {
+      const floor = floorOf(
+        buildRoomMesh(generateRoom(CANNED_BRIDGE), look).static,
+      );
+      expect(floor.length).toBeGreaterThan(0);
+      for (const v of floor) expectTint(v.tint, look.palette.floor);
+    }
   });
 });

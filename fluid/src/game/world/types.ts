@@ -11,6 +11,11 @@
  * no DOM. Same input and same `GAME_VERSION` give the same `RoomSpec` byte
  * for byte, which is what the golden tests pin and what lets a live change be
  * diffed room against room.
+ *
+ * One hand-built room, the console room (`consoleRoom.ts`), also carries
+ * `interior`: its fittings, a family of their own (`InteriorPiece`). No
+ * generated room has the key, and an absent key is not written by
+ * `JSON.stringify`, so the goldens do not see it.
  */
 
 /** Where a reference lands, once the graph located it. */
@@ -427,6 +432,32 @@ export interface Hero {
 }
 
 /**
+ * The fittings of the console room (2.6e C2), named by their shape: a wall
+ * of roundels, the inner doors, the scanner and the console. They are not
+ * heroes: no pool draws them and no generated room carries them.
+ */
+export type InteriorKind =
+  "roundel-wall" | "inner-doors" | "scanner" | "console";
+
+/**
+ * One fitting of the console room, with a hero's conventions: `x` and `y`
+ * in `Decor`'s continuous cell units, the centre of its box for the free
+ * console and its wall point for a flush wall piece (`wallAnchor` in
+ * `sites.ts`; the inner doors, two edges wide, at the point between their
+ * two edges); `turn` 0-3 quarter turns clockwise from facing north, a wall
+ * piece taking its wall's `turnForSide`; `variant` indexes the kind's
+ * variants in `INTERIOR_CATALOGUE` (`consoleRoom.ts`); `seed` its own seed.
+ */
+export interface InteriorPiece {
+  kind: InteriorKind;
+  variant: number;
+  x: number;
+  y: number;
+  turn: number;
+  seed: number;
+}
+
+/**
  * What a surface is for (C3): a desk top, a bench top, a table, a shelf
  * level or cabinet top, or an `under` spot for the trap and the case -
  * ordinarily below a host's top (the floor in its knee space, or a lower
@@ -603,6 +634,12 @@ export interface RoomSpec {
    * last, after the dressing. They never collide and move nothing.
    */
   curios: Curio[];
+  /**
+   * The console room's fittings, 2.6e C2; absent on every generated room.
+   * Drawn instanced as their own family (`interiorInstances`), and the
+   * free-standing ones collide (`interiorFootprint`).
+   */
+  interior?: InteriorPiece[];
   lights: LightZone[];
   /** How many fixtures found no wall slot and were left out. */
   dropped: number;

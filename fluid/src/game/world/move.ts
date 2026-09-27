@@ -14,7 +14,8 @@
  * machine sized by its kind (`FOOTPRINTS` in `footprints.ts`), each piece
  * of the archetype's furniture turned with it, the scaffold frames of a room
  * under construction, every floor prop of the set dressing and every hero
- * prop but the flush wall-mounted ones (`heroBlocker`). The grid's
+ * prop but the flush wall-mounted ones (`heroBlocker`), and in the console
+ * room its free-standing console (`interiorFootprint`). The grid's
  * bounding rectangle is still clamped to as a backstop. The two axes are
  * resolved one after the other, which is what lets the player slide along a
  * wall instead of stopping dead when walking into it at an angle.
@@ -28,6 +29,7 @@ import {
   heroBlocker,
   propFootprint,
 } from "./footprints";
+import { interiorFootprint } from "./consoleRoom";
 import { isFloor } from "./layout";
 import type { Box, RoomSpec } from "./types";
 import { CELL } from "./units";
@@ -95,10 +97,11 @@ export function spawnPlayer(room: RoomSpec): Player {
  * The boxes the player collides with besides the grid: the terminals and
  * machines (`footprintOf`), the furniture (`decorFootprint`), the scaffold
  * frames the generator put up (`room.scaffold`), the floor props of the
- * set dressing (`propFootprint`) and the heroes (`heroBlocker`). Flush
- * fixtures, pipe runs, the wall and ceiling props and the flush wall heroes
- * are left out: they hang on a wall or overhead. Built once per room, not
- * per tick.
+ * set dressing (`propFootprint`), the heroes (`heroBlocker`) and the
+ * console room's fittings (`interiorFootprint`: the console's desk). Flush
+ * fixtures, pipe runs, the wall and ceiling props, the flush wall heroes
+ * and the flush fittings are left out: they hang on a wall or overhead.
+ * Built once per room, not per tick.
  */
 export function blockersFor(room: RoomSpec): Box[] {
   const out: Box[] = [];
@@ -117,6 +120,10 @@ export function blockersFor(room: RoomSpec): Box[] {
   }
   for (const h of room.heroes) {
     const box = heroBlocker(h);
+    if (box !== null) out.push(box);
+  }
+  for (const p of room.interior ?? []) {
+    const box = interiorFootprint(p);
     if (box !== null) out.push(box);
   }
   return out;

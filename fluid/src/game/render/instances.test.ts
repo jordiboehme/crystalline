@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { CANNED_WORKSHOP, galleryRoom } from "../world/canned";
+import {
+  CANNED_BRIDGE,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
+  galleryRoom,
+} from "../world/canned";
+import { consoleRoom } from "../world/consoleRoom";
 import { generateRoom } from "../world/generate";
 import type { Hero, Prop } from "../world/types";
 import { CELL } from "../world/units";
@@ -11,11 +17,14 @@ import {
   heroInstances,
   heroKey,
   instanceGroups,
+  interiorInstances,
+  interiorKey,
   propInstances,
   propKey,
 } from "./instances";
 import { turnMat2Columns } from "./kit";
 import { HERO_BANK } from "./models/heroes/common";
+import { INTERIOR_BANK } from "./models/interior/common";
 import { PROP_BANK } from "./models/props/common";
 import { SCENE_VS } from "./shaders";
 
@@ -255,6 +264,54 @@ describe("curioInstances", () => {
     const keys = all.map((g) => g.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(instanceGroups(room).at(-1)?.family).toBe("curio");
+  });
+});
+
+describe("interiorInstances (2.6e C2)", () => {
+  it("groups the console room's fittings in their own key space, after every other family", () => {
+    // Mutation caught: the interior family left out of `instanceGroups`,
+    // a key without its prefix (it could meet a prop's), or the console's
+    // slot not its twinkling bank.
+    const room = consoleRoom();
+    const pieces = room.interior ?? [];
+    expect(pieces.length).toBeGreaterThan(0);
+    const groups = interiorInstances(room);
+    expect(groups.reduce((n, g) => n + g.count, 0)).toBe(pieces.length);
+    for (const g of groups) {
+      expect(g.family).toBe("interior");
+      expect(g.key).toBe(`interior:${g.kind}:${String(g.variant)}`);
+      expect(g.key).toBe(interiorKey(g.kind, g.variant));
+      for (let i = 0; i < g.count; i++) {
+        expect(g.data[i * INSTANCE_FLOATS + 1]).toBe(0);
+        expect(g.data[i * INSTANCE_FLOATS + 4]).toBe(
+          bankSlot(INTERIOR_BANK[g.kind]),
+        );
+      }
+    }
+    const desk = groups.find((g) => g.kind === "console");
+    expect(Array.from(desk?.data ?? [])).toEqual([
+      3 * CELL,
+      0,
+      3 * CELL,
+      0,
+      bankSlot("twinkle"),
+    ]);
+    const all = instanceGroups(room);
+    expect(all.slice(-groups.length)).toEqual(groups);
+    expect(all.filter((g) => g.family === "interior")).toEqual(groups);
+  });
+
+  it("gives every generated canned room no interior group", () => {
+    // Mutation caught: a generated room given fittings (a golden would
+    // move) or an interior group made from nothing.
+    for (const place of [CANNED_BRIDGE, CANNED_WORKSHOP, CANNED_HUB]) {
+      const room = generateRoom(place);
+      expect(room.interior).toBeUndefined();
+      expect(interiorInstances(room)).toEqual([]);
+      expect(instanceGroups(room).some((g) => g.family === "interior")).toBe(
+        false,
+      );
+    }
   });
 });
 

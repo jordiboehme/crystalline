@@ -1,15 +1,17 @@
 /**
- * The set dressing, the heroes and the curios as instance data: one group
- * per prop kind and variant, one per hero kind and variant and one per
- * curio kind and variant, each holding one short record per instance for
- * the GPU.
+ * The set dressing, the heroes, the curios and the console room's
+ * fittings as instance data: one group per prop kind and variant, one per
+ * hero kind and variant, one per curio kind and variant and one per
+ * fitting kind and variant, each holding one short record per instance
+ * for the GPU.
  *
  * Every prop model is built once at the origin (`buildPropMesh` in
  * `models/props/index.ts`), and so is every hero model (`buildHeroMesh` in
  * `models/heroes/index.ts`) and every curio model (`buildCurioMesh` in
  * `models/curios/index.ts`); the scene vertex shader turns each instance
  * by its quarter turns and moves it to its anchor. This module is the pure
- * half of that: it reads `room.props`, `room.heroes` and `room.curios` and
+ * half of that: it reads `room.props`, `room.heroes`, `room.curios` and
+ * `room.interior` and
  * writes the per-instance floats, so what the renderer uploads is tested
  * without a GL context. The renderer uploads one instance buffer per group
  * and draws the group's mesh once with `drawArraysInstanced`.
@@ -25,13 +27,27 @@
  * (`curioKey`, `curio:<kind>:<variant>`). An instance's height is the
  * surface the curio stands on (`Curio.h`), not the floor, and its slot is
  * its kind's blink bank (`CURIO_BANK`, C16).
+ *
+ * The console room's fittings are the fourth family (2.6e C2), in a key
+ * space of their own (`interiorKey`, `interior:<kind>:<variant>`), built
+ * once at the origin by `buildInteriorMesh` (`models/interior/index.ts`).
+ * An instance stands on the floor, and its slot is its kind's blink bank
+ * (`INTERIOR_BANK`), which the console's small lights and the roundels'
+ * glow pulse with. Only a room with `interior` has any.
  */
 
-import type { CurioKind, HeroKind, PropKind, RoomSpec } from "../world/types";
+import type {
+  CurioKind,
+  HeroKind,
+  InteriorKind,
+  PropKind,
+  RoomSpec,
+} from "../world/types";
 import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
 import { CURIO_BANK } from "./models/curios/common";
 import { HERO_BANK } from "./models/heroes/common";
+import { INTERIOR_BANK } from "./models/interior/common";
 import { PROP_BANK } from "./models/props/common";
 
 /**
@@ -69,6 +85,16 @@ export function heroKey(kind: HeroKind, variant: number): string {
  */
 export function curioKey(kind: CurioKind, variant: number): string {
   return `curio:${kind}:${String(variant)}`;
+}
+
+/**
+ * The key a console room fitting's mesh is cached and grouped under:
+ * `interior:<kind>:<variant>`. The prefix keeps it apart from every
+ * `propKey`, `heroKey` and `curioKey`, so the renderer's one mesh cache
+ * holds all four families without a collision.
+ */
+export function interiorKey(kind: InteriorKind, variant: number): string {
+  return `interior:${kind}:${String(variant)}`;
 }
 
 /**
@@ -113,8 +139,22 @@ export interface CurioGroup {
   data: Float32Array;
 }
 
-/** One instance group of any of the three families; `family` tells them apart. */
-export type InstanceGroup = PropGroup | HeroGroup | CurioGroup;
+/**
+ * All instances of one console room fitting kind and variant: `count`
+ * records of `INSTANCE_FLOATS` floats in `data`, in the order the pieces
+ * appear in `room.interior`.
+ */
+export interface InteriorGroup {
+  key: string;
+  family: "interior";
+  kind: InteriorKind;
+  variant: number;
+  count: number;
+  data: Float32Array;
+}
+
+/** One instance group of any of the four families; `family` tells them apart. */
+export type InstanceGroup = PropGroup | HeroGroup | CurioGroup | InteriorGroup;
 
 /**
  * Groups records by key and sorts the groups by key, so the draw order is
@@ -233,13 +273,40 @@ export function curioInstances(room: RoomSpec): CurioGroup[] {
 }
 
 /**
+ * The console room's fittings as instance groups, one per distinct kind
+ * and variant, sorted by key. Each instance is `x * CELL`, 0 (every
+ * fitting stands on the floor), `y * CELL`, the turn and its kind's blink
+ * bank slot (`bankSlot(INTERIOR_BANK[kind])`). A room without `interior`
+ * (every generated room) gives no groups. A pure function: the same room
+ * gives equal arrays.
+ */
+export function interiorInstances(room: RoomSpec): InteriorGroup[] {
+  return grouped(
+    (room.interior ?? []).map((p) => ({
+      key: interiorKey(p.kind, p.variant),
+      kind: p.kind,
+      variant: p.variant,
+      floats: [
+        p.x * CELL,
+        0,
+        p.y * CELL,
+        p.turn,
+        bankSlot(INTERIOR_BANK[p.kind]),
+      ],
+    })),
+  ).map((g) => ({ ...g, family: "interior" as const }));
+}
+
+/**
  * Every instance group the renderer draws: the props' groups, then the
- * heroes', then the curios', each family sorted by key.
+ * heroes', then the curios', then the console room fittings', each family
+ * sorted by key.
  */
 export function instanceGroups(room: RoomSpec): InstanceGroup[] {
   return [
     ...propInstances(room),
     ...heroInstances(room),
     ...curioInstances(room),
+    ...interiorInstances(room),
   ];
 }

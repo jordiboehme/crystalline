@@ -10,25 +10,28 @@
  * small light upload, the blink gains (`uBlink`, the blink banks of
  * `blink.ts`, H11), the room and its moving parts (each mover drawn with
  * the uniforms `moverDraw` in `parts.ts` gives it), one instanced draw per
- * prop, hero or curio kind and variant, and six full-screen passes. The
+ * prop, hero, curio or fitting kind and variant, and six full-screen passes. The
  * scene is rendered at the canvas size handed to `resize`, the bloom at
  * half of that and below. The static room is drawn at `restDraw`, the
  * movers at their own uniforms, and the uniforms go back to `restDraw`
  * before the instance groups and once more after them, so `uGain` is 1
- * for every prop, hero and curio and no later draw inherits a mover's
+ * for every prop, hero, curio and fitting and no later draw inherits a mover's
  * gain or turn (`uModelYaw`, a swinging leaf's cosine and sine).
  *
- * The set dressing, the heroes and the curios are drawn instanced (see
+ * The set dressing, the heroes, the curios and the console room's
+ * fittings are drawn instanced (see
  * `instances.ts`). Heroes are instanced like props, in their own key space
  * (`hero:<kind>:<variant>`), their slot their kind's blink bank. Curios
  * are the third family, in a key space of their own
  * (`curio:<kind>:<variant>`), each instance at the height of the surface
- * it stands on and its slot its kind's blink bank. The group's family
- * picks the builder (`buildGroupMesh`). Each kind and variant the room
+ * it stands on and its slot its kind's blink bank. The console room's
+ * fittings are the fourth (`interior:<kind>:<variant>`), standing on the
+ * floor, their slot their kind's blink bank. The group's family picks the
+ * builder (`buildGroupMesh`). Each kind and variant the room
  * needs is built once as its own mesh in the look's colours and kept in a
  * cache keyed by the group's key; the cache is cleared when the look's id
- * changes and otherwise grows lazily, bounded by the prop, hero and curio
- * catalogues. The condition does not enter the key: it changes only grime
+ * changes and otherwise grows lazily, bounded by the prop, hero, curio and
+ * fitting catalogues. The condition does not enter the key: it changes only grime
  * and light scale, never the palette a mesh is coloured from (a look test
  * pins that). The room's instance buffers depend only on the room, so a
  * look switch, which calls `setRoom` again with the very same room object,
@@ -58,7 +61,13 @@ import { createProgram, type Program } from "../gl/program";
 import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
 import type { FaultFrame } from "../world/malfunction";
-import type { CurioKind, HeroKind, PropKind, RoomSpec } from "../world/types";
+import type {
+  CurioKind,
+  HeroKind,
+  InteriorKind,
+  PropKind,
+  RoomSpec,
+} from "../world/types";
 import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
 import { instanceGroups } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
@@ -67,6 +76,7 @@ import { C64_PALETTE, applyCondition, type Look, type LookId } from "./looks";
 import type { MoverPart } from "./models";
 import { buildCurioMesh } from "./models/curios";
 import { buildHeroMesh } from "./models/heroes";
+import { buildInteriorMesh } from "./models/interior";
 import { buildPropMesh } from "./models/props";
 import { moverDraw, restDraw, type MoverDraw } from "./parts";
 import {
@@ -162,13 +172,15 @@ interface GpuMover {
 type GroupMesh =
   | { key: string; family: "prop"; kind: PropKind; variant: number }
   | { key: string; family: "hero"; kind: HeroKind; variant: number }
-  | { key: string; family: "curio"; kind: CurioKind; variant: number };
+  | { key: string; family: "curio"; kind: CurioKind; variant: number }
+  | { key: string; family: "interior"; kind: InteriorKind; variant: number };
 
 /**
  * A group's mesh in `look`'s colours, from its family's builder: a prop's
- * `buildPropMesh`, a hero's `buildHeroMesh` or a curio's `buildCurioMesh`.
- * The switch is exhaustive, so a fourth family fails the typecheck here
- * until it is given its builder.
+ * `buildPropMesh`, a hero's `buildHeroMesh`, a curio's `buildCurioMesh` or
+ * a console room fitting's `buildInteriorMesh`. The switch is exhaustive,
+ * so a fifth family fails the typecheck here until it is given its
+ * builder.
  */
 function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
   switch (g.family) {
@@ -178,6 +190,8 @@ function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
       return buildHeroMesh(g.kind, g.variant, look);
     case "curio":
       return buildCurioMesh(g.kind, g.variant, look);
+    case "interior":
+      return buildInteriorMesh(g.kind, g.variant, look);
     default: {
       const never: never = g;
       throw new Error(`renderer: no builder for ${JSON.stringify(never)}`);
@@ -186,7 +200,7 @@ function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
 }
 
 /**
- * One prop, hero or curio kind and variant of the room on the GPU: which
+ * One prop, hero, curio or fitting kind and variant of the room on the GPU: which
  * mesh it draws (`id`), its instance buffer, kept while the room stays the
  * same, and the vertex array that binds it to the cached mesh of the
  * current look, remade on every `setRoom`.
@@ -307,7 +321,7 @@ export function createRenderer(
     groups = [];
   };
 
-  /** Deletes every cached prop, hero and curio mesh. */
+  /** Deletes every cached prop, hero, curio and fitting mesh. */
   const releaseGroupCache = () => {
     for (const v of groupMeshes.values()) v.dispose();
     groupMeshes.clear();
@@ -399,7 +413,7 @@ export function createRenderer(
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
       const needed: readonly GroupMesh[] =
         nextGroups ?? groups.map((g) => g.id);
-      // The prop, hero and curio meshes this room lacks in this look are
+      // The prop, hero, curio and fitting meshes this room lacks in this look are
       // built on the CPU before the old room is let go, like the room mesh,
       // so one that cannot be built leaves the old room drawn too.
       const fresh = new Map<string, MeshData>();
@@ -416,7 +430,7 @@ export function createRenderer(
       if (nextGroups !== null) {
         releaseGroups();
         // An instance group is a `GroupMesh` as it stands (its count and
-        // data ride along, a few floats each), so one map serves all three
+        // data ride along, a few floats each), so one map serves all four
         // families.
         groups = nextGroups.map((g) => ({
           id: g,

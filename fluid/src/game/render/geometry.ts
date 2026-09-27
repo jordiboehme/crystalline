@@ -8,7 +8,9 @@
  * parts of every way come back as movers, each its own small mesh, for the
  * renderer to slide, blink, scale or turn, and after them every hero's
  * moving parts (`buildHeroMovers`: a police box's two door leaves, keyed
- * by the hero's index in `room.heroes`). The heroes themselves are drawn
+ * by the hero's index in `room.heroes`), and last the console room
+ * fittings' (`buildInteriorMovers`, by the piece's index in
+ * `room.interior`). The heroes and the fittings themselves are drawn
  * instanced, without those parts. Per vertex: position, normal, a uv in
  * metres (so panel seams fall on whole numbers and the shader can draw
  * edge lines there), the texture array layer, a tint from the look, and a
@@ -33,7 +35,10 @@
  * cell and a wall quad on every edge where a floor cell meets void or the
  * grid's edge, the same rule `wallSlots` uses for the walls fixtures stand
  * against. The uv of every shell quad is its world position in metres, so
- * the seams run on unbroken across cells. The models themselves are built
+ * the seams run on unbroken across cells. A room with `interior` (the
+ * console room, 2.6e C4) draws its shell in `CONSOLE_SHELL`'s fixed tints
+ * on the same layers, whatever the look; its flush fittings cover the
+ * walls. The models themselves are built
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
@@ -53,6 +58,8 @@ import {
   type Mover,
 } from "./models";
 import { buildHeroMovers } from "./models/heroes";
+import { buildInteriorMovers } from "./models/interior";
+import { CONSOLE_SHELL } from "./models/interior/common";
 
 /**
  * Floats per vertex in the interleaved array: position 3, normal 3, uv 2,
@@ -455,11 +462,22 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const p = look.palette;
   const H = room.ceiling;
   const doorways = doorwayColumns(room);
-  const wall: Surface = { layer: LAYER.panel, tint: p.panel, flag: FLAG.lit };
-  const floor: Surface = { layer: LAYER.floor, tint: p.floor, flag: FLAG.lit };
+  // A room with fittings (the console room) keeps its own colours in
+  // every look (2.6e C4); every other room takes the look's.
+  const fitted = room.interior !== undefined;
+  const wall: Surface = {
+    layer: LAYER.panel,
+    tint: fitted ? CONSOLE_SHELL.wall : p.panel,
+    flag: FLAG.lit,
+  };
+  const floor: Surface = {
+    layer: LAYER.floor,
+    tint: fitted ? CONSOLE_SHELL.floor : p.floor,
+    flag: FLAG.lit,
+  };
   const ceiling: Surface = {
     layer: LAYER.ceiling,
-    tint: p.ceiling,
+    tint: fitted ? CONSOLE_SHELL.ceiling : p.ceiling,
     flag: FLAG.lit,
   };
   const building = room.condition === "construction";
@@ -524,6 +542,9 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
     movers.push(...buildFixture(kitAt, fx, i, ctx));
   });
   room.heroes.forEach((h, i) => movers.push(...buildHeroMovers(h, i, look)));
+  (room.interior ?? []).forEach((piece, i) =>
+    movers.push(...buildInteriorMovers(piece, i, look)),
+  );
   for (const d of room.decor) buildDecor(kitAt, d, ctx);
   return { static: b.build(), movers };
 }

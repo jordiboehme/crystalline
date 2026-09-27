@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import { consoleRoom, interiorFootprint } from "./consoleRoom";
 import {
   FIXTURE_DEPTH,
   FIXTURE_WIDTH,
@@ -837,5 +838,26 @@ describe("running", () => {
         expect(p.z).toBeGreaterThanOrEqual(board.z1 + PLAYER_RADIUS - 1e-6);
       }
     }
+  });
+});
+
+describe("the console room's console (2.6e C8)", () => {
+  it("stops the player walking at it from the spawn outside its footprint", () => {
+    // Mutation caught: the interior pieces' footprints left out of
+    // `blockersFor`, so the player walks through the console to the north
+    // wall.
+    const r = consoleRoom();
+    const bs = blockersFor(r);
+    const desk = (r.interior ?? []).find((p) => p.kind === "console");
+    if (desk === undefined) throw new Error("no console");
+    const box = interiorFootprint(desk);
+    if (box === null) throw new Error("no console footprint");
+    let p = spawnPlayer(r);
+    expect(p.z).toBeGreaterThan(box.z1 + PLAYER_RADIUS);
+    for (let i = 0; i < 70; i++)
+      p = stepPlayer(p, { ...idle, forward: 1 }, r, bs);
+    expect(p.x).toBeCloseTo(6);
+    expect(p.z).toBeGreaterThanOrEqual(box.z1 + PLAYER_RADIUS - 1e-6);
+    expect(p.z).toBeLessThan(box.z1 + PLAYER_RADIUS + 0.05);
   });
 });
