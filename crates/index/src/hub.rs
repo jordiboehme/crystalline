@@ -199,7 +199,7 @@ pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result
     let client = hub_client(cache_dir)?;
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
-    let cached = is_cached(&client, repo.repo).await?;
+    let cached = is_cached(&client, repo).await?;
     if !cached {
         eprintln!(
             "crystalline: downloading {} {} to {} (first use, about {} MB)...",
@@ -215,7 +215,7 @@ pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result
     let remote = client.model(owner, name);
     let mut paths = IndexMap::with_capacity(repo.files.len());
     for file in repo.files {
-        let path = match cached_path(&client, repo.repo, file).await? {
+        let path = match cached_path(&client, repo, file).await? {
             Some(path) => path,
             None => remote
                 .download_file()
@@ -226,7 +226,12 @@ pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result
                 .maybe_progress(show_progress.then(|| ByteProgress::new(file)))
                 .send()
                 .await
-                .map_err(|e| IndexError::Embedding(format!("downloading {file}: {e}")))?,
+                .map_err(|e| {
+                    IndexError::Embedding(format!(
+                        "downloading {file} for {} {}: {e}",
+                        repo.what, repo.repo
+                    ))
+                })?,
         };
         paths.insert((*file).to_string(), path);
     }
@@ -261,12 +266,12 @@ pub(crate) fn hub_client(cache_dir: &Path) -> Result<HFClient> {
 /// air-gapped and CI-prefetch paths must not do.
 pub(crate) async fn cached_path(
     client: &HFClient,
-    repo: &str,
+    repo: &HubRepo<'_>,
     name: &str,
 ) -> Result<Option<PathBuf>> {
-    let (owner, repo) = repo_parts(repo)?;
+    let (owner, repo_name) = repo_parts(repo.repo)?;
     match client
-        .model(owner, repo)
+        .model(owner, repo_name)
         .download_file()
         .filename(name)
         .local_files_only(true)
@@ -276,13 +281,14 @@ pub(crate) async fn cached_path(
         Ok(path) => Ok(Some(path)),
         Err(HFError::LocalEntryNotFound { .. }) => Ok(None),
         Err(e) => Err(IndexError::Embedding(format!(
-            "reading the model cache for {name}: {e}"
+            "reading the model cache for {name} of {} {}: {e}",
+            repo.what, repo.repo
         ))),
     }
 }
 
 /// True when the weights are already in the cache, with no network call at all.
-pub(crate) async fn is_cached(client: &HFClient, repo: &str) -> Result<bool> {
+pub(crate) async fn is_cached(client: &HFClient, repo: &HubRepo<'_>) -> Result<bool> {
     Ok(cached_path(client, repo, "model.safetensors")
         .await?
         .is_some())

@@ -5,14 +5,17 @@
 //! does not start until the parity test passes for all three. Skipped with a
 //! note otherwise, like the postgres leg.
 //!
-//! Point `CRYSTALLINE_MODELS_DIR` at a directory of its own: a daemon sharing
-//! the cache prunes checkpoints its setting does not name.
+//! `CRYSTALLINE_MODELS_DIR` must point at a directory of its own, and the
+//! tests refuse to run without it: the default is the user's real model
+//! cache, where a running daemon prunes checkpoints its setting does not name
+//! (possibly mid-test) and 1.4 GB would land unasked.
 //!
 //! Run it on the release profile: an unoptimized candle takes many minutes
 //! over the 270-token parity batch, the release build about twenty seconds.
 //!
 //! ```text
-//! CRYSTALLINE_TEST_NLI=1 cargo nextest run --cargo-profile release -p crystalline-index --test nli_model --no-capture -j 1
+//! CRYSTALLINE_TEST_NLI=1 CRYSTALLINE_MODELS_DIR=/path/to/scratch/models \
+//!   cargo nextest run --cargo-profile release -p crystalline-index --test nli_model --no-capture -j 1
 //! ```
 
 #![cfg(feature = "local-embeddings")]
@@ -21,12 +24,20 @@ use crystalline_index::nli::local::LocalNli;
 use crystalline_index::nli::{ContradictionScorer, NLI_MODELS, NliProfile, nli_model};
 use crystalline_index::sweep::{CONTRADICTION_STORE_FLOOR, ORDER_AGGREGATION};
 
+/// Whether the real-model tests run. Asked for without a dedicated model
+/// directory, they fail loudly rather than download into the user's cache.
 fn enabled() -> bool {
-    if std::env::var("CRYSTALLINE_TEST_NLI").as_deref() == Ok("1") {
-        return true;
+    if std::env::var("CRYSTALLINE_TEST_NLI").as_deref() != Ok("1") {
+        eprintln!("note: skipping the real NLI model tests (CRYSTALLINE_TEST_NLI is not 1)");
+        return false;
     }
-    eprintln!("note: skipping the real NLI model tests (CRYSTALLINE_TEST_NLI is not 1)");
-    false
+    let dedicated = std::env::var_os("CRYSTALLINE_MODELS_DIR").is_some_and(|d| !d.is_empty());
+    assert!(
+        dedicated,
+        "CRYSTALLINE_TEST_NLI=1 needs CRYSTALLINE_MODELS_DIR set to a directory of its own: \
+         the default is your real model cache, which a running daemon prunes"
+    );
+    true
 }
 
 #[tokio::test]

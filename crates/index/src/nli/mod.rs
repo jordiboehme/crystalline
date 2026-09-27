@@ -60,7 +60,9 @@ pub trait ContradictionScorer: Send + Sync {
 /// The classifier row that means "contradiction", read from the checkpoint's
 /// `id2label` and never assumed: label order differs between checkpoints. A
 /// checkpoint without the label (a binary entailment model) is refused with
-/// its label list.
+/// its label list. Only the loader reads it, so a build without the loader
+/// compiles it for the label-rule test alone.
+#[cfg(any(feature = "local-embeddings", test))]
 pub(crate) fn contradiction_index(
     id2label: &std::collections::BTreeMap<u32, String>,
 ) -> Result<usize> {
