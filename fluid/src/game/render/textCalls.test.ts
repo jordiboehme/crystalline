@@ -149,6 +149,7 @@ describe("no text on the console room's fittings (2.6e C20)", () => {
     // the scanner, a number on the inner doors).
     const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
     expect(kinds.length).toBe(4);
+    expect(Object.values(LOOKS).length).toBeGreaterThan(1);
     recorded.length = 0;
     marked.length = 0;
     for (const look of Object.values(LOOKS))

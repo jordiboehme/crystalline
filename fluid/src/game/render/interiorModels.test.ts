@@ -216,6 +216,7 @@ describe("interior models (2.6e C2)", () => {
     // beige in one look and grey in another.
     const walls = KINDS.filter((k) => k !== "console");
     expect(walls.length).toBe(3);
+    expect(Object.values(LOOKS).length).toBeGreaterThan(1);
     for (const kind of walls)
       for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
         const tintsIn = (look: Look) => {

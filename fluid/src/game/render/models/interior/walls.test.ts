@@ -262,10 +262,11 @@ describe("the console room's wall pieces (2.6e C5 to C7)", () => {
     expect(under).toEqual([]);
   });
 
-  it("leaves out every roundel the scanner's housing would cover, and only those (C24c)", () => {
+  it("leaves out the middle column's rows 2 to 4 and every roundel the scanner's housing would cover, and only those (C7, C24c)", () => {
     // Mutation caught: C7's middle column alone left out, so the side
-    // columns' roundels run under the 1.32 m housing; or roundels dropped
-    // that the housing does not reach.
+    // columns' roundels run under the 1.32 m housing; C7's middle rows
+    // kept where the housing does not reach (the roundel over it); or
+    // roundels dropped that neither rule names.
     const parts = wallParts("scanner", 0);
     const box = scannerHousing();
     const housing = parts.filter((p) => {
@@ -285,7 +286,7 @@ describe("the console room's wall pieces (2.6e C5 to C7)", () => {
         r.a0 < box.a1 && r.a1 > box.a0 && r.h0 < box.h1 && r.h1 > box.h0;
       expect(overlaps).toBe(false);
     }
-    // Every cell the housing misses keeps its roundel.
+    // Every cell neither rule names keeps its roundel, and no other does.
     const faces = parts.filter(isRoundelFace).map(centreOf);
     let kept = 0;
     for (let col = 0; col < ROUNDEL.cols; col++)
@@ -298,13 +299,14 @@ describe("the console room's wall pieces (2.6e C5 to C7)", () => {
           a + half > box.a0 &&
           h - half < box.h1 &&
           h + half > box.h0;
-        if (covered) continue;
-        kept++;
-        expect(
-          faces.some((c) => near(c.a, a, 1e-3) && near(c.h, h, 1e-3)),
-          `${String(col)},${String(row)}`,
-        ).toBe(true);
+        const gap = col === 1 && row >= 1 && row <= 3;
+        const here = faces.some(
+          (c) => near(c.a, a, 1e-3) && near(c.h, h, 1e-3),
+        );
+        expect(here, `${String(col)},${String(row)}`).toBe(!covered && !gap);
+        if (!covered && !gap) kept++;
       }
+    expect(kept).toBe(8);
     expect(faces.length).toBe(kept);
   });
 

@@ -210,14 +210,14 @@ const SLAB = interiorHalf("roundel-wall").d1 - ROUNDEL.rimProud;
 
 /**
  * The slab and its grid of `ROUNDEL` roundels, less the cells `skip`
- * names (by the cell's centre), the cells `glowing` names lit on the
+ * names, the cells `glowing` names lit on the
  * `breathe` bank, each on the group its cell's index gives. The slab is
  * the piece's own width and height (`interiorHalf(kind)`).
  */
 function roundelSlab(
   r: Parameters<InteriorRecipe>[0],
   glowing: readonly (readonly [number, number])[],
-  skip: (a: number, h: number) => boolean,
+  skip: (col: number, row: number) => boolean,
 ): void {
   const { k, s, kind } = r;
   const { hw, top } = interiorHalf(kind);
@@ -227,8 +227,8 @@ function roundelSlab(
   k.box(-hw, hw, 0, d, 0, top, white);
   for (let col = 0; col < ROUNDEL.cols; col++)
     for (let row = 0; row < ROUNDEL.rows; row++) {
+      if (skip(col, row)) continue;
       const { a, h } = cellAt(col, row);
-      if (skip(a, h)) continue;
       const lit = glowing.some(([c, w]) => c === col && w === row);
       const face = lit
         ? s.blink(ROUNDEL_GLOW, (col + ROUNDEL.cols * row) % BLINK_GROUPS)
@@ -330,10 +330,17 @@ export function scannerHousing(): {
 }
 
 /**
- * The scanner (C7): a roundel wall less every roundel its housing would
- * cover (C24c: the roundel's square bounds against the housing's box, so
- * the rows at 1.22 m and 1.94 m go in all three columns and nine
- * roundels stay), the dark housing (a body, and a bezel standing `recess`
+ * The rows of the middle column the scanner leaves out (C7: rows 2 to 4
+ * counted from 1, here from 0), round and above its housing.
+ */
+export const SCANNER_GAP_ROWS: readonly number[] = [1, 2, 3];
+
+/**
+ * The scanner (C7): a roundel wall less the middle column's
+ * `SCANNER_GAP_ROWS` and every other roundel its housing would cover
+ * (C24c: the roundel's square bounds against the housing's box, so the
+ * rows at 1.22 m and 1.94 m go in the side columns too and eight roundels
+ * stay), the dark housing (a body, and a bezel standing `recess`
  * out of it round the screen), the pale blue screen one `DECAL_LIFT` off
  * the body and its dots one more off the screen. The dots are spread by
  * the plastic sequence (two irrational steps), fixed, so every scanner
@@ -343,15 +350,17 @@ const scanner: InteriorRecipe = (r) => {
   const { k, s } = r;
   const box = scannerHousing();
   const half = ROUNDEL.across / 2;
-  roundelSlab(
-    r,
-    [],
-    (a, h) =>
+  const middle = (ROUNDEL.cols - 1) / 2;
+  roundelSlab(r, [], (col, row) => {
+    if (col === middle && SCANNER_GAP_ROWS.includes(row)) return true;
+    const { a, h } = cellAt(col, row);
+    return (
       a - half < box.a1 &&
       a + half > box.a0 &&
       h - half < box.h1 &&
-      h + half > box.h0,
-  );
+      h + half > box.h0
+    );
+  });
   const d0 = SLAB;
   const face = d0 + SCANNER.proud;
   const body = face - SCANNER.recess;
