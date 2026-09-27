@@ -45,7 +45,7 @@ import {
   meResponse,
   userFixture,
 } from "../test/harness";
-import { INVERT_KEY } from "./session";
+import { INVERT_KEY, type SessionOptions } from "./session";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -74,6 +74,8 @@ const made = vi.hoisted(() => ({
   }[],
   navigations: [] as string[],
   sessions: [] as { disposed: boolean }[],
+  /** The options every session was created with, as the route passed them. */
+  options: [] as SessionOptions[],
 }));
 
 vi.mock("./render/renderer", () => ({
@@ -95,6 +97,7 @@ vi.mock("./session", async (importOriginal) => {
   return {
     ...actual,
     createSession: (opts: Parameters<typeof actual.createSession>[0]) => {
+      made.options.push(opts);
       const session = actual.createSession({
         ...opts,
         navigate: (path: string) => {
@@ -268,6 +271,7 @@ beforeEach(() => {
   made.renderers.length = 0;
   made.navigations.length = 0;
   made.sessions.length = 0;
+  made.options.length = 0;
   gl.available = false;
   // jsdom has no `matchMedia`; the device check and the session's
   // pixel-ratio watch both ask it. A fine pointer and no coarse one: a
@@ -509,6 +513,26 @@ describe("GameRoute", () => {
       expect(renderer.dispose).toHaveBeenCalled();
     }
     expect(actWarnings()).toEqual([]);
+  });
+
+  it("hands the session the console room, its listing read from the domains (2.6e C13)", async () => {
+    // Mutation caught: the route forgetting the consoleRoom option, or a
+    // listing that does not read the domain listing.
+    gl.available = true;
+    serve();
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    const consoleRoom = made.options.at(-1)?.consoleRoom;
+    expect(consoleRoom).toBeDefined();
+    const rows = await consoleRoom?.domains(new AbortController().signal);
+    expect(rows).toEqual([{ name: "eng", canonicalName: null, aliases: [] }]);
+    expect(rows?.map((r) => r.name)).toEqual(
+      domainsResponse().domains.map((d) => d.name),
+    );
+    await settle(100);
+    view.unmount();
   });
 
   it("opens the level select on idclev and jumps to a domain's bridge", async () => {

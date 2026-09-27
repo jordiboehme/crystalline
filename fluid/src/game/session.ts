@@ -24,7 +24,8 @@
  *
  * Each tick, in order: the typed keys for the level cheat's word, the look
  * and command keys, movement, what the player faces and a use of it, the doors,
- * the faults of the broken ways, the HUD prompt, the ways out of the room,
+ * the faults of the broken ways, the walk into a police box and out of the
+ * console room, the HUD prompt, the ways out of the room,
  * warming the cache for the places behind the doors the player walks up to,
  * the room's light specials and the blink banks (`render/blink.ts`, H11).
  * The blink state is made once per session, not per room: a hero blinks the
@@ -37,6 +38,26 @@
  * door state is kept under `boxKey(index)`, alongside the fixture doors'
  * `door:<index>` keys, in the same map the renderer draws every mover's
  * fraction from.
+ *
+ * With `SessionOptions.consoleRoom` (the game route only), walking through
+ * a box's open doors (`boxEntry`) cuts into the console room
+ * (`world/consoleRoom.ts`): instantly, with no connector, no load and no
+ * navigation. The session enters the console room under the domain and
+ * permalink of the room left, so `current`, F and the URL keep naming that
+ * room, and a reload inside returns to it. The cut in starts reading the
+ * domain listing. Walking into the console room's inner doors
+ * (`atConsoleExit`) travels to the bridge of a domain picked from that
+ * listing (`pickExitDomain`, seeded by the tick count), with the connector
+ * naming the domain; the exit waits while the listing is still being read,
+ * and falls back to the room left's own domain when it could not be read.
+ * The bridge lands with a police box beside its entrance for that visit
+ * (`withArrivalBox`): the player steps out of it, its doors open and
+ * swinging shut, and its walk-in latched until the player has left its
+ * doorway. The walk-in and the exit are latched like a way, so each fires
+ * again only after the player has left its zone; a failed exit leaves the
+ * player inside with the notice. Neither fires while a load is in flight
+ * or an overlay has the keys, and every entry of a room ends the visit of
+ * the console room (a jump from inside leaves it like any `go`).
  *
  * Malfunctions belong to one visit of a room. A travel that settles as
  * missing (404) or denied (403) marks the way it went through as failed
@@ -86,7 +107,17 @@ import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
-import { boxFocus, boxKey, stepBoxDoors } from "./world/box";
+import { withArrivalBox } from "./world/arrival";
+import {
+  boxEntry,
+  boxFocus,
+  boxKey,
+  exitSeed,
+  pickExitDomain,
+  stepBoxDoors,
+  type DomainRow,
+} from "./world/box";
+import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
@@ -195,6 +226,8 @@ export type RendererFactory = (
  *   `client`, or says `SIGNAL LOST` when there is none.
  * - `onLevels`: the level cheat's switch and channel; only the game route
  *   passes it. See the member.
+ * - `consoleRoom`: the police box's inside and the listing its inner doors
+ *   pick from; only the game route passes it. See the member.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -215,6 +248,19 @@ export interface SessionOptions {
    * the model gallery never pass it.
    */
   onLevels?: (open: boolean) => void;
+  /**
+   * The console room's switch and listing (2.6e C11, C13): with it, walking
+   * through a police box's open doors cuts into the console room, and
+   * walking into the console room's inner doors travels to a domain's
+   * bridge picked from `domains`, which answers the domain listing, or
+   * null when it could not be read. It is read once per visit of the
+   * console room, and its signal aborts once the player leaves the room.
+   * Without it a box's doors still open, but walking in does nothing: the
+   * look demo and the model gallery never pass it.
+   */
+  consoleRoom?: {
+    domains(signal: AbortSignal): Promise<readonly DomainRow[] | null>;
+  };
 }
 
 /**
@@ -259,6 +305,8 @@ export type PlaceLoader = (
  * - `dispose` stops everything and frees the GPU objects. It takes the
  *   reader and the connector down; nothing is written to the HUD after it.
  * - `current` is the place the player is in, null before the first one.
+ *   Inside the console room it is the room the player walked in from,
+ *   since the console room has no address of its own.
  */
 export interface Session {
   go(address: PlaceAddress, arrival?: Arrival | null, label?: string): void;
@@ -421,6 +469,24 @@ export function createSession(opts: SessionOptions): Session {
   let faultNow: ReadonlyMap<number, FaultFrame> = new Map();
   /** The travel in flight: its generation and the fixture it went through. */
   let travelling: { gen: number; fixture: number } | null = null;
+  /**
+   * The visit of the console room the player is in: the room walked in
+   * from. Null outside it; every entry clears it and the cut in sets it.
+   */
+  let inside: { from: PlaceAddress } | null = null;
+  /**
+   * The listing the console room's exit picks from: undefined while it is
+   * still read, null when it could not be read.
+   */
+  let exitRows: readonly DomainRow[] | null | undefined = undefined;
+  /** Whether the exit fired and the player has not left its doorway since. */
+  let exitLatched = false;
+  /** The police box walked into (or stepped out of) and not left since. */
+  let boxLatched: number | null = null;
+  /** Aborts the listing read for the console room's visit. */
+  let listing: AbortController | null = null;
+  /** Counts the cuts in, so a listing that answers late is dropped. */
+  let visit = 0;
 
   let generation = 0;
   let controller: AbortController | null = null;
@@ -478,7 +544,8 @@ export function createSession(opts: SessionOptions): Session {
     if (disposed) return;
     const parts = [LOOKS[lookId].name.toUpperCase()];
     if (room !== null) {
-      parts.unshift(room.title.toUpperCase());
+      // The console room has no title: the line leaves it out.
+      if (room.title !== "") parts.unshift(room.title.toUpperCase());
       parts.push(room.condition.toUpperCase());
     }
     parts.push(
@@ -542,6 +609,10 @@ export function createSession(opts: SessionOptions): Session {
    * generated from, or null for a room built by hand (`showRoom`), whose
    * terminals then open no reader. `keep` keeps the player, the doors and
    * this visit's failed ways and faults, for the same place shown again.
+   * `spawn`, when given, places the player there (in metres) in place of
+   * `arrivalSpawn` (the arrival box's step out). Every entry ends a visit
+   * of the console room: `inside` is cleared and its listing read aborted
+   * (the cut in sets both again once it has entered).
    *
    * The renderer is asked first. When it refuses the room, nothing of the
    * session has changed yet: the player stays in the room they were in,
@@ -555,6 +626,7 @@ export function createSession(opts: SessionOptions): Session {
     built: RoomSpec,
     arrival: Arrival | null,
     keep: boolean,
+    spawn?: { x: number; z: number; yaw: number },
   ): boolean => {
     if (!present(built, lookId)) {
       fail(LOAD_ERROR);
@@ -567,8 +639,8 @@ export function createSession(opts: SessionOptions): Session {
     lights = createLights(room.lights);
     current = { domain: built.domain, permalink: built.permalink };
     if (!keep || player === null) {
-      const spawn = arrivalSpawn(room, arrival);
-      player = { ...spawn, vx: 0, vz: 0, pitch: 0, bob: 0 };
+      const at = spawn ?? arrivalSpawn(room, arrival);
+      player = { ...at, vx: 0, vz: 0, pitch: 0, bob: 0 };
       doors = new Map();
       boxes = new Map();
       doorOpen = new Map();
@@ -579,17 +651,30 @@ export function createSession(opts: SessionOptions): Session {
     previous = player;
     prefetched = new Set();
     latched = null;
+    boxLatched = null;
+    exitLatched = false;
+    inside = null;
+    listing?.abort();
+    listing = null;
     placeNotice = null;
     showStanding();
     showStatus();
     return true;
   };
 
+  /**
+   * A load of `travel` has settled: enters the place, or fails with the
+   * reason there is none. With `landing` `"box"` (the console room's exit)
+   * the room is entered with the arrival box (`withArrivalBox`), the player
+   * stepping out of it, its doors fully open and heading shut, and its
+   * walk-in latched; with no spot for the box, the room is entered plain.
+   */
   const settle = (
     gen: number,
     arrival: Arrival | null,
     loaded: LoadedPlace,
     label: string,
+    landing: "box" | null,
   ) => {
     if (disposed || gen !== generation) return;
     loading = false;
@@ -615,8 +700,23 @@ export function createSession(opts: SessionOptions): Session {
       return;
     }
     travelling = null;
-    if (!enter(loaded.place, generateRoom(loaded.place), arrival, false)) {
+    const generated = generateRoom(loaded.place);
+    const arrived =
+      landing === "box" ? withArrivalBox(loaded.place, generated) : null;
+    if (
+      !enter(
+        loaded.place,
+        arrived?.room ?? generated,
+        arrival,
+        false,
+        arrived?.spawn ?? undefined,
+      )
+    ) {
       return;
+    }
+    if (arrived !== null && arrived.box !== null) {
+      boxes = new Map([[arrived.box, { open: 1, target: 0 }]]);
+      boxLatched = arrived.box;
     }
     const here = loaded.place;
     const path = gameEngramRoute(here.domain, here.permalink);
@@ -661,10 +761,16 @@ export function createSession(opts: SessionOptions): Session {
     return gen;
   };
 
-  const go = (
+  /**
+   * Loads `address` and enters it once it lands (`settle`): the journey
+   * behind `go` and the console room's exit, which lands with `landing`
+   * `"box"`.
+   */
+  const travel = (
     address: PlaceAddress,
-    arrival: Arrival | null = null,
-    label?: string,
+    arrival: Arrival | null,
+    label: string | undefined,
+    landing: "box" | null,
   ) => {
     if (disposed) return;
     const gen = leave();
@@ -685,7 +791,7 @@ export function createSession(opts: SessionOptions): Session {
     controller = abort;
     loader(address, abort.signal).then(
       (loaded) => {
-        settle(gen, arrival, loaded, shown);
+        settle(gen, arrival, loaded, shown, landing);
       },
       (error: unknown) => {
         if (disposed || gen !== generation) return;
@@ -696,6 +802,14 @@ export function createSession(opts: SessionOptions): Session {
         if (!isAbort(error)) fail(LOAD_ERROR);
       },
     );
+  };
+
+  const go = (
+    address: PlaceAddress,
+    arrival: Arrival | null = null,
+    label?: string,
+  ) => {
+    travel(address, arrival, label, null);
   };
 
   const showCanned = (next: PlaceInput) => {
@@ -723,6 +837,56 @@ export function createSession(opts: SessionOptions): Session {
     go(travel.address, { via: travel.via, from: current });
     // Only a travel the session took can mark its way failed (M2).
     if (loading) travelling = { gen: generation, fixture: travel.fixture };
+  };
+
+  /**
+   * Walks into the police box: cuts to the console room at once, under the
+   * address of the room left (C12), and starts reading the listing its
+   * inner doors pick from. Does nothing without the console room option
+   * or with no room to return to.
+   */
+  const cutIn = () => {
+    const options = opts.consoleRoom;
+    const from = current;
+    if (options === undefined || from === null) return;
+    leave();
+    const built = {
+      ...consoleRoom(),
+      domain: from.domain,
+      permalink: from.permalink,
+    };
+    if (!enter(null, built, null, false)) return;
+    inside = { from };
+    exitLatched = false;
+    exitRows = undefined;
+    const mine = ++visit;
+    const abort = new AbortController();
+    listing = abort;
+    options.domains(abort.signal).then(
+      (rows) => {
+        if (disposed || mine !== visit || inside === null) return;
+        exitRows = rows;
+      },
+      (error: unknown) => {
+        if (disposed || mine !== visit || inside === null || isAbort(error))
+          return;
+        exitRows = null;
+      },
+    );
+  };
+
+  /**
+   * Walks out of the console room's inner doors: travels to the bridge of
+   * a domain picked from the listing (C13), the connector naming it, to
+   * land with the arrival box (C14).
+   */
+  const walkOut = (from: PlaceAddress) => {
+    const picked = pickExitDomain(
+      exitRows ?? [],
+      from.domain,
+      exitSeed(from.domain, ticks),
+    );
+    travel(bridgeAddress(picked), null, picked, "box");
   };
 
   const openReader = (index: number) => {
@@ -970,6 +1134,26 @@ export function createSession(opts: SessionOptions): Session {
     for (const [index, state] of doors)
       doorOpen.set(`door:${index}`, state.open);
     for (const [index, state] of boxes) doorOpen.set(boxKey(index), state.open);
+    if (opts.consoleRoom !== undefined && !loading && !modal()) {
+      const entered = boxEntry(room, player, boxes);
+      if (entered === null) {
+        boxLatched = null;
+      } else if (entered !== boxLatched) {
+        cutIn();
+        // The rest of this tick read the room left: the console room
+        // starts on the next.
+        return;
+      }
+    }
+    if (inside !== null && !loading && !modal()) {
+      if (!atConsoleExit(player)) {
+        exitLatched = false;
+      } else if (!exitLatched && exitRows !== undefined) {
+        exitLatched = true;
+        walkOut(inside.from);
+        return;
+      }
+    }
     setPrompt(
       modal() || loading ? null : (focus?.prompt ?? boxAt?.prompt ?? null),
     );
@@ -1086,6 +1270,8 @@ export function createSession(opts: SessionOptions): Session {
       generation++;
       controller?.abort();
       controller = null;
+      listing?.abort();
+      listing = null;
       if (noticeTimer !== null) clearTimeout(noticeTimer);
       noticeTimer = null;
       loop.stop();

@@ -36,6 +36,13 @@
  * session to `jump` to that domain's bridge, a journey like any other that
  * replaces the URL when it lands. Esc hands the keys back through
  * `closeLevels`.
+ *
+ * Only this route passes the session its `consoleRoom` option, so only
+ * here does walking through a police box's open doors lead into the
+ * console room, and its inner doors out to a domain's bridge picked from
+ * the domain listing (`loadDomainRows`, the sidebar's own cached query).
+ * The console room has no address: the URL keeps naming the room walked
+ * in from, so a reload inside comes back there.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -43,6 +50,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
 import { engramRoute } from "../paths";
+import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
 import { createSession, type Session } from "./session";
@@ -118,6 +126,7 @@ export default function GameRoute() {
       openFluid,
       forceRgba8: false,
       onLevels: setLevels,
+      consoleRoom: { domains: (signal) => loadDomainRows(client, signal) },
     });
     sessionRef.current = session;
     const first = addressRef.current;

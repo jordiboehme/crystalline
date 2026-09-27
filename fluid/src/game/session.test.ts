@@ -18,7 +18,8 @@ import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
 import { TICK_MS, type Clock } from "./core/loop";
-import { prefetchPlace } from "./data/source";
+import { prefetchPlace, type LoadedPlace } from "./data/source";
+import { gameEngramRoute } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
@@ -29,8 +30,10 @@ import {
   type PlaceLoader,
   type RendererFactory,
   type Session,
+  type SessionOptions,
 } from "./session";
-import { boxFront } from "./world/box";
+import { withArrivalBox } from "./world/arrival";
+import { boxFront, type DomainRow } from "./world/box";
 import { CANNED_BRIDGE, galleryRoom, heroHallRoom } from "./world/canned";
 import { NOT_FOUND, generateRoom } from "./world/generate";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
@@ -191,6 +194,7 @@ function start(
     factory?: RendererFactory;
     load?: PlaceLoader;
     onLevels?: (open: boolean) => void;
+    consoleRoom?: SessionOptions["consoleRoom"];
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -211,6 +215,9 @@ function start(
     clock,
     ...(options.load === undefined ? {} : { load: options.load }),
     ...(options.onLevels === undefined ? {} : { onLevels: options.onLevels }),
+    ...(options.consoleRoom === undefined
+      ? {}
+      : { consoleRoom: options.consoleRoom }),
   });
   sessions.push(session);
   return session;
@@ -285,6 +292,37 @@ afterEach(() => {
   client.clear();
   window.localStorage.clear();
 });
+
+/**
+ * The hero hall with the player at its first police box's front, and
+ * that box's hero index.
+ *
+ * `spotView`'s own front spot stands about 2.48 m out (`FRAME_BASE` plus
+ * `FRAME_SCALE` times the box's 1.3 m footprint), farther than `REACH`
+ * (2.2 m), so the box would never come into focus there. The spawn is
+ * put `REACH - 0.4` m out along `boxFront`'s own frame instead.
+ */
+function standAtBox(session: Session): number {
+  const room = heroHallRoom();
+  const index = room.heroes.findIndex((h) => h.kind === "police-box");
+  if (index < 0) throw new Error("no police box in the hero hall");
+  const front = boxFront(room.heroes[index]!);
+  const dist = REACH - 0.4;
+  const wx = front.x + front.inward[0] * dist;
+  const wz = front.z + front.inward[1] * dist;
+  const spawn = {
+    x: wx / CELL - 0.5,
+    y: wz / CELL - 0.5,
+    yaw: Math.atan2(front.inward[0], front.inward[1]),
+  };
+  session.showRoom({ ...room, spawn }, { pitch: 0 });
+  frames(1);
+  return index;
+}
+
+/** The door fractions the last frame was drawn with. */
+const lastDoors = () =>
+  renderer.draw.mock.calls.at(-1)?.[3] ?? new Map<string, number>();
 
 describe("go", () => {
   it("loads the place and navigates to its game route once", async () => {
@@ -1918,37 +1956,6 @@ describe("malfunctions", () => {
 });
 
 describe("the police box's doors", () => {
-  /**
-   * The hero hall with the player at its first police box's front, and
-   * that box's hero index.
-   *
-   * `spotView`'s own front spot stands about 2.48 m out (`FRAME_BASE` plus
-   * `FRAME_SCALE` times the box's 1.3 m footprint), farther than `REACH`
-   * (2.2 m), so the box would never come into focus there. The spawn is
-   * put `REACH - 0.4` m out along `boxFront`'s own frame instead.
-   */
-  function standAtBox(session: Session): number {
-    const room = heroHallRoom();
-    const index = room.heroes.findIndex((h) => h.kind === "police-box");
-    if (index < 0) throw new Error("no police box in the hero hall");
-    const front = boxFront(room.heroes[index]!);
-    const dist = REACH - 0.4;
-    const wx = front.x + front.inward[0] * dist;
-    const wz = front.z + front.inward[1] * dist;
-    const spawn = {
-      x: wx / CELL - 0.5,
-      y: wz / CELL - 0.5,
-      yaw: Math.atan2(front.inward[0], front.inward[1]),
-    };
-    session.showRoom({ ...room, spawn }, { pitch: 0 });
-    frames(1);
-    return index;
-  }
-
-  /** The door fractions the last frame was drawn with. */
-  const lastDoors = () =>
-    renderer.draw.mock.calls.at(-1)?.[3] ?? new Map<string, number>();
-
   it("opens and closes on Space and draws the leaves by their fraction (2.6e C10)", () => {
     // Mutation caught: the box focus never read (the press drained by the
     // fixture branch), or doorOpen missing the box's key.
@@ -1980,5 +1987,292 @@ describe("the police box's doors", () => {
     key("keyup", "ArrowUp");
     expect(renderer.setRoom).toHaveBeenCalledTimes(1);
     expect(session.current).toEqual(before);
+  });
+});
+
+const row = (
+  name: string,
+  canonicalName: string | null = null,
+  aliases: string[] = [],
+): DomainRow => ({ name, canonicalName, aliases });
+
+/** The hero hall's domain: the room left when the tests walk in from the hall. */
+const HALL = heroHallRoom().domain;
+
+/** Answers every place with the canned bridge moved to that address. */
+const okBridge: PlaceLoader = (a) =>
+  Promise.resolve({
+    kind: "place",
+    place: { ...CANNED_BRIDGE, domain: a.domain, permalink: a.permalink },
+  });
+
+/** A session with the console room switched on, its listing `rows` (a value or a promise). */
+function startWithConsole(
+  rows: readonly DomainRow[] | null | Promise<readonly DomainRow[] | null>,
+  load: PlaceLoader,
+  onLevels?: (open: boolean) => void,
+): Session {
+  return start({
+    load,
+    consoleRoom: { domains: () => Promise.resolve(rows) },
+    ...(onLevels === undefined ? {} : { onLevels }),
+  });
+}
+
+/** Opens the box in front and walks forward until the room changes (at most 60 ticks). */
+function walkIn() {
+  key("keydown", "Space");
+  key("keyup", "Space");
+  frames(19);
+  const before = renderer.setRoom.mock.calls.length;
+  key("keydown", "ArrowUp");
+  for (let t = 0; t < 60 && renderer.setRoom.mock.calls.length === before; t++)
+    frames(1);
+  key("keyup", "ArrowUp");
+}
+
+/** Backs from the console room's spawn into its inner doors. */
+function backOut(ticks = 40) {
+  key("keydown", "ArrowDown");
+  frames(ticks);
+  key("keyup", "ArrowDown");
+}
+
+/** The room the renderer was last handed. */
+const lastRoom = () => renderer.setRoom.mock.calls.at(-1)?.[0];
+
+describe("the console room", () => {
+  it("cuts into the console room on walking in: no connector, no navigation, the room left kept as current (2.6e C12)", () => {
+    // Mutation caught: the connector shown, navigate called, or current
+    // moved to the console room; and the status line leading with an
+    // empty title (its separator first).
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    const before = session.current;
+    hud.connector.mockClear();
+    walkIn();
+    frames(1);
+    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+    expect(hud.connector).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(session.current).toEqual(before);
+    expect(lastCamera().yaw).toBe(0);
+    const status = hud.status.mock.calls.at(-1)?.[0] ?? "";
+    expect(status.startsWith("  |  ")).toBe(false);
+    expect(status.startsWith("APERTURE")).toBe(true);
+  });
+
+  it("walks out to another domain's bridge, the connector naming it, and steps out of a box there (2.6e C13, C14)", async () => {
+    // Mutation caught: the exit going to the room left's own domain, the
+    // connector showing the permalink, the landing without the box.
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    walkIn();
+    await flush();
+    backOut();
+    expect(hud.connector).toHaveBeenCalledWith(true, "ops", expect.any(String));
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+    });
+    const bridge = lastRoom();
+    const plain = generateRoom({
+      ...CANNED_BRIDGE,
+      domain: "ops",
+      permalink: "manifest",
+    });
+    expect(bridge?.heroes.filter((h) => h.kind === "police-box").length).toBe(
+      plain.heroes.filter((h) => h.kind === "police-box").length + 1,
+    );
+    expect(session.current).toEqual({ domain: "ops", permalink: "manifest" });
+  });
+
+  it("a failed exit leaves the player inside and fires again only after the doorway is left (Review Focus 2)", async () => {
+    // Mutation caught: no latch (a load every tick in the doorway), or the
+    // player thrown out of the room on a failure.
+    let calls = 0;
+    const load: PlaceLoader = (a, signal) => {
+      calls++;
+      return calls === 1
+        ? Promise.resolve({ kind: "missing" })
+        : okBridge(a, signal);
+    };
+    const session = startWithConsole([row(HALL), row("ops")], load);
+    standAtBox(session);
+    walkIn();
+    await flush();
+    backOut();
+    await flush();
+    frames(30); // still pressed against the doors
+    await flush();
+    expect(calls).toBe(1);
+    expect(hud.notice).toHaveBeenCalledWith(NOT_FOUND);
+    expect(lastRoom()?.interior).toBeDefined();
+    key("keydown", "ArrowUp");
+    frames(20);
+    key("keyup", "ArrowUp");
+    backOut();
+    await vi.waitFor(() => {
+      expect(calls).toBe(2);
+    });
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+    });
+    expect(session.current?.domain).toBe("ops");
+  });
+
+  it("never cuts in while an overlay has the keys or a load is in flight, and a jump from inside leaves the room (Review Focus 4)", async () => {
+    // Mutation caught: the walk-in without its modal or loading guard, or
+    // a jump that lands with the arrival box.
+    const levels = vi.fn<(open: boolean) => void>();
+    const slow = deferred<LoadedPlace>();
+    const load: PlaceLoader = (a, signal) =>
+      a.permalink === "slow" ? slow.promise : okBridge(a, signal);
+    const session = startWithConsole([row(HALL), row("ops")], load, levels);
+    // Stand in the walk-in zone itself, so only the guards keep the cut out.
+    const i = standAtBox(session);
+    const h = heroHallRoom().heroes[i]!;
+    const f = boxFront(h);
+    const at = { x: f.x + f.inward[0] * 0.36, z: f.z + f.inward[1] * 0.36 };
+    session.showRoom({
+      ...heroHallRoom(),
+      spawn: {
+        x: at.x / CELL - 0.5,
+        y: at.z / CELL - 0.5,
+        yaw: Math.atan2(f.inward[0], f.inward[1]),
+      },
+    });
+    const shown = renderer.setRoom.mock.calls.length;
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    frames(30); // the doors could not be opened: the select has the keys
+    expect(renderer.setRoom.mock.calls.length).toBe(shown);
+    session.closeLevels();
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(10); // half open
+    session.go({ domain: HALL, permalink: "slow" });
+    frames(20); // open now, the player in the zone, a load in flight
+    expect(renderer.setRoom.mock.calls.length).toBe(shown);
+    slow.resolve({
+      kind: "place",
+      place: { ...CANNED_BRIDGE, domain: HALL, permalink: "slow" },
+    });
+    await flush();
+    // Inside, a jump leaves like any go and lands without a box.
+    standAtBox(session);
+    walkIn();
+    await flush();
+    session.jump("ops");
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+    });
+    expect(lastRoom()).toEqual(
+      generateRoom({ ...CANNED_BRIDGE, domain: "ops", permalink: "manifest" }),
+    );
+  });
+
+  it("never cuts in while the level select is open, even with the doors swinging wide under it (Review Focus 4)", () => {
+    // Mutation caught: the walk-in without its modal guard. The brief's
+    // own test cannot catch it, since the select takes the key that would
+    // open the doors; here the doors are already opening when it opens.
+    const levels = vi.fn<(open: boolean) => void>();
+    const session = startWithConsole([row(HALL), row("ops")], okBridge, levels);
+    const i = standAtBox(session);
+    const f = boxFront(heroHallRoom().heroes[i]!);
+    const at = { x: f.x + f.inward[0] * 0.36, z: f.z + f.inward[1] * 0.36 };
+    session.showRoom({
+      ...heroHallRoom(),
+      spawn: {
+        x: at.x / CELL - 0.5,
+        y: at.z / CELL - 0.5,
+        yaw: Math.atan2(f.inward[0], f.inward[1]),
+      },
+    });
+    const shown = renderer.setRoom.mock.calls.length;
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(2); // the doors start to open, far from open enough
+    type("idclev");
+    frames(1);
+    expect(levels).toHaveBeenLastCalledWith(true);
+    frames(30); // fully open now, the player in the zone, the select up
+    expect(lastDoors().get(`box:${String(i)}`)).toBe(1);
+    expect(renderer.setRoom.mock.calls.length).toBe(shown);
+    session.closeLevels();
+    frames(2);
+    // The guard was all that kept it out: with the select closed, it cuts.
+    expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
+    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the console room and the arrival box through a look switch and a restored context (Review Focus 5)", async () => {
+    // Mutation caught: a look switch or a restore that rebuilds the
+    // room (the box would vanish, the console room would drop its player).
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    walkIn();
+    const inside = lastRoom();
+    key("keydown", "Digit4");
+    key("keyup", "Digit4");
+    frames(1);
+    expect(lastRoom()).toBe(inside);
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("ops");
+    });
+    const bridge = lastRoom();
+    lastCanvas?.dispatchEvent(new Event("webglcontextlost"));
+    lastCanvas?.dispatchEvent(new Event("webglcontextrestored"));
+    expect(lastRoom()).toBe(bridge);
+    expect(bridge?.heroes.some((h) => h.kind === "police-box")).toBe(true);
+  });
+
+  it("steps out of the arrival box with its doors wide open and swinging shut (2.6e C14)", async () => {
+    // Mutation caught: the arrival box's doors starting shut (no door
+    // state set on landing), or left open (heading open, not shut).
+    const session = startWithConsole([row(HALL), row("ops")], okBridge);
+    standAtBox(session);
+    walkIn();
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(session.current?.domain).toBe("ops");
+    });
+    const place = { ...CANNED_BRIDGE, domain: "ops", permalink: "manifest" };
+    const expected = withArrivalBox(place, generateRoom(place));
+    expect(expected.box).not.toBeNull();
+    expect(lastRoom()).toEqual(expected.room);
+    const key = `box:${String(expected.box)}`;
+    frames(1);
+    expect(lastDoors().get(key)).toBeGreaterThan(0.9);
+    frames(19);
+    expect(lastDoors().get(key)).toBe(0);
+  });
+
+  it("waits for the listing and falls back to the room left's domain when it fails (2.6e C13)", async () => {
+    // Mutation caught: an exit fired (and latched) before the listing
+    // landed, or a failed listing that strands the player.
+    const listing = deferred<readonly DomainRow[] | null>();
+    const loads: string[] = [];
+    const load: PlaceLoader = (a, signal) => {
+      loads.push(a.domain);
+      return okBridge(a, signal);
+    };
+    const session = startWithConsole(listing.promise, load);
+    standAtBox(session);
+    walkIn();
+    backOut();
+    expect(loads).toEqual([]);
+    listing.resolve(null);
+    await flush();
+    frames(2); // still in the doorway, not latched: it fires now
+    await vi.waitFor(() => {
+      expect(loads).toEqual([HALL]);
+    });
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ domain: HALL, permalink: "manifest" });
+    });
   });
 });
