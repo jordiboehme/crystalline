@@ -116,9 +116,13 @@
  * 11. The mark (2.6d C12), when `rare.mark.take` is drawn: the candidates
  *     so far that `markedVariant` accepts (a large crate or a crate stack,
  *     `MARK_FROM`), sorted by seed, then `y`, then `x`; the one at
- *     `floor(roll * n)` becomes a `marked-crate` of its marked variant and
- *     keeps its position, turn and seed. Every marked footprint lies inside
- *     the one it replaces, so nothing checked for the old prop changes.
+ *     `floor(roll * n)` becomes a `marked-crate` of its marked variant,
+ *     keeping its turn and seed. A wall-side crate also shifts back along
+ *     its turn by half the depth the mark loses, so its own back still
+ *     meets its wall at the gap it was backed to (`WALL_GAP` or
+ *     `SCREEN_GAP`) instead of standing away from it; a crate off a wall
+ *     keeps its position outright. Every marked footprint lies inside the
+ *     one it replaces, so nothing else checked for the old prop changes.
  * 12. Ceiling, anchored at wall points like a wall prop: the ceiling run
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
  *     `ceiling-<side>` (also skipping a reserved edge like a used one);
@@ -809,6 +813,7 @@ export function dressCandidates(
 
   // Step 11 (2.6d C12): the mark, on one accepted large crate or crate
   // stack, picked by the roll among them in seed order.
+  const wallSideByCell = new Map(wallSide.map((s) => [cellKey(s.cx, s.cy), s]));
   if (rare.mark.take) {
     const eligible = out
       .filter((c) => markedVariant(c.prop) !== null)
@@ -826,8 +831,47 @@ export function dressCandidates(
         )
       ];
     const variant = pick === undefined ? null : markedVariant(pick.prop);
-    if (pick !== undefined && variant !== null)
-      pick.prop = { ...pick.prop, kind: "marked-crate", variant };
+    if (pick !== undefined && variant !== null) {
+      const was = pick.prop;
+      const marked: Prop = { ...was, kind: "marked-crate", variant };
+      // A wall-side crate keeps its back at the gap it was placed at
+      // (`WALL_GAP` or `SCREEN_GAP`, step 5) rather than drifting away
+      // from its wall as its depth shrinks: shift its centre back along
+      // its turn by half of what the mark's footprint loses there.
+      const spot = wallSideByCell.get(
+        cellKey(Math.floor(was.x), Math.floor(was.y)),
+      );
+      const side = spot?.wall ?? null;
+      const oldBox = side === null ? null : propFootprint(was);
+      const newBox = side === null ? null : propFootprint(marked);
+      if (oldBox !== null && newBox !== null) {
+        if (side === "n")
+          marked.y = round3(
+            was.y +
+              ((newBox.z1 - newBox.z0) / 2 - (oldBox.z1 - oldBox.z0) / 2) /
+                CELL,
+          );
+        else if (side === "s")
+          marked.y = round3(
+            was.y +
+              ((oldBox.z1 - oldBox.z0) / 2 - (newBox.z1 - newBox.z0) / 2) /
+                CELL,
+          );
+        else if (side === "w")
+          marked.x = round3(
+            was.x +
+              ((newBox.x1 - newBox.x0) / 2 - (oldBox.x1 - oldBox.x0) / 2) /
+                CELL,
+          );
+        else if (side === "e")
+          marked.x = round3(
+            was.x +
+              ((oldBox.x1 - oldBox.x0) / 2 - (newBox.x1 - newBox.x0) / 2) /
+                CELL,
+          );
+      }
+      pick.prop = marked;
+    }
   }
 
   // Step 12: the ceiling.

@@ -579,11 +579,13 @@ describe("floor props", () => {
         }[side];
         const kind = kinds.get(edgeKey({ x: cx, y: cy, side }));
         if (p.kind === "marked-crate") {
-          // The mark keeps the relabelled crate's position, and its box lies
-          // inside the crate's, so it stands at least that gap off its wall
-          // (2.6d C12).
-          expect(gap).toBeGreaterThanOrEqual(
-            (kind === undefined ? WALL_GAP : SCREEN_GAP) - 1e-9,
+          // The mark shifts a wall-side crate back along its turn by half
+          // the depth it loses, so its back stands at the same gap off its
+          // wall the crate it replaced did, not merely at or past it (2.6d
+          // C12 fix). Its box still lies inside the crate's.
+          expect(gap).toBeCloseTo(
+            kind === undefined ? WALL_GAP : SCREEN_GAP,
+            2,
           );
           if (kind !== undefined)
             expect(PROP_CATALOGUE[kind].keepClear).toBe(false);
@@ -1980,13 +1982,32 @@ describe("rare props (2.6d C9 to C13)", () => {
           throw new Error(`${name}: no prop under the mark`);
         expect(m.kind, name).toBe("marked-crate");
         expect(m.variant, name).toBe(markedVariant(was));
-        expect({ ...m, kind: was.kind, variant: was.variant }, name).toEqual(
-          was,
-        );
+        expect(m.turn, name).toBe(was.turn);
+        expect(m.seed, name).toBe(was.seed);
+        expect(m.anchor, name).toBe(was.anchor);
         const inner = propFootprint(m);
         const outer = propFootprint(was);
-        if (inner === null || outer === null)
+        const unshifted = propFootprint({
+          ...was,
+          kind: m.kind,
+          variant: m.variant,
+        });
+        if (inner === null || outer === null || unshifted === null)
           throw new Error("floor props have boxes");
+        // A wall-side mark shifts its centre back along its turn by up to
+        // half the depth it loses there (2.6d C12 fix), pinned exactly at
+        // dress.test.ts's WALL_GAP test; every other mark, and every mark
+        // whose depth barely changes, keeps its exact x and y.
+        const dxBound =
+          Math.abs(outer.x1 - outer.x0 - (unshifted.x1 - unshifted.x0)) /
+          2 /
+          CELL;
+        const dzBound =
+          Math.abs(outer.z1 - outer.z0 - (unshifted.z1 - unshifted.z0)) /
+          2 /
+          CELL;
+        expect(Math.abs(m.x - was.x), name).toBeLessThanOrEqual(dxBound + 1e-9);
+        expect(Math.abs(m.y - was.y), name).toBeLessThanOrEqual(dzBound + 1e-9);
         expect(
           inner.x0 >= outer.x0 - 1e-9 &&
             inner.x1 <= outer.x1 + 1e-9 &&
