@@ -97,6 +97,15 @@ pub struct ObservationRecord {
 /// there, and - only when the row names a domain nobody registered - the whole
 /// bracket text as a permalink and then a title in the row's OWN domain.
 ///
+/// The target domain of a bare reference is the row's own domain. The target
+/// domain of a prefixed one is the domain its prefix spells and nothing else:
+/// an explicit `[[domain:Target]]` resolves only within the named domain, as
+/// core's rule says. A prefix that spells no domain has no target domain, so
+/// the first two readings find nothing and the bare target is never looked up
+/// at home; only the whole bracket text is. `[[ops:Runbook]]` written where
+/// `ops` is not registered stays unresolved even when the home domain holds a
+/// Runbook, and heals once `ops` is registered and its spelling resets the row.
+///
 /// "Target domain" and "registered" both mean a row of `domain_spelling`: a
 /// reference may name its domain by the local name, the canonical name its
 /// MANIFEST declares or a former name, and every one of those that resolves
@@ -111,10 +120,16 @@ pub struct ObservationRecord {
 /// and only the spelling table can settle it. It stays a second question rather than
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
-/// true, so it resolves exactly as it did before until its engram is reindexed.
+/// true, so it never takes this reading until its engram is reindexed.
 pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
+    // A bare reference reads its own domain; a prefixed one reads only the
+    // domain its prefix spells, and a prefix that spells nothing gives NULL,
+    // which no engram's `domain_id` equals. There is no fallback to the row's
+    // own domain here: that is what the third and fourth arms are for, and
+    // they read the whole bracket text, never the bare target.
     let target_domain = format!(
-        "COALESCE((SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain), {table}.domain_id)"
+        "CASE WHEN {table}.to_domain IS NULL THEN {table}.domain_id \
+         ELSE (SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain) END"
     );
     let unregistered = format!(
         "{table}.to_domain IS NOT NULL \
@@ -188,9 +203,10 @@ pub(crate) enum ReferenceCandidates<'a> {
 /// The resolve pass over one reference table: bind every row whose `to_id` is
 /// still NULL to the engram its bracket text names.
 ///
-/// One statement. Target domain is `to_domain` when set, else the row's own
-/// domain. Prefer a permalink match, then a title match, then the whole
-/// bracket text at home - see [`reference_match`].
+/// One statement. Target domain is the domain `to_domain` spells when set
+/// (none when it spells nothing), else the row's own domain. Prefer a
+/// permalink match, then a title match, then - only for a prefix that spells
+/// no domain - the whole bracket text at home; see [`reference_match`].
 ///
 /// Shared by both backends because the text is the same in both dialects down
 /// to the bind placeholder, which is the one argument: `?1` for turso, `$1` for
