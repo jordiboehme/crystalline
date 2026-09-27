@@ -1223,8 +1223,20 @@ export const VARIANTS_HALL_DECOR: readonly {
 /** The variants hall's one light level, steady everywhere, as `galleryRoom`'s. */
 const VARIANTS_HALL_LIGHT = 210;
 
-/** How many metres apart a variants-hall decor row's centre stands from the next (2.7 Task 1). */
-const DECOR_ROW_PITCH = 4;
+/**
+ * How many metres apart a variants-hall decor row's centre stands from the
+ * next: the deepest piece's full depth (`DECOR_ROW_REACH` twice) plus
+ * `DECOR_ROW_CLEAR`, so two rows never meet.
+ */
+const DECOR_ROW_PITCH = 3.6;
+
+/**
+ * How far a variants-hall decor piece reaches from its row's centre line:
+ * half the deepest decor footprint (the round table's).
+ */
+const DECOR_ROW_REACH = Math.max(
+  ...Object.values(FOOTPRINTS.decor).map((s) => (s === null ? 0 : s.depth / 2)),
+);
 
 /** How many metres a variants-hall decor piece keeps clear of its row neighbour (2.7 Task 1). */
 const DECOR_ROW_CLEAR = 1.2;
@@ -1240,12 +1252,14 @@ const DECOR_ROW_SAFETY = 0.1;
  * by `"<kind>:<variant>"`: one row every `DECOR_ROW_PITCH` metres, in the
  * northern half of the hall (the entrance lane only ever reaches the
  * southern half, C13's `withHeroes` aside, which this hand-built room never
- * runs), packed left to right within `USE_LANE_DEPTH` plus
- * `DECOR_ROW_SAFETY` of the west and east walls, so no piece ever reaches a
- * terminal's or a machine's use lane whichever wall row it falls on. Widest
- * first (a largest-fit-first bin pack): a kind's footprint never changes
- * across its variants (2.7 C3), so every instance of one kind claims the
- * same width regardless of which variant it draws. `pipe-run`
+ * runs), every piece `USE_LANE_DEPTH` plus `DECOR_ROW_SAFETY` clear of the
+ * north wall too (machines the east wall cannot hold spill onto it), packed
+ * left to right within `USE_LANE_DEPTH` plus `DECOR_ROW_SAFETY` of the west
+ * and east walls, so no piece ever reaches a terminal's or a machine's use
+ * lane whichever wall row it falls on. Widest first (a largest-fit-first
+ * bin pack): a kind's footprint never changes across its variants (2.7
+ * C3), so every instance of one kind claims the same width regardless of
+ * which variant it draws. `pipe-run`
  * (`decorFootprint` null, C13) packs at `PIPE_HALF * 2`, a piece hanging
  * from the ceiling with no floor box of its own, so it still keeps its row
  * neighbours' clearance without ever being measured against the floor.
@@ -1261,8 +1275,8 @@ function variantsHallDecorPlacements(
   const halfDepth = ((hall.y1 - hall.y0) * CELL) / 2;
   const rows: { z: number; cursor: number }[] = [];
   for (
-    let z = DECOR_ROW_PITCH / 2;
-    z <= halfDepth - DECOR_ROW_PITCH / 2;
+    let z = USE_LANE_DEPTH + DECOR_ROW_SAFETY + DECOR_ROW_REACH;
+    z <= halfDepth - DECOR_ROW_REACH;
     z += DECOR_ROW_PITCH
   ) {
     rows.push({ z, cursor: xMin });

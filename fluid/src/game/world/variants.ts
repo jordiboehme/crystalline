@@ -3,11 +3,11 @@
  *
  * A kind's variant is one of `VARIANT_COUNTS[kind]` recipes a model file
  * picks between (`render/models/machines.ts`, `terminal.ts`, `decor.ts`);
- * variant 0 is always today's model, part for part (2.7 C1), and every
- * count here starts at 1 (2.7 C1's only variant), which Tasks 4 to 7 raise
- * as they add recipes. A leaf module (2.7 Global Constraints): it imports
- * `core/seed.ts` and `types.ts` only, so the generator side, the render side
- * and the tests can all read it without pulling in either.
+ * variant 0 is always the kind's first model, part for part (2.7 C1), and
+ * a count of 1 means that model alone. A leaf module (2.7 Global
+ * Constraints): it imports `core/seed.ts` and `types.ts` only, so the
+ * generator side, the render side and the tests can all read it without
+ * pulling in either.
  *
  * A pick never draws from an existing stream (2.7 C4): a machine's variant
  * comes from its tag alone, so the same tag is the same machine and the
@@ -29,9 +29,9 @@ import type { DecorKind, MachineKind } from "./types";
 
 /**
  * How many variants each kind's recipe builds (2.7 C2): the terminal, every
- * machine kind and every decor kind. Every count starts at 1 (variant 0
- * only, today's model); Tasks 4 to 7 raise a kind's count once its extra
- * recipes exist, and `variants.test.ts` pins every count between 1 and 4.
+ * machine kind and every decor kind. A count of 1 is variant 0 alone; a
+ * kind's count is raised only once its extra recipes exist, and
+ * `variants.test.ts` pins every count between 1 and 4.
  */
 export const VARIANT_COUNTS: {
   terminal: number;
@@ -40,12 +40,12 @@ export const VARIANT_COUNTS: {
 } = {
   terminal: 1,
   machine: {
-    workbench: 1,
-    "lab-bench": 1,
-    "server-rack": 1,
-    "cryo-pod": 1,
-    fabricator: 1,
-    hydroponics: 1,
+    workbench: 3,
+    "lab-bench": 3,
+    "server-rack": 3,
+    "cryo-pod": 3,
+    fabricator: 3,
+    hydroponics: 3,
     "nav-table": 1,
     "comms-array": 1,
     "reactor-coupling": 1,

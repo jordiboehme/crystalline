@@ -7,18 +7,20 @@ import {
   footprintOf,
   pipeRunBox,
 } from "../world/footprints";
+import { FIXTURE_SURFACES } from "../world/curios";
 import { MACHINE_KINDS } from "../world/generate";
 import type {
   Decor,
   DecorKind,
   DoorStyle,
   Fixture,
+  MachineKind,
   Rect,
   Side,
   WallSlot,
 } from "../world/types";
 import { CELL } from "../world/units";
-import { VARIANT_COUNTS } from "../world/variants";
+import { VARIANT_COUNTS, tagAccent } from "../world/variants";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
@@ -39,13 +41,18 @@ import { LOOKS } from "./looks";
 import {
   add,
   cross,
+  GLOWING,
   dot,
   floatingGlow,
   inBox,
+  occupancy,
   positions,
   scale,
+  shape,
+  silhouetteDelta,
   sub,
   toLocal,
+  touching,
   worstWinding,
   type Part,
 } from "./modelChecks";
@@ -847,5 +854,459 @@ describe("text rows", () => {
     expect(vs.length).toBe(6);
     expect(Math.min(...vs)).toBeCloseTo(2 / 6, 6);
     expect(Math.max(...vs)).toBeCloseTo(3 / 6, 6);
+  });
+});
+
+/** A machine of `machine` in variant `variant`, tag "t", on the north wall. */
+function machineAt(machine: MachineKind, variant: number): Fixture {
+  return {
+    kind: "machine",
+    slot: slotOn("n"),
+    machine,
+    tag: "t",
+    hue: 140,
+    seed: 5,
+    variant,
+  };
+}
+
+/** The terminal of variant `variant` on the north wall. */
+const terminalAt = (variant: number): Fixture => ({
+  kind: "terminal",
+  slot: slotOn("n"),
+  heading: "H",
+  lines: [],
+  section: 0,
+  seed: 1,
+  variant,
+});
+
+/** A piece of decor of `kind` in variant `variant`, at (4.5, 3), turn 0. */
+const decorAt = (kind: DecorKind, variant: number): Decor => ({
+  kind,
+  x: 4.5,
+  y: 3,
+  turn: 0,
+  seed: 11,
+  variant,
+});
+
+/**
+ * An FNV-1a hash over a mesh's float bits, every vertex float but its three
+ * tint floats (offsets 9 to 11), so an accent that only re-tints an existing
+ * part (2.7 C9, C10) leaves it as it was.
+ */
+function meshHash(m: MeshData): string {
+  const bits = new Uint32Array(
+    m.vertices.buffer,
+    m.vertices.byteOffset,
+    m.count * FLOATS_PER_VERTEX,
+  );
+  let h = 0x811c9dc5;
+  for (let i = 0; i < m.count; i++) {
+    for (let k = 0; k < FLOATS_PER_VERTEX; k++) {
+      if (k >= 9 && k <= 11) continue;
+      const w = bits[i * FLOATS_PER_VERTEX + k] ?? 0;
+      for (let b = 0; b < 4; b++) {
+        h ^= (w >>> (8 * b)) & 0xff;
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+    }
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Variant 0's hash of every machine kind, the terminal and every decor kind
+ * (2.7 C1), taken from the models before any other variant existed; a new
+ * variant never moves them.
+ */
+const VARIANT_ZERO_HASHES: Record<string, string> = {
+  terminal: "5ef012b8",
+  "machine:workbench": "73a071c7",
+  "machine:lab-bench": "4cb12d3a",
+  "machine:server-rack": "85fcdac0",
+  "machine:cryo-pod": "c5dbba3b",
+  "machine:fabricator": "04ca04ef",
+  "machine:hydroponics": "c7291645",
+  "machine:nav-table": "8e42665b",
+  "machine:comms-array": "cb32155e",
+  "machine:reactor-coupling": "ab9813af",
+  "machine:cargo-loader": "a4a64aa1",
+  "machine:med-scanner": "c6152b5e",
+  "machine:containment": "b1c94d20",
+  "decor:command-console": "5532e1b9",
+  "decor:captain-chair": "9b1ef258",
+  "decor:round-table": "b927ad5b",
+  "decor:council-chair": "1ae66879",
+  "decor:generator": "de41788a",
+  "decor:pipe-run": "13545095",
+  "decor:shelf-row": "6fd4f6d2",
+  "decor:lab-island": "36ff4f55",
+  "decor:specimen-tank": "918f0109",
+};
+
+/** Every kind's variant 0 hash, by `terminal`, `machine:<kind>`, `decor:<kind>`. */
+function variantZeroHashes(): Record<string, string> {
+  const out: Record<string, string> = {};
+  out.terminal = meshHash(buildOne(terminalAt(0)).static);
+  for (const m of MACHINE_KINDS)
+    out[`machine:${m}`] = meshHash(buildOne(machineAt(m, 0)).static);
+  for (const d of DECOR_KINDS)
+    out[`decor:${d}`] = meshHash(buildOneDecor(decorAt(d, 0)).static);
+  return out;
+}
+
+/** A kind with more than one variant and how to voxelise each of them. */
+interface VariantKind {
+  name: string;
+  count: number;
+  occupancy(v: number): Set<string>;
+}
+
+/** Every machine kind, the terminal and every decor kind (2.7 C2). */
+function variantKinds(): VariantKind[] {
+  const wall = frameForSlot(slotOn("n"));
+  const out: VariantKind[] = [
+    {
+      name: "terminal",
+      count: VARIANT_COUNTS.terminal,
+      occupancy: (v) => occupancy(buildOne(terminalAt(v)).static, wall),
+    },
+  ];
+  for (const m of MACHINE_KINDS)
+    out.push({
+      name: `machine:${m}`,
+      count: VARIANT_COUNTS.machine[m],
+      occupancy: (v) => occupancy(buildOne(machineAt(m, v)).static, wall),
+    });
+  for (const d of DECOR_KINDS)
+    out.push({
+      name: `decor:${d}`,
+      count: VARIANT_COUNTS.decor[d],
+      occupancy: (v) => {
+        const decor = decorAt(d, v);
+        return occupancy(buildOneDecor(decor).static, frameForDecor(decor));
+      },
+    });
+  return out;
+}
+
+/** A recorded part's bounds in the north wall's local `[a, d, h]`. */
+interface LocalBox {
+  part: Part;
+  lo: V3;
+  hi: V3;
+}
+
+/** Every static part of a machine variant, with its local bounds. */
+function localParts(fx: Fixture): LocalBox[] {
+  const wall = frameForSlot(fx.slot);
+  return buildOne(fx).parts.map((part) => {
+    const s = shape(part.points.map((q) => toLocal(wall, q)));
+    return { part, lo: s.lo, hi: s.hi };
+  });
+}
+
+const CYLINDERS = ["cylinder", "cylinderAlong", "lathe", "ring"];
+const BOXES = ["box", "bevelBox"];
+const extent = (b: LocalBox, k: 0 | 1 | 2) => b.hi[k] - b.lo[k];
+
+/**
+ * Whether some chain of parts of `methods`, each touching the next, runs
+ * from a part `from` accepts to a part `to` accepts.
+ */
+function chained(
+  boxes: readonly LocalBox[],
+  methods: readonly string[],
+  from: (b: LocalBox) => boolean,
+  to: (b: LocalBox) => boolean,
+  minLength = 1,
+): boolean {
+  const pool = boxes.filter((b) => methods.includes(b.part.method));
+  const shapes = pool.map((b) => shape(b.part.points));
+  const depth: number[] = pool.map((b) => (from(b) ? 1 : 0));
+  for (let changed = true; changed;) {
+    changed = false;
+    shapes.forEach((p, i) => {
+      if (depth[i]) return;
+      const j = shapes.findIndex(
+        (q, k) => (depth[k] ?? 0) > 0 && touching(p, q),
+      );
+      if (j >= 0) {
+        depth[i] = (depth[j] ?? 0) + 1;
+        changed = true;
+      }
+    });
+  }
+  return pool.some((b, i) => (depth[i] ?? 0) >= minLength && to(b));
+}
+
+/** Whether a part of `ps` lies in the north wall's plane (d about 0). */
+const onWall = (b: LocalBox) => b.lo[1] <= 0.01;
+
+/** Whether two plan rectangles overlap, `a` and `d` in local terms. */
+const overlapsPlan = (
+  b: LocalBox,
+  r: { a0: number; a1: number; d0: number; d1: number },
+) => b.lo[0] < r.a1 && b.hi[0] > r.a0 && b.lo[1] < r.d1 && b.hi[1] > r.d0;
+
+/** The machine body's tint in the test's look. */
+const BODY = LOOKS.aperture.palette.machine;
+const isBody = (b: LocalBox) => b.part.tint?.join() === BODY.join();
+const centreD = (b: LocalBox) => (b.lo[1] + b.hi[1]) / 2;
+
+/**
+ * What makes each new machine variant that variant (2.7 Task 4's table), on
+ * its recorded parts in the north wall's local terms. Entry `v - 1` is
+ * variant `v`'s check; each holds for its variant and fails for variant 0.
+ */
+const SIGNATURES: Partial<
+  Record<MachineKind, ((ps: LocalBox[]) => boolean)[]>
+> = {
+  workbench: [
+    // A closed cabinet on the wall, 0.5 to 0.9 m wide, above 1.1 m, and
+    // no pegboard hooks.
+    (ps) =>
+      ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          onWall(b) &&
+          b.lo[2] >= 1.1 &&
+          extent(b, 0) >= 0.5 - EPS &&
+          extent(b, 0) <= 0.9 + EPS,
+      ) &&
+      !ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          b.lo[2] >= 1.6 &&
+          b.hi[2] <= 1.75 &&
+          b.hi[1] <= 0.06 &&
+          extent(b, 0) <= 0.08,
+      ),
+    // Two gas bottles standing on the floor, 0.08 to 0.12 m in radius.
+    (ps) =>
+      ps.filter((b) => {
+        const r = Math.max(extent(b, 0), extent(b, 1)) / 2;
+        return (
+          b.part.method === "cylinder" &&
+          b.lo[2] <= EPS &&
+          r >= 0.08 - EPS &&
+          r <= 0.12 + EPS &&
+          extent(b, 2) > 2 * r
+        );
+      }).length >= 2,
+  ],
+  "lab-bench": [
+    // The fume arm: a chain of round parts from the wall reaching out
+    // over the bench top.
+    (ps) =>
+      chained(
+        ps,
+        CYLINDERS,
+        (b) => onWall(b) && b.lo[2] > 0.94,
+        (b) => b.hi[1] >= 0.35 && b.lo[2] > 0.94,
+      ),
+    // The analyser or the reagent tower: a box over 0.4 m tall standing
+    // on the bench top at an end, clear of both curio tops.
+    (ps) => {
+      const tops = FIXTURE_SURFACES.machine["lab-bench"];
+      return ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          Math.abs(b.lo[2] - 0.94) < 0.005 &&
+          extent(b, 2) > 0.4 &&
+          tops.every((r) => !overlapsPlan(b, r)) &&
+          tops.some((r) => b.lo[0] < r.a1 && b.hi[0] > r.a0),
+      );
+    },
+  ],
+  "server-rack": [
+    // Two tall cabinets with a gap between them.
+    (ps) => {
+      const tall = ps.filter(
+        (b) => BOXES.includes(b.part.method) && extent(b, 2) > 1.5,
+      );
+      return tall.some((p) =>
+        tall.some((q) => q.lo[0] - p.hi[0] >= 0.05 - EPS),
+      );
+    },
+    // An open frame: four thin corner posts and no tall side panel.
+    (ps) =>
+      ps.filter(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          extent(b, 0) < 0.06 &&
+          extent(b, 1) < 0.06 &&
+          extent(b, 2) > 1.5,
+      ).length >= 4 &&
+      !ps.some(
+        (b) =>
+          extent(b, 2) > 1.5 && (extent(b, 0) >= 0.3 || extent(b, 1) >= 0.3),
+      ),
+  ],
+  "cryo-pod": [
+    // The capsule leans: its top's centre at least 0.2 m further from the
+    // wall than its bottom's.
+    (ps) => {
+      const capsule = ps.filter(
+        (b) => isBody(b) && CYLINDERS.includes(b.part.method),
+      );
+      if (capsule.length === 0) return false;
+      const low = capsule.reduce((x, y) => (y.lo[2] < x.lo[2] ? y : x));
+      const high = capsule.reduce((x, y) => (y.hi[2] > x.hi[2] ? y : x));
+      return centreD(high) - centreD(low) >= 0.2;
+    },
+    // A drum: a capsule under 1.6 m tall with a round window.
+    (ps) => {
+      const capsule = ps.filter((b) => isBody(b) && b.part.method === "lathe");
+      const disc = ps.some((b) => {
+        if (b.part.method !== "extrude" || b.part.flag !== FLAG.emissive)
+          return false;
+        const ca = (b.lo[0] + b.hi[0]) / 2;
+        const ch = (b.lo[2] + b.hi[2]) / 2;
+        const wall = frameForSlot(slotOn("n"));
+        const rs = b.part.points.map((q) => {
+          const [a, , h] = toLocal(wall, q);
+          return Math.hypot(a - ca, h - ch);
+        });
+        return (
+          Math.min(...rs) > 0.9 * Math.max(...rs) && Math.max(...rs) > 0.05
+        );
+      });
+      return (
+        capsule.length > 0 && capsule.every((b) => extent(b, 2) < 1.6) && disc
+      );
+    },
+  ],
+  fabricator: [
+    // The resin printer: a box over 1.4 m tall.
+    (ps) => ps.some((b) => BOXES.includes(b.part.method) && extent(b, 2) > 1.4),
+    // The arm cell: a chain of at least four round or square parts rising
+    // from the top of the machine's wide table (the highest part off the
+    // wall at least 1.2 m wide; the tag strip is on the wall).
+    (ps) => {
+      const wide = ps.filter(
+        (b) =>
+          BOXES.includes(b.part.method) && !onWall(b) && extent(b, 0) >= 1.2,
+      );
+      if (wide.length === 0) return false;
+      const table = Math.max(...wide.map((b) => b.hi[2]));
+      const above = ps.filter((b) => b.lo[2] >= table - 0.002);
+      return chained(
+        above,
+        [...CYLINDERS, ...BOXES],
+        (b) => Math.abs(b.lo[2] - table) <= 0.002,
+        (b) => b.hi[2] >= table + 0.4,
+        4,
+      );
+    },
+  ],
+  hydroponics: [
+    // The tray rack: three flat trays stacked at three heights.
+    (ps) => {
+      const trays = ps
+        .filter(
+          (b) =>
+            BOXES.includes(b.part.method) &&
+            extent(b, 0) >= 1.2 &&
+            extent(b, 1) >= 0.4 &&
+            extent(b, 2) <= 0.15,
+        )
+        .map((b) => b.lo[2])
+        .sort((x, y) => x - y);
+      let levels = 0;
+      let last = -Infinity;
+      for (const h of trays) {
+        if (h - last > 0.2) levels++;
+        if (h - last > 0.2) last = h;
+      }
+      return levels >= 3;
+    },
+    // The tube garden: at least five tall upright tubes.
+    (ps) =>
+      ps.filter(
+        (b) =>
+          b.part.method === "cylinder" &&
+          extent(b, 2) >= 0.6 &&
+          extent(b, 2) > 2 * Math.max(extent(b, 0), extent(b, 1)),
+      ).length >= 5,
+  ],
+};
+
+/**
+ * How many parts of each machine variant carry the tag's second accent
+ * (2.7 C10), entry `v` for variant `v`. Variant 0 re-tints parts it already
+ * had: the vice's two jaws, the lab bench's three door handles, the rack's
+ * five top vents, the pod's collar ring, the fabricator's print carriage,
+ * the hydroponics grow light's two arms, the nav table's three metal keys,
+ * the comms base's cross bar, the reactor's two collar rings, the loader's
+ * mast head, the scanner's two bed rails and the containment cap's ring.
+ */
+const ACCENT_PARTS: Record<MachineKind, readonly number[]> = {
+  workbench: [2, 3, 2],
+  "lab-bench": [3, 1, 1],
+  "server-rack": [5, 2, 1],
+  "cryo-pod": [1, 1, 1],
+  fabricator: [1, 1, 1],
+  hydroponics: [2, 3, 1],
+  "nav-table": [3],
+  "comms-array": [1],
+  "reactor-coupling": [2],
+  "cargo-loader": [1],
+  "med-scanner": [2],
+  containment: [1],
+};
+
+describe("model variants (2.7)", () => {
+  it("keeps every variant 0 as it was (2.7 C1)", () => {
+    // Mutation caught: a variant 1 edit that leaks into variant 0's branch.
+    const hashes = variantZeroHashes();
+    expect(Object.keys(hashes).length).toBe(1 + 12 + 9);
+    expect(hashes).toEqual(VARIANT_ZERO_HASHES);
+  });
+
+  it("makes every pair of a kind's variants differ in shape (2.7 C2)", () => {
+    // Mutation caught: a variant built as another (delta 0), or one that
+    // only recolours (the same voxels).
+    const kinds = variantKinds().filter((k) => k.count >= 2);
+    expect(kinds.length).toBeGreaterThan(0);
+    for (const k of kinds)
+      for (let a = 0; a < k.count; a++)
+        for (let b = a + 1; b < k.count; b++)
+          expect(
+            silhouetteDelta(k.occupancy(a), k.occupancy(b)),
+            `${k.name} ${String(a)} against ${String(b)}`,
+          ).toBeGreaterThanOrEqual(0.2);
+  }, 30_000);
+
+  for (const machine of MACHINE_KINDS)
+    for (const [i, check] of (SIGNATURES[machine] ?? []).entries())
+      it(`builds ${machine} variant ${String(i + 1)} to its design (2.7 Task 4)`, () => {
+        // Mutation caught: the variant built as variant 0 (the check must
+        // fail there, so it cannot pass on any build of the kind).
+        expect(VARIANT_COUNTS.machine[machine]).toBeGreaterThan(i + 1);
+        expect(check(localParts(machineAt(machine, i + 1)))).toBe(true);
+        expect(check(localParts(machineAt(machine, 0)))).toBe(false);
+      });
+
+  it("paints the tag's second accent on each variant's trim parts only (2.7 C10)", () => {
+    // Mutation caught: an accent part left in its old colour, one painted
+    // twice, a glowing part tinted in the accent, or the room's accent mark
+    // used instead of the tag's colour.
+    const accent = LOOKS.aperture.accents[tagAccent("t")];
+    if (!accent) throw new Error("no accent");
+    expect(Object.keys(ACCENT_PARTS).length).toBe(MACHINE_KINDS.length);
+    for (const machine of MACHINE_KINDS) {
+      const counts = ACCENT_PARTS[machine];
+      expect(counts.length, machine).toBe(VARIANT_COUNTS.machine[machine]);
+      counts.forEach((n, v) => {
+        const painted = buildOne(machineAt(machine, v)).parts.filter(
+          (p) => p.tint?.join() === accent.join(),
+        );
+        expect(painted.length, `${machine} variant ${String(v)}`).toBe(n);
+        for (const p of painted) expect(GLOWING).not.toContain(p.flag);
+      });
+    }
   });
 });
