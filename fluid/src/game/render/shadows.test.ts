@@ -104,16 +104,33 @@ describe("contact shadows", () => {
     expect(k.corner).toBeGreaterThan(k.edge * 0.8);
   });
 
-  it("grows a larger prop's patch a little darker and a little softer", () => {
-    // Mutation caught: darkness or softness that ignores the footprint, or
-    // one that grows without bound (a hero's patch would black the floor).
-    const small = { x: 0, z: 0, hx: 0.2, hz: 0.2, round: true };
-    const large = { x: 0, z: 0, hx: 2.5, hz: 1.3, round: false };
-    expect(casterDarkness(large)).toBeGreaterThan(casterDarkness(small));
-    expect(casterSoftness(large)).toBeGreaterThan(casterSoftness(small));
-    const huge = { x: 0, z: 0, hx: 10, hz: 10, round: false };
-    expect(casterDarkness(huge)).toBeLessThanOrEqual(1);
-    expect(casterSoftness(huge)).toBeLessThanOrEqual(0.5);
+  it("keeps small and medium props' patches full, lightens a large one's by its size, and widens its soft edge", () => {
+    // Mutation caught: one darkness for every size (big cabinets and
+    // machines back on a painted pad), a darkness that grows with the
+    // footprint, one keyed by kind rather than size (two equal footprints
+    // would differ), or softness without bound.
+    const at = (hx: number, hz: number, round = false) => ({
+      x: 0,
+      z: 0,
+      hx,
+      hz,
+      round,
+    });
+    const barrel = at(0.325, 0.325, true);
+    const crate = at(0.4, 0.4);
+    const machine = at(0.9, 0.45);
+    const console = at(1.5, 0.5);
+    const hero = at(2.5, 1.3);
+    expect(casterDarkness(barrel)).toBe(1);
+    expect(casterDarkness(crate)).toBe(1);
+    expect(casterDarkness(machine)).toBeLessThan(0.9);
+    expect(casterDarkness(console)).toBeLessThan(casterDarkness(machine));
+    expect(casterDarkness(hero)).toBeLessThan(casterDarkness(console));
+    expect(casterDarkness(hero)).toBeGreaterThanOrEqual(0.5);
+    // Size alone: a round and a square patch of one footprint match.
+    expect(casterDarkness(at(0.9, 0.45, true))).toBe(casterDarkness(machine));
+    expect(casterSoftness(hero)).toBeGreaterThan(casterSoftness(barrel));
+    expect(casterSoftness(at(10, 10))).toBeLessThanOrEqual(0.5);
   });
 
   it("casts a wall-standing locker bank's patch in front of its wall, along it", () => {

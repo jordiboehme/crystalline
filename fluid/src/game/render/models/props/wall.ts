@@ -15,8 +15,9 @@
  * other wall prop carries it.
  *
  * In a look with `propAccents` a prop paints exactly one part in its own
- * accent instead (`s.own`) and the slits turn dark metal: one locker handle,
- * the breaker box's lever (variant 0) or the bar across its two boxes
+ * accent instead (`s.own`) and the slits turn dark metal: a full-width
+ * stripe across one locker door,
+ * the breaker box's switch housing (variant 0) or the bar across its two boxes
  * (variant 1) and a trim along the conduit cabinet's top. A
  * part only that look draws is added only there.
  */
@@ -79,8 +80,13 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       L.depth + 0.03,
       L.h1 / 2 - 0.09,
       L.h1 / 2 + 0.09,
-      i === 1 ? s.own(s.metal) : s.metal,
+      s.metal,
     );
+    // A full-width stripe across the second door, drawn only in a look
+    // with the prop's own accent.
+    const stripe = s.own(s.panel);
+    if (i === 1 && stripe !== s.panel)
+      k.box(a0, a1, L.depth - 0.005, L.depth + 0.002, 1.3, 1.42, stripe);
   }
 }
 
@@ -381,7 +387,7 @@ function breakerBox({ k, s, kitAt, variant }: Parameters<PropRecipe>[0]): void {
       B.depth,
       mid - 0.1,
       mid + 0.1,
-      s.dark,
+      s.own(s.dark),
     );
     const f = frameAt([0, 0, 0], 0);
     const lever = yawed(f, B.half - 0.05, B.depth, -0.7);
@@ -392,7 +398,7 @@ function breakerBox({ k, s, kitAt, variant }: Parameters<PropRecipe>[0]): void {
       0.09,
       mid - 0.02,
       mid + 0.02,
-      s.own(s.dark),
+      s.dark,
     );
   } else {
     const w = B.half * 0.9;

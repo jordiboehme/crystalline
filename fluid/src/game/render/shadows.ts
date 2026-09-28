@@ -4,7 +4,7 @@
  * (`Caster`): a soft rectangle the size of its footprint, turned with it,
  * or a soft disc (an ellipse in a footprint that is not square) for a
  * round thing such as a barrel, a cone or a round table. A larger footprint
- * gives a slightly darker patch with a wider soft edge. The patches are
+ * gives a lighter patch with a wider soft edge. The patches are
  * painted once per room into a small R8 texture over the grid
  * (`SHADOW_TEXELS` a metre), which the scene shader reads on the floor and
  * darkens its light by, before the bands, as far as the look's
@@ -76,11 +76,23 @@ export interface Caster {
   round: boolean;
 }
 
-/** How dark a patch's middle gets, 0 to 1: a little darker as the footprint grows. */
+/**
+ * How dark a patch's middle gets, 0 to 1, by the footprint's size (the
+ * square root of its area) alone: full for small and medium props, up to
+ * `DARK_FULL` across, then lighter as the footprint grows, down to
+ * `DARK_LEAST`, so a big cabinet or machine stands on a soft shade rather
+ * than a painted pad.
+ */
 export function casterDarkness(c: Caster): number {
   const size = 2 * Math.sqrt(c.hx * c.hz);
-  return Math.min(1, 0.85 + 0.1 * size);
+  return Math.max(DARK_LEAST, Math.min(1, 1 - 0.35 * (size - DARK_FULL)));
 }
+
+/** The footprint size, in metres, up to which a patch is fully dark. */
+const DARK_FULL = 0.8;
+
+/** The lightest a large footprint's patch gets. */
+const DARK_LEAST = 0.55;
 
 /**
  * How far a patch's soft edge runs past the footprint grown by `MARGIN`,

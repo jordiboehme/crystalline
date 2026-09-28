@@ -111,6 +111,30 @@ function markedArea(m: MeshData): { part: number; whole: number } {
   return { part, whole };
 }
 
+/**
+ * How many groups the parts fall into, two parts in one group when a
+ * corner of one lies within a millimetre of a corner of the other,
+ * directly or through others: the strips of a rim or a band share their
+ * corners, two separate stripes or bands share none.
+ */
+function touchingGroups(parts: readonly (readonly V3[])[]): number {
+  const parent = parts.map((_, i) => i);
+  const root = (i: number): number => {
+    while (parent[i] !== i) i = parent[i] ?? i;
+    return i;
+  };
+  const touch = (a: readonly V3[], b: readonly V3[]) =>
+    a.some((p) =>
+      b.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) < 1e-3),
+    );
+  parts.forEach((a, i) =>
+    parts.forEach((b, j) => {
+      if (j > i && touch(a, b)) parent[root(j)] = root(i);
+    }),
+  );
+  return new Set(parts.map((_, i) => root(i))).size;
+}
+
 /** Where an instance goes: its world offset, in metres. */
 function anchorFor(kind: PropKind, t: number): V3 {
   const entry = PROP_CATALOGUE[kind];
@@ -373,13 +397,14 @@ describe("prop models", () => {
     }
   });
 
-  it("paints at most one small part of each prop in its own accent in look 2, and nothing in the room's", () => {
-    // Mutation caught: two parts marked (two locker handles, every barrel
-    // of the cluster, a handle on every drawer), a large part marked (a
-    // whole locker door, a whole lid, a seat or a body: its surface would
-    // pass the small part's share), a room accent part left in (the
-    // barrel's ribs beside its own band), a kind that loses its only
-    // coloured part, or a part that glows.
+  it("paints one part of each prop in its own accent in look 2, big enough to read but never a whole door, lid or body, and nothing in the room's", () => {
+    // Mutation caught: two parts marked (a stripe on two locker doors, a
+    // band on every barrel of the cluster), a whole door or lid marked
+    // (its surface passes the cap), a whole body marked (it fills the
+    // prop), a room accent part left in (the barrel's ribs beside its own
+    // band), a kind that loses its coloured part, or a part that glows.
+    // One part may be drawn in several strips that meet at their corners
+    // (a rim, a band); strips that share no corner are two parts.
     const look = propLook(LOOKS.aperture);
     const OWN = [
       "barrel",
@@ -397,6 +422,10 @@ describe("prop models", () => {
       "tool-cart",
       "trolley",
     ];
+    const volume = (lo: V3, hi: V3) =>
+      Math.max(hi[0] - lo[0], 0.01) *
+      Math.max(hi[1] - lo[1], 0.01) *
+      Math.max(hi[2] - lo[2], 0.01);
     for (const kind of PROP_KINDS)
       for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
         const at = `${kind} variant ${String(v)}`;
@@ -406,16 +435,20 @@ describe("prop models", () => {
           parts.filter((p) => p.tint?.[0] === ACCENT_MARK),
           at,
         ).toEqual([]);
-        expect(own.length, at).toBe(OWN.includes(kind) ? 1 : 0);
         for (const p of own) expect(GLOWING, at).not.toContain(p.flag);
+        expect(touchingGroups(own.map((p) => p.points)), at).toBe(
+          OWN.includes(kind) ? 1 : 0,
+        );
         if (own.length === 0) continue;
-        const { part, whole } = markedArea(mesh);
-        // A handle, a band, a stripe, a small panel or a rim: under a
-        // quarter of a square metre (a locker door or a crate's lid is about
-        // two) and under a sixth of the prop's own surface (a small prop's
-        // seat or body would pass the first).
-        expect(part, at).toBeLessThan(0.25);
-        expect(part / whole, at).toBeLessThan(0.15);
+        // A door is about 2 m² of surface and a big crate's lid about 3; a
+        // band all round a big crate, both its faces counted, about 1.
+        expect(markedArea(mesh).part, at).toBeLessThan(1.2);
+        const whole = shape(parts.flatMap((q) => q.points));
+        const part = shape(own.flatMap((q) => q.points));
+        expect(
+          volume(part.lo, part.hi) / volume(whole.lo, whole.hi),
+          at,
+        ).toBeLessThan(0.25);
       }
   });
 
