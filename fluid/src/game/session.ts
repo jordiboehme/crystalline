@@ -118,10 +118,11 @@
  * reads no keys, exactly as with the CRT reader, until the host calls
  * `closeLevels` or `jump` goes somewhere.
  *
- * The station pauses (M4 C6) when the pointer lock ends while nothing else
- * has the keys, and on a fresh Esc while the pointer is not locked (the
- * path a browser that refuses the lock takes), unless something else
- * already took that Esc (`defaultPrevented`). The session listens for both
+ * With `onPause` (the game route only), the station pauses (M4 C6) when
+ * the pointer lock ends while nothing else has the keys, and on a fresh
+ * Esc while the pointer is not locked (the path a browser that refuses
+ * the lock takes), unless something else already took that Esc
+ * (`defaultPrevented`). The session listens for both
  * itself, beside the input's own listeners, and registers them when it is
  * created, before any overlay mounts, so an overlay's Esc finds the
  * session modal (C9). A load in flight does not stop a pause; it settles
@@ -336,7 +337,8 @@ export interface SessionOptions {
   /**
    * The pause's channel (M4 C6): called with true when the station pauses
    * and with false when the pause ends (`resume`, a `go`, `dispose`).
-   * Without it the station still pauses, and nothing shows it.
+   * Without it the station never pauses: the look demo and the model
+   * gallery never pass it.
    */
   onPause?: (paused: boolean) => void;
 }
@@ -723,8 +725,13 @@ export function createSession(opts: SessionOptions): Session {
     if (e.key !== "Escape" || e.repeat || e.defaultPrevented) return;
     if (document.pointerLockElement !== canvas) pause();
   };
-  document.addEventListener("pointerlockchange", onPauseLock);
-  window.addEventListener("keydown", onPauseKey);
+  // Only a host that shows the pause (`onPause`) gets one: the look demo
+  // and the model gallery never pass it, and a pause nobody can end would
+  // freeze them.
+  if (opts.onPause !== undefined) {
+    document.addEventListener("pointerlockchange", onPauseLock);
+    window.addEventListener("keydown", onPauseKey);
+  }
 
   // The notice shown when no timed one is up: a missing GPU wins over a
   // place that could not be entered.

@@ -3374,6 +3374,24 @@ describe("the pause (M4 C6 to C9)", () => {
     session.resume();
   });
 
+  it("never pauses without onPause, as on the look demo and the gallery", () => {
+    // Mutation caught: the pause listeners registered whatever the host
+    // passed (a lost lock or an Esc would freeze a screen that shows no
+    // pause and never resumes).
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    lock();
+    unlock();
+    esc();
+    expect(session.paused).toBe(false);
+    const eye = lastCamera().eye;
+    key("keydown", "KeyW");
+    frames(5);
+    key("keyup", "KeyW");
+    expect(lastCamera().eye).not.toEqual(eye);
+  });
+
   it("pauses on a lost lock while a load is in flight (C6a)", () => {
     const onPause = pauseSpy();
     const session = start({
