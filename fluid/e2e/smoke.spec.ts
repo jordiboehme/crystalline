@@ -545,3 +545,45 @@ test("a domain is registered, filled from an archive and unregistered", async ({
   expect(domains.ok()).toBeTruthy();
   expect(await domains.text()).not.toContain(RESTORE_DOMAIN);
 });
+
+test("the station launches from the C64 screen and returns to the same page", async ({
+  page,
+}) => {
+  // Signed in by `beforeEach`.
+  const route = `/d/${DOMAIN}/e/${DEEP_PERMALINK}`;
+  await page.goto(route);
+  // The gem: the first element inside the header's home link.
+  await page
+    .locator('header a[href="/"] > span')
+    .first()
+    .click({ clickCount: 3 });
+  await expect(
+    page.getByRole("dialog", { name: "About Crystalline" }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: 'LOAD"GAME",8,1' }).click();
+  await expect(page).toHaveURL(new RegExp(`/%CF%80${route}$`));
+  await expect(page.locator("canvas")).toBeVisible();
+  await expect(page.getByText("?DEVICE NOT PRESENT ERROR")).toHaveCount(0);
+  // Log the renderer once, so the CI job shows what drew the canvas.
+  const renderer = await page.evaluate(() => {
+    const gl = document.createElement("canvas").getContext("webgl2");
+    const info = gl?.getExtension("WEBGL_debug_renderer_info");
+    return gl && info
+      ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL))
+      : "no webgl2";
+  });
+  console.log(`renderer: ${renderer}`);
+  // The connecting screen skips on any key.
+  await page.keyboard.press("Shift");
+  // Wait for the room to land before pausing: the HUD's status line leads
+  // with the room's title once the room is entered (before that it names
+  // only the look and the mouse hint).
+  await expect(page.locator('[data-hud="status"]')).toContainText(
+    "DEEP GAMMA NOTE",
+  );
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Paused" })).toBeVisible();
+  await page.getByRole("button", { name: "RUN/STOP (ESC)" }).click();
+  await expect(page).toHaveURL(new RegExp(`${route}$`));
+  await expect(page).not.toHaveURL(/%CF%80/);
+});

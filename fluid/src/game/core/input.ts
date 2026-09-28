@@ -50,6 +50,12 @@ export interface Input {
   /** Whether the pointer is locked to the target. */
   readonly locked: boolean;
   /**
+   * When the lock last ended, on `performance.now()`'s clock, or
+   * `-Infinity` before it ever did. `requestLock` does nothing until
+   * `RELOCK_DELAY_MS` after it, so the pause screen waits that long too.
+   */
+  readonly lockEndedAt: number;
+  /**
    * Forgets every held key, every unconsumed press and the mouse movement
    * gathered so far. The session calls it when an overlay that reads the
    * keys itself (the CRT reader or the level select) opens or closes, so a
@@ -72,7 +78,7 @@ export interface Input {
 }
 
 /** How long Chrome refuses a new lock after one ended. */
-const RELOCK_DELAY_MS = 1100;
+export const RELOCK_DELAY_MS = 1100;
 
 /**
  * How many typed codes wait at most between two reads of `typed`. A tick
@@ -151,6 +157,9 @@ export function createInput(
     },
     get locked() {
       return isLocked();
+    },
+    get lockEndedAt() {
+      return lockEndedAt;
     },
     clear() {
       down.clear();

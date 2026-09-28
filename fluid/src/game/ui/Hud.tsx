@@ -55,7 +55,8 @@ export function Hud({ view, connector, legend }: HudProps) {
         {import.meta.env.DEV ? <span ref={frame} /> : null}
       </div>
       <div className={`absolute inset-x-0 bottom-0 p-3 ${line}`}>
-        <span ref={status} />
+        {/* Named for the browser smoke, which waits on the room's label. */}
+        <span ref={status} data-hud="status" />
       </div>
       <div
         ref={prompt}

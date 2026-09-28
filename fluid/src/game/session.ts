@@ -117,6 +117,22 @@
  * letter, since Space is the use key. While the select is open the session
  * reads no keys, exactly as with the CRT reader, until the host calls
  * `closeLevels` or `jump` goes somewhere.
+ *
+ * The station pauses (M4 C6) when the pointer lock ends while nothing else
+ * has the keys, and on a fresh Esc while the pointer is not locked (the
+ * path a browser that refuses the lock takes), unless something else
+ * already took that Esc (`defaultPrevented`). The session listens for both
+ * itself, beside the input's own listeners, and registers them when it is
+ * created, before any overlay mounts, so an overlay's Esc finds the
+ * session modal (C9). A load in flight does not stop a pause; it settles
+ * under it. While paused the session is modal: the tick drains the keys
+ * and returns, so nothing moves, no door, fault or light steps and nothing
+ * is travelled to, while the frame keeps being drawn. The host shows its
+ * pause screen from `onPause` and ends the pause with `resume`, in the
+ * gesture that asks for the lock again; a new place (`leave`) ends it too.
+ * `setBusy` holds the station modal the same way for a screen of the
+ * host's (the connecting screen), without a pause. Going down pauses
+ * nothing: both listeners are removed before the input releases the lock.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
@@ -274,6 +290,8 @@ export type RendererFactory = (
  *   pick from; only the game route passes it. See the member.
  * - `onLift`: the lift overlay's channel; only the game route passes it.
  *   See the member.
+ * - `onPause`: the pause's channel; only the game route passes it. See
+ *   the member.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -315,6 +333,12 @@ export interface SessionOptions {
    * demo and the model gallery never pass it.
    */
   onLift?: (lift: { stops: LiftStop[]; note: string | null } | null) => void;
+  /**
+   * The pause's channel (M4 C6): called with true when the station pauses
+   * and with false when the pause ends (`resume`, a `go`, `dispose`).
+   * Without it the station still pauses, and nothing shows it.
+   */
+  onPause?: (paused: boolean) => void;
 }
 
 /**
@@ -377,6 +401,16 @@ export type PlaceLoader = (
  * - `where` is the room's label as the status line shows it, the room's
  *   title upper-cased; null before the first room and in the console room,
  *   which has no title.
+ * - `pause` pauses the station unless something already has the keys: the
+ *   keys are forgotten, the prompt goes, the lock is released and
+ *   `onPause` is told. `paused` says whether it is paused.
+ * - `resume` ends the pause, tells `onPause` and asks for the lock again,
+ *   so it must be called from a user gesture. Not paused, it does nothing.
+ * - `setBusy` holds the station modal for a screen of the host's, as an
+ *   overlay does, with no pause and no lock released.
+ * - `lockEndedAt` is when the pointer lock last ended, on
+ *   `performance.now()`'s clock (`Input.lockEndedAt`): the lock is asked
+ *   for again no sooner than `RELOCK_DELAY_MS` after it.
  */
 export interface Session {
   go(address: StationAddress, arrival?: Arrival | null, label?: string): void;
@@ -395,8 +429,13 @@ export interface Session {
   /** The lift overlay was closed: gives the session the keys back. */
   closeLift(): void;
   dispose(): void;
+  pause(): void;
+  resume(): void;
+  setBusy(busy: boolean): void;
   readonly current: StationAddress | null;
   readonly where: string | null;
+  readonly paused: boolean;
+  readonly lockEndedAt: number;
 }
 
 /** Where the inverted-look choice is remembered: "1" inverted, "0" normal. */
@@ -430,6 +469,13 @@ export const LIFT_RIDE_MS = 1200;
  * console room's exit latch (`exitLatched`), which is its own.
  */
 export const UP_LATCH_CLEAR = 2.0;
+
+/**
+ * How long the pause screen ignores Esc after it opened, in milliseconds
+ * (M4 C7): a browser that delivers the Esc that ended the lock must not
+ * leave the station on it.
+ */
+export const PAUSE_ESC_GUARD_MS = 250;
 
 /** No fixture held shut. */
 const NONE_SHUT: ReadonlySet<number> = new Set();
@@ -595,11 +641,15 @@ export function createSession(opts: SessionOptions): Session {
   let ticks = 0;
   /** Whether the timed notice up is the inverted-look one (C6). */
   let lookFlash = false;
+  /** Whether the station is paused (M4 C6). */
+  let paused = false;
+  /** Whether a screen of the host's holds the station (`setBusy`). */
+  let busy = false;
   /**
-   * Whether an overlay (the CRT reader, the level select or the lift's
-   * stops) has the keys.
+   * Whether something else has the keys: an overlay (the CRT reader, the
+   * level select or the lift's stops), the pause or a busy host.
    */
-  const modal = () => readerOpen || levelsOpen || liftOpen;
+  const modal = () => readerOpen || levelsOpen || liftOpen || paused || busy;
   let lastPrompt: string | null = null;
   /** Ways whose travel failed this visit: fixture index to its seal label. */
   let failed = new Map<number, string>();
@@ -663,6 +713,18 @@ export function createSession(opts: SessionOptions): Session {
   };
   window.addEventListener("keydown", onClaimedKey);
   window.addEventListener("keyup", onClaimedKey);
+  // The pause's own listeners (M4 C6, C9), after the input's, so the
+  // input has stamped the lock's end before a pause is shown. `pause`
+  // itself does nothing once disposed or while anything is modal.
+  const onPauseLock = () => {
+    if (document.pointerLockElement !== canvas) pause();
+  };
+  const onPauseKey = (e: KeyboardEvent) => {
+    if (e.key !== "Escape" || e.repeat || e.defaultPrevented) return;
+    if (document.pointerLockElement !== canvas) pause();
+  };
+  document.addEventListener("pointerlockchange", onPauseLock);
+  window.addEventListener("keydown", onPauseKey);
 
   // The notice shown when no timed one is up: a missing GPU wins over a
   // place that could not be entered.
@@ -980,7 +1042,7 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Leaves whatever the session was doing for a new place: closes the CRT
-   * reader, the level select and the lift overlay, drops the load in
+   * reader, the level select, the lift overlay and the pause, drops the load in
    * flight (a new generation, the old one aborted) and a ride's held
    * landing with it, and takes the connector down if it was up.
    */
@@ -988,6 +1050,7 @@ export function createSession(opts: SessionOptions): Session {
     closeReader();
     closeLevels();
     closeLift();
+    closePause();
     travelling = null;
     ride = null;
     const gen = ++generation;
@@ -1263,6 +1326,38 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /**
+   * Pauses the station (M4 C6) unless something already has the keys:
+   * forgets every key and the half-typed word, takes the prompt down,
+   * releases the lock (the loss that follows finds the session modal) and
+   * tells the host.
+   */
+  const pause = () => {
+    if (disposed || modal()) return;
+    paused = true;
+    input.clear();
+    cheat?.reset();
+    setPrompt(null);
+    if (document.pointerLockElement !== null) {
+      document.exitPointerLock?.();
+    }
+    opts.onPause?.(true);
+  };
+
+  /**
+   * Ends the pause without asking for the lock, for `resume` and a new
+   * place (`leave`): forgets the keys pressed on the pause screen and
+   * tells the host. Returns whether a pause was ended.
+   */
+  const closePause = (): boolean => {
+    if (disposed || !paused) return false;
+    paused = false;
+    input.clear();
+    cheat?.reset();
+    opts.onPause?.(false);
+    return true;
+  };
+
+  /**
    * Rides the lift last opened to its stop `index` (M3 C27): closes the
    * overlay and travels there, the connector naming the stop. The lift's
    * doors are already heading shut (`stepDoors` never opens them). The
@@ -1384,6 +1479,9 @@ export function createSession(opts: SessionOptions): Session {
       // none of them is ours.
       for (const code of COMMAND_KEYS) input.pressed(code);
       input.takeLook();
+      // Paused, nothing else runs: no movement, doors, faults, travel,
+      // lights or blink (M4 C6).
+      if (paused) return;
     } else {
       let matched = false;
       if (cheat !== null) {
@@ -1629,6 +1727,17 @@ export function createSession(opts: SessionOptions): Session {
     closeLevels,
     ride: rideLift,
     closeLift,
+    pause,
+    resume() {
+      if (closePause()) input.requestLock();
+    },
+    setBusy(next) {
+      if (disposed || busy === next) return;
+      busy = next;
+      // A key the host's screen took is not replayed as a command.
+      input.clear();
+      cheat?.reset();
+    },
     dispose() {
       if (disposed) return;
       // The host's overlays go down with the session, so a host that
@@ -1636,6 +1745,7 @@ export function createSession(opts: SessionOptions): Session {
       hud.reader(null);
       opts.onLevels?.(false);
       opts.onLift?.(null);
+      opts.onPause?.(false);
       hud.connector(false, loadingLabel, lookId);
       disposed = true;
       generation++;
@@ -1654,6 +1764,10 @@ export function createSession(opts: SessionOptions): Session {
       canvas.removeEventListener("click", onClick);
       window.removeEventListener("keydown", onClaimedKey);
       window.removeEventListener("keyup", onClaimedKey);
+      // Before `input.dispose()`, which releases the lock: going down
+      // pauses nothing (F18).
+      document.removeEventListener("pointerlockchange", onPauseLock);
+      window.removeEventListener("keydown", onPauseKey);
       canvas.removeEventListener("webglcontextlost", onLost);
       canvas.removeEventListener("webglcontextrestored", onRestored);
       input.dispose();
@@ -1665,6 +1779,12 @@ export function createSession(opts: SessionOptions): Session {
     },
     get where() {
       return where();
+    },
+    get paused() {
+      return paused;
+    },
+    get lockEndedAt() {
+      return input.lockEndedAt;
     },
   };
 }

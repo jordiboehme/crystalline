@@ -65,6 +65,18 @@
  * address the player stands at (`fluidRouteOfStation`): `/` in the
  * airlock, the domain page on a bridge, the folder on a deck, the engram's
  * reading page in its room.
+ *
+ * The station pauses when the pointer lock ends or Esc is pressed with
+ * nothing else open (the session's own decision, `onPause`), and the route
+ * shows the pause screen (`PauseScreen`) over the still station, with the
+ * room's label and the time the lock ended taken from the session as it
+ * paused. `CONT` resumes the session inside its own click or key, which
+ * asks for the lock again. `RUN/STOP` or Esc is the way out: the route
+ * replaces its own history entry with the Fluid page of the place the
+ * player is at (`fluidRouteOfStation`), so Back from that page never goes
+ * into the station again. Before the first room lands the session is at
+ * no place yet, and the way out leads to the page of the address the URL
+ * last sent it to; the unmount that follows disposes the session.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -86,6 +98,7 @@ import { DeviceRefusal } from "./ui/DeviceRefusal";
 import { GAME_LEGEND } from "./ui/keys";
 import { LevelSelect } from "./ui/LevelSelect";
 import { LiftSelect } from "./ui/LiftSelect";
+import { PauseScreen } from "./ui/PauseScreen";
 import { StationView } from "./ui/StationView";
 import { useHud } from "./ui/useHud";
 import type { LiftStop, StationAddress } from "./world/types";
@@ -137,6 +150,12 @@ export default function ExploreRoute() {
     stops: LiftStop[];
     note: string | null;
   } | null>(null);
+  // The pause, with what the screen shows taken from the session as it
+  // paused: the room's label and when the lock ended. Null while running.
+  const [pause, setPause] = useState<{
+    where: string | null;
+    lockEndedAt: number;
+  } | null>(null);
 
   useEffect(() => {
     navigateRef.current = navigate;
@@ -167,9 +186,19 @@ export default function ExploreRoute() {
       forceRgba8: false,
       onLevels: setLevels,
       onLift: setLift,
+      onPause: (paused) => {
+        const running = sessionRef.current;
+        setPause(
+          paused && running !== null
+            ? { where: running.where, lockEndedAt: running.lockEndedAt }
+            : null,
+        );
+      },
       consoleRoom: { domains: (signal) => loadDomainRows(client, signal) },
     });
     sessionRef.current = session;
+    // Nothing of the route's own holds the station busy yet.
+    session.setBusy(false);
     const first = addressRef.current;
     requestedRef.current = first;
     session.go(first);
@@ -211,6 +240,18 @@ export default function ExploreRoute() {
   const ride = useCallback((stop: number) => {
     sessionRef.current?.ride(stop);
   }, []);
+  // Inside the click or key that continues, so the lock may be asked for.
+  const resume = useCallback(() => {
+    sessionRef.current?.resume();
+  }, []);
+  // The way out (M4 C7): the Fluid page of where the player is, or of the
+  // address the URL last sent the session to before any room landed, in
+  // place of the station's own history entry.
+  const leave = useCallback(() => {
+    const at = sessionRef.current?.current ??
+      requestedRef.current ?? { kind: "airlock" };
+    void navigateRef.current(fluidRouteOfStation(at), { replace: true });
+  }, []);
 
   if (refusal !== null) return <DeviceRefusal />;
   return (
@@ -237,6 +278,14 @@ export default function ExploreRoute() {
           note={lift.note}
           onRide={ride}
           onClose={closeLift}
+        />
+      )}
+      {pause !== null && (
+        <PauseScreen
+          where={pause.where}
+          lockEndedAt={pause.lockEndedAt}
+          onContinue={resume}
+          onLeave={leave}
         />
       )}
     </>

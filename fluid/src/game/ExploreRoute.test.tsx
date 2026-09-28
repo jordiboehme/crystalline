@@ -25,6 +25,7 @@ import {
   MemoryRouter,
   useLocation,
   useNavigate,
+  useNavigationType,
   type NavigateFunction,
 } from "react-router";
 import {
@@ -49,7 +50,7 @@ import {
 } from "../test/harness";
 import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
-import type { LiftStop } from "./world/types";
+import type { LiftStop, StationAddress } from "./world/types";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -82,7 +83,36 @@ const made = vi.hoisted(() => ({
   options: [] as SessionOptions[],
   /** The reader's "open in Fluid" handler the route last handed its view. */
   openFluid: null as (() => void) | null,
+  /** Every value the real sessions told the route's `onPause`. */
+  pauses: [] as boolean[],
 }));
+
+/**
+ * The kind of fixture a room the session builds puts the player in front
+ * of, or null for the room's own spawn: a seam for the Esc precedence test,
+ * which needs a terminal and a lift in reach of the route's real session
+ * without walking there on a real-time loop.
+ */
+const facing = vi.hoisted(() => ({
+  kind: null as "terminal" | "lift" | null,
+}));
+
+vi.mock("./world/station", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./world/station")>();
+  const { wallFacingSpawn } = await import("./world/interact");
+  return {
+    ...actual,
+    roomFor: (...args: Parameters<typeof actual.roomFor>) => {
+      const built = actual.roomFor(...args);
+      const fixture = built.room.fixtures.find((f) => f.kind === facing.kind);
+      if (fixture === undefined) return built;
+      return {
+        ...built,
+        room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
+      };
+    },
+  };
+});
 
 /**
  * A seam for the one test that needs to report a lift without walking the
@@ -139,6 +169,10 @@ vi.mock("./session", async (importOriginal) => {
         navigate: (path: string) => {
           made.navigations.push(path);
           opts.navigate(path);
+        },
+        onPause: (paused: boolean) => {
+          made.pauses.push(paused);
+          opts.onPause?.(paused);
         },
       });
       const entry = { disposed: false };
@@ -233,17 +267,23 @@ function NavProbe({
   return null;
 }
 
-/** Records the router's pathname and search each time they change. */
+/**
+ * Records the router's pathname and search each time they change, and how
+ * the router got there (a push, a replace or a pop).
+ */
 function LocationProbe() {
   const { pathname, search } = useLocation();
+  const type = useNavigationType();
   useEffect(() => {
     location = pathname + search;
-  }, [pathname, search]);
+    navigationType = type;
+  }, [pathname, search, type]);
   return null;
 }
 
 let navigate: NavigateFunction | null = null;
 let location = "";
+let navigationType = "";
 const keepNavigate = (n: NavigateFunction) => {
   navigate = n;
 };
@@ -335,6 +375,9 @@ beforeEach(() => {
   apiMock.mockReset();
   navigate = null;
   location = "";
+  navigationType = "";
+  facing.kind = null;
+  made.pauses.length = 0;
   made.renderers.length = 0;
   made.navigations.length = 0;
   made.sessions.length = 0;
@@ -419,8 +462,13 @@ function stubSession(
       opts.onLift?.(null);
     },
     dispose: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    setBusy: vi.fn(),
     current: null,
     where: null,
+    paused: false,
+    lockEndedAt: -Infinity,
   };
 }
 
@@ -902,6 +950,179 @@ describe("ExploreRoute", () => {
     );
     view.unmount();
   });
+
+  it("gives Esc to the overlay that is open and pauses only when none is (Review Focus 2)", async () => {
+    // Mutation caught: the session's pause listener without its modal
+    // check (every overlay's Esc would pause under it); the pause never
+    // reaching the route (no screen on the last Esc). The overlays'
+    // `preventDefault` on Esc is the second guard (C9): with the modal
+    // check in place it cannot go red on its own, see the report.
+    gl.available = true;
+    serve({ "/domains/eng/tree": TREE });
+    const PAUSED = { name: "Paused" } as const;
+    const esc = async (target: Element | Window = window) => {
+      await act(async () => {
+        fireEvent.keyDown(target, { key: "Escape", code: "Escape" });
+        await new Promise((r) => setTimeout(r, 100));
+      });
+    };
+    const space = async () => {
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { code: "Space", key: " " }),
+        );
+        await new Promise((r) => setTimeout(r, 150));
+        window.dispatchEvent(
+          new KeyboardEvent("keyup", { code: "Space", key: " " }),
+        );
+      });
+    };
+
+    // The reader, at the room's terminal.
+    facing.kind = "terminal";
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(300);
+    await space();
+    const reader = await screen.findByRole("dialog", { name: /Alpha/ });
+    expect(reader).toBeInTheDocument();
+    await esc();
+    expect(screen.queryByRole("dialog", { name: /Alpha/ })).toBeNull();
+    expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
+    expect(made.pauses).toEqual([]);
+
+    // The level select.
+    await typeWord("idclev");
+    const levels = await screen.findByRole("dialog", LEVELS);
+    await esc(within(levels).getByRole("textbox", { name: "Domain name" }));
+    expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
+    expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
+    expect(made.pauses).toEqual([]);
+
+    // The lift, on a deck.
+    facing.kind = "lift";
+    go("/%CF%80/d/eng?path=notes");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("notes/");
+    });
+    await settle(300);
+    await space();
+    const lift = await screen.findByRole("dialog", LIFT);
+    await esc(within(lift).getByRole("textbox", { name: "Stop name" }));
+    expect(screen.queryByRole("dialog", LIFT)).toBeNull();
+    expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
+    expect(made.pauses).toEqual([]);
+
+    // Nothing open: the same Esc pauses.
+    await esc();
+    expect(await screen.findByRole("dialog", PAUSED)).toBeInTheDocument();
+    expect(made.pauses).toEqual([true]);
+    view.unmount();
+  });
+
+  it.each<{
+    name: string;
+    url: string;
+    current: StationAddress | null;
+    where: string | null;
+    to: string;
+  }>([
+    {
+      name: "an engram's room",
+      url: "/%CF%80/d/eng/e/notes/x",
+      current: { kind: "engram", domain: "eng", permalink: "notes/x" },
+      where: "X",
+      to: "/d/eng/e/notes/x",
+    },
+    {
+      name: "a deck",
+      url: "/%CF%80/d/eng?path=notes",
+      current: { kind: "deck", domain: "eng", folder: "notes", section: 0 },
+      where: "NOTES",
+      to: "/d/eng?path=notes",
+    },
+    {
+      name: "the airlock",
+      url: "/%CF%80",
+      current: { kind: "airlock" },
+      where: "AIRLOCK",
+      to: "/",
+    },
+    {
+      // Inside the console room `current` is the room walked in from,
+      // and the room has no label.
+      name: "the console room",
+      url: "/%CF%80/d/eng/e/alpha",
+      current: { kind: "engram", domain: "eng", permalink: "alpha" },
+      where: null,
+      to: "/d/eng/e/alpha",
+    },
+    {
+      // The player walked on and the stub never replaced the URL: the
+      // room the player is in wins over the one the URL names.
+      name: "a room the URL has not caught up with",
+      url: "/%CF%80/d/eng/e/alpha",
+      current: { kind: "engram", domain: "eng", permalink: "beta" },
+      where: "BETA",
+      to: "/d/eng/e/beta",
+    },
+    {
+      name: "the dark screen before the first room",
+      url: "/%CF%80/d/eng/e/notes/x",
+      current: null,
+      where: null,
+      to: "/d/eng/e/notes/x",
+    },
+  ])(
+    "leaves $name to its Fluid page, replacing the entry (M4 C7)",
+    async ({ url, current, where, to }) => {
+      // Mutation caught: a push in place of the replace, the π prefix
+      // kept (`gameRouteOf`), the URL's address preferred over `current`,
+      // the `requestedRef` fallback dropped (the dark screen leaves to /).
+      gl.available = true;
+      serve({ "/domains/eng/tree": TREE });
+      let options: SessionOptions | null = null;
+      const resume = vi.fn<() => void>();
+      sessionStub.factory = (opts) => {
+        options = opts;
+        return {
+          ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+          resume,
+          current,
+          where,
+          lockEndedAt: -Infinity,
+        };
+      };
+      const view = renderAt(url);
+      await waitFor(() => {
+        expect(options).not.toBeNull();
+      });
+      act(() => {
+        options?.onPause?.(true);
+      });
+      const dialog = await screen.findByRole("dialog", { name: "Paused" });
+      expect(
+        within(dialog).getByText(
+          where === null ? "BREAK" : `BREAK IN ${where}`,
+        ),
+      ).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("button", { name: "CONT" }));
+      expect(resume).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "RUN/STOP (ESC)" }),
+      );
+      await waitFor(() => {
+        expect(location).toBe(to);
+      });
+      expect(navigationType).toBe("REPLACE");
+      expect(screen.queryByRole("dialog", { name: "Paused" })).toBeNull();
+      expect(made.sessions).toHaveLength(1);
+      view.unmount();
+    },
+  );
 
   it.each(["/%CF%80/dev", "/%CF%80/dev/gallery"])(
     "ignores the word on %s",

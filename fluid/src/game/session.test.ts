@@ -213,6 +213,7 @@ function start(
     onLevels?: (open: boolean) => void;
     consoleRoom?: SessionOptions["consoleRoom"];
     onLift?: SessionOptions["onLift"];
+    onPause?: SessionOptions["onPause"];
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -237,6 +238,7 @@ function start(
       ? {}
       : { consoleRoom: options.consoleRoom }),
     ...(options.onLift === undefined ? {} : { onLift: options.onLift }),
+    ...(options.onPause === undefined ? {} : { onPause: options.onPause }),
   });
   sessions.push(session);
   return session;
@@ -3265,5 +3267,255 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     await vi.waitFor(() => {
       expect(session.current?.kind).toBe("deck");
     });
+  });
+});
+
+describe("the pause (M4 C6 to C9)", () => {
+  /** Holds the pointer locked to the newest session's canvas. */
+  function lock() {
+    Object.defineProperty(document, "pointerLockElement", {
+      configurable: true,
+      get: () => lastCanvas,
+    });
+    document.dispatchEvent(new Event("pointerlockchange"));
+  }
+
+  /** Ends the lock, as the browser does on Esc or a lost focus. */
+  function unlock() {
+    Reflect.deleteProperty(document, "pointerLockElement");
+    document.dispatchEvent(new Event("pointerlockchange"));
+  }
+
+  /**
+   * An Esc keydown sent from the page's body, as a browser sends it, so a
+   * listener on the body can cancel it before the window hears it.
+   */
+  function esc(options: { repeat?: boolean; prevented?: boolean } = {}) {
+    const prevent = (e: Event) => {
+      e.preventDefault();
+    };
+    if (options.prevented === true)
+      document.body.addEventListener("keydown", prevent);
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Escape",
+        code: "Escape",
+        repeat: options.repeat ?? false,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    document.body.removeEventListener("keydown", prevent);
+  }
+
+  const pauseSpy = () => vi.fn<(paused: boolean) => void>();
+  const pauses = (spy: ReturnType<typeof pauseSpy>) =>
+    spy.mock.calls.filter(([p]) => p).length;
+
+  afterEach(() => {
+    Reflect.deleteProperty(document, "pointerLockElement");
+  });
+
+  it("pauses on a lost lock and an unlocked Esc only when nothing is modal", () => {
+    // Mutation caught: the modal check dropped (the reader's lock release
+    // or a busy screen would pause), `repeat` or `defaultPrevented` not
+    // checked, `!loading` added back (a lost lock during a load would not
+    // pause).
+    const onPause = pauseSpy();
+    const session = start({ client: null, onPause });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+
+    // (a) The lock ends with nothing open: paused.
+    lock();
+    unlock();
+    expect(onPause).toHaveBeenLastCalledWith(true);
+    expect(session.paused).toBe(true);
+    session.resume();
+    expect(onPause).toHaveBeenLastCalledWith(false);
+    expect(session.paused).toBe(false);
+
+    // (b) With the reader open, the same loss pauses nothing.
+    walkToScope();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    lock();
+    unlock();
+    esc();
+    expect(pauses(onPause)).toBe(1);
+    session.closeReader();
+
+    // (c) An Esc while unlocked pauses.
+    esc();
+    expect(pauses(onPause)).toBe(2);
+    session.resume();
+
+    // (d) An auto-repeated one does not.
+    esc({ repeat: true });
+    expect(pauses(onPause)).toBe(2);
+
+    // (e) Nor one something else already took.
+    esc({ prevented: true });
+    expect(pauses(onPause)).toBe(2);
+
+    // (f) While busy, nothing pauses.
+    session.setBusy(true);
+    lock();
+    unlock();
+    esc();
+    expect(pauses(onPause)).toBe(2);
+    session.setBusy(false);
+    esc();
+    expect(pauses(onPause)).toBe(3);
+    session.resume();
+  });
+
+  it("pauses on a lost lock while a load is in flight (C6a)", () => {
+    const onPause = pauseSpy();
+    const session = start({
+      load: () => new Promise(() => undefined),
+      onPause,
+    });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    session.go({ kind: "airlock" });
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      true,
+      expect.any(String),
+      expect.any(String),
+    );
+    lock();
+    unlock();
+    expect(onPause).toHaveBeenLastCalledWith(true);
+  });
+
+  it("freezes the station while paused", () => {
+    // Mutation caught: the tick not returning early while paused (the W
+    // walks, the door slides open).
+    const deck = generateDeck(CANNED_DECK, 0);
+    const i = deck.fixtures.findIndex(
+      (f) => f.kind === "door" && f.address !== null,
+    );
+    const door = deck.fixtures[i];
+    if (door?.kind !== "door") throw new Error("the deck has no door");
+    const onPause = pauseSpy();
+    const session = start({
+      load: () => new Promise(() => undefined),
+      onPause,
+    });
+    session.showRoom(
+      { ...deck, spawn: wallFacingSpawn(door.slot) },
+      undefined,
+      {
+        kind: "deck",
+        domain: deck.domain,
+        folder: CANNED_DECK.folder,
+        section: 0,
+      },
+    );
+    frames(1);
+    const eye = lastCamera().eye;
+    const shut = lastDoors().get(`door:${String(i)}`) ?? 0;
+    expect(shut).toBeLessThan(0.5);
+    session.pause();
+    expect(onPause).toHaveBeenLastCalledWith(true);
+    key("keydown", "KeyW");
+    frames(35);
+    expect(lastCamera().eye).toEqual(eye);
+    expect(lastDoors().get(`door:${String(i)}`) ?? 0).toBe(shut);
+    expect(hud.connector).not.toHaveBeenCalledWith(
+      true,
+      expect.any(String),
+      expect.any(String),
+    );
+
+    session.resume();
+    expect(onPause).toHaveBeenLastCalledWith(false);
+    // The W held across the pause was forgotten; a new press walks.
+    key("keyup", "KeyW");
+    key("keydown", "KeyW");
+    frames(5);
+    key("keyup", "KeyW");
+    expect(lastCamera().eye).not.toEqual(eye);
+    expect(lastDoors().get(`door:${String(i)}`) ?? 0).toBeGreaterThan(shut);
+  });
+
+  it("closes the pause on a new place", () => {
+    // Mutation caught: `leave` not closing the pause.
+    const onPause = pauseSpy();
+    const session = start({ client: null, onPause });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    session.pause();
+    expect(onPause).toHaveBeenLastCalledWith(true);
+    session.go({ kind: "airlock" });
+    expect(onPause).toHaveBeenLastCalledWith(false);
+    expect(session.paused).toBe(false);
+  });
+
+  it("pauses nothing while it is disposed", () => {
+    // Mutation caught: the pause listeners removed after `input.dispose()`
+    // and the handler not guarded by `disposed` (F18): `input.dispose()`
+    // releases the lock, and that loss would pause a session going down.
+    const onPause = pauseSpy();
+    const session = start({ client: null, onPause });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    lock();
+    const exit = vi.fn(() => {
+      unlock();
+    });
+    Object.defineProperty(document, "exitPointerLock", {
+      configurable: true,
+      value: exit,
+    });
+    try {
+      session.dispose();
+    } finally {
+      Reflect.deleteProperty(document, "exitPointerLock");
+    }
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(pauses(onPause)).toBe(0);
+  });
+
+  it("releases the lock when paused from outside and is modal until resumed", () => {
+    const onPause = pauseSpy();
+    const session = start({ client: null, onPause });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    lock();
+    const exit = vi.fn(() => {
+      unlock();
+    });
+    Object.defineProperty(document, "exitPointerLock", {
+      configurable: true,
+      value: exit,
+    });
+    try {
+      session.pause();
+    } finally {
+      Reflect.deleteProperty(document, "exitPointerLock");
+    }
+    expect(exit).toHaveBeenCalledTimes(1);
+    // The lost lock that followed is the pause's own, not a second one.
+    expect(onPause.mock.calls).toEqual([[true]]);
+    // Resuming twice tells the host once.
+    session.resume();
+    session.resume();
+    expect(onPause.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("stamps when the lock ended, for the pause screen's wait (C8)", () => {
+    const session = start({ client: null });
+    expect(session.lockEndedAt).toBe(-Infinity);
+    lock();
+    const before = performance.now();
+    unlock();
+    expect(session.lockEndedAt).toBeGreaterThanOrEqual(before);
+    expect(session.lockEndedAt).toBeLessThanOrEqual(performance.now());
   });
 });

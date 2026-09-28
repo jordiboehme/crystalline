@@ -10,8 +10,10 @@
 
 import { Link } from "react-router";
 
-const C64_BLUE = "#352879";
-const C64_LIGHT_BLUE = "#6c5eb5";
+/** The C64's screen colour, which the pause screen shares. */
+export const C64_BLUE = "#352879";
+/** The C64's border and text colour, which the pause screen shares. */
+export const C64_LIGHT_BLUE = "#6c5eb5";
 
 /** The refusal screen, full screen and with one way out. */
 export function DeviceRefusal() {
