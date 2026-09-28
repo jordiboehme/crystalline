@@ -584,7 +584,7 @@ describe("the accent stripe (2.7 C8, C9)", () => {
 
   it("uploads the look's accent at the room's index, and draws no stripe in the console room (Review Focus 5)", () => {
     // Mutation caught: the stripe drawn in a room with fittings, or the
-    // accent read from the wrong look after a switch.
+    // accent read from another look.
     expect(
       stripeQuads(buildRoomMesh(consoleRoom(), LOOKS.aperture).static),
     ).toEqual([]);

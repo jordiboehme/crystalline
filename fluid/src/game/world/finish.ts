@@ -5,8 +5,9 @@
  * The accent is an index into the look's accent set (`Look.accents`, five
  * colours per look, index `i` in the same colour family in every look), so
  * a room keeps its colour family in every look while the colour itself
- * follows the look (fixed in play; only a dev page picks another). The renderer uploads the look's accent at that
- * index (`accentFor` in `render/looks.ts`), and every surface carrying the
+ * follows the look (fixed in play; only a dev page picks another). The
+ * renderer uploads the look's accent at that index (`accentFor` in
+ * `render/looks.ts`), and every surface carrying the
  * accent mark (`accentTint` in `render/geometry.ts`) takes it.
  *
  * The wall patterns are `WALL_PATTERNS` texture and uv-scale sets for the

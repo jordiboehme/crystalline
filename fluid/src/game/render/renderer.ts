@@ -420,9 +420,9 @@ export function createRenderer(
       // cannot be built leaves the old one on the GPU and drawn.
       const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
       const built = buildRoomMesh(nextRoom, nextLookApplied);
-      // The same room handed back (a restored context, or a new look,
-      // which only a dev page picks): its instance buffers stay. This is
-      // read before anything is released.
+      // The same room object handed back (`enter` showing the same place
+      // again): its instance buffers stay. This is read before anything
+      // is released.
       const sameRoom = nextRoom === room;
       const lookChanged = nextLook.id !== meshLook;
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);

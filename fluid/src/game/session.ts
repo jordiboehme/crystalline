@@ -77,8 +77,8 @@
  * renderer refuses, and not a `go` from outside, which went through no
  * way. A failure that settles after the player has left for another place
  * is dropped with its generation. The marks and the running faults are
- * kept while the same place is shown again (`showCanned`'s keep, a look
- * switch, a restored GPU context) and cleared on every fresh entry. Their
+ * kept while the same place is shown again (`showCanned`'s keep, a
+ * restored GPU context) and cleared on every fresh entry. Their
  * frames go to the renderer as `draw`'s fifth argument, never into the
  * door states that decide travel, and collision reads neither.
  *
