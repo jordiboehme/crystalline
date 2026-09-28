@@ -76,6 +76,30 @@ describe("withBridge (M3 C20, C21)", () => {
     expect(privFitted.fixtures.at(-1)).toMatchObject({ keys: [0] });
   });
 
+  it("reads the screen from `display`, kept apart from the routing key `domain` (M3 review, carried from task 5)", () => {
+    // Mutation caught: the screen line read `bridge.domain` again instead
+    // of `bridge.display` - the canonical name would then leak into a
+    // route or a stencil hash instead of only appearing on the screen.
+    const room = generateRoom(CANNED_BRIDGE);
+    const named: BridgeInput = {
+      ...CANNED_BRIDGE_DATA,
+      display: "Engineering Bay",
+    };
+    const fitted = withBridge(CANNED_BRIDGE, room, named);
+    const screen = fitted.fixtures.at(-1);
+    expect(screen).toMatchObject({
+      kind: "screen",
+      lines: ["Engineering Bay", engramCount(5)],
+    });
+    const lift = fitted.fixtures.at(-2);
+    expect(lift?.kind === "lift" ? lift.stops.map((s) => s.to) : []).toEqual([
+      { kind: "airlock" },
+      { kind: "deck", domain: "station", folder: "", section: 0 },
+      { kind: "deck", domain: "station", folder: "engineering", section: 0 },
+      { kind: "deck", domain: "station", folder: "logs", section: 0 },
+    ]);
+  });
+
   it("leaves a room with no bridge data as it was", () => {
     // Mutation caught: a re-dress run with no data.
     const room = generateRoom(CANNED_BRIDGE);

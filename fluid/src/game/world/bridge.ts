@@ -8,16 +8,18 @@
  *
  * 1. the deck lift, on the entrance edge (`{ ...room.entrance, side: "s" }`,
  *    the same edge `withExit` puts an exit on), whose stops come from
- *    `bridgeStops` and whose `note` marks a failed tree
+ *    `bridgeStops` (`bridge.domain`, the routing key, so every stop's `to`
+ *    addresses a domain that exists) and whose `note` marks a failed tree
  *    (`bridge.folders === null`, `?DECK LIST ERROR`) or an empty domain
  *    (no folders and no root deck, `NO DECKS`); otherwise the panel carries
  *    no note;
  * 2. the wall screen, on `bridgeScreenEdge(room)` when one is free: two
- *    lines, the domain's name and, when the listing's count is known,
- *    `engramCount` of it, the key pictogram on the name
- *    (`keys: [0]`) for a private domain. A room with no free edge gets no
- *    screen; the placard at the entrance already names the room, so the
- *    lift panel needs no fallback (M3 A13).
+ *    lines, `bridge.display` (the domain's display name, kept apart from
+ *    `bridge.domain` so a canonical name never leaks into a route or a
+ *    stencil hash) and, when the listing's count is known, `engramCount` of
+ *    it, the key pictogram on the name (`keys: [0]`) for a private domain.
+ *    A room with no free edge gets no screen; the placard at the entrance
+ *    already names the room, so the lift panel needs no fallback (M3 A13).
  *
  * With the two fixtures in place the room is re-dressed exactly as
  * `withHeroes` re-dresses round a forced hero: `dressRoom` of the room with
@@ -66,16 +68,21 @@ import type {
 } from "./types";
 
 /**
- * One domain's bridge as `withBridge` needs it: `domain` the name its
- * screen and its lift's `DECK 1` stop read, `engrams` the listing's count
- * (null when it failed, never drawn on the screen then), `private` whether
- * the domain's name is drawn with the key pictogram, `folders` the
- * top-level folder names of its tree (null when the tree failed to load,
- * never an empty successful listing read as a failure), and `rootDeck`
- * whether the root holds engrams besides the MANIFEST (M3 C7, C12).
+ * One domain's bridge as `withBridge` needs it: `domain` the routing key
+ * its lift's stops address decks with and `folderDeck` hashes decks by
+ * (M3 C1, C6), `display` the name the screen reads instead - the domain's
+ * canonical name when the listing knows one, else `domain` itself, so a
+ * canonical name never turns into a route or a stencil hash - `engrams`
+ * the listing's count (null when it failed, never drawn on the screen
+ * then), `private` whether the name is drawn with the key pictogram,
+ * `folders` the top-level folder names of its tree (null when the tree
+ * failed to load, never an empty successful listing read as a failure),
+ * and `rootDeck` whether the root holds engrams besides the MANIFEST (M3
+ * C7, C12).
  */
 export interface BridgeInput {
   domain: string;
+  display: string;
   engrams: number | null;
   private: boolean;
   /** null when the tree failed. */
@@ -180,8 +187,8 @@ export function withBridge(
   if (edge !== null) {
     const lines =
       bridge.engrams === null
-        ? [bridge.domain]
-        : [bridge.domain, engramCount(bridge.engrams)];
+        ? [bridge.display]
+        : [bridge.display, engramCount(bridge.engrams)];
     fixtures.push({
       kind: "screen",
       slot: edge,

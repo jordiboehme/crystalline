@@ -214,10 +214,13 @@ export const CANNED_BRIDGE: PlaceInput = {
  * two top-level folders, already in `byLabel` order, a root deck
  * (`rootDeck: true`), a known engram count and a public domain, so
  * `bridge-fitted.json` pins the lift's full stop list and a screen with no
- * key. `?hall=bridge` shows the room this fits.
+ * key. `display` equals `domain` (no canonical name here), so the screen's
+ * first line and the golden read `station` either way. `?hall=bridge`
+ * shows the room this fits.
  */
 export const CANNED_BRIDGE_DATA: BridgeInput = {
   domain: "station",
+  display: "station",
   engrams: 5,
   private: false,
   folders: ["engineering", "logs"],

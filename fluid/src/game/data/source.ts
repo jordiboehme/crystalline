@@ -129,8 +129,13 @@ function abortError(): DOMException {
   return new DOMException("The place load was aborted.", "AbortError");
 }
 
-/** Reject with an `AbortError` when the signal has fired. */
-function checkAborted(signal: AbortSignal | undefined): void {
+/**
+ * Reject with an `AbortError` when the signal has fired.
+ *
+ * Exported for `data/station.ts` (M3 C29), which loads the airlock, a
+ * bridge, a deck and an engram under the very same cancellation contract.
+ */
+export function checkAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) {
     throw abortError();
   }
@@ -147,8 +152,10 @@ function checkAborted(signal: AbortSignal | undefined): void {
  * signal and then cancels the queries it started, the abort listener rejects
  * first, so a TanStack `CancelledError` never reaches the caller and needs no
  * mapping of its own.
+ *
+ * Exported for `data/station.ts` (M3 C29), for the very same reason.
  */
-async function abortable<T>(
+export async function abortable<T>(
   round: Promise<T>,
   signal: AbortSignal | undefined,
 ): Promise<T> {
