@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Package a local release archive for the current (or a given) target,
-# mirroring what .github/workflows/release.yml builds per platform. Useful
+# mirroring what .github/workflows/build.yml builds per platform. Useful
 # for producing a one-off artifact by hand or sanity-checking packaging
 # before tagging a release. The workflow itself does not call this script;
 # it stays self-contained so CI never depends on a local dev tool. Archives
@@ -18,7 +18,7 @@ cd "$repo_root"
 target="${1:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
 version="v$(awk -F'"' '/^version = /{ print $2; exit }' Cargo.toml)"
 
-# Friendly platform name for the archive, matching .github/workflows/release.yml's
+# Friendly platform name for the archive, matching .github/workflows/build.yml's
 # matrix.platform. The Rust target triple keeps driving the actual build below.
 case "$target" in
     aarch64-apple-darwin) platform="macos-arm64" ;;
