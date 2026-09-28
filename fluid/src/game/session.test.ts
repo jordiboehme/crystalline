@@ -26,6 +26,7 @@ import type { LoadedStation } from "./data/station";
 import {
   addressOfGameLocation,
   domainOf,
+  fluidRouteOfStation,
   gameRouteOf,
   stationOfPlace,
 } from "./paths";
@@ -55,6 +56,8 @@ import {
   CANNED_DECK,
   CANNED_DOMAINS,
   CANNED_HANGAR,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
   galleryRoom,
   heroHallRoom,
 } from "./world/canned";
@@ -64,7 +67,13 @@ import { LIFT_WORDS } from "./world/lifts";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS, blockersFor } from "./world/move";
-import { DIP_SWAP_MS, FLICKER_MS, diffRooms, settleSpot } from "./world/diff";
+import {
+  DIP_SWAP_MS,
+  FLICKER_MS,
+  darkened,
+  diffRooms,
+  settleSpot,
+} from "./world/diff";
 import { withPadHeroes } from "./world/hangar";
 import { roomFor } from "./world/station";
 import type {
@@ -4159,7 +4168,7 @@ describe("live changes (M4 C13 to C19)", () => {
           ...a,
           spawn: { x: spot.x / CELL - 0.5, y: spot.z / CELL - 0.5, yaw: 0.5 },
         },
-        undefined,
+        { pitch: 0.3 },
         ROOM_AT,
       );
       frames(2);
@@ -4173,6 +4182,7 @@ describe("live changes (M4 C13 to C19)", () => {
       const spot = freeInBoth(a, b);
       const session = standAt(spot);
       const pitch = lastCamera().pitch;
+      expect(pitch).toBeCloseTo(0.3, 6);
       answers.set("hall", engramOf(redoored()));
       rooms = [];
       session.changed(frameOf());
@@ -4315,5 +4325,310 @@ describe("live changes (M4 C13 to C19)", () => {
     await run(2000);
     expect(rooms.length).toBe(count);
     expect(notices.some((n) => n.text === RECONFIGURING)).toBe(false);
+  });
+
+  describe("fix round 1", () => {
+    /** A promise that rejects once asked, as a load the server fails. */
+    function failing(): { promise: Promise<LoadedStation>; fail(): void } {
+      let reject!: (e: unknown) => void;
+      const promise = new Promise<LoadedStation>((_, r) => {
+        reject = r;
+      });
+      return {
+        promise,
+        fail: () => {
+          reject(new Error("boom"));
+        },
+      };
+    }
+
+    it("never puts the player inside a prop when the room goes dark (I1)", async () => {
+      // Mutation caught: the dark room entered with the player kept where
+      // they stood, inside a prop its re-dressing moved.
+      const cases: {
+        place: PlaceInput;
+        room: RoomSpec;
+        x: number;
+        z: number;
+      }[] = [];
+      for (const base of [CANNED_WORKSHOP, CANNED_HUB]) {
+        for (let i = 0; i < 60 && cases.length < 4; i++) {
+          const place = {
+            ...base,
+            domain: "station",
+            permalink: `p${String(i)}`,
+          };
+          const room = built(place);
+          const dark = darkened(room, "station");
+          // A point a prop of the dark room covers is the only candidate:
+          // cheap to find, then checked free before the dark with
+          // `settleSpot`.
+          const props = blockersFor(dark);
+          const covered = (x: number, z: number) =>
+            props.some((p) => x >= p.x0 && x <= p.x1 && z >= p.z0 && z <= p.z1);
+          let found: { x: number; z: number } | null = null;
+          for (
+            let z = 0.125;
+            z < room.grid.length * CELL && !found;
+            z += 0.25
+          ) {
+            for (
+              let x = 0.125;
+              x < (room.grid[0]?.length ?? 0) * CELL;
+              x += 0.25
+            ) {
+              if (!covered(x, z)) continue;
+              const kept = settleSpot(room, x, z);
+              if (kept.x === x && kept.z === z) {
+                found = { x, z };
+                break;
+              }
+            }
+          }
+          if (found) cases.push({ place, room, ...found });
+        }
+      }
+      expect(cases.length).toBeGreaterThanOrEqual(2);
+      for (const c of cases) {
+        const session = start({ load: liveLoad });
+        session.showRoom(
+          {
+            ...c.room,
+            spawn: { x: c.x / CELL - 0.5, y: c.z / CELL - 0.5, yaw: 0.7 },
+          },
+          { pitch: -0.2 },
+          engramAt("station", c.place.permalink),
+        );
+        frames(2);
+        const count = rooms.length;
+        session.changed(
+          frameOf({ permalink: c.place.permalink, kind: "deleted" }),
+        );
+        await run(1000);
+        expect(rooms.length).toBe(count + 1);
+        const dark = shown();
+        const want = settleSpot(dark, c.x, c.z);
+        // The room went dark between two ticks: the first frame drawn
+        // after it stands at the spot, or within the walk's own push off a
+        // prop's edge of it, and inside no prop.
+        const swappedAt = rooms.at(-1)!.at;
+        const first = drawn.find((d) => d.at > swappedAt);
+        if (first === undefined) throw new Error("nothing drawn");
+        const [ex, , ez] = first.camera.eye;
+        expect(Math.hypot(ex - want.x, ez - want.z)).toBeLessThanOrEqual(
+          PLAYER_RADIUS + 1e-6,
+        );
+        for (const b of blockersFor(dark)) {
+          const inside = ex > b.x0 && ex < b.x1 && ez > b.z0 && ez < b.z1;
+          expect(inside).toBe(false);
+        }
+        expect(first.camera.yaw).toBeCloseTo(0.7, 6);
+        expect(first.camera.pitch).toBeCloseTo(-0.2, 6);
+        session.dispose();
+      }
+    });
+
+    it("drops a live change a new place overtakes: its answer, its dip and its move (I2, M8)", async () => {
+      // Mutation caught: `settled` without its generation and abort guard,
+      // `leave` keeping the dip, `leave` keeping the move's target, the
+      // dip's notice left up over the journey.
+      const beta = placeOf({ permalink: "beta" });
+      answers.set("beta", engramOf(beta));
+      const session = await standIn();
+
+      // (a) A move whose load a door's journey overtakes.
+      const late = deferred<LoadedStation>();
+      holds.set("annex/hall", late.promise);
+      session.changed(
+        frameOf({
+          kind: "moved",
+          permalink: "annex/hall",
+          path: "annex/hall.md",
+          from: { path: "hall.md", permalink: "hall" },
+        }),
+      );
+      await run(COALESCE_MS + 2 * TICK_MS);
+      expect(loadsOf("annex/hall")).toBe(1);
+      session.go(engramAt("station", "beta"));
+      await run(100);
+      expect(session.current).toEqual(engramAt("station", "beta"));
+      const navigations = navigate.mock.calls.length;
+      late.resolve(engramOf(placeOf({ permalink: "annex/hall" })));
+      await run(2000);
+      expect(shown()).toEqual(built(beta));
+      expect(navigate.mock.calls.length).toBe(navigations);
+      // A frame for the room now shown reads that room, not the move.
+      asked = [];
+      session.changed(frameOf({ permalink: "beta", path: "beta.md" }));
+      await run(1000);
+      expect(loadsOf("beta")).toBe(1);
+      expect(loadsOf("annex/hall")).toBe(0);
+      expect(session.current).toEqual(engramAt("station", "beta"));
+
+      // (b) A dip a journey overtakes before its swap.
+      answers.set("beta", engramOf({ ...redoored(), permalink: "beta" }));
+      session.changed(frameOf({ permalink: "beta", path: "beta.md" }));
+      await run(COALESCE_MS + 2 * TICK_MS);
+      const dip = notices.find((n) => n.text === RECONFIGURING);
+      if (dip === undefined) throw new Error("no dip");
+      const other = deferred<LoadedStation>();
+      holds.set("gamma", other.promise);
+      session.go(engramAt("station", "gamma"));
+      // The dip's notice goes with it.
+      expect(hud.notice).toHaveBeenLastCalledWith(null);
+      const gamma = placeOf({ permalink: "gamma" });
+      other.resolve(engramOf(gamma));
+      await run(DIP_SWAP_MS + 500);
+      expect(shown()).toEqual(built(gamma));
+      expect(session.current).toEqual(engramAt("station", "gamma"));
+    });
+
+    it("runs a re-check held by a busy screen, the level select or a failed journey once each ends (I3)", async () => {
+      // Mutation caught: `retryCheck` removed from `setBusy(false)`,
+      // `closeLevels` or the travel's reject branch.
+      const onLevels = vi.fn<(open: boolean) => void>();
+      const session = await standIn(placeOf(), { onLevels });
+
+      session.setBusy(true);
+      asked = [];
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      session.setBusy(false);
+      await run(200);
+      expect(loadsOf("hall")).toBe(1);
+
+      type("idclev");
+      frames(1);
+      expect(onLevels).toHaveBeenLastCalledWith(true);
+      asked = [];
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      session.closeLevels();
+      await run(200);
+      expect(loadsOf("hall")).toBe(1);
+
+      const broken = failing();
+      holds.set("beta", broken.promise);
+      session.go(engramAt("station", "beta"));
+      asked = [];
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      broken.fail();
+      await run(200);
+      expect(hud.notice).toHaveBeenCalledWith("?LOAD ERROR");
+      expect(loadsOf("hall")).toBe(1);
+    });
+
+    it("flashes SIGNAL LOST, darkens with ACCESS DENIED and never darkens the airlock (M4)", async () => {
+      // Mutation caught: the offline flash removed, the denied notice
+      // taken for the missing one, the airlock guard removed.
+      const session = await standIn();
+      const count = rooms.length;
+      answers.set("hall", { kind: "offline" });
+      session.changed(frameOf());
+      await run(1000);
+      expect(hud.notice).toHaveBeenCalledWith("SIGNAL LOST");
+      expect(rooms.length).toBe(count);
+
+      answers.set("hall", { kind: "denied" });
+      session.changed(frameOf());
+      await run(4000);
+      expect(rooms.length).toBe(count + 1);
+      expect(hud.notice).toHaveBeenLastCalledWith(ACCESS_DENIED);
+
+      let asks = 0;
+      const load: PlaceLoader = (a, signal) => {
+        if (a.kind !== "airlock") return liveLoad(a, signal);
+        asks++;
+        return asks > 1
+          ? Promise.resolve({ kind: "missing" })
+          : liveLoad(a, signal);
+      };
+      const airlock = start({ load });
+      airlock.go({ kind: "airlock" });
+      await micro();
+      frames(1);
+      expect(airlock.current).toEqual({ kind: "airlock" });
+      const before = rooms.length;
+      notices = [];
+      airlock.changed({
+        event: "domain",
+        change: { domain: "ops", actor: null },
+      });
+      await run(1000);
+      expect(asks).toBe(2);
+      expect(rooms.length).toBe(before);
+      expect(notices.some((n) => n.text === NOT_FOUND)).toBe(false);
+    });
+
+    it("runs one re-check at a time and the one owed after it (M5)", async () => {
+      // Mutation caught: `checking` dropped from the hold (two loads of
+      // the same room at once).
+      const session = await standIn();
+      const slow = deferred<LoadedStation>();
+      holds.set("hall", slow.promise);
+      asked = [];
+      session.changed(frameOf());
+      await run(COALESCE_MS + 2 * TICK_MS);
+      expect(loadsOf("hall")).toBe(1);
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(1);
+      slow.resolve(engramOf(placeOf()));
+      await run(200);
+      expect(loadsOf("hall")).toBe(2);
+    });
+
+    it("opens the Fluid page of a move not yet followed on F, and ignores moves inside the console room (M6, M7)", async () => {
+      // Mutation caught: F reading `current` alone (the old permalink's
+      // page, a 404 after the move), a move taken inside the console room.
+      const session = await standIn();
+      const late = deferred<LoadedStation>();
+      holds.set("annex/hall", late.promise);
+      session.changed(
+        frameOf({
+          kind: "moved",
+          permalink: "annex/hall",
+          path: "annex/hall.md",
+          from: { path: "hall.md", permalink: "hall" },
+        }),
+      );
+      await run(COALESCE_MS + 2 * TICK_MS);
+      expect(session.current).toEqual(ROOM_AT);
+      expect(session.page).toEqual(engramAt("station", "annex/hall"));
+      key("keydown", "KeyF");
+      frames(1);
+      key("keyup", "KeyF");
+      expect(openFluid).toHaveBeenLastCalledWith(
+        fluidRouteOfStation(engramAt("station", "annex/hall")),
+      );
+      session.dispose();
+
+      const inside = startWithConsole([row(HALL), row("ops")], liveLoad);
+      standAtBox(inside);
+      walkIn();
+      frames(1);
+      expect(isConsole(lastRoom())).toBe(true);
+      inside.changed(
+        frameOf({
+          domain: HALL,
+          kind: "moved",
+          permalink: "elsewhere",
+          path: "elsewhere.md",
+          from: { path: "x.md", permalink: heroHallRoom().permalink },
+        }),
+      );
+      expect(inside.page).toEqual(HALL_ADDRESS);
+      openFluid.mockClear();
+      key("keydown", "KeyF");
+      frames(1);
+      key("keyup", "KeyF");
+      expect(openFluid).toHaveBeenLastCalledWith(
+        fluidRouteOfStation(HALL_ADDRESS),
+      );
+    });
   });
 });

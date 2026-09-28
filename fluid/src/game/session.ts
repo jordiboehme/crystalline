@@ -85,7 +85,7 @@
  * Keys, by `KeyboardEvent.code`, the classic layout plus WASD: Up and Down
  * (or W and S) walk, Left and Right turn, and strafe while Alt is held,
  * comma and period (or A and D) strafe, Shift held runs, Space uses what
- * the player faces, F opens the current address's page in Fluid
+ * the player faces, F opens the page of `page` in Fluid
  * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
  * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
@@ -160,12 +160,14 @@
  * the malfunctions cleared. A shape change within `RESHAPE_MIN_MS` of the
  * last is held until that has passed. A move replaces the URL once its
  * room is entered. A room whose engram went (a 404) or is refused (a 403)
- * goes dark in place (`darkened`, C19): the player kept, the lights at a
+ * goes dark in place (`darkened`, C19): the player kept (moved to the
+ * nearest free floor when the dark room's props now stand there), the lights at a
  * quarter and failing, a hatch to the bridge, the notice standing, the
  * URL kept; a second such answer changes nothing, and a later one that
  * loads the room brings it back through a dip. The airlock is never
  * darkened. An `offline` answer flashes `SIGNAL LOST` and keeps the room.
- * A new place drops the re-check in flight and a running dip.
+ * A new place drops the re-check in flight, a running dip with its
+ * notice, and a move not yet followed.
  *
  * Nothing changes under the pause: a re-check owed waits for `resume`, an
  * answer that lands while paused is dropped and the re-check owed again,
@@ -451,6 +453,9 @@ export type PlaceLoader = (
  *   null before the first one and in a room `showRoom` showed without an
  *   address. Inside the console room it is the address the player walked
  *   in from, since the console room has no address of its own.
+ * - `page` is the address whose Fluid page F and the host's way out open:
+ *   `current`, or the address a move sent it to while that move has not
+ *   been followed yet (M4 C18), since the old permalink's page is gone.
  * - `where` is the room's label as the status line shows it, the room's
  *   title upper-cased; null before the first room and in the console room,
  *   which has no title.
@@ -492,6 +497,7 @@ export interface Session {
    */
   changed(event: ChangeEvent): void;
   readonly current: StationAddress | null;
+  readonly page: StationAddress | null;
   readonly where: string | null;
   readonly paused: boolean;
   readonly lockEndedAt: number;
@@ -709,6 +715,8 @@ export function createSession(opts: SessionOptions): Session {
   let ticks = 0;
   /** Whether the timed notice up is the inverted-look one (C6). */
   let lookFlash = false;
+  /** Whether the timed notice up is a dip's `STATION RECONFIGURING`. */
+  let dipFlash = false;
   /** Whether the station is paused (M4 C6). */
   let paused = false;
   /** Whether a screen of the host's holds the station (`setBusy`). */
@@ -858,12 +866,14 @@ export function createSession(opts: SessionOptions): Session {
 
   const flash = (text: string, ms: number) => {
     lookFlash = false;
+    dipFlash = false;
     if (disposed) return;
     if (noticeTimer !== null) clearTimeout(noticeTimer);
     hud.notice(text);
     noticeTimer = setTimeout(() => {
       noticeTimer = null;
       lookFlash = false;
+      dipFlash = false;
       showStanding();
     }, ms);
   };
@@ -1206,6 +1216,13 @@ export function createSession(opts: SessionOptions): Session {
     checking = false;
     dip = null;
     target = null;
+    // The dip's notice goes with the dip.
+    if (dipFlash && noticeTimer !== null) {
+      clearTimeout(noticeTimer);
+      noticeTimer = null;
+      dipFlash = false;
+      showStanding();
+    }
     if (loading) {
       loading = false;
       hud.connector(false, loadingLabel, lookId);
@@ -1652,6 +1669,16 @@ export function createSession(opts: SessionOptions): Session {
       if (dark || address.kind === "airlock") return;
       const domain = domainOf(address) ?? room.domain;
       if (!reenterKept(place, darkened(room, domain), current)) return;
+      // The dark room's props are dressed again round its hatch, so the
+      // spot the player kept may now be inside one: they step to the
+      // nearest free floor, their view kept (as a reshape's swap does).
+      if (player !== null && room !== null) {
+        const spot = settleSpot(room, player.x, player.z);
+        if (spot.x !== player.x || spot.z !== player.z) {
+          player = { ...player, x: spot.x, z: spot.z, vx: 0, vz: 0 };
+          previous = player;
+        }
+      }
       dark = true;
       placeNotice = FAILED[loaded.kind];
       showStanding();
@@ -1679,6 +1706,7 @@ export function createSession(opts: SessionOptions): Session {
       return;
     }
     flash(RECONFIGURING, DIP_MS);
+    dipFlash = true;
     dip = {
       kind: "dip",
       at: stationTime(),
@@ -1873,8 +1901,9 @@ export function createSession(opts: SessionOptions): Session {
         flash(inverted ? "LOOK INVERTED" : "LOOK NORMAL", LOOK_NOTICE_MS);
         lookFlash = true;
       }
-      if (input.pressed("KeyF") && current !== null) {
-        opts.openFluid(fluidRouteOfStation(current));
+      const page = target ?? current;
+      if (input.pressed("KeyF") && page !== null) {
+        opts.openFluid(fluidRouteOfStation(page));
       }
       if (matched) openLevels();
     }
@@ -2191,6 +2220,9 @@ export function createSession(opts: SessionOptions): Session {
     },
     get current() {
       return current;
+    },
+    get page() {
+      return target ?? current;
     },
     get where() {
       return where();

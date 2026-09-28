@@ -265,8 +265,8 @@ export default function ExploreRoute() {
     sessionRef.current?.closeReader();
   }, []);
   const readerOpenFluid = useCallback(() => {
-    const current = sessionRef.current?.current;
-    if (current) openFluid(fluidRouteOfStation(current));
+    const page = sessionRef.current?.page;
+    if (page) openFluid(fluidRouteOfStation(page));
   }, []);
   const closeLevels = useCallback(() => {
     sessionRef.current?.closeLevels();
@@ -287,11 +287,12 @@ export default function ExploreRoute() {
   const resume = useCallback(() => {
     sessionRef.current?.resume();
   }, []);
-  // The way out (M4 C7): the Fluid page of where the player is, or of the
-  // address the URL last sent the session to before any room landed, in
-  // place of the station's own history entry.
+  // The way out (M4 C7): the Fluid page of where the player is (`page`,
+  // which names a moved engram's new address before its room follows), or
+  // of the address the URL last sent the session to before any room
+  // landed, in place of the station's own history entry.
   const leave = useCallback(() => {
-    const at = sessionRef.current?.current ??
+    const at = sessionRef.current?.page ??
       requestedRef.current ?? { kind: "airlock" };
     void navigateRef.current(fluidRouteOfStation(at), { replace: true });
   }, []);

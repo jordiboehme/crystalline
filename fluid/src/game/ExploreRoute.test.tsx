@@ -504,6 +504,7 @@ function stubSession(
     setBusy: vi.fn(),
     changed: vi.fn(),
     current: null,
+    page: null,
     where: null,
     paused: false,
     lockEndedAt: -Infinity,
@@ -1129,6 +1130,7 @@ describe("ExploreRoute", () => {
           ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
           resume,
           current,
+          page: current,
           where,
           lockEndedAt: -Infinity,
         };
@@ -1180,6 +1182,9 @@ describe("ExploreRoute", () => {
         get current() {
           return at.current;
         },
+        get page() {
+          return at.current;
+        },
         get where() {
           return at.where;
         },
@@ -1206,6 +1211,38 @@ describe("ExploreRoute", () => {
     );
     await waitFor(() => {
       expect(location).toBe("/d/eng/e/beta");
+    });
+    view.unmount();
+  });
+
+  it("leaves by the new address of a move the room has not followed yet (M4 C18)", async () => {
+    // Mutation caught: the way out reading `current` alone, the old
+    // permalink's page, which the move made a 404.
+    gl.available = true;
+    serve();
+    let options: SessionOptions | null = null;
+    sessionStub.factory = (opts) => {
+      options = opts;
+      return {
+        ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+        current: { kind: "engram", domain: "eng", permalink: "alpha" },
+        page: { kind: "engram", domain: "eng", permalink: "notes/alpha" },
+        where: "ALPHA",
+      };
+    };
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(options).not.toBeNull();
+    });
+    act(() => {
+      options?.onPause?.(true);
+    });
+    const dialog = await screen.findByRole("dialog", { name: "Paused" });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "RUN/STOP (ESC)" }),
+    );
+    await waitFor(() => {
+      expect(location).toBe("/d/eng/e/notes/alpha");
     });
     view.unmount();
   });
