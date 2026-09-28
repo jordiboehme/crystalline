@@ -7,7 +7,7 @@
  * the look (the family's rule, 2.6e C4): the airlock's shell is drawn in
  * the same fixed white as the console room's.
  *
- * - The **outer hatch** is a flush piece: a round collar standing out of
+ * - The **outer hatch** is a backed piece: a round collar standing out of
  *   the wall, cut into `HATCH.segments` sectors alternately hazard yellow
  *   and black; inside it the sealed door, a pale disc set back behind the
  *   collar with a raised plate on it; eight locking dogs bridging the

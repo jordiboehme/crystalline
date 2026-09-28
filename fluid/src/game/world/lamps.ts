@@ -1,6 +1,7 @@
 /**
  * Where a room's lamps hang: one ceiling light panel per light zone, and its
- * plan box. The renderer builds the panels from `lampCentre` and the lamp
+ * plan box. The airlock is the one exception: the renderer hangs no panel
+ * there, since its iris light is its lamp (M3 C24). The renderer builds the panels from `lampCentre` and the lamp
  * size (`render/geometry.ts` imports them from here), and the dressing
  * keeps its ceiling spans clear of `lampBoxes`, so both sides read one
  * definition and a span never hides a lamp (D10).

@@ -175,6 +175,27 @@ describe("the airlock (M3 C24)", () => {
       expect(box.z0).toBeGreaterThanOrEqual(y * CELL);
       expect(box.z1).toBeLessThanOrEqual((y + 1) * CELL);
     }
+    // The wall pieces keep clear of each other: the beacons out past the
+    // hatch's collar along the north wall, and no two lockers' boxes
+    // overlap.
+    const alongNorth = pieces
+      .filter((p) => p.kind === "outer-hatch" || p.kind === "beacon")
+      .map((p) => {
+        const hw = INTERIOR_CATALOGUE[p.kind].width / 2;
+        return [p.x * CELL - hw, p.x * CELL + hw] as const;
+      })
+      .sort((a, b) => a[0] - b[0]);
+    expect(alongNorth).toHaveLength(3);
+    for (let i = 1; i < alongNorth.length; i++)
+      expect(alongNorth[i]![0]).toBeGreaterThan(alongNorth[i - 1]![1]);
+    const boxes = lockers.map((l) => interiorFootprint(l)!);
+    boxes.forEach((a, i) =>
+      boxes.slice(i + 1).forEach((b) => {
+        const apart =
+          a.x1 <= b.x0 || b.x1 <= a.x0 || a.z1 <= b.z0 || b.z1 <= a.z0;
+        expect(apart).toBe(true);
+      }),
+    );
     const middle = room.width / 2;
     const [ring, ...stencils] = room.decals;
     expect(ring).toMatchObject({

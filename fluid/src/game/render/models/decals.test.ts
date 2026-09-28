@@ -512,6 +512,40 @@ describe("the decal recipe", () => {
 });
 
 describe("the airlock's hazard ring (M3 C24)", () => {
+  it("draws a word stencil dark, not in the floor stencil's light tint", () => {
+    // Mutation caught: a word stencil folded into the floor stencil's
+    // branch, so CYCLE is drawn pale on the airlock's pale floor.
+    const b = createBuilder();
+    buildDecals((f) => createKit(b, f), b, {
+      ...galleryRoom(),
+      decals: [
+        {
+          kind: "stencil",
+          on: "floor",
+          x: 2.5,
+          y: 2.5,
+          turn: 0,
+          along: 0,
+          h: 0,
+          width: 2.4,
+          length: 0.6,
+          variant: 0,
+          seed: 0,
+          word: "cycle",
+        },
+      ],
+    });
+    const mesh = b.build();
+    expect(mesh.count).toBeGreaterThan(0);
+    for (let i = 0; i < mesh.count; i++) {
+      const tint = vertexAt(mesh, i).tint;
+      tint.forEach((c, k) =>
+        expect(c).toBeCloseTo(DECAL_TINT.wordStencil[k] ?? NaN, 5),
+      );
+    }
+    expect(DECAL_TINT.wordStencil[0]).toBeLessThan(0.3);
+  });
+
   const ringDecal: Decal = {
     kind: "ring",
     on: "floor",
