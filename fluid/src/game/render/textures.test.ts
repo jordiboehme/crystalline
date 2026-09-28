@@ -119,6 +119,15 @@ describe("baseLayers", () => {
     expect(widest(32, 60)).toBeGreaterThan(2 * widest(4, 32));
   });
 
+  it("names a tile for every kind that reads one, and none for the stencil (2.7 C20)", () => {
+    // Mutation caught: a stencil entry the recipe never reads (the stencil
+    // draws one point of the solid tile), which a reader could change to
+    // no effect.
+    expect(Object.keys(DECAL_TILES).sort()).toEqual(
+      ["arrow", "chevrons", "grime", "rust", "solid", "streak"].sort(),
+    );
+  });
+
   it("maps a tile's rectangle inside its own margin (2.7 C20)", () => {
     // Mutation caught: a rectangle over the whole tile (its margin's clear
     // texels at every decal's edge) or over the wrong tile.

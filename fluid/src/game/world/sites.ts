@@ -35,6 +35,10 @@
  *   - for every poster and the placard, a viewing lane:
  *     `footprint(slot, { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH })`
  *     (1.2 m by 1.5 m), so no floor prop stands in front of the sheet;
+ *   - the wall stencil's edge (`stencilEdge`, 2.7 C19), when it is a wall
+ *     edge and no fixture's: a viewing lane of the same size,
+ *     `footprint(edge, STENCIL_STRIP)`, so no floor prop or hero stands in
+ *     front of the deck and bay stencil and hides it;
  *   - the entrance: x `(entrance.x + 0.5) * CELL +- LANE_WIDTH / 2`, z from
  *     `((hall.y0 + hall.y1) / 2) * CELL` to `(entrance.y + 1) * CELL`;
  *   - every doorway column `c`: x from `(c - 1) * CELL` to `(c + 2) * CELL`,
@@ -463,6 +467,27 @@ export function fitsFloor(room: SiteBase, box: Box): boolean {
 }
 
 /**
+ * The wall edge the deck and bay stencil goes on (2.7 C19): the entrance's
+ * east neighbour, `{ x: entrance.x + 1, y: entrance.y, side: "s" }`, which
+ * is in `noRun`, so no wall prop or run takes it. The stencil is laid there
+ * only when it is a wall edge and no fixture's (`placeDecals`).
+ */
+export function stencilEdge(room: Pick<SiteBase, "entrance">): WallSlot {
+  return { x: room.entrance.x + 1, y: room.entrance.y, side: "s" };
+}
+
+/**
+ * The clear strip in front of the wall stencil's edge (2.7 C19), as a
+ * `footprint` size: a poster's viewing lane, `SHEET_LANE_WIDTH` along the
+ * wall by `SHEET_LANE_DEPTH` out, wider than the stencil's 0.9 m. It is one
+ * of the lanes, so floor props and heroes keep out of it.
+ */
+export const STENCIL_STRIP = {
+  along: SHEET_LANE_WIDTH,
+  out: SHEET_LANE_DEPTH,
+} as const;
+
+/**
  * Where props may go in a room: runs, free edges, lanes, taken footprints,
  * corner zones, wall-side cells, long walls, cluster blocks and span lines.
  * See the module doc for the rules.
@@ -503,6 +528,10 @@ export function dressingSites(room: SiteBase): DressingSites {
         break;
     }
   }
+  const sign = stencilEdge(room);
+  const signKey = edgeKey(sign);
+  if (wallEdges.has(signKey) && !fixtureEdges.has(signKey))
+    lanes.push(footprint(sign, STENCIL_STRIP));
   const ex = (entrance.x + 0.5) * CELL;
   lanes.push({
     x0: ex - LANE_WIDTH / 2,

@@ -10,7 +10,9 @@
  *   and `DECAL_LIFT` off the wall. Where it would cross the accent stripe
  *   (`ACCENT_STRIPE`, the same lift on the same wall) it is drawn in two
  *   pieces, below and above the band, its uv split with it, so the two
- *   never fight for one depth: the stripe reads as painted over it.
+ *   never fight for one depth: the stripe reads as painted over it. On a
+ *   room under construction it is cut out of the hazard baseboard's band
+ *   (0 to `BASEBOARD`, the same lift) the same way.
  * - A **face** decal is a `k.panel` in the crate's own frame at its face
  *   (the decal's anchor lies on the face, its turn the way the face looks),
  *   `DECAL_LIFT` off it.
@@ -43,6 +45,7 @@ import type { Decal, RoomSpec } from "../../world/types";
 import { CELL } from "../../world/units";
 import {
   ACCENT_STRIPE,
+  BASEBOARD,
   FLAG,
   accentTint,
   type Builder,
@@ -151,9 +154,9 @@ function piecesOf(d: Decal, tile: number): { n: number; uv: UvRect } {
 
 /**
  * A vertical decal in `frame`: `a0..a1` along, `h0..h1` up, `DECAL_LIFT`
- * off the surface, with `uv` over it. With `stripe`, the part inside the
- * accent stripe's band is left out and the rest drawn as up to two
- * pieces, each with its own share of the uv.
+ * off the surface, with `uv` over it. The parts inside the `cuts` bands
+ * (heights, low to high, not overlapping) are left out and the rest drawn
+ * as pieces, each with its own share of the uv.
  */
 function upright(
   kitAt: KitAt,
@@ -164,18 +167,19 @@ function upright(
   h1: number,
   uv: UvRect,
   s: Surface,
-  stripe: boolean,
+  cuts: readonly (readonly [number, number])[],
 ): void {
   const k = kitAt(frame);
-  const spans =
-    stripe && h0 < ACCENT_STRIPE.h1 && h1 > ACCENT_STRIPE.h0
-      ? [
-          [h0, Math.min(h1, ACCENT_STRIPE.h0)],
-          [Math.max(h0, ACCENT_STRIPE.h1), h1],
-        ]
-      : [[h0, h1]];
+  const spans: [number, number][] = [];
+  let from = h0;
+  for (const [c0, c1] of cuts) {
+    if (c1 <= from || c0 >= h1) continue;
+    spans.push([from, Math.min(h1, c0)]);
+    from = Math.max(from, c1);
+  }
+  spans.push([from, h1]);
   const vAt = (h: number) => uv.v0 + ((h - h0) / (h1 - h0)) * (uv.v1 - uv.v0);
-  for (const [lo = 0, hi = 0] of spans) {
+  for (const [lo, hi] of spans) {
     if (hi - lo <= 1e-6) continue;
     const v0 = vAt(lo);
     k.panel(
@@ -191,6 +195,22 @@ function upright(
       v0,
     );
   }
+}
+
+/**
+ * The bands a wall decal is cut out of (2.7 C9, C21): the accent stripe's
+ * always, and on a room under construction the hazard baseboard's (0 to
+ * `BASEBOARD`), both standing `DECAL_LIFT` off the wall like the decal, so
+ * they read as painted over it rather than fighting it for depth. A wall
+ * decal never lies on a way's edge, where the baseboard is left out. A
+ * face decal is cut out of nothing.
+ */
+function cutsOf(d: Decal, room: RoomSpec): (readonly [number, number])[] {
+  if (d.on !== "wall") return [];
+  const stripe = [ACCENT_STRIPE.h0, ACCENT_STRIPE.h1] as const;
+  return room.condition === "construction"
+    ? [[0, BASEBOARD], stripe]
+    : [stripe];
 }
 
 /** The frame a wall or face decal lies in. */
@@ -277,8 +297,9 @@ function stencil(kitAt: KitAt, b: Builder, d: Decal): void {
 /**
  * Builds every decal of `room.decals` into the static mesh (2.7 C20, C21):
  * wall and face decals through `kitAt`, floor decals straight into `b`.
- * Reads nothing of the room but its decals. See the module doc for how
- * each is laid.
+ * Reads the room's decals and its condition (a room under construction
+ * cuts its wall decals out of the baseboard's band too). See the module
+ * doc for how each is laid.
  */
 export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
   for (const d of room.decals) {
@@ -318,7 +339,7 @@ export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
           d.h + d.length,
           uv,
           s,
-          d.on === "wall",
+          cutsOf(d, room),
         );
       }
     }

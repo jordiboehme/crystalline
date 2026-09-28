@@ -377,8 +377,13 @@ export type Builder = ReturnType<typeof createBuilder>;
  */
 export const LINTEL = 2.4;
 
-/** How tall the hazard-striped baseboards of a room under construction are. */
-const BASEBOARD = 0.3;
+/**
+ * How tall the hazard-striped baseboards of a room under construction are,
+ * in metres. The decal recipe cuts wall decals out of this band on a room
+ * under construction (`buildDecals`), since the baseboard stands the same
+ * `DECAL_LIFT` off the wall.
+ */
+export const BASEBOARD = 0.3;
 /** How far the baseboards stand off their wall, against z-fighting. */
 const BASEBOARD_INSET = 0.01;
 

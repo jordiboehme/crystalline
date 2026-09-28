@@ -11,22 +11,25 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../../world/canned";
 import { generateRoom } from "../../world/generate";
-import type { RoomSpec } from "../../world/types";
+import { galleryRoom } from "../../world/canned";
+import { HERO_FRONT } from "../../world/footprints";
+import type { Decal, RoomSpec } from "../../world/types";
 import { CELL } from "../../world/units";
 import {
-  ACCENT_MARK,
   ACCENT_STRIPE,
+  accentTint,
+  createBuilder,
   FLAG,
   FLOATS_PER_VERTEX,
   buildRoomMesh,
   type MeshData,
   type V3,
 } from "../geometry";
-import { DECAL_LIFT } from "../kit";
+import { DECAL_LIFT, createKit } from "../kit";
 import { LAYER, TEXT_BASE } from "../layers";
 import { LOOKS } from "../looks";
 import { DECAL_TILES } from "../textures";
-import { DECAL_BUDGET, DECAL_TINT } from "./decals";
+import { DECAL_BUDGET, DECAL_TINT, buildDecals } from "./decals";
 import { MARKS, stencilMarks } from "./marks";
 
 /** One vertex read back from a mesh. */
@@ -291,7 +294,7 @@ describe("the decal recipe", () => {
         expect(same(q.tint, DECAL_TINT.chevrons)).toBe(true);
         kinds.add("chevrons");
       } else if (inTiles("arrow", q.tile)) {
-        expect(q.tint[0]).toBe(ACCENT_MARK);
+        expect([...q.tint]).toEqual(accentTint(1));
         kinds.add("arrow");
       } else if (inTiles("grime", q.tile)) {
         expect(same(q.tint, DECAL_TINT.grime)).toBe(true);
@@ -373,4 +376,133 @@ describe("the decal recipe", () => {
       expect(vertices / 3).toBeLessThan(DECAL_BUDGET);
     }
   }, 30_000);
+
+  it("lays no decal triangle on the plane of the baseboard, the stripe or any other surface it overlaps (2.7 C21)", () => {
+    // Mutation caught: wall decals not cut out of the construction
+    // baseboard's band (0 to 0.3 m, `DECAL_LIFT` off the wall like the
+    // decals), so a low smear or a riser's bleed fights the hazard stripes
+    // for depth; or not cut out of the accent stripe's band.
+    const rooms: RoomSpec[] = [];
+    for (const status of ["stable", "draft", "deprecated", "archived"])
+      for (const p of [CANNED_BRIDGE, CANNED_WORKSHOP, CANNED_HUB])
+        rooms.push(generateRoom({ ...p, status }));
+    for (let i = 0; i < 12; i++)
+      for (const p of [CANNED_BRIDGE, CANNED_WORKSHOP])
+        rooms.push(
+          generateRoom({
+            ...p,
+            status: "draft",
+            permalink: `${p.permalink}-${String(i)}`,
+          }),
+        );
+    let checked = 0;
+    let low = 0;
+    for (const room of rooms) {
+      const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+      const key = (n: V3, plane: number) =>
+        `${n[0].toFixed(2)},${n[2].toFixed(2)},${String(Math.round(plane * 100))}`;
+      const others = new Map<string, Flat[]>();
+      const decals: Flat[] = [];
+      for (let i = 0; i + 2 < mesh.count; i += 3) {
+        const vs = [0, 1, 2].map((k) => vertexAt(mesh, i + k));
+        const first = vs[0]!;
+        if (Math.abs(first.n[1]) > 0.01) continue;
+        const f = flatOf(vs);
+        if (first.flag === FLAG.decal) decals.push(f);
+        else {
+          const k = key(f.normal, f.plane);
+          const list = others.get(k) ?? [];
+          list.push(f);
+          others.set(k, list);
+        }
+      }
+      if (room.condition === "construction")
+        low += room.decals.filter((d) => d.on === "wall" && d.h < 0.3).length;
+      for (const d of decals) {
+        checked++;
+        for (const dp of [-1, 0, 1])
+          for (const o of others.get(key(d.normal, d.plane + dp / 100)) ?? [])
+            expect(coplanarOverlap(d, o, 1e-3)).toBe(false);
+      }
+    }
+    expect(checked).toBeGreaterThan(1000);
+    // Wall decals do reach down into the baseboard's band in construction
+    // rooms, so the cut is exercised.
+    expect(low).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("reads every stencil the right way round on the floor at each turn and on the wall (2.7 C19)", () => {
+    // Mutation caught: a stencil line laid turned half round in place
+    // (mirrored left to right and flipped top to bottom), which reads
+    // upside down, or the floor quad's axes swapped.
+    const base = {
+      kind: "stencil" as const,
+      along: 0,
+      variant: 0,
+      seed: 0,
+      width: 1.0,
+      length: 0.3,
+    };
+    const quadsOf = (d: Decal) => {
+      const b = createBuilder();
+      buildDecals((f) => createKit(b, f), b, { ...galleryRoom(), decals: [d] });
+      const mesh = b.build();
+      expect(mesh.count % 6).toBe(0);
+      return Array.from({ length: mesh.count / 6 }, (_, q) => {
+        const vs = Array.from({ length: 6 }, (_, k) =>
+          vertexAt(mesh, q * 6 + k),
+        );
+        const mean = (k: 0 | 1 | 2) => vs.reduce((s, v) => s + v.p[k], 0) / 6;
+        return [mean(0), mean(1), mean(2)] as V3;
+      });
+    };
+    for (const turn of [0, 1, 2, 3]) {
+      const quads = quadsOf({
+        ...base,
+        on: "floor",
+        x: 5.5,
+        y: 5.5,
+        turn,
+        h: 0,
+        stencil: { deck: 1, bay: 23, letter: 2, lines: 1 },
+      });
+      expect(quads.length).toBeGreaterThan(10);
+      const [fx, fz] = HERO_FRONT[turn]!;
+      const right = (p: V3) => -fz * p[0] + fx * p[2];
+      const up = (p: V3) => fx * p[0] + fz * p[2];
+      // The first run laid is row 0's first (top left), the last row 4's
+      // last (bottom right).
+      const first = quads[0]!;
+      const last = quads.at(-1)!;
+      expect(right(first), `turn ${String(turn)}`).toBeLessThan(
+        right(last) - 0.5,
+      );
+      expect(up(first), `turn ${String(turn)}`).toBeGreaterThan(up(last) + 0.1);
+    }
+    const wall = quadsOf({
+      ...base,
+      on: "wall",
+      x: 2.5,
+      y: 3,
+      turn: 0,
+      h: 1.5,
+      width: 0.9,
+      stencil: { deck: 23, bay: 45, letter: 0, lines: 2 },
+    });
+    // A south wall's slot frame runs `along` towards -x; the lines' split
+    // is the middle of the block (11 rows, the gap row in the middle).
+    const mid = 1.5 + (11 * 0.024) / 2;
+    for (const line of [
+      wall.filter((p) => p[1] > mid),
+      wall.filter((p) => p[1] < mid),
+    ]) {
+      expect(line.length).toBeGreaterThan(10);
+      const first = line[0]!;
+      const last = line.at(-1)!;
+      expect(-first[0]).toBeLessThan(-last[0] - 0.3);
+      expect(first[1]).toBeGreaterThan(last[1] + 0.05);
+    }
+    // DECK over BAY.
+    expect(wall[0]![1]).toBeGreaterThan(mid);
+  });
 });

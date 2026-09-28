@@ -132,12 +132,18 @@ describe("the scene shader's decal branch", () => {
     );
   });
 
-  it("never lets the lowest ordered threshold keep a clear texel (2.7 C20)", () => {
+  it("never lets the lowest ordered threshold keep a clear texel, and samples before it discards (2.7 C20)", () => {
     // Mutation caught: thresholds starting at 0, where `0.0 < 0.0` keeps
     // one fragment in sixteen of a decal's clear margin, a dotted square
-    // round every decal.
+    // round every decal; or the swirl sampled after the discard.
     expect(SCENE_FS).toMatch(/\(BAYER4\[[^\]]+\] \+ 0\.5\) \/ 16\.0/);
-    // The discard comes before any colour is written.
+    // The swirl's implicit-lod sample is taken before the discard, so no
+    // fragment reads it with a discarded neighbour in its quad; and the
+    // discard comes before any colour is written.
+    expect(SCENE_FS.indexOf("float swirl = texture(")).toBeGreaterThan(0);
+    expect(SCENE_FS.indexOf("float swirl = texture(")).toBeLessThan(
+      SCENE_FS.indexOf("discard;"),
+    );
     expect(SCENE_FS.indexOf("discard;")).toBeLessThan(
       SCENE_FS.indexOf("outColour ="),
     );

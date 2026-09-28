@@ -20,6 +20,7 @@ import decalsSource from "./decals.ts?raw";
 import {
   FOOTPRINTS,
   HERO_FRONT,
+  footprint,
   heroFootprint,
   propFootprint,
 } from "./footprints";
@@ -34,6 +35,8 @@ import {
   fitsFloor,
   inside,
   overlaps,
+  STENCIL_STRIP,
+  stencilEdge,
   wallAnchor,
 } from "./sites";
 import type {
@@ -618,4 +621,48 @@ describe("the decal hand tables against the meshes (2.7 Task 10 Step 3b)", () =>
     }
     expect(faces).toBe(3);
   });
+
+  it("sets each bay's stencil to read from the hall, its top pointing east into the bay (2.7 C19)", () => {
+    // Mutation caught: a bay stencil turned to point west (turn 3), which
+    // reads upside down to a player walking in from the hall.
+    const room = generateRoom(CANNED_HUB);
+    const bays = room.decals.filter(
+      (d) => d.kind === "stencil" && (d.stencil?.letter ?? 0) > 0,
+    );
+    expect(bays.length).toBe(room.bays.length);
+    for (const b of room.bays)
+      expect(b.x0).toBeGreaterThanOrEqual(room.hall.x1);
+    for (const d of bays) expect(d.turn).toBe(1);
+  });
+
+  it("keeps every floor prop and hero out of the strip in front of a wall stencil (2.7 C19)", () => {
+    // Mutation caught: the strip left out of the lanes floor props keep
+    // clear, so a crate stack stands in front of the stencil and hides it
+    // (the canned hub at every condition).
+    const list = [
+      ...rooms(40),
+      ...Object.values(STATUSES).map((status) =>
+        generateRoom({ ...CANNED_HUB, status }),
+      ),
+    ];
+    let stencils = 0;
+    for (const room of list) {
+      const walls = room.decals.filter(
+        (d) => d.kind === "stencil" && d.on === "wall",
+      );
+      for (const d of walls) {
+        stencils++;
+        const e = edgeOf(d);
+        expect(e).toEqual(stencilEdge(room));
+        const strip = footprint(e, STENCIL_STRIP);
+        for (const p of room.props) {
+          const b = propFootprint(p);
+          if (b !== null) expect(overlaps(strip, b)).toBe(false);
+        }
+        for (const h of room.heroes)
+          expect(overlaps(strip, heroFootprint(h))).toBe(false);
+      }
+    }
+    expect(stencils).toBeGreaterThan(100);
+  }, 30_000);
 });

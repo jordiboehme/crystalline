@@ -37,6 +37,8 @@ import {
   isLargeHall,
   overlaps,
   spanBox,
+  STENCIL_STRIP,
+  stencilEdge,
   turnForSide,
   wallAnchor,
   type RoomBase,
@@ -262,11 +264,16 @@ describe("lanes", () => {
   const sites = dressingSites(hub);
   const wayKinds = new Set(["door", "hatch", "portal", "terminal", "machine"]);
 
-  it("gives the hub one lane per fixture, the entrance and each doorway column", () => {
+  it("gives the hub one lane per fixture, the entrance, each doorway column and the wall stencil", () => {
+    // Mutation caught (the stencil's lane): no strip kept clear in front of
+    // the deck and bay stencil, or one of the wrong size.
     const cols = doorwayColumns(hub).size;
     expect(cols).toBe(1 + bayCount(hub));
     expect(bayCount(hub)).toBeGreaterThan(0);
-    expect(sites.lanes).toHaveLength(hub.fixtures.length + 1 + cols);
+    expect(sites.lanes).toHaveLength(hub.fixtures.length + 1 + cols + 1);
+    expect(sites.lanes).toContainEqual(
+      footprint(stencilEdge(hub), STENCIL_STRIP),
+    );
     for (const f of hub.fixtures) {
       if (!wayKinds.has(f.kind)) continue;
       const out =

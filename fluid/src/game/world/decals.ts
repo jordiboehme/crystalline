@@ -10,14 +10,16 @@
  *
  * 1. **Stencils** (C19). The wall stencil, `DECK n` over `BAY m`, on the
  *    entrance's east neighbour edge `{ x: entrance.x + 1, y: entrance.y,
- *    side: "s" }` when that is a wall edge and no fixture edge, 1.5 m up,
- *    0.9 by 0.3 m. The entrance floor stencil, `BAY m`, at
+ *    side: "s" }` (`stencilEdge`) when that is a wall edge and no fixture
+ *    edge, 1.5 m up, 0.9 by 0.3 m; the strip in front of it is a lane
+ *    (`STENCIL_STRIP`), so no floor prop or hero hides it. The entrance floor stencil, `BAY m`, at
  *    `(entrance.x + 0.5, entrance.y - 1.0)` reading walking in (turn 0),
  *    1.0 by 0.3 m, or at `entrance.y - 0.5` when that box is not clear: a
  *    lane cell outside the interior band that nothing takes, so a room
  *    always has exactly one (the fallback is still checked, and the tests
  *    pin that it is always clear). Each overflow bay's `BAY mA` to `BAY mD` at
- *    the bay's centre, reading from the hall (turn 3), when its box is
+ *    the bay's centre, reading from the hall (turn 1: every bay lies east
+ *    of the hall, so its top points east, away from the reader), when its box is
  *    clear. The numbers are `deckNumber` and `bayNumber` (C18). All the
  *    stencils of a room share one seed (they draw nothing), so the sort
  *    keeps them in place order and the bay letters run A to D.
@@ -107,6 +109,7 @@ import {
   isLargeHall,
   overlaps,
   round3,
+  stencilEdge,
   wallAnchor,
   type DecalBase,
 } from "./sites";
@@ -423,7 +426,7 @@ export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
     seed: stencilSeed,
   };
   const ent = room.entrance;
-  const signEdge: WallSlot = { x: ent.x + 1, y: ent.y, side: "s" };
+  const signEdge = stencilEdge(room);
   const signKey = edgeKey(signEdge);
   if (wallEdges.has(signKey) && !sites.fixtureEdges.has(signKey))
     fixed.push(
@@ -456,7 +459,7 @@ export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
       on: "floor",
       x: (bay.x0 + bay.x1) / 2,
       y: (bay.y0 + bay.y1) / 2,
-      turn: 3,
+      turn: 1,
       h: 0,
       width: 1.0,
       length: 0.3,

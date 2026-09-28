@@ -217,7 +217,11 @@ const ATLAS_TILES = 4;
  * margin (2.7 C20): at the 256-texel layer a tile is 64 texels and its
  * outer 4 texels on every side are fully transparent, so a coarser mip
  * level never bleeds one tile's shape into its neighbour. A layer of
- * another size scales the whole sheet.
+ * another size scales the whole sheet, margin and all, sampling each
+ * texel at its centre: the margin keeps its 4 texels at 256, is 2 at 128
+ * and 1 at 64, and is lost below that (at 32 a tile's first texel already
+ * falls inside it). The station draws the atlas at `LAYER_SIZE` (256)
+ * only; a smaller layer is for tests of the other layers.
  */
 const TILE = 64;
 const MARGIN = 4;
@@ -226,19 +230,18 @@ const MARGIN = 4;
  * The decal atlas's tiles by kind (2.7 C20), row by row from the layer's
  * first row: chevrons 0 and 1, the arrow 2, grime 3 to 5, streaks 6 and 7,
  * rust 8 and 9, and the solid tile 15, whose alpha is full inside its
- * margin, for the stencils' pixels (a stencil draws from `solid`, never
- * from a tile of its own). Tiles 10 to 14 are empty. A decal's `variant`
+ * margin, for the stencils' pixels (a stencil draws one point of `solid`
+ * and has no entry of its own). Tiles 10 to 14 are empty. A decal's `variant`
  * indexes its kind's list.
  */
 export const DECAL_TILES: Readonly<
-  Record<DecalKind | "solid", readonly number[]>
+  Record<Exclude<DecalKind, "stencil"> | "solid", readonly number[]>
 > = {
   chevrons: [0, 1],
   arrow: [2],
   grime: [3, 4, 5],
   streak: [6, 7],
   rust: [8, 9],
-  stencil: [15],
   solid: [15],
 };
 

@@ -200,8 +200,12 @@ void main() {
  * discarded, so a hard-edged shape (a chevron, an arrow, a stencil's
  * pixel) stays crisp and a soft one (grime, a streak, rust) fades in a
  * stipple, the old ordered-dither look, with no blending and no sorting.
- * The test comes right after the texture read, so a discarded fragment
- * writes nothing. The atlas's colour is white, so a decal's colour is its
+ * The test comes right after the texture reads (the texel and the
+ * portal's swirl), so a discarded fragment writes nothing and every
+ * implicit-lod sample is taken while the whole 2x2 quad still runs: a
+ * discard is not uniform across a quad, and a sample after it would read
+ * undefined derivatives. Everything after the test reads the derivatives
+ * taken at the top (`textureGrad` for the grime). The atlas's colour is white, so a decal's colour is its
  * tint in every look, and the shapes survive Freescape 64, whose texture
  * mix is 0.
  *
@@ -281,11 +285,11 @@ void main() {
   vec2 fw = abs(dx) + abs(dy);
   vec4 texel4 = texture(uTextures, vec3(vUv, vLayer));
   vec3 texel = texel4.rgb;
+  vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);
+  float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
   if (vFlag == ${String(FLAG.decal)} && texel4.a < bayer4(gl_FragCoord.xy)) discard;
   vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
   float level = cellLevel(vWorld, vNormal);
-  vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);
-  float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
 
   if (vFlag == 1) {
     outColour = vec4(vTint * texel * 1.4 * uGain, 1.0);
