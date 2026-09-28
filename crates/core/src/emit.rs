@@ -615,6 +615,31 @@ pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
     set_frontmatter_block_line(source, &["stale_after", "review_after"], line)
 }
 
+/// True when the frontmatter sets `key` to something other than a one-line
+/// scalar: a block sequence or mapping, a block scalar (`|` or `>`), a flow
+/// collection (`[...]` or `{...}`), or any value continued on an indented line
+/// below the key. False when the key or the frontmatter block is absent.
+///
+/// [`set_frontmatter_field`] and [`remove_frontmatter_field`] touch only the
+/// key's own line, so a caller asks this first: on such a value they would
+/// leave the continuation lines behind, where they either join the new value
+/// or fold into the key above.
+pub fn frontmatter_value_spans_lines(source: &str, key: &str) -> bool {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return false;
+    }
+    let mut lines = source[fm_span].lines();
+    let Some(line) = lines.by_ref().find(|l| line_sets_key(l, key)) else {
+        return false;
+    };
+    let inline = line[key.len() + 1..].trim_start();
+    if inline.starts_with(['|', '>', '[', '{']) {
+        return true;
+    }
+    lines.next().is_some_and(is_value_continuation)
+}
+
 fn format_scalar_line(key: &str, value: &str) -> String {
     let mut m = Mapping::new();
     m.insert(
