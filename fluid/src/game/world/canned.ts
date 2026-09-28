@@ -7,7 +7,10 @@
  * high salience (a sliding door and a blast door), one wikilink into another
  * domain (a portal in the cross-domain colour), two tags (two machines), one
  * observation (a poster) and one inbound reference (a hatch). It is also the
- * golden room the generator is pinned against.
+ * golden room the generator is pinned against. `CANNED_BRIDGE_DATA` (M3
+ * C20) is the bridge data `withBridge` fits to that room's own:
+ * `withBridge(CANNED_BRIDGE, generateRoom(CANNED_BRIDGE), CANNED_BRIDGE_DATA)`
+ * is the fitted bridge golden, and `?hall=bridge` shows it.
  *
  * `CANNED_HUB` is the other extreme: an engram three hundred others point at,
  * with forty tags and twenty relations, so its room needs a backlink
@@ -69,9 +72,10 @@ import {
   hostSurfaces,
   type HostSurface,
 } from "./curios";
+import type { BridgeInput } from "./bridge";
+import type { DeckInput, DeckRow } from "./deck";
 import { bayNumber, deckNumber } from "./decals";
 import { PROP_ORDER } from "./dress";
-import type { DeckInput, DeckRow } from "./deck";
 import { plainFinish } from "./finish";
 import { FOOTPRINTS, PIPE_HALF } from "./footprints";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
@@ -193,6 +197,21 @@ export const CANNED_BRIDGE: PlaceInput = {
       content: "The reactor runs hot for an hour after every jump.",
     },
   ],
+};
+
+/**
+ * The bridge data `withBridge` fits to `CANNED_BRIDGE`'s room (M3 C20):
+ * two top-level folders, already in `byLabel` order, a root deck
+ * (`rootDeck: true`), a known engram count and a public domain, so
+ * `bridge-fitted.json` pins the lift's full stop list and a screen with no
+ * key. `?hall=bridge` shows the room this fits.
+ */
+export const CANNED_BRIDGE_DATA: BridgeInput = {
+  domain: "station",
+  engrams: 5,
+  private: false,
+  folders: ["engineering", "logs"],
+  rootDeck: true,
 };
 
 /**

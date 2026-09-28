@@ -73,6 +73,13 @@
  * spells it; `?section=2` is the short section the deck golden pins). The
  * spawn is the deck's own, in front of the lift; `?at=screen:0` stands in
  * front of the screen. The doors and the lift lead nowhere in the gallery.
+ *
+ * `?hall=bridge` (M3 C20, C21) shows `CANNED_BRIDGE`'s room fitted with
+ * `CANNED_BRIDGE_DATA` (`withBridge`), for judging the bridge's own deck
+ * lift and wall screen composed with the room the generator already dressed:
+ * `?at=lift:0` stands in front of the lift, `?at=screen:0` in front of the
+ * screen. Every door, portal and hatch leads nowhere in the gallery, as in
+ * `galleryRoom`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -85,14 +92,18 @@ import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import {
+  CANNED_BRIDGE,
+  CANNED_BRIDGE_DATA,
   CANNED_DECK,
   galleryRoom,
   heroHallRoom,
   liftsHallRoom,
   variantsHallRoom,
 } from "../world/canned";
+import { withBridge } from "../world/bridge";
 import { consoleRoom } from "../world/consoleRoom";
 import { generateDeck } from "../world/deck";
+import { generateRoom } from "../world/generate";
 import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
 import { spotView } from "./spots";
 
@@ -137,7 +148,13 @@ export default function Gallery() {
                       Math.floor(Number(params.get("section") ?? "1")) - 1 || 0,
                     ),
                   )
-                : galleryRoom();
+                : hall === "bridge"
+                  ? withBridge(
+                      CANNED_BRIDGE,
+                      generateRoom(CANNED_BRIDGE),
+                      CANNED_BRIDGE_DATA,
+                    )
+                  : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"
