@@ -4,7 +4,7 @@
  * The prompt for what the player faces sits at the bottom centre on a
  * dark backing fitted to its text (`PROMPT_BACKING`), so it stays readable
  * over whatever lies behind it, the white doorway of an open police box
- * included (2.6e C28); the status line (room, look, condition, mouse hint) at
+ * included (2.6e C28); the status line (room, condition, mouse hint) at
  * the bottom left, the frame time at the top right beside an optional key
  * legend (the frame time only in a development build, where it is a
  * measuring aid rather than something a player needs), and a notice

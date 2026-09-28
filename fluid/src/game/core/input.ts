@@ -4,8 +4,8 @@
  * Keys are tracked by `KeyboardEvent.code`, the physical position, so WASD
  * sits under the same fingers on a German, French or US layout. The loop asks
  * two different questions: `held` for movement, which lasts as long as the
- * key is down, and `pressed` for commands like switching the look, which is
- * true once per physical press and ignores the operating system's
+ * key is down, and `pressed` for commands like inverting the mouse, which
+ * is true once per physical press and ignores the operating system's
  * auto-repeat.
  *
  * Every held key is dropped when the window loses focus, the tab is hidden or

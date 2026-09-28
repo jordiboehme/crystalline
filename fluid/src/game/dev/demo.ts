@@ -14,7 +14,7 @@
  * nowhere, since there is no client to load a place with: walking through a
  * door says `SIGNAL LOST` and leaves the player on the place shown.
  *
- * Keys: 1, 2 and 4 pick the look, R toggles the retired condition (the
+ * Keys: R toggles the retired condition (the
  * place's own status; retired shows `archived`, the derelict end of the
  * scale), and the rest are the game's own (`session.ts`): the arrows or
  * WASD walk, Alt with the arrows, comma and period strafe, Shift runs, the
@@ -74,6 +74,7 @@
  * gallery's `?at=` reads, without leaving the look demo.
  */
 
+import type { LookId } from "../render/looks";
 import { createSession, type HudSink, type Session } from "../session";
 import { CANNED_BRIDGE } from "../world/canned";
 import {
@@ -330,7 +331,8 @@ export function roomWithForcedProp(
  * which the shell needs to close the CRT reader.
  *
  * `options.forceRgba8` skips the half-float probe, so the RGBA8 bloom path
- * Safari takes can be judged on any browser. `options.openFluid` is where F
+ * Safari takes can be judged on any browser. `options.look` is the look the
+ * session runs in (Aperture grid when absent). `options.openFluid` is where F
  * sends the engram's Fluid page. `options.place` is the canned bridge
  * unless the caller names another, and `options.props` is true unless the
  * caller asks for the undressed comparison (no props and no heroes). R shows
@@ -359,6 +361,7 @@ export function startDemo(
   hud: HudSink,
   options: {
     forceRgba8: boolean;
+    look?: LookId;
     openFluid: (path: string) => void;
     place?: PlaceInput;
     props?: boolean;
@@ -403,6 +406,7 @@ export function startDemo(
     navigate: () => {},
     openFluid: options.openFluid,
     forceRgba8: options.forceRgba8,
+    ...(options.look === undefined ? {} : { initialLook: options.look }),
   });
   /**
    * Shows a room built by `hero`, `curio` or `prop`, framed at `at` when it

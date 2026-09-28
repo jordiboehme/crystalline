@@ -1,10 +1,12 @@
 /**
  * STATION LOOK DEMO: the milestone 1 test room, for picking a look.
  *
- * A full-screen canvas with a small HUD: the look and the room's condition,
- * the frame time, and the keys. Development only - the route that renders
- * this exists only under `import.meta.env.DEV`, so a production build never
- * contains it. `?bloom=rgba8` forces the fallback bloom path Safari takes
+ * A full-screen canvas with a small HUD: the room's condition, the frame
+ * time, and the look and the keys on the legend. `?look=` picks the look
+ * by any id in `LOOK_ORDER` (`lookParam`; the game's own when absent): the
+ * game has no key to switch it. Development only - the route that renders
+ * this exists only under `import.meta.env.DEV`, so a production build
+ * never contains it. `?bloom=rgba8` forces the fallback bloom path Safari takes
  * without float targets, and `?nogl` shows the refusal screen, so both can
  * be checked on any browser.
  *
@@ -57,6 +59,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import { fluidRouteOfStation } from "../paths";
+import type { LookId } from "../render/looks";
 import type { Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { CLASSIC_KEYS } from "../ui/keys";
@@ -68,9 +71,11 @@ import { HERO_KINDS } from "../world/heroes";
 import { RARE_PROP_KINDS, type RarePropKind } from "../world/props";
 import type { CurioKind, HeroKind, PlaceInput } from "../world/types";
 import { startDemo } from "./demo";
+import { lookParam, lookLabel } from "./lookParam";
 
-/** The keys, along the top of the screen. */
-const LEGEND = `STATION LOOK DEMO · ${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64 · R RETIRED`;
+/** The look and the keys, along the top of the screen. */
+const legendFor = (look: LookId) =>
+  `STATION LOOK DEMO · ${lookLabel(look)} · ${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · R RETIRED`;
 
 /** The places `?room=` picks between. */
 const ROOMS: Record<string, PlaceInput> = {
@@ -138,7 +143,10 @@ function propFor(params: URLSearchParams): RarePropKind | undefined {
 export default function LookDemo() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sessionRef = useRef<Session | null>(null);
-  const { sink, view, connector, reader } = useHud();
+  const [look] = useState<LookId>(() =>
+    lookParam(new URLSearchParams(window.location.search)),
+  );
+  const { sink, view, connector, reader } = useHud(look);
   const [refusal] = useState<Refusal | null>(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.has("nogl")) return "no-webgl2";
@@ -155,6 +163,7 @@ export default function LookDemo() {
     const at = params.get("at") ?? undefined;
     const { session, stop } = startDemo(canvas, sink, {
       forceRgba8: params.get("bloom") === "rgba8",
+      look,
       openFluid,
       place: placeFor(params),
       props: params.get("props") !== "0",
@@ -168,7 +177,7 @@ export default function LookDemo() {
       sessionRef.current = null;
       stop();
     };
-  }, [refusal, sink]);
+  }, [refusal, sink, look]);
 
   const closeReader = useCallback(() => {
     sessionRef.current?.closeReader();
@@ -185,7 +194,7 @@ export default function LookDemo() {
       view={view}
       connector={connector}
       reader={reader}
-      legend={LEGEND}
+      legend={legendFor(look)}
       onCloseReader={closeReader}
       onOpenFluid={readerOpenFluid}
     />

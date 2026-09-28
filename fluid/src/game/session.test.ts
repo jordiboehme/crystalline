@@ -32,6 +32,7 @@ import {
   stationOfPlace,
 } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
+import { LOOK_ORDER, LOOKS } from "./render/looks";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
@@ -511,14 +512,22 @@ describe("go", () => {
     expect(hud.reader).toHaveBeenLastCalledWith(null);
   });
 
-  it("redraws the connector in the new look while loading", () => {
+  it("keeps the connector in the game's look while loading, whatever digit is pressed", () => {
+    // Mutation caught: a look key read again while a place loads (the
+    // connector would be redrawn in the day shift's or the third look's
+    // colours).
     serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
-    key("keydown", "Digit4");
-    frames(1);
-    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "freescape");
+    const calls = hud.connector.mock.calls.length;
+    for (const code of ["Digit1", "Digit2", "Digit3", "Digit4"]) {
+      key("keydown", code);
+      frames(1);
+      key("keyup", code);
+    }
+    expect(hud.connector.mock.calls.length).toBe(calls);
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
   });
 
   it("warms the cache once for the place behind a door the player walks up to", async () => {
@@ -761,19 +770,30 @@ describe("a room the renderer refuses", () => {
     expect(eyeAt()[1]).toBeLessThan(before[1] - 0.5);
   });
 
-  it("keeps the look the renderer refuses the room in from being taken", () => {
+  it("never switches the look from a key: the room stays in Aperture grid and the status names no look", () => {
+    // Mutation caught: the digit keys mapped to looks again (the room would
+    // be handed to the renderer a second time, in another look), or the
+    // look's name put back on the status line.
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
-    renderer.setRoom.mockImplementation(() => {
-      throw new Error("no");
-    });
-    key("keydown", "Digit4");
-    frames(1);
-    expect(hud.notice).toHaveBeenLastCalledWith("?LOAD ERROR");
-    expect(hud.status).toHaveBeenLastCalledWith(
-      expect.stringContaining("APERTURE"),
-    );
+    const rooms = renderer.setRoom.mock.calls.length;
+    expect(rooms).toBeGreaterThan(0);
+    hud.notice.mockClear();
+    for (const code of ["Digit1", "Digit2", "Digit3", "Digit4"]) {
+      key("keydown", code);
+      frames(1);
+      key("keyup", code);
+      frames(1);
+    }
+    expect(renderer.setRoom.mock.calls.length).toBe(rooms);
+    for (const [, look] of renderer.setRoom.mock.calls)
+      expect(look.id).toBe("aperture");
+    expect(hud.notice).not.toHaveBeenCalled();
+    expect(hud.status).toHaveBeenCalled();
+    for (const [text] of hud.status.mock.calls)
+      for (const id of LOOK_ORDER)
+        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
     expect(session.current).toEqual(engramAt("station", "manifest"));
   });
 });
@@ -1443,11 +1463,12 @@ describe("the level cheat", () => {
     expect(openFluid).not.toHaveBeenCalled();
     expect(hud.reader).not.toHaveBeenCalled();
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    // Digit1 would switch to the day shift look; the status still names
-    // the look the select opened over.
+    // No key switches the look, so Digit1 does nothing here either, and
+    // the status line names no look.
     expect(hud.status).toHaveBeenCalled();
     for (const [text] of hud.status.mock.calls) {
-      expect(text).toContain("APERTURE GRID");
+      for (const id of LOOK_ORDER)
+        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
     }
 
     // Closed: nothing typed inside comes back as a command or a step.
@@ -1960,7 +1981,7 @@ describe("malfunctions", () => {
     expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
   });
 
-  it("keeps a failure across a look switch and a restored context, and clears it on re-entry", async () => {
+  it("keeps a failure across a restored context, and clears it on re-entry", async () => {
     const canvas = document.createElement("canvas");
     const session = start({
       client: null,
@@ -1974,11 +1995,7 @@ describe("malfunctions", () => {
     for (let i = 0; i < 20 && !lastFaults().has(door0); i++) frames(1);
     expect(lastFaults().has(door0)).toBe(true);
 
-    key("keydown", "Digit1");
-    frames(1);
-    key("keyup", "Digit1");
-    expect(hud.status).toHaveBeenLastCalledWith(expect.stringContaining("DAY"));
-    frames(3);
+    frames(4);
     expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
     const beforeLoss = lastFaults().get(door0);
 
@@ -2246,7 +2263,9 @@ describe("the console room", () => {
     expect(lastCamera().yaw).toBe(0);
     const status = hud.status.mock.calls.at(-1)?.[0] ?? "";
     expect(status.startsWith("  |  ")).toBe(false);
-    expect(status.startsWith("APERTURE")).toBe(true);
+    expect(
+      status.startsWith(`${lastRoom()?.condition.toUpperCase() ?? "?"}  |  `),
+    ).toBe(true);
   });
 
   it("walks out to another domain's bridge, the connector naming it, and steps out of a box there (2.6e C13, C14)", async () => {
@@ -2398,15 +2417,13 @@ describe("the console room", () => {
     expect(isConsole(lastRoom())).toBe(true);
   });
 
-  it("keeps the console room and the arrival box through a look switch and a restored context (Review Focus 5)", async () => {
-    // Mutation caught: a look switch or a restore that rebuilds the
-    // room (the box would vanish, the console room would drop its player).
+  it("keeps the console room and the arrival box through a restored context (Review Focus 5)", async () => {
+    // Mutation caught: a restore that rebuilds the room (the box would
+    // vanish, the console room would drop its player).
     const session = startWithConsole([row(HALL), row("ops")], okBridge);
     standAtBox(session);
     walkIn();
     const inside = lastRoom();
-    key("keydown", "Digit4");
-    key("keyup", "Digit4");
     frames(1);
     expect(lastRoom()).toBe(inside);
     await flush();

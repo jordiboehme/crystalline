@@ -7,7 +7,6 @@ import {
   LOOK_ORDER,
   applyCondition,
   hueToRgb,
-  lookForKey,
   type Rgb,
 } from "./looks";
 import type { Condition } from "../world/types";
@@ -17,16 +16,11 @@ function allColours(look: (typeof LOOKS)["day"]): Rgb[] {
 }
 
 describe("looks", () => {
-  it("are the three the spec names, on keys 1, 2 and 4", () => {
+  it("are the three the spec names", () => {
     expect(LOOK_ORDER).toEqual(["day", "aperture", "freescape"]);
     expect(LOOKS.day.name).toBe("Day shift");
     expect(LOOKS.aperture.name).toBe("Aperture grid");
     expect(LOOKS.freescape.name).toBe("Freescape 64");
-    expect(lookForKey("Digit1")).toBe("day");
-    expect(lookForKey("Digit2")).toBe("aperture");
-    expect(lookForKey("Digit4")).toBe("freescape");
-    expect(lookForKey("Digit3")).toBeNull();
-    expect(lookForKey("KeyW")).toBeNull();
   });
 
   it("keep every colour inside [0, 1]", () => {

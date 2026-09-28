@@ -27,8 +27,8 @@
  * player where they stand with a notice for three seconds; with no room to
  * stand in yet, the notice stays over the dark screen.
  *
- * Each tick, in order: the typed keys for the level cheat's word, the look
- * and command keys, movement, what the player faces and a use of it, the doors,
+ * Each tick, in order: the typed keys for the level cheat's word, the
+ * command keys, movement, what the player faces and a use of it, the doors,
  * the faults of the broken ways, the walk into a police box and out of the
  * console room, the HUD prompt, the ways out of the room,
  * warming the cache for the places behind the doors the player walks up to,
@@ -89,9 +89,11 @@
  * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
  * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
- * M turns the sound off and on (with `sound`: its `toggleMute`, the
- * notice `SOUND OFF` or `SOUND ON`; without it M does nothing), and 1, 2
- * and 4 switch the look. Only the mouse looks up and down. The
+ * and M turns the sound off and on (with `sound`: its `toggleMute`, the
+ * notice `SOUND OFF` or `SOUND ON`; without it M does nothing).
+ * No key switches the look: the game always runs in Aperture grid (look
+ * 2), and only the dev pages start in another (`initialLook`, their
+ * `?look=`). Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
  * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
  * reader is open it reads the keys itself: the session ignores its own
@@ -234,7 +236,7 @@ import {
 } from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
-import { LOOKS, lookForKey, type LookId } from "./render/looks";
+import { LOOKS, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
 import {
   boxEntry,
@@ -319,7 +321,7 @@ export interface ReaderState {
  *
  * - `prompt`: the line for what the player faces (`SPACE READ Scope`), null
  *   when nothing.
- * - `status`: the room, the look, its condition and the mouse hint.
+ * - `status`: the room, its condition and the mouse hint.
  * - `frame`: the frame time and the render targets' colour format, with
  *   `BUILD <ms> MS` appended once a room has been built: the time the last
  *   `renderer.setRoom` call took.
@@ -365,7 +367,8 @@ export type RendererFactory = (
  * - `openFluid`: opens a Fluid path (the F key) outside the game.
  * - `forceRgba8`: take the RGBA8 bloom path whatever the GPU offers.
  * - `createRenderer`: see `RendererFactory`.
- * - `initialLook`: the look to start in; `aperture` when not given.
+ * - `initialLook`: the look the session runs in, for good; `aperture`
+ *   when not given. Only the dev pages pass another (their `?look=`).
  * - `clock`: the loop's clock; the browser's when not given. Tests crank it
  *   by hand.
  * - `load`: loads a place in place of the query client. The gallery's
@@ -647,11 +650,8 @@ const CLAIMED_KEYS: ReadonlySet<string> = new Set([
 /** The use key: doors, terminals, the hatch, a police box's doors. */
 const USE_KEY = "Space";
 
-/** The look keys, in the order they are read. */
-const LOOK_KEYS = ["Digit1", "Digit2", "Digit4"] as const;
-
 /** Every key that commands the session, drained while the reader is open. */
-const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM", ...LOOK_KEYS] as const;
+const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM"] as const;
 
 /** The renderer on a real WebGL2 context. */
 const defaultFactory: RendererFactory = (canvas, options) => {
@@ -708,7 +708,7 @@ export function createSession(opts: SessionOptions): Session {
   const now = () => (opts.clock ?? performance).now();
 
   let disposed = false;
-  let lookId: LookId = opts.initialLook ?? "aperture";
+  const lookId: LookId = opts.initialLook ?? "aperture";
   let inverted = readInverted();
   let place: PlaceInput | null = null;
   let current: StationAddress | null = null;
@@ -949,10 +949,10 @@ export function createSession(opts: SessionOptions): Session {
 
   const showStatus = () => {
     if (disposed) return;
-    const parts = [LOOKS[lookId].name.toUpperCase()];
+    const parts: string[] = [];
     if (room !== null) {
       const label = where();
-      if (label !== null) parts.unshift(label);
+      if (label !== null) parts.push(label);
       parts.push(room.condition.toUpperCase());
     }
     parts.push(
@@ -1982,20 +1982,6 @@ export function createSession(opts: SessionOptions): Session {
       // rather than kept for the room that loads or, when the load fails,
       // for this one.
       if (loading) input.pressed(USE_KEY);
-      for (const code of LOOK_KEYS) {
-        if (!input.pressed(code)) continue;
-        const next = lookForKey(code);
-        if (next === null || next === lookId) continue;
-        // A look the renderer refuses the room in is not taken: the room
-        // stays in the look it has.
-        if (room !== null && !present(room, next)) {
-          fail(LOAD_ERROR);
-          continue;
-        }
-        lookId = next;
-        if (loading) hud.connector(true, loadingLabel, lookId);
-        showStatus();
-      }
       if (input.pressed("KeyI")) {
         inverted = !inverted;
         writeInverted(inverted);

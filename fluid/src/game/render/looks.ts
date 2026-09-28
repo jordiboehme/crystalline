@@ -16,8 +16,9 @@
  * - Freescape 64: flat-shaded solid polygons, ordered dithering and the
  *   C64 palette, after Driller and the other Freescape games.
  *
- * The one the demo's player picks becomes the default; the others stay
- * behind a hidden key only if they cost almost nothing.
+ * The game always runs in Aperture grid and has no key to switch looks;
+ * the dev pages (the look demo and the model gallery) still start in any
+ * of the three through their `?look=` parameter.
  */
 
 import type { Condition, Finish } from "../world/types";
@@ -262,19 +263,8 @@ export function accentFor(room: { finish: Finish }, look: Look): Rgb {
   return look.accents[room.finish.accent] ?? [0, 0, 0];
 }
 
-/** The looks in key order. */
+/** The looks in order, the game's own (Aperture grid) second. */
 export const LOOK_ORDER: readonly LookId[] = ["day", "aperture", "freescape"];
-
-const KEYS: Record<string, LookId> = {
-  Digit1: "day",
-  Digit2: "aperture",
-  Digit4: "freescape",
-};
-
-/** The look a key selects, by `KeyboardEvent.code`. Key 3 is deliberately free. */
-export function lookForKey(code: string): LookId | null {
-  return KEYS[code] ?? null;
-}
 
 /**
  * A look adjusted for a room's condition: construction adds a little grime,
