@@ -1397,8 +1397,10 @@ describe("ExploreRoute", () => {
     },
   );
 
-  // Mutation caught: the board's route missing or below the station's
-  // splat (the station mounts there instead, in the airlock).
+  // Mutation caught: the board's route missing or at another path (the
+  // station mounts there instead, in the airlock). Its order among the
+  // routes is not pinned: the router ranks by specificity, so it would
+  // win over the splat declared anywhere; it sits above it by house style.
   it("serves the sound board at /π/dev/sounds in development", async () => {
     gl.available = true;
     serve();
@@ -1453,6 +1455,31 @@ describe("ExploreRoute", () => {
       await settle(300);
       view.unmount();
       expect(ctx.calls.at(-1)).toBe("close");
+    });
+
+    // Mutation caught: the route's visibility listener left on the document
+    // after the unmount (one more per mount, each holding a dead director).
+    it("takes its visibility listener down on unmount", async () => {
+      gl.available = true;
+      stubAudio();
+      serve();
+      const added = vi.spyOn(document, "addEventListener");
+      const removed = vi.spyOn(document, "removeEventListener");
+      const view = renderAt("/%CF%80");
+      await waitFor(() => {
+        expect(made.options.length).toBeGreaterThan(0);
+      });
+      const listeners = added.mock.calls
+        .filter(([type]) => type === "visibilitychange")
+        .map(([, listener]) => listener);
+      // The route's own and the session's: every one of them goes.
+      expect(listeners.length).toBeGreaterThan(0);
+      await settle(300);
+      view.unmount();
+      const gone = removed.mock.calls
+        .filter(([type]) => type === "visibilitychange")
+        .map(([, listener]) => listener);
+      for (const listener of listeners) expect(gone).toContain(listener);
     });
 
     // Mutation caught: the suspend on the pause missing, the hidden tab

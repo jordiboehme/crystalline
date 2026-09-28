@@ -31,18 +31,6 @@ import type { Patch, Voice } from "./patch";
 /** How long a drone takes to fade in and the one it replaces to fade out. */
 export const CROSSFADE_S = 0.6;
 
-/** Every ambience, in the order the sound board lists them. */
-export const AMBIENCES = [
-  "clean",
-  "construction",
-  "dim",
-  "derelict",
-  "airlock",
-  "hangar",
-  "console",
-  "dark",
-] as const satisfies readonly Ambience[];
-
 /** How one kind's hum is made. */
 interface Hum {
   /** The fundamental, Hz. */
@@ -128,6 +116,13 @@ const HUMS = {
   },
   dark: DERELICT,
 } as const satisfies Record<Ambience, Hum>;
+
+/**
+ * Every ambience, in the order the sound board lists them: the keys of the
+ * drone table, which the type holds complete, so a new kind cannot be left
+ * off the board.
+ */
+export const AMBIENCES = Object.keys(HUMS) as readonly Ambience[];
 
 /** The drone of `ambience` for the room of `seed`: a looping patch. */
 export function dronePatch(ambience: Ambience, seed: number): Patch {

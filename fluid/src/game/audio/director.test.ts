@@ -88,6 +88,43 @@ describe("createDirector", () => {
     expect(Math.max(...peaks)).toBeCloseTo(0.25, 9);
   });
 
+  // Mutation caught: a placed one-shot's panner left on the bus after the
+  // shot ended (disconnected only when a later one-shot prunes it).
+  it("disconnects a door's panner once the door has sounded", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({
+      kind: "door",
+      sound: "bulkhead",
+      open: false,
+      pan: 0.3,
+      gain: 1,
+    });
+    const panner = ctx.ofKind("panner")[0]!;
+    expect(panner.connections).toHaveLength(1);
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    expect(panner.connections).toHaveLength(0);
+    expect(panner.disconnects).toBe(1);
+  });
+
+  // Mutation caught: a noise buffer filled per patch name (fifteen two
+  // second buffers kept for the context's life, where two do).
+  it("fills one noise buffer per bus, whatever the patches", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "step", foot: 0, run: true, n: 1 });
+    director.cue({ kind: "step", foot: 0, run: false, n: 2 });
+    for (const sound of ["sliding", "exit", "blast"] as const) {
+      director.cue({ kind: "door", sound, open: true, pan: 0, gain: 1 });
+    }
+    director.cue({ kind: "travel", via: "portal" });
+    director.cue({ kind: "room", ambience: "airlock", seed: 1 });
+    director.cue({ kind: "room", ambience: "derelict", seed: 1 });
+    expect(ctx.buffers).toHaveLength(2);
+  });
+
   // Mutation caught: the drone restarted on every room of the same kind.
   it("keeps one drone through rooms of the same ambience", () => {
     const { ctx, mixer, director } = setup();
@@ -142,6 +179,42 @@ describe("createDirector", () => {
     // The oldest steps went, the newest play on.
     expect(stopped(steps[0]!)).toBe(true);
     expect(stopped(steps.at(-1)!)).toBe(false);
+
+    // The ride's hum and a new room's drone make room too: the count
+    // stays at the cap with both of them live.
+    const liveNow = () =>
+      [
+        ...levelsInto(ctx, bus(mixer, "ambience")),
+        ...door,
+        ...levelsInto(ctx, bus(mixer, "effects")),
+      ].filter((l) => !stopped(l)).length;
+    director.cue({ kind: "ride", phase: "depart" });
+    expect(liveNow()).toBeLessThanOrEqual(VOICE_CAP);
+    director.cue({ kind: "room", ambience: "hangar", seed: 1 });
+    const drones = levelsInto(ctx, bus(mixer, "ambience"));
+    const effects = levelsInto(ctx, bus(mixer, "effects"));
+    const hum = effects.at(-1)!;
+    const all = [...drones, ...door, ...effects].filter((l) => !stopped(l));
+    expect(all.length).toBeLessThanOrEqual(VOICE_CAP);
+    expect(stopped(hum)).toBe(false);
+    expect(stopped(drones.at(-1)!)).toBe(false);
+  });
+
+  // Mutation caught: a drone started over a full cap (a room entered while
+  // 24 one-shots play, or the first click on a reload) going past it.
+  it("makes room for a drone that starts over a full cap", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    for (let n = 0; n < 30; n++) {
+      director.cue({ kind: "step", foot: 0, run: false, n });
+    }
+    director.cue({ kind: "room", ambience: "dim", seed: 1 });
+    const live = [
+      ...levelsInto(ctx, bus(mixer, "ambience")),
+      ...levelsInto(ctx, bus(mixer, "effects")),
+    ].filter((l) => !stopped(l));
+    expect(live.length).toBeLessThanOrEqual(VOICE_CAP);
+    expect(stopped(levelsInto(ctx, bus(mixer, "ambience"))[0]!)).toBe(false);
   });
 
   // Mutation caught: the ride's hum never stopped, or stopped with a

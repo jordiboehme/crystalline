@@ -639,6 +639,45 @@ describe("playPatch's slow modulations", () => {
   });
 });
 
+describe("playPatch's end", () => {
+  // Mutation caught: the end reported before the last source ended, twice,
+  // or never (a placed one-shot's panner would stay on the bus).
+  it("says once when the last source has ended, at once for none", () => {
+    const ctx = new FakeAudioContext();
+    let ends = 0;
+    playPatch(
+      ctx,
+      ctx.destination,
+      { name: "two", voices: [voice(), voice({ wave: "noise", pitch: [] })] },
+      0,
+      "two",
+      () => {
+        ends += 1;
+      },
+    );
+    const [osc, noise] = sources(ctx) as unknown as { end(): void }[];
+    osc!.end();
+    expect(ends).toBe(0);
+    noise!.end();
+    expect(ends).toBe(1);
+    noise!.end();
+    expect(ends).toBe(1);
+
+    let empty = 0;
+    playPatch(
+      ctx,
+      ctx.destination,
+      { name: "none", voices: [] },
+      0,
+      "n",
+      () => {
+        empty += 1;
+      },
+    );
+    expect(empty).toBe(1);
+  });
+});
+
 describe("playPatch's noise", () => {
   // Mutation caught: a fresh two-second buffer filled on every play (the
   // cost of every footstep, Task 6 m8).

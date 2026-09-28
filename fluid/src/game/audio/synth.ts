@@ -165,8 +165,11 @@ interface Source {
 
 /**
  * Schedules `patch` on `ctx` at `when` (context seconds) into `dest`. Noise
- * voices play `noiseBuffer(ctx, NOISE_BUFFER_S, seedName)`. The returned
- * stop fades out in `fadeS`.
+ * voices play `noiseBuffer(ctx, NOISE_BUFFER_S, seedName)` (kept per
+ * context and name). The returned stop fades out in `fadeS`. `onEnd` is
+ * called once, when the last source has ended and the graph is
+ * disconnected (at once for a patch with no voices), so a caller can take
+ * down what it put between the patch and its bus.
  */
 export function playPatch(
   ctx: BaseAudioContextLike,
@@ -174,6 +177,7 @@ export function playPatch(
   patch: Patch,
   when: number,
   seedName: string,
+  onEnd?: () => void,
 ): PlayingPatch {
   const loop = patch.loop === true;
   const made: AudioNodeLike[] = [];
@@ -270,13 +274,20 @@ export function playPatch(
   let stopped = false;
   let end = loop ? Number.POSITIVE_INFINITY : when + patchLength(patch);
   let ended = 0;
+  let released = false;
   const release = (): void => {
     ended += 1;
-    if (ended < sources.length) return;
+    if (released || ended < sources.length) return;
+    released = true;
     for (const node of made) node.disconnect();
+    onEnd?.();
   };
   for (const source of sources) source.node.onended = release;
-  if (sources.length === 0) level.disconnect();
+  if (sources.length === 0) {
+    released = true;
+    level.disconnect();
+    onEnd?.();
+  }
 
   return {
     get end() {

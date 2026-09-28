@@ -25,12 +25,12 @@
  *   (a looping patch, stopped by the director on `arrive`, F16), `arrive`
  *   a two-note chime.
  *
- * Every patch's name is fixed per recipe (not per step or run), since the
- * synth fills a noise buffer per name and keeps it.
+ * Every patch's name is fixed per recipe (not per step or run), for the
+ * sound board's list; the noise is seeded per bus by whoever plays it.
  */
 
 import { seedFor } from "../core/seed";
-import { LIFT_RIDE_MS } from "../session";
+import { LIFT_RIDE_MS } from "../timing";
 import type { DoorSound } from "./cues";
 import { arpeggio, midiHz, type Patch, type Step, type Voice } from "./patch";
 

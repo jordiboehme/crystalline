@@ -289,6 +289,7 @@ import {
   stepPlayer,
   type Player,
 } from "./world/move";
+import { LIFT_RIDE_MS } from "./timing";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
 import { roomFor } from "./world/station";
 import type {
@@ -564,12 +565,8 @@ export const LOOK_NOTICE_MS = 1500;
  */
 export const LISTING_WAIT_MS = 5000;
 
-/**
- * How long a lift ride lasts at the least, in milliseconds (M3 C27): a
- * load that settles sooner is held until then, so the connector naming
- * the stop stays up for the ride.
- */
-export const LIFT_RIDE_MS = 1200;
+/** The shortest lift ride (M3 C27), kept in `timing.ts` for the sound. */
+export { LIFT_RIDE_MS };
 
 /**
  * How far from its exit's wall point the player must once stand, in

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { LIFT_RIDE_MS } from "../session";
+import { LIFT_RIDE_MS } from "../timing";
 import type { DoorSound } from "./cues";
 import {
   doorPatch,

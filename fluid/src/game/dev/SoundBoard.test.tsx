@@ -92,6 +92,10 @@ describe("SoundBoard", () => {
     const ctx = contexts[0]!;
     expect(ctx.calls).toEqual(["resume"]);
     expect(into(ctx, busAt(ctx, BUS_LEVELS.effects))).toHaveLength(1);
+    // Noise from one buffer per bus, not one per patch name.
+    fireEvent.click(screen.getByRole("button", { name: "door exit open" }));
+    fireEvent.click(screen.getByRole("button", { name: "hatch" }));
+    expect(ctx.buffers).toHaveLength(1);
 
     const drone = screen.getByRole("button", { name: "drone hangar" });
     expect(drone).toHaveAttribute("aria-pressed", "false");

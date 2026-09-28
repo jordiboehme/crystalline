@@ -63,9 +63,11 @@ export default function SoundBoard() {
     mixer.unlock();
     const ctx = mixer.ctx;
     const patch = make();
-    const bus = mixer.bus(busOf(patch));
+    const on = busOf(patch);
+    const bus = mixer.bus(on);
     if (ctx === null || bus === null) return;
-    const playing = playPatch(ctx, bus, patch, ctx.currentTime, patch.name);
+    // Noise from the bus's one buffer, as the director plays it.
+    const playing = playPatch(ctx, bus, patch, ctx.currentTime, on);
     if (patch.loop === true) {
       loops.set(name, playing);
       sync();

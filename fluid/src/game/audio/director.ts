@@ -13,7 +13,11 @@
  *   At most `VOICE_CAP` patches play at once, the drone and the ride's hum
  *   counted; one more drops the oldest step or fault first (a 30 ms fade),
  *   and only when none is left the oldest other one-shot. The drone and the
- *   hum are never dropped. While the context is not running the one-shots
+ *   hum are never dropped, and starting either makes room the same way. A
+ *   placed shot's panner is disconnected as soon as the shot has ended.
+ *   Noise plays from one seeded buffer per bus (the synth keeps a buffer
+ *   per seed name, and a name per patch would keep fifteen two-second
+ *   buffers for the context's life). While the context is not running the one-shots
  *   are dropped: its clock stands still, and everything scheduled on it
  *   would sound at once when it runs again.
  * - **The drone.** One looping drone per room: a `room` cue with the
@@ -78,12 +82,11 @@ export interface Director extends SoundSink {
   dispose(): void;
 }
 
-/** A one-shot that is playing: what it is, and its panner if placed. */
+/** A one-shot that is playing. */
 interface Shot {
   playing: PlayingPatch;
   /** Steps and faults are the first dropped at the cap. */
   cheap: boolean;
-  panner: AudioNodeLike | null;
 }
 
 /** How a one-shot is played. */
@@ -98,8 +101,8 @@ export function createDirector(mixer: Mixer): Director {
   let disposed = false;
   /** The one-shots still playing, oldest first. */
   let shots: Shot[] = [];
-  /** One-shots dropped at the cap, fading, whose panners wait to go. */
-  let fading: Shot[] = [];
+  /** The panners of placed shots not yet ended. */
+  const panners = new Set<AudioNodeLike>();
   /** The room's ambience and seed, kept when there is no context. */
   let wanted: { ambience: Ambience; seed: number } | null = null;
   let drone: { ambience: Ambience; playing: PlayingPatch } | null = null;
@@ -111,34 +114,33 @@ export function createDirector(mixer: Mixer): Director {
 
   const held = () => (drone === null ? 0 : 1) + (hum === null ? 0 : 1);
 
-  /** Forgets the one-shots that have ended, disconnecting their panners. */
-  const prune = (now: number) => {
-    const ended = (s: Shot) => s.playing.end <= now;
-    for (const s of [...shots, ...fading]) {
-      if (ended(s)) s.panner?.disconnect();
-    }
-    shots = shots.filter((s) => !ended(s));
-    fading = fading.filter((s) => !ended(s));
-  };
-
   /** Drops the oldest step or fault, else the oldest one-shot. */
   const evict = () => {
     const i = shots.findIndex((s) => s.cheap);
     const [gone] = shots.splice(i < 0 ? 0 : i, 1);
-    if (gone === undefined) return;
-    gone.playing.stop();
-    fading.push(gone);
+    gone?.playing.stop();
   };
 
   /**
-   * Plays `patch` on `bus` from now: through a panner when placed, its
-   * voices scaled by `gain`. Null without a context or bus.
+   * Makes room under `VOICE_CAP` for one more patch: forgets the one-shots
+   * whose time has passed, then drops one-shots until the next one fits.
+   */
+  const makeRoom = () => {
+    const now = mixer.ctx?.currentTime ?? 0;
+    shots = shots.filter((s) => s.playing.end > now);
+    while (shots.length > 0 && shots.length + held() + 1 > VOICE_CAP) evict();
+  };
+
+  /**
+   * Plays `patch` on `bus` from now: through a panner when placed (taken
+   * down when the patch ends), its voices scaled by `gain`, its noise from
+   * the bus's buffer. Null without a context or bus.
    */
   const start = (
     patch: Patch,
     bus: Bus,
     { pan, gain = 1 }: ShotOptions = {},
-  ): { playing: PlayingPatch; panner: AudioNodeLike | null } | null => {
+  ): PlayingPatch | null => {
     const ctx = mixer.ctx;
     const out = mixer.bus(bus);
     if (ctx === null || out === null) return null;
@@ -158,8 +160,15 @@ export function createDirector(mixer: Mixer): Director {
             ...patch,
             voices: patch.voices.map((v) => ({ ...v, gain: v.gain * gain })),
           };
-    const playing = playPatch(ctx, dest, played, ctx.currentTime, patch.name);
-    return { playing, panner };
+    if (panner !== null) panners.add(panner);
+    const onEnd =
+      panner === null
+        ? undefined
+        : () => {
+            panner.disconnect();
+            panners.delete(panner);
+          };
+    return playPatch(ctx, dest, played, ctx.currentTime, bus, onEnd);
   };
 
   /** A one-shot on the effects bus, under the cap; dropped while not running. */
@@ -167,20 +176,19 @@ export function createDirector(mixer: Mixer): Director {
     const ctx = mixer.ctx;
     if (disposed || ctx === null || !mixer.running) return;
     if (options.gain !== undefined && !(options.gain > 0)) return;
-    prune(ctx.currentTime);
-    while (shots.length > 0 && shots.length + held() >= VOICE_CAP) evict();
-    const played = start(patch, "effects", options);
-    if (played === null) return;
-    shots.push({ ...played, cheap: options.cheap === true });
+    makeRoom();
+    const playing = start(patch, "effects", options);
+    if (playing === null) return;
+    shots.push({ playing, cheap: options.cheap === true });
   };
 
   /** Starts the wanted drone when there is none and a context to play it. */
   const startDrone = () => {
     if (disposed || wanted === null || drone !== null) return;
-    const played = start(dronePatch(wanted.ambience, wanted.seed), "ambience");
-    if (played !== null) {
-      drone = { ambience: wanted.ambience, playing: played.playing };
-    }
+    if (mixer.ctx === null) return;
+    makeRoom();
+    const playing = start(dronePatch(wanted.ambience, wanted.seed), "ambience");
+    if (playing !== null) drone = { ambience: wanted.ambience, playing };
   };
 
   /** A room entered: its drone, kept for the same ambience, else faded to. */
@@ -211,7 +219,8 @@ export function createDirector(mixer: Mixer): Director {
     chimeOwed = false;
     shot(doorPatch("sliding", false));
     if (disposed || !mixer.running) return;
-    hum = start(ridePatch("depart"), "effects")?.playing ?? null;
+    makeRoom();
+    hum = start(ridePatch("depart"), "effects");
   };
 
   const cue = (c: Cue) => {
@@ -286,9 +295,9 @@ export function createDirector(mixer: Mixer): Director {
       for (const s of shots) s.playing.stop();
       drone?.playing.stop();
       hum?.stop();
-      for (const s of [...shots, ...fading]) s.panner?.disconnect();
+      for (const panner of panners) panner.disconnect();
+      panners.clear();
       shots = [];
-      fading = [];
       drone = null;
       hum = null;
       wanted = null;
