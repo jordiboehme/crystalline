@@ -57,10 +57,35 @@ embed and would report seconds where the pass takes an hour. It refuses in that
 state rather than reporting a number that looks like a result.
 
 Options: `--bin` (default `target/release/crystalline`), `--corpus`, `--out`,
-`--stage all|base|embed|daemon`, and `STATE_DIR` in the environment for the
-state directory, which defaults to `/tmp/crystalline-scale` because a unix
-socket path holds at most 103 bytes and a state directory under a deep
-working copy overruns it.
+`--stage all|base|embed|daemon|nli`, `--nli-profile full|light|english-only`,
+`--nli-lift yes|no`, and `STATE_DIR` in the environment for the state
+directory, which defaults to `/tmp/crystalline-scale` because a unix socket
+path holds at most 103 bytes and a state directory under a deep working copy
+overruns it. `DRAIN_LIMIT` in the environment raises the `nli` stage's
+pre-flight ceiling for a long timing run (default 1800 seconds).
+
+## Contradiction scoring
+
+`generate.py --contradictions N` plants N flipped pairs and N hard negatives in
+a `probes` domain of their own (so they never compete with natural pairs for
+the per-domain pair cap) and writes the sidecar
+`contradictions.json` beside the corpus: flips by type (negation, number or
+version, date, antonym, entity swap, quantity word), half English, half German
+and one in ten mixed, and negatives that must stay quiet (compatible facts, the
+same frame with a different scope, different periods with and without dates,
+paraphrases and entailments), with German number and date formats.
+
+`run.sh --stage nli --nli-profile full` (or `light`, `english-only`) scores the
+corpus with that profile after the `embed` stage and dumps every stored row to
+`<out>/nli-<profile>.json`; `evals/nli/evaluate.py` turns a dump and the sidecar
+into the report the measurement note is written from. Precision runs on a
+small probes corpus with the related line lowered and the pair cap lifted
+(the default `--nli-lift yes`); drain time and resident size run on the full
+corpus with the product's own caps (`--nli-lift no`), because the full corpus's
+lead cosines are degenerate and a lifted cap there means weeks of CPU. A
+pre-flight stops a stage whose projected drain exceeds `DRAIN_LIMIT`. Each
+profile gets its own model cache under `<out>`, seeded with a clone of the
+embedding model.
 
 ## Isolation
 

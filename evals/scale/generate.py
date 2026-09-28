@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import re
 import shutil
@@ -424,6 +425,76 @@ CONDITIONS = [
     "a partial outage", "the night shift", "heavy rain", "month end",
 ]
 
+# --- planted contradictions (--contradictions) --------------------------------
+#
+# Each planted item is two engrams in a `contradictions/` folder of one domain
+# that share a title stem and an opening paragraph (so their lead embeddings
+# are related) and differ in one observation line. A flip must be read as a
+# contradiction; a hard negative must stay quiet. The sidecar records every
+# item with its line numbers, so the evaluator can find the planted line pair.
+
+# (English subject, German subject with its article)
+PLANT_SUBJECTS = [
+    ("nightly backup", "das nächtliche Backup"),
+    ("build server", "der Build-Server"),
+    ("warehouse system", "das Lagerverwaltungssystem"),
+    ("cold chain monitor", "die Kühlkettenüberwachung"),
+    ("night run", "der Nachtlauf"),
+    ("test bench", "der Prüfstand"),
+    ("ingest service", "der Ingest-Dienst"),
+    ("release gate", "das Freigabetor"),
+]
+
+# (type, lang, line a, line b); {s} is the English subject, {D} the German one
+# capitalized, {d} the German one as written.
+PLANT_FLIPS = [
+    ("negation", "en", "The {s} runs on a fixed schedule", "The {s} does not run on a fixed schedule"),
+    ("negation", "de", "{D} läuft nach festem Zeitplan", "{D} läuft nicht nach festem Zeitplan"),
+    ("negation", "de", "{D} braucht keinen Neustart", "{D} braucht einen Neustart"),
+    ("negation", "de", "{D} nutzt nicht mehr das alte Skript", "{D} nutzt das alte Skript"),
+    ("number", "en", "The {s} keeps 1,000 entries", "The {s} keeps 1,500 entries"),
+    ("number", "de", "{D} fasst 1.000 Einträge", "{D} fasst 1.500 Einträge"),
+    ("number", "de", "Die Toleranz für {d} liegt bei 1,5 mm", "Die Toleranz für {d} liegt bei 2,5 mm"),
+    ("version", "en", "The {s} uses Node 18", "The {s} uses Node 20"),
+    ("version", "en", "The {s} uses Node 18.19.0", "The {s} uses Node 20.1.0"),
+    ("date", "en", "The {s} was introduced in 2023", "The {s} was introduced in 2021"),
+    ("date", "de", "Die Abnahme für {d} war am 27.09.2026", "Die Abnahme für {d} war am 14.03.2025"),
+    ("antonym", "en", "The {s} is enabled by default", "The {s} is disabled by default"),
+    ("antonym", "de", "{D} ist standardmäßig aktiviert", "{D} ist standardmäßig deaktiviert"),
+    ("entity", "en", "The {s} is owned by the platform team", "The {s} is owned by the data team"),
+    ("entity", "de", "{D} gehört dem Plattformteam", "{D} gehört dem Datenteam"),
+    ("quantity", "en", "The {s} always needs a manual approval", "The {s} never needs a manual approval"),
+    ("quantity", "de", "{D} braucht immer eine manuelle Freigabe", "{D} braucht nie eine manuelle Freigabe"),
+    ("number", "mixed", "The {s} uses version 18", "{D} nutzt Version 20"),
+    ("antonym", "mixed", "The {s} is enabled by default", "{D} ist standardmäßig deaktiviert"),
+    ("negation", "mixed", "{D} braucht keinen Neustart", "The {s} needs a restart"),
+    ("quantity", "mixed", "The {s} always needs a manual approval", "{D} braucht nie eine manuelle Freigabe"),
+]
+
+PLANT_NEGATIVES = [
+    ("compatible", "en", "The {s} runs at night", "The {s} writes a log file"),
+    ("compatible", "de", "{D} läuft nachts", "{D} schreibt eine Logdatei"),
+    ("scope", "en", "On the work mac the {s} uses version 18", "On the home mac the {s} uses version 20"),
+    ("scope", "de", "Auf dem Arbeits-Mac nutzt {d} Version 18", "Auf dem Heim-Mac nutzt {d} Version 20"),
+    ("period-undated", "en", "The {s} used version 18", "The {s} uses version 20"),
+    ("period-undated", "de", "{D} nutzte Version 18", "{D} nutzt Version 20"),
+    ("period-dated", "en", "Until 2024 the {s} used version 18", "Since 2025 the {s} uses version 20"),
+    ("period-dated", "de", "Bis 2024 nutzte {d} Version 18", "Seit 2025 nutzt {d} Version 20"),
+    ("paraphrase", "en", "The {s} runs every night", "Every night the {s} runs"),
+    ("paraphrase", "de", "{D} läuft jede Nacht", "Jede Nacht läuft {d}"),
+    ("entailment", "en", "The {s} runs every night at two", "The {s} runs every night"),
+    ("entailment", "de", "{D} läuft jede Nacht um zwei", "{D} läuft jede Nacht"),
+    ("compatible", "mixed", "The {s} runs at night", "{D} schreibt eine Logdatei"),
+]
+
+
+def plant_lang(index: int) -> str:
+    """Half English, half German, one in ten mixed."""
+    if index % 10 == 9:
+        return "mixed"
+    return "en" if index % 2 == 0 else "de"
+
+
 CATEGORY_TEMPLATES = {
     "fact": "The {thing} holds {measure} under {condition}",
     "decision": "We settled on the {process} for every {thing} change",
@@ -726,17 +797,105 @@ def generate(out: Path, seed: int, domain_count: int, per_domain: int) -> dict:
     return stats
 
 
+PROBES = {
+    "name": "probes",
+    "scope": ["Planted line pairs for the contradiction measurement"],
+    "when": ["Never for work: this domain exists for evals/nli/evaluate.py"],
+    "notes": ["Each probe is two engrams that share a paragraph and differ in one observation line"],
+}
+
+
+def plant_contradictions(out: Path, seed: int, count: int) -> list:
+    """Write `count` flipped pairs and `count` hard negatives into a `probes`
+    domain of their own, and the sidecar. A domain of their own so the planted
+    pairs never compete with the natural ones for the per-domain pair cap, and
+    a seeded paragraph per probe so probes do not all read as related to each
+    other. The second bullet is unique per probe (never shared between two
+    probes) so it never becomes an unplanted line pair of its own."""
+    rng = random.Random(f"{seed}:contradictions")
+    root = out / "probes"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "MANIFEST.md").write_text(manifest_text(PROBES), encoding="utf-8")
+    items = []
+    for kind, table, stem in (("flip", PLANT_FLIPS, "Contradiction probe"), ("negative", PLANT_NEGATIVES, "Consistency probe")):
+        for i in range(count):
+            lang = plant_lang(i)
+            ptype, _, line_a, line_b = rng.choice([t for t in table if t[1] == lang])
+            en, de = PLANT_SUBJECTS[i % len(PLANT_SUBJECTS)]
+            fill = {"s": en, "D": de[:1].upper() + de[1:], "d": de}
+            texts = (line_a.format(**fill), line_b.format(**fill))
+            domain = "probes"
+            title = f"{stem} {i:04d}"
+            paragraph = f"{title} records how the {en} is run. " + " ".join(
+                sentence(rng) for _ in range(2)
+            )
+            shared = f"This is probe {i:04d} of the {stem.lower()} set, written for the contradiction measurement"
+            ends = []
+            for side, text in zip("ab", texts):
+                side_title = f"{title} {side}"
+                permalink = f"pairs/{slugify(side_title)}"
+                body_lines = [
+                    "---",
+                    "type: engram",
+                    f"title: {side_title}",
+                    f"permalink: {permalink}",
+                    "tags:",
+                    "  - measurement",
+                    "status: stable",
+                    f"recorded_at: {RECORDED_LATEST.isoformat()}",
+                    f"generated: {GENERATED}",
+                    "---",
+                    "",
+                    paragraph,
+                    "",
+                    f"- [fact] {text} #measurement",
+                    f"- [fact] {shared} #measurement",
+                    "",
+                ]
+                path = root / "pairs" / f"{slugify(side_title)}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(body_lines), encoding="utf-8")
+                ends.append((permalink, body_lines.index(f"- [fact] {text} #measurement") + 1, text))
+            items.append(
+                {
+                    "id": len(items),
+                    "kind": kind,
+                    "type": ptype,
+                    "lang": lang,
+                    "domain": domain,
+                    "a": ends[0][0],
+                    "b": ends[1][0],
+                    "a_line": ends[0][1],
+                    "b_line": ends[1][1],
+                    "a_text": ends[0][2],
+                    "b_text": ends[1][2],
+                }
+            )
+    (out / "contradictions.json").write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return items
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=20260914)
     parser.add_argument("--domains", type=int, default=5)
     parser.add_argument("--engrams-per-domain", type=int, default=2000)
     parser.add_argument("--out", type=Path, default=Path("evals/scale/corpus"))
+    parser.add_argument(
+        "--contradictions", type=int, default=0,
+        help="plant this many flipped pairs and as many hard negatives",
+    )
     args = parser.parse_args()
 
     stats = generate(
         args.out.resolve(), args.seed, args.domains, args.engrams_per_domain
     )
+
+    if args.contradictions:
+        planted = plant_contradictions(
+            args.out.resolve(), args.seed, args.contradictions
+        )
+        print(f"planted:      {len(planted)} pairs, sidecar contradictions.json")
 
     engrams = stats["engrams"]
     tokens = stats["body_tokens"]
