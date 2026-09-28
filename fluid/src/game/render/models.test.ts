@@ -24,6 +24,7 @@ import { VARIANT_COUNTS, tagAccent } from "../world/variants";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
+  accentTint,
   createBuilder,
   type MeshData,
   type Surface,
@@ -36,7 +37,7 @@ import {
   frameForSlot,
   type Frame,
 } from "./kit";
-import { LAYER } from "./layers";
+import { LAYER, TEXT_BASE } from "./layers";
 import { LOOKS } from "./looks";
 import {
   add,
@@ -1561,5 +1562,148 @@ describe("model variants (2.7)", () => {
         for (const p of painted) expect(GLOWING).not.toContain(p.flag);
       });
     }
+  });
+});
+
+/** A terminal variant's parts in the north wall's local terms, and the keys it asked for. */
+function terminalParts(variant: number): { ps: LocalBox[]; keys: string[] } {
+  const fx = terminalAt(variant);
+  const wall = frameForSlot(fx.slot);
+  const built = buildOne(fx);
+  const ps = built.parts.map((part) => {
+    const s = shape(part.points.map((q) => toLocal(wall, q)));
+    return { part, lo: s.lo, hi: s.hi };
+  });
+  return { ps, keys: built.keys };
+}
+
+/**
+ * The screen of a terminal build: its text quad's rectangle (`a0..a1`,
+ * `h0..h1`) and the face it stands on, `DECAL_LIFT` behind the quad.
+ */
+function screenOf(ps: readonly LocalBox[]) {
+  const text = ps.filter((b) => b.part.layer >= TEXT_BASE);
+  expect(text).toHaveLength(1);
+  const [t] = text;
+  if (!t) throw new Error("no screen");
+  return {
+    a0: t.lo[0],
+    a1: t.hi[0],
+    h0: t.lo[2],
+    h1: t.hi[2],
+    face: t.lo[1] - DECAL_LIFT,
+  };
+}
+
+/** How far in front of the wall the desk top reaches (`terminal.ts`'s `DESK_DEPTH`). */
+const DESK_FRONT = 0.6;
+
+/**
+ * What makes each new terminal variant that variant (2.7 Task 6), on its
+ * recorded parts in the north wall's local terms. Entry `v - 1` is variant
+ * `v`'s check; each holds for its variant and fails for variant 0.
+ */
+const TERMINAL_SIGNATURES: ((ps: LocalBox[], keys: string[]) => boolean)[] = [
+  // The flat console: nothing behind the screen deeper than 0.12 m from
+  // its face (no tube case), and a seat with no back: no part standing
+  // wholly in front of the desk rises above 0.6 m.
+  (ps) => {
+    const sc = screenOf(ps);
+    const behind = ps.filter(
+      (b) =>
+        b.part.layer < TEXT_BASE &&
+        b.lo[0] < sc.a1 - EPS &&
+        b.hi[0] > sc.a0 + EPS &&
+        b.lo[2] < sc.h1 - EPS &&
+        b.hi[2] > sc.h0 + EPS &&
+        b.lo[1] < sc.face - 0.12 - EPS,
+    );
+    const back = ps.filter(
+      (b) => b.lo[1] >= DESK_FRONT - EPS && b.hi[2] > 0.6 + EPS,
+    );
+    return behind.length === 0 && back.length === 0;
+  },
+  // The hooded twin: a part above the screen's top edge, over the screen,
+  // that reaches at least 0.1 m out past its face (the hood); a second
+  // glowing panel left of the screen at screen height; and no text key but
+  // the terminal's own.
+  (ps, keys) => {
+    const sc = screenOf(ps);
+    const hood = ps.some(
+      (b) =>
+        b.lo[2] >= sc.h1 - EPS &&
+        b.hi[1] >= sc.face + 0.1 &&
+        b.lo[0] < sc.a1 &&
+        b.hi[0] > sc.a0,
+    );
+    const side = ps.some(
+      (b) =>
+        b.part.method === "panel" &&
+        b.part.layer < TEXT_BASE &&
+        glows(b) &&
+        b.hi[0] <= sc.a0 + EPS &&
+        b.lo[2] < sc.h1 &&
+        b.hi[2] > sc.h0,
+    );
+    return hood && side && keys.join() === `terminal:${String(INDEX)}`;
+  },
+];
+
+/**
+ * How many parts of each terminal variant carry the room's accent mark
+ * (2.7 C9), entry `v` for variant `v`: the chair's seat and back and the
+ * three drawer pulls on variants 0 and 2 (re-tints of existing parts on
+ * variant 0), the stool's seat and the three pulls on variant 1.
+ */
+const TERMINAL_ACCENT_PARTS: readonly number[] = [5, 4, 5];
+
+describe("terminal variants (2.7 Task 6)", () => {
+  it("keeps the screen quad where it was on every terminal variant (2.7 C3)", () => {
+    // Mutation caught: a variant that moves, resizes or reshapes the screen
+    // (the text would stretch and the reading would move).
+    const screen = (v: number) =>
+      buildOne({
+        kind: "terminal",
+        slot: slotOn("n"),
+        heading: "H",
+        lines: [],
+        section: 0,
+        seed: 1,
+        variant: v,
+      })
+        .parts.filter((p) => p.layer >= TEXT_BASE)
+        .map((p) =>
+          p.points.map((q) => q.map((c) => c.toFixed(5)).join(",")).join(";"),
+        );
+    expect(VARIANT_COUNTS.terminal).toBe(3);
+    expect(screen(0)).toHaveLength(1);
+    for (let v = 1; v < VARIANT_COUNTS.terminal; v++)
+      expect(screen(v)).toEqual(screen(0));
+  });
+
+  for (const [i, check] of TERMINAL_SIGNATURES.entries())
+    it(`builds terminal variant ${String(i + 1)} to its design (2.7 Task 6)`, () => {
+      // Mutation caught: the variant built as variant 0 (the check must
+      // fail there, so it cannot pass on any build of the kind).
+      expect(VARIANT_COUNTS.terminal).toBeGreaterThan(i + 1);
+      const own = terminalParts(i + 1);
+      const zero = terminalParts(0);
+      expect(check(own.ps, own.keys)).toBe(true);
+      expect(check(zero.ps, zero.keys)).toBe(false);
+    });
+
+  it("paints the room's accent on the seat, back and drawer pulls only (2.7 C9)", () => {
+    // Mutation caught: an accent part left in its old colour, one painted
+    // twice, a glowing part (the screen, the side monitor's bars) in the
+    // accent, or the tag's baked colour used instead of the mark.
+    const mark = accentTint(1).join();
+    expect(TERMINAL_ACCENT_PARTS.length).toBe(VARIANT_COUNTS.terminal);
+    TERMINAL_ACCENT_PARTS.forEach((n, v) => {
+      const painted = buildOne(terminalAt(v)).parts.filter(
+        (p) => p.tint?.join() === mark,
+      );
+      expect(painted.length, `terminal variant ${String(v)}`).toBe(n);
+      for (const p of painted) expect(GLOWING).not.toContain(p.flag);
+    });
   });
 });

@@ -38,7 +38,7 @@ export const VARIANT_COUNTS: {
   machine: Record<MachineKind, number>;
   decor: Record<DecorKind, number>;
 } = {
-  terminal: 1,
+  terminal: 3,
   machine: {
     workbench: 3,
     "lab-bench": 3,

@@ -21,6 +21,7 @@ import {
   wallPatternOf,
   type MeshData,
 } from "./geometry";
+import { DECAL_LIFT } from "./kit";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS, accentFor, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
@@ -440,9 +441,11 @@ describe("the console room's movers and size (2.6e C9, C19)", () => {
 
 /**
  * The accent stripe's quads in a mesh: walked six vertices at a time, the
- * vertical quads whose tint carries the accent mark, each with its tint,
- * its bottom and top height and the key of the cell edge it lies on (read
- * back from its world x and z and its normal, as `edgeQuad` places it).
+ * vertical quads whose tint carries the accent mark and that span a whole
+ * cell edge `DECAL_LIFT` off a cell border (a model's accent parts, such as
+ * a terminal's chair back, are neither), each with its tint, its bottom and
+ * top height and the key of the cell edge it lies on (read back from its
+ * world x and z and its normal, as `edgeQuad` places it).
  */
 function stripeQuads(
   m: MeshData,
@@ -456,6 +459,13 @@ function stripeQuads(
     if (!quad.every((v) => v.tint[0] === ACCENT_MARK)) continue;
     if (!quad.every((v) => Math.abs(v.normal[1]) < EPS)) continue;
     const [nx, , nz] = first.normal;
+    const [plane, run]: [0 | 2, 0 | 2] = Math.abs(nz) > 0.5 ? [2, 0] : [0, 2];
+    const at = first.pos[plane];
+    const lift = Math.abs(at - Math.round(at / CELL) * CELL);
+    const runs = quad.map((v) => v.pos[run]);
+    const span = Math.max(...runs) - Math.min(...runs);
+    if (Math.abs(lift - DECAL_LIFT) > EPS || Math.abs(span - CELL) > EPS)
+      continue;
     const side: Side = nz > 0.5 ? "n" : nz < -0.5 ? "s" : nx > 0.5 ? "w" : "e";
     const mid = (k: 0 | 2) =>
       quad.reduce((sum, v) => sum + v.pos[k], 0) / quad.length;
