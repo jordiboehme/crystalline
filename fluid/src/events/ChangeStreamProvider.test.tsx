@@ -1360,6 +1360,40 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     second();
   });
 
+  it("tells a consumer that attaches while the carrier is down at once", async () => {
+    // Catches `attach` saying nothing of the carrier: a consumer that comes
+    // late (the station mounted during a drop) would take the stream for up
+    // until the next change, and never hear the drop it arrived in.
+    const hub = lone();
+    const first = hub.subscribe(() => undefined);
+    await settle();
+    await connectAll();
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    const late: boolean[] = [];
+    const leave = subscribeOn(hub, () => undefined, {
+      onCarrier: (up) => late.push(up),
+    });
+    expect(late, "down, heard on attaching").toEqual([false]);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(late, "and the return").toEqual([false, true]);
+    // Up is what every consumer takes for granted: an attach while up says
+    // nothing, so a consumer never hears an up without a down before it.
+    const upNow: boolean[] = [];
+    const third = subscribeOn(hub, () => undefined, {
+      onCarrier: (up) => upNow.push(up),
+    });
+    expect(upNow).toEqual([]);
+    third();
+    leave();
+    first();
+  });
+
   it("keeps a throwing carrier consumer from stopping the leader's reconnect and its reset", async () => {
     // Catches `onCarrier` called outside a try/catch: a bug in one
     // subscriber's carrier handler would stop the 502 path before it asks
@@ -1644,7 +1678,7 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     leave();
   });
 
-  it("reports the carrier down after MAX_REOPENS disagreements in a row, and starts over after the backoff", async () => {
+  it("reopens MAX_REOPENS times in a row, then reports the carrier down and starts over after the backoff", async () => {
     // Catches the bound failing closed for good (frames held back forever
     // on a healthy session) or passing it without saying so on the
     // carrier (which is defined as whether frames flow).
@@ -1693,6 +1727,80 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     other.close();
     await settle();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("waits longer before each fresh start while the cookie never holds, up to the cap", async () => {
+    // Catches the fresh start's backoff counted on the counter every open
+    // clears: a cookie that never holds would start over about once a
+    // second forever. Every source opens as soon as it is made and every
+    // answer is in at once, so the gap before a fresh start is its delay.
+    let asked = 0;
+    const flipping: SessionProbe = () => {
+      asked += 1;
+      return Promise.resolve(me(asked % 2 === 0 ? "bob" : "ada"));
+    };
+    const made: number[] = [];
+    const streamFactory = (url: string): EventSource => {
+      const source = new FakeEventSource(url);
+      made.push(Date.now());
+      queueMicrotask(() => {
+        source.open();
+      });
+      return source as unknown as EventSource;
+    };
+    const leave = lone({ sessionProbe: flipping, streamFactory }).subscribe(
+      () => undefined,
+    );
+    await settle();
+    await advance(200_000);
+    // Each cycle is one source and MAX_REOPENS reopens; the next source
+    // after it is a fresh start.
+    const cycle = MAX_REOPENS + 1;
+    const gaps: number[] = [];
+    for (let i = cycle; i < made.length; i += cycle) {
+      gaps.push(made[i]! - made[i - 1]!);
+    }
+    expect(gaps.slice(0, 7)).toEqual([
+      1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+    ]);
+    leave();
+  });
+
+  it("does not report the carrier up for a source it already knows it will close", async () => {
+    // Catches `setCarrier(true)` at the open of a reopen whose "before"
+    // answer is unknown: the leader closes that source once the "after"
+    // answer is in, so the carrier would read up and then down a second
+    // later, while no frame flows.
+    let network = true;
+    const probe: SessionProbe = () =>
+      network
+        ? Promise.resolve(me("ada"))
+        : Promise.reject(new TypeError("offline"));
+    const carrier: boolean[] = [];
+    const leave = subscribeOn(lone({ sessionProbe: probe }), () => undefined, {
+      onCarrier: (up) => carrier.push(up),
+    });
+    await settle();
+    await connectAll();
+    network = false;
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    network = true;
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(carrier, "still down: this source is closed again").toEqual([false]);
+    await advance(1_000);
+    expect(FakeEventSource.instances, "the uncounted reopen").toHaveLength(2);
+    act(() => {
+      sourceAt(1).open();
+    });
+    await settle();
+    expect(carrier, "up once frames can flow").toEqual([false, true]);
+    leave();
   });
 
   it("takes a probe that cannot answer before the browser's reopen as no disagreement", async () => {

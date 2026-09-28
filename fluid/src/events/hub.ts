@@ -32,8 +32,9 @@
  *   answers naming the same account is the label. Two answers that name
  *   different accounts, or an account and nobody, disagree: the cookie
  *   changed around the request, and the source is opened again. After
- *   `MAX_REOPENS` disagreements in a row the carrier is reported down and
- *   the lead starts over after the stream's backoff. A probe that could
+ *   `MAX_REOPENS` reopens in a row the next disagreement makes the lead
+ *   start over, after a backoff that grows with each such start until a
+ *   label holds. A probe that could
  *   not answer (a network error, a 5xx) is no disagreement: it is asked
  *   again, and when it was the answer before the browser's own reopen,
  *   which cannot be asked again before that request, the source is opened
@@ -55,7 +56,9 @@
  * nothing arrives while it runs) and up when a source opens, and tells the
  * other tabs over the channel, so every tab's consumers hear one change
  * per drop and one per return. A fresh hub starts with the carrier up, so
- * the first `open` is no change.
+ * the first `open` is no change. Up is what a consumer takes for granted:
+ * one that attaches while the carrier is down hears the drop at once, and
+ * one that attaches while it is up hears nothing until it changes.
  *
  * A tab takes part while anything in it wants the stream: a mounted
  * provider, a consumer attached from outside the shell, or a `subscribe`
@@ -249,6 +252,9 @@ export class ChangeHub {
     // session is a new sign-in: take part again.
     this.dormant = false;
     this.demandChanged();
+    // Up is what a consumer takes for granted; one that attaches during a
+    // drop hears it at once, or it would never hear the drop it came in.
+    if (!this.carrierUp) this.tell(consumer, false);
     return () => {
       this.consumers.delete(consumer);
       this.demandChanged();
@@ -341,14 +347,18 @@ export class ChangeHub {
     if (up === this.carrierUp) return;
     this.carrierUp = up;
     if (broadcast) this.channel?.postMessage({ type: "carrier", up });
-    // A consumer's bug must not stop the reconnect or the reset that
-    // follow this call, nor cost the others their news.
-    for (const consumer of [...this.consumers]) {
-      try {
-        consumer.onCarrier?.(up);
-      } catch (error) {
-        console.error("a change consumer threw", error);
-      }
+    for (const consumer of [...this.consumers]) this.tell(consumer, up);
+  }
+
+  /**
+   * One consumer's carrier news. A consumer's bug must not stop the
+   * reconnect or the reset that follow, nor cost the others their news.
+   */
+  private tell(consumer: ChangeConsumer, up: boolean): void {
+    try {
+      consumer.onCarrier?.(up);
+    } catch (error) {
+      console.error("a change consumer threw", error);
     }
   }
 
@@ -483,6 +493,8 @@ export class ChangeHub {
     let afterAsked = false;
     let askAttempt = 0;
     let reopens = 0;
+    /** Fresh starts after the bound since the last label: their backoff. */
+    let restarts = 0;
     let askRetry: ReturnType<typeof setTimeout> | null = null;
     const forgetAccount = () => {
       asking += 1;
@@ -517,6 +529,7 @@ export class ChangeHub {
       if (before === undefined) return;
       if (before === after) {
         reopens = 0;
+        restarts = 0;
         this.account = after;
         this.accountKnown = true;
         const own = this.ownIdentity();
@@ -540,9 +553,14 @@ export class ChangeHub {
         detach = null;
         this.setCarrier(false, true);
         if (retry) clearTimeout(retry);
-        scheduleRetry(() => {
+        // Its own count: every open clears `attempt`, and this wait must
+        // grow while the cookie keeps moving.
+        const delay = reconnectDelay(restarts, this.deps.random);
+        restarts += 1;
+        retry = setTimeout(() => {
+          retry = null;
           begin(true);
-        });
+        }, delay);
         return;
       }
       // The answer that closed this bracket was asked before the next
@@ -677,7 +695,9 @@ export class ChangeHub {
       const onOpen = () => {
         attempt = 0;
         if (!afterAsked) askAfter();
-        this.setCarrier(true, true);
+        // With no answer before this request the leader will close this
+        // source once the answer after it is in: no frame flows on it.
+        if (!beforeUnknown) this.setCarrier(true, true);
         if (gap) {
           // Nothing said what happened while no source was open.
           gap = false;
