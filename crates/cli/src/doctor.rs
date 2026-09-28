@@ -43,10 +43,11 @@
 //! domains left behind, and stale service artifacts, respells those links,
 //! and keeps one copy of a repeated frontmatter key whose copies all agree
 //! (in a team domain the copy the base snapshot has; in a domain that
-//! reviews changes only when that restores the base); the rest, including
-//! the whole GitHub, environment, harnesses and provisioning sections, are
-//! report-only, and every finding that has a fix points at the right next
-//! command.
+//! reviews changes only when that restores the base; never on a read-only
+//! instance), writing it through a rename so the file is never cut short;
+//! the rest, including the whole GitHub, environment, harnesses and
+//! provisioning sections, are report-only, and every finding that has a fix
+//! points at the right next command.
 //!
 //! The index reads are socket-first, the same shape `sync_dispatch` uses: a
 //! running daemon holds the index file, so its stamps are asked for over ctl
@@ -210,8 +211,9 @@ pub struct DuplicateKeyFile {
     /// Every repeated key, with the lines of its copies and whether they agree.
     pub keys: Vec<crystalline_core::frontmatter::DuplicateKey>,
     /// Whether `--fix` would repair this file (every repeat agrees, the result
-    /// parses and, in a reviewing domain, restores the base). Decided on every
-    /// run, so the report only sends a person to `--fix` when it would work.
+    /// parses, the instance is not read-only and, in a reviewing domain, the
+    /// result restores the base). Decided on every run, so the report only
+    /// sends a person to `--fix` when it would work.
     pub fixable: bool,
     /// Whether `--fix` removed the extra copies in this run.
     pub fixed: bool,
@@ -223,6 +225,12 @@ pub struct DuplicateKeyFile {
 /// What `--fix` says about a reviewing domain's file it will not rewrite.
 const REVIEWED_NOTE: &str =
     "This domain reviews changes, so --fix leaves it: fix it in the repository";
+
+/// What `--fix` says on a read-only instance, which never writes a domain file.
+const READ_ONLY_NOTE: &str = "This instance is read-only, so --fix leaves it";
+
+/// What `--fix` says when the file changed between doctor's read and its write.
+const CHANGED_NOTE: &str = "The file changed while doctor ran, so --fix left it: run doctor again";
 
 /// A MANIFEST policy key whose declared value nobody recognizes, with what
 /// the domain reads it as. Reported, never fixed: a policy is a decision.
@@ -1084,6 +1092,7 @@ pub async fn run(
                 stamps,
                 rebuild_markers.get(name).cloned(),
                 fix,
+                cfg.read_only(),
             )
             .await?,
         );
@@ -1569,13 +1578,14 @@ async fn check_domain(
     daemon_stamps: Option<HashMap<String, FileStamp>>,
     rebuild_marker: Option<(String, Option<String>)>,
     fix: bool,
+    read_only: bool,
 ) -> Result<DomainDoctor> {
     // The marker is stamped onto every shape of report, not only the one the
     // on-disk checks run to the end of. A domain whose folder has gone is
     // exactly how a rebuild gets interrupted in the first place, and that
     // report must still say a rebuild did not finish rather than only that the
     // path is missing.
-    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix).await?;
+    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix, read_only).await?;
     if let Some((started, kind)) = rebuild_marker {
         d.rebuild_started = Some(started);
         d.rebuild_kind = kind;
@@ -1652,6 +1662,7 @@ async fn check_domain_checks(
     store: Option<&dyn Store>,
     daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
+    read_only: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
     // orphans, unindexed, encoding) do not apply. Report its database engram
@@ -1755,7 +1766,11 @@ async fn check_domain_checks(
             .as_deref()
             .and_then(|dir| read_base_file(dir, &rel).ok().flatten())
             .and_then(|bytes| String::from_utf8(bytes).ok());
-        let plan = plan_duplicate_fix(&source, base.as_deref(), entry.is_overlay());
+        let mut plan = plan_duplicate_fix(&source, base.as_deref(), entry.is_overlay());
+        // A read-only instance never writes a domain file, doctor included.
+        if read_only && plan.is_ok() {
+            plan = Err(READ_ONLY_NOTE.to_string());
+        }
         let mut report = DuplicateKeyFile {
             path: rel,
             keys,
@@ -1764,9 +1779,9 @@ async fn check_domain_checks(
             not_fixed: plan.as_ref().err().cloned(),
         };
         if fix && let Ok(text) = plan {
-            match std::fs::write(&file, text) {
+            match write_fix(&file, &source, &text) {
                 Ok(()) => report.fixed = true,
-                Err(e) => report.not_fixed = Some(format!("Writing the file failed: {e}")),
+                Err(note) => report.not_fixed = Some(note),
             }
         }
         d.duplicate_keys.push(report);
@@ -1869,6 +1884,36 @@ async fn check_domain_checks(
     Ok(d)
 }
 
+/// Write `text` over `file` for `--fix`: into a sibling temporary file, then
+/// renamed into place, so a crash or a full disk never leaves the engram cut
+/// short. Right before the rename the file is read again, and if it no longer
+/// holds `source` (an agent or a person wrote it meanwhile) the fix is
+/// dropped and the newer text stays. The error is the note the report shows.
+fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
+    let mut name = file
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".doctor-fix.{}", std::process::id()));
+    let tmp = file.with_file_name(name);
+    let written = std::fs::write(&tmp, text).and_then(|()| {
+        let permissions = std::fs::metadata(file)?.permissions();
+        std::fs::set_permissions(&tmp, permissions)
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Writing the file failed: {e}"));
+    }
+    if std::fs::read_to_string(file).ok().as_deref() != Some(source) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CHANGED_NOTE.to_string());
+    }
+    std::fs::rename(&tmp, file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Writing the file failed: {e}")
+    })
+}
+
 /// What `--fix` would write for a file with repeated keys, or why it leaves
 /// the file. A reviewing domain's folder only moves through a merge, so there
 /// the fix only counts when it restores the base snapshot byte for byte.
@@ -1882,9 +1927,10 @@ fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Resu
         Collapse::ValuesDiffer(_) => Err(
             "Another key in this file has different values, so --fix leaves the file".to_string(),
         ),
-        Collapse::Unchanged | Collapse::NotRepairable => {
-            Err("It does not parse without the extra copies either".to_string())
-        }
+        Collapse::Unchanged | Collapse::NotRepairable => Err(
+            "The file still does not parse without the extra copies, so --fix leaves it"
+                .to_string(),
+        ),
     }
 }
 
@@ -2833,20 +2879,30 @@ pub fn render_human(report: &DoctorReport) -> String {
             // "rerun with --fix" only when --fix would repair the whole file;
             // otherwise every key is named for a person to fix by hand.
             let mixed = f.keys.iter().any(|k| !k.same_value);
-            for k in &f.keys {
+            for (i, k) in f.keys.iter().enumerate() {
                 let lines = crystalline_core::frontmatter::line_list(&k.lines);
+                let many = k.lines.len() > 2;
                 let _ = if f.fixed {
-                    writeln!(out, "  fixed {}: kept one `{}` line", f.path, k.key)
+                    // The file parses now but is not in the index yet; the
+                    // hint goes on the file's last line only.
+                    let hint = if i + 1 == f.keys.len() {
+                        format!(", run `crystalline sync --domain {}` to index it", d.name)
+                    } else {
+                        String::new()
+                    };
+                    writeln!(out, "  fixed {}: kept one `{}` line{hint}", f.path, k.key)
                 } else if !k.same_value {
+                    let rest = if many { "others" } else { "other" };
                     writeln!(
                         out,
-                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with different values (verify rule E010): keep the right one and delete the other",
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with different values (verify rule E010): keep the right one and delete the {rest}",
                         f.path, k.key
                     )
                 } else if mixed {
+                    let which = if many { "all but one" } else { "one" };
                     writeln!(
                         out,
-                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010): delete one of the lines",
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010): delete {which} of the lines",
                         f.path, k.key
                     )
                 } else if let Some(note) = &f.not_fixed {
@@ -4392,5 +4448,37 @@ mod tests {
         let out = render_human(&drafted_only);
         assert!(!out.contains("could not be written"), "{out}");
         assert!(!out.contains("[problem]"), "{out}");
+    }
+
+    /// The fix lands through a sibling file and a rename, so the engram is
+    /// never cut short, and it leaves no temporary file behind.
+    #[test]
+    fn write_fix_replaces_the_file_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old").unwrap();
+        write_fix(&file, "old", "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("dup.md")]);
+    }
+
+    /// A write that lands between doctor's read and its rename wins: the fix
+    /// is skipped with a reason and the newer text stays.
+    #[test]
+    fn write_fix_skips_a_file_that_changed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "changed by someone else").unwrap();
+        let err = write_fix(&file, "what doctor read", "collapsed").unwrap_err();
+        assert_eq!(err, CHANGED_NOTE);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "changed by someone else"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
