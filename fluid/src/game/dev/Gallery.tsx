@@ -56,6 +56,15 @@
  * missing or unknown name falls back to `entry`. `?at=` and `?fault=` are
  * not meant with `?hall=console`: the console room carries no fixture and
  * no prop or curio `?at=` could frame.
+ *
+ * `?hall=lifts` (M3 C7, C24, C28) shows `liftsHallRoom()` instead, for
+ * judging the station's lift, wall screen and exit: the lift on the
+ * entrance edge behind the spawn, listing fourteen domains with a key, the
+ * current stop's mark, the overflow line and a note on its panel; the
+ * screen across the hall with the key on its heading; the exit two cells
+ * east of the lift. `?at=lift:0`, `?at=screen:0` and `?at=exit:0` put the
+ * player in front of each. The lift and the exit lead nowhere in the
+ * gallery.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -67,7 +76,12 @@ import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
-import { galleryRoom, heroHallRoom, variantsHallRoom } from "../world/canned";
+import {
+  galleryRoom,
+  heroHallRoom,
+  liftsHallRoom,
+  variantsHallRoom,
+} from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
 import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
 import { spotView } from "./spots";
@@ -103,7 +117,9 @@ export default function Gallery() {
           ? heroHallRoom()
           : hall === "variants"
             ? variantsHallRoom()
-            : galleryRoom();
+            : hall === "lifts"
+              ? liftsHallRoom()
+              : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"

@@ -7,9 +7,10 @@
  * swirl, grime, pictograms, the ribbed and plated wall patterns and the
  * decal atlas, 2.7 C11 and C12), followed by the room's text. A terminal
  * screen, a poster and the placard each get a whole layer; the one-line
- * labels of doors, portals, hatches and machine tags are packed six to a
- * layer, one label per row, so a hub with forty tags and twenty doors does
- * not ask the GPU for sixty layers. `layerPlan` is the one place that
+ * labels of doors, portals, hatches, machine tags and exits are packed six
+ * to a layer, one label per row, so a hub with forty tags and twenty doors
+ * does not ask the GPU for sixty layers. A lift's call panel and a
+ * station screen each get a whole layer too (M3 C7, C24). `layerPlan` is the one place that
  * decides where each piece of text goes: the geometry asks it for a key's
  * layer and v range, and the text renderer draws each request into the row
  * the plan gave it, so a label always lands on the quad it was drawn for.
@@ -20,7 +21,8 @@
  * same squeeze is applied per row. `ASPECT` is that shared fact.
  */
 
-import type { RoomSpec } from "../world/types";
+import { LIFT_LINES, moreLine } from "../world/lifts";
+import type { Fixture, RoomSpec } from "../world/types";
 
 /**
  * The procedural layers, made once at start and shared by every room. Their
@@ -80,7 +82,9 @@ export const ROW_INSET = 0.5;
  * its lines vertically by this factor (inside the square layer, or inside
  * its row for a label) and the quad of that aspect squeezes them back, so
  * letters keep their shape. A hatch label is a label; a poster is shaped
- * like the placard.
+ * like the placard. A `panel` is a lift's call panel screen (M3 C7),
+ * taller than wide: its quad in `models/lift.ts` takes its height from
+ * this aspect and its width, so the two cannot drift apart.
  */
 export const ASPECT = {
   screen: 1.25,
@@ -88,19 +92,29 @@ export const ASPECT = {
   hatch: 6,
   placard: 1.4,
   poster: 1.4,
+  panel: 0.8,
 } as const;
 
 /** The kinds of text, which set a request's aspect and its drawing style. */
 export type TextKind = keyof typeof ASPECT;
 
 /**
+ * The key mark (M3 C20, C24): a line of a text request that starts with it
+ * is drawn with the key pictogram in front (a private domain), the mark
+ * itself never drawn. Only a line's first character counts, so a lift's
+ * current stop that is private reads `KEY_MARK + "> " + label`: the mark
+ * first, then the current stop's `> `.
+ */
+export const KEY_MARK = "\u0001";
+
+/**
  * One piece of text to draw: a stable key naming the quad it belongs to
  * (`placard`, `terminal:<i>`, `door:<i>`, `portal:<i>`, `hatch:<i>`,
- * `tag:<i>`, `poster:<i>` with `i` the fixture's index in
- * `room.fixtures`), the kind of quad, which sets its aspect and style, the
- * lines to draw, and for a label (`label` or `hatch`) its row within its
- * layer; a whole-layer request (`screen`, `placard`, `poster`) has `row`
- * null.
+ * `tag:<i>`, `poster:<i>`, `lift:<i>`, `screen:<i>`, `exit:<i>` with `i`
+ * the fixture's index in `room.fixtures`), the kind of quad, which sets
+ * its aspect and style, the lines to draw, and for a label (`label` or
+ * `hatch`) its row within its layer; a whole-layer request (`screen`,
+ * `placard`, `poster`, `panel`) has `row` null.
  */
 export interface TextRequest {
   key: string;
@@ -135,11 +149,13 @@ function isLabel(kind: TextKind): boolean {
  * The text a room needs, in plan order: the placard first, then the
  * fixtures in `room.fixtures` order - a terminal gives a screen with its
  * heading on the first line, a poster a placard-shaped sheet with its
- * category on the first line, a door, a portal and a machine a one-line
- * label (a sealed door or portal says why it is sealed instead), and a
- * hatch a one-line hatch label. Labels and hatch labels are numbered in
- * this order, the `n`th taking row `n % LABEL_ROWS`; whole-layer requests
- * have no row.
+ * category on the first line, a door, a portal, a machine and an exit a
+ * one-line label (a sealed door or portal says why it is sealed instead),
+ * and a hatch a one-line hatch label. A lift gives a `panel` (`liftLines`)
+ * and a station screen a `screen` of its lines, the key mark in front of
+ * each line `keys` names. Labels and hatch labels are numbered in this
+ * order, the `n`th taking row `n % LABEL_ROWS`; whole-layer requests have
+ * no row.
  */
 export function textRequests(room: RoomSpec): TextRequest[] {
   const out: Omit<TextRequest, "row">[] = [];
@@ -183,6 +199,19 @@ export function textRequests(room: RoomSpec): TextRequest[] {
       case "machine":
         out.push({ key: `tag:${i}`, kind: "label", lines: [f.tag] });
         break;
+      case "lift":
+        out.push({ key: `lift:${i}`, kind: "panel", lines: liftLines(f) });
+        break;
+      case "screen":
+        out.push({
+          key: `screen:${i}`,
+          kind: "screen",
+          lines: f.lines.map((l, n) => (f.keys.includes(n) ? KEY_MARK + l : l)),
+        });
+        break;
+      case "exit":
+        out.push({ key: `exit:${i}`, kind: "label", lines: [f.label] });
+        break;
       case "placard":
         break;
     }
@@ -192,6 +221,22 @@ export function textRequests(room: RoomSpec): TextRequest[] {
     ...r,
     row: isLabel(r.kind) ? labels++ % LABEL_ROWS : null,
   }));
+}
+
+/**
+ * A lift's call panel, line by line (M3 C7): its first `LIFT_LINES` stops'
+ * labels, a private stop's starting with `KEY_MARK` and the current stop's
+ * with `> ` after the mark; then `moreLine` for the stops left out, only
+ * when some are; then the lift's `note` when it has one.
+ */
+function liftLines(lift: Extract<Fixture, { kind: "lift" }>): string[] {
+  const lines = lift.stops
+    .slice(0, LIFT_LINES)
+    .map((s) => `${s.key ? KEY_MARK : ""}${s.here ? "> " : ""}${s.label}`);
+  if (lift.stops.length > LIFT_LINES)
+    lines.push(moreLine(lift.stops.length - LIFT_LINES));
+  if (lift.note !== null) lines.push(lift.note);
+  return lines;
 }
 
 /**

@@ -37,7 +37,7 @@ import {
   frameForSlot,
   type Frame,
 } from "./kit";
-import { LAYER, TEXT_BASE } from "./layers";
+import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS } from "./looks";
 import {
   add,
@@ -78,6 +78,9 @@ import {
   type Mover,
 } from "./models";
 import { CASE_GLASS } from "./models/machines";
+import { LIFT_OPENING, LIFT_POCKET } from "./models/lift";
+import { LIFT_WORDS } from "../world/lifts";
+import { liftsHallRoom } from "../world/canned";
 
 /**
  * Every kit made while a model builds, the models' own mover kits
@@ -150,6 +153,8 @@ function context(ceiling = CEILING): { ctx: ModelContext; keys: string[] } {
         if (
           key.startsWith("terminal") ||
           key.startsWith("poster") ||
+          key.startsWith("lift") ||
+          key.startsWith("screen") ||
           key === "placard"
         )
           return { layer: 11, v0: 0, v1: 1 };
@@ -244,8 +249,41 @@ function fixtures(slot: WallSlot): [string, Fixture][] {
     { kind: "poster", slot, category: "C", lines: [], seed: 6 },
   ]);
   out.push(["placard", { kind: "placard", slot, lines: [] }]);
+  out.push([
+    "lift",
+    {
+      kind: "lift",
+      slot,
+      stops: Array.from({ length: 14 }, (_, i) => ({
+        label: `S${String(i)}`,
+        to: { kind: "airlock" as const },
+        key: i === 0,
+        here: i === 0,
+      })),
+      note: LIFT_WORDS.deckError,
+      seed: 8,
+    },
+  ]);
+  out.push([
+    "screen",
+    { kind: "screen", slot, lines: ["A", "B"], keys: [0], seed: 9 },
+  ]);
+  out.push([
+    "exit",
+    {
+      kind: "exit",
+      slot,
+      label: "DECK 1",
+      to: { kind: "airlock" },
+      seed: 10,
+    },
+  ]);
   return out;
 }
+
+/** The door style a way is drawn in: an exit is a sliding door (M3 C28). */
+const styleOf = (fx: Extract<Fixture, { kind: "door" | "exit" }>): DoorStyle =>
+  fx.kind === "door" ? fx.style : "sliding";
 
 /** The one text key each kind of fixture draws. */
 const KEY_OF: Record<Fixture["kind"], string> = {
@@ -520,7 +558,21 @@ describe("fixture models", () => {
           const of = (part: Mover["part"]) =>
             movers.filter((m) => m.part === part);
           switch (fx.kind) {
-            case "door": {
+            case "lift": {
+              // Two leaves under the door key, which the lift's door
+              // state drives (M3 C27), and no lamp or sparks.
+              expect(movers).toHaveLength(2);
+              for (const m of movers) {
+                expect(m.key).toBe(`door:${INDEX}`);
+                expect(m.part).toBe("leaf");
+                expect(m.pivot).toBeNull();
+                expect(m.rest).toBe(1);
+                expect(dot(m.axis, wall.along)).toBeCloseTo(1, 9);
+              }
+              break;
+            }
+            case "door":
+            case "exit": {
               const leaves = of("leaf");
               expect(leaves).toHaveLength(2);
               for (const m of leaves) {
@@ -529,7 +581,7 @@ describe("fixture models", () => {
                 expect(m.rest).toBe(1);
               }
               const axes = leaves.map((m) => m.axis);
-              switch (fx.style) {
+              switch (styleOf(fx)) {
                 case "sliding":
                   expect(leaves.map((m) => m.travel)).toEqual([
                     SLIDE_TRAVEL,
@@ -597,7 +649,8 @@ describe("fixture models", () => {
           }
         });
 
-        if (fx.kind === "door") {
+        if (fx.kind === "door" || fx.kind === "exit") {
+          const style = styleOf(fx);
           for (const ceiling of [CEILING, HIGH_CEILING]) {
             // The leaves only: the lamp and the sparks never move. The
             // envelope is convex and a leaf travels in a straight line, so
@@ -627,12 +680,12 @@ describe("fixture models", () => {
                     expect(p[1]).toBeGreaterThanOrEqual(-EPS);
                   const [a, d, h] = toLocal(wall, p);
                   // Behind the housing front, and never over the label.
-                  if (fx.style !== "sliding")
+                  if (style !== "sliding")
                     expect(d).toBeLessThan(HOUSING_DEPTH);
                   if (a > la0 && a < la1 && h > lh0 && h < lh1)
                     expect(d).toBeLessThan(labelD);
                   // Nothing is left standing in the opening.
-                  const o = OPENING[fx.style];
+                  const o = OPENING[style];
                   expect(
                     Math.abs(a) < o.half - EPS &&
                       h > o.h0 + EPS &&
@@ -686,7 +739,40 @@ describe("fixture models", () => {
           });
         }
 
-        if (fx.kind === "door") {
+        if (fx.kind === "lift") {
+          it("slides its two doors into the pier beside them, clear of the opening (M3 C27)", () => {
+            // Mutation caught: a leaf that stays in the doorway at open 1,
+            // one that parks outside the wall band or the pier (seen on
+            // the bare wall past the frame), or in front of the pier's face.
+            const leaves = opened(built);
+            expect(leaves).toHaveLength(2);
+            const closed = built.moverParts.flat().flatMap((p) => p.points);
+            const closedA = closed.map((q) => toLocal(wall, q)[0]);
+            // Shut, the two leaves span the whole opening.
+            expect(Math.min(...closedA)).toBeLessThanOrEqual(LIFT_OPENING.a0);
+            expect(Math.max(...closedA)).toBeGreaterThanOrEqual(
+              LIFT_OPENING.a1,
+            );
+            for (const { points } of leaves) {
+              expect(points.length).toBeGreaterThan(0);
+              for (const p of points) {
+                expect(inBox(band, p)).toBe(true);
+                const [a, d, h] = toLocal(wall, p);
+                expect(a).toBeGreaterThanOrEqual(LIFT_POCKET.a0 - EPS);
+                expect(a).toBeLessThanOrEqual(LIFT_POCKET.a1 + EPS);
+                expect(d).toBeLessThan(LIFT_POCKET.front);
+                expect(
+                  a > LIFT_OPENING.a0 + EPS &&
+                    a < LIFT_OPENING.a1 - EPS &&
+                    h > LIFT_OPENING.h0 + EPS &&
+                    h < LIFT_OPENING.h1 - EPS,
+                ).toBe(false);
+              }
+            }
+          });
+        }
+
+        if (fx.kind === "door" || fx.kind === "exit") {
           it("draws its lamp lens as a signal light, off the room's light (H12)", () => {
             const lens = partsOf(built, "lamp");
             expect(lens.length).toBeGreaterThan(0);
@@ -787,6 +873,34 @@ describe("fixture models", () => {
       });
     }
   }
+});
+
+describe("the exit's label (M3 C28)", () => {
+  it("reads the exit's own text key from the room's plan, never the door's", () => {
+    // Mutation caught: the exit's label drawn under `door:<i>`, which the
+    // room's plan has no text for, so the lookup throws.
+    const room = liftsHallRoom();
+    const index = room.fixtures.findIndex((f) => f.kind === "exit");
+    const exit = room.fixtures[index];
+    if (exit === undefined) throw new Error("no exit");
+    const plan = layerPlan(room);
+    const asked: string[] = [];
+    const builder = createBuilder();
+    const movers = buildFixture((f) => createKit(builder, f), exit, index, {
+      look: LOOKS.aperture,
+      ceiling: room.ceiling,
+      hall: room.hall,
+      textLayer: (key) => {
+        asked.push(key);
+        return plan.lookup(key);
+      },
+    });
+    expect(asked).toEqual([`exit:${String(index)}`]);
+    expect(movers.filter((m) => m.part === "leaf").map((m) => m.key)).toEqual([
+      `door:${String(index)}`,
+      `door:${String(index)}`,
+    ]);
+  });
 });
 
 describe("decor models", () => {

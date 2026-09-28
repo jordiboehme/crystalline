@@ -633,11 +633,17 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
       .flatMap(heroEdges)
       .map(edgeKey),
   ]);
-  // Wall slots that are ways through keep their wall clear of baseboards.
+  // Wall slots that are ways through (a lift and an exit among them, M3
+  // C28) keep their wall clear of baseboards.
   const openings = new Set(
     room.fixtures
       .filter(
-        (f) => f.kind === "door" || f.kind === "portal" || f.kind === "hatch",
+        (f) =>
+          f.kind === "door" ||
+          f.kind === "portal" ||
+          f.kind === "hatch" ||
+          f.kind === "lift" ||
+          f.kind === "exit",
       )
       .map((f) => `${f.slot.x},${f.slot.y},${f.slot.side}`),
   );

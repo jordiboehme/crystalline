@@ -38,9 +38,14 @@
  * The recess, lamp and spark tints (`RECESS`, `LAMP_TINT`, `SPARK_TINT`)
  * live in `./common`, since `hatch.ts` shares `RECESS` for its own recess
  * panel.
+ *
+ * The sliding recipe is shared (`slidingDoor`): an engram room's exit
+ * (M3 C28) is a sliding door whose label is drawn under its own text key,
+ * `exit:<i>`, while its movers keep the door keys, so the exit opens and
+ * blinks as a door does.
  */
 
-import type { DoorStyle, Fixture } from "../../world/types";
+import type { DoorStyle, Fixture, WallSlot } from "../../world/types";
 import { FLAG, createBuilder, type Surface, type V3 } from "../geometry";
 import {
   DECAL_LIFT,
@@ -173,7 +178,11 @@ function leaves(f: Frame, key: string, index: number): Leaves {
   };
 }
 
-/** What every door style gets. */
+/**
+ * What every door style gets. The leaves in `out` are keyed `door:<i>`;
+ * `textKey` is the key the label is drawn under (`door:<i>` for a door,
+ * `exit:<i>` for an exit).
+ */
 interface Style {
   k: Kit;
   f: Frame;
@@ -181,8 +190,35 @@ interface Style {
   s: Surfaces;
   ctx: ModelContext;
   sealed: boolean;
-  key: string;
+  textKey: string;
   index: number;
+}
+
+/**
+ * Builds a way of style `style` on `slot` and returns its movers: the
+ * leaves (`door:<index>`), then the lamp and the sparks, its label drawn
+ * under `textKey`.
+ */
+function buildStyled(
+  kitAt: KitAt,
+  slot: WallSlot,
+  style: DoorStyle,
+  index: number,
+  ctx: ModelContext,
+  sealed: boolean,
+  textKey: string,
+): Mover[] {
+  const f = frameForSlot(slot);
+  const k = kitAt(f);
+  const out = leaves(f, `door:${index}`, index);
+  const recipe = { sliding, bulkhead, blast }[style];
+  const s = surfaces(ctx.look);
+  const st = { k, f, out, s, ctx, sealed, textKey, index };
+  const [lampAt, sparkH] = recipe(st);
+  // Built after the leaves, so the movers come back in the order their
+  // kits were first used: leaves, lamp, sparks.
+  const lens = lamp(st, ...lampAt);
+  return [...out.movers, lens, sparks(st, sparkH)];
 }
 
 /** Builds a door against its wall slot and returns its movers. */
@@ -192,18 +228,33 @@ export function buildDoor(
   index: number,
   ctx: ModelContext,
 ): Mover[] {
-  const f = frameForSlot(fx.slot);
-  const k = kitAt(f);
-  const key = `door:${index}`;
   const sealed = fx.address === null;
-  const out = leaves(f, key, index);
-  const style = { sliding, bulkhead, blast }[fx.style];
-  const st = { k, f, out, s: surfaces(ctx.look), ctx, sealed, key, index };
-  const [lampAt, sparkH] = style(st);
-  // Built after the leaves, so the movers come back in the order their
-  // kits were first used: leaves, lamp, sparks.
-  const lens = lamp(st, ...lampAt);
-  return [...out.movers, lens, sparks(st, sparkH)];
+  return buildStyled(
+    kitAt,
+    fx.slot,
+    fx.style,
+    index,
+    ctx,
+    sealed,
+    `door:${index}`,
+  );
+}
+
+/**
+ * The sliding door's recipe on its own, open (never sealed), for a
+ * fixture that is drawn as a sliding door but is no door: its leaves,
+ * lamp and sparks keep the door keys (`door:<index>`, `lamp:<index>`,
+ * `spark:<index>`), and its label is drawn under `textKey` (an exit's
+ * `exit:<index>`, M3 C28), which the room's text plan holds for it.
+ */
+export function slidingDoor(
+  kitAt: KitAt,
+  slot: WallSlot,
+  index: number,
+  ctx: ModelContext,
+  textKey: string,
+): Mover[] {
+  return buildStyled(kitAt, slot, "sliding", index, ctx, false, textKey);
 }
 
 /**
@@ -317,7 +368,7 @@ function housing(
   top: number,
   body: Surface,
 ) {
-  const { k, ctx, key } = st;
+  const { k, ctx, textKey } = st;
   k.bevelBox(-half, half, 0, HOUSING_DEPTH, bottom, top, 0.03, body);
   const h0 = bottom + HOUSING_LABEL_MARGIN;
   const h1 = Math.min(
@@ -327,7 +378,7 @@ function housing(
   textPanel(
     k,
     ctx,
-    key,
+    textKey,
     -HOUSING_LABEL_HALF,
     HOUSING_LABEL_HALF,
     HOUSING_DEPTH,
@@ -370,7 +421,7 @@ const SLIDE_LABEL_D = 0.1;
  * over the lintel.
  */
 function sliding(st: Style): Parts {
-  const { k, f, out, s, ctx, sealed, key } = st;
+  const { k, f, out, s, ctx, sealed, textKey } = st;
   const p = ctx.look.palette;
   const seam: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
   const [w, j, t] = [SLIDE_HALF, SLIDE_JAMB, SLIDE_FRAME_D];
@@ -438,7 +489,7 @@ function sliding(st: Style): Parts {
   label(
     k,
     ctx,
-    key,
+    textKey,
     -SLIDE_LABEL_HALF,
     SLIDE_LABEL_HALF,
     SLIDE_LABEL_BOTTOM,
@@ -480,7 +531,7 @@ const BULK_LABEL_MARGIN = 0.05;
  * plain, so the label reads on it.
  */
 function bulkhead(st: Style): Parts {
-  const { k, f, out, s, ctx, sealed, key } = st;
+  const { k, f, out, s, ctx, sealed, textKey } = st;
   const p = ctx.look.palette;
   const frame: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
   const [w, j, t] = [BULK_HALF, BULK_JAMB, HOUSING_DEPTH];
@@ -494,7 +545,7 @@ function bulkhead(st: Style): Parts {
     h0 + (2 * BULK_LABEL_HALF) / ASPECT.label,
     BULK_LINTEL - BULK_LABEL_MARGIN,
   );
-  textPanel(k, ctx, key, -BULK_LABEL_HALF, BULK_LABEL_HALF, t, h0, h1, {
+  textPanel(k, ctx, textKey, -BULK_LABEL_HALF, BULK_LABEL_HALF, t, h0, h1, {
     tint: [1, 1, 1],
     flag: FLAG.emissive,
   });

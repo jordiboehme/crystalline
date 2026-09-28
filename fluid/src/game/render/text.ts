@@ -15,10 +15,18 @@
  * squeeze per row, as `layerPlan` in `layers.ts` lays them out. Terminals
  * use the look's terminal style: green phosphor on dark glass in the manner
  * of MU/TH/UR, or the C64's light blue on blue with upper-case characters.
+ *
+ * A line that starts with `KEY_MARK` (M3 C20, C24) is drawn with the key
+ * pictogram (`SIGNS.key`) in front of it, one glyph wide and as tall as the
+ * line, in the line's own colour; the mark itself is never drawn. A lift's
+ * call panel (`panel`) lists up to `LIFT_LINES` stops and two more lines
+ * in amber on black, with no heading.
  */
 
+import { LIFT_LINES } from "../world/lifts";
 import {
   ASPECT,
+  KEY_MARK,
   LAYER_SIZE,
   ROW_HEIGHT,
   type LayerPlan,
@@ -58,8 +66,15 @@ function pixels(ctx: CanvasRenderingContext2D, size: number): Uint8Array {
   return flipRows(ctx.getImageData(0, 0, size, size).data, size, size);
 }
 
-/** The colours of a kind of text in a look: its background and its ink. */
-function colours(kind: TextKind, look: Look): { background: Rgb; ink: Rgb } {
+/**
+ * The colours of a kind of text in a look: its background and its ink. A
+ * model that frames a text quad in glass of its own (the station screen)
+ * reads the background here, so the glass and the text layer agree.
+ */
+export function colours(
+  kind: TextKind,
+  look: Look,
+): { background: Rgb; ink: Rgb } {
   const petscii = look.terminal === "petscii";
   switch (kind) {
     case "screen":
@@ -79,7 +94,52 @@ function colours(kind: TextKind, look: Look): { background: Rgb; ink: Rgb } {
       return { background: [0.05, 0.05, 0.06], ink: [1, 0.78, 0.2] };
     case "label":
       return { background: [0.05, 0.05, 0.06], ink: [1, 1, 1] };
+    case "panel":
+      // A lift's call panel: amber stop names on black, like a lit floor
+      // indicator, the same in every look.
+      return { background: [0.03, 0.03, 0.035], ink: [1, 0.72, 0.28] };
   }
+}
+
+/** How many lines a whole-layer kind shows: the rows it is cut into. */
+const ROWS: Record<Exclude<TextKind, "label" | "hatch">, number> = {
+  screen: 9,
+  placard: 5,
+  poster: 5,
+  // Every stop the panel lists, the overflow line and the note.
+  panel: LIFT_LINES + 2,
+};
+
+/**
+ * Draws one line of a multi-line request at `(x, y)` in the logical space,
+ * its glyphs `px` tall, at most `width` wide, in `colour`. A line starting
+ * with `KEY_MARK` gets the key pictogram first, a `px` square in the same
+ * colour, and the rest of the line starts one glyph width in.
+ */
+function drawLine(
+  ctx: CanvasRenderingContext2D,
+  line: string,
+  x: number,
+  y: number,
+  px: number,
+  width: number,
+  colour: string,
+) {
+  ctx.fillStyle = colour;
+  if (!line.startsWith(KEY_MARK)) {
+    ctx.fillText(line, x, y, width);
+    return;
+  }
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(px / 16, px / 16);
+  ctx.strokeStyle = colour;
+  ctx.fillStyle = colour;
+  ctx.lineWidth = 1;
+  SIGNS.key(ctx);
+  ctx.restore();
+  ctx.fillStyle = colour;
+  ctx.fillText(line.slice(KEY_MARK.length), x + px, y, width - px);
 }
 
 /**
@@ -128,19 +188,35 @@ function drawRequest(
     ctx.textAlign = "center";
     ctx.fillText(text, size / 2, (logicalHeight - px) / 2);
   } else {
-    const rows = request.kind === "screen" ? 9 : 5;
+    const rows = ROWS[request.kind];
     const px = logicalHeight / (rows + 1);
+    const glyph = px * 0.85;
     lines.slice(0, rows).forEach((line, i) => {
-      const heading = i === 0;
-      ctx.font = `${heading ? "bold " : ""}${px * 0.85}px ui-monospace, Menlo, Consolas, monospace`;
+      const heading = i === 0 && request.kind !== "panel";
+      ctx.font = `${heading ? "bold " : ""}${glyph}px ui-monospace, Menlo, Consolas, monospace`;
       if (heading && request.kind === "screen") {
         // Headings in reverse video, as the CRT reader will draw them.
-        ctx.fillRect(px * 0.3, px * 0.4, size - px * 0.6, px);
-        ctx.fillStyle = css(background);
-        ctx.fillText(line, px * 0.5, px * 0.5, size - px);
         ctx.fillStyle = css(ink);
+        ctx.fillRect(px * 0.3, px * 0.4, size - px * 0.6, px);
+        drawLine(
+          ctx,
+          line,
+          px * 0.5,
+          px * 0.5,
+          glyph,
+          size - px,
+          css(background),
+        );
       } else {
-        ctx.fillText(line, px * 0.5, px * (0.5 + i * 1.05), size - px);
+        drawLine(
+          ctx,
+          line,
+          px * 0.5,
+          px * (0.5 + i * 1.05),
+          glyph,
+          size - px,
+          css(ink),
+        );
       }
     });
     if (request.kind === "screen") {
@@ -223,8 +299,9 @@ export interface PictogramRect {
  * The pictogram set, a 4 by 4 sheet of square tiles in the one pictogram
  * layer, so a square plate shows its sign undistorted: `service`, `portal`
  * and `door` keep their milestone 1 tiles across the top two rows, the six
- * sign-plate pictograms (`SIGN_PICTOGRAMS`) fill the row after them, and
- * seven tiles stay dark for later signs. This is the single source of the
+ * sign-plate pictograms (`SIGN_PICTOGRAMS`) fill the row after them, the
+ * `key` of a private domain (M3 C20, C24) sits beside `caution`, and six
+ * tiles stay dark for later signs. This is the single source of the
  * layout: `drawPictogramLayer` draws each sign into the tile named here, and
  * a model maps its plate to the same rectangle (`SERVICE_PICTOGRAM` in
  * `models/hatch.ts` is `PICTOGRAM.service`, a sign plate's is
@@ -240,14 +317,16 @@ export const PICTOGRAM = {
   voltage: { u0: 0.5, v0: 0.5, uw: 0.25, vh: 0.25 },
   air: { u0: 0.75, v0: 0.5, uw: 0.25, vh: 0.25 },
   caution: { u0: 0, v0: 0.25, uw: 0.25, vh: 0.25 },
+  key: { u0: 0.25, v0: 0.25, uw: 0.25, vh: 0.25 },
 } as const satisfies Record<string, PictogramRect>;
 
 /**
  * The six generic signs a sign-plate prop may show, one per variant
  * (`PROP_CATALOGUE["sign-plate"].variants` in `world/props.ts`), in variant
  * order: variant `v` shows `PICTOGRAM[SIGN_PICTOGRAMS[v]]`. Every name here
- * is also a key of `PICTOGRAM`, apart from `service`, `portal` and `door`,
- * which stay reserved for the hatch and the milestone 1 signs.
+ * is also a key of `PICTOGRAM`, apart from `service`, `portal`, `door` and
+ * `key`, which stay reserved for the hatch, the milestone 1 signs and the
+ * private domains.
  */
 export const SIGN_PICTOGRAMS = [
   "exit",
@@ -381,6 +460,16 @@ const SIGNS: Record<
     ctx.beginPath();
     ctx.arc(8, 11.3, 0.9, 0, Math.PI * 2);
     ctx.fill();
+  },
+  // A key lying on its side: a ring bow, a shaft and two teeth.
+  key(ctx) {
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(5.4, 7, 3.2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillRect(8.4, 6, 5.8, 2);
+    ctx.fillRect(10.4, 8, 1.6, 3.4);
+    ctx.fillRect(12.6, 8, 1.6, 2.4);
   },
 };
 

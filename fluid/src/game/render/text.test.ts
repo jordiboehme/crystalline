@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { PROP_CATALOGUE } from "../world/props";
 import { LAYER_SIZE } from "./layers";
-import { flipRows, PICTOGRAM, SIGN_PICTOGRAMS } from "./text";
+import { LOOK_ORDER, LOOKS } from "./looks";
+import { colours, flipRows, PICTOGRAM, SIGN_PICTOGRAMS } from "./text";
 
 describe("flipRows", () => {
   it("turns the image upside down so row 0 is the bottom, as GL expects", () => {
@@ -53,6 +54,27 @@ describe("PICTOGRAM", () => {
           b.v0 + b.vh <= a.v0;
         expect(apart, `${String(aKey)} vs ${String(bKey)}`).toBe(true);
       }
+    }
+  });
+});
+
+describe("the key pictogram (M3 C20, C24)", () => {
+  it("takes the free tile next to caution", () => {
+    // Mutation caught: the key tile missing, or moved onto another tile.
+    expect(PICTOGRAM.key).toEqual({ u0: 0.25, v0: 0.25, uw: 0.25, vh: 0.25 });
+  });
+});
+
+describe("colours", () => {
+  it("answers a lift panel's colours in every look, ink apart from background", () => {
+    // Mutation caught: the `panel` case missing from the switch, which has
+    // no default, so it answers undefined.
+    expect(LOOK_ORDER.length).toBeGreaterThan(0);
+    for (const id of LOOK_ORDER) {
+      const { background, ink } = colours("panel", LOOKS[id]);
+      expect(background).toHaveLength(3);
+      expect(ink).toHaveLength(3);
+      expect(ink).not.toEqual(background);
     }
   });
 });

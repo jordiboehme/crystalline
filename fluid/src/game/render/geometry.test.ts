@@ -5,6 +5,7 @@ import { BLINK_GROUPS } from "./blink";
 import {
   CANNED_BRIDGE,
   CANNED_HUB,
+  CANNED_WORKSHOP,
   galleryRoom,
   heroHallRoom,
 } from "../world/canned";
@@ -16,11 +17,18 @@ import { HERO_FOOTING } from "../world/footprints";
 import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
 import { edgeKey, edgeOf } from "../world/sites";
-import type { PlaceInput, RoomSpec, Side } from "../world/types";
+import type {
+  Fixture,
+  PlaceInput,
+  RoomSpec,
+  Side,
+  WallSlot,
+} from "../world/types";
 import { CELL } from "../world/units";
 import {
   ACCENT_MARK,
   ACCENT_STRIPE,
+  BASEBOARD,
   FLAG,
   UNDER_STRIPE,
   FLOATS_PER_VERTEX,
@@ -707,5 +715,83 @@ describe("the decals in the static mesh (2.7 C20, C21)", () => {
     expect(heroHallRoom().decals).toEqual([]);
     expect(count(heroHallRoom())).toBe(0);
     expect(count(consoleRoom())).toBe(0);
+  });
+});
+
+/**
+ * The cell edges a mesh draws a construction baseboard on: walked six
+ * vertices at a time, the vertical hazard-striped quads that span a whole
+ * cell edge from the floor up to `BASEBOARD`, just off a cell border, each
+ * read back to the key of its cell edge as `stripeQuads` reads a stripe.
+ */
+function baseboardEdges(m: MeshData): Set<string> {
+  const vs = all(m);
+  const out = new Set<string>();
+  for (let q = 0; q + 5 < vs.length; q += 6) {
+    const quad = vs.slice(q, q + 6);
+    const first = quad[0];
+    if (first === undefined) continue;
+    if (!quad.every((v) => v.layer === LAYER.hazard)) continue;
+    if (!quad.every((v) => Math.abs(v.normal[1]) < EPS)) continue;
+    const ys = quad.map((v) => v.pos[1]);
+    if (Math.abs(Math.min(...ys)) > EPS) continue;
+    if (Math.abs(Math.max(...ys) - BASEBOARD) > EPS) continue;
+    const [nx, , nz] = first.normal;
+    const [plane, run]: [0 | 2, 0 | 2] = Math.abs(nz) > 0.5 ? [2, 0] : [0, 2];
+    const at = first.pos[plane];
+    const lift = Math.abs(at - Math.round(at / CELL) * CELL);
+    const runs = quad.map((v) => v.pos[run]);
+    const span = Math.max(...runs) - Math.min(...runs);
+    if (lift > 0.05 || Math.abs(span - CELL) > EPS) continue;
+    const side: Side = nz > 0.5 ? "n" : nz < -0.5 ? "s" : nx > 0.5 ? "w" : "e";
+    const mid = (k: 0 | 2) =>
+      quad.reduce((sum, v) => sum + v.pos[k], 0) / quad.length;
+    out.add(
+      edgeKey({
+        x: Math.floor(mid(0) / CELL),
+        y: Math.floor(mid(2) / CELL),
+        side,
+      }),
+    );
+  }
+  return out;
+}
+
+describe("the construction baseboard (M3 C28)", () => {
+  it("draws no baseboard on a lift's or an exit's edge", () => {
+    // Mutation caught: the lift or the exit missing from `openings`, so a
+    // hazard baseboard runs across the foot of its doors.
+    const base = generateRoom(CANNED_WORKSHOP);
+    expect(base.condition).toBe("construction");
+    const boards = baseboardEdges(buildRoomMesh(base, LOOKS.aperture).static);
+    const entrance: WallSlot = { ...base.entrance, side: "s" };
+    const taken = new Set(base.fixtures.map((f) => edgeKey(f.slot)));
+    const free = wallRuns(base.grid)
+      .flat()
+      .find(
+        (e) =>
+          !taken.has(edgeKey(e)) &&
+          edgeKey(e) !== edgeKey(entrance) &&
+          boards.has(edgeKey(e)),
+      );
+    if (free === undefined) throw new Error("no free wall edge");
+    // Both edges carry a baseboard before the lift and the exit stand there.
+    expect(boards.has(edgeKey(entrance))).toBe(true);
+    expect(boards.has(edgeKey(free))).toBe(true);
+    const fitted: Fixture[] = [
+      { kind: "lift", slot: entrance, stops: [], note: null, seed: 1 },
+      {
+        kind: "exit",
+        slot: free,
+        label: "DECK 1",
+        to: { kind: "airlock" },
+        seed: 2,
+      },
+    ];
+    const room: RoomSpec = { ...base, fixtures: [...base.fixtures, ...fitted] };
+    const after = baseboardEdges(buildRoomMesh(room, LOOKS.aperture).static);
+    expect(after.size).toBeGreaterThan(0);
+    expect(after.has(edgeKey(entrance))).toBe(false);
+    expect(after.has(edgeKey(free))).toBe(false);
   });
 });

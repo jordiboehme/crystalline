@@ -41,10 +41,15 @@
  * length against the surface's `d` axis, and the rows are grouped to fit
  * that budget.
  *
- * The gallery and the hero hall take a plain finish (`plainFinish`: accent
- * 0, wall pattern 0 everywhere); the variants hall shows every wall
- * pattern (`variantsHallRoom`). The gallery and the hero hall carry no
- * decals (`decals: []`); the variants hall carries one of every decal kind
+ * `liftsHallRoom` (M3) is the gallery's room for the station's lift, wall
+ * screen and exit, for the `?hall=lifts` dev route: one of each in a
+ * plain nine by six hall, the lift on the entrance edge. With the gallery
+ * room it carries every fixture kind.
+ *
+ * The gallery, the hero hall and the lifts hall take a plain finish
+ * (`plainFinish`: accent 0, wall pattern 0 everywhere); the variants hall
+ * shows every wall pattern (`variantsHallRoom`). The gallery, the hero
+ * hall and the lifts hall carry no decals (`decals: []`); the variants hall carries one of every decal kind
  * and tile on its south wall and its floor, and both stencils
  * (`variantsHallDecals`).
  */
@@ -74,6 +79,7 @@ import {
   type Layout,
   type SlotPref,
 } from "./layout";
+import { LIFT_WORDS, airlockStops, deckLabel } from "./lifts";
 import { PROP_CATALOGUE, PROP_KINDS, USE_LANE_DEPTH } from "./props";
 import { wallAnchor } from "./sites";
 import type {
@@ -1191,6 +1197,132 @@ export function heroHallRoom(): RoomSpec {
     inboundMore: 0,
   };
   return { ...base, curios: heroHallCurios(seed, base) };
+}
+
+/**
+ * The floor plan of the lifts hall: a plain hall nine cells wide and six
+ * deep, no bays, its entrance on column 4.
+ */
+const LIFTS_HALL_NEED = {
+  north: 3,
+  west: 2,
+  east: 2,
+  south: 3,
+  any: 0,
+  hatches: 0,
+};
+
+/**
+ * The domains the lifts hall's lift lists, as the airlock's lift would
+ * (`airlockStops`): fourteen, so its panel shows ten, the overflow line
+ * and a note, with three private ones, one of them first in the order
+ * and the stop the lift stands at.
+ */
+const LIFTS_HALL_DOMAINS: readonly { name: string; private: boolean }[] = [
+  "atlas",
+  "beacon",
+  "cobalt",
+  "delta",
+  "ember",
+  "fjord",
+  "garnet",
+  "harbor",
+  "iris",
+  "juniper",
+  "kestrel",
+  "lumen",
+  "meridian",
+  "nova",
+].map((name) => ({
+  name,
+  private: name === "atlas" || name === "delta" || name === "kestrel",
+}));
+
+/**
+ * The lifts hall (M3 C7, C24, C28): the gallery's room for the station's
+ * three fixture kinds, for the dev-only route `/π/dev/gallery?hall=lifts`,
+ * built by hand in a plain nine by six hall (`LIFTS_HALL_NEED`).
+ *
+ * - The **lift** stands on the entrance edge, where every lift of the
+ *   station stands, listing fourteen domains as the airlock's lift would
+ *   (`LIFTS_HALL_DOMAINS`), `atlas` private and current, with the note
+ *   `?DECK LIST ERROR`: its panel shows every kind of line it can show,
+ *   the key and the `> ` mark on one stop, the key alone on another, the
+ *   overflow line and the note.
+ * - The **screen** faces it across the hall on the north wall's centre
+ *   edge, reading a private domain's name (the key on its heading) and
+ *   its count, as a bridge's screen reads.
+ * - The **exit** stands on the south wall two cells east of the lift,
+ *   labelled as the root deck, so it is judged from inside the room as an
+ *   engram room's exit is seen.
+ * - The placard beside the entrance names the hall. One steady light zone
+ *   per four by four block, as the hero hall's; a plain finish, no
+ *   decals, no props, heroes or curios.
+ *
+ * Every fixture stands on a wall edge of its own. The same call gives the
+ * same room byte for byte.
+ */
+export function liftsHallRoom(): RoomSpec {
+  const seed = seedFor(GAME_VERSION, "lifts-hall");
+  const layout = planLayout(LIFTS_HALL_NEED);
+  const entrance = layout.entrance;
+  const fixtures: Fixture[] = [
+    {
+      kind: "placard",
+      slot: layout.placard,
+      lines: ["Lifts Hall", "A LIFT A SCREEN", "AND AN EXIT"],
+    },
+    {
+      kind: "lift",
+      slot: entrance,
+      stops: airlockStops(LIFTS_HALL_DOMAINS, "atlas"),
+      note: LIFT_WORDS.deckError,
+      seed: seedFor(seed, "lift"),
+    },
+    {
+      kind: "screen",
+      slot: { x: entrance.x, y: layout.hall.y0, side: "n" },
+      lines: ["atlas", `42 ${LIFT_WORDS.engrams}`],
+      keys: [0],
+      seed: seedFor(seed, "screen"),
+    },
+    {
+      kind: "exit",
+      slot: { x: entrance.x + 2, y: entrance.y, side: "s" },
+      label: deckLabel("station", ""),
+      to: { kind: "deck", domain: "station", folder: "", section: null },
+      seed: seedFor(seed, "exit"),
+    },
+  ];
+  return {
+    version: GAME_VERSION,
+    seed,
+    domain: "station",
+    permalink: "lifts-hall",
+    title: "Lifts Hall",
+    archetype: "engineering",
+    condition: "clean",
+    width: layout.width,
+    depth: layout.depth,
+    grid: layout.grid,
+    hall: layout.hall,
+    bays: layout.bays,
+    corridor: layout.corridor,
+    entrance: { x: entrance.x, y: entrance.y },
+    ceiling: 4,
+    spawn: { x: entrance.x, y: entrance.y, yaw: 0 },
+    fixtures,
+    decor: [],
+    scaffold: [],
+    heroes: [],
+    props: [],
+    curios: [],
+    finish: plainFinish(layout.bays.length),
+    decals: [],
+    lights: heroHallLights(seed, layout),
+    dropped: 0,
+    inboundMore: 0,
+  };
 }
 
 /**

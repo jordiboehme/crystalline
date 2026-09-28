@@ -51,6 +51,7 @@ import {
   GALLERY_HALL_PROPS,
   galleryRoom,
   heroHallRoom,
+  liftsHallRoom,
   row,
   VARIANTS_HALL_COUNCIL,
   VARIANTS_HALL_DECOR,
@@ -460,6 +461,44 @@ function hostOf(room: RoomSpec, c: RoomSpec["curios"][number]) {
       box.z1 <= s.box.z1 + 1e-6,
   );
 }
+
+describe("liftsHallRoom (M3 C7, C24, C28)", () => {
+  const room = liftsHallRoom();
+
+  it("holds one lift, one screen with a key line and one exit, each on a wall edge of its own", () => {
+    // Mutation caught: a kind dropped from the hall or doubled, two
+    // fixtures on one edge, a fixture off the wall, the screen's key line
+    // lost, the lift off the entrance edge.
+    const count = (kind: Fixture["kind"]) =>
+      room.fixtures.filter((f) => f.kind === kind).length;
+    expect(STATION_KINDS.length).toBe(3);
+    for (const kind of STATION_KINDS) expect(count(kind), kind).toBe(1);
+    const walls = new Set(wallRuns(room.grid).flat().map(edgeKey));
+    const edges = room.fixtures.map((f) => edgeKey(f.slot));
+    for (const e of edges) expect(walls.has(e), e).toBe(true);
+    expect(new Set(edges).size).toBe(edges.length);
+    const screen = room.fixtures.find((f) => f.kind === "screen");
+    if (screen?.kind !== "screen") throw new Error("no screen");
+    expect(screen.keys.length).toBeGreaterThan(0);
+    for (const k of screen.keys) expect(screen.lines[k]).toBeDefined();
+    const lift = room.fixtures.find((f) => f.kind === "lift");
+    expect(lift?.slot).toEqual({ ...room.entrance, side: "s" });
+  });
+
+  it("carries, with the gallery, every fixture kind", () => {
+    // Mutation caught: a kind dropped from the hall (or from the gallery).
+    const kinds = new Set(
+      [...galleryRoom().fixtures, ...room.fixtures].map((f) => f.kind),
+    );
+    expect(FIXTURE_KINDS.length).toBe(10);
+    expect([...kinds].sort()).toEqual([...FIXTURE_KINDS].sort());
+  });
+
+  it("is the same room on every call", () => {
+    // Mutation caught: a random or clock-driven pick in the hall.
+    expect(JSON.stringify(liftsHallRoom())).toBe(JSON.stringify(room));
+  });
+});
 
 describe("heroHallRoom", () => {
   const hall = heroHallRoom();
