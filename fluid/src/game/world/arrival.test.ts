@@ -652,8 +652,6 @@ describe("the arrival box (2.6e C14)", () => {
         expect(p2, layout.permalink).toBeGreaterThanOrEqual(N * 0.5);
       }
       for (const layout of wideLayouts) sweep(layout);
-
-      console.log("box-landing pass counts:\n" + report.join("\n"));
     }, 60_000);
 
     it("blocks every pass 1 and pass 2 spot on a narrow bridge, leaving only the lift's own column free in the deep band: pass 3 still lands the box there, exactly as the plain nearest-free rule always did (Review Focus)", () => {
