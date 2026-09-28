@@ -5081,9 +5081,11 @@ describe("sound cues (M4 Task 7)", () => {
     expect(cues).toEqual([{ kind: "terminal" }]);
   });
 
-  it("answers once per visit after the wait (M4 C25)", () => {
-    // Mutation caught: the timer not reset when the focus leaves, a cue
-    // per tick, the visit's answer not cleared on entry.
+  /**
+   * The canned bridge with its Scope terminal given the first seed that
+   * answers (M4 C25), the player spawned facing it, and its address.
+   */
+  const answeringBridge = () => {
     const built = generateRoom(CANNED_BRIDGE);
     const index = built.fixtures.findIndex(
       (f) => f.kind === "terminal" && f.heading === "Scope",
@@ -5103,15 +5105,25 @@ describe("sound cues (M4 Task 7)", () => {
       spawn: wallFacingSpawn(scope.slot),
     };
     const at = engramAt(CANNED_BRIDGE.domain, CANNED_BRIDGE.permalink);
+    return { room, at };
+  };
+
+  /** Cranks until `ms` have passed since `from`. */
+  const until = (from: number, ms: number) => {
+    while (now - from < ms) frames(1);
+  };
+
+  const facingScope = () =>
+    hud.prompt.mock.calls.at(-1)?.[0] === "SPACE READ Scope";
+
+  it("answers once per visit after the wait (M4 C25)", () => {
+    // Mutation caught: the timer not reset when the focus leaves, a cue
+    // per tick, the visit's answer not cleared on entry.
+    const { room, at } = answeringBridge();
     const { cues, sink } = recordSound();
     const session = start({ client: null, sound: sink });
     const answered = () => cues.filter((c) => c.kind === "answer");
-    /** Cranks until `ms` have passed since `from`. */
-    const until = (from: number, ms: number) => {
-      while (now - from < ms) frames(1);
-    };
-    const facing = () =>
-      hud.prompt.mock.calls.at(-1)?.[0] === "SPACE READ Scope";
+    const facing = facingScope;
 
     session.showRoom(room, { pitch: 0 }, at);
     frames(1);
@@ -5157,6 +5169,30 @@ describe("sound cues (M4 Task 7)", () => {
     expect(answered()).toHaveLength(2);
     until(t0, ANSWER_WAIT_MS * 3);
     expect(answered()).toHaveLength(2);
+  });
+
+  it("starts the answering console's wait over after a pause (M4 C25)", () => {
+    // Mutation caught: the time before the pause counted towards the wait
+    // (the console answering on the first tick after the resume).
+    const { room, at } = answeringBridge();
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    const answered = () => cues.filter((c) => c.kind === "answer");
+    session.showRoom(room, { pitch: 0 }, at);
+    frames(1);
+    expect(facingScope()).toBe(true);
+    until(now, 1000);
+    session.pause();
+    until(now, 3000);
+    session.resume();
+    frames(1);
+    expect(facingScope()).toBe(true);
+    const t0 = now;
+    expect(answered()).toEqual([]);
+    until(t0, ANSWER_WAIT_MS - 100);
+    expect(answered()).toEqual([]);
+    until(t0, ANSWER_WAIT_MS);
+    expect(answered()).toHaveLength(1);
   });
 
   it("sends the police box's take-off and landing, and the jump", async () => {

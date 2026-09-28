@@ -1597,6 +1597,9 @@ export function createSession(opts: SessionOptions): Session {
     input.clear();
     cheat?.reset();
     setPrompt(null);
+    // The tick returns before the focus while paused: the answering
+    // console's wait starts over after it (M4 C25).
+    answering = null;
     if (document.pointerLockElement !== null) {
       document.exitPointerLock?.();
     }
