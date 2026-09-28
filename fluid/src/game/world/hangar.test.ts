@@ -10,7 +10,8 @@ import { seedFor } from "../core/seed";
 import { CANNED_DECK, CANNED_HANGAR } from "./canned";
 import { curioBox } from "./curios";
 import { bayNumber, deckNumber } from "./decals";
-import { generateDeck } from "./deck";
+import { generateDeck, type DeckInput } from "./deck";
+import { SECTION_SIZE } from "./folders";
 import { footprint, heroFootprint, propFootprint } from "./footprints";
 import hangarGolden from "./golden/hangar.json?raw";
 import {
@@ -24,6 +25,7 @@ import {
 } from "./hangar";
 import hangarSource from "./hangar.ts?raw";
 import {
+  bayDoorApron,
   gantryBeams,
   gantryLegEdges,
   gantryLegs,
@@ -64,6 +66,31 @@ function padStencils(room: RoomSpec): Decal[] {
   );
 }
 
+/** The first `n` folders `bay<i>` of domain `station` that are hangars. */
+function hangarFolders(n: number): string[] {
+  const out: string[] = [];
+  for (let f = 0; out.length < n; f++)
+    if (isHangar("station", `bay${String(f)}`)) out.push(`bay${String(f)}`);
+  return out;
+}
+
+/** A hangar folder's level: `n` engrams directly in it, nothing else. */
+function hangarInput(folder: string, n: number): DeckInput {
+  return {
+    domain: "station",
+    folder,
+    rows: Array.from({ length: n }, (_, i) => ({
+      permalink: `${folder}/e${String(i).padStart(3, "0")}`,
+      title: `Entry ${String(i)}`,
+      type: "engram",
+      status: "stable",
+    })),
+    subfolders: [],
+    total: n,
+    truncated: false,
+  };
+}
+
 /** The hangar golden's room: `CANNED_HANGAR`, section 0. */
 function hangarRoom(): RoomSpec {
   return generateDeck(CANNED_HANGAR, 0);
@@ -89,9 +116,11 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     expect(domains.some((d) => seedFor("hangar", d, "") % 5 === 0)).toBe(true);
     for (const d of domains) expect(isHangar(d, ""), d).toBe(false);
 
-    expect(isHangar("station", "cargo/Flight Deck")).toBe(
-      isHangar("station", "cargo/Flight Deck"),
-    );
+    // Pinned answers, slug hashes measured once: `flight-deck` is 0 mod 5,
+    // `landing-bays` 4 and `ship-yard` 0.
+    expect(isHangar("station", "Flight Deck")).toBe(true);
+    expect(isHangar("station", "Landing Bays")).toBe(false);
+    expect(isHangar("station", "Ship Yard")).toBe(true);
     expect(isHangar(CANNED_DECK.domain, CANNED_DECK.folder)).toBe(false);
     expect(isHangar(CANNED_HANGAR.domain, CANNED_HANGAR.folder)).toBe(true);
     // The canned hangar's raw name is no hangar: only its slug is, so a
@@ -147,6 +176,12 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     // and the bay door's span leaves 28, however many rows ask.
     const free = hangarLayout({ rows: 40, seed: room.seed }).doorSlots;
     expect(free.length).toBe(28);
+    // Every engram of a full section finds a door slot: a section size past
+    // the free slots would drop doors silently (`generateDeck` skips a row
+    // with no slot).
+    expect(
+      hangarLayout({ rows: SECTION_SIZE, seed: room.seed }).doorSlots.length,
+    ).toBe(SECTION_SIZE);
     expect(hangarLayout({ rows: 24, seed: room.seed }).doorSlots).toEqual(
       free.slice(0, 24),
     );
@@ -196,27 +231,56 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     }
   });
 
-  it("keeps the pads clear", () => {
-    // Mutation caught: `sites.ts` not reading the pads, `placeDecals` not
-    // laying the pad stencils.
+  it("keeps the pads, the gantry legs and the bay door's apron clear", () => {
+    // Mutation caught: `sites.ts` not taking the pads, not taking the
+    // gantry legs, or not taking the bay door's apron (a crate or trolley
+    // against the bay door).
+    const rooms = [
+      hangarRoom(),
+      ...hangarFolders(8).flatMap((f) => [
+        generateDeck(hangarInput(f, 24), 0),
+        generateDeck(hangarInput(f, 7), 0),
+      ]),
+    ];
+    expect(rooms.length).toBe(17);
+    let props = 0;
+    let heroes = 0;
+    let curios = 0;
+    for (const room of rooms) {
+      const hangar = room.hangar;
+      if (hangar === undefined) throw new Error("no hangar");
+      const kept = [
+        ...hangar.pads.map(padBox),
+        ...gantryLegs(room),
+        bayDoorApron(hangar),
+      ];
+      expect(kept.length).toBe(7);
+      props += room.props.length;
+      heroes += room.heroes.length;
+      curios += room.curios.length;
+      for (const box of kept) {
+        const at = `${room.permalink} ${String(box.x0)},${String(box.z0)}`;
+        for (const p of room.props) {
+          const foot = propFootprint(p);
+          if (foot !== null)
+            expect(overlaps(foot, box), `${at} ${p.kind}`).toBe(false);
+        }
+        for (const h of room.heroes)
+          expect(overlaps(heroFootprint(h), box), `${at} ${h.kind}`).toBe(
+            false,
+          );
+        for (const c of room.curios)
+          expect(overlaps(curioBox(c), box), `${at} ${c.kind}`).toBe(false);
+      }
+    }
+    expect(props).toBeGreaterThan(0);
+    expect(heroes).toBeGreaterThan(0);
+    expect(curios).toBeGreaterThan(0);
+
     const room = hangarRoom();
     const hangar = room.hangar;
     if (hangar === undefined) throw new Error("no hangar");
     const pads = hangar.pads.map(padBox);
-    expect(pads.length).toBe(2);
-    expect(room.props.length).toBeGreaterThan(0);
-    expect(room.heroes.length).toBeGreaterThan(0);
-    expect(room.curios.length).toBeGreaterThan(0);
-    for (const pad of pads) {
-      for (const p of room.props) {
-        const box = propFootprint(p);
-        if (box !== null) expect(overlaps(box, pad), p.kind).toBe(false);
-      }
-      for (const h of room.heroes)
-        expect(overlaps(heroFootprint(h), pad), h.kind).toBe(false);
-      for (const c of room.curios)
-        expect(overlaps(curioBox(c), pad), c.kind).toBe(false);
-    }
 
     const stencils = padStencils(room);
     expect(stencils.map((d) => d.stencil)).toEqual([
@@ -285,25 +349,9 @@ describe("the hangar deck (M3 C13 to C18)", () => {
   it("hangs no ceiling span across or along a gantry", () => {
     // Mutation caught: the span lines not keeping off the gantries' beams
     // (a duct run through a truss or its catwalk).
-    const folders: string[] = [];
-    for (let f = 0; folders.length < 20; f++)
-      if (isHangar("station", `bay${String(f)}`))
-        folders.push(`bay${String(f)}`);
     const rooms = [
       hangarRoom(),
-      ...folders.map((folder) =>
-        generateDeck(
-          {
-            domain: "station",
-            folder,
-            rows: [],
-            subfolders: [],
-            total: 0,
-            truncated: false,
-          },
-          0,
-        ),
-      ),
+      ...hangarFolders(20).map((f) => generateDeck(hangarInput(f, 0), 0)),
     ];
     expect(rooms.length).toBe(21);
     let spans = 0;

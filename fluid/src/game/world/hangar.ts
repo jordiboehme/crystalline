@@ -21,11 +21,13 @@
  *   slots are `wallSlots` of the grid, west wall first, then east, south
  *   and north (each wall in `wallSlots`' own order), less the leg edges,
  *   the entrance edge and the bay door's span: 28 slots for at most 24
- *   doors. The zones are lit at `HANGAR_LIGHT`, steady (C19).
+ *   doors. `hangarLayout` returns no lights: `generateDeck` (`deck.ts`)
+ *   lights the zones as a deck's and sets every level to `HANGAR_LIGHT`,
+ *   steady (C19).
  * - **The dressing** (C16) is the ordinary pass: `dressingSites` takes the
- *   pads and the gantry legs as taken boxes and keeps the bay door's span
- *   and the leg edges free of anything hung on a wall, so the cargo
- *   gathers along the walls and between the pads.
+ *   pads, the gantry legs and the bay door's apron as taken boxes and keeps
+ *   the bay door's span and the leg edges free of anything hung on a wall,
+ *   so the cargo gathers along the other walls and between the pads.
  * - **The pad stencils** (C17) are laid by `placeDecals` itself, so every
  *   pass that re-runs the decals keeps them.
  * - **The pad hero seam** (C18): `withPadHeroes` stands a given list of

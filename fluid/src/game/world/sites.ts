@@ -48,9 +48,11 @@
  *     z over the column's floor rows, one cell wide on each side of it.
  * - **Taken.** `footprintOf` of every fixture, `decorFootprint` of every
  *   piece of decor, and every box of `room.scaffold`, with nulls dropped;
- *   in a hangar also every pad's box (`padBox`) and every gantry leg's
- *   (`gantryLegs`), M3 C16, so no hero, floor prop, curio or decal stands
- *   on a pad or in a leg. A room with no `hangar` key adds nothing.
+ *   in a hangar also every pad's box (`padBox`), every gantry leg's
+ *   (`gantryLegs`) and the bay door's apron (`bayDoorApron`), M3 C16, so
+ *   no hero, floor prop, curio or decal other than the pad stencils stands
+ *   on a pad, in a leg or against the bay door. A room with no `hangar`
+ *   key adds nothing.
  * - **Corner zones.** For the hall and then each bay rectangle `r`, in that
  *   order: the four 2x2 blocks at `(r.x0, r.y0)`, `(r.x1 - 2, r.y0)`,
  *   `(r.x0, r.y1 - 2)` and `(r.x1 - 2, r.y1 - 2)`, keyed `"x0,y0"` of the
@@ -88,11 +90,12 @@
  *   hangar, a gantry's beam (`gantryBeams`, M3 C15): the lab island's
  *   duct, the specimen tanks and the scaffold poles reach the ceiling, a
  *   span under a lamp would hide it, a pipe run hangs in the span band
- *   (E3), and a span would run through a gantry's truss or catwalk. A line is dropped whole, never cut short. Every span
- *   stays at least one full cell (2 m) off every hall wall, past the
- *   ceiling band along the walls (1.2 m) where the runs, loops, beacon and
- *   loose cables hang. Which palette hangs a span, and on which line, is
- *   the pass's choice; this module only lists the lines.
+ *   (E3), and a span would run through a gantry's truss or catwalk. A
+ *   line is dropped whole, never cut short. Every span stays at least one
+ *   full cell (2 m) off every hall wall, past the ceiling band along the
+ *   walls (1.2 m) where the runs, loops, beacon and loose cables hang.
+ *   Which palette hangs a span, and on which line, is the pass's choice;
+ *   this module only lists the lines.
  * - **Long walls** (ruling 11). When the hall's width is at least its
  *   depth, the hall's `n` edges (west to east) and its `s` edges (east to
  *   west); otherwise its `w` edges (south to north) and its `e` edges (north
@@ -118,9 +121,10 @@
  * ways lead to draw raw (`nearOf` in `neighbours.ts` fills them), and a
  * weighted list less those kinds as far as the list allows.
  *
- * This is the generator side: it imports `footprints.ts`, `hangarShape.ts`,
- * `lamps.ts`, `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
- * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
+ * This is the generator side: it imports `footprints.ts`,
+ * `hangarShape.ts`, `lamps.ts`, `layout.ts`, `props.ts`, `types.ts` and
+ * `units.ts`, and never `move.ts`, `generate.ts` or `interact.ts` (ruling
+ * 20). `sites.test.ts` keeps it so.
  */
 
 import {
@@ -129,7 +133,13 @@ import {
   footprintOf,
   pipeRunBox,
 } from "./footprints";
-import { gantryBeams, gantryLegEdges, gantryLegs, padBox } from "./hangarShape";
+import {
+  bayDoorApron,
+  gantryBeams,
+  gantryLegEdges,
+  gantryLegs,
+  padBox,
+} from "./hangarShape";
 import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
@@ -605,6 +615,7 @@ export function dressingSites(room: SiteBase): DressingSites {
   if (room.hangar !== undefined) {
     taken.push(...room.hangar.pads.map(padBox));
     taken.push(...gantryLegs(room));
+    taken.push(bayDoorApron(room.hangar));
   }
 
   const nextToDoorway = (x: number, y: number) =>
