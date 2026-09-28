@@ -52,6 +52,21 @@ function browser({ locks = true }: { locks?: boolean } = {}) {
   };
 }
 
+/** The module's own hub asks `/auth/me` itself: answer "ada". */
+function stubSignedIn(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ user: { name: "ada" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    ),
+  );
+}
+
 /** A lone tab, the shape most cases here need. */
 function lone(deps: HubDeps = {}): ChangeHub {
   return browser().tab(deps);
@@ -252,6 +267,8 @@ describe("the change stream in one tab", () => {
     const probe = vi.fn(signedIn);
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, lone({ sessionProbe: probe }));
+    // The account the stream was opened as is asked once, at the start.
+    probe.mockClear();
     act(() => {
       theSource().fail(0);
     });
@@ -269,12 +286,15 @@ describe("the change stream in one tab", () => {
     // The daemon is still down at the first probe and up at the second.
     const probe = vi
       .fn<SessionProbe>()
+      .mockImplementationOnce(signedIn)
       .mockRejectedValueOnce(new ApiProblem(502, "bad gateway", ""))
       .mockImplementation(signedIn);
     const hub = lone({ sessionProbe: probe });
     const unsubscribe = hub.subscribe((event) => seen.push(event.event));
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, hub);
+    // The first answer named the account the stream was opened as.
+    probe.mockClear();
     act(() => {
       theSource().fail(2);
     });
@@ -347,6 +367,8 @@ describe("the change stream in one tab", () => {
       .mockRejectedValue(new ApiProblem(401, "unauthorized", ""));
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, lone({ sessionProbe: probe }));
+    // Asked at the start: the stream's own refusal is what ends it.
+    probe.mockClear();
     act(() => {
       theSource().fail(2);
     });
@@ -608,6 +630,7 @@ describe("subscribeToChanges", () => {
   it("shares this tab's one source with the shell: every frame reaches a listener registered outside the provider (Jordi, 2026-09-27)", async () => {
     // The module's own hub, on the setup's fake Web Locks and channel.
     vi.stubGlobal("EventSource", FakeEventSource);
+    stubSignedIn();
     const { client } = recordingClient();
     const seen: string[] = [];
     const unsubscribe = subscribeToChanges((event) => seen.push(event.event));
@@ -783,7 +806,9 @@ describe("one stream per browser", () => {
     /** Two tabs of one browser whose cookie now belongs to `cookie`. */
     async function twoTabs(leaderShows: string, followerShows: string) {
       const fake = browser();
-      let cookie = "bob";
+      // The stream is opened as the leader's account; the cookie belongs
+      // to bob once both tabs are up.
+      let cookie = leaderShows;
       const probe: SessionProbe = () => Promise.resolve(me(cookie));
       const leader = recordingClient();
       const follower = recordingClient();
@@ -795,6 +820,7 @@ describe("one stream per browser", () => {
       const heard: string[] = [];
       const leave = followerHub.subscribe((event) => heard.push(event.event));
       const followerView = await mount(follower.client, <div />, followerHub);
+      cookie = "bob";
       return {
         fake,
         leader,
@@ -1049,10 +1075,14 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     // `subscribe`, so `ownIdentity()` stays undefined and another account's
     // frame gets through), or `recheck` never wired. Both arms of
     // `mismatch()` are pinned: the stale follower and the stale leader.
-    for (const cookie of ["ada", "bob"]) {
+    const cookies = ["ada", "bob"];
+    expect(cookies.length).toBeGreaterThan(0);
+    for (const cookie of cookies) {
       FakeEventSource.instances = [];
       const fake = browser();
-      const probe: SessionProbe = () => Promise.resolve(me(cookie));
+      // The stream is opened as ada; then the cookie is `cookie`'s.
+      let now = "ada";
+      const probe: SessionProbe = () => Promise.resolve(me(now));
       const shell = recordingClient();
       shell.client.setQueryData(ME_QUERY_KEY, me("ada"));
       await mount(shell.client, <div />, fake.tab({ sessionProbe: probe }));
@@ -1064,6 +1094,7 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
         { identity: { held: () => me("bob"), recheck } },
       );
       await settle();
+      now = cookie;
       expect(FakeEventSource.instances, `${cookie}: one stream`).toHaveLength(
         1,
       );
@@ -1096,10 +1127,10 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
   });
 
   it("lets a lone plain listener's leader stream as the probed account", async () => {
-    // Catches `lead()` probing only while `consumers.size === 0`: a
-    // carrier-only subscriber is a consumer without an identity, and the
-    // leader would stream as account null, which stops other tabs' shells
-    // from filtering (F12).
+    // Catches a leader whose tab holds no identity streaming as account
+    // null (its probe's answer not taken as the label): null frames pass
+    // every other tab's filter (F12). A carrier-only subscriber is a
+    // consumer without an identity, so it is checked as well.
     const subscribers: [string, StreamSubscription | undefined][] = [
       ["a plain listener", undefined],
       ["a carrier-only subscriber", { onCarrier: () => undefined }],
@@ -1147,8 +1178,10 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
   it("carries the carrier to every tab (Review Focus 4)", async () => {
     // Catches only the leader told, the state not deduplicated (two downs
     // for one drop), the first open reported as a change, or the message
-    // type not accepted by `readMessage`.
+    // type not accepted by `readMessage`, or a follower passing on a
+    // carrier it only heard (one message per change on the channel).
     const fake = browser();
+    const other = overhear(fake);
     const carriers: boolean[][] = [[], []];
     const leaves = carriers.map((seen) =>
       subscribeOn(fake.tab(), () => undefined, {
@@ -1183,7 +1216,14 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
       [false, true],
       [false, true],
     ]);
+    expect(
+      other.messages
+        .filter((message) => (message as { type?: unknown }).type === "carrier")
+        .map((message) => (message as { up?: unknown }).up),
+      "the leader alone says it",
+    ).toEqual([false, true]);
     for (const leave of leaves) leave();
+    other.close();
   });
 
   it("reports a closed source as down and its replacement's open as up", async () => {
@@ -1240,6 +1280,197 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     second();
     error.mockRestore();
   });
+
+  it("takes a carrier message only with a boolean up", async () => {
+    // Catches `readMessage` taking any `up` (a `0` read as down).
+    const fake = browser();
+    const carrier: boolean[] = [];
+    const leave = subscribeOn(fake.tab(), () => undefined, {
+      onCarrier: (up) => carrier.push(up),
+    });
+    await settle();
+    const other = new FakeBroadcastChannel(STREAM_NAME, fake.bus);
+    other.postMessage({ type: "carrier", up: 0 });
+    await settle();
+    expect(carrier, "not a boolean, not taken").toEqual([]);
+    other.postMessage({ type: "carrier", up: false });
+    await settle();
+    expect(carrier, "a boolean is").toEqual([false]);
+    leave();
+    other.close();
+  });
+
+  it("starts a hub that stopped with the carrier up again", async () => {
+    // Catches `stop()` keeping a down carrier: the next stream's first
+    // open would be reported as a return nobody heard the drop of.
+    const hub = lone();
+    const before: boolean[] = [];
+    const first = subscribeOn(hub, () => undefined, {
+      onCarrier: (up) => before.push(up),
+    });
+    await settle();
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    expect(before).toEqual([false]);
+    first();
+    await settle();
+    const after: boolean[] = [];
+    const second = subscribeOn(hub, () => undefined, {
+      onCarrier: (up) => after.push(up),
+    });
+    await settle();
+    expect(FakeEventSource.instances, "a new stream").toHaveLength(2);
+    act(() => {
+      sourceAt(1).open();
+    });
+    await settle();
+    expect(after, "its first open is no change").toEqual([]);
+    second();
+  });
+
+  it("keeps a throwing carrier consumer from stopping the leader's reconnect and its reset", async () => {
+    // Catches `onCarrier` called outside a try/catch: a bug in one
+    // subscriber's carrier handler would stop the 502 path before it asks
+    // the probe, and skip the gap reset after a reopen (F30).
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const hub = lone();
+    const carrier: boolean[] = [];
+    const seen: string[] = [];
+    const leaves = [
+      subscribeOn(hub, () => undefined, {
+        onCarrier: () => {
+          throw new Error("boom");
+        },
+      }),
+      subscribeOn(hub, () => undefined, {
+        onCarrier: (up) => carrier.push(up),
+      }),
+      hub.subscribe((event) => seen.push(event.event)),
+    ];
+    await settle();
+    act(() => {
+      theSource().fail(2);
+    });
+    await settle();
+    expect(carrier, "the other consumer still hears it").toEqual([false]);
+    await advance(1_000);
+    expect(FakeEventSource.instances, "reopened").toHaveLength(2);
+    act(() => {
+      sourceAt(1).open();
+    });
+    await settle();
+    expect(seen, "the gap reset").toEqual(["reset"]);
+    expect(carrier).toEqual([false, true]);
+    expect(error).toHaveBeenCalledTimes(2);
+    for (const leave of leaves) leave();
+    error.mockRestore();
+  });
+
+  it("labels frames with the account the leader's stream was opened as, after a sign-in as somebody else in another tab (Review Focus 4)", async () => {
+    // Catches the leader labelling its frames with the identity its own
+    // tab holds: after ada signs out and bob signs in in the other tab,
+    // the server ends ada's stream, the browser reopens it with bob's
+    // cookie, and bob's frames would reach ada's tab labelled as ada's.
+    const fake = browser();
+    let cookie = "ada";
+    const probe: SessionProbe = () => Promise.resolve(me(cookie));
+    const leader = recordingClient();
+    leader.client.setQueryData(ME_QUERY_KEY, me("ada"));
+    await mount(leader.client, <div />, fake.tab({ sessionProbe: probe }));
+    const followerHub = fake.tab({ sessionProbe: probe });
+    const follower = recordingClient();
+    follower.client.setQueryData(ME_QUERY_KEY, me("ada"));
+    const followerView = await mount(follower.client, <div />, followerHub);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    // In the follower's tab ada signs out and bob signs in.
+    followerView.unmount();
+    cookie = "bob";
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    const bob = recordingClient();
+    bob.client.setQueryData(ME_QUERY_KEY, me("bob"));
+    await mount(bob.client, <div />, followerHub);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    leader.invalidate.mockClear();
+    act(() => {
+      theSource().emit("engram", engram("gamma"), "9:1");
+    });
+    await settle();
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    await settle();
+    expect(leader.keys(), "bob's frame never reaches ada's tab").not.toContain(
+      JSON.stringify(["engram", "eng", "gamma"]),
+    );
+    expect(
+      leader.invalidate,
+      "ada's tab re-asks who is signed in",
+    ).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+    expect(bob.keys(), "bob's own tab takes it").toContain(
+      JSON.stringify(["engram", "eng", "gamma"]),
+    );
+    expect(FakeEventSource.instances, "no reconnect was needed").toHaveLength(
+      1,
+    );
+  });
+
+  it("never passes a frame on before the leader knows its stream's account", async () => {
+    // Catches frames that arrive before the probe answers going out as
+    // account null, which every tab's filter lets through: here ada's
+    // frame would reach the tab that shows bob.
+    const fake = browser();
+    const answers: ((value: unknown) => void)[] = [];
+    const slow: SessionProbe = () =>
+      new Promise((resolve) => {
+        answers.push(resolve);
+      });
+    const other = overhear(fake);
+    const seen: string[] = [];
+    const leave = fake
+      .tab({ sessionProbe: slow })
+      .subscribe((event) => seen.push(event.event));
+    await settle();
+    const bob = recordingClient();
+    bob.client.setQueryData(ME_QUERY_KEY, me("bob"));
+    await mount(bob.client, <div />, fake.tab());
+    expect(FakeEventSource.instances).toHaveLength(1);
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    await settle();
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    await settle();
+    expect(other.accounts(), "nothing passed on yet").toEqual([]);
+    expect(seen, "nor taken in the leader's own tab").toEqual([]);
+    expect(bob.keys()).not.toContain(
+      JSON.stringify(["engram", "eng", "alpha"]),
+    );
+    expect(answers.length, "the leader asked").toBeGreaterThan(0);
+    for (const answer of answers) answer(me("ada"));
+    await settle();
+    expect(
+      other.accounts(),
+      "one reset labelled with the account stands in for what was dropped",
+    ).toEqual(["user:ada"]);
+    expect(seen).toEqual(["reset"]);
+    leave();
+    other.close();
+  });
 });
 
 describe("subscribeToChanges (M4 C10)", () => {
@@ -1247,6 +1478,7 @@ describe("subscribeToChanges (M4 C10)", () => {
     // Catches `subscribeToChanges` not delegating to `subscribeOn` with
     // `defaultHub()`: its options dropped, or another hub than the shell's.
     vi.stubGlobal("EventSource", FakeEventSource);
+    stubSignedIn();
     const { client } = recordingClient();
     const seen: string[] = [];
     const carrier: boolean[] = [];

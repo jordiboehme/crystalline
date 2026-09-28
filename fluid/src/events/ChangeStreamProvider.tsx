@@ -65,8 +65,7 @@ export interface StreamSubscription {
  * mounting (it takes a tab whose session ended back into the running). A
  * consumer whose `held()` answers `undefined`, or one that passes no
  * `identity` at all, counts as "no shell" when the hub asks who this tab
- * shows: it filters nothing and leaves the leader to probe the account it
- * streams as.
+ * shows: it filters nothing.
  */
 // The seam is the point of this module as much as the provider is.
 // eslint-disable-next-line react-refresh/only-export-components

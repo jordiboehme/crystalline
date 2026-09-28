@@ -23,14 +23,19 @@
  *   reopened source, or the source of a tab that took over from a closed
  *   leader, opens, every tab resets once: the pages refetch what they show.
  *
- * - Every frame names the account the leader's stream was opened as. A tab
- *   whose shell shows somebody else drops it and asks the probe which of
+ * - Every frame names the account the leader's stream was opened as: the
+ *   cookie's, which the leader asks the probe for whenever a source starts
+ *   and whenever the browser reopens one, never the identity its own tab
+ *   shows, which can be stale after a sign-in in another tab. Until the
+ *   answer comes no frame is passed on, not even in the leader's tab; once
+ *   it does, one reset stands in for whatever was dropped. A tab whose
+ *   shell shows somebody else drops a frame and asks the probe which of
  *   the two is stale: a stale tab re-asks who is signed in and resets, a
  *   stale leader re-checks its session and reopens as the cookie's account,
  *   with a reset. Another account is never taken as a session that ended.
- *   A tab where no consumer holds an identity (no shell, or only
- *   subscribers that pass none) has no account of its own, so its leading
- *   stream asks the probe which account it streams as.
+ *   A sign-in that lands between the stream's request and the probe's can
+ *   mislabel that one stream; the first frame another tab drops for it
+ *   sets that right.
  *
  * The carrier: whether frames flow. The leader reports it down on any
  * `error` of its source (the browser's own reconnect included, since
@@ -41,11 +46,12 @@
  *
  * A tab takes part while anything in it wants the stream: a mounted
  * provider, a consumer attached from outside the shell, or a `subscribe`
- * listener. It leaves when the last one goes. Attaching a consumer counts
- * as the shell mounting: it takes a tab whose session was found ended back
- * into the running. A consumer attached with an identity after the session
- * ended only wakes a stream that answers 401 again, which is harmless:
- * `RequireAuth` has already sent the route to the login screen.
+ * listener. It leaves when the last one goes. Attaching any consumer, with
+ * an identity or only a carrier callback, counts as the shell mounting: it
+ * takes a tab whose session was found ended back into the running. A
+ * consumer attached after the session ended only wakes a stream that
+ * answers 401 again, which is harmless: `RequireAuth` has already sent the
+ * route to the login screen.
  */
 
 import { API_BASE, ApiProblem, api } from "../api/client";
@@ -94,8 +100,7 @@ export interface ChangeConsumer {
   recheckIdentity(): void;
   /**
    * The capability answer this tab holds: who its shell says is signed in.
-   * `undefined` is "no shell": the consumer filters nothing and leaves the
-   * leader to ask the probe.
+   * `undefined` is "no shell": the consumer filters nothing.
    */
   heldIdentity(): unknown;
   /** The stream went down (`false`) or came back (`true`). */
@@ -183,8 +188,19 @@ export class ChangeHub {
    * until a provider attaches again (the shell after a new sign-in).
    */
   private dormant = false;
-  /** While this tab leads: the account its stream was opened as. */
+  /**
+   * While this tab leads: the account its stream was opened as, as the
+   * probe last named it.
+   */
   private account: string | null = null;
+  /**
+   * Whether `account` names the stream open now. Until it does, no frame is
+   * passed on: a frame labelled with a guess could reach a tab that shows
+   * somebody the frame was not streamed for.
+   */
+  private accountKnown = false;
+  /** A frame was dropped while the account was not known. */
+  private missed = false;
   /** While this tab leads: re-check the session and reconnect if it moved. */
   private leaderRecheck: (() => void) | null = null;
   private checking = false;
@@ -305,7 +321,15 @@ export class ChangeHub {
     if (up === this.carrierUp) return;
     this.carrierUp = up;
     if (broadcast) this.channel?.postMessage({ type: "carrier", up });
-    for (const consumer of [...this.consumers]) consumer.onCarrier?.(up);
+    // A consumer's bug must not stop the reconnect or the reset that
+    // follow this call, nor cost the others their news.
+    for (const consumer of [...this.consumers]) {
+      try {
+        consumer.onCarrier?.(up);
+      } catch (error) {
+        console.error("a change consumer threw", error);
+      }
+    }
   }
 
   private probeIdentity(): Promise<Probed> {
@@ -381,6 +405,12 @@ export class ChangeHub {
 
   /** A frame this tab read off its own source: here and in every other tab. */
   private broadcast(event: ChangeEvent): void {
+    if (!this.accountKnown) {
+      // Once the account is known, one reset stands in for what was
+      // dropped here.
+      this.missed = true;
+      return;
+    }
     const account = this.account;
     this.channel?.postMessage({ type: "frame", event, account });
     this.deliver(event, account);
@@ -412,16 +442,59 @@ export class ChangeHub {
     let attempt = 0;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let detach: (() => void) | null = null;
-    // The account the stream opens as is the one this tab shows; a tab
-    // where no consumer holds an identity asks.
-    this.account = this.ownIdentity() ?? null;
-    if (this.ownIdentity() === undefined) {
+    this.account = null;
+    this.accountKnown = false;
+    this.missed = false;
+
+    // The account a stream is opened as is the cookie's, which the probe
+    // names; never the identity this tab shows, which can be stale after a
+    // sign-in in another tab. Each request of the stream is asked about:
+    // every new source, and every reopen the browser makes on its own.
+    let asking = 0;
+    let learning = false;
+    let askAttempt = 0;
+    let askRetry: ReturnType<typeof setTimeout> | null = null;
+    const forgetAccount = () => {
+      asking += 1;
+      learning = false;
+      this.accountKnown = false;
+      if (askRetry) clearTimeout(askRetry);
+      askRetry = null;
+    };
+    const learnAccount = () => {
+      forgetAccount();
+      const generation = asking;
+      learning = true;
       void this.probeIdentity().then((probed) => {
-        if (!ended && this.account === null && probed.kind === "is") {
+        if (ended || generation !== asking) return;
+        learning = false;
+        if (probed.kind === "is") {
+          askAttempt = 0;
           this.account = probed.identity;
+          this.accountKnown = true;
+          const own = this.ownIdentity();
+          if (own !== undefined && own !== probed.identity) {
+            // This tab shows somebody the stream is not for.
+            for (const consumer of [...this.consumers]) {
+              consumer.recheckIdentity();
+            }
+          }
+          if (this.missed) {
+            this.missed = false;
+            this.broadcast({ event: "reset" });
+          }
+        } else {
+          // An ended session is the stream's own to find out: the server
+          // ends it, and its reopen is refused. Until then, ask again.
+          const delay = reconnectDelay(askAttempt, this.deps.random);
+          askAttempt += 1;
+          askRetry = setTimeout(() => {
+            askRetry = null;
+            learnAccount();
+          }, delay);
         }
       });
-    }
+    };
 
     /**
      * Whether the session still stands, and as whom. Another account than
@@ -469,6 +542,7 @@ export class ChangeHub {
 
     const connect = (gap: boolean) => {
       const source = factory(`${API_BASE}/events`);
+      learnAccount();
       const frames = EVENT_NAMES.map(
         (name) =>
           [
@@ -484,6 +558,7 @@ export class ChangeHub {
       }
       const onOpen = () => {
         attempt = 0;
+        if (!this.accountKnown && !learning) learnAccount();
         this.setCarrier(true, true);
         if (gap) {
           // Nothing said what happened while no source was open.
@@ -493,6 +568,8 @@ export class ChangeHub {
       };
       source.addEventListener("open", onOpen);
       source.onerror = () => {
+        // The browser's own reopen may carry another cookie.
+        forgetAccount();
         // Down either way: nothing arrives while the browser reconnects.
         this.setCarrier(false, true);
         // CONNECTING is the browser mid-reconnect, with `Last-Event-ID`.
@@ -532,7 +609,9 @@ export class ChangeHub {
     connect(handover);
     return () => {
       ended = true;
+      forgetAccount();
       this.account = null;
+      this.missed = false;
       this.leaderRecheck = null;
       if (retry) clearTimeout(retry);
       detach?.();
