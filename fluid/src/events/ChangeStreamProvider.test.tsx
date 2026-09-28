@@ -14,7 +14,7 @@ import {
 } from "./ChangeStreamProvider";
 import { CLAIM_MS, LEADER_TIMEOUT_MS } from "./election";
 import type { HubDeps, SessionProbe } from "./hub";
-import { ChangeHub, STREAM_NAME } from "./hub";
+import { ChangeHub, MAX_REOPENS, STREAM_NAME } from "./hub";
 import { IgnoredEngramsContext, useIgnoredEngram } from "./ignored";
 import { useRecentChange } from "./recent";
 import {
@@ -95,6 +95,19 @@ async function advance(ms: number): Promise<void> {
   await settle();
 }
 
+/**
+ * The browser having connected every source that is still waiting: a real
+ * `EventSource` fires `open` before any message.
+ */
+async function connectAll(): Promise<void> {
+  act(() => {
+    for (const source of FakeEventSource.instances) {
+      if (!source.opened && source.readyState !== 2) source.open();
+    }
+  });
+  await settle();
+}
+
 async function mount(
   client: QueryClient,
   children: ReactNode = <div />,
@@ -102,6 +115,7 @@ async function mount(
 ) {
   const view = render(tree(client, children, hub));
   await settle();
+  await connectAll();
   return {
     ...view,
     rerenderWith: (next: ReactNode) => {
@@ -267,13 +281,16 @@ describe("the change stream in one tab", () => {
     const probe = vi.fn(signedIn);
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, lone({ sessionProbe: probe }));
-    // The account the stream was opened as is asked once, at the start.
+    // The account the stream was opened as is asked around its request.
     probe.mockClear();
     act(() => {
       theSource().fail(0);
     });
     await advance(60_000);
-    expect(probe).not.toHaveBeenCalled();
+    expect(
+      probe,
+      "asked once, before the browser's own reopen, and never to recover",
+    ).toHaveBeenCalledTimes(1);
     expect(invalidate).not.toHaveBeenCalled();
     expect(FakeEventSource.instances).toHaveLength(1);
   });
@@ -287,13 +304,14 @@ describe("the change stream in one tab", () => {
     const probe = vi
       .fn<SessionProbe>()
       .mockImplementationOnce(signedIn)
+      .mockImplementationOnce(signedIn)
       .mockRejectedValueOnce(new ApiProblem(502, "bad gateway", ""))
       .mockImplementation(signedIn);
     const hub = lone({ sessionProbe: probe });
     const unsubscribe = hub.subscribe((event) => seen.push(event.event));
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, hub);
-    // The first answer named the account the stream was opened as.
+    // The first two answers named the account the stream was opened as.
     probe.mockClear();
     act(() => {
       theSource().fail(2);
@@ -322,6 +340,8 @@ describe("the change stream in one tab", () => {
     act(() => {
       next.open();
     });
+    // The reset waits for the answer asked after the open.
+    await settle();
     expect(invalidate).toHaveBeenCalledWith();
     expect(seen).toEqual(["reset"]);
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
@@ -427,15 +447,20 @@ describe("the change stream in one tab", () => {
   });
 
   it("an unmount while the probe is out or the backoff runs never opens a source", async () => {
+    // The two answers around the stream's request come at once; the one
+    // the closed source asks for is held.
     let answer: (value: unknown) => void = () => undefined;
+    let asked = 0;
     const view = await mount(
       client,
       <div />,
       lone({
         sessionProbe: () =>
-          new Promise((resolve) => {
-            answer = resolve;
-          }),
+          ++asked <= 2
+            ? signedIn()
+            : new Promise((resolve) => {
+                answer = resolve;
+              }),
       }),
     );
     act(() => {
@@ -467,14 +492,17 @@ describe("the change stream in one tab", () => {
     // not even an ended session re-asks who is signed in.
     FakeEventSource.instances = [];
     let refuse: (reason: unknown) => void = () => undefined;
+    let refused = 0;
     const third = await mount(
       client,
       <div />,
       lone({
         sessionProbe: () =>
-          new Promise((_resolve, reject) => {
-            refuse = reject;
-          }),
+          ++refused <= 2
+            ? signedIn()
+            : new Promise((_resolve, reject) => {
+                refuse = reject;
+              }),
       }),
     );
     act(() => {
@@ -645,7 +673,7 @@ describe("subscribeToChanges", () => {
         </ChangeStreamProvider>
       </QueryClientProvider>,
     );
-    await settle();
+    await connectAll();
     expect(FakeEventSource.instances, "no second connection").toHaveLength(1);
     const source = theSource();
     expect(source.withCredentials, "the session cookie rides along").toBe(true);
@@ -1142,6 +1170,7 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
       const other = overhear(fake);
       const leave = subscribeOn(fake.tab(), () => undefined, options);
       await settle();
+      await connectAll();
       expect(FakeEventSource.instances, name).toHaveLength(1);
       act(() => {
         theSource().emit("engram", engram("alpha"), "1:1");
@@ -1271,6 +1300,7 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
       identity,
     });
     await settle();
+    await connectAll();
     act(() => {
       theSource().emit("engram", engram("alpha"), "1:1");
     });
@@ -1432,11 +1462,16 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     // account null, which every tab's filter lets through: here ada's
     // frame would reach the tab that shows bob.
     const fake = browser();
+    // The answer before the request comes at once, the one after it is
+    // slow.
     const answers: ((value: unknown) => void)[] = [];
+    let asked = 0;
     const slow: SessionProbe = () =>
-      new Promise((resolve) => {
-        answers.push(resolve);
-      });
+      ++asked === 1
+        ? Promise.resolve(me("ada"))
+        : new Promise((resolve) => {
+            answers.push(resolve);
+          });
     const other = overhear(fake);
     const seen: string[] = [];
     const leave = fake
@@ -1471,6 +1506,194 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     leave();
     other.close();
   });
+
+  it("never labels a stream with an account the cookie took on after its request went out (Review Focus 4)", async () => {
+    // Catches the label taken from the answer asked after the open alone:
+    // the stream's request went out with ada's cookie, bob signed in right
+    // after, and ada's frames would reach bob's tab labelled as bob's.
+    const fake = browser();
+    let cookie = "ada";
+    const probe: SessionProbe = () => Promise.resolve(me(cookie));
+    let opened = 0;
+    const streamFactory = (url: string): EventSource => {
+      const source = fakeStreamFactory(url);
+      opened += 1;
+      // The sign-in lands right after the first request went out.
+      if (opened === 1) cookie = "bob";
+      return source;
+    };
+    const ada = recordingClient();
+    ada.client.setQueryData(ME_QUERY_KEY, me("ada"));
+    await mount(
+      ada.client,
+      <div />,
+      fake.tab({ sessionProbe: probe, streamFactory }),
+    );
+    const bob = recordingClient();
+    bob.client.setQueryData(ME_QUERY_KEY, me("bob"));
+    await mount(
+      bob.client,
+      <div />,
+      fake.tab({ sessionProbe: probe, streamFactory }),
+    );
+    act(() => {
+      sourceAt(0).emit("engram", engram("ada0"), "1:1");
+    });
+    await settle();
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    await settle();
+    expect(bob.keys(), "ada's frame never reaches bob's tab").not.toContain(
+      JSON.stringify(["engram", "eng", "ada0"]),
+    );
+    await advance(1_000);
+    expect(
+      FakeEventSource.instances,
+      "the stream is opened again, as bob",
+    ).toHaveLength(2);
+    await connectAll();
+    act(() => {
+      sourceAt(1).emit("engram", engram("bob1"), "2:1");
+    });
+    await settle();
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    await settle();
+    expect(bob.keys(), "bob's own frame reaches his tab").toContain(
+      JSON.stringify(["engram", "eng", "bob1"]),
+    );
+    expect(ada.keys(), "and never ada's").not.toContain(
+      JSON.stringify(["engram", "eng", "bob1"]),
+    );
+  });
+
+  it("drops an answer asked for a request the browser already replaced", async () => {
+    // Catches the generation check gone: the slow answer about the first
+    // request (ada) lands after the browser reopened with bob's cookie and
+    // that reopen was labelled, and would throw the good label away.
+    const fake = browser();
+    let cookie = "ada";
+    let asked = 0;
+    let late: (value: unknown) => void = () => undefined;
+    const probe: SessionProbe = () => {
+      asked += 1;
+      if (asked === 2) {
+        return new Promise((resolve) => {
+          late = resolve;
+        });
+      }
+      return Promise.resolve(me(cookie));
+    };
+    const other = overhear(fake);
+    const leave = fake.tab({ sessionProbe: probe }).subscribe(() => undefined);
+    await settle();
+    await connectAll();
+    expect(asked, "one answer before, one (slow) after").toBe(2);
+    cookie = "bob";
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    late(me("ada"));
+    await settle();
+    await advance(60_000);
+    act(() => {
+      theSource().emit("engram", engram("beta"), "2:1");
+    });
+    await settle();
+    expect(FakeEventSource.instances, "no reopen").toHaveLength(1);
+    expect(other.accounts(), "bob's stream keeps bob's label").toEqual([
+      "user:bob",
+    ]);
+    leave();
+    other.close();
+  });
+
+  it("asks again when the answer after the open says nothing", async () => {
+    // Catches no retry after an unknown answer: the stream is up, but with
+    // no label every frame in every tab would be dropped until the next
+    // reopen, with no error anywhere.
+    const probe = vi
+      .fn<SessionProbe>()
+      .mockImplementationOnce(signedIn)
+      .mockRejectedValueOnce(new ApiProblem(502, "bad gateway", ""))
+      .mockImplementation(signedIn);
+    const hub = lone({ sessionProbe: probe });
+    const seen: string[] = [];
+    const leave = hub.subscribe((event) => seen.push(event.event));
+    await settle();
+    await connectAll();
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    await settle();
+    expect(seen, "held back while nobody knows the account").toEqual([]);
+    await advance(1_000);
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(seen, "one reset for what was dropped").toEqual(["reset"]);
+    act(() => {
+      theSource().emit("engram", engram("beta"), "1:2");
+    });
+    expect(seen).toEqual(["reset", "engram"]);
+    leave();
+  });
+
+  it("stops reopening after MAX_REOPENS answers in a row disagree, and holds every frame back", async () => {
+    // Catches the reopen without a bound: a cookie that never settles
+    // would open a source after source forever.
+    const fake = browser();
+    let asked = 0;
+    const flipping: SessionProbe = () =>
+      Promise.resolve(me(++asked % 2 === 0 ? "bob" : "ada"));
+    const other = overhear(fake);
+    const leave = fake
+      .tab({ sessionProbe: flipping })
+      .subscribe(() => undefined);
+    await settle();
+    for (let round = 0; round < MAX_REOPENS + 3; round++) {
+      await connectAll();
+      await advance(30_000);
+    }
+    expect(FakeEventSource.instances).toHaveLength(MAX_REOPENS + 1);
+    const last = sourceAt(MAX_REOPENS);
+    expect(last.readyState, "the last one stays open").toBe(1);
+    act(() => {
+      last.emit("engram", engram("alpha"), "1:1");
+    });
+    await settle();
+    expect(other.accounts(), "nothing passed on").toEqual([]);
+    leave();
+    other.close();
+    await settle();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("drops a frame labelled with no account in a tab that shows somebody", async () => {
+    // Catches `deliver` letting a null label through: no leader writes
+    // one, so a tab that holds an identity fails closed on it.
+    const fake = browser();
+    const heard: string[] = [];
+    const leave = subscribeOn(fake.tab(), (event) => heard.push(event.event), {
+      identity: { held: () => me("ada"), recheck: () => undefined },
+    });
+    await settle();
+    const other = new FakeBroadcastChannel(STREAM_NAME, fake.bus);
+    const frame = { event: "engram", change: engram("alpha") };
+    other.postMessage({ type: "frame", event: frame, account: null });
+    await settle();
+    expect(heard, "no label, not taken").toEqual([]);
+    other.postMessage({ type: "frame", event: frame, account: "user:ada" });
+    await settle();
+    expect(heard, "its own account's is").toEqual(["engram"]);
+    leave();
+    other.close();
+  });
 });
 
 describe("subscribeToChanges (M4 C10)", () => {
@@ -1493,7 +1716,7 @@ describe("subscribeToChanges (M4 C10)", () => {
         </ChangeStreamProvider>
       </QueryClientProvider>,
     );
-    await settle();
+    await connectAll();
     expect(FakeEventSource.instances, "the shell's one source").toHaveLength(1);
     const source = theSource();
     act(() => {

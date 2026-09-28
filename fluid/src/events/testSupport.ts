@@ -14,6 +14,8 @@ export class FakeEventSource {
   /** What the second constructor argument asked for. */
   withCredentials: boolean;
   readyState = 1;
+  /** Whether `open` ever fired on this source. */
+  opened = false;
   onerror: ((event: Event) => void) | null = null;
   private listeners = new Map<string, Set<Listener>>();
   constructor(url: string, init?: EventSourceInit) {
@@ -36,6 +38,7 @@ export class FakeEventSource {
   /** The browser having connected: fires `open`. */
   open() {
     this.readyState = 1;
+    this.opened = true;
     for (const listener of this.listeners.get("open") ?? []) {
       listener(new MessageEvent<string>("open"));
     }

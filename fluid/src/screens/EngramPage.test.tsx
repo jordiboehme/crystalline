@@ -1643,6 +1643,23 @@ describe("the reading page follows the stream", () => {
     return source;
   }
 
+  /**
+   * The browser having connected the shell's stream: a real `EventSource`
+   * fires `open` before any message, and the leading tab asks the probe
+   * who the stream is for before it passes a frame on.
+   */
+  async function connected(): Promise<void> {
+    const source = stream();
+    if (!source.opened) {
+      act(() => {
+        source.open();
+      });
+    }
+    await act(async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+  }
+
   /** The line's live region, which stays mounted and is empty between changes. */
   function line(): HTMLElement {
     return screen.getByRole("status", { name: "Recent change" });
@@ -1680,6 +1697,7 @@ describe("the reading page follows the stream", () => {
       content: BODY.replace("Body prose", "Revised prose"),
       checksum: "new1",
     });
+    await connected();
     act(() => {
       stream().emit("engram", frame(), "1:1");
     });
@@ -1719,6 +1737,7 @@ describe("the reading page follows the stream", () => {
     serve();
     renderApp(engramRoute("eng", "alpha"));
     await screen.findByRole("heading", { name: "Alpha" });
+    await connected();
     act(() => {
       stream().emit(
         "engram",
@@ -1757,6 +1776,7 @@ describe("the reading page follows the stream", () => {
     await screen.findByRole("heading", { name: "Alpha" });
     // The line's height pushes the body down by 60px.
     top = -440;
+    await connected();
     act(() => {
       stream().emit("engram", frame({ checksum: "3f8a1c05e2" }), "1:1");
     });
@@ -1788,6 +1808,7 @@ describe("the reading page follows the stream", () => {
     renderApp(engramRoute("eng", "alpha"));
     await screen.findByRole("heading", { name: "Alpha" });
     gone = true;
+    await connected();
     act(() => {
       stream().emit(
         "engram",
@@ -1817,6 +1838,7 @@ describe("the reading page follows the stream", () => {
       </MemoryRouter>,
     );
     await screen.findByRole("heading", { name: "Alpha" });
+    await connected();
     const region = line();
     // Everything the line ever said on the way: the old address must not
     // say "Updated" for the commit before it follows the move.
@@ -1882,10 +1904,12 @@ describe("the reading page follows the stream", () => {
     expect(screen.getByTestId("navigation")).toHaveTextContent(
       `REPLACE ${engramRoute("eng", "topics/alpha")}`,
     );
+    // The new address's detail replaces the placeholder the follow kept
+    // (the old address's text) when its own answer lands.
     expect(
-      within(screen.getByRole("navigation", { name: "Breadcrumb" })).getByText(
-        "topics",
-      ),
+      await within(
+        screen.getByRole("navigation", { name: "Breadcrumb" }),
+      ).findByText("topics"),
     ).toBeInTheDocument();
   });
 
@@ -1966,6 +1990,7 @@ describe("the reading page follows the stream", () => {
       </MemoryRouter>,
     );
     await screen.findByRole("heading", { name: "Alpha" });
+    await connected();
     act(() => {
       stream().emit(
         "engram",
@@ -2045,6 +2070,7 @@ describe("the reading page follows the stream", () => {
       ).getByRole("link", { name: "Alpha" }),
     );
     await screen.findByRole("heading", { name: "Alpha" });
+    await connected();
     act(() => {
       stream().emit(
         "engram",

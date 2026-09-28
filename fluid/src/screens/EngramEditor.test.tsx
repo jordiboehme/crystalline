@@ -1018,6 +1018,12 @@ describe("the engram editor", () => {
       actor: "ada",
       draft_of: null,
     });
+    // A real `EventSource` fires `open` before any message, and the
+    // leading tab asks who the stream is for before it passes one on.
+    act(() => {
+      source.open();
+    });
+    await settled();
     act(() => {
       source.emit("engram", frame("alpha"), "1:1");
     });

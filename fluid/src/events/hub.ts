@@ -24,18 +24,24 @@
  *   leader, opens, every tab resets once: the pages refetch what they show.
  *
  * - Every frame names the account the leader's stream was opened as: the
- *   cookie's, which the leader asks the probe for whenever a source starts
- *   and whenever the browser reopens one, never the identity its own tab
- *   shows, which can be stale after a sign-in in another tab. Until the
- *   answer comes no frame is passed on, not even in the leader's tab; once
- *   it does, one reset stands in for whatever was dropped. A tab whose
- *   shell shows somebody else drops a frame and asks the probe which of
- *   the two is stale: a stale tab re-asks who is signed in and resets, a
- *   stale leader re-checks its session and reopens as the cookie's account,
- *   with a reset. Another account is never taken as a session that ended.
- *   A sign-in that lands between the stream's request and the probe's can
- *   mislabel that one stream; the first frame another tab drops for it
- *   sets that right.
+ *   cookie's when the stream's request went out, never the identity the
+ *   leader's own tab shows, which can be stale after a sign-in in another
+ *   tab. The server does not name it, so the leader asks the probe, which
+ *   carries the same cookie, once before each request of the stream (a new
+ *   source, or the browser's own reopen) and once after it opened. The two
+ *   answers agreeing is the label; answers that disagree mean the cookie
+ *   changed around the request, and the source is opened again, at most
+ *   `MAX_REOPENS` times in a row. Until there is a label no frame is
+ *   passed on, not even in the leader's tab; once there is, one reset
+ *   stands in for whatever was dropped. What the bracket cannot see is a
+ *   cookie that changes and changes back between its two answers; the
+ *   server re-checks each stream's own session every few seconds and ends
+ *   one whose session is gone, which bounds that case.
+ * - A tab whose shell shows somebody else than a frame's label drops it
+ *   and asks the probe which of the two is stale: a stale tab re-asks who
+ *   is signed in and resets, a stale leader re-checks its session and
+ *   reopens as the cookie's account, with a reset. Another account is
+ *   never taken as a session that ended.
  *
  * The carrier: whether frames flow. The leader reports it down on any
  * `error` of its source (the browser's own reconnect included, since
@@ -151,6 +157,13 @@ function readMessage(value: unknown): Message | null {
 /** What the capability probe said about the cookie this browser holds now. */
 type Probed =
   { kind: "is"; identity: string } | { kind: "ended" } | { kind: "unknown" };
+
+/**
+ * How often in a row the leader closes and reopens a source whose request
+ * the probe's two answers disagree about, before it leaves the next reopen
+ * to the browser or the server and keeps holding frames back.
+ */
+export const MAX_REOPENS = 3;
 
 /** How long a tab that found a mismatch waits before it looks again. */
 export const RECHECK_QUIET_MS = 2_000;
@@ -377,7 +390,7 @@ export class ChangeHub {
    */
   private deliver(event: ChangeEvent, account: string | null): void {
     const own = this.ownIdentity();
-    if (own !== undefined && account !== null && own !== account) {
+    if (own !== undefined && own !== account) {
       this.mismatch(account);
       return;
     }
@@ -446,53 +459,93 @@ export class ChangeHub {
     this.accountKnown = false;
     this.missed = false;
 
-    // The account a stream is opened as is the cookie's, which the probe
-    // names; never the identity this tab shows, which can be stale after a
-    // sign-in in another tab. Each request of the stream is asked about:
-    // every new source, and every reopen the browser makes on its own.
+    // The account a stream is opened as is the cookie's when its request
+    // went out. The probe carries the same cookie, so the leader brackets
+    // each request of the stream (every new source, and every reopen the
+    // browser makes on its own) between two answers: one asked before the
+    // request, one asked after the source opened. Only the order in which
+    // they were asked matters, not the order they come back in. When the
+    // two name the same account, that is the label; when they differ, the
+    // cookie changed around the request, and the source is closed and
+    // opened again, at most `MAX_REOPENS` times in a row.
     let asking = 0;
-    let learning = false;
+    let before: string | null | undefined;
+    let after: string | undefined;
+    let afterAsked = false;
     let askAttempt = 0;
+    let reopens = 0;
     let askRetry: ReturnType<typeof setTimeout> | null = null;
     const forgetAccount = () => {
       asking += 1;
-      learning = false;
       this.accountKnown = false;
+      before = undefined;
+      after = undefined;
+      afterAsked = false;
       if (askRetry) clearTimeout(askRetry);
       askRetry = null;
     };
-    const learnAccount = () => {
-      forgetAccount();
+    const settleBracket = () => {
+      if (before === undefined || after === undefined) return;
+      if (before === after) {
+        reopens = 0;
+        this.account = after;
+        this.accountKnown = true;
+        const own = this.ownIdentity();
+        if (own !== undefined && own !== after) {
+          // This tab shows somebody the stream is not for.
+          for (const consumer of [...this.consumers]) {
+            consumer.recheckIdentity();
+          }
+        }
+        if (this.missed) {
+          this.missed = false;
+          this.broadcast({ event: "reset" });
+        }
+        return;
+      }
+      // Frames stay held back either way; past the bound the next reopen
+      // is the browser's or the server's, with a fresh bracket.
+      if (reopens >= MAX_REOPENS) return;
+      const next = after;
+      const delay = reconnectDelay(reopens, this.deps.random);
+      reopens += 1;
+      detach?.();
+      detach = null;
+      if (retry) clearTimeout(retry);
+      retry = setTimeout(() => {
+        retry = null;
+        // The answer that closed this bracket was asked before the next
+        // request, so it opens the next one.
+        connect(true, next);
+      }, delay);
+    };
+    const askBefore = () => {
       const generation = asking;
-      learning = true;
       void this.probeIdentity().then((probed) => {
         if (ended || generation !== asking) return;
-        learning = false;
+        before = probed.kind === "is" ? probed.identity : null;
+        settleBracket();
+      });
+    };
+    const askAfter = () => {
+      afterAsked = true;
+      const generation = asking;
+      void this.probeIdentity().then((probed) => {
+        if (ended || generation !== asking) return;
         if (probed.kind === "is") {
           askAttempt = 0;
-          this.account = probed.identity;
-          this.accountKnown = true;
-          const own = this.ownIdentity();
-          if (own !== undefined && own !== probed.identity) {
-            // This tab shows somebody the stream is not for.
-            for (const consumer of [...this.consumers]) {
-              consumer.recheckIdentity();
-            }
-          }
-          if (this.missed) {
-            this.missed = false;
-            this.broadcast({ event: "reset" });
-          }
-        } else {
-          // An ended session is the stream's own to find out: the server
-          // ends it, and its reopen is refused. Until then, ask again.
-          const delay = reconnectDelay(askAttempt, this.deps.random);
-          askAttempt += 1;
-          askRetry = setTimeout(() => {
-            askRetry = null;
-            learnAccount();
-          }, delay);
+          after = probed.identity;
+          settleBracket();
+          return;
         }
+        // An ended session is the stream's own to find out: the server
+        // ends it, and its reopen is refused. Until then, ask again.
+        const delay = reconnectDelay(askAttempt, this.deps.random);
+        askAttempt += 1;
+        askRetry = setTimeout(() => {
+          askRetry = null;
+          askAfter();
+        }, delay);
       });
     };
 
@@ -502,18 +555,22 @@ export class ChangeHub {
      * holds a live one, so the stream reconnects as it.
      */
     const checkSession = async (): Promise<
-      "valid" | "changed" | "ended" | "unknown"
+      | { state: "valid"; identity: string }
+      | { state: "changed"; identity: string }
+      | { state: "ended" }
+      | { state: "unknown" }
     > => {
       const probed = await this.probeIdentity();
-      if (probed.kind !== "is") return probed.kind;
+      if (probed.kind === "ended") return { state: "ended" };
+      if (probed.kind === "unknown") return { state: "unknown" };
+      const identity = probed.identity;
       const was = this.account;
-      this.account = probed.identity;
       // Learning the account of a stream nobody could name is no change.
-      if (was === null || was === probed.identity) return "valid";
-      if (this.ownIdentity() !== probed.identity) {
+      if (was === null || was === identity) return { state: "valid", identity };
+      if (this.ownIdentity() !== identity) {
         for (const consumer of [...this.consumers]) consumer.recheckIdentity();
       }
-      return "changed";
+      return { state: "changed", identity };
     };
 
     const scheduleRetry = (step: () => void) => {
@@ -526,23 +583,26 @@ export class ChangeHub {
     };
 
     const recover = () => {
-      void checkSession().then((state) => {
+      void checkSession().then((checked) => {
         if (ended) return;
-        if (state === "ended") {
+        if (checked.state === "ended") {
           this.sessionEnded(true);
-        } else if (state === "valid" || state === "changed") {
-          scheduleRetry(() => {
-            connect(true);
-          });
-        } else {
+        } else if (checked.state === "unknown") {
           scheduleRetry(recover);
+        } else {
+          const { identity } = checked;
+          scheduleRetry(() => {
+            connect(true, identity);
+          });
         }
       });
     };
 
-    const connect = (gap: boolean) => {
+    /** A new source, whose request goes out after `known` was answered. */
+    const connect = (gap: boolean, known: string | null) => {
+      forgetAccount();
+      before = known;
       const source = factory(`${API_BASE}/events`);
-      learnAccount();
       const frames = EVENT_NAMES.map(
         (name) =>
           [
@@ -558,7 +618,7 @@ export class ChangeHub {
       }
       const onOpen = () => {
         attempt = 0;
-        if (!this.accountKnown && !learning) learnAccount();
+        if (!afterAsked) askAfter();
         this.setCarrier(true, true);
         if (gap) {
           // Nothing said what happened while no source was open.
@@ -568,12 +628,16 @@ export class ChangeHub {
       };
       source.addEventListener("open", onOpen);
       source.onerror = () => {
-        // The browser's own reopen may carry another cookie.
         forgetAccount();
         // Down either way: nothing arrives while the browser reconnects.
         this.setCarrier(false, true);
-        // CONNECTING is the browser mid-reconnect, with `Last-Event-ID`.
-        if (source.readyState !== CLOSED) return;
+        if (source.readyState !== CLOSED) {
+          // CONNECTING is the browser mid-reconnect, with `Last-Event-ID`,
+          // and with whatever cookie it holds then: its request is
+          // bracketed like a new one, from here to its `open`.
+          askBefore();
+          return;
+        }
         detach?.();
         detach = null;
         recover();
@@ -592,21 +656,28 @@ export class ChangeHub {
     // show and found this tab the stale one: if the session moved, the
     // stream reopens as it, with a reset.
     this.leaderRecheck = () => {
-      void checkSession().then((state) => {
+      void checkSession().then((checked) => {
         if (ended) return;
-        if (state === "ended") {
+        if (checked.state === "ended") {
           this.sessionEnded(true);
-        } else if (state === "changed") {
+        } else if (checked.state === "changed") {
           detach?.();
           detach = null;
           if (retry) clearTimeout(retry);
           retry = null;
-          connect(true);
+          connect(true, checked.identity);
         }
       });
     };
 
-    connect(handover);
+    // The first request of this lead goes out once its "before" answer is
+    // in; an answer that names nobody still opens it, and the stream's own
+    // refusal then says whether the session ended.
+    const first = asking;
+    void this.probeIdentity().then((probed) => {
+      if (ended || first !== asking) return;
+      connect(handover, probed.kind === "is" ? probed.identity : null);
+    });
     return () => {
       ended = true;
       forgetAccount();
