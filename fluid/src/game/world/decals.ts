@@ -334,9 +334,10 @@ function fitsRect(room: DecalBase, r: Rect, box: Box): boolean {
 
 /**
  * The decals of a finished room (2.7 C13 to C19). See the module doc for
- * the pass.
+ * the pass. `cap` is `DECAL_CAP` for every room the generator makes; a
+ * test passes `Infinity` to see what the cap cut.
  */
-export function placeDecals(room: DecalBase): Decal[] {
+export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
   const sites = dressingSites(room);
   const rates = DECAL_RATES[room.condition];
   const rank = RANK[room.condition];
@@ -691,8 +692,7 @@ export function placeDecals(room: DecalBase): Decal[] {
 
   // 8. The cap, then the order.
   const drops = [stains, faces, smears, streaks];
-  let over =
-    fixed.length + drops.reduce((n, list) => n + list.length, 0) - DECAL_CAP;
+  let over = fixed.length + drops.reduce((n, list) => n + list.length, 0) - cap;
   for (const list of drops) {
     if (over <= 0) break;
     const cut = Math.min(over, list.length);

@@ -352,6 +352,30 @@ describe("decal placement (2.7 Task 10)", () => {
     expect(decals).not.toEqual(g.decals);
   });
 
+  it("cuts a full room down to the cap from the floor stains up, never a strip, an arrow or a stencil (2.7 C17)", () => {
+    // Mutation caught: no cap at all, or a cap that drops streaks, smears,
+    // faces or the never-dropped kinds before the floor stains. A derelict
+    // reseed of the hub (hub-1) is the first found over the cap.
+    const room = generateRoom({
+      ...CANNED_HUB,
+      status: "archived",
+      permalink: "hub-1",
+    });
+    const { decals, ...rest } = room;
+    const full = placeDecals(rest, Infinity);
+    expect(full.length).toBeGreaterThan(DECAL_CAP);
+    expect(decals.length).toBe(DECAL_CAP);
+    const key = (d: Decal) => JSON.stringify(d);
+    const kept = new Set(decals.map(key));
+    const dropped = full.filter((d) => !kept.has(key(d)));
+    expect(dropped.length).toBe(full.length - DECAL_CAP);
+    for (const d of dropped) {
+      expect(d.kind).toBe("grime");
+      expect(d.on).toBe("floor");
+    }
+    expect(decals.every((d) => full.some((f) => key(f) === key(d)))).toBe(true);
+  });
+
   it("keeps the rate table C15's, rank by rank (2.7 C15)", () => {
     // Mutation caught: a rate copied into the wrong condition's row.
     expect(DECAL_RATES).toEqual({
