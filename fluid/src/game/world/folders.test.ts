@@ -3,6 +3,7 @@ import { pathPermalink } from "../../permalink";
 import { deckNumber } from "./decals";
 import {
   SECTION_SIZE,
+  childFolder,
   clampSection,
   folderDeck,
   folderName,
@@ -78,6 +79,14 @@ describe("folders (M3 C6, C8)", () => {
     expect(parentFolder("")).toBeNull();
     expect(folderOfPath("notes/deep/x.md")).toBe("notes/deep");
     expect(folderOfPath("x.md")).toBe("");
+  });
+
+  it("nests a folder one level under its parent", () => {
+    // Mutation caught: the root guard dropped, so a top-level folder's name
+    // grows a leading slash instead of standing on its own.
+    expect(childFolder("", "notes")).toBe("notes");
+    expect(childFolder("notes", "deep")).toBe("notes/deep");
+    expect(parentFolder(childFolder("notes", "deep"))).toBe("notes");
   });
 
   it("knows the MANIFEST at the root only", () => {

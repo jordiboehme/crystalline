@@ -1,18 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import { engramRoute } from "../paths";
-import type { StationAddress } from "./world/types";
+import type { PlaceAddress, StationAddress } from "./world/types";
 import {
   MANIFEST_PERMALINK,
   addressOfGameLocation,
   bridgeAddress,
   canonicalStation,
+  domainOf,
   fluidRouteOf,
   fluidRouteOfStation,
   gameEngramRoute,
   gameRouteOf,
   placeKeyOf,
   sameStation,
+  stationOfPlace,
 } from "./paths";
 
 describe("gameEngramRoute", () => {
@@ -190,5 +192,41 @@ describe("station addresses (M3 C1 to C5)", () => {
       true,
     );
     expect(sameStation(null, { kind: "airlock" })).toBe(false);
+  });
+
+  it("names the domain of every address kind, or null for the airlock", () => {
+    // Mutation caught: the airlock's own domain read from a field it does
+    // not carry, instead of the null the doc promises.
+    expect(domainOf({ kind: "airlock" })).toBeNull();
+    expect(domainOf({ kind: "bridge", domain: "eng" })).toBe("eng");
+    expect(
+      domainOf({ kind: "deck", domain: "eng", folder: "x", section: 0 }),
+    ).toBe("eng");
+    expect(domainOf({ kind: "engram", domain: "eng", permalink: "a" })).toBe(
+      "eng",
+    );
+  });
+
+  it("turns a PlaceAddress into its canonical station, MANIFEST included", () => {
+    // Mutation caught: the address handed back as a plain engram room
+    // without running C3's canonicalisation, so the MANIFEST case never
+    // turns into the bridge.
+    const engram: PlaceAddress = { domain: "eng", permalink: "notes/x" };
+    expect(stationOfPlace(engram)).toEqual({
+      kind: "engram",
+      domain: "eng",
+      permalink: "notes/x",
+    });
+    const manifest: PlaceAddress = { domain: "eng", permalink: "MANIFEST" };
+    expect(stationOfPlace(manifest)).toEqual({
+      kind: "bridge",
+      domain: "eng",
+    });
+    const nested: PlaceAddress = { domain: "eng", permalink: "notes/manifest" };
+    expect(stationOfPlace(nested)).toEqual({
+      kind: "engram",
+      domain: "eng",
+      permalink: "notes/manifest",
+    });
   });
 });
