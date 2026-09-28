@@ -165,7 +165,7 @@ function standInPlace(domain: string, permalink: string): PlaceInput {
  * The listing is never fetched here directly: `loadPlace`'s own parallel
  * round (for the MANIFEST) already reads it, under the very key
  * `domainsQuery` names, to resolve a bracket link's domain prefix - so
- * this reads it back from that one attempt's cache (`client.getQueryData`,
+ * this reads it back from that one attempt's cache (`client.getQueryState`,
  * fetching nothing) once `loadPlace` has settled, whether that attempt
  * succeeded or failed. `loadPlace` reads every one of its four payloads in
  * parallel regardless of any other one failing, so the listing has always
@@ -173,6 +173,14 @@ function standInPlace(domain: string, permalink: string): PlaceInput {
  * `loadPlace`, would cost a second request on a failed listing (TanStack
  * Query does not treat an error result as fresh, so a second `fetchQuery`
  * for the same key retries rather than reusing it).
+ *
+ * The read is gated on the query's own `status`, not merely on whether it
+ * holds data: `getQueryState` keeps the last successful listing in `data`
+ * through a failed refetch, so on a warm cache a plain `getQueryData` would
+ * quietly serve a stale listing on a failure instead of the documented
+ * `engrams: null`, `private: false` defaults. Reading `status === "success"`
+ * only takes the listing when the attempt `loadPlace` just made is the one
+ * that answered it.
  */
 async function loadBridge(
   client: QueryClient,
@@ -222,7 +230,9 @@ async function loadBridge(
   let engrams: number | null = null;
   let priv = false;
   let display = domain;
-  const listing = client.getQueryData<DomainListing>(DOMAINS_QUERY_KEY);
+  const listingState = client.getQueryState<DomainListing>(DOMAINS_QUERY_KEY);
+  const listing =
+    listingState?.status === "success" ? listingState.data : undefined;
   if (listing !== undefined) {
     const row = listing.domains.find((d) => d.name === domain);
     if (row !== undefined) {

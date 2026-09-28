@@ -14,6 +14,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../../api/client";
+import { DOMAINS_QUERY_KEY } from "../../api/domains";
 import { engramDetailKey } from "../../api/engram";
 import type { Answer } from "../../test/harness";
 import { answersFor } from "../../test/harness";
@@ -409,6 +410,59 @@ describe("loadStation: a bridge (M3 C20, C22, C23, C29)", () => {
     expect(listingCalls).toHaveBeenCalledTimes(1);
   });
 
+  it("degrades to the documented defaults on a failed refetch, even with a warm cached listing", async () => {
+    // Mutation caught: reading the cached listing with `getQueryData`
+    // regardless of the latest attempt's own outcome (`getQueryState`'s
+    // `data` keeps the last successful listing through a failed refetch),
+    // instead of gating the read on that attempt's `status` - a warm
+    // cache would then quietly serve the stale listing (its old count,
+    // its old private flag, its old display name) instead of degrading to
+    // `engrams: null`, `private: false` and the domain key.
+    serve({
+      "/domains/eng/tree": () =>
+        treeResponse("eng", "", [], [treeRow("manifest")]),
+      "/domains": () =>
+        listingResponse([
+          domainRow("eng", {
+            engrams: 42,
+            private: true,
+            canonicalName: "Engineering Bay",
+          }),
+        ]),
+      "/domains/eng/engrams/manifest": () =>
+        detailResponse("eng", "manifest", "Eng", "manifest.md"),
+    });
+    const warm = await loadStation(client, { kind: "bridge", domain: "eng" });
+    expect(warm.kind).toBe("bridge");
+    if (warm.kind !== "bridge") return;
+    expect(warm.bridge).toMatchObject({
+      engrams: 42,
+      private: true,
+      display: "Engineering Bay",
+    });
+
+    // The listing is now warm in the cache. Mark it stale and fail its
+    // next attempt; the cache still holds the old, successful data.
+    await client.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+    serve({
+      "/domains/eng/tree": () =>
+        treeResponse("eng", "", [], [treeRow("manifest")]),
+      "/domains": () => {
+        throw new ApiProblem(500, "no", "listing failed");
+      },
+      "/domains/eng/engrams/manifest": () =>
+        detailResponse("eng", "manifest", "Eng", "manifest.md"),
+    });
+    const loaded = await loadStation(client, { kind: "bridge", domain: "eng" });
+    expect(loaded.kind).toBe("bridge");
+    if (loaded.kind !== "bridge") return;
+    expect(loaded.bridge).toMatchObject({
+      engrams: null,
+      private: false,
+      display: "eng",
+    });
+  });
+
   it("shows the domain's canonical name on the bridge screen, kept apart from its routing key", async () => {
     // Mutation caught: the canonical name written into `domain` (breaking
     // every deck stop's `to.domain`) instead of into `display`.
@@ -653,10 +707,13 @@ describe("loadStation: an engram (M3 C28, C29)", () => {
 
 describe("loadStation: cancellation (M3 C29)", () => {
   it("rejects at once when the signal is already aborted, for every address kind", async () => {
-    // Mutation caught: `checkAborted` dropped from `loadStation`'s entry
-    // point (or from any one loader's first line), so a signal that had
-    // already fired before the call was made would fall through to the
-    // first fetch instead of rejecting before any request is made.
+    // Defence in depth, not one reproducible mutation: `loadStation`'s own
+    // entry `checkAborted` and every loader's own first line (and
+    // `loadPlace`'s, on the bridge and engram paths) each independently
+    // reject an already-fired signal before any request is made, verified
+    // by hand - dropping `loadStation`'s own check alone leaves every
+    // loader's still catching it. What this pins is that no path is
+    // missing a guard altogether, not any single line.
     serve({});
     const controller = new AbortController();
     controller.abort();
@@ -675,9 +732,12 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts a bridge load during the tree fetch", async () => {
-    // Mutation caught: the trailing `checkAborted` after the tree fetch
-    // dropped, so a signal that fired while the tree was still in flight
-    // would go unnoticed and the load would carry on to the MANIFEST fetch.
+    // Defence in depth, not one reproducible mutation: the abort fires
+    // while the tree request is still in flight, so `abortable`'s own
+    // race, the trailing `checkAborted` after the tree's try/catch and
+    // `loadPlace`'s own entry check (reached next, on the degrade path)
+    // each independently catch it - verified by hand, dropping any one
+    // alone leaves this test green.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () => {
@@ -693,9 +753,12 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts a bridge load during the MANIFEST fetch", async () => {
-    // Mutation caught: the trailing `checkAborted` after `loadPlace`
-    // dropped, so a signal that fired while the MANIFEST was still loading
-    // would go unnoticed and the load would resolve with a stale bridge.
+    // Defence in depth, not one reproducible mutation: the abort fires
+    // while the MANIFEST detail request is still in flight, so
+    // `loadPlace`'s own `abortable` race, `loadPlace`'s own trailing
+    // `checkAborted` and `loadBridge`'s trailing `checkAborted` after the
+    // `await loadPlace(...)` each independently catch it - verified by
+    // hand, dropping any one alone leaves this test green.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () =>
@@ -712,9 +775,12 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts a deck load during the tree fetch", async () => {
-    // Mutation caught: the trailing `checkAborted` after the tree fetch
-    // dropped, so a signal that fired while the tree was still in flight
-    // would go unnoticed and the load would resolve with a stale deck.
+    // Defence in depth, not one reproducible mutation: the abort fires
+    // while the tree request is still in flight, so `abortable`'s own
+    // race (whose `AbortError` the `catch` block's `throw error;`
+    // re-throws unchanged) and the trailing `checkAborted` after the
+    // try/catch each independently catch it - verified by hand, dropping
+    // either alone leaves this test green.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () => {
@@ -732,9 +798,10 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts an airlock load during the listing fetch", async () => {
-    // Mutation caught: the trailing `checkAborted` after the listing fetch
-    // dropped, so a signal that fired while the listing was still loading
-    // would go unnoticed and the load would resolve with a stale airlock.
+    // Defence in depth, not one reproducible mutation: the abort fires
+    // while the listing request is still in flight, so `abortable`'s own
+    // race and the trailing `checkAborted` each independently catch it -
+    // verified by hand, dropping either alone leaves this test green.
     const controller = new AbortController();
     serve({
       "/domains": () => {
@@ -748,9 +815,13 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts an engram load during the detail fetch", async () => {
-    // Mutation caught: `loadEngram` swallowing `loadPlace`'s own
-    // `AbortError` (a `.catch` that maps every rejection to a fault kind,
-    // say) instead of letting it propagate.
+    // Defence in depth, not one reproducible mutation: `loadEngram` adds
+    // no guard of its own here - it inherits `loadPlace`'s abort contract
+    // unchanged, and that contract's own two guards (its `abortable` race
+    // and its trailing `checkAborted`) were each independently verified
+    // to catch this same in-flight-abort shape when the bridge's MANIFEST
+    // fetch was reproduced above. What this test pins is that `loadEngram`
+    // does not swallow what `loadPlace` already rejects with.
     const controller = new AbortController();
     serve({
       "/domains/eng/engrams/alpha": () => {
