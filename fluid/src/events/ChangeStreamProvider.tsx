@@ -16,7 +16,12 @@
  * 2026-09-27): a listener registration usable from anywhere, in any tab,
  * inside the shell or not. It never opens a second connection and never
  * polls; a listener in a tab with no shell makes that tab take part in the
- * stream on its own.
+ * stream on its own. Without options the listener hears every frame this
+ * tab takes. A subscriber that shows somebody as signed in passes
+ * `identity`: it is then registered like the shell, so frames streamed as
+ * another account never reach it and it is asked to re-check when the
+ * session ended or moved. `onCarrier` hears the stream go down and come
+ * back. `subscribeOn` is the same on a given hub.
  */
 
 import type { Query } from "@tanstack/react-query";
@@ -26,7 +31,7 @@ import { useEffect, useMemo } from "react";
 
 import type { ChangeEvent } from "../api/events";
 import { ME_QUERY_KEY } from "../auth/keys";
-import type { ChangeHub, ChangeListener } from "./hub";
+import type { ChangeConsumer, ChangeHub, ChangeListener } from "./hub";
 import { defaultHub } from "./hub";
 import type { IgnoredEngrams } from "./ignored";
 import { IgnoredEngramsContext, createIgnoredEngrams } from "./ignored";
@@ -44,15 +49,61 @@ export type {
 /** How long after the first frame the pending keys wait for company. */
 export const COALESCE_MS = 250;
 
+/** What a subscriber outside the shell may hand the stream (M4 C10, C11). */
+export interface StreamSubscription {
+  /** Who the subscriber shows as signed in, and how it re-asks. */
+  identity?: { held(): unknown; recheck(): void };
+  /** The stream went down (false) or came back (true). */
+  onCarrier?: (up: boolean) => void;
+}
+
 /**
- * Register `listener` on the one stream, usable outside `Layout` and in any
- * tab. Returns the unsubscribe function. No second connection, no polling:
- * this fans out whatever the browser's one `EventSource` receives.
+ * `subscribeToChanges` on a given hub: the seam the tests build tabs with.
+ *
+ * Without options this is `hub.subscribe(listener)`. With either option the
+ * listener is attached as a `ChangeConsumer`, which counts as a shell
+ * mounting (it takes a tab whose session ended back into the running). A
+ * consumer whose `held()` answers `undefined`, or one that passes no
+ * `identity` at all, counts as "no shell" when the hub asks who this tab
+ * shows: it filters nothing and leaves the leader to probe the account it
+ * streams as.
  */
 // The seam is the point of this module as much as the provider is.
 // eslint-disable-next-line react-refresh/only-export-components
-export function subscribeToChanges(listener: ChangeListener): () => void {
-  return defaultHub().subscribe(listener);
+export function subscribeOn(
+  hub: ChangeHub,
+  listener: ChangeListener,
+  options?: StreamSubscription,
+): () => void {
+  if (!options?.identity && !options?.onCarrier) {
+    return hub.subscribe(listener);
+  }
+  // Called on the object it came with, so a subscriber's methods keep
+  // their `this`.
+  const identity = options.identity;
+  const consumer: ChangeConsumer = {
+    onEvent: listener,
+    heldIdentity: () => identity?.held(),
+    recheckIdentity: () => {
+      identity?.recheck();
+    },
+    ...(options.onCarrier ? { onCarrier: options.onCarrier } : {}),
+  };
+  return hub.attach(consumer);
+}
+
+/**
+ * Register `listener` on the one stream, usable outside `Layout` and in any
+ * tab: `subscribeOn(defaultHub(), ...)`. Returns the unsubscribe function.
+ * No second connection, no polling: this fans out whatever the browser's
+ * one `EventSource` receives.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export function subscribeToChanges(
+  listener: ChangeListener,
+  options?: StreamSubscription,
+): () => void {
+  return subscribeOn(defaultHub(), listener, options);
 }
 
 /** Whether `key` is the detail or a graph of an engram the editor holds. */

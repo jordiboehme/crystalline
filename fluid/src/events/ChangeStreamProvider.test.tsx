@@ -6,8 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem } from "../api/client";
 import { ME_QUERY_KEY } from "../auth/keys";
+import type { StreamSubscription } from "./ChangeStreamProvider";
 import {
   ChangeStreamProvider,
+  subscribeOn,
   subscribeToChanges,
 } from "./ChangeStreamProvider";
 import { CLAIM_MS, LEADER_TIMEOUT_MS } from "./election";
@@ -248,6 +250,7 @@ describe("the change stream in one tab", () => {
 
   it("a source that reconnects on its own is left to the browser", async () => {
     const probe = vi.fn(signedIn);
+    client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, lone({ sessionProbe: probe }));
     act(() => {
       theSource().fail(0);
@@ -270,6 +273,7 @@ describe("the change stream in one tab", () => {
       .mockImplementation(signedIn);
     const hub = lone({ sessionProbe: probe });
     const unsubscribe = hub.subscribe((event) => seen.push(event.event));
+    client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, hub);
     act(() => {
       theSource().fail(2);
@@ -341,6 +345,7 @@ describe("the change stream in one tab", () => {
     const probe = vi
       .fn<SessionProbe>()
       .mockRejectedValue(new ApiProblem(401, "unauthorized", ""));
+    client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     await mount(client, <div />, lone({ sessionProbe: probe }));
     act(() => {
       theSource().fail(2);
@@ -1010,5 +1015,264 @@ describe("one stream per browser", () => {
       await settle();
       expect(second.resets()).toBe(1);
     });
+  });
+});
+
+describe("subscribeOn with options (M4 C10, C11)", () => {
+  const me = (name: string) => ({ user: { name } });
+
+  /** Every message a tab of `fake` posts on the stream's channel. */
+  function overhear(fake: ReturnType<typeof browser>) {
+    const messages: unknown[] = [];
+    const channel = new FakeBroadcastChannel(STREAM_NAME, fake.bus);
+    channel.onmessage = (event: MessageEvent) => {
+      messages.push(event.data);
+    };
+    return {
+      messages,
+      /** The account the frames posted so far were streamed as. */
+      accounts: () =>
+        messages
+          .filter(
+            (message): message is { type: "frame"; account: unknown } =>
+              (message as { type?: unknown }).type === "frame",
+          )
+          .map((message) => message.account),
+      close: () => {
+        channel.close();
+      },
+    };
+  }
+
+  it("filters a subscriber by the identity it passes, and rechecks the stale side (Review Focus 4)", async () => {
+    // Catches `options.identity` ignored (the listener added with
+    // `subscribe`, so `ownIdentity()` stays undefined and another account's
+    // frame gets through), or `recheck` never wired. Both arms of
+    // `mismatch()` are pinned: the stale follower and the stale leader.
+    for (const cookie of ["ada", "bob"]) {
+      FakeEventSource.instances = [];
+      const fake = browser();
+      const probe: SessionProbe = () => Promise.resolve(me(cookie));
+      const shell = recordingClient();
+      shell.client.setQueryData(ME_QUERY_KEY, me("ada"));
+      await mount(shell.client, <div />, fake.tab({ sessionProbe: probe }));
+      const heard: string[] = [];
+      const recheck = vi.fn();
+      const leave = subscribeOn(
+        fake.tab({ sessionProbe: probe }),
+        (event) => heard.push(event.event),
+        { identity: { held: () => me("bob"), recheck } },
+      );
+      await settle();
+      expect(FakeEventSource.instances, `${cookie}: one stream`).toHaveLength(
+        1,
+      );
+      act(() => {
+        theSource().emit("engram", engram("alpha"), "1:1");
+      });
+      await settle();
+      expect(heard, `${cookie}: ada's frame never reaches bob`).not.toContain(
+        "engram",
+      );
+      if (cookie === "ada") {
+        // The subscriber's tab is the stale one: it re-asks and resets.
+        expect(recheck).toHaveBeenCalledTimes(1);
+        expect(heard).toEqual(["reset"]);
+        expect(FakeEventSource.instances, "the leader stays").toHaveLength(1);
+      } else {
+        // The leader is the stale one: it re-checks and reopens as bob.
+        expect(recheck).not.toHaveBeenCalled();
+        expect(heard).toEqual([]);
+        expect(
+          shell.invalidate,
+          "the leader's shell re-asks who is signed in",
+        ).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+        expect(FakeEventSource.instances, "reopened as bob").toHaveLength(2);
+      }
+      leave();
+      cleanup();
+      await settle();
+    }
+  });
+
+  it("lets a lone plain listener's leader stream as the probed account", async () => {
+    // Catches `lead()` probing only while `consumers.size === 0`: a
+    // carrier-only subscriber is a consumer without an identity, and the
+    // leader would stream as account null, which stops other tabs' shells
+    // from filtering (F12).
+    const subscribers: [string, StreamSubscription | undefined][] = [
+      ["a plain listener", undefined],
+      ["a carrier-only subscriber", { onCarrier: () => undefined }],
+    ];
+    expect(subscribers.length).toBeGreaterThan(0);
+    for (const [name, options] of subscribers) {
+      FakeEventSource.instances = [];
+      const fake = browser();
+      const other = overhear(fake);
+      const leave = subscribeOn(fake.tab(), () => undefined, options);
+      await settle();
+      expect(FakeEventSource.instances, name).toHaveLength(1);
+      act(() => {
+        theSource().emit("engram", engram("alpha"), "1:1");
+      });
+      await settle();
+      expect(other.accounts(), name).toEqual(["user:ada"]);
+      leave();
+      other.close();
+      await settle();
+    }
+  });
+
+  it("keeps a subscription without options a plain listener: it never wakes a tab whose session ended", async () => {
+    // Catches every call routed through `attach`, which counts as a shell
+    // mounting and takes the tab back into the running (C10: without
+    // options the call behaves exactly as `subscribe`).
+    const unauthorized = () =>
+      Promise.reject(new ApiProblem(401, "unauthorized", ""));
+    const hub = lone({ sessionProbe: unauthorized });
+    const view = await mount(recordingClient().client, <div />, hub);
+    act(() => {
+      theSource().fail(2);
+    });
+    await settle();
+    const leave = subscribeOn(hub, () => undefined);
+    await advance(60_000);
+    expect(FakeEventSource.instances, "still out of the running").toHaveLength(
+      1,
+    );
+    leave();
+    view.unmount();
+  });
+
+  it("carries the carrier to every tab (Review Focus 4)", async () => {
+    // Catches only the leader told, the state not deduplicated (two downs
+    // for one drop), the first open reported as a change, or the message
+    // type not accepted by `readMessage`.
+    const fake = browser();
+    const carriers: boolean[][] = [[], []];
+    const leaves = carriers.map((seen) =>
+      subscribeOn(fake.tab(), () => undefined, {
+        onCarrier: (up) => seen.push(up),
+      }),
+    );
+    await settle();
+    expect(FakeEventSource.instances, "one leader").toHaveLength(1);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(carriers, "the first open is no change").toEqual([[], []]);
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    expect(carriers, "down in the leader and the follower").toEqual([
+      [false],
+      [false],
+    ]);
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    expect(carriers, "one drop is one down").toEqual([[false], [false]]);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(carriers, "and up again everywhere").toEqual([
+      [false, true],
+      [false, true],
+    ]);
+    for (const leave of leaves) leave();
+  });
+
+  it("reports a closed source as down and its replacement's open as up", async () => {
+    // Catches only the CONNECTING error counted: a 502 closes the source,
+    // the probe answers the same account, and a new one opens after the
+    // backoff.
+    const carrier: boolean[] = [];
+    const leave = subscribeOn(lone(), () => undefined, {
+      onCarrier: (up) => carrier.push(up),
+    });
+    await settle();
+    act(() => {
+      theSource().open();
+      theSource().fail(2);
+    });
+    await settle();
+    expect(carrier, "down at the error").toEqual([false]);
+    await advance(1_000);
+    expect(FakeEventSource.instances, "reopened").toHaveLength(2);
+    expect(carrier, "nothing until the new source opens").toEqual([false]);
+    act(() => {
+      sourceAt(1).open();
+    });
+    await settle();
+    expect(carrier).toEqual([false, true]);
+    leave();
+  });
+
+  it("keeps one throwing consumer from costing the others their frame", async () => {
+    // Catches `consumer.onEvent` called outside the try/catch (F30).
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const hub = lone();
+    const identity = { held: () => me("ada"), recheck: () => undefined };
+    const seen: string[] = [];
+    const first = subscribeOn(
+      hub,
+      () => {
+        throw new Error("boom");
+      },
+      { identity },
+    );
+    const second = subscribeOn(hub, (event) => seen.push(event.event), {
+      identity,
+    });
+    await settle();
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    expect(seen).toEqual(["engram"]);
+    expect(error).toHaveBeenCalledTimes(1);
+    first();
+    second();
+    error.mockRestore();
+  });
+});
+
+describe("subscribeToChanges (M4 C10)", () => {
+  it("routes through this tab's default hub, with or without options", async () => {
+    // Catches `subscribeToChanges` not delegating to `subscribeOn` with
+    // `defaultHub()`: its options dropped, or another hub than the shell's.
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const { client } = recordingClient();
+    const seen: string[] = [];
+    const carrier: boolean[] = [];
+    const unsubscribe = subscribeToChanges((event) => seen.push(event.event), {
+      onCarrier: (up) => carrier.push(up),
+    });
+    await settle();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <ChangeStreamProvider>
+          <div />
+        </ChangeStreamProvider>
+      </QueryClientProvider>,
+    );
+    await settle();
+    expect(FakeEventSource.instances, "the shell's one source").toHaveLength(1);
+    const source = theSource();
+    act(() => {
+      source.emit("engram", engram("alpha"), "1:1");
+      source.fail(0);
+    });
+    expect(seen).toEqual(["engram"]);
+    expect(carrier).toEqual([false]);
+    unsubscribe();
+    view.unmount();
+    await settle();
+    expect(source.readyState, "nobody wants it any more").toBe(2);
   });
 });

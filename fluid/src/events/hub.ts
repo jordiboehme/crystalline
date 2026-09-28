@@ -28,9 +28,24 @@
  *   the two is stale: a stale tab re-asks who is signed in and resets, a
  *   stale leader re-checks its session and reopens as the cookie's account,
  *   with a reset. Another account is never taken as a session that ended.
+ *   A tab where no consumer holds an identity (no shell, or only
+ *   subscribers that pass none) has no account of its own, so its leading
+ *   stream asks the probe which account it streams as.
+ *
+ * The carrier: whether frames flow. The leader reports it down on any
+ * `error` of its source (the browser's own reconnect included, since
+ * nothing arrives while it runs) and up when a source opens, and tells the
+ * other tabs over the channel, so every tab's consumers hear one change
+ * per drop and one per return. A fresh hub starts with the carrier up, so
+ * the first `open` is no change.
  *
  * A tab takes part while anything in it wants the stream: a mounted
- * provider or a `subscribe` listener. It leaves when the last one goes.
+ * provider, a consumer attached from outside the shell, or a `subscribe`
+ * listener. It leaves when the last one goes. Attaching a consumer counts
+ * as the shell mounting: it takes a tab whose session was found ended back
+ * into the running. A consumer attached with an identity after the session
+ * ended only wakes a stream that answers 401 again, which is harmless:
+ * `RequireAuth` has already sent the route to the login screen.
  */
 
 import { API_BASE, ApiProblem, api } from "../api/client";
@@ -65,7 +80,10 @@ export type SessionProbe = () => Promise<unknown>;
 /** A callback for every frame the one stream carries, whatever it invalidates. */
 export type ChangeListener = (event: ChangeEvent) => void;
 
-/** What a mounted provider hands the hub. */
+/**
+ * What a mounted provider hands the hub, and what a subscriber outside the
+ * shell that passes an identity is registered as.
+ */
 export interface ChangeConsumer {
   /** Every frame, in order, the resets included. */
   onEvent(event: ChangeEvent): void;
@@ -74,8 +92,14 @@ export interface ChangeConsumer {
    * names somebody other than the one this tab shows.
    */
   recheckIdentity(): void;
-  /** The capability answer this tab holds: who its shell says is signed in. */
+  /**
+   * The capability answer this tab holds: who its shell says is signed in.
+   * `undefined` is "no shell": the consumer filters nothing and leaves the
+   * leader to ask the probe.
+   */
   heldIdentity(): unknown;
+  /** The stream went down (`false`) or came back (`true`). */
+  onCarrier?(up: boolean): void;
 }
 
 /**
@@ -96,19 +120,24 @@ export interface HubDeps {
  * What the tabs say to each other. A frame names the account the leader's
  * stream was opened as, so a tab signed in as somebody else never takes
  * it; `recheck` asks the leader to find out whether it still streams as the
- * right account.
+ * right account; `carrier` passes on whether the leader's stream is up.
  */
 type Message =
   | { type: "frame"; event: ChangeEvent; account: string | null }
   | { type: "ended" }
-  | { type: "recheck" };
+  | { type: "recheck" }
+  | { type: "carrier"; up: boolean };
 
 /**
  * A message from another tab of this app. Its frames were read by
  * `parseFrame` there, so they are taken as they came.
  */
 function readMessage(value: unknown): Message | null {
-  const type = asObject(value)?.type;
+  const message = asObject(value);
+  const type = message?.type;
+  if (type === "carrier") {
+    return typeof message?.up === "boolean" ? { type, up: message.up } : null;
+  }
   return type === "frame" || type === "ended" || type === "recheck"
     ? (value as Message)
     : null;
@@ -160,6 +189,8 @@ export class ChangeHub {
   private leaderRecheck: (() => void) | null = null;
   private checking = false;
   private quietUntil = 0;
+  /** Whether frames flow; see the module doc. */
+  private carrierUp = true;
 
   constructor(deps: HubDeps = {}) {
     this.deps = deps;
@@ -233,6 +264,8 @@ export class ChangeHub {
   private stop(): void {
     this.election?.stop();
     this.election = null;
+    // A tab out of the running has no stream to be down.
+    this.carrierUp = true;
     if (this.channel) {
       this.channel.onmessage = null;
       this.channel.close();
@@ -248,6 +281,8 @@ export class ChangeHub {
       this.sessionEnded(false);
     } else if (message.type === "recheck") {
       this.leaderRecheck?.();
+    } else if (message.type === "carrier") {
+      this.setCarrier(message.up, false);
     } else {
       this.deliver(message.event, message.account);
     }
@@ -260,6 +295,17 @@ export class ChangeHub {
       if (held !== undefined) return identityOf(held);
     }
     return undefined;
+  }
+
+  /**
+   * The stream went down or came back: tell this tab's consumers, and with
+   * `broadcast` the other tabs too. Only a change is passed on.
+   */
+  private setCarrier(up: boolean, broadcast: boolean): void {
+    if (up === this.carrierUp) return;
+    this.carrierUp = up;
+    if (broadcast) this.channel?.postMessage({ type: "carrier", up });
+    for (const consumer of [...this.consumers]) consumer.onCarrier?.(up);
   }
 
   private probeIdentity(): Promise<Probed> {
@@ -315,9 +361,9 @@ export class ChangeHub {
   }
 
   private fanOut(event: ChangeEvent): void {
+    // One listener's or consumer's bug must not cost the page its own
+    // refresh, nor the others after it their frame.
     for (const listener of [...this.listeners]) {
-      // One listener's bug must not cost the page its own refresh, nor the
-      // listeners after it their frame.
       try {
         listener(event);
       } catch (error) {
@@ -325,7 +371,11 @@ export class ChangeHub {
       }
     }
     for (const consumer of [...this.consumers]) {
-      consumer.onEvent(event);
+      try {
+        consumer.onEvent(event);
+      } catch (error) {
+        console.error("a change consumer threw", error);
+      }
     }
   }
 
@@ -362,10 +412,10 @@ export class ChangeHub {
     let attempt = 0;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let detach: (() => void) | null = null;
-    // The account the stream opens as is the one this tab shows; a tab with
-    // no shell asks.
+    // The account the stream opens as is the one this tab shows; a tab
+    // where no consumer holds an identity asks.
     this.account = this.ownIdentity() ?? null;
-    if (this.consumers.size === 0) {
+    if (this.ownIdentity() === undefined) {
       void this.probeIdentity().then((probed) => {
         if (!ended && this.account === null && probed.kind === "is") {
           this.account = probed.identity;
@@ -434,6 +484,7 @@ export class ChangeHub {
       }
       const onOpen = () => {
         attempt = 0;
+        this.setCarrier(true, true);
         if (gap) {
           // Nothing said what happened while no source was open.
           gap = false;
@@ -442,6 +493,8 @@ export class ChangeHub {
       };
       source.addEventListener("open", onOpen);
       source.onerror = () => {
+        // Down either way: nothing arrives while the browser reconnects.
+        this.setCarrier(false, true);
         // CONNECTING is the browser mid-reconnect, with `Last-Event-ID`.
         if (source.readyState !== CLOSED) return;
         detach?.();
