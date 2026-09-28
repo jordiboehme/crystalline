@@ -167,6 +167,13 @@ impl Engine {
     /// path: another engram there is never replaced, and an unreadable file is
     /// replaced only by an overwrite. Run once unlocked (for the message) and
     /// again under the write lock (for the race).
+    ///
+    /// Inside a join (`join` is the one that took), the owner an overwrite
+    /// finds is screened against the granted page before anything names it:
+    /// it can be a file only the owner's draft holds, and every refusal below
+    /// would print its path. The screen's own refusal names `rel`, the path
+    /// the caller built. Both runs screen, so a holder that moved while the
+    /// write waited is screened as well.
     #[allow(clippy::too_many_arguments)]
     async fn capture_landing(
         &self,
@@ -177,10 +184,16 @@ impl Engine {
         rel: &str,
         permalink: &str,
         overwrite: bool,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
     ) -> Result<String> {
         let path = match overwrite {
             true => match view.permalink_holder(domain_id, permalink).await? {
                 Some(held) => {
+                    if let Some(join) = join {
+                        self.screen_granted_path_named(domain, &held, rel, scope, Some(join))
+                            .await?;
+                    }
                     refuse_other_folder(domain, permalink, &held, rel)?;
                     held
                 }
@@ -353,6 +366,8 @@ impl Engine {
                 &rel,
                 &permalink,
                 p.overwrite,
+                scope,
+                join,
             )
             .await;
         // A join is into ONE draft: screened on where the capture would land,
@@ -567,6 +582,8 @@ impl Engine {
                 &rel,
                 &permalink,
                 p.overwrite,
+                scope,
+                join,
             )
             .await?;
         if settled != path {
@@ -726,8 +743,11 @@ impl Engine {
         // A replacement preview, so the landing an overwrite would take. A
         // landing that cannot be worked out answers `None` here: the write
         // raises the real refusal a moment later, after its own join screen.
+        let joined = join.filter(|_| view.joined().is_some());
         let path = self
-            .capture_landing(&view, domain_id, &source, &p.domain, &rel, &permalink, true)
+            .capture_landing(
+                &view, domain_id, &source, &p.domain, &rel, &permalink, true, scope, joined,
+            )
             .await
             .ok()?;
         // The same screen the write runs, run before anybody is named: a
@@ -735,7 +755,7 @@ impl Engine {
         // in the owner's overlay is refused by the write, and a question that
         // named who is in the room over that page would have disclosed it
         // ahead of the gate that refuses.
-        if let Some(join) = join.filter(|_| view.joined().is_some()) {
+        if let Some(join) = joined {
             self.screen_granted_path_named(&p.domain, &path, &rel, scope, Some(join))
                 .await
                 .ok()?;
@@ -1902,5 +1922,109 @@ mod landing_race_tests {
             "nothing written at the old landing"
         );
         assert_eq!(std::fs::read_to_string(root.join(RENAMED)).unwrap(), ENGRAM);
+    }
+
+    /// A joined overwrite waits for the owner's draft lock while the owner's
+    /// draft changes under it: the page granted to bob now answers to another
+    /// permalink, and the one bob addressed belongs to a file only her draft
+    /// holds, in another folder. The landing settled under the lock is
+    /// screened like the first one, so the refusal names the path bob built
+    /// and never that file.
+    #[tokio::test]
+    async fn a_joined_overwrite_whose_owner_moves_while_it_waits_names_no_private_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("conventions")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        std::fs::write(root.join(OWNER), ENGRAM).unwrap();
+        let mut entry = DomainEntry::file(root.clone());
+        entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+        let mut config = GlobalConfig::default();
+        config.domains.insert("notes".to_string(), entry);
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), config, None, None)
+                .with_state_dir(tmp.path().join("state")),
+        );
+        engine.sync(None).await.unwrap();
+        let params = |content: &str| WriteParams {
+            domain: "notes".to_string(),
+            title: "Code Review Standards".to_string(),
+            content: content.to_string(),
+            folder: Some("conventions".to_string()),
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: true,
+            share_link: None,
+            model: None,
+        };
+        let ada = crate::scope::Scope::User {
+            account: "ada".to_string(),
+            admin: false,
+        };
+        engine
+            .write_engram_as(&params("Ada's rule."), None, &ada)
+            .await
+            .unwrap();
+
+        let join = crate::join::Join {
+            account: "bob".to_string(),
+            holder: crate::join::Holder::Process(1),
+            domain: "notes".to_string(),
+            path: OWNER.to_string(),
+            owner: "ada".to_string(),
+            expires_at: None,
+        };
+        let lock = engine.draft_lock("notes", "ada", OWNER).unwrap();
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            let bobs = params("Bob's rule.");
+            tokio::spawn(async move {
+                let bob = crate::scope::Scope::User {
+                    account: "bob".to_string(),
+                    admin: false,
+                };
+                engine
+                    .write_engram_joined(&bobs, None, &bob, Some(&join))
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Ada's draft changes while bob waits, written straight into her
+        // rows: her own verbs would queue behind the lock this test holds.
+        {
+            let store = engine.store.lock().await;
+            let domain_id = store.domain_id("notes").await.unwrap().unwrap();
+            let other = ENGRAM.replace(
+                "permalink: conventions/code-review-standards",
+                "permalink: other-page",
+            );
+            for (path, text) in [(OWNER, other.as_str()), ("private/Secret Plan.md", ENGRAM)] {
+                let record = Engine::overlay_record(path, text).unwrap();
+                store
+                    .upsert_overlay(domain_id, "ada", &record)
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this session is working inside ada's draft of 'conventions/Code Review Standards.md', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+        );
+        assert!(!err.contains("Secret Plan"), "{err}");
     }
 }

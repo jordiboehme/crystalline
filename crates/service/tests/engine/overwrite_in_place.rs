@@ -594,3 +594,75 @@ async fn a_write_the_index_refuses_leaves_the_file_as_it_found_it() {
 
     store.lock().await.rollback().await.unwrap();
 }
+
+/// Moves one of ada's drafts, keeping its permalink.
+async fn ada_moves(engine: &Engine, identifier: &str, destination: &str) {
+    engine
+        .move_engram_as(
+            &MoveParams {
+                identifier: identifier.to_string(),
+                domain: "notes".to_string(),
+                destination: destination.to_string(),
+                destination_domain: None,
+                permalink: Some("keep".to_string()),
+                update_links: None,
+            },
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_joined_landing_refusal_never_names_a_file_only_the_owners_draft_holds() {
+    let (_tmp, engine, _scratch) = fixture(true, &[]).await;
+    // The permalink the capture addresses lives in a draft-only file in
+    // another folder...
+    engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Private.",
+                false,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    ada_moves(&engine, PERMALINK, "private/Secret Plan.md").await;
+    // ...and the slug path, which is the page granted to bob, holds another
+    // engram of hers.
+    engine
+        .write_engram_as(
+            &capture("Other Page", Some("conventions"), "Granted.", false),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    ada_moves(&engine, "conventions/other-page", SLUG).await;
+
+    let (bob, mut join) = bob_in_adas_draft();
+    join.path = SLUG.to_string();
+    let err = engine
+        .write_engram_joined(
+            &capture("Code Review Standards", Some("conventions"), "x", true),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "this session is working inside ada's draft of 'conventions/code-review-standards.md', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+    );
+    assert!(
+        !err.contains("Secret Plan") && !err.contains("private"),
+        "{err}"
+    );
+}
