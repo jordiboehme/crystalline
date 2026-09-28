@@ -332,8 +332,11 @@ export function surfaces(look: Look, own = false) {
         ? { layer: LAYER.panel, tint: propMarkTint(k), flag: FLAG.lit }
         : fallback,
   } satisfies Record<string, Surface | ((...args: never[]) => Surface)>;
-  /** True when `own` marks a part: a part only that look draws may be added. */
-  return { ...all, owns: own };
+  return {
+    ...all,
+    /** True when `own` marks a part: a part only that look draws may be added. */
+    owns: own,
+  };
 }
 
 /** The surfaces `surfaces` returns. */
