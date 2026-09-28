@@ -2182,7 +2182,9 @@ fn detect_unsourced_ingest(input: &SweepInput, graph: &Graph<'_>, report: &mut S
     for fact in &input.engrams {
         if fact.is_retired()
             || fact.resource.is_some()
-            || V111_EXEMPT_TYPES.contains(&fact.engram_type.as_str())
+            || V111_EXEMPT_TYPES
+                .iter()
+                .any(|t| fact.engram_type.eq_ignore_ascii_case(t))
         {
             continue;
         }

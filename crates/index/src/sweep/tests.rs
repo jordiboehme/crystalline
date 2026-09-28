@@ -2184,6 +2184,22 @@ fn v111_never_flags_the_record_a_retired_engram_or_a_manifest() {
 }
 
 #[test]
+fn v111_exempt_types_are_matched_case_insensitively() {
+    let record = ingestion_record(1, "sources/ops-wiki", None);
+    let mut manifest = fact(2, "manifest");
+    manifest.engram_type = "Manifest".to_string();
+    let mut schema = fact(3, "schema-def");
+    schema.engram_type = "SCHEMA".to_string();
+    let mut sweep = input(vec![record, manifest, schema]);
+    sweep.graph.edges = vec![wikilink(1, 2), wikilink(1, 3)];
+    assert!(
+        !fired(&detect(&sweep)).contains(&"V111"),
+        "an exempt type spelled in another case must still be exempt: {:?}",
+        fired(&detect(&sweep))
+    );
+}
+
+#[test]
 fn the_catalog_carries_twenty_five_rules_and_v006_is_temporal() {
     assert_eq!(RULES.len(), 25);
     let info = rule_info("V006").expect("V006 is in the catalog");
