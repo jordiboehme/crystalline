@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
-import { ACCENT_MARK, FLAG } from "./geometry";
+import { ACCENT_MARK, FLAG, PROP_MARK } from "./geometry";
 import rendererSource from "./renderer.ts?raw";
-import { LOOK_ORDER, LOOKS } from "./looks";
+import { ACCENT_COUNT, LOOK_ORDER, LOOKS } from "./looks";
 import { SCENE_FS, SCENE_VS, SIGNAL_GAIN } from "./shaders";
 
 describe("the scene shader's blink and signal paths", () => {
@@ -113,9 +113,29 @@ it("swaps the accent mark for uAccent in the vertex shader (2.7 C8)", () => {
   // draw with a negative red), or the mark tested on the wrong channel.
   expect(SCENE_VS).toContain("uniform vec3 uAccent;");
   expect(SCENE_VS).toContain(
-    "vTint = aTint.x < 0.0 ? uAccent * aTint.y : aTint;",
+    "vTint = aTint.x < -1.5 ? ownAccent * aTint.y : aTint.x < 0.0 ? uAccent * aTint.y : aTint;",
   );
   expect(ACCENT_MARK).toBeLessThan(0);
+  expect(ACCENT_MARK).toBeGreaterThan(-1.5);
+});
+
+it("swaps a prop's own mark for the look's accent at the instance's pick, the room's with no pick", () => {
+  // Mutation caught: the pick read from the turn's low bits (it would
+  // turn the prop), the turn read from the whole float (a prop with a
+  // pick would turn by it), an off-by-one pick (pick 0, no pick, would
+  // index the array), or an accents array shorter than a look's.
+  expect(PROP_MARK).toBeLessThan(-1.5);
+  expect(SCENE_VS).toContain("uniform vec3 uAccents[5];");
+  expect(ACCENT_COUNT).toBe(5);
+  for (const look of Object.values(LOOKS))
+    expect(look.accents.length, look.id).toBe(ACCENT_COUNT);
+  expect(SCENE_VS).toContain("int turnPick = int(aInstanceTurn.x + 0.5);");
+  expect(SCENE_VS).toContain("mat2 turn = TURNS[turnPick & 3];");
+  expect(SCENE_VS).toContain("int pick = turnPick >> 2;");
+  expect(SCENE_VS).toContain(
+    "vec3 ownAccent = pick == 0 ? uAccent : uAccents[pick - 1];",
+  );
+  expect(rendererSource).toContain('scene.uniform("uAccents")');
 });
 
 describe("the scene shader's decal branch", () => {

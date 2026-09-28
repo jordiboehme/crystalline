@@ -17,6 +17,15 @@
  * seat, the trolley's top grip bar and the tool cart's drawer fronts. The
  * barrel's two ribs carry it too, as its middle band, on every barrel of
  * the cluster (variant 1). No other floor prop carries it.
+ *
+ * In a look with `propAccents` a prop paints exactly one part in its own
+ * accent instead (`s.own`) and the parts above turn dark metal: the stool's
+ * and the bench's seat, the trolley's grip bar, the tool cart's top drawer
+ * front, one barrel's upper rib, a crate's lid, a band on the crate stack,
+ * the filing cabinet's top drawer front, one box on the storage shelf, the
+ * fume cabinet's flue and one drum of the rack. A part only that look
+ * draws (a lid, a band) is added only there, so the other looks' meshes
+ * stay as they were.
  */
 
 import type { Surface } from "../../geometry";
@@ -129,10 +138,20 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       0.03,
       s.body,
     );
+    // The lid, drawn only in a look with the prop's own accent.
+    const lid = s.own(s.body);
+    if (lid !== s.body)
+      k.box(-hw + post, hw - post, -hd + post, hd - post, H, H + 0.03, lid);
     return;
   }
   if (variant === 1) {
     k.bevelBox(-hw, hw, -hd, hd, 0, CRATE_H.large, 0.04, s.body);
+    // The lid, drawn only in a look with the prop's own accent.
+    const lid = s.own(s.body);
+    if (lid !== s.body) {
+      const H = CRATE_H.large;
+      k.box(-hw + 0.06, hw - 0.06, -hd + 0.06, hd - 0.06, H, H + 0.03, lid);
+    }
     return;
   }
   const H1 = CRATE_H.large * 0.8;
@@ -151,6 +170,18 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     0.025,
     s.body,
   );
+  // The small crate's lid, drawn only in a look with the prop's own accent.
+  const lid = s.own(s.body);
+  if (lid !== s.body)
+    k.box(
+      offA - sw + 0.03,
+      offA + sw - 0.03,
+      offD - sd + 0.03,
+      offD + sd - 0.03,
+      H1 + CRATE_H.stackedSmall,
+      H1 + CRATE_H.stackedSmall + 0.025,
+      lid,
+    );
 }
 
 /** Ribs, lid and radius shared between the barrel's variants. */
@@ -173,7 +204,8 @@ const RIB_PROUD = 0.008;
  * with two ribs and a lid, `sides` facets round. `band` colours the two
  * ribs (plain dark metal by default); `barrel` passes the room's accent so
  * every barrel of the cluster carries it, `drumRack` leaves it as it was.
- * `inset` is documented on `RIB_PROUD`.
+ * `inset` is documented on `RIB_PROUD`. `top` colours the upper rib alone
+ * (`band` by default), where a prop's own accent goes.
  */
 function oneBarrel(
   k: Kit,
@@ -186,6 +218,7 @@ function oneBarrel(
   base = 0,
   band: Surface = s.dark,
   inset: number = BARREL.ribTube,
+  top: Surface = band,
 ): void {
   k.cylinder(a, d, base, base + height, radius, sides, s.metal);
   for (const h of [height * 0.3, height * 0.7]) {
@@ -197,7 +230,7 @@ function oneBarrel(
       BARREL.ribTube,
       6,
       sides,
-      band,
+      h > height / 2 ? top : band,
       "up",
     );
   }
@@ -233,6 +266,7 @@ function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       0,
       s.accent(),
       inset,
+      s.own(s.accent()),
     );
     return;
   }
@@ -242,9 +276,10 @@ function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     [hw - r - 0.02, -(hd - r - 0.15)],
     [0, hd - r - 0.02],
   ];
-  for (const [a, d] of positions) {
-    oneBarrel(k, s, a, d, r, 0.8, 10, 0, s.accent(), inset);
-  }
+  positions.forEach(([a, d], i) => {
+    const top = i === 2 ? s.own(s.accent()) : s.accent();
+    oneBarrel(k, s, a, d, r, 0.8, 10, 0, s.accent(), inset, top);
+  });
 }
 
 /** The trolley deck's thickness and the caster's radius. */
@@ -329,7 +364,8 @@ function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       s.dark,
     );
   }
-  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, s.accent());
+  const grip = s.own(s.accent());
+  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, grip);
 }
 
 /**
@@ -342,13 +378,13 @@ function stool({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const r = Math.min(hw, hd) - 0.03;
   const H = 0.75;
   if (variant === 0) {
-    k.cylinder(0, 0, H - 0.04, H, r, 12, s.accent());
+    k.cylinder(0, 0, H - 0.04, H, r, 12, s.own(s.accent()));
     k.cylinder(0, 0, 0.04, H - 0.04, 0.035, 8, s.metal);
     k.cylinder(0, 0, 0, 0.04, r * 0.4, 8, s.dark);
     k.ring(0, 0, 0.24, r * 0.7, 0.014, 6, 12, s.dark, "up");
     return;
   }
-  k.bevelBox(-r, r, -r, r, H - 0.04, H, 0.015, s.accent());
+  k.bevelBox(-r, r, -r, r, H - 0.04, H, 0.015, s.own(s.accent()));
   const legA = r - 0.03;
   for (const a of [-legA, legA]) {
     for (const d of [-legA, legA]) {
@@ -394,7 +430,7 @@ function filingCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       front + 0.004,
       h0,
       h0 + bh,
-      s.dark,
+      i === drawers - 1 ? s.own(s.dark) : s.dark,
     );
     const hh = h0 + bh * 0.75;
     k.box(
@@ -454,7 +490,16 @@ function storageShelf({ k, s, variant }: Parameters<PropRecipe>[0]): void {
         hd * 1.2,
         top / shelves - 0.06,
       );
-      shelfBox(k, s, hw * 0.35, 0, h, hw * 0.5, hd * 1.1, top / shelves - 0.1);
+      shelfBox(
+        k,
+        i === 0 ? { ...s, body: s.own(s.body, 0.85) as typeof s.body } : s,
+        hw * 0.35,
+        0,
+        h,
+        hw * 0.5,
+        hd * 1.1,
+        top / shelves - 0.1,
+      );
     }
   }
 }
@@ -544,7 +589,7 @@ function bench({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     0.42,
     0.48,
     0.012,
-    s.accent(),
+    s.own(s.accent()),
   );
   const legA = hw - 0.08;
   for (const a of [-legA, legA]) {
@@ -656,7 +701,7 @@ function fumeCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     1.63,
     s.hazard,
   );
-  k.cylinder(0, 0, H, H + 0.15, 0.11, 10, s.metal);
+  k.cylinder(0, 0, H, H + 0.15, 0.11, 10, s.own(s.metal));
 }
 
 /** The traffic cone's colours: an orange body and a hazard band. */
@@ -813,7 +858,7 @@ function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       front + 0.004,
       h0,
       h0 + bh,
-      s.accent(),
+      i === drawers - 1 ? s.own(s.accent()) : s.accent(),
     );
     k.box(
       -0.05,
@@ -1000,6 +1045,19 @@ function crateStack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     const md = (hd - 0.02) * 0.78;
     const offA = (hw - 0.02 - mw) * 0.5;
     k.bevelBox(offA - mw, offA + mw, -md, md, H0, H1, bevel * 0.85, s.body);
+    // A band round the middle crate, drawn only in a look with the prop's
+    // own accent.
+    const band = s.own(s.body);
+    if (band !== s.body)
+      k.box(
+        offA - mw - 0.004,
+        offA + mw + 0.004,
+        -md - 0.004,
+        md + 0.004,
+        H0 + 0.3,
+        H0 + 0.38,
+        band,
+      );
     const sw = mw * 0.62;
     const sd = md * 0.62;
     k.bevelBox(offA - sw, offA + sw, -sd, sd, H1, H2, bevel * 0.7, s.body);
@@ -1041,6 +1099,11 @@ function crateStack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const sd = hd * 0.45;
   k.bevelBox(-sw, sw, -sd, sd, 1.45, 1.95, bevel * 0.8, s.body);
   k.box(-sw + 0.02, sw - 0.02, -sd - 0.005, sd + 0.005, 1.68, 1.76, s.hazard);
+  // A band round the big crate, drawn only in a look with the prop's own
+  // accent.
+  const band = s.own(s.body);
+  if (band !== s.body)
+    k.box(-hw + 0.016, hw - 0.016, -hd + 0.016, hd - 0.016, 1.1, 1.18, band);
 }
 
 /**
@@ -1074,9 +1137,26 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       );
     }
     const dr = Math.min(hw, hd) * 0.42;
+    // One drum on the upper deck carries the prop's own accent on its
+    // upper rib, a hair proud so it reads; in any other look every drum
+    // stays as it was.
+    const top = s.own(s.dark);
     for (const h0 of decks) {
       for (const a of [-hw * 0.4, hw * 0.4]) {
-        oneBarrel(k, s, a, 0, dr, 0.8, 8, h0 + 0.04);
+        const own = top !== s.dark && h0 === decks[1] && a < 0;
+        oneBarrel(
+          k,
+          s,
+          a,
+          0,
+          dr,
+          0.8,
+          8,
+          h0 + 0.04,
+          s.dark,
+          own ? BARREL.ribTube - RIB_PROUD : BARREL.ribTube,
+          own ? top : s.dark,
+        );
       }
     }
     return;
@@ -1089,8 +1169,18 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     [0.85, [-hd * 0.42, hd * 0.42]],
     [1.4, [0]],
   ];
+  // The top drum carries the prop's own accent.
   for (const [h, ds] of tiers) {
-    for (const d of ds) k.cylinderAlong(a0, a1, d, h, r, 10, s.metal);
+    for (const d of ds)
+      k.cylinderAlong(
+        a0,
+        a1,
+        d,
+        h,
+        r,
+        10,
+        ds.length === 1 ? s.own(s.metal) : s.metal,
+      );
   }
 }
 

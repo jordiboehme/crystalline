@@ -74,16 +74,18 @@ function contextFor(room: RoomSpec): ModelContext {
 const marked = (m: MeshData) => tints(m).some((t) => t[0] === ACCENT_MARK);
 
 describe("the room's accent (2.7 C9)", () => {
-  it("puts the room's accent on the six kinds' small parts in every variant, and nowhere else in the set dressing", () => {
+  it("puts the room's accent on the six kinds' small parts in every variant, and nowhere else in the set dressing, in every look without the props' own accents", () => {
     // Mutation caught: an accented kind without its part, or the accent on
-    // a kind that should not carry it.
+    // a kind that should not carry it. Look 2 gives each prop its own
+    // accent instead (`propLook.test.ts`).
     expect(PROP_KINDS.length).toBeGreaterThan(0);
-    for (const kind of PROP_KINDS)
-      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
-        expect(
-          marked(buildPropMesh(kind, v, LOOKS.aperture)),
-          `${kind} variant ${String(v)}`,
-        ).toBe((ACCENTED as readonly string[]).includes(kind));
+    for (const look of [LOOKS.day, LOOKS.freescape])
+      for (const kind of PROP_KINDS)
+        for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
+          expect(
+            marked(buildPropMesh(kind, v, look)),
+            `${look.id} ${kind} variant ${String(v)}`,
+          ).toBe((ACCENTED as readonly string[]).includes(kind));
   });
 
   it("never puts the room's accent on a hero, a curio, a fitting, a way, a poster, the placard or a tag strip", () => {

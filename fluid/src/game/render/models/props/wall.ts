@@ -13,6 +13,12 @@
  * The locker bank carries the room's accent (`s.accent()`, 2.7 C9) on the
  * topmost vent slit of every door, its trim strip, in every variant. No
  * other wall prop carries it.
+ *
+ * In a look with `propAccents` a prop paints exactly one part in its own
+ * accent instead (`s.own`) and the slits turn dark metal: one locker door,
+ * the breaker box's lever (variant 0) or the bar across its two boxes
+ * (variant 1) and a trim along the conduit cabinet's top. A
+ * part only that look draws is added only there.
  */
 
 import { FLAG, type Surface } from "../../geometry";
@@ -54,13 +60,19 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     const a0 = -inner + i * (width + gap);
     const a1 = a0 + width;
     k.box(a0, a1, L.depth - 0.03, L.depth - 0.005, 0.05, L.h1 - 0.05, s.panel);
+    // In a look with the prop's own accent, the second door takes it, a
+    // hair proud of the body (the doors sit inside it), its slits with it.
+    const door = s.own(s.panel, 0.9);
+    const own = i === 1 && door !== s.panel;
+    if (own) k.box(a0, a1, L.depth, L.depth + 0.006, 0.05, L.h1 - 0.05, door);
+    const proud = own ? 0.01 : 0;
     for (let j = 0; j < 3; j++) {
       const h0 = L.h1 - 0.2 - j * 0.07;
       k.box(
         a0 + 0.04,
         a1 - 0.04,
-        L.depth - 0.005,
-        L.depth,
+        L.depth - 0.005 + proud,
+        L.depth + proud,
         h0,
         h0 + 0.02,
         j === 0 ? s.accent() : s.dark,
@@ -386,7 +398,7 @@ function breakerBox({ k, s, kitAt, variant }: Parameters<PropRecipe>[0]): void {
       0.09,
       mid - 0.02,
       mid + 0.02,
-      s.dark,
+      s.own(s.dark),
     );
   } else {
     const w = B.half * 0.9;
@@ -409,7 +421,7 @@ function breakerBox({ k, s, kitAt, variant }: Parameters<PropRecipe>[0]): void {
       B.depth,
       B.h1 + 0.02,
       B.h1 + 0.05,
-      s.dark,
+      s.own(s.dark),
     );
   }
 }
@@ -716,6 +728,11 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       0.98,
       s.metal,
     );
+    // A trim along the cabinet's top, drawn only in a look with the
+    // prop's own accent.
+    const trim = s.own(s.body);
+    if (trim !== s.body)
+      k.box(-0.55, 0.25, C.depth - 0.01, C.depth + 0.004, 1.78, 1.84, trim);
     for (const a of [-0.4, 0.1]) k.cylinder(a, d, 1.9, 2.2, 0.03, 8, s.metal);
     k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
     for (const a of [-0.85, 0.85]) {
@@ -736,6 +753,11 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     ] as const) {
       k.bevelBox(a0, a1, 0, C.depth, 0, 1.7, 0.015, s.body);
       const mid = (a0 + a1) / 2;
+      // A trim along the left cabinet's top, drawn only in a look with the
+      // prop's own accent.
+      const trim = s.own(s.body);
+      if (a0 < 0 && trim !== s.body)
+        k.box(a0, a1, C.depth - 0.01, C.depth + 0.004, 1.58, 1.64, trim);
       k.box(
         mid - 0.004,
         mid + 0.004,

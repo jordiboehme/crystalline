@@ -54,7 +54,7 @@ describe("propInstances", () => {
     for (const g of groups) expect(g.key).toBe(propKey(g.kind, g.variant));
   });
 
-  it("writes each prop's anchor in metres, its turn and its kind's bank slot", () => {
+  it("writes each prop's anchor in metres, its turn with its accent pick and its kind's bank slot", () => {
     const groups = propInstances(workshop);
     const seen = new Map<string, number>();
     for (const p of workshop.props) {
@@ -70,13 +70,44 @@ describe("propInstances", () => {
         p.x * CELL,
         p.anchor === "ceiling" ? workshop.ceiling : 0,
         p.y * CELL,
-        p.turn,
+        p.turn + 4 * (1 + ((p.seed >>> 0) % 5)),
         bankSlot(PROP_BANK[p.kind]),
       ];
       for (let k = 0; k < INSTANCE_FLOATS; k++) {
         expect(floats[k]).toBeCloseTo(expected[k] ?? NaN, 5);
       }
+      // The shader's turn is the float's low two bits.
+      expect(Math.round(floats[3] ?? NaN) & 3).toBe(p.turn);
     }
+  });
+
+  it("picks each prop's own accent from its seed alone, the same every time", () => {
+    // Mutation caught: a pick from the prop's position, kind or place in
+    // the list (two props with one seed would differ, or the pick would
+    // move with a neighbour), or a random pick (two builds would differ).
+    const at = { anchor: "floor", y: 3.5, turn: 1, variant: 0 } as const;
+    const picks = (props: Prop[]) =>
+      propInstances({ ...workshop, props }).flatMap((g) =>
+        Array.from({ length: g.count }, (_, i) =>
+          Math.floor(Math.round(g.data[i * INSTANCE_FLOATS + 3] ?? NaN) / 4),
+        ),
+      );
+    const one = (seed: number, x: number, kind: Prop["kind"]): Prop => ({
+      ...at,
+      kind,
+      x,
+      seed,
+    });
+    // One seed, two kinds, two places: one pick.
+    const same = picks([one(77, 2.5, "crate"), one(77, 6.5, "barrel")]);
+    expect(new Set(same).size).toBe(1);
+    // The pick of seed 77 is 77 % 5 = 2, carried as 1 + 2.
+    expect(same[0]).toBe(3);
+    // Seeds 0 to 4 give all five picks, 1 to 5.
+    const five = picks([0, 1, 2, 3, 4].map((s) => one(s, 2.5, "crate")));
+    expect(new Set(five)).toEqual(new Set([1, 2, 3, 4, 5]));
+    // The same room gives the same floats.
+    expect(propInstances(workshop)).toEqual(propInstances(workshop));
   });
 
   it("gives a blinking prop its kind's bank slot and a crate the steady slot (2.6d C15)", () => {

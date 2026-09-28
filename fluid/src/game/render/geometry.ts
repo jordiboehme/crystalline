@@ -85,7 +85,7 @@ import { CELL } from "../world/units";
 import { BLINK_GROUPS } from "./blink";
 import { DECAL_LIFT, createKit } from "./kit";
 import { LAYER, layerPlan } from "./layers";
-import type { Look, Rgb } from "./looks";
+import { propLook, type Look, type Rgb } from "./looks";
 import {
   buildDecor,
   buildFixture,
@@ -158,6 +158,15 @@ export const SHELL_FIXTURES: ReadonlySet<Fixture["kind"]> = new Set<
   Fixture["kind"]
 >(["door", "portal", "hatch", "lift", "screen", "exit", "poster", "placard"]);
 
+/**
+ * The look a fixture is built in: the set dressing's colours (`propLook`)
+ * for a terminal or a machine, the plain look for the shell's fixtures
+ * (the ways through, the lifts, the screens and the signs).
+ */
+export function fixtureLook(kind: Fixture["kind"], look: Look): Look {
+  return SHELL_FIXTURES.has(kind) ? look : propLook(look);
+}
+
 /** A blink group's flag: `FLAG.blink + group`, group 0 to 7. */
 export type BlinkFlag = 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
 
@@ -213,6 +222,21 @@ export const ACCENT_MARK = -1;
  */
 export function accentTint(k: number): Rgb {
   return [ACCENT_MARK, k, 0];
+}
+
+/**
+ * The prop's own accent mark: a tint whose first channel is this number is
+ * "the prop's own accent, times the second channel". On a prop instance
+ * the vertex shader swaps it for the look's accent at the pick the
+ * instance carries (`propAccentPick` of its seed, `propInstances`); where
+ * there is no pick it is the room's accent, as `accentTint`. Only the set
+ * dressing carries it, and only in a look with `propAccents`.
+ */
+export const PROP_MARK = -2;
+
+/** The prop's own accent mark's tint: `[PROP_MARK, k, 0]`. */
+export function propMarkTint(k: number): Rgb {
+  return [PROP_MARK, k, 0];
 }
 
 /**
@@ -792,10 +816,15 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   };
   const kitAt: KitAt = (f) => createKit(b, f);
   const movers: Mover[] = [];
+  // The machines, the terminals and the furniture take the set dressing's
+  // colours.
+  const propCtx: ModelContext = { ...ctx, look: propLook(look) };
   room.fixtures.forEach((fx, i) => {
     const from = b.floats();
-    const own = buildFixture(kitAt, fx, i, ctx);
-    if (SHELL_FIXTURES.has(fx.kind)) {
+    const shell = SHELL_FIXTURES.has(fx.kind);
+    const fxCtx = { ...ctx, look: fixtureLook(fx.kind, look) };
+    const own = buildFixture(kitAt, fx, i, fxCtx);
+    if (shell) {
       b.markShell(from);
       for (const m of own) markShell(m.mesh.vertices);
     }
@@ -805,7 +834,7 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   (room.interior ?? []).forEach((piece, i) =>
     movers.push(...buildInteriorMovers(piece, i, look)),
   );
-  for (const d of room.decor) buildDecor(kitAt, d, ctx);
+  for (const d of room.decor) buildDecor(kitAt, d, propCtx);
   buildDecals(kitAt, b, room);
   return { static: b.build(), movers };
 }

@@ -14,14 +14,16 @@ import { turnForSide, wallAnchor } from "../world/sites";
 import type { PropKind, Side } from "../world/types";
 import { CELL } from "../world/units";
 import {
+  ACCENT_MARK,
   FLAG,
+  PROP_MARK,
   accentTint,
   createBuilder,
   type MeshData,
   type V3,
 } from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOKS, propLook, type Look } from "./looks";
 import {
   GLOWING,
   floatingGlow,
@@ -66,16 +68,19 @@ function sideFor(t: number): Side {
   return side;
 }
 
-/** A prop built once at the origin, with every kit call recorded. */
+/**
+ * A prop built once at the origin, with every kit call recorded, in look 2
+ * (whose parts drawn only for the prop's own accent the envelope checks
+ * then cover) unless `look` says otherwise.
+ */
 function buildRecorded(
   kind: PropKind,
   variant: number,
+  look: Look = LOOKS.aperture,
 ): { mesh: MeshData; parts: Part[] } {
   const builder = createBuilder();
   const parts: Part[] = [];
-  buildProp(recordingKitAt(builder, parts), kind, variant, {
-    look: LOOKS.aperture,
-  });
+  buildProp(recordingKitAt(builder, parts), kind, variant, { look });
   return { mesh: builder.build(), parts };
 }
 
@@ -315,7 +320,7 @@ describe("prop models", () => {
       }
   });
 
-  it("paints exactly the six kinds' small parts with the room's accent, and none of them glows (2.7 C9)", () => {
+  it("paints exactly the six kinds' small parts with the room's accent, and none of them glows, in a look without the props' own accents (2.7 C9)", () => {
     // Mutation caught: a part painted twice, the wrong part painted (a
     // handle's upright, a drawer pull, a middle vent slit, a rib the drum
     // rack shares), or an accent part that glows.
@@ -333,12 +338,63 @@ describe("prop models", () => {
       readonly number[],
     ][]) {
       counts.forEach((n, v) => {
-        const { parts } = buildRecorded(kind, v);
+        const { parts } = buildRecorded(kind, v, LOOKS.day);
         const painted = parts.filter((p) => p.tint?.join() === mark);
         expect(painted.length, `${kind} variant ${String(v)}`).toBe(n);
         for (const p of painted) expect(GLOWING).not.toContain(p.flag);
       });
     }
+  });
+
+  it("paints at most one small part of each prop in its own accent in look 2, and nothing in the room's", () => {
+    // Mutation caught: two parts marked (two locker doors, every barrel of
+    // the cluster, a handle on every drawer), a whole body or bank marked
+    // (the part would fill most of the prop), a room accent part left in
+    // (the barrel's ribs beside its own band), a kind that loses its only
+    // coloured part, or a part that glows.
+    const look = propLook(LOOKS.aperture);
+    const OWN = [
+      "barrel",
+      "bench",
+      "breaker-box",
+      "conduit-cabinet",
+      "crate",
+      "crate-stack",
+      "drum-rack",
+      "filing-cabinet",
+      "fume-cabinet",
+      "locker-bank",
+      "stool",
+      "storage-shelf",
+      "tool-cart",
+      "trolley",
+    ];
+    const volume = (lo: V3, hi: V3) =>
+      Math.max(hi[0] - lo[0], 0.01) *
+      Math.max(hi[1] - lo[1], 0.01) *
+      Math.max(hi[2] - lo[2], 0.01);
+    for (const kind of PROP_KINDS)
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
+        const at = `${kind} variant ${String(v)}`;
+        const { parts } = buildRecorded(kind, v, look);
+        const own = parts.filter((p) => p.tint?.[0] === PROP_MARK);
+        expect(
+          parts.filter((p) => p.tint?.[0] === ACCENT_MARK),
+          at,
+        ).toEqual([]);
+        // The storage shelf's bare variant has no part to give.
+        const bare = kind === "storage-shelf" && v === 1;
+        expect(own.length, at).toBe(OWN.includes(kind) && !bare ? 1 : 0);
+        for (const p of own) {
+          expect(GLOWING, at).not.toContain(p.flag);
+          const whole = shape(parts.flatMap((q) => q.points));
+          const part = shape(p.points);
+          expect(
+            volume(part.lo, part.hi) / volume(whole.lo, whole.hi),
+            at,
+          ).toBeLessThan(0.2);
+        }
+      }
   });
 
   it("keeps the tool cart's drawer fronts visibly proud of its own red body, not buried inside it (2.7 C9)", () => {
@@ -348,7 +404,7 @@ describe("prop models", () => {
     // brief's own first depths did exactly this).
     const mark = accentTint(1).join();
     for (let v = 0; v < PROP_CATALOGUE["tool-cart"].variants; v++) {
-      const { parts } = buildRecorded("tool-cart", v);
+      const { parts } = buildRecorded("tool-cart", v, LOOKS.day);
       const fronts = parts.filter((p) => p.tint?.join() === mark);
       const body = parts.find(
         (p) => p.method === "bevelBox" && p.tint?.join() !== mark,

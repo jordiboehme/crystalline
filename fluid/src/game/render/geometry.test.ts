@@ -46,12 +46,13 @@ import {
   accentTint,
   buildRoomMesh,
   createBuilder,
+  fixtureLook,
   wallPatternOf,
   type MeshData,
 } from "./geometry";
 import { DECAL_LIFT, createKit } from "./kit";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
-import { LOOKS, accentFor, type Rgb } from "./looks";
+import { LOOKS, accentFor, propLook, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
 import { buildHeroMesh } from "./models/heroes";
 import { buildInteriorMesh } from "./models/interior";
@@ -1033,7 +1034,10 @@ describe("look 2's seams on the room shell only", () => {
       room.fixtures.forEach((fx, i) => {
         seen.add(fx.kind);
         const b = createBuilder();
-        buildFixture((f) => createKit(b, f), fx, i, ctx);
+        buildFixture((f) => createKit(b, f), fx, i, {
+          ...ctx,
+          look: fixtureLook(fx.kind, ctx.look),
+        });
         const want = SHELL_KINDS.includes(fx.kind) ? FLAG.shell : FLAG.lit;
         const label = `${name} ${fx.kind}:${String(i)}`;
         const flags = asBuilt(built.static.vertices, b.build());
@@ -1115,7 +1119,10 @@ describe("look 2's seams on the room shell only", () => {
       const ctx = ctxOf(room);
       for (const d of room.decor) {
         const b = createBuilder();
-        buildDecor((f) => createKit(b, f), d, ctx);
+        buildDecor((f) => createKit(b, f), d, {
+          ...ctx,
+          look: propLook(ctx.look),
+        });
         const flags = asBuilt(stat, b.build());
         expect(flags.some((f) => f.own === FLAG.lit)).toBe(true);
         expect(flags.filter((f) => f.room !== f.own)).toEqual([]);

@@ -83,7 +83,7 @@ export function buildProp(
   RECIPES[kind]({
     k: kitAt(frameAt([0, 0, 0], 0)),
     kitAt,
-    s: surfaces(ctx.look),
+    s: surfaces(ctx.look, ctx.look.propAccents === true),
     ctx,
     variant,
     kind,

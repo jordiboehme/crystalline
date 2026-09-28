@@ -17,6 +17,7 @@ import {
   FLAG,
   accentTint,
   blinkFlag,
+  propMarkTint,
   type MeshData,
   type Surface,
   type V3,
@@ -282,14 +283,23 @@ export function shade(c: Rgb, k: number): Rgb {
  * gain the bank moves, and `accent` for a part in the room's accent times
  * `k` (the accent mark, `accentTint`, 2.7 C8), which the vertex shader
  * swaps for the room's accent at draw time.
+ *
+ * With `own` (a prop of the set dressing in a look with `propAccents`),
+ * `accent` gives dark metal instead and `own` marks the prop's one part in
+ * its own accent, so a prop carries at most one coloured part.
  */
-export function surfaces(look: Look) {
+export function surfaces(look: Look, own = false) {
   const p = look.palette;
+  const dark: Surface = {
+    layer: LAYER.metal,
+    tint: shade(p.metal, 0.45),
+    flag: FLAG.lit,
+  };
   return {
     body: { layer: LAYER.panel, tint: p.machine, flag: FLAG.lit },
     panel: { layer: LAYER.panel, tint: p.panel, flag: FLAG.lit },
     metal: { layer: LAYER.metal, tint: p.metal, flag: FLAG.lit },
-    dark: { layer: LAYER.metal, tint: shade(p.metal, 0.45), flag: FLAG.lit },
+    dark,
     hazard: { layer: LAYER.hazard, tint: [1, 1, 1], flag: FLAG.lit },
     glow: (tint: Rgb): Surface => ({
       layer: LAYER.panel,
@@ -311,11 +321,16 @@ export function surfaces(look: Look) {
       tint,
       flag: FLAG.lit,
     }),
-    accent: (k = 1): Surface => ({
-      layer: LAYER.panel,
-      tint: accentTint(k),
-      flag: FLAG.lit,
-    }),
+    accent: (k = 1): Surface =>
+      own ? dark : { layer: LAYER.panel, tint: accentTint(k), flag: FLAG.lit },
+    /**
+     * The one part of a prop drawn in the prop's own accent times `k`
+     * (`propMarkTint`) when `own` is set; `fallback` otherwise.
+     */
+    own: (fallback: Surface, k = 1): Surface =>
+      own
+        ? { layer: LAYER.panel, tint: propMarkTint(k), flag: FLAG.lit }
+        : fallback,
   } satisfies Record<string, Surface | ((...args: never[]) => Surface)>;
 }
 

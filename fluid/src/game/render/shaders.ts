@@ -26,6 +26,7 @@ import { CELL } from "../world/units";
 import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
 import { FLAG } from "./geometry";
 import { turnMat2Columns } from "./kit";
+import { ACCENT_COUNT } from "./looks";
 
 /**
  * How far, in metres, the surface shader moves a fragment along its normal
@@ -118,7 +119,10 @@ const TURN_TABLE = [0, 1, 2, 3]
  * renderer uploads `uAccent` on every draw from the look and the room
  * (`accentFor` in `looks.ts`), so a mesh built once per look takes each
  * room's accent, and a restored context keeps it. The look is fixed in
- * play; only a dev page picks another.
+ * play; only a dev page picks another. A first channel below -1.5 is the
+ * prop's own mark (`PROP_MARK`): it takes `uAccents` at the pick the
+ * instance's turn float carries above its two turn bits (`propTurn` in
+ * `instances.ts`), or `uAccent` with no pick.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;
@@ -140,6 +144,8 @@ uniform float uModelScale;
 uniform vec2 uModelYaw;
 // The room's accent (2.7 C8), taken by every tint carrying the accent mark
 uniform vec3 uAccent;
+// The look's accents, a prop's own accent picked from them (PROP_MARK)
+uniform vec3 uAccents[${String(ACCENT_COUNT)}];
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;
@@ -149,7 +155,9 @@ flat out int vFlag;
 flat out float vSlot;
 const mat2 TURNS[4] = mat2[4](${TURN_TABLE});
 void main() {
-  mat2 turn = TURNS[int(aInstanceTurn.x + 0.5) & 3];
+  int turnPick = int(aInstanceTurn.x + 0.5);
+  mat2 turn = TURNS[turnPick & 3];
+  int pick = turnPick >> 2;
   vec2 xz = turn * aPosition.xz;
   vec3 placed = vec3(xz.x, aPosition.y, xz.y) + aInstanceOffset;
   mat2 yaw = mat2(uModelYaw.x, -uModelYaw.y, uModelYaw.y, uModelYaw.x);
@@ -161,7 +169,8 @@ void main() {
   vNormal = vec3(nxz.x, aNormal.y, nxz.y);
   vUv = aUv;
   vLayer = aLayer;
-  vTint = aTint.x < 0.0 ? uAccent * aTint.y : aTint;
+  vec3 ownAccent = pick == 0 ? uAccent : uAccents[pick - 1];
+  vTint = aTint.x < -1.5 ? ownAccent * aTint.y : aTint.x < 0.0 ? uAccent * aTint.y : aTint;
   vFlag = int(aFlag + 0.5);
   vSlot = aInstanceTurn.y;
   gl_Position = uViewProjection * vec4(world, 1.0);

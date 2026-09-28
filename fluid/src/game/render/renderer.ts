@@ -81,6 +81,7 @@ import {
   C64_PALETTE,
   accentFor,
   applyCondition,
+  propLook,
   type Look,
   type LookId,
 } from "./looks";
@@ -180,7 +181,7 @@ interface GpuMover {
  * Which mesh an instance group draws: its key, its family and, per family,
  * its kind, and its variant. The family picks the builder.
  */
-type GroupMesh =
+export type GroupMesh =
   | { key: string; family: "prop"; kind: PropKind; variant: number }
   | { key: string; family: "hero"; kind: HeroKind; variant: number }
   | { key: string; family: "curio"; kind: CurioKind; variant: number }
@@ -191,12 +192,13 @@ type GroupMesh =
  * `buildPropMesh`, a hero's `buildHeroMesh`, a curio's `buildCurioMesh` or
  * a console room fitting's `buildInteriorMesh`. The switch is exhaustive,
  * so a fifth family fails the typecheck here until it is given its
- * builder.
+ * builder. Only a prop is built in `propLook`, the set dressing's colours;
+ * a hero, a curio and a fitting keep the plain look.
  */
-function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
+export function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
   switch (g.family) {
     case "prop":
-      return buildPropMesh(g.kind, g.variant, look);
+      return buildPropMesh(g.kind, g.variant, propLook(look));
     case "hero":
       return buildHeroMesh(g.kind, g.variant, look);
     case "curio":
@@ -582,6 +584,10 @@ export function createRenderer(
         light.grid.depth,
       );
       gl.uniform3f(scene.uniform("uAccent"), ...accentFor(room, look));
+      gl.uniform3fv(
+        scene.uniform("uAccents"),
+        new Float32Array(look.accents.flatMap((c) => [...c])),
+      );
       gl.uniform1f(scene.uniform("uLightScale"), look.lightScale);
       gl.uniform1f(scene.uniform("uFalloff"), look.falloff);
       gl.uniform1f(scene.uniform("uMinLight"), look.minLight);

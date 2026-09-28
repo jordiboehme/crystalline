@@ -52,6 +52,14 @@ export interface Look {
     lamp: Rgb;
     fog: Rgb;
   };
+  /**
+   * The body and panel colours of the set dressing, the machines, the
+   * terminals and the furniture (`propLook`), so they stand off white walls
+   * as light grey console plastic. Absent keeps the palette's `machine` and
+   * `panel` for them too. The shell and its ways (doors, portals, hatches,
+   * lifts, screens), the heroes and the curios never take it.
+   */
+  propBody?: { body: Rgb; panel: Rgb };
   /** Multiplies every light level. */
   lightScale: number;
   /** How quickly light falls off with distance (the classic banded distance light). */
@@ -102,6 +110,13 @@ export interface Look {
    * `accentFor` reads it.
    */
   accents: readonly Rgb[];
+  /**
+   * True when each prop of the set dressing paints one part (a lid, a band,
+   * a handle, one door) in its own accent from `accents`, picked by its
+   * seed (`propAccentPick`), and its other accent parts in dark metal.
+   * Absent, a prop's accent parts take the room's accent.
+   */
+  propAccents?: boolean;
 }
 
 const C64_RAW: readonly (readonly [number, number, number])[] = [
@@ -202,6 +217,7 @@ export const LOOKS: Record<LookId, Look> = {
       lamp: hex(0xf0f8ff),
       fog: hex(0x0c1014),
     },
+    propBody: { body: hex(0xbdbdb8), panel: hex(0xcdcdc8) },
     lightScale: 1,
     falloff: 0.05,
     minLight: 0.1,
@@ -227,6 +243,7 @@ export const LOOKS: Record<LookId, Look> = {
       hex(0x845cc8),
       hex(0x1f9e8c),
     ],
+    propAccents: true,
   },
   freescape: {
     id: "freescape",
@@ -279,6 +296,38 @@ export const LOOKS: Record<LookId, Look> = {
  */
 export function accentFor(room: { finish: Finish }, look: Look): Rgb {
   return look.accents[room.finish.accent] ?? [0, 0, 0];
+}
+
+/**
+ * The look the set dressing, the machines, the terminals and the furniture
+ * are built in: `look` with its `machine` and `panel` swapped for
+ * `propBody`, or `look` itself when it has none. The room's shell and its
+ * ways, the heroes and the curios keep the plain look.
+ */
+export function propLook(look: Look): Look {
+  if (look.propBody === undefined) return look;
+  return {
+    ...look,
+    palette: {
+      ...look.palette,
+      machine: look.propBody.body,
+      panel: look.propBody.panel,
+    },
+  };
+}
+
+/**
+ * How many accents every look holds, and so how many a prop may pick from:
+ * the scene shader's `uAccents` array is this long.
+ */
+export const ACCENT_COUNT = 5;
+
+/**
+ * The accent a prop picks from its seed, 0 to `ACCENT_COUNT - 1`: the same
+ * seed always picks the same accent, whatever the look.
+ */
+export function propAccentPick(seed: number): number {
+  return (seed >>> 0) % ACCENT_COUNT;
 }
 
 /** The looks in order, the game's own (Aperture grid) second. */

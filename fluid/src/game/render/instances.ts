@@ -43,11 +43,13 @@ import type {
   CurioKind,
   HeroKind,
   InteriorKind,
+  Prop,
   PropKind,
   RoomSpec,
 } from "../world/types";
 import { CELL } from "../world/units";
 import { bankSlot } from "./blink";
+import { propAccentPick } from "./looks";
 import { CURIO_BANK } from "./models/curios/common";
 import { HERO_BANK } from "./models/heroes/common";
 import { INTERIOR_BANK } from "./models/interior/common";
@@ -61,6 +63,19 @@ import { PROP_BANK } from "./models/props/common";
  * it is a hero, a curio or a prop (`PROP_BANK`, 0 for a steady prop).
  */
 export const INSTANCE_FLOATS = 5;
+
+/**
+ * A prop instance's turn float: its quarter turn, 0 to 3, plus four times
+ * one more than its accent pick (`propAccentPick` of its seed), so 4 to 23.
+ * The vertex shader turns the instance by the float's low two bits and
+ * takes the prop's own accent (`PROP_MARK`) from the rest; a hero, a curio
+ * or a fitting writes its bare turn, 0 to 3, so it has no pick and its
+ * marks take the room's accent. Every look reads the same float: a mesh
+ * without the prop's own mark never uses the pick.
+ */
+export function propTurn(p: Pick<Prop, "turn" | "seed">): number {
+  return p.turn + 4 * (1 + propAccentPick(p.seed));
+}
 
 /**
  * The key a prop's mesh is cached and grouped under: `kind:variant`. The
@@ -211,7 +226,8 @@ function grouped<K>(
  * The room's props as instance groups, one per distinct kind and variant,
  * sorted by key so the draw order is the same every time. Each instance is
  * `x * CELL`, the anchor height (the ceiling for a ceiling prop, else the
- * floor), `y * CELL`, the turn and its kind's blink bank slot
+ * floor), `y * CELL`, the turn with its accent pick (`propTurn`) and its
+ * kind's blink bank slot
  * (`bankSlot(PROP_BANK[kind])`, 2.6d C15: 0 for every steady kind). A room
  * without props gives no groups. A pure function: the same room gives
  * equal arrays.
@@ -226,7 +242,7 @@ export function propInstances(room: RoomSpec): PropGroup[] {
         p.x * CELL,
         p.anchor === "ceiling" ? room.ceiling : 0,
         p.y * CELL,
-        p.turn,
+        propTurn(p),
         bankSlot(PROP_BANK[p.kind]),
       ],
     })),
