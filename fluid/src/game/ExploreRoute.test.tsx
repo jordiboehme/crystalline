@@ -1397,6 +1397,19 @@ describe("ExploreRoute", () => {
     },
   );
 
+  // Mutation caught: the board's route missing or below the station's
+  // splat (the station mounts there instead, in the airlock).
+  it("serves the sound board at /π/dev/sounds in development", async () => {
+    gl.available = true;
+    serve();
+    const view = renderAt("/%CF%80/dev/sounds");
+    expect(
+      await screen.findByRole("heading", { name: "SOUND BOARD" }),
+    ).toBeInTheDocument();
+    expect(made.sessions).toHaveLength(0);
+    view.unmount();
+  });
+
   describe("sound (M4 C28)", () => {
     /** Hides or shows the tab as the browser would. */
     function setHidden(hidden: boolean) {

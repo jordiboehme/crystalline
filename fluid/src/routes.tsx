@@ -124,6 +124,14 @@ const Gallery = import.meta.env.DEV
   : null;
 
 /**
+ * The sound board at `/π/dev/sounds`: every patch the station plays, one
+ * button each (M4 C28). A development tool, gated the same way for good.
+ */
+const SoundBoard = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/SoundBoard"))
+  : null;
+
+/**
  * The MANIFEST's old address. The document is read on the domain page now,
  * so a link that still points here lands there rather than on the not-found
  * screen; the editor keeps its own segment beneath it.
@@ -196,6 +204,19 @@ export function AppRoutes() {
             element={
               <Suspense fallback={null}>
                 <Gallery />
+              </Suspense>
+            }
+          />
+        )}
+        {/*
+          The sound board, gated and placed the same way.
+        */}
+        {SoundBoard === null ? null : (
+          <Route
+            path="/π/dev/sounds"
+            element={
+              <Suspense fallback={null}>
+                <SoundBoard />
               </Suspense>
             }
           />

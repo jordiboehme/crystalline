@@ -111,7 +111,7 @@ import { useLocation, useNavigate } from "react-router";
 import { ME_QUERY_KEY } from "../auth/keys";
 import { subscribeToChanges } from "../events/ChangeStreamProvider";
 import { createDirector } from "./audio/director";
-import { createMixer } from "./audio/mixer";
+import { createMixer, makeAudioContext } from "./audio/mixer";
 import { changeKeys } from "./data/changes";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
@@ -136,16 +136,6 @@ import type { LiftStop, StationAddress } from "./world/types";
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
   window.open(path, "_blank", "noopener");
-}
-
-/**
- * A context of the mixer's own, made inside the gesture that unlocks it
- * when the launch primed none (a reload); null without WebAudio.
- */
-function makeAudioContext(): AudioContext | null {
-  const Ctor = (globalThis as { AudioContext?: new () => AudioContext })
-    .AudioContext;
-  return Ctor === undefined ? null : new Ctor();
 }
 
 /**

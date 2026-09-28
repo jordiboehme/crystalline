@@ -174,6 +174,17 @@ export function createMixer(source: ContextSource = {}): Mixer {
   };
 }
 
+/**
+ * A live context of the browser's own, for `ContextSource.make`: called
+ * inside the gesture that unlocks. Null without WebAudio (jsdom, an old
+ * browser); a constructor that throws is the mixer's to catch.
+ */
+export function makeAudioContext(): AudioContext | null {
+  const Ctor = (globalThis as { AudioContext?: new () => AudioContext })
+    .AudioContext;
+  return Ctor === undefined ? null : new Ctor();
+}
+
 /** The master and the four buses on `ctx`, the master at the mute state. */
 function build(ctx: AudioContextLike, muted: boolean): Graph {
   const master = ctx.createGain();
