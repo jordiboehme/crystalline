@@ -11,9 +11,11 @@ import {
   CANNED_WORKSHOP,
   galleryRoom,
   heroHallRoom,
+  liftsHallRoom,
 } from "../world/canned";
 import { airlockRoom } from "../world/airlock";
-import { consoleRoom } from "../world/consoleRoom";
+import { INTERIOR_CATALOGUE, consoleRoom } from "../world/consoleRoom";
+import { CURIO_CATALOGUE, CURIO_KINDS } from "../world/curios";
 import { generateDeck } from "../world/deck";
 import { plainFinish } from "../world/finish";
 import { generateRoom } from "../world/generate";
@@ -25,6 +27,7 @@ import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
 import { edgeKey, edgeOf } from "../world/sites";
 import type {
   Fixture,
+  InteriorKind,
   PlaceInput,
   RoomSpec,
   Side,
@@ -42,10 +45,11 @@ import {
   WALL_PATTERN_LOOK,
   accentTint,
   buildRoomMesh,
+  createBuilder,
   wallPatternOf,
   type MeshData,
 } from "./geometry";
-import { DECAL_LIFT } from "./kit";
+import { DECAL_LIFT, createKit } from "./kit";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS, accentFor, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
@@ -53,6 +57,8 @@ import { buildHeroMesh } from "./models/heroes";
 import { buildInteriorMesh } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
 import { COLUMN } from "./models/interior/console";
+import { buildDecor, buildFixture, type ModelContext } from "./models";
+import { buildCurioMesh } from "./models/curios";
 import { buildPropMesh } from "./models/props";
 
 const EPS = 1e-4;
@@ -430,7 +436,7 @@ describe("the console room's shell (2.6e C4)", () => {
       expect(floor.length).toBeGreaterThan(0);
       for (const v of floor) expectTint(v.tint, CONSOLE_SHELL.floor);
       const ceiling = all(m).filter((v) => v.layer === LAYER.ceiling);
-      const panels = ceiling.filter((v) => v.flag === FLAG.lit);
+      const panels = ceiling.filter((v) => v.flag === FLAG.shell);
       expect(panels.length).toBeGreaterThan(0);
       for (const v of panels) expectTint(v.tint, CONSOLE_SHELL.ceiling);
       const walls = all(m).filter(
@@ -877,4 +883,209 @@ describe("the hangar in the room mesh (M3 C15)", () => {
     expect(room.ceiling).toBe(4);
     expect(mesh.count / 3).toBe(2056);
   });
+});
+
+describe("look 2's seams on the room shell only", () => {
+  /** The fixture kinds whose surfaces keep the seams, leaves included. */
+  const SHELL_KINDS: readonly Fixture["kind"][] = [
+    "door",
+    "portal",
+    "hatch",
+    "lift",
+    "screen",
+    "exit",
+    "poster",
+    "placard",
+  ];
+  const flagsOf = (m: MeshData) => all(m).map((v) => v.flag);
+  const ctxOf = (room: RoomSpec): ModelContext => {
+    const plan = layerPlan(room);
+    return {
+      look: LOOKS.aperture,
+      ceiling: room.ceiling,
+      hall: room.hall,
+      textLayer: (key) => plan.lookup(key),
+    };
+  };
+  /**
+   * The float offset in `whole` where `part` sits, compared on every float
+   * but the flag, which the room mesh may have turned into `shell`.
+   */
+  const offsetOf = (whole: Float32Array, part: Float32Array): number => {
+    const F = FLOATS_PER_VERTEX;
+    for (let o = 0; o + part.length <= whole.length; o += F) {
+      let same = true;
+      for (let k = 0; k < part.length && same; k++)
+        if (k % F !== F - 1 && whole[o + k] !== part[k]) same = false;
+      if (same) return o;
+    }
+    return -1;
+  };
+  /**
+   * How the room mesh flagged a piece built on its own: its own flags and,
+   * vertex for vertex, the flags the same floats carry in `stat`.
+   */
+  const asBuilt = (stat: Float32Array, own: MeshData) => {
+    const at = offsetOf(stat, own.vertices);
+    expect(at).toBeGreaterThanOrEqual(0);
+    return flagsOf(own).map((flag, j) => ({
+      own: flag,
+      room: stat[at + j * FLOATS_PER_VERTEX + FLOATS_PER_VERTEX - 1],
+    }));
+  };
+  const airlock = () => airlockRoom({ domains: CANNED_DOMAINS, here: null });
+  const rooms = (): [string, RoomSpec][] => [
+    ["gallery", galleryRoom()],
+    ["lifts hall", liftsHallRoom()],
+    ["airlock", airlock()],
+    ["bridge", generateRoom(CANNED_BRIDGE)],
+  ];
+
+  it("marks the floor, the ceiling and the full walls as shell, and leaves no lit vertex on them", () => {
+    // Mutation caught: the shell never marked (b.markShell() dropped), so
+    // look 2 would draw no seams on the walls at all.
+    for (const [name, room] of [
+      ["bridge", generateRoom(CANNED_BRIDGE)],
+      ["airlock", airlock()],
+    ] as const) {
+      const vs = all(buildRoomMesh(room, LOOKS.aperture).static);
+      const floor = vs.filter(
+        (v) =>
+          v.layer === LAYER.floor &&
+          Math.abs(v.pos[1]) < EPS &&
+          Math.abs(v.normal[1] - 1) < EPS,
+      );
+      const ceiling = vs.filter(
+        (v) => v.layer === LAYER.ceiling && v.flag !== FLAG.lamp,
+      );
+      const patternLayers = new Set(WALL_PATTERN_LOOK.map((p) => p.layer));
+      const walls: Vertex[] = [];
+      for (let q = 0; q + 5 < vs.length; q += 6) {
+        const quad = vs.slice(q, q + 6);
+        const ys = quad.map((v) => v.pos[1]);
+        if (
+          quad.every(
+            (v) => patternLayers.has(v.layer) && Math.abs(v.normal[1]) < EPS,
+          ) &&
+          Math.min(...ys) < EPS &&
+          Math.max(...ys) > room.ceiling - EPS
+        )
+          walls.push(...quad);
+      }
+      for (const [part, list] of [
+        ["floor", floor],
+        ["ceiling", ceiling],
+        ["walls", walls],
+      ] as const) {
+        expect(list.length, `${name} ${part}`).toBeGreaterThan(0);
+        expect(
+          list.filter((v) => v.flag !== FLAG.shell).map((v) => v.flag),
+          `${name} ${part}`,
+        ).toEqual([]);
+      }
+    }
+  });
+
+  it("keeps the seams on every way through, screen and sign, leaves included, and on no terminal or machine", () => {
+    // Mutation caught: "screen" (or any way or sign) dropped from
+    // SHELL_FIXTURES, "terminal" added to it, or a way's movers left lit
+    // (the leaves would lose their seams as they slide).
+    const seen = new Set<Fixture["kind"]>();
+    for (const [name, room] of rooms()) {
+      const built = buildRoomMesh(room, LOOKS.aperture);
+      const ctx = ctxOf(room);
+      room.fixtures.forEach((fx, i) => {
+        seen.add(fx.kind);
+        const b = createBuilder();
+        buildFixture((f) => createKit(b, f), fx, i, ctx);
+        const want = SHELL_KINDS.includes(fx.kind) ? FLAG.shell : FLAG.lit;
+        const label = `${name} ${fx.kind}:${String(i)}`;
+        const flags = asBuilt(built.static.vertices, b.build());
+        expect(
+          flags.some((f) => f.own === FLAG.lit),
+          label,
+        ).toBe(true);
+        const wrong = flags.filter((f) =>
+          f.own === FLAG.lit ? f.room !== want : f.room !== f.own,
+        );
+        expect(wrong, label).toEqual([]);
+        for (const m of built.movers.filter(
+          (m) => m.fixture === i && !m.key.startsWith("box:"),
+        )) {
+          const moverFlags = flagsOf(m.mesh);
+          expect(moverFlags, `${label} ${m.key}`).not.toContain(
+            want === FLAG.shell ? FLAG.lit : FLAG.shell,
+          );
+        }
+      });
+    }
+    for (const kind of [...SHELL_KINDS, "terminal", "machine"] as const)
+      expect(seen.has(kind), kind).toBe(true);
+    // A way's leaves are among the movers checked above.
+    const liftLeaves = buildRoomMesh(airlock(), LOOKS.aperture).movers.filter(
+      (m) => m.key.startsWith("door:"),
+    );
+    expect(liftLeaves.length).toBeGreaterThan(0);
+    for (const m of liftLeaves) expect(flagsOf(m.mesh)).toContain(FLAG.shell);
+  }, 60_000);
+
+  it("leaves props, heroes, curios, fittings and decor plain, the airlock's outer hatch among them", () => {
+    // Mutation caught: the room marked as shell after the heroes, the
+    // fittings or the decor (b.markShell() moved down), a mover of a hero
+    // or a fitting marked, or an instanced model flagged shell.
+    for (const kind of PROP_KINDS)
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
+        expect(flagsOf(buildPropMesh(kind, v, LOOKS.aperture))).not.toContain(
+          FLAG.shell,
+        );
+    for (const kind of HERO_KINDS)
+      expect(flagsOf(buildHeroMesh(kind, 0, LOOKS.aperture))).not.toContain(
+        FLAG.shell,
+      );
+    for (const kind of CURIO_KINDS)
+      for (let v = 0; v < CURIO_CATALOGUE[kind].variants; v++)
+        expect(flagsOf(buildCurioMesh(kind, v, LOOKS.aperture))).not.toContain(
+          FLAG.shell,
+        );
+    for (const kind of Object.keys(INTERIOR_CATALOGUE) as InteriorKind[])
+      expect(flagsOf(buildInteriorMesh(kind, 0, LOOKS.aperture))).not.toContain(
+        FLAG.shell,
+      );
+    const hatch = flagsOf(buildInteriorMesh("outer-hatch", 0, LOOKS.aperture));
+    expect(hatch).toContain(FLAG.lit);
+
+    // The movers of heroes and fittings: a police box's leaves, the rotor.
+    for (const room of [heroHallRoom(), consoleRoom(), airlock()]) {
+      const { movers } = buildRoomMesh(room, LOOKS.aperture);
+      const own = movers.filter(
+        (m) => m.key.startsWith("box:") || m.part === "rotor",
+      );
+      for (const m of own) expect(flagsOf(m.mesh)).not.toContain(FLAG.shell);
+    }
+    expect(
+      buildRoomMesh(heroHallRoom(), LOOKS.aperture).movers.some((m) =>
+        m.key.startsWith("box:"),
+      ),
+    ).toBe(true);
+
+    // The decor (pipes among it), found in the static mesh by its floats.
+    let decor = 0;
+    for (const [, room] of [
+      ...rooms(),
+      ["workshop", generateRoom(CANNED_WORKSHOP)] as const,
+    ]) {
+      if (room.decor.length === 0) continue;
+      const stat = buildRoomMesh(room, LOOKS.aperture).static.vertices;
+      const ctx = ctxOf(room);
+      for (const d of room.decor) {
+        const b = createBuilder();
+        buildDecor((f) => createKit(b, f), d, ctx);
+        const flags = asBuilt(stat, b.build());
+        expect(flags.some((f) => f.own === FLAG.lit)).toBe(true);
+        expect(flags.filter((f) => f.room !== f.own)).toEqual([]);
+        decor++;
+      }
+    }
+    expect(decor).toBeGreaterThan(0);
+  }, 60_000);
 });

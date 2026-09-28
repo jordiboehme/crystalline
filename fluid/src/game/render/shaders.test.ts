@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
 import { ACCENT_MARK, FLAG } from "./geometry";
 import rendererSource from "./renderer.ts?raw";
+import { LOOK_ORDER, LOOKS } from "./looks";
 import { SCENE_FS, SCENE_VS, SIGNAL_GAIN } from "./shaders";
 
 describe("the scene shader's blink and signal paths", () => {
@@ -128,7 +129,7 @@ describe("the scene shader's decal branch", () => {
       /if \(vFlag == 14 && texel4\.a < bayer4\(gl_FragCoord\.xy\)\) discard;/,
     );
     expect(SCENE_FS).toContain(
-      "bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == 0);",
+      "bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == 15);",
     );
   });
 
@@ -154,5 +155,46 @@ describe("the scene shader's decal branch", () => {
     expect(SCENE_FS.indexOf("discard;")).toBeLessThan(
       SCENE_FS.indexOf("outColour ="),
     );
+  });
+});
+
+describe("the scene shader's seams in look 2", () => {
+  it("draws the everywhere seams on the shell flag only, never on a plain lit surface", () => {
+    // Mutation caught: the framed test back on `vFlag == 0` (every prop,
+    // hero and fitting would glow again), or the shell's test dropped.
+    expect(FLAG.shell).toBe(15);
+    expect(SCENE_FS).toContain(
+      `bool framed = vFlag == ${String(FLAG.frame)} || (uEdgeEverywhere && vFlag == ${String(FLAG.shell)});`,
+    );
+    expect(SCENE_FS).not.toMatch(/vFlag == 0\b/);
+    expect(SCENE_FS.match(/uEdgeEverywhere &&/g)?.length).toBe(1);
+  });
+
+  it("lights the shell exactly as a lit surface: a flag of its own that no early branch takes", () => {
+    // Mutation caught: the shell given a flag another surface has (14, the
+    // decal, would discard its fragments; 13, a blink group, would draw it
+    // as a blinking light).
+    const others = Object.entries(FLAG)
+      .filter(([name]) => name !== "shell")
+      .map(([, flag]) => flag);
+    expect(others).not.toContain(FLAG.shell);
+    expect(
+      FLAG.shell >= FLAG.blink && FLAG.shell < FLAG.blink + BLINK_GROUPS,
+    ).toBe(false);
+    const main = SCENE_FS.slice(SCENE_FS.indexOf("void main()"));
+    const lit = main.indexOf("float dist = distance(uEye, vWorld);");
+    const first = main.indexOf(`vFlag == ${String(FLAG.shell)}`);
+    expect(lit).toBeGreaterThan(0);
+    expect(first).toBeGreaterThan(lit);
+  });
+
+  it("uploads uEdgeEverywhere from the look, which only look 2 turns on", () => {
+    // Mutation caught: the day shift or the third look given seams
+    // everywhere, or the uniform fed a constant instead of the look.
+    expect(rendererSource).toMatch(
+      /scene\.uniform\("uEdgeEverywhere"\),\s*look\.edge\.everywhere \? 1 : 0,/,
+    );
+    for (const id of LOOK_ORDER)
+      expect(LOOKS[id].edge.everywhere, id).toBe(id === "aperture");
   });
 });

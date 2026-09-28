@@ -10,8 +10,9 @@
  *
  * - Day shift: beige and off-white panels in bright light, neon only on
  *   doors, portals and tag strips.
- * - Aperture grid: white panels with glowing seams everywhere, doors in cyan
- *   and portals in orange.
+ * - Aperture grid: white panels with glowing seams on the room's shell and
+ *   its ways through, doors in cyan and portals in orange. Props, heroes,
+ *   fittings, decor, terminals and machines are plain shaded.
  * - Freescape 64: flat-shaded solid polygons, ordered dithering and the
  *   C64 palette, after Driller and the other Freescape games.
  *
@@ -64,7 +65,11 @@ export interface Look {
     colour: Rgb;
     /** Added brightness of an edge line; above 1 feeds the bloom. */
     strength: number;
-    /** Seams on every wall panel, not only on frames. */
+    /**
+     * Seams on the room's shell, not only on frames: on every surface
+     * flagged `shell` (`FLAG.shell`, `buildRoomMesh`), never on a prop, a
+     * hero, a fitting or other furniture.
+     */
     everywhere: boolean;
     /** Line width in pixels. */
     width: number;

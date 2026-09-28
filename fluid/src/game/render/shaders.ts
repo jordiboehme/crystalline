@@ -209,6 +209,12 @@ void main() {
  * atlas's colour is white, so a decal's colour is its tint in every look,
  * and the shapes survive Freescape 64, whose texture mix is 0.
  *
+ * Edge lines: a frame (`FLAG.frame`) always draws them, in its own tint.
+ * With `uEdgeEverywhere` (look 2) the room's shell (`FLAG.shell`) draws
+ * them too, in the look's edge colour; a plain `lit` surface (a prop, a
+ * hero, a fitting, a terminal) never does. The shell is lit exactly as
+ * `lit`: no early return tests its flag.
+ *
  * The uv's screen-space derivatives are taken once, at the top of `main`
  * before any early return, so they are defined for every fragment of the
  * quad; the edge lines and the grime lookup (`textureGrad`) share them. The
@@ -328,7 +334,7 @@ void main() {
   float facing = 0.82 + 0.18 * abs(dot(normalize(vNormal), normalize(vec3(0.35, 0.8, 0.5))));
   vec3 colour = base * lit * facing;
 
-  bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == 0);
+  bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == ${String(FLAG.shell)});
   if (framed) {
     float e = edgeLine(vUv, fw, uEdgeWidth);
     vec3 edgeColour = vFlag == 3 ? vTint : uEdgeColour;

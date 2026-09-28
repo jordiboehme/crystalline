@@ -27,6 +27,13 @@
  *   channel's, one flag per group of the hero's blink bank (`blink.ts`).
  * - `decal`: a decal (2.7 C20), lit as `lit` but with no edge lines, and
  *   first alpha-tested against an ordered threshold.
+ * - `shell`: lit as `lit`, and the only surface that draws the look's
+ *   seams when `edge.everywhere` is on (look 2). `buildRoomMesh` turns every
+ *   `lit` vertex of the shell (walls, floor, ceiling, lintels, stripe and
+ *   baseboards), the scaffolding and the hangar into `shell`, and those
+ *   of the fixtures in `SHELL_FIXTURES` with their movers; props, heroes,
+ *   curios, fittings, decor, terminals and machines stay `lit` and are
+ *   plain shaded.
  *
  * Every face is wound counter-clockwise seen from the side its normal points
  * to: the room shell faces inward, boxes face outward and wall panels face
@@ -67,6 +74,7 @@ import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import { edgeKey, edgeOf } from "../world/sites";
 import type {
   Box,
+  Fixture,
   HeroKind,
   PropKind,
   Rect,
@@ -115,6 +123,9 @@ export const FLOATS_PER_VERTEX = 13;
  *   the shader discards its fragment where the texel's alpha is under the
  *   ordered threshold at its pixel, then lights it as `lit` with no edge
  *   lines.
+ * - `shell`: the room's structure, lit exactly as `lit`. It is the only
+ *   flag that draws the look's seams when `edge.everywhere` is on
+ *   (`markShell`); a `lit` surface never draws them.
  */
 export const FLAG = {
   lit: 0,
@@ -125,7 +136,27 @@ export const FLAG = {
   signal: 5,
   blink: 6,
   decal: 14,
+  shell: 15,
 } as const;
+
+/**
+ * Turn every `lit` vertex of `data` from float `from` to float `to` into
+ * `shell`: the room's structure, which keeps the look's seams when
+ * `edge.everywhere` is on, while props, heroes and fittings lose them.
+ */
+export function markShell(data: Float32Array, from = 0, to = data.length) {
+  for (let i = from + FLOATS_PER_VERTEX - 1; i < to; i += FLOATS_PER_VERTEX)
+    if (data[i] === FLAG.lit) data[i] = FLAG.shell;
+}
+
+/**
+ * The fixtures that keep their seams with the shell, moving leaves
+ * included: the ways through, the screens and the signs. Terminals and
+ * machines are left plain, like props, heroes, fittings and decor.
+ */
+export const SHELL_FIXTURES: ReadonlySet<Fixture["kind"]> = new Set<
+  Fixture["kind"]
+>(["door", "portal", "hatch", "lift", "screen", "exit", "poster", "placard"]);
 
 /** A blink group's flag: `FLAG.blink + group`, group 0 to 7. */
 export type BlinkFlag = 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
@@ -387,6 +418,12 @@ export function createBuilder() {
         s,
       );
     },
+    /** How many floats have been pushed so far. */
+    floats: () => length,
+    /** `markShell` over the floats from `from` to the end. */
+    markShell(from = 0) {
+      markShell(data, from, length);
+    },
     /**
      * The vertices so far, trimmed to their length. A copy, so the builder
      * can go on growing without changing a mesh already handed out.
@@ -602,6 +639,11 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  * lamp panel, except in the airlock (M3 C24), which is lit by the iris
  * light in its ceiling instead. A hangar (`room.hangar`) adds its bay door,
  * pads and gantries (`buildHangar`, M3 C15).
+ *
+ * Seams: everything built up to the fixtures, and every fixture in
+ * `SHELL_FIXTURES` with its movers, is marked `shell` (`markShell`);
+ * nothing else is, so look 2 draws its seams on the room's structure,
+ * its ways through and its signs only.
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const b = createBuilder();
@@ -738,6 +780,8 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
 
   // A hangar's bay door, pads and gantries (M3 C15).
   buildHangar(b, room, look);
+  // Everything so far is the room's structure.
+  b.markShell();
 
   const plan = layerPlan(room);
   const ctx: ModelContext = {
@@ -749,7 +793,13 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const kitAt: KitAt = (f) => createKit(b, f);
   const movers: Mover[] = [];
   room.fixtures.forEach((fx, i) => {
-    movers.push(...buildFixture(kitAt, fx, i, ctx));
+    const from = b.floats();
+    const own = buildFixture(kitAt, fx, i, ctx);
+    if (SHELL_FIXTURES.has(fx.kind)) {
+      b.markShell(from);
+      for (const m of own) markShell(m.mesh.vertices);
+    }
+    movers.push(...own);
   });
   room.heroes.forEach((h, i) => movers.push(...buildHeroMovers(h, i, look)));
   (room.interior ?? []).forEach((piece, i) =>

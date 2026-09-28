@@ -40,7 +40,7 @@ describe("looks", () => {
     }
   });
 
-  it("put glowing seams everywhere only in Aperture grid", () => {
+  it("put glowing seams on the shell only in Aperture grid", () => {
     expect(LOOKS.day.edge.everywhere).toBe(false);
     expect(LOOKS.aperture.edge.everywhere).toBe(true);
   });
