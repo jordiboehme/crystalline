@@ -6466,3 +6466,26 @@ async fn an_alias_of_a_hidden_domain_answers_like_an_unknown_name_over_mcp() {
         assert_eq!(browsed["domain"], "hush-lab", "{browsed}");
     }
 }
+
+/// Issue 112: the description says an overwrite keeps the file and where it
+/// refuses, so an agent regenerating an engram knows what will happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_an_overwrite_keeps_the_file() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        text.contains("in its own file, whatever that file is called"),
+        "{text}"
+    );
+    assert!(text.contains("move_engram it first"), "{text}");
+}

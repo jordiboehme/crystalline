@@ -1,0 +1,464 @@
+//! Issue 112: an overwrite replaces the engram that owns the permalink in its
+//! own file, whatever that file is called, and no write leaves a stray file.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::support;
+use crystalline_core::config::{DomainEntry, GlobalConfig, ReviewMode};
+use crystalline_index::TursoStore;
+use crystalline_service::changes::{Change, ChangeKind, Envelope};
+use crystalline_service::params::*;
+use crystalline_service::{Engine, Scope};
+use tokio::sync::{Mutex, broadcast};
+
+const OWNER: &str = "conventions/Code Review Standards.md";
+const SLUG: &str = "conventions/code-review-standards.md";
+const PERMALINK: &str = "conventions/code-review-standards";
+
+fn engram(title: &str, permalink: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+fn seed(root: &Path, rel: &str, contents: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+/// A file domain `notes` holding a MANIFEST and whatever `files` seeds,
+/// synced; `review` puts it in review mode.
+async fn fixture(
+    review: bool,
+    files: &[(&str, String)],
+) -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = tmp.path().join("notes");
+    seed(
+        &notes,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: notes\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Everything about notes\n\n## When to Use\n\n- Route here for notes questions\n",
+    );
+    for (rel, text) in files {
+        seed(&notes, rel, text);
+    }
+    let mut entry = DomainEntry::file(notes);
+    if review {
+        entry.review = Some(ReviewMode::Overlay);
+    }
+    let mut cfg = GlobalConfig::default();
+    cfg.domains.insert("notes".to_string(), entry);
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(tmp.path().join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+fn capture(title: &str, folder: Option<&str>, content: &str, overwrite: bool) -> WriteParams {
+    WriteParams {
+        domain: "notes".to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        folder: folder.map(str::to_string),
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite,
+        share_link: None,
+        model: None,
+    }
+}
+
+fn read_as(identifier: &str) -> ReadParams {
+    ReadParams {
+        identifier: identifier.to_string(),
+        domain: Some("notes".to_string()),
+        share_link: None,
+    }
+}
+
+fn drain(rx: &mut broadcast::Receiver<Envelope>) -> Vec<Change> {
+    let mut out = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        out.push(envelope.change);
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_overwrite_replaces_a_title_named_file_in_place() {
+    let (tmp, engine, _scratch) = fixture(
+        false,
+        &[(
+            OWNER,
+            engram("Code Review Standards", PERMALINK, "The old rule."),
+        )],
+    )
+    .await;
+    let notes = tmp.path().join("notes");
+    let mut rx = engine.changes().subscribe();
+
+    let receipt = engine
+        .write_engram(&capture(
+            "Code Review Standards",
+            Some("conventions"),
+            "The new rule.",
+            true,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(receipt["path"], OWNER, "{receipt}");
+    assert_eq!(receipt["permalink"], PERMALINK);
+    assert_eq!(receipt["action"], "written");
+    assert!(
+        !notes.join(SLUG).exists(),
+        "no second file at the slug path"
+    );
+    let text = std::fs::read_to_string(notes.join(OWNER)).unwrap();
+    assert!(
+        text.contains("The new rule.") && !text.contains("The old rule."),
+        "{text}"
+    );
+    assert!(text.contains(&format!("permalink: {PERMALINK}")), "{text}");
+
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let Change::Engram(change) = &heard[0] else {
+        panic!("{heard:?}")
+    };
+    assert_eq!(
+        (change.kind, change.path.as_str()),
+        (ChangeKind::Modified, OWNER)
+    );
+
+    // The watcher's pass behind the write: nothing moved, nothing failed.
+    let report = engine
+        .sync_paths("notes", vec![OWNER.to_string(), SLUG.to_string()])
+        .await
+        .unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(
+        (report.added, report.updated, report.deleted, report.moved),
+        (0, 0, 0, 0),
+        "the engine recorded the stamp, so the pass reads it unchanged: {report:?}"
+    );
+    assert!(drain(&mut rx).is_empty(), "the watcher announces nothing");
+
+    let read = engine
+        .read_engram(&read_as(PERMALINK), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(read["content"].as_str().unwrap().contains("The new rule."));
+}
+
+#[tokio::test]
+async fn an_overwrite_matches_the_folder_by_slug() {
+    let owner = "Conventions/Code Review Standards.md";
+    let (tmp, engine, _scratch) = fixture(
+        false,
+        &[(
+            owner,
+            engram("Code Review Standards", PERMALINK, "The old rule."),
+        )],
+    )
+    .await;
+    let receipt = engine
+        .write_engram(&capture(
+            "Code Review Standards",
+            Some("conventions"),
+            "The new rule.",
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], owner);
+    let notes = tmp.path().join("notes");
+    assert!(
+        std::fs::read_to_string(notes.join(owner))
+            .unwrap()
+            .contains("The new rule.")
+    );
+}
+
+#[tokio::test]
+async fn an_overwrite_of_an_engram_in_another_folder_is_refused_before_disk() {
+    let moved = "archive/code-review-standards.md";
+    let old = engram("Code Review Standards", PERMALINK, "The old rule.");
+    // A root engram moved into a folder with its permalink kept.
+    let root_moved = engram("Root Rule", "root-rule", "Kept its root permalink.");
+    let (tmp, engine, _scratch) = fixture(
+        false,
+        &[(moved, old.clone()), ("archive/root-rule.md", root_moved)],
+    )
+    .await;
+    let err = engine
+        .write_engram(&capture(
+            "Code Review Standards",
+            Some("conventions"),
+            "The new rule.",
+            true,
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'archive/code-review-standards.md' in folder 'archive', not in folder 'conventions'. An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram"
+    );
+    assert!(
+        !err.contains("already exists in domain"),
+        "never the elicitation marker"
+    );
+    let notes = tmp.path().join("notes");
+    assert!(
+        !notes.join(SLUG).exists(),
+        "nothing written at the slug path"
+    );
+    assert_eq!(std::fs::read_to_string(notes.join(moved)).unwrap(), old);
+
+    // The root is named as such.
+    let err = engine
+        .write_engram(&capture("Root Rule", None, "x", true))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "permalink 'root-rule' in domain 'notes' belongs to 'archive/root-rule.md' in folder 'archive', not in the domain root. An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram"
+    );
+    assert!(!notes.join("root-rule.md").exists());
+}
+
+#[tokio::test]
+async fn a_write_never_replaces_a_file_that_holds_another_engram() {
+    let other = engram("Something Else", "custom-gamma", "Not gamma.");
+    let (tmp, engine, _scratch) = fixture(false, &[("gamma.md", other.clone())]).await;
+    for overwrite in [false, true] {
+        let err = engine
+            .write_engram(&capture("Gamma", None, "Gamma body.", overwrite))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "'gamma.md' in domain 'notes' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram",
+            "overwrite={overwrite}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes/gamma.md")).unwrap(),
+        other
+    );
+}
+
+#[tokio::test]
+async fn a_create_refuses_an_unreadable_file_and_an_overwrite_repairs_it() {
+    let broken = "---\ntitle: [unclosed\n---\n\nbody\n".to_string();
+    let (tmp, engine, _scratch) = fixture(false, &[("gamma.md", broken.clone())]).await;
+    let err = engine
+        .write_engram(&capture("Gamma", None, "Gamma body.", false))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "'gamma.md' in domain 'notes' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
+    );
+    let path = tmp.path().join("notes/gamma.md");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+
+    engine
+        .write_engram(&capture("Gamma", None, "Gamma body.", true))
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("Gamma body.")
+    );
+}
+
+#[tokio::test]
+async fn a_title_namesake_is_not_an_owner() {
+    let namesake = engram("Gamma", "g", "Answers to g, titled Gamma.");
+    let (tmp, engine, _scratch) = fixture(false, &[("g.md", namesake.clone())]).await;
+    let receipt = engine
+        .write_engram(&capture("Gamma", None, "The real gamma.", true))
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], "gamma.md");
+    let notes = tmp.path().join("notes");
+    assert_eq!(
+        std::fs::read_to_string(notes.join("g.md")).unwrap(),
+        namesake
+    );
+}
+
+fn ada() -> Scope {
+    Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    }
+}
+
+/// Bob, working inside ada's draft of the title-named page.
+fn bob_in_adas_draft() -> (Scope, crystalline_service::Join) {
+    (
+        Scope::User {
+            account: "bob".to_string(),
+            admin: false,
+        },
+        crystalline_service::Join {
+            account: "bob".to_string(),
+            holder: crystalline_service::Holder::Process(1),
+            domain: "notes".to_string(),
+            path: OWNER.to_string(),
+            owner: "ada".to_string(),
+            expires_at: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_joined_overwrite_of_the_granted_title_named_page_lands_in_the_owners_draft() {
+    let (_tmp, engine, _scratch) = fixture(
+        true,
+        &[(
+            OWNER,
+            engram("Code Review Standards", PERMALINK, "The old rule."),
+        )],
+    )
+    .await;
+    engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Ada's rule.",
+                true,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    let (bob, join) = bob_in_adas_draft();
+    let receipt = engine
+        .write_engram_joined(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Bob's rule.",
+                true,
+            ),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], OWNER);
+    assert_eq!(receipt["joined"], "landed in ada's draft");
+    let hers = engine
+        .read_engram(&read_as(PERMALINK), &ada())
+        .await
+        .unwrap();
+    assert!(hers["content"].as_str().unwrap().contains("Bob's rule."));
+}
+
+#[tokio::test]
+async fn a_joined_capture_elsewhere_hears_the_join_refusal_before_anything_about_the_draft() {
+    let (_tmp, engine, _scratch) = fixture(
+        true,
+        &[
+            (
+                OWNER,
+                engram("Code Review Standards", PERMALINK, "The old rule."),
+            ),
+            (
+                "archive/root-rule.md",
+                engram("Root Rule", "root-rule", "Moved."),
+            ),
+        ],
+    )
+    .await;
+    engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Ada's rule.",
+                true,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    let (bob, join) = bob_in_adas_draft();
+    // Would be M1 for anybody else; inside a join it is the join refusal.
+    let err = engine
+        .write_engram_joined(
+            &capture("Root Rule", None, "x", true),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is working inside ada's draft"), "{err}");
+    assert!(!err.contains("belongs to"), "{err}");
+}
+
+#[tokio::test]
+async fn an_overwrite_in_review_mode_drafts_the_owning_path() {
+    let old = engram("Code Review Standards", PERMALINK, "The old rule.");
+    let (tmp, engine, _scratch) = fixture(true, &[(OWNER, old.clone())]).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    let receipt = engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "The new rule.",
+                true,
+            ),
+            None,
+            &ada,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], OWNER, "{receipt}");
+    assert_eq!(receipt["draft"], true);
+
+    let notes = tmp.path().join("notes");
+    assert_eq!(
+        std::fs::read_to_string(notes.join(OWNER)).unwrap(),
+        old,
+        "the folder is untouched"
+    );
+    assert!(!notes.join(SLUG).exists());
+
+    let mine = engine.read_engram(&read_as(PERMALINK), &ada).await.unwrap();
+    assert_eq!(mine["path"], OWNER);
+    assert!(mine["content"].as_str().unwrap().contains("The new rule."));
+    let team = engine
+        .read_engram(&read_as(PERMALINK), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(team["content"].as_str().unwrap().contains("The old rule."));
+}

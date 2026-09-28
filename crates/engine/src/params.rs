@@ -68,7 +68,10 @@ pub struct WriteParams {
     /// status and recorded_at, which have their own parameters.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
-    /// Overwrite an existing engram with the same permalink instead of erroring.
+    /// Replace the engram that already answers to this permalink instead of
+    /// erroring. It is replaced in its own file, whatever that file is
+    /// called; an engram that lives in another folder is refused (move it
+    /// with move_engram first).
     #[serde(default)]
     pub overwrite: bool,
     /// Your model id, for example claude-opus-5; recorded beside who wrote it

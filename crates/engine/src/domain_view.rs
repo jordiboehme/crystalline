@@ -132,6 +132,18 @@ pub struct DomainView<'a> {
     _writing: Option<crate::rename::WriteTicket<'a>>,
 }
 
+/// What stands at one path for a writer, told apart the way a capture needs
+/// it before it writes anything (see [`DomainView::occupant_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Occupant {
+    /// Nothing, or a path this writer's own tombstone deletes.
+    Free,
+    /// An engram answering to this permalink.
+    Engram(String),
+    /// A file or row that does not parse as an engram.
+    Unreadable,
+}
+
 impl<'a> DomainView<'a> {
     /// The base view: the folder the team reviewed and nothing else.
     ///
@@ -526,6 +538,103 @@ impl<'a> DomainView<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// The path of the engram that answers to exactly `permalink` in this
+    /// view, never a title namesake: the writer's own draft first, then the
+    /// base row unless the writer's own tombstone deletes its path. The same
+    /// reading of "holds" [`DomainView::refuse_address_held_elsewhere`] uses,
+    /// asked as "where" rather than "somewhere else". The two lookups are
+    /// twins on purpose (that one also filters out the path being written and
+    /// a move's vacated source); a change to what "holds" means changes both.
+    pub(crate) async fn permalink_holder(
+        &self,
+        domain_id: DomainId,
+        permalink: &str,
+    ) -> Result<Option<String>> {
+        let store = self.engine.store();
+        let store = store.lock().await;
+        // `find_engram` answers a title as well as a permalink; only an exact
+        // permalink is an owner.
+        let base = store
+            .find_engram(self.domain.as_str(), permalink)
+            .await?
+            .filter(|found| found.permalink == permalink)
+            .map(|found| found.path);
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(base);
+        };
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| !entry.tombstone && entry.permalink == permalink)
+        {
+            return Ok(Some(entry.path.clone()));
+        }
+        Ok(base.filter(|path| {
+            !entries
+                .iter()
+                .any(|entry| entry.tombstone && entry.path == *path)
+        }))
+    }
+
+    /// What stands at `path` for this view's writer: their own draft row (a
+    /// tombstone is nothing), else the file on disk for a file domain, else
+    /// the base row for a virtual one. The file is read through the
+    /// filesystem, so a case-folding filesystem answers for the file a write
+    /// there would really replace.
+    pub(crate) async fn occupant_at(
+        &self,
+        domain_id: DomainId,
+        source: &ContentSource,
+        path: &str,
+    ) -> Result<Occupant> {
+        if let Some(actor) = self.actor.as_deref() {
+            let held = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store.overlay_entry(domain_id, actor, path).await?
+            };
+            match held {
+                Some(entry) if entry.tombstone => return Ok(Occupant::Free),
+                Some(entry) => return Ok(Occupant::Engram(entry.permalink)),
+                None => {}
+            }
+        }
+        let text = match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Occupant::Free);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        return Ok(Occupant::Unreadable);
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
+            ContentSource::Virtual => {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                match store.engram_content(domain_id, path).await? {
+                    Some(text) => text,
+                    None => return Ok(Occupant::Free),
+                }
+            }
+        };
+        Ok(match parse_engram(&text) {
+            Ok(engram) => Occupant::Engram(
+                EngramRecord::from_engram(&engram, path, virtual_stamp(&text)).permalink,
+            ),
+            Err(_) => Occupant::Unreadable,
+        })
     }
 
     /// The row and the mirror of a draft, once the address has been settled.

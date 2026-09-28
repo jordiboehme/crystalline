@@ -1197,3 +1197,64 @@ both_backends!(
     a_virtual_engram_resolves_by_its_stored_path,
     virtual_path_identifier
 );
+
+// --- overwrite in place (#112) ------------------------------------------------
+
+async fn virtual_overwrite_in_place(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store.clone());
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("conventions")).unwrap();
+    std::fs::write(
+        src.path().join("conventions/Code Review Standards.md"),
+        "---\ntype: engram\ntitle: Code Review Standards\npermalink: conventions/code-review-standards\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Code Review Standards\n\nThe old rule.\n",
+    )
+    .unwrap();
+    engine
+        .import_domain("notes", src.path(), false, false)
+        .await
+        .unwrap();
+
+    let receipt = engine
+        .write_engram(&WriteParams {
+            folder: Some("conventions".to_string()),
+            overwrite: true,
+            ..write_params("Code Review Standards", "The new rule.")
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], "conventions/Code Review Standards.md");
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "conventions/code-review-standards".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["path"], "conventions/Code Review Standards.md");
+    assert!(read["content"].as_str().unwrap().contains("The new rule."));
+    // No row stands at the slug path, asked of the store itself rather than
+    // through the resolver, and the folder holds exactly one engram.
+    let st = store.lock().await;
+    let domain_id = st.domain_id("notes").await.unwrap().expect("registered");
+    assert!(
+        st.engram_content(domain_id, "conventions/code-review-standards.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let rows = st
+        .list_engrams("notes", Some("conventions"), None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}
+
+both_backends!(
+    a_virtual_overwrite_replaces_the_owning_row,
+    virtual_overwrite_in_place
+);

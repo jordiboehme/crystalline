@@ -3839,12 +3839,10 @@ async fn a_draft_never_takes_a_permalink_another_path_holds() {
         )
         .await
         .expect_err("a create may not land on an address the team's folder already spends");
-    assert!(
-        taken
-            .to_string()
-            .contains("permalink 'nightly-ledger' already exists at another path")
-            && taken.to_string().contains("docs/ledger.md"),
-        "naming where it is held, not just that it is: {taken}"
+    assert_eq!(
+        taken.to_string(),
+        "permalink 'nightly-ledger' in domain 'team' belongs to 'docs/ledger.md' in folder 'docs', not in the domain root. An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram",
+        "naming where it is held, not just that it is"
     );
 
     // -- and the addresses stayed unique, which is what the refusals are for:
