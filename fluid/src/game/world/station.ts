@@ -101,10 +101,12 @@ export interface StationRoom {
  *   round the arrival box through `withArrivalBox`, which composes after
  *   the fittings so the box's candidates see the lift and the screen and
  *   never stand in the screen's lane;
- * - a **deck** is `generateDeck` at the section `deckRoomSection` resolves:
- *   the section holding the engram `arrival.from` names, when it names one
- *   in this same domain, else the section `loaded.section` asked for (M3
- *   C1's `null` reading as the first);
+ * - a **deck** is `generateDeck` at the section `deckRoomSection` resolves.
+ *   An explicit, already-resolved `loaded.section` always wins (C1: `null`
+ *   is what means "unresolved", and a number is not re-resolved); only
+ *   when `loaded.section` is `null` does the section holding the engram
+ *   `arrival.from` names, when it names one in this same domain, take
+ *   over, else the deck's first section;
  * - an **engram** is `generateRoom(place)` with one exit added
  *   (`withExit`) to its deck, `{ kind: "deck", domain, folder,
  *   section: null }` labelled `deckLabel(domain, folder)` - unresolved, so
@@ -152,6 +154,7 @@ export function roomFor(
     }
     case "deck": {
       const from =
+        loaded.section === null &&
         arrival !== null &&
         arrival.from.kind === "engram" &&
         arrival.from.domain === loaded.input.domain

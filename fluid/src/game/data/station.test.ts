@@ -172,8 +172,10 @@ describe("loadStation: the airlock (M3 C24, C29)", () => {
 
 describe("loadStation: a bridge (M3 C20, C22, C23, C29)", () => {
   it("builds a bridge from its domain's tree root and MANIFEST", async () => {
-    // Mutation caught: a folder dropped, `rootDeck` read from the visible
-    // rows instead of `total`, or the listing's fields misread.
+    // Mutation caught: a folder dropped, or the listing's fields misread
+    // (the count, the private flag or the display name). `rootDeck`'s own
+    // total-vs-visible-rows distinction is pinned separately below, where
+    // the two readings can actually disagree.
     serve({
       "/domains/eng/tree": () =>
         treeResponse(
@@ -285,6 +287,46 @@ describe("loadStation: a bridge (M3 C20, C22, C23, C29)", () => {
     expect(loaded.bridge.rootDeck).toBe(false);
   });
 
+  it("derives rootDeck from the tree's true total, not the rows it happened to send (M1)", async () => {
+    // Mutation caught: `rootDeck` computed from `tree.engrams.length`
+    // instead of `tree.total` - a truncated root level (more rows exist
+    // than the level sent) would then read as having no root deck even
+    // though the level plainly holds more than the MANIFEST.
+    serve({
+      "/domains/eng/tree": () =>
+        treeResponse("eng", "", [], [treeRow("manifest")], {
+          truncated: true,
+          total: 5,
+        }),
+      "/domains": () => listingResponse([domainRow("eng")]),
+      "/domains/eng/engrams/manifest": () =>
+        detailResponse("eng", "manifest", "Eng", "manifest.md"),
+    });
+    const loaded = await loadStation(client, { kind: "bridge", domain: "eng" });
+    expect(loaded.kind).toBe("bridge");
+    if (loaded.kind !== "bridge") return;
+    expect(loaded.bridge.rootDeck).toBe(true);
+  });
+
+  it("marks a bridge's domain private when the listing says so (I2)", async () => {
+    // Mutation caught: `priv` read as `false` regardless of the listing's
+    // own `private` flag - the key pictogram on the bridge screen (C20)
+    // would then never appear for a private domain.
+    serve({
+      "/domains/eng/tree": () =>
+        treeResponse("eng", "", [], [treeRow("manifest")]),
+      "/domains": () => listingResponse([domainRow("eng", { private: true })]),
+      "/domains/eng/engrams/manifest": () =>
+        detailResponse("eng", "manifest", "Eng", "manifest.md"),
+    });
+    const loaded = await loadStation(client, { kind: "bridge", domain: "eng" });
+    expect(loaded.kind).toBe("bridge");
+    if (loaded.kind !== "bridge") return;
+    expect(loaded.bridge.private).toBe(true);
+  });
+
+  // Mutation caught: `faultOf`'s 404 and 403 mapped to the wrong kind (both
+  // cases below turn red at once from that one swap).
   it.each([
     [404, "missing"],
     [403, "denied"],
@@ -347,6 +389,26 @@ describe("loadStation: a bridge (M3 C20, C22, C23, C29)", () => {
     });
   });
 
+  it("reads a failed domain listing once, not twice (M2)", async () => {
+    // Mutation caught: `loadBridge` fetching the listing itself ahead of
+    // `loadPlace`'s own attempt (a second `fetchQuery` call for the same
+    // key on a failed listing is not reused - TanStack Query retries a
+    // failed fetch rather than treating it as fresh - so the domain
+    // listing would be requested twice instead of once).
+    const listingCalls = vi.fn(() => {
+      throw new ApiProblem(500, "no", "listing failed");
+    });
+    serve({
+      "/domains/eng/tree": () =>
+        treeResponse("eng", "", [], [treeRow("manifest")]),
+      "/domains": listingCalls,
+      "/domains/eng/engrams/manifest": () =>
+        detailResponse("eng", "manifest", "Eng", "manifest.md"),
+    });
+    await loadStation(client, { kind: "bridge", domain: "eng" });
+    expect(listingCalls).toHaveBeenCalledTimes(1);
+  });
+
   it("shows the domain's canonical name on the bridge screen, kept apart from its routing key", async () => {
     // Mutation caught: the canonical name written into `domain` (breaking
     // every deck stop's `to.domain`) instead of into `display`.
@@ -407,6 +469,8 @@ describe("loadStation: a deck (M3 C8, C11, C12, C29)", () => {
     });
   });
 
+  // Mutation caught: `faultOf`'s 404 and 403 mapped to the wrong kind (both
+  // cases below turn red at once from that one swap).
   it.each([
     [404, "missing"],
     [403, "denied"],
@@ -477,6 +541,34 @@ describe("loadStation: an engram (M3 C28, C29)", () => {
     expect(loaded.folder).toBe("notes/deep");
   });
 
+  it("gives an engram outside any folder the root deck (M3)", async () => {
+    // Mutation caught: a root-level path or permalink read as its own
+    // one-segment folder instead of the empty root (`folderOfPath`/
+    // `folderOfPermalink` cutting at the segment itself rather than at the
+    // last `/`, which a root-level path or permalink has none of).
+    serve({
+      "/domains/eng/engrams/x": () => detailResponse("eng", "x", "X", "x.md"),
+      "/domains": () => listingResponse([domainRow("eng")]),
+      "/graph": () => ({ nodes: [], edges: [], truncated: false }),
+      "/domains/eng/inbound/x": () => ({
+        total: 0,
+        page: 1,
+        limit: 24,
+        count: 0,
+        types: [],
+        hits: [],
+      }),
+    });
+    const loaded = await loadStation(client, {
+      kind: "engram",
+      domain: "eng",
+      permalink: "x",
+    });
+    expect(loaded.kind).toBe("engram");
+    if (loaded.kind !== "engram") return;
+    expect(loaded.folder).toBe("");
+  });
+
   it("gives an engram its deck folder from its permalink in a virtual domain, when it has no path", async () => {
     // Mutation caught: `folderOfPath` called on a null path instead of
     // falling back to `folderOfPermalink`.
@@ -533,6 +625,9 @@ describe("loadStation: an engram (M3 C28, C29)", () => {
     });
   });
 
+  // Mutation caught: `loadEngram` not passing `loadPlace`'s own
+  // missing/denied/offline result straight through (a mapping of its own
+  // that got the codes wrong, or that swallowed the distinction).
   it.each([
     [404, "missing"],
     [403, "denied"],
@@ -558,6 +653,10 @@ describe("loadStation: an engram (M3 C28, C29)", () => {
 
 describe("loadStation: cancellation (M3 C29)", () => {
   it("rejects at once when the signal is already aborted, for every address kind", async () => {
+    // Mutation caught: `checkAborted` dropped from `loadStation`'s entry
+    // point (or from any one loader's first line), so a signal that had
+    // already fired before the call was made would fall through to the
+    // first fetch instead of rejecting before any request is made.
     serve({});
     const controller = new AbortController();
     controller.abort();
@@ -575,7 +674,10 @@ describe("loadStation: cancellation (M3 C29)", () => {
     expect(apiMock).not.toHaveBeenCalled();
   });
 
-  it("aborts a bridge load during the tree and listing round", async () => {
+  it("aborts a bridge load during the tree fetch", async () => {
+    // Mutation caught: the trailing `checkAborted` after the tree fetch
+    // dropped, so a signal that fired while the tree was still in flight
+    // would go unnoticed and the load would carry on to the MANIFEST fetch.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () => {
@@ -591,6 +693,9 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts a bridge load during the MANIFEST fetch", async () => {
+    // Mutation caught: the trailing `checkAborted` after `loadPlace`
+    // dropped, so a signal that fired while the MANIFEST was still loading
+    // would go unnoticed and the load would resolve with a stale bridge.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () =>
@@ -607,6 +712,9 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts a deck load during the tree fetch", async () => {
+    // Mutation caught: the trailing `checkAborted` after the tree fetch
+    // dropped, so a signal that fired while the tree was still in flight
+    // would go unnoticed and the load would resolve with a stale deck.
     const controller = new AbortController();
     serve({
       "/domains/eng/tree": () => {
@@ -624,6 +732,9 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts an airlock load during the listing fetch", async () => {
+    // Mutation caught: the trailing `checkAborted` after the listing fetch
+    // dropped, so a signal that fired while the listing was still loading
+    // would go unnoticed and the load would resolve with a stale airlock.
     const controller = new AbortController();
     serve({
       "/domains": () => {
@@ -637,6 +748,9 @@ describe("loadStation: cancellation (M3 C29)", () => {
   });
 
   it("aborts an engram load during the detail fetch", async () => {
+    // Mutation caught: `loadEngram` swallowing `loadPlace`'s own
+    // `AbortError` (a `.catch` that maps every rejection to a fault kind,
+    // say) instead of letting it propagate.
     const controller = new AbortController();
     serve({
       "/domains/eng/engrams/alpha": () => {
@@ -651,5 +765,67 @@ describe("loadStation: cancellation (M3 C29)", () => {
         controller.signal,
       ),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects at once, rather than waiting forever, while the airlock's listing hangs (I3)", async () => {
+    // Mutation caught: the `abortable` race dropped from `loadAirlock`
+    // (`await client.fetchQuery(domainsQuery()).catch(...)` with no race
+    // against the signal) - a request that never settles would then hang
+    // the whole call past the point the player gave up, instead of
+    // rejecting the moment the signal fires.
+    const controller = new AbortController();
+    serve({ "/domains": () => new Promise(() => {}) });
+    const pending = loadStation(client, { kind: "airlock" }, controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects at once, rather than waiting forever, while a bridge's tree hangs (I3)", async () => {
+    // Mutation caught: the `abortable` race dropped from the tree fetch in
+    // `loadBridge` - a tree request that never settles would then hang the
+    // whole bridge load past the point the player gave up.
+    const controller = new AbortController();
+    serve({ "/domains/eng/tree": () => new Promise(() => {}) });
+    const pending = loadStation(
+      client,
+      { kind: "bridge", domain: "eng" },
+      controller.signal,
+    );
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects at once, rather than waiting forever, while a deck's tree hangs (I3)", async () => {
+    // Mutation caught: the `abortable` race dropped from the tree fetch in
+    // `loadDeck` - a tree request that never settles would then hang the
+    // whole deck load past the point the player gave up.
+    const controller = new AbortController();
+    serve({ "/domains/eng/tree": () => new Promise(() => {}) });
+    const pending = loadStation(
+      client,
+      { kind: "deck", domain: "eng", folder: "notes", section: null },
+      controller.signal,
+    );
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects at once, rather than waiting forever, while an engram's detail hangs (I3)", async () => {
+    // Mutation caught: `loadPlace`'s own `abortable` race dropped from its
+    // detail fetch - a detail request that never settles would then hang
+    // the whole engram load past the point the player gave up.
+    const controller = new AbortController();
+    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
+    const pending = loadStation(
+      client,
+      { kind: "engram", domain: "eng", permalink: "alpha" },
+      controller.signal,
+    );
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

@@ -179,15 +179,48 @@ describe("roomFor (M3 C1, C20, C21, C28)", () => {
     expect(crossDomain.address).toMatchObject({ section: 0 });
   });
 
+  it("keeps an explicit, already-resolved deck section over the arrival engram's own (C1)", () => {
+    // Mutation caught: the arrival engram's section honoured even when the
+    // request already named a section (an explicit `?section=` in the URL
+    // would silently land the player in a different section than the one
+    // the address named).
+    const sections = sectionsOf(
+      CANNED_DECK.rows.filter((r) => !isManifestPermalink(r.permalink)),
+    );
+    expect(sections.length).toBe(2);
+    const secondRow = sections[1]?.[0];
+    expect(secondRow).toBeDefined();
+    if (secondRow === undefined) return;
+    const loaded: StationRoomInput = {
+      kind: "deck",
+      input: CANNED_DECK,
+      section: 0,
+    };
+    const from: StationAddress = {
+      kind: "engram",
+      domain: CANNED_DECK.domain,
+      permalink: secondRow.permalink,
+    };
+    const result = roomFor(loaded, { from }, null);
+    expect(result.address).toEqual({
+      kind: "deck",
+      domain: CANNED_DECK.domain,
+      folder: CANNED_DECK.folder,
+      section: 0,
+    });
+    expect(result.room).toEqual(generateDeck(CANNED_DECK, 0));
+  });
+
   it("stands the arrival box after the bridge's own fittings, clear of the screen's lane (M3 C21)", () => {
     // Mutation caught: `landing === "box"` ignored (the box never stood up
     // at all, `box` stays null). `withBridge` first, `withArrivalBox` after
-    // is still the composition built here (matching C21 and the order
-    // `withArrivalBox`'s own module doc calls for), but M3 A5's task 5
-    // report found this canned room's box and screen cannot be made to
-    // conflict by swapping that order either way (the arrival box is
-    // always free-standing, clear of any wall's viewing lane by
-    // construction) - confirmed again here by hand, see the report.
+    // is the composition built here, matching C21 and the order
+    // `withArrivalBox`'s own module doc calls for; swapping that order on
+    // this canned room does not turn this assertion red by itself (the
+    // arrival box is always free-standing, clear of any wall's viewing
+    // lane by construction, so it cannot land in the screen's lane
+    // whichever fixture the room already carries), which is why the
+    // catchable mutation named above is the one built into this test.
     const loaded: StationRoomInput = {
       kind: "bridge",
       place: CANNED_BRIDGE,

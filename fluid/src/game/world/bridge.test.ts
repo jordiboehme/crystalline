@@ -76,7 +76,7 @@ describe("withBridge (M3 C20, C21)", () => {
     expect(privFitted.fixtures.at(-1)).toMatchObject({ keys: [0] });
   });
 
-  it("reads the screen from `display`, kept apart from the routing key `domain` (M3 review, carried from task 5)", () => {
+  it("reads the screen from `display`, kept apart from the routing key `domain`", () => {
     // Mutation caught: the screen line read `bridge.domain` again instead
     // of `bridge.display` - the canonical name would then leak into a
     // route or a stencil hash instead of only appearing on the screen.

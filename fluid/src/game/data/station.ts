@@ -17,22 +17,24 @@
  *   `domains` null - "cannot tell", never `offline` (C29's directory reads
  *   `?DOMAIN LIST ERROR` on `null`, a station-wide fault would be the wrong
  *   read for one listing failing to load).
- * - a **bridge** reads its domain's tree root and the domain listing in
- *   parallel, then, once the tree has answered, the MANIFEST engram the
- *   tree names (C22): the root row whose permalink upper-cases to
- *   `MANIFEST`, else the literal permalink `manifest`. A 404, 403 or a
- *   dropped connection on the tree gives `missing`, `denied` or `offline`
- *   for the whole bridge; any other tree failure is not fatal - the panel
- *   degrades instead (`folders: null`, `rootDeck: false`, the `manifest`
- *   fallback permalink), the same shape C29's `?DECK LIST ERROR` note
- *   already reads, so the choice costs no new case in `world/bridge.ts`. A
- *   failed listing gives `engrams: null`, `private: false` and falls the
- *   screen's `display` name back to the domain's own key. The MANIFEST
- *   fetch is `loadPlace` itself (a MANIFEST is an ordinary engram, and the
- *   bridge is its generated room with fittings, C3): a 404 there is not
- *   `missing` but C23's stand-in place (the domain as title, type
- *   `manifest`, no content and no ways), a 403 is `denied`, and anything
- *   else `loadPlace` already distinguishes on its own.
+ * - a **bridge** reads its domain's tree root, then, once the tree has
+ *   answered, the MANIFEST engram the tree names (C22): the root row whose
+ *   permalink upper-cases to `MANIFEST`, else the literal permalink
+ *   `manifest`. A 404, 403 or a dropped connection on the tree gives
+ *   `missing`, `denied` or `offline` for the whole bridge; any other tree
+ *   failure is not fatal - the panel degrades instead (`folders: null`,
+ *   `rootDeck: false`, the `manifest` fallback permalink), the same shape
+ *   C29's `?DECK LIST ERROR` note already reads, so the choice costs no
+ *   new case in `world/bridge.ts`. The MANIFEST fetch is `loadPlace`
+ *   itself (a MANIFEST is an ordinary engram, and the bridge is its
+ *   generated room with fittings, C3): a 404 there is not `missing` but
+ *   C23's stand-in place (the domain as title, type `manifest`, no
+ *   content and no ways), a 403 is `denied`, and anything else `loadPlace`
+ *   already distinguishes on its own. The domain listing is read back from
+ *   `loadPlace`'s own cache afterward, never fetched a second time (see
+ *   `loadBridge`'s own comment); a failed listing gives `engrams: null`,
+ *   `private: false` and falls the screen's `display` name back to the
+ *   domain's own key.
  * - a **deck** reads its tree level alone: a 404, 403 or dropped connection
  *   gives `missing`, `denied` or `offline`; anything else is a fault and is
  *   rethrown, as `loadPlace`'s own detail fetch does. The rows, the
@@ -52,7 +54,11 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import { ApiProblem } from "../../api/client";
 import { treeQuery, type DomainTree } from "../../api/domain";
-import { DOMAINS_QUERY_KEY, fetchDomains } from "../../api/domains";
+import {
+  DOMAINS_QUERY_KEY,
+  fetchDomains,
+  type DomainListing,
+} from "../../api/domains";
 import { engramDetailKey, type EngramDetail } from "../../api/engram";
 import {
   folderOfPath,
@@ -152,9 +158,21 @@ function standInPlace(domain: string, permalink: string): PlaceInput {
 }
 
 /**
- * One domain's bridge (M3 C20, C22, C23, C29): the tree root and the
- * listing read in parallel, then the MANIFEST by the permalink the tree
- * names. See the module comment for what each failure turns into.
+ * One domain's bridge (M3 C20, C22, C23, C29): the tree root, then the
+ * MANIFEST by the permalink the tree names. See the module comment for
+ * what each failure turns into.
+ *
+ * The listing is never fetched here directly: `loadPlace`'s own parallel
+ * round (for the MANIFEST) already reads it, under the very key
+ * `domainsQuery` names, to resolve a bracket link's domain prefix - so
+ * this reads it back from that one attempt's cache (`client.getQueryData`,
+ * fetching nothing) once `loadPlace` has settled, whether that attempt
+ * succeeded or failed. `loadPlace` reads every one of its four payloads in
+ * parallel regardless of any other one failing, so the listing has always
+ * been attempted by the time it returns. Fetching it here too, ahead of
+ * `loadPlace`, would cost a second request on a failed listing (TanStack
+ * Query does not treat an error result as fresh, so a second `fetchQuery`
+ * for the same key retries rather than reusing it).
  */
 async function loadBridge(
   client: QueryClient,
@@ -162,45 +180,28 @@ async function loadBridge(
   signal: AbortSignal | undefined,
 ): Promise<LoadedStation> {
   checkAborted(signal);
-  const [treeResult, listingResult] = await abortable(
-    Promise.allSettled([
-      client.fetchQuery(treeQuery(domain, "")),
-      client.fetchQuery(domainsQuery()),
-    ]),
-    signal,
-  );
-  checkAborted(signal);
-
   let folders: readonly string[] | null;
   let rootDeck: boolean;
   let manifestPermalink: string;
-  if (treeResult.status === "fulfilled") {
-    const tree = treeResult.value;
+  try {
+    const tree = await abortable(
+      client.fetchQuery(treeQuery(domain, "")),
+      signal,
+    );
     const manifestRow = tree.engrams.find((r) =>
       isManifestPermalink(r.permalink),
     );
     manifestPermalink = manifestRow?.permalink ?? "manifest";
     folders = tree.folders;
     rootDeck = tree.total - (manifestRow === undefined ? 0 : 1) > 0;
-  } else {
-    const fault = faultOf(treeResult.reason);
+  } catch (error) {
+    const fault = faultOf(error);
     if (fault !== null) return { kind: fault };
     folders = null;
     rootDeck = false;
     manifestPermalink = "manifest";
   }
-
-  let engrams: number | null = null;
-  let priv = false;
-  let display = domain;
-  if (listingResult.status === "fulfilled") {
-    const row = listingResult.value.domains.find((d) => d.name === domain);
-    if (row !== undefined) {
-      engrams = row.engrams;
-      priv = row.private;
-      display = row.canonicalName ?? domain;
-    }
-  }
+  checkAborted(signal);
 
   const loadedPlace = await loadPlace(
     client,
@@ -216,6 +217,19 @@ async function loadBridge(
     place = standInPlace(domain, manifestPermalink);
   } else {
     return loadedPlace;
+  }
+
+  let engrams: number | null = null;
+  let priv = false;
+  let display = domain;
+  const listing = client.getQueryData<DomainListing>(DOMAINS_QUERY_KEY);
+  if (listing !== undefined) {
+    const row = listing.domains.find((d) => d.name === domain);
+    if (row !== undefined) {
+      engrams = row.engrams;
+      priv = row.private;
+      display = row.canonicalName ?? domain;
+    }
   }
 
   const bridge: BridgeInput = {
