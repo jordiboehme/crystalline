@@ -13,12 +13,15 @@ import { describe, expect, it } from "vitest";
 
 import { stationOfPlace } from "../paths";
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
-import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import { CANNED_BRIDGE, CANNED_DECK, CANNED_HUB, galleryRoom } from "./canned";
+import { generateDeck } from "./deck";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
 import { isFloor } from "./layout";
 import {
   APPROACH,
+  ARRIVAL_DISTANCE,
   DOOR_HALF,
+  DOOR_REACH,
   DOOR_STEP,
   FACING,
   REACH,
@@ -33,6 +36,7 @@ import {
   type DoorState,
 } from "./interact";
 import { PLAYER_RADIUS, blockersFor, type Player } from "./move";
+import { roomFor } from "./station";
 import type { Fixture, RoomSpec, StationAddress, WallSlot } from "./types";
 import { CELL } from "./units";
 
@@ -653,5 +657,151 @@ describe("ways in the failed map", () => {
       expect(-Math.sin(spawn.yaw)).toBeCloseTo(-w.inward[0], 9);
       expect(-Math.cos(spawn.yaw)).toBeCloseTo(-w.inward[1], 9);
     }
+  });
+});
+
+describe("the exit and the lift (M3 C27, C28)", () => {
+  const row = CANNED_DECK.rows[5]!;
+  const engram: StationAddress = {
+    kind: "engram",
+    domain: CANNED_DECK.domain,
+    permalink: row.permalink,
+  };
+  const place = {
+    ...CANNED_BRIDGE,
+    domain: CANNED_DECK.domain,
+    permalink: row.permalink,
+    title: row.title,
+  };
+  const room = roomFor(
+    { kind: "engram", place, folder: CANNED_DECK.folder },
+    null,
+    null,
+  ).room;
+  const exitIndex = indexOf(room, (f) => f.kind === "exit");
+  const exit = room.fixtures[exitIndex]!;
+  const deckAt: StationAddress = {
+    kind: "deck",
+    domain: CANNED_DECK.domain,
+    folder: CANNED_DECK.folder,
+    section: null,
+  };
+
+  it("walks up through an open exit's doorway and stands in front of the deck's door back, facing into the hall", () => {
+    // Mutation caught: the exit's arrival matched against a hatch (a deck
+    // has none, so the player would stand at the lift), the exit never
+    // opened on approach, or its travel read from a shut door.
+    if (exit.kind !== "exit") throw new Error("not an exit");
+    expect(exit.to).toEqual(deckAt);
+    const near = inFront(room, exitIndex, 1.5);
+    const doors = settle(room, near, new Map(), 12);
+    expect(doors.get(exitIndex)).toEqual({ open: 1, target: 1 });
+    expect(travelOf(room, near, doors)).toBeNull();
+    const doorway = inFront(room, exitIndex, DOOR_REACH / 2);
+    expect(travelOf(room, doorway, doors)).toEqual({
+      via: "exit",
+      fixture: exitIndex,
+      to: exit.to,
+    });
+    // Beside the opening, and through a shut exit, nobody goes up.
+    expect(
+      travelOf(
+        room,
+        inFront(room, exitIndex, DOOR_REACH / 2, DOOR_HALF.sliding + 0.1),
+        doors,
+      ),
+    ).toBeNull();
+    expect(travelOf(room, doorway, new Map())).toBeNull();
+
+    const deck = roomFor(
+      {
+        kind: "deck",
+        input: CANNED_DECK,
+        section: null,
+      },
+      { from: engram },
+      null,
+    ).room;
+    const back = indexOf(
+      deck,
+      (f) =>
+        f.kind === "door" &&
+        f.address !== null &&
+        f.address.permalink === row.permalink,
+    );
+    const w = wallPoint(deck.fixtures[back]!.slot);
+    const got = arrivalSpawn(deck, { via: "exit", from: engram });
+    expect(got.x).toBeCloseTo(w.x + w.inward[0] * ARRIVAL_DISTANCE);
+    expect(got.z).toBeCloseTo(w.z + w.inward[1] * ARRIVAL_DISTANCE);
+    // Facing away from the door, into the hall.
+    expect(
+      -Math.sin(got.yaw) * w.inward[0] - Math.cos(got.yaw) * w.inward[1],
+    ).toBeCloseTo(1);
+    // The entrance is not in front of that door: the match is what put
+    // the player there.
+    const entrance = arrivalSpawn(deck, null);
+    expect(Math.hypot(entrance.x - got.x, entrance.z - got.z)).toBeGreaterThan(
+      1,
+    );
+  });
+
+  it("lands a lift ride at the entrance facing in, even from an engram with a door here", () => {
+    // Mutation caught: a lift arrival matched like an exit's.
+    const deck = roomFor(
+      { kind: "deck", input: CANNED_DECK, section: 0 },
+      { from: engram },
+      null,
+    ).room;
+    const got = arrivalSpawn(deck, { via: "lift", from: engram });
+    expect(got).toEqual({
+      x: (deck.spawn.x + 0.5) * CELL,
+      z: (deck.spawn.y + 0.5) * CELL,
+      yaw: deck.spawn.yaw,
+    });
+  });
+
+  it("holds a latched exit shut and carries no one through it", () => {
+    // Mutation caught: the latch read by `stepDoors` or `travelOf` alone.
+    const near = inFront(room, exitIndex, 1.5);
+    let doors = new Map<number, DoorState>([
+      [exitIndex, { open: 1, target: 1 }],
+    ]);
+    const shut = new Set([exitIndex]);
+    expect(
+      travelOf(
+        room,
+        inFront(room, exitIndex, DOOR_REACH / 2),
+        doors,
+        undefined,
+        shut,
+      ),
+    ).toBeNull();
+    for (let i = 0; i < 12; i++)
+      doors = stepDoors(room, near, doors, null, undefined, shut);
+    expect(doors.get(exitIndex)).toEqual({ open: 0, target: 0 });
+  });
+
+  it("offers a lift in the failed map sealed, as every other way", () => {
+    // Mutation caught: the lift offered for Space whatever `failed` says.
+    const deck = generateDeck(CANNED_DECK, 0);
+    const lift = indexOf(deck, (f) => f.kind === "lift");
+    const player = inFront(deck, lift, 1);
+    expect(focusOf(deck, player)?.prompt).toBe("SPACE LIFT");
+    expect(
+      focusOf(deck, player, new Map(), new Map([[lift, NOT_FOUND]]))?.prompt,
+    ).toBe(`SEALED ${NOT_FOUND}`);
+  });
+
+  it("sends a lift's doors shut, whoever stands at them", () => {
+    // Mutation caught: the lift's doors left out of the door states (the
+    // arrival's open doors would never close) or opened on approach.
+    const deck = generateDeck(CANNED_DECK, 0);
+    const lift = indexOf(deck, (f) => f.kind === "lift");
+    const player = inFront(deck, lift, 1);
+    let doors = new Map<number, DoorState>([[lift, { open: 1, target: 0 }]]);
+    doors = stepDoors(deck, player, doors, null);
+    expect(doors.get(lift)).toEqual({ open: 1 - DOOR_STEP, target: 0 });
+    doors = settle(deck, player, doors, 12);
+    expect(doors.get(lift)).toEqual({ open: 0, target: 0 });
   });
 });

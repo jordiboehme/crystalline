@@ -124,13 +124,17 @@ export type DoorState = { open: number; target: 0 | 1 };
 
 /**
  * A way out of the room the player has just taken: through a door, a portal
- * or a hatch, which fixture it was, and the place it leads to.
+ * or a hatch, which fixture it was, and the place it leads to; or up
+ * through an exit (M3 C28), to the station address it opens onto, since a
+ * deck is no place of its own.
  */
-export type Travel = {
-  via: "door" | "portal" | "hatch";
-  fixture: number;
-  address: PlaceAddress;
-};
+export type Travel =
+  | {
+      via: "door" | "portal" | "hatch";
+      fixture: number;
+      address: PlaceAddress;
+    }
+  | { via: "exit"; fixture: number; to: StationAddress };
 
 /**
  * How the player came into a room: the kind of way and the station address
@@ -270,8 +274,15 @@ function offer(
       }
       return null;
     }
-    case "lift":
+    case "lift": {
+      // No ride marks a lift (M3 C29); a lift in `failed` would be sealed
+      // like any other way all the same.
+      const seal = failed.get(index);
+      if (seal !== undefined) {
+        return { kind: "lift", index, prompt: `SEALED ${seal}` };
+      }
       return { kind: "lift", index, prompt: "SPACE LIFT" };
+    }
     case "exit":
     case "machine":
     case "poster":
@@ -320,15 +331,18 @@ export function focusOf(
 /**
  * The doors one tick later.
  *
- * Every door of the room gets a state (a door not in `doors` starts shut).
- * A sliding door heads open while the player `approaches` it (in front
- * of its wall and within `APPROACH` of its wall point) and shut otherwise; a
- * bulkhead or blast door keeps heading where it was until `pressed`, the
- * index of the fixture Space was pressed at
- * this tick, names it, which turns it round. A sealed door always heads
- * shut, and so does a door in `failed`, whatever the player does. Then each
- * door moves `DOOR_STEP` towards where it is heading. Returns a new map;
- * `doors` is left as it was.
+ * Every door of the room gets a state (a door not in `doors` starts shut),
+ * and so do its exit and its lift, whose leaves are drawn the same way.
+ * A sliding door and an exit (M3 C28) head open while the player
+ * `approaches` them (in front of the wall and within `APPROACH` of its
+ * wall point) and shut otherwise; a bulkhead or blast door keeps heading
+ * where it was until `pressed`, the index of the fixture Space was pressed
+ * at this tick, names it, which turns it round. A lift's doors always head
+ * shut: a ride has no car to open onto (C27). A sealed door always heads
+ * shut, and so does a way in `failed` or in `shut` (the session's latched
+ * exit), whatever the player does. Then each door moves `DOOR_STEP`
+ * towards where it is heading. Returns a new map; `doors` is left as it
+ * was.
  */
 export function stepDoors(
   room: RoomSpec,
@@ -336,13 +350,23 @@ export function stepDoors(
   doors: ReadonlyMap<number, DoorState>,
   pressed: number | null,
   failed: ReadonlyMap<number, string> = new Map(),
+  shut: ReadonlySet<number> = new Set(),
 ): Map<number, DoorState> {
   const out = new Map<number, DoorState>();
   room.fixtures.forEach((fixture, index) => {
-    if (fixture.kind !== "door") return;
+    if (
+      fixture.kind !== "door" &&
+      fixture.kind !== "exit" &&
+      fixture.kind !== "lift"
+    )
+      return;
     const was = doors.get(index) ?? { open: 0, target: 0 };
     let target: 0 | 1;
-    if (fixture.address === null || failed.has(index)) {
+    if (fixture.kind === "lift" || failed.has(index) || shut.has(index)) {
+      target = 0;
+    } else if (fixture.kind === "exit") {
+      target = approaches(fixture.slot, player) ? 1 : 0;
+    } else if (fixture.address === null) {
       target = 0;
     } else if (fixture.style === "sliding") {
       target = approaches(fixture.slot, player) ? 1 : 0;
@@ -370,28 +394,34 @@ export function stepDoors(
  * inside its opening
  * (`DOOR_HALF`). An unsealed portal carries the player through on contact:
  * in front of its wall, within `PORTAL_REACH` of it, and inside its ring
- * (`PORTAL_HALF`). Nothing carries the player from behind a wall, where a
- * bay or the backlink corridor may lie. A way in `failed` carries no one,
- * whatever its `DoorState` says.
- * Hatches are crawled through on Space instead (`hatchTravel`).
+ * (`PORTAL_HALF`). An exit carries the player up by the sliding door's
+ * rule (M3 C28). Nothing carries the player from behind a wall, where a
+ * bay or the backlink corridor may lie. A way in `failed` or in `shut`
+ * (the session's latched exit) carries no one, whatever its `DoorState`
+ * says. Hatches are crawled through on Space instead (`hatchTravel`).
  */
 export function travelOf(
   room: RoomSpec,
   player: Player,
   doors: ReadonlyMap<number, DoorState>,
   failed: ReadonlyMap<number, string> = new Map(),
+  shut: ReadonlySet<number> = new Set(),
 ): Travel | null {
+  /** Whether the player stands in the open doorway of a door at `slot`. */
+  const inDoorway = (index: number, slot: WallSlot, half: number) => {
+    if ((doors.get(index)?.open ?? 0) <= OPEN_ENOUGH) return false;
+    const r = relative(wallPoint(slot), player.x, player.z);
+    return r.depth >= 0 && r.depth < DOOR_REACH && Math.abs(r.side) < half;
+  };
   for (const [index, fixture] of room.fixtures.entries()) {
-    if (failed.has(index)) continue;
+    if (failed.has(index) || shut.has(index)) continue;
     if (fixture.kind === "door" && fixture.address !== null) {
-      if ((doors.get(index)?.open ?? 0) <= OPEN_ENOUGH) continue;
-      const r = relative(wallPoint(fixture.slot), player.x, player.z);
-      if (
-        r.depth >= 0 &&
-        r.depth < DOOR_REACH &&
-        Math.abs(r.side) < DOOR_HALF[fixture.style]
-      ) {
+      if (inDoorway(index, fixture.slot, DOOR_HALF[fixture.style])) {
         return { via: "door", fixture: index, address: fixture.address };
+      }
+    } else if (fixture.kind === "exit") {
+      if (inDoorway(index, fixture.slot, DOOR_HALF.sliding)) {
+        return { via: "exit", fixture: index, to: fixture.to };
       }
     } else if (fixture.kind === "portal" && fixture.address !== null) {
       const r = relative(wallPoint(fixture.slot), player.x, player.z);
@@ -428,8 +458,10 @@ export function hatchTravel(
  *   this room's hatch that leads back to A.
  * - Through a hatch back to A, the player arrives in front of this room's
  *   door or portal that leads to A.
- * - Otherwise (no arrival, an exit or a lift, or no fixture matches) at
- *   the entrance.
+ * - Up through an exit from engram A (M3 C28), the player arrives in front
+ *   of this deck's door that leads to A.
+ * - Otherwise (no arrival, a lift ride, or no fixture matches) at the
+ *   entrance, facing in (M3 C27: in front of the lift).
  *
  * A way leads to a `PlaceAddress`, which is compared with `from` as the
  * station address it names (`stationOfPlace`): an engram matches the way
@@ -447,9 +479,14 @@ export function arrivalSpawn(
   const leadsBack = (to: PlaceAddress) =>
     arrival !== null && sameStation(stationOfPlace(to), arrival.from);
   const match =
-    arrival === null || arrival.via === "exit" || arrival.via === "lift"
+    arrival === null || arrival.via === "lift"
       ? undefined
       : room.fixtures.find((f) => {
+          if (arrival.via === "exit") {
+            return (
+              f.kind === "door" && f.address !== null && leadsBack(f.address)
+            );
+          }
           if (arrival.via === "hatch") {
             return (
               (f.kind === "door" || f.kind === "portal") &&

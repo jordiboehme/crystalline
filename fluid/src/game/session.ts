@@ -95,6 +95,22 @@
  * reader is open it reads the keys itself: the session ignores its own
  * commands and all movement until the host calls `closeReader`.
  *
+ * Space at a lift (M3 C26) opens its stops when the host passed `onLift`
+ * (the game route): the session is modal while they are open, as with the
+ * level select, until the host calls `closeLift` or `ride`. A lift that
+ * reads `?DOMAIN LIST ERROR` (the airlock whose listing failed, C29) opens
+ * nothing and reads the airlock again instead. `ride` travels to a stop
+ * with the connector naming it and holds a settled load until
+ * `LIFT_RIDE_MS` after the ride began (C27), a check made each tick, so
+ * a quick load still shows the ride; the player comes out at the
+ * entrance, in front of the lift, its doors open and sliding shut. An
+ * engram room's exit (C28) is walked through like a sliding door and
+ * leads up to its deck, in front of the deck's door back to the room.
+ * It is latched on every entry (`upLatched`): the entrance spawn stands
+ * 1 m from it, so it stays shut and carries no one until the player has
+ * once stood `UP_LATCH_CLEAR` from its wall. A failed stop or exit is a
+ * notice only: neither marks a way (C29).
+ *
  * Typed with no pause longer than a second, `idclev` opens the level select
  * when the host passed `onLevels` (the game route): the word's I toggle is
  * taken back on the match, and its D strafes for a moment; its E is a plain
@@ -145,6 +161,7 @@ import {
   approaches,
   stepDoors,
   travelOf,
+  wallPoint,
   type Arrival,
   type DoorState,
   type Travel,
@@ -168,7 +185,14 @@ import {
 } from "./world/move";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
 import { roomFor } from "./world/station";
-import type { Box, PlaceInput, RoomSpec, StationAddress } from "./world/types";
+import type {
+  Box,
+  Fixture,
+  LiftStop,
+  PlaceInput,
+  RoomSpec,
+  StationAddress,
+} from "./world/types";
 
 export type { Arrival } from "./world/interact";
 
@@ -248,6 +272,8 @@ export type RendererFactory = (
  *   passes it. See the member.
  * - `consoleRoom`: the police box's inside and the listing its inner doors
  *   pick from; only the game route passes it. See the member.
+ * - `onLift`: the lift overlay's channel; only the game route passes it.
+ *   See the member.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -281,6 +307,14 @@ export interface SessionOptions {
   consoleRoom?: {
     domains(signal: AbortSignal): Promise<readonly DomainRow[] | null>;
   };
+  /**
+   * The lift overlay's channel (M3 C26): with it, Space at a lift calls it
+   * with the lift's stops and note and the session gives the overlay the
+   * keys; closing the overlay (`closeLift`, `ride`, a `go`, `dispose`)
+   * calls it with null. Without it Space at a lift does nothing: the look
+   * demo and the model gallery never pass it.
+   */
+  onLift?: (lift: { stops: LiftStop[]; note: string | null } | null) => void;
 }
 
 /**
@@ -318,8 +352,8 @@ export type PlaceLoader = (
  *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
  *   for those dev seams only; every other caller omits it and keeps the
  *   entrance's own pitch of 0.
- * - `go`, `showCanned` and `showRoom` close an open CRT reader or level
- *   select first.
+ * - `go`, `showCanned` and `showRoom` close an open CRT reader, level
+ *   select or lift overlay first.
  * - `closeReader` tells the session the CRT reader was closed, which gives
  *   it the keys back.
  * - `jump` goes to a domain's bridge (`bridgeAddress`), the level select's
@@ -327,6 +361,12 @@ export type PlaceLoader = (
  *   connector names the domain (C10).
  * - `closeLevels` tells the session the level select was closed, which
  *   gives it the keys back.
+ * - `ride` rides the lift last opened to its stop `stop` (an index into
+ *   the stops `onLift` was given): closes the overlay and travels there,
+ *   the connector naming the stop, landing no sooner than `LIFT_RIDE_MS`
+ *   after the call. An index with no stop does nothing.
+ * - `closeLift` tells the session the lift overlay was closed, which gives
+ *   it the keys back.
  * - `dispose` stops everything and frees the GPU objects. It takes the
  *   reader and the connector down; nothing is written to the HUD after it.
  * - `current` is the station address the player is in, the one the session
@@ -350,6 +390,10 @@ export interface Session {
   jump(domain: string): void;
   /** The level select was closed: gives the session the keys back. */
   closeLevels(): void;
+  /** Rides the lift last opened to its stop at index `stop` (M3 C27). */
+  ride(stop: number): void;
+  /** The lift overlay was closed: gives the session the keys back. */
+  closeLift(): void;
   dispose(): void;
   readonly current: StationAddress | null;
   readonly where: string | null;
@@ -371,6 +415,24 @@ export const LOOK_NOTICE_MS = 1500;
  * rather than nowhere.
  */
 export const LISTING_WAIT_MS = 5000;
+
+/**
+ * How long a lift ride lasts at the least, in milliseconds (M3 C27): a
+ * load that settles sooner is held until then, so the connector naming
+ * the stop stays up for the ride.
+ */
+export const LIFT_RIDE_MS = 1200;
+
+/**
+ * How far from its exit's wall point the player must once stand, in
+ * metres, before the exit opens (M3 C28): the entrance spawn stands 1 m
+ * from it, and a step back would otherwise go straight up again. Not the
+ * console room's exit latch (`exitLatched`), which is its own.
+ */
+export const UP_LATCH_CLEAR = 2.0;
+
+/** No fixture held shut. */
+const NONE_SHUT: ReadonlySet<number> = new Set();
 
 /** The notice for a refused or missing GPU. */
 const NO_DEVICE = "?DEVICE NOT PRESENT ERROR";
@@ -508,14 +570,36 @@ export function createSession(opts: SessionOptions): Session {
   let readerOpen = false;
   /** Whether the level select is open (only with `onLevels`). */
   let levelsOpen = false;
+  /** Whether the lift overlay is open (only with `onLift`). */
+  let liftOpen = false;
+  /**
+   * The lift whose overlay was last opened in this room, by fixture index;
+   * `ride` rides it. Null until one is opened, and on every entry.
+   */
+  let liftAt: number | null = null;
+  /**
+   * The ride in flight: when it started and, once its load has settled
+   * early, the landing held until `LIFT_RIDE_MS` after that. `leave`
+   * drops it.
+   */
+  let ride: { start: number; held: (() => void) | null } | null = null;
+  /**
+   * The room's exit while it is latched (M3 C28), by fixture index: set
+   * on every entry, cleared once the player stands `UP_LATCH_CLEAR` from
+   * its wall point.
+   */
+  let upLatched: number | null = null;
   /** The level cheat's word, read only when the host passed `onLevels`. */
   const cheat = opts.onLevels === undefined ? null : createCheatReader();
   /** Ticks run so far: the clock the word's gap is counted on (C2). */
   let ticks = 0;
   /** Whether the timed notice up is the inverted-look one (C6). */
   let lookFlash = false;
-  /** Whether an overlay (the CRT reader or the level select) has the keys. */
-  const modal = () => readerOpen || levelsOpen;
+  /**
+   * Whether an overlay (the CRT reader, the level select or the lift's
+   * stops) has the keys.
+   */
+  const modal = () => readerOpen || levelsOpen || liftOpen;
   let lastPrompt: string | null = null;
   /** Ways whose travel failed this visit: fixture index to its seal label. */
   let failed = new Map<number, string>();
@@ -749,6 +833,9 @@ export function createSession(opts: SessionOptions): Session {
     latched = null;
     boxLatched = null;
     exitLatched = false;
+    liftAt = null;
+    const exit = room.fixtures.findIndex((f) => f.kind === "exit");
+    upLatched = exit < 0 ? null : exit;
     inside = null;
     listing?.abort();
     listing = null;
@@ -761,15 +848,10 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /**
-   * A load of `travel` has settled: builds the room (`roomFor`) and enters
-   * it at the address `roomFor` resolved, or fails with the reason there
-   * is none. With `landing` `"box"` (the console room's exit, which goes
-   * to a bridge) the room is entered with the arrival box
-   * (`withArrivalBox`), the player stepping out of it, its doors fully
-   * open and heading shut, and its walk-in latched; with no spot for the
-   * box, the room is entered plain. Once entered, the URL is replaced with
-   * the entered address's game route unless the location's pathname and
-   * search already spell it (M3 C5), so no address replaces itself.
+   * A load of `travel` has settled. A current one lands (`land`) at once,
+   * unless it is a lift ride's that settled before `LIFT_RIDE_MS` had
+   * passed: then the landing is held, and the tick runs it once the ride
+   * has lasted that long (M3 C27).
    */
   const settle = (
     gen: number,
@@ -779,6 +861,48 @@ export function createSession(opts: SessionOptions): Session {
     landing: "box" | null,
   ) => {
     if (disposed || gen !== generation) return;
+    if (ride !== null && now() < ride.start + LIFT_RIDE_MS) {
+      ride.held = () => {
+        land(arrival, loaded, label, landing);
+      };
+      return;
+    }
+    land(arrival, loaded, label, landing);
+  };
+
+  /**
+   * The doors of the first fixture of `kind` in the room start fully open
+   * and heading shut: the lift after a ride, the exit after a walk in
+   * through a deck's door (M3 C27, C28).
+   */
+  const startOpen = (kind: Fixture["kind"]) => {
+    const index = room?.fixtures.findIndex((f) => f.kind === kind) ?? -1;
+    if (index < 0) return;
+    doors = new Map(doors).set(index, { open: 1, target: 0 });
+    // A ride lands inside a tick that ends there, so the frame drawn next
+    // reads the door open from here rather than from `stepDoors`.
+    doorOpen = new Map(doorOpen).set(`door:${String(index)}`, 1);
+  };
+
+  /**
+   * A load of `travel` has landed: builds the room (`roomFor`) and enters
+   * it at the address `roomFor` resolved, or fails with the reason there
+   * is none. With `landing` `"box"` (the console room's exit, which goes
+   * to a bridge) the room is entered with the arrival box
+   * (`withArrivalBox`), the player stepping out of it, its doors fully
+   * open and heading shut, and its walk-in latched; with no spot for the
+   * box, the room is entered plain. Once entered, the URL is replaced with
+   * the entered address's game route unless the location's pathname and
+   * search already spell it (M3 C5), so no address replaces itself.
+   */
+  const land = (
+    arrival: Arrival | null,
+    loaded: LoadedStation,
+    label: string,
+    landing: "box" | null,
+  ) => {
+    const gen = generation;
+    ride = null;
     loading = false;
     controller = null;
     hud.connector(false, label, lookId);
@@ -819,6 +943,9 @@ export function createSession(opts: SessionOptions): Session {
       boxes = new Map([[built.box, { open: 1, target: 0 }]]);
       boxLatched = built.box;
     }
+    if (arrival?.via === "lift") startOpen("lift");
+    else if (arrival?.via === "door" && arrival.from.kind === "deck")
+      startOpen("exit");
     const path = gameRouteOf(built.address);
     const { pathname, search } = window.location;
     if (pathname + search !== path) opts.navigate(path);
@@ -844,14 +971,16 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Leaves whatever the session was doing for a new place: closes the CRT
-   * reader and the level select, drops the load in flight (a new
-   * generation, the old one aborted) and takes the connector down if it
-   * was up.
+   * reader, the level select and the lift overlay, drops the load in
+   * flight (a new generation, the old one aborted) and a ride's held
+   * landing with it, and takes the connector down if it was up.
    */
   const leave = (): number => {
     closeReader();
     closeLevels();
+    closeLift();
     travelling = null;
+    ride = null;
     const gen = ++generation;
     controller?.abort();
     controller = null;
@@ -897,6 +1026,7 @@ export function createSession(opts: SessionOptions): Session {
         loading = false;
         controller = null;
         travelling = null;
+        ride = null;
         hud.connector(false, shown, lookId);
         if (!isAbort(error)) fail(LOAD_ERROR);
       },
@@ -945,6 +1075,12 @@ export function createSession(opts: SessionOptions): Session {
    */
   const takeTravel = (travel: Travel) => {
     latched = travel.fixture;
+    if (travel.via === "exit") {
+      // Up to the deck (M3 C28). A failed exit is a notice only (C29):
+      // without `travelling`, its failure marks no way.
+      go(travel.to, current === null ? null : { via: "exit", from: current });
+      return;
+    }
     go(
       stationOfPlace(travel.address),
       current === null ? null : { via: travel.via, from: current },
@@ -1079,6 +1215,67 @@ export function createSession(opts: SessionOptions): Session {
     opts.onLevels?.(false);
   };
 
+  /**
+   * Space at lift `index` (M3 C26, C29): with `onLift`, outside the
+   * console room, opens its stops and gives the overlay the keys and the
+   * mouse as the level select does; a lift that reads
+   * `?DOMAIN LIST ERROR` reads the airlock again instead.
+   */
+  const openLift = (index: number) => {
+    const lift = room?.fixtures[index];
+    if (lift?.kind !== "lift" || opts.onLift === undefined || inside !== null)
+      return;
+    if (lift.note === LIFT_WORDS.domainError) {
+      go({ kind: "airlock" });
+      return;
+    }
+    liftOpen = true;
+    liftAt = index;
+    cheat?.reset();
+    input.clear();
+    if (document.pointerLockElement !== null) {
+      document.exitPointerLock?.();
+    }
+    setPrompt(null);
+    opts.onLift({ stops: lift.stops, note: lift.note });
+  };
+
+  /**
+   * Closes the lift overlay, for the host's Esc, a ride or a new place
+   * (`leave`): gives the session the keys back and tells the host. Does
+   * nothing when the overlay is not open.
+   */
+  const closeLift = () => {
+    if (disposed || !liftOpen) return;
+    liftOpen = false;
+    cheat?.reset();
+    input.clear();
+    opts.onLift?.(null);
+  };
+
+  /**
+   * Rides the lift last opened to its stop `index` (M3 C27): closes the
+   * overlay and travels there, the connector naming the stop. The lift's
+   * doors are already heading shut (`stepDoors` never opens them). The
+   * ride starts now on the session's clock; its landing waits for
+   * `LIFT_RIDE_MS` (`settle`). A failed stop is a notice only (C29): no
+   * `travelling`, so no way is marked.
+   */
+  const rideLift = (index: number) => {
+    if (disposed) return;
+    const lift = liftAt === null ? undefined : room?.fixtures[liftAt];
+    const stop = lift?.kind === "lift" ? lift.stops[index] : undefined;
+    if (stop === undefined) return;
+    closeLift();
+    const start = now();
+    go(
+      stop.to,
+      current === null ? null : { via: "lift", from: current },
+      stop.label,
+    );
+    if (loading) ride = { start, held: null };
+  };
+
   // Sizes the backbuffer to the canvas's CSS size times the pixel ratio and
   // says whether it changed, so a resize that changes nothing rebuilds no
   // render targets.
@@ -1158,6 +1355,14 @@ export function createSession(opts: SessionOptions): Session {
 
   const tick = () => {
     ticks++;
+    // A ride whose load settled early lands once it has lasted
+    // `LIFT_RIDE_MS` (M3 C27); the new room starts on the next tick.
+    const held = ride?.held ?? null;
+    if (held !== null && ride !== null && now() >= ride.start + LIFT_RIDE_MS) {
+      ride = null;
+      held();
+      return;
+    }
     // The keys typed since the last tick, in order: the level cheat's
     // word is read from them, and they are dropped unread while an
     // overlay has the keys (C4).
@@ -1247,11 +1452,26 @@ export function createSession(opts: SessionOptions): Session {
         // A failed hatch carries no one: `hatchTravel` reads `failed`.
         const travel = hatchTravel(room, focus.index, failed);
         if (travel !== null) takeTravel(travel);
+      } else if (focus.kind === "lift" && !failed.has(focus.index)) {
+        openLift(focus.index);
       }
     } else if (used && boxAt !== null) {
       pressedBox = boxAt.index;
     }
-    doors = stepDoors(room, player, doors, pressedDoor, failed);
+    // The exit's latch holds until the player has once stood
+    // `UP_LATCH_CLEAR` from its wall point (M3 C28).
+    if (upLatched !== null) {
+      const exit = room.fixtures[upLatched];
+      if (exit === undefined) {
+        upLatched = null;
+      } else {
+        const w = wallPoint(exit.slot);
+        if (Math.hypot(player.x - w.x, player.z - w.z) > UP_LATCH_CLEAR)
+          upLatched = null;
+      }
+    }
+    const shut = upLatched === null ? NONE_SHUT : new Set([upLatched]);
+    doors = stepDoors(room, player, doors, pressedDoor, failed, shut);
     boxes = stepBoxDoors(room, boxes, pressedBox);
     faults = stepFaults(room, player, faults, failed, pressedWay, doors);
     faultNow = faultFrames(faults);
@@ -1295,7 +1515,7 @@ export function createSession(opts: SessionOptions): Session {
     );
 
     if (!loading && !modal()) {
-      const travel = travelOf(room, player, doors, failed);
+      const travel = travelOf(room, player, doors, failed, shut);
       if (travel === null) {
         latched = null;
       } else if (travel.fixture !== latched) {
@@ -1395,12 +1615,15 @@ export function createSession(opts: SessionOptions): Session {
       go(bridgeAddress(domain), null, domain);
     },
     closeLevels,
+    ride: rideLift,
+    closeLift,
     dispose() {
       if (disposed) return;
       // The host's overlays go down with the session, so a host that
       // outlives it (StrictMode's second mount) starts clean.
       hud.reader(null);
       opts.onLevels?.(false);
+      opts.onLift?.(null);
       hud.connector(false, loadingLabel, lookId);
       disposed = true;
       generation++;

@@ -25,8 +25,10 @@ import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
+  LIFT_RIDE_MS,
   LISTING_WAIT_MS,
   NOTICE_MS,
+  UP_LATCH_CLEAR,
   createSession,
   type HudSink,
   type PlaceLoader,
@@ -47,7 +49,8 @@ import {
   heroHallRoom,
 } from "./world/canned";
 import { generateDeck, type DeckRow } from "./world/deck";
-import { NOT_FOUND, generateRoom } from "./world/generate";
+import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
+import { LIFT_WORDS } from "./world/lifts";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
@@ -209,6 +212,7 @@ function start(
     load?: PlaceLoader;
     onLevels?: (open: boolean) => void;
     consoleRoom?: SessionOptions["consoleRoom"];
+    onLift?: SessionOptions["onLift"];
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -232,6 +236,7 @@ function start(
     ...(options.consoleRoom === undefined
       ? {}
       : { consoleRoom: options.consoleRoom }),
+    ...(options.onLift === undefined ? {} : { onLift: options.onLift }),
   });
   sessions.push(session);
   return session;
@@ -2868,5 +2873,363 @@ describe("station addresses (M3)", () => {
       expect(session.current).toEqual({ kind: "airlock" });
     });
     expect(hud.notice).not.toHaveBeenCalledWith("?LOAD ERROR");
+  });
+});
+
+describe("the lifts and the exit (M3 C26 to C29)", () => {
+  const deck = generateDeck(CANNED_DECK, 0);
+  const DECK_AT: StationAddress = {
+    kind: "deck",
+    domain: CANNED_DECK.domain,
+    folder: CANNED_DECK.folder,
+    section: 0,
+  };
+
+  /** The one lift of `room`, which must have one. */
+  const liftOf = (room: RoomSpec): Extract<Fixture, { kind: "lift" }> => {
+    const f = room.fixtures.find((x) => x.kind === "lift");
+    if (f?.kind !== "lift") throw new Error("no lift");
+    return f;
+  };
+
+  /** `room` with the player spawned in its lift's cell, facing the lift. */
+  const facingLift = (room: RoomSpec): RoomSpec => ({
+    ...room,
+    spawn: wallFacingSpawn(liftOf(room).slot),
+  });
+
+  /** Presses Space, the use key, for one frame. */
+  const pressUse = () => {
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+  };
+
+  type LiftCall = Parameters<NonNullable<SessionOptions["onLift"]>>[0];
+  const liftSpy = () => vi.fn<(lift: LiftCall) => void>();
+  /** The calls that opened the overlay. */
+  const opened = (spy: ReturnType<typeof liftSpy>) =>
+    spy.mock.calls.filter(([lift]) => lift !== null);
+
+  /** The index of the deck lift's stop that rides to `kind`. */
+  const stopTo = (kind: StationAddress["kind"]) => {
+    const i = liftOf(deck).stops.findIndex((s) => s.to.kind === kind);
+    expect(i).toBeGreaterThanOrEqual(0);
+    return i;
+  };
+
+  /** A session with a lift spy, standing at the deck's lift. */
+  const atDeckLift = (
+    load: PlaceLoader,
+    onLevels?: (open: boolean) => void,
+  ) => {
+    const onLift = liftSpy();
+    const session = start({
+      load,
+      onLift,
+      ...(onLevels === undefined ? {} : { onLevels }),
+    });
+    session.showRoom(facingLift(deck), undefined, DECK_AT);
+    frames(1);
+    return { session, onLift };
+  };
+
+  /** Cranks the clock by `ms`, a tick at a time. */
+  const crank = (ms: number) => {
+    const until = now + ms;
+    while (now < until) frames(1);
+  };
+
+  /** How far in front of the exit's wall the eye of the last frame is. */
+  const exitDepth = () => {
+    const room = lastRoom();
+    const exit = room?.fixtures.find((f) => f.kind === "exit");
+    if (exit === undefined) throw new Error("no exit");
+    const w = wallPoint(exit.slot);
+    const eye = lastCamera().eye;
+    return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+  };
+
+  /** Holds `code` until `done` or `max` frames, then lets go. */
+  const holdUntil = (code: string, done: () => boolean, max = 200) => {
+    key("keydown", code);
+    for (let t = 0; t < max && !done(); t++) frames(1);
+    key("keyup", code);
+  };
+
+  const connectorUps = () =>
+    hud.connector.mock.calls.filter(([active]) => active).length;
+
+  it("opens the lift's stops on Space and holds the keys while they are open (C26)", () => {
+    // Mutation caught: the lift overlay left out of `modal()` (a second
+    // Space opens it again and the player walks off under it).
+    const { session, onLift } = atDeckLift(() => new Promise(() => undefined));
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE LIFT");
+    pressUse();
+    const lift = liftOf(deck);
+    expect(lift.stops.length).toBeGreaterThan(0);
+    expect(opened(onLift)).toEqual([[{ stops: lift.stops, note: lift.note }]]);
+    const eye = lastCamera().eye;
+    pressUse();
+    key("keydown", "KeyW");
+    frames(10);
+    key("keyup", "KeyW");
+    expect(opened(onLift)).toHaveLength(1);
+    expect(lastCamera().eye).toEqual(eye);
+    session.closeLift();
+    expect(onLift).toHaveBeenLastCalledWith(null);
+    pressUse();
+    expect(opened(onLift)).toHaveLength(2);
+  });
+
+  it("refuses the lift while busy and settles a failed stop or exit with a notice only (Review Focus 4)", async () => {
+    // Mutation caught: the modal check dropped (the overlay opened under
+    // a load in flight or the level select), the held result not dropped
+    // on `leave`, a failed exit marking its way (it would never open
+    // again). A failed stop marking the lift is not visible from outside:
+    // a lift's offer and its doors ignore `failed`.
+    // A load in flight.
+    {
+      const { session, onLift } = atDeckLift(
+        () => new Promise(() => undefined),
+      );
+      session.go({ kind: "bridge", domain: "ops" });
+      pressUse();
+      frames(2);
+      expect(opened(onLift)).toHaveLength(0);
+      session.dispose();
+    }
+    // The level select.
+    {
+      const onLevels = vi.fn<(open: boolean) => void>();
+      const { session, onLift } = atDeckLift(stationLoad, onLevels);
+      type("idclev");
+      frames(1);
+      expect(onLevels).toHaveBeenLastCalledWith(true);
+      pressUse();
+      frames(2);
+      expect(opened(onLift)).toHaveLength(0);
+      session.dispose();
+    }
+    // A failed stop: the notice, and nothing else changes.
+    const answers: Record<string, string> = {
+      missing: NOT_FOUND,
+      denied: ACCESS_DENIED,
+      offline: "SIGNAL LOST",
+    };
+    let answer: "missing" | "denied" | "offline" = "missing";
+    const failing: PlaceLoader = () => Promise.resolve({ kind: answer });
+    const { session, onLift } = atDeckLift(failing);
+    for (const kind of ["missing", "denied", "offline"] as const) {
+      answer = kind;
+      pressUse();
+      const opens = opened(onLift).length;
+      expect(opens).toBeGreaterThan(0);
+      const rooms = renderer.setRoom.mock.calls.length;
+      hud.notice.mockClear();
+      session.ride(stopTo("bridge"));
+      await flush();
+      crank(1300);
+      expect(hud.notice, kind).toHaveBeenCalledWith(answers[kind]);
+      expect(session.current, kind).toEqual(DECK_AT);
+      expect(renderer.setRoom.mock.calls.length, kind).toBe(rooms);
+      pressUse();
+      expect(opened(onLift).length, kind).toBe(opens + 1);
+      session.closeLift();
+    }
+    session.dispose();
+
+    // A ride's held result is dropped by a go from outside.
+    {
+      const load: PlaceLoader = (a, signal) =>
+        a.kind === "engram"
+          ? new Promise(() => undefined)
+          : stationLoad(a, signal);
+      const { session: s, onLift: spy } = atDeckLift(load);
+      pressUse();
+      expect(opened(spy)).toHaveLength(1);
+      s.ride(stopTo("bridge"));
+      await flush();
+      s.go(engramAt("station", "elsewhere"));
+      crank(1500);
+      await flush();
+      expect(s.current).toEqual(DECK_AT);
+      s.dispose();
+    }
+
+    // A second ride aborts the first and lands only the second.
+    {
+      const signals: AbortSignal[] = [];
+      const load: PlaceLoader = (a, signal) => {
+        if (a.kind === "bridge") {
+          signals.push(signal);
+          return new Promise(() => undefined);
+        }
+        return stationLoad(a, signal);
+      };
+      const { session: s, onLift: spy } = atDeckLift(load);
+      pressUse();
+      expect(opened(spy)).toHaveLength(1);
+      const rooms = renderer.setRoom.mock.calls.length;
+      s.ride(stopTo("bridge"));
+      const up = liftOf(deck).stops.findIndex((x) => x.label === "UP");
+      expect(up).toBeGreaterThanOrEqual(0);
+      s.ride(up);
+      expect(signals).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(true);
+      await flush();
+      crank(1300);
+      await flush();
+      expect(s.current).toEqual({
+        ...liftOf(deck).stops[up]!.to,
+        section: 0,
+      });
+      expect(renderer.setRoom.mock.calls.length).toBe(rooms + 1);
+      s.dispose();
+    }
+
+    // A failed exit: the notice, and the exit opens and carries again.
+    {
+      const load: PlaceLoader = (a, signal) =>
+        a.kind === "deck"
+          ? Promise.resolve({ kind: "missing" })
+          : stationLoad(a, signal);
+      const s = start({ load, onLift: liftSpy() });
+      s.go(engramAt("station", "alpha"));
+      await vi.waitFor(() => {
+        expect(s.current).toEqual(engramAt("station", "alpha"));
+      });
+      frames(1);
+      holdUntil("ArrowUp", () => exitDepth() > 2.5);
+      frames(10);
+      const ups = connectorUps();
+      hud.notice.mockClear();
+      holdUntil("ArrowDown", () => connectorUps() > ups);
+      expect(connectorUps()).toBe(ups + 1);
+      await flush();
+      expect(hud.notice).toHaveBeenCalledWith(NOT_FOUND);
+      expect(s.current).toEqual(engramAt("station", "alpha"));
+      holdUntil("ArrowUp", () => exitDepth() > 1.5);
+      frames(10);
+      holdUntil("ArrowDown", () => connectorUps() > ups + 1);
+      expect(connectorUps()).toBe(ups + 2);
+      s.dispose();
+    }
+  });
+
+  it("lands a ride at LIFT_RIDE_MS after it started, its lift's doors open and heading shut (C27)", async () => {
+    // Mutation caught: the result entered as soon as the load settles, or
+    // the arrival's lift doors starting shut.
+    const settled = deferred<LoadedStation>();
+    const load: PlaceLoader = (a, signal) =>
+      a.kind === "bridge" ? settled.promise : stationLoad(a, signal);
+    const { session, onLift } = atDeckLift(load);
+    pressUse();
+    expect(opened(onLift)).toHaveLength(1);
+    const i = stopTo("bridge");
+    const stop = liftOf(deck).stops[i]!;
+    const t0 = now;
+    session.ride(i);
+    expect(onLift).toHaveBeenLastCalledWith(null);
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      true,
+      stop.label,
+      expect.any(String),
+    );
+    crank(200);
+    settled.resolve(await stationLoad(stop.to, new AbortController().signal));
+    await flush();
+    let landedAt: number | null = null;
+    for (let t = 0; t < 100 && landedAt === null; t++) {
+      frames(1);
+      if (session.current?.kind === "bridge") landedAt = now;
+    }
+    expect(landedAt).not.toBeNull();
+    expect(landedAt ?? 0).toBeGreaterThanOrEqual(t0 + LIFT_RIDE_MS);
+    expect(landedAt ?? 0).toBeLessThan(t0 + LIFT_RIDE_MS + 3 * TICK_MS);
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      false,
+      stop.label,
+      expect.any(String),
+    );
+    const bridge = lastRoom();
+    if (bridge === undefined) throw new Error("no room");
+    const lift = bridge.fixtures.findIndex((f) => f.kind === "lift");
+    expect(lift).toBeGreaterThanOrEqual(0);
+    // The landing frame itself draws the lift open, never shut for a frame.
+    expect(lastDoors().get(`door:${String(lift)}`)).toBe(1);
+    frames(2);
+    const open = lastDoors().get(`door:${String(lift)}`) ?? 0;
+    expect(open).toBeGreaterThan(0.5);
+    expect(open).toBeLessThan(1);
+    frames(20);
+    expect(lastDoors().get(`door:${String(lift)}`)).toBe(0);
+  });
+
+  it("re-reads a failed airlock listing from its lift", () => {
+    // Mutation caught: the overlay opened with no stops.
+    const airlock = airlockRoom({ domains: null, here: null });
+    expect(liftOf(airlock).note).toBe(LIFT_WORDS.domainError);
+    const load = vi.fn<PlaceLoader>(() => new Promise(() => undefined));
+    const onLift = liftSpy();
+    const session = start({ load, onLift });
+    session.showRoom(facingLift(airlock), undefined, { kind: "airlock" });
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE LIFT");
+    expect(load).not.toHaveBeenCalled();
+    pressUse();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load.mock.calls[0]?.[0]).toEqual({ kind: "airlock" });
+    expect(onLift).not.toHaveBeenCalled();
+  });
+
+  it("latches the exit on entry: a step back does nothing, a walk in and back out goes up (C28)", async () => {
+    // Mutation caught: the latch dropped (the exit, still open from the
+    // walk in, carries the player straight back up) or never released.
+    const door = deck.fixtures.findIndex(
+      (f) => f.kind === "door" && f.address !== null,
+    );
+    const through = deck.fixtures[door];
+    if (through?.kind !== "door" || through.address === null)
+      throw new Error("the deck has no door");
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.showRoom(
+      { ...deck, spawn: wallFacingSpawn(through.slot) },
+      undefined,
+      DECK_AT,
+    );
+    holdUntil("KeyW", () => connectorUps() > 0, 80);
+    const target = stationOfPlace(through.address);
+    await vi.waitFor(() => {
+      expect(session.current).toEqual(target);
+    });
+    frames(2);
+    const room = lastRoom();
+    const exit = room?.fixtures.findIndex((f) => f.kind === "exit") ?? -1;
+    expect(exit).toBeGreaterThanOrEqual(0);
+    // Out of the deck's door means in through the exit: open, heading shut.
+    const open = lastDoors().get(`door:${String(exit)}`) ?? 0;
+    expect(open).toBeGreaterThan(0.5);
+    // A step straight back reaches the doorway and goes nowhere.
+    const ups = connectorUps();
+    let nearest = Infinity;
+    key("keydown", "ArrowDown");
+    for (let t = 0; t < 40; t++) {
+      frames(1);
+      nearest = Math.min(nearest, exitDepth());
+    }
+    key("keyup", "ArrowDown");
+    expect(nearest).toBeLessThan(0.6);
+    expect(connectorUps()).toBe(ups);
+    expect(session.current).toEqual(target);
+    // In past UP_LATCH_CLEAR and back out: up to the deck.
+    holdUntil("ArrowUp", () => exitDepth() > UP_LATCH_CLEAR + 0.5);
+    expect(exitDepth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    frames(10);
+    holdUntil("ArrowDown", () => connectorUps() > ups);
+    expect(connectorUps()).toBe(ups + 1);
+    await vi.waitFor(() => {
+      expect(session.current?.kind).toBe("deck");
+    });
   });
 });
