@@ -1890,12 +1890,7 @@ async fn check_domain_checks(
 /// holds `source` (an agent or a person wrote it meanwhile) the fix is
 /// dropped and the newer text stays. The error is the note the report shows.
 fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
-    let mut name = file
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(format!(".doctor-fix.{}", std::process::id()));
-    let tmp = file.with_file_name(name);
+    let tmp = fix_temp_path(file);
     let written = std::fs::write(&tmp, text).and_then(|()| {
         let permissions = std::fs::metadata(file)?.permissions();
         std::fs::set_permissions(&tmp, permissions)
@@ -1912,6 +1907,19 @@ fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("Writing the file failed: {e}")
     })
+}
+
+/// The temporary file [`write_fix`] writes first: a hidden sibling
+/// (`.<name>.doctor-fix.<pid>`), so neither a sync nor remote change
+/// detection, which walk every file that is not hidden, ever picks up one a
+/// crash left behind.
+fn fix_temp_path(file: &Path) -> std::path::PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    if let Some(own) = file.file_name() {
+        name.push(own);
+    }
+    name.push(format!(".doctor-fix.{}", std::process::id()));
+    file.with_file_name(name)
 }
 
 /// What `--fix` would write for a file with repeated keys, or why it leaves
@@ -4448,6 +4456,31 @@ mod tests {
         let out = render_human(&drafted_only);
         assert!(!out.contains("could not be written"), "{out}");
         assert!(!out.contains("[problem]"), "{out}");
+    }
+
+    /// The temporary file is hidden, so a sync or remote change detection,
+    /// which walk every file that is not hidden, never takes a leftover one
+    /// for an engram or a change to propose.
+    #[test]
+    fn write_fix_names_its_temporary_file_as_a_hidden_sibling() {
+        let tmp = fix_temp_path(Path::new("/kb/a/dup.md"));
+        assert_eq!(tmp.parent(), Some(Path::new("/kb/a")));
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!(".dup.md.doctor-fix.{}", std::process::id()));
+    }
+
+    /// The fixed file keeps the original's permissions.
+    #[test]
+    #[cfg(unix)]
+    fn write_fix_keeps_the_original_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_fix(&file, "old", "new").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// The fix lands through a sibling file and a rename, so the engram is
