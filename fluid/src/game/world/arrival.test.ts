@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import { circleOverlapsBox } from "../dev/spots";
 import {
+  ARRIVAL_LIFT_CLEARANCE,
   ARRIVAL_REACH,
   arrivalBoxCandidates,
   placeArrivalBox,
@@ -428,4 +429,49 @@ describe("the arrival box (2.6e C14)", () => {
     expect(rooms).toBe(660);
     expect(landed / rooms).toBeGreaterThanOrEqual(MEASURED_MINUS_MARGIN);
   }, 30_000);
+
+  it("lands clear of the lift's column, off the path between the lift and the hall's centre (Jordi, M4)", () => {
+    // Mutation caught: the lift-clearance filter dropped, shrunk below two
+    // cells, or skipped for the "does not stand between" half of the rule,
+    // letting the box land beside the lift again and block the sightline
+    // between the lift and the room.
+    const wide = [
+      CANNED_BRIDGE,
+      CANNED_WORKSHOP,
+      CANNED_HUB,
+      narrowWithHatches(4),
+      narrowWithHatches(8),
+    ];
+    let checked = 0;
+    for (const place of wide) {
+      const room = generateRoom(place);
+      const out = withArrivalBox(place, room);
+      expect(out.box, place.permalink).not.toBeNull();
+      const h = out.room.heroes[out.box!]!;
+      checked++;
+      const liftX = room.entrance.x + 0.5;
+      const liftY = room.entrance.y + 1;
+      const centreX = (room.hall.x0 + room.hall.x1) / 2;
+      const centreY = (room.hall.y0 + room.hall.y1) / 2;
+      expect(Math.abs(h.x - liftX), place.permalink).toBeGreaterThanOrEqual(
+        ARRIVAL_LIFT_CLEARANCE - 1e-9,
+      );
+      const betweenX =
+        h.x >= Math.min(liftX, centreX) - 1e-9 &&
+        h.x <= Math.max(liftX, centreX) + 1e-9;
+      const betweenY =
+        h.y >= Math.min(liftY, centreY) - 1e-9 &&
+        h.y <= Math.max(liftY, centreY) + 1e-9;
+      expect(betweenX && betweenY, place.permalink).toBe(false);
+    }
+    expect(checked).toBe(wide.length);
+    // A hall too narrow to hold the clearance (5 cells wide, less than
+    // twice ARRIVAL_LIFT_CLEARANCE) still lands the box, falling back to
+    // the plain nearest free candidate: the rule never turns a landing
+    // that used to succeed into a null.
+    const narrow = generateRoom(narrowWithHatches(0));
+    expect(narrow.hall.x1 - narrow.hall.x0).toBeLessThan(5.5);
+    const out = withArrivalBox(narrowWithHatches(0), narrow);
+    expect(out.box).not.toBeNull();
+  });
 });
