@@ -1644,34 +1644,179 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     leave();
   });
 
-  it("stops reopening after MAX_REOPENS answers in a row disagree, and holds every frame back", async () => {
-    // Catches the reopen without a bound: a cookie that never settles
-    // would open a source after source forever.
+  it("reports the carrier down after MAX_REOPENS disagreements in a row, and starts over after the backoff", async () => {
+    // Catches the bound failing closed for good (frames held back forever
+    // on a healthy session) or passing it without saying so on the
+    // carrier (which is defined as whether frames flow).
     const fake = browser();
     let asked = 0;
-    const flipping: SessionProbe = () =>
-      Promise.resolve(me(++asked % 2 === 0 ? "bob" : "ada"));
+    // Names ada and bob by turns for as long as the bound takes, then
+    // holds still on ada.
+    const flipping: SessionProbe = () => {
+      asked += 1;
+      const name = asked <= MAX_REOPENS + 2 && asked % 2 === 0 ? "bob" : "ada";
+      return Promise.resolve(me(name));
+    };
     const other = overhear(fake);
-    const leave = fake
-      .tab({ sessionProbe: flipping })
-      .subscribe(() => undefined);
+    const carrier: boolean[] = [];
+    const leave = subscribeOn(
+      fake.tab({ sessionProbe: flipping }),
+      () => undefined,
+      {
+        onCarrier: (up) => carrier.push(up),
+      },
+    );
     await settle();
     for (let round = 0; round < MAX_REOPENS + 3; round++) {
       await connectAll();
-      await advance(30_000);
+      await advance(5_000);
     }
-    expect(FakeEventSource.instances).toHaveLength(MAX_REOPENS + 1);
-    const last = sourceAt(MAX_REOPENS);
-    expect(last.readyState, "the last one stays open").toBe(1);
+    await connectAll();
+    expect(
+      FakeEventSource.instances,
+      "the first source, MAX_REOPENS reopens, and one fresh start",
+    ).toHaveLength(MAX_REOPENS + 2);
+    expect(
+      carrier,
+      "down at each reopen and at the bound, up at each open",
+    ).toEqual([false, true, false, true, false, true, false, true]);
+    const last = sourceAt(MAX_REOPENS + 1);
     act(() => {
       last.emit("engram", engram("alpha"), "1:1");
     });
     await settle();
-    expect(other.accounts(), "nothing passed on").toEqual([]);
+    expect(
+      other.accounts(),
+      "frames flow again: the fresh start's reset, then the frame",
+    ).toEqual(["user:ada", "user:ada"]);
     leave();
     other.close();
     await settle();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("takes a probe that cannot answer before the browser's reopen as no disagreement", async () => {
+    // Catches an unknown "before" answer counted as a disagreement: a
+    // network that drops a few times in a row with one account signed in
+    // would spend the bound, and each reopen would wait longer.
+    let network = true;
+    const probe: SessionProbe = () =>
+      network
+        ? Promise.resolve(me("ada"))
+        : Promise.reject(new TypeError("offline"));
+    const seen: string[] = [];
+    const leave = lone({ sessionProbe: probe }).subscribe((event) =>
+      seen.push(event.event),
+    );
+    await settle();
+    await connectAll();
+    const rounds = MAX_REOPENS + 2;
+    expect(rounds).toBeGreaterThan(0);
+    for (let round = 0; round < rounds; round++) {
+      const current = sourceAt(round);
+      network = false;
+      act(() => {
+        current.fail(0);
+      });
+      await settle();
+      network = true;
+      act(() => {
+        current.open();
+      });
+      await settle();
+      await advance(1_000);
+      expect(
+        FakeEventSource.instances,
+        `round ${String(round)}: reopened after the first backoff step`,
+      ).toHaveLength(round + 2);
+    }
+    act(() => {
+      sourceAt(rounds).open();
+    });
+    await settle();
+    act(() => {
+      sourceAt(rounds).emit("engram", engram("alpha"), "1:1");
+    });
+    expect(seen, "frames flow once the network holds").toEqual([
+      "reset",
+      "engram",
+    ]);
+    leave();
+  });
+
+  it("asks again before its first request when the probe cannot answer", async () => {
+    // Catches a lead that opens its first source with no answer before it.
+    const probe = vi
+      .fn<SessionProbe>()
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockImplementation(signedIn);
+    const leave = lone({ sessionProbe: probe }).subscribe(() => undefined);
+    await settle();
+    expect(FakeEventSource.instances, "no request yet").toHaveLength(0);
+    await advance(1_000);
+    expect(FakeEventSource.instances).toHaveLength(1);
+    leave();
+  });
+
+  it("reports the carrier down and up when the leader reopens a source itself", async () => {
+    // Catches a reopen the leader starts (answers that disagree, or a
+    // re-check that found the session moved) closing the source without
+    // telling the consumers the carrier went down.
+    const fake = browser();
+    let cookie = "ada";
+    const probe: SessionProbe = () => Promise.resolve(me(cookie));
+    let opened = 0;
+    const streamFactory = (url: string): EventSource => {
+      const source = fakeStreamFactory(url);
+      opened += 1;
+      if (opened === 1) cookie = "bob";
+      return source;
+    };
+    const carrier: boolean[] = [];
+    const leave = subscribeOn(
+      fake.tab({ sessionProbe: probe, streamFactory }),
+      () => undefined,
+      { onCarrier: (up) => carrier.push(up) },
+    );
+    await settle();
+    await connectAll();
+    expect(carrier, "the answers disagreed: closed").toEqual([false]);
+    await advance(1_000);
+    await connectAll();
+    expect(carrier, "open again").toEqual([false, true]);
+    leave();
+
+    // The re-check path: bob's tab finds the leader stale.
+    FakeEventSource.instances = [];
+    const second = browser();
+    let now = "ada";
+    const cookieProbe: SessionProbe = () => Promise.resolve(me(now));
+    const ada = recordingClient();
+    ada.client.setQueryData(ME_QUERY_KEY, me("ada"));
+    await mount(ada.client, <div />, second.tab({ sessionProbe: cookieProbe }));
+    const heard: boolean[] = [];
+    const follow = subscribeOn(
+      second.tab({ sessionProbe: cookieProbe }),
+      () => undefined,
+      {
+        identity: { held: () => me("bob"), recheck: () => undefined },
+        onCarrier: (up) => heard.push(up),
+      },
+    );
+    await settle();
+    now = "bob";
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    await settle();
+    expect(
+      FakeEventSource.instances,
+      "the leader reopened as bob",
+    ).toHaveLength(2);
+    expect(heard, "the follower heard it close").toEqual([false]);
+    await connectAll();
+    expect(heard).toEqual([false, true]);
+    follow();
   });
 
   it("drops a frame labelled with no account in a tab that shows somebody", async () => {

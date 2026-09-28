@@ -29,14 +29,21 @@
  *   tab. The server does not name it, so the leader asks the probe, which
  *   carries the same cookie, once before each request of the stream (a new
  *   source, or the browser's own reopen) and once after it opened. The two
- *   answers agreeing is the label; answers that disagree mean the cookie
- *   changed around the request, and the source is opened again, at most
- *   `MAX_REOPENS` times in a row. Until there is a label no frame is
- *   passed on, not even in the leader's tab; once there is, one reset
- *   stands in for whatever was dropped. What the bracket cannot see is a
- *   cookie that changes and changes back between its two answers; the
- *   server re-checks each stream's own session every few seconds and ends
- *   one whose session is gone, which bounds that case.
+ *   answers naming the same account is the label. Two answers that name
+ *   different accounts, or an account and nobody, disagree: the cookie
+ *   changed around the request, and the source is opened again. After
+ *   `MAX_REOPENS` disagreements in a row the carrier is reported down and
+ *   the lead starts over after the stream's backoff. A probe that could
+ *   not answer (a network error, a 5xx) is no disagreement: it is asked
+ *   again, and when it was the answer before the browser's own reopen,
+ *   which cannot be asked again before that request, the source is opened
+ *   once more with the answer after it, without counting toward the
+ *   bound. Until there is a label no frame is passed on, not even in the
+ *   leader's tab; once there is, one reset stands in for whatever was
+ *   dropped. What the bracket cannot see is a cookie that changes and
+ *   changes back between its two answers; the server re-checks each
+ *   stream's own session every 10 seconds (`VISIBILITY_TTL`) and ends one
+ *   whose session is gone, which bounds that case.
  * - A tab whose shell shows somebody else than a frame's label drops it
  *   and asks the probe which of the two is stale: a stale tab re-asks who
  *   is signed in and resets, a stale leader re-checks its session and
@@ -160,8 +167,8 @@ type Probed =
 
 /**
  * How often in a row the leader closes and reopens a source whose request
- * the probe's two answers disagree about, before it leaves the next reopen
- * to the browser or the server and keeps holding frames back.
+ * the probe's two answers name different accounts for, before it reports
+ * the carrier down and starts its lead over after the stream's backoff.
  */
 export const MAX_REOPENS = 3;
 
@@ -465,11 +472,13 @@ export class ChangeHub {
     // browser makes on its own) between two answers: one asked before the
     // request, one asked after the source opened. Only the order in which
     // they were asked matters, not the order they come back in. When the
-    // two name the same account, that is the label; when they differ, the
-    // cookie changed around the request, and the source is closed and
-    // opened again, at most `MAX_REOPENS` times in a row.
+    // two name the same account, that is the label; when they name
+    // different ones, the cookie changed around the request, and the source
+    // is closed and opened again (see the module doc for the bound and for
+    // a probe that could not answer).
     let asking = 0;
     let before: string | null | undefined;
+    let beforeUnknown = false;
     let after: string | undefined;
     let afterAsked = false;
     let askAttempt = 0;
@@ -479,13 +488,33 @@ export class ChangeHub {
       asking += 1;
       this.accountKnown = false;
       before = undefined;
+      beforeUnknown = false;
       after = undefined;
       afterAsked = false;
       if (askRetry) clearTimeout(askRetry);
       askRetry = null;
     };
+    /** Close this source and open another, whose "before" is `next`. */
+    const reopen = (next: string, delay: number) => {
+      detach?.();
+      detach = null;
+      this.setCarrier(false, true);
+      if (retry) clearTimeout(retry);
+      retry = setTimeout(() => {
+        retry = null;
+        connect(true, next);
+      }, delay);
+    };
     const settleBracket = () => {
-      if (before === undefined || after === undefined) return;
+      if (after === undefined) return;
+      if (beforeUnknown) {
+        // The browser's own request went out with nobody asked before it.
+        // The answer after it was asked before the next request, so that
+        // one is bracketed; this is no disagreement.
+        reopen(after, reconnectDelay(0, this.deps.random));
+        return;
+      }
+      if (before === undefined) return;
       if (before === after) {
         reopens = 0;
         this.account = after;
@@ -503,27 +532,31 @@ export class ChangeHub {
         }
         return;
       }
-      // Frames stay held back either way; past the bound the next reopen
-      // is the browser's or the server's, with a fresh bracket.
-      if (reopens >= MAX_REOPENS) return;
-      const next = after;
+      if (reopens >= MAX_REOPENS) {
+        // The cookie does not hold still: no frame flows, so say so, and
+        // start over after the stream's backoff.
+        reopens = 0;
+        detach?.();
+        detach = null;
+        this.setCarrier(false, true);
+        if (retry) clearTimeout(retry);
+        scheduleRetry(() => {
+          begin(true);
+        });
+        return;
+      }
+      // The answer that closed this bracket was asked before the next
+      // request, so it opens the next one.
       const delay = reconnectDelay(reopens, this.deps.random);
       reopens += 1;
-      detach?.();
-      detach = null;
-      if (retry) clearTimeout(retry);
-      retry = setTimeout(() => {
-        retry = null;
-        // The answer that closed this bracket was asked before the next
-        // request, so it opens the next one.
-        connect(true, next);
-      }, delay);
+      reopen(after, delay);
     };
     const askBefore = () => {
       const generation = asking;
       void this.probeIdentity().then((probed) => {
         if (ended || generation !== asking) return;
-        before = probed.kind === "is" ? probed.identity : null;
+        if (probed.kind === "unknown") beforeUnknown = true;
+        else before = probed.kind === "is" ? probed.identity : null;
         settleBracket();
       });
     };
@@ -598,6 +631,31 @@ export class ChangeHub {
       });
     };
 
+    /**
+     * The first request of a lead goes out once its "before" answer is in.
+     * An answer that names nobody still opens it, and the stream's own
+     * refusal then says whether the session ended; a probe that could not
+     * answer is asked again.
+     */
+    const begin = (gap: boolean) => {
+      forgetAccount();
+      const generation = asking;
+      void this.probeIdentity().then((probed) => {
+        if (ended || generation !== asking) return;
+        if (probed.kind === "unknown") {
+          const delay = reconnectDelay(askAttempt, this.deps.random);
+          askAttempt += 1;
+          askRetry = setTimeout(() => {
+            askRetry = null;
+            begin(gap);
+          }, delay);
+          return;
+        }
+        askAttempt = 0;
+        connect(gap, probed.kind === "is" ? probed.identity : null);
+      });
+    };
+
     /** A new source, whose request goes out after `known` was answered. */
     const connect = (gap: boolean, known: string | null) => {
       forgetAccount();
@@ -663,6 +721,7 @@ export class ChangeHub {
         } else if (checked.state === "changed") {
           detach?.();
           detach = null;
+          this.setCarrier(false, true);
           if (retry) clearTimeout(retry);
           retry = null;
           connect(true, checked.identity);
@@ -670,14 +729,7 @@ export class ChangeHub {
       });
     };
 
-    // The first request of this lead goes out once its "before" answer is
-    // in; an answer that names nobody still opens it, and the stream's own
-    // refusal then says whether the session ended.
-    const first = asking;
-    void this.probeIdentity().then((probed) => {
-      if (ended || first !== asking) return;
-      connect(handover, probed.kind === "is" ? probed.identity : null);
-    });
+    begin(handover);
     return () => {
       ended = true;
       forgetAccount();
