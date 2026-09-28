@@ -6,9 +6,9 @@
  *
  * It is a 6 by 6 cell hall (12 m across), 4 m high, with nothing a
  * generated room carries: no fixtures, decor, scaffold, heroes, props or
- * curios, no title and a plain finish (`plainFinish`: accent 0, wall
- * pattern 0; its shell keeps its own tints and draws no accent stripe
- * whatever the finish says). What it holds instead are its fittings,
+ * curios, no decals, no title and a plain finish (`plainFinish`: accent
+ * 0, wall pattern 0; its shell keeps its own tints and draws no accent
+ * stripe whatever the finish says). What it holds instead are its fittings,
  * `RoomSpec.interior` (C2): every wall edge carries one flush piece (the
  * inner doors across the south row's cells 2 and 3, the scanner on cell
  * 4's south edge, a wall of roundels on each of the other 21 edges), and
@@ -277,6 +277,7 @@ export function consoleRoom(): RoomSpec {
     props: [],
     curios: [],
     finish: plainFinish(0),
+    decals: [],
     interior: interiorOf(seed),
     lights: lightsOf(seed),
     dropped: 0,

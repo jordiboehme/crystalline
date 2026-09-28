@@ -520,6 +520,7 @@ describe("frameCurio's sight line", () => {
       props: [],
       curios,
       finish: plainFinish(0),
+      decals: [],
       lights: [],
       dropped: 0,
       inboundMore: 0,

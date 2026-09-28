@@ -666,6 +666,7 @@ function withHeroes(base: SiteBase, heroes: Hero[]): RoomSpec {
     props: [],
     curios: [],
     finish: plainFinish(base.bays.length),
+    decals: [],
   };
   return { ...room, props: dressRoom(room) };
 }

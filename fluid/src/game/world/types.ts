@@ -597,6 +597,51 @@ export interface Finish {
   corridorWalls: number;
 }
 
+/** The decal kinds (2.7 C14). */
+export type DecalKind =
+  "chevrons" | "arrow" | "grime" | "streak" | "rust" | "stencil";
+
+/** What a decal lies on: a wall edge, the floor, or a large crate's face. */
+export type DecalOn = "wall" | "floor" | "face";
+
+/**
+ * A stencil's text (2.7 C18, C19): its deck, its bay number, and its bay's
+ * letter (0 none, 1 to 4 for A to D); `lines` 2 for the wall's two lines,
+ * 1 for a floor's one.
+ */
+export interface StencilText {
+  deck: number;
+  bay: number;
+  letter: number;
+  lines: 1 | 2;
+}
+
+/**
+ * One decal (2.7 C13). `x` and `y` in `Decor`'s continuous cell units:
+ * the centre on the floor, the edge's wall point (`wallAnchor`) on a
+ * wall, and the face's middle at floor level on a face. `turn` 0 to 3: on
+ * the floor the way the decal's top points (0 north), on a wall or face
+ * the turn of the surface's frame (`turnForSide`, or the crate's own face
+ * turn). `along` moves it along a wall or face, in metres, in its frame's
+ * `along` direction. `h` its bottom edge in metres (0 on the floor).
+ * `width` across and `length` up (wall, face) or along `turn` (floor), in
+ * metres. `variant` picks the kind's tile. `stencil` only on a stencil.
+ */
+export interface Decal {
+  kind: DecalKind;
+  on: DecalOn;
+  x: number;
+  y: number;
+  turn: number;
+  along: number;
+  h: number;
+  width: number;
+  length: number;
+  variant: number;
+  seed: number;
+  stencil?: StencilText;
+}
+
 /**
  * A room, ready to be meshed.
  *
@@ -676,6 +721,14 @@ export interface RoomSpec {
    * key order. A hand-built room takes `plainFinish`.
    */
   finish: Finish;
+  /**
+   * The decals (`placeDecals` in `decals.ts`, 2.7 C13 to C19): chevrons,
+   * arrows, grime, streaks, rust and the deck and bay stencils, placed
+   * after the curios as pure data, never over text. Written after the
+   * finish and before the lights, the goldens' key order. A hand-built
+   * room has none.
+   */
+  decals: Decal[];
   /**
    * The console room's fittings, 2.6e C2; absent on every generated room.
    * Drawn instanced as their own family (`interiorInstances`), and the

@@ -485,6 +485,85 @@
     "bayWalls": [],
     "corridorWalls": 2
   },
+  "decals": [
+    {
+      "kind": "stencil",
+      "on": "floor",
+      "x": 3.5,
+      "y": 4,
+      "turn": 0,
+      "along": 0,
+      "h": 0,
+      "width": 1,
+      "length": 0.3,
+      "variant": 0,
+      "seed": 475181656385895,
+      "stencil": {
+        "deck": 1,
+        "bay": 6,
+        "letter": 0,
+        "lines": 1
+      }
+    },
+    {
+      "kind": "stencil",
+      "on": "wall",
+      "x": 4.5,
+      "y": 6,
+      "turn": 0,
+      "along": 0,
+      "h": 1.5,
+      "width": 0.9,
+      "length": 0.3,
+      "variant": 0,
+      "seed": 475181656385895,
+      "stencil": {
+        "deck": 1,
+        "bay": 6,
+        "letter": 0,
+        "lines": 2
+      }
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 6.375,
+      "y": 3.5,
+      "turn": 3,
+      "along": 0,
+      "h": 0,
+      "width": 1.8,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 232453483196428
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 6.375,
+      "y": 1.5,
+      "turn": 3,
+      "along": 0,
+      "h": 0,
+      "width": 1.8,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 2788757694276330
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 3.5,
+      "y": 0.125,
+      "turn": 2,
+      "along": 0,
+      "h": 0,
+      "width": 1.6,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 3793846840796860
+    }
+  ],
   "lights": [
     {
       "x0": 0,

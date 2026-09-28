@@ -43,7 +43,7 @@
  *
  * The gallery and the hero hall take a plain finish (`plainFinish`: accent
  * 0, wall pattern 0 everywhere); the variants hall shows every wall
- * pattern (`variantsHallRoom`).
+ * pattern (`variantsHallRoom`). All three carry no decals (`decals: []`).
  */
 
 import { seedFor } from "../core/seed";
@@ -586,6 +586,7 @@ export function galleryRoom(): RoomSpec {
     props,
     curios: [],
     finish: plainFinish(layout.bays.length),
+    decals: [],
     lights,
     dropped: 0,
     inboundMore: 0,
@@ -1178,6 +1179,7 @@ export function heroHallRoom(): RoomSpec {
     props: [],
     curios: [],
     finish: plainFinish(layout.bays.length),
+    decals: [],
     lights: heroHallLights(seed, layout),
     dropped: 0,
     inboundMore: 0,
@@ -1544,6 +1546,7 @@ export function variantsHallRoom(): RoomSpec {
       bayWalls: [1, 2, 1, 2].slice(0, layout.bays.length),
       corridorWalls: 1,
     },
+    decals: [],
     lights,
     dropped: 0,
     inboundMore: 0,

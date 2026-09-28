@@ -56,12 +56,16 @@
  * 10. The finish (`finishFor`, `finish.ts`, 2.7 C8, C11): the room's accent
  *    and the wall pattern of its hall, each bay and its corridor, by seed
  *    alone, so it moves nothing else.
+ * 11. The decals (`placeDecals`, `decals.ts`, 2.7 C13 to C19), on the
+ *    finished room: chevrons, arrows, grime, streaks, rust and the deck and
+ *    bay stencils, never over text and never under a footprint. They read
+ *    everything and move nothing.
  *
  * The forced-hero seam (2.6e C15): `withHeroes` stands a given set of
- * heroes in a room the generator built and re-runs steps 8 and 9 round
- * them, exactly as `generateRoom` runs them round its own draws: the
- * heroes sorted by `HERO_ORDER`, the dressing, then the curios with the
- * room's own draws and neighbours. Handed the room's own heroes, it gives
+ * heroes in a room the generator built and re-runs steps 8, 9 and 11
+ * round them, exactly as `generateRoom` runs them round its own draws: the
+ * heroes sorted by `HERO_ORDER`, the dressing, the curios with the room's
+ * own draws and neighbours, then the decals. Handed the room's own heroes, it gives
  * the room back unchanged. The dev switches (`dev/demo.ts`) and the
  * arrival box (`world/arrival.ts`) both go through it; the generator
  * itself never calls it.
@@ -80,6 +84,7 @@ import {
 } from "./layout";
 import { dressRoom } from "./dress";
 import { curioDraws, placeCurios } from "./curios";
+import { placeDecals } from "./decals";
 import { finishFor } from "./finish";
 import { decorFootprint } from "./footprints";
 import { HERO_ORDER, heroDraws, placeHeroes } from "./heroes";
@@ -715,7 +720,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   // The heroes stand before the dressing, which keeps off what they
   // reserve. They replace the empty list in place, so the keys (and the
   // goldens) read fixtures, decor, scaffold, heroes, props, curios, finish,
-  // lights.
+  // decals, lights.
   const near = nearFor(place);
   const room: RoomBase = {
     ...base,
@@ -724,16 +729,17 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   // The curios come last, on the dressed room, since shelves and filing
   // cabinets are props; they read everything and move nothing.
   const dressed: CurioBase = { ...room, props: dressRoom(room) };
+  // The decals come after the curios and the finish, on the finished
+  // room; they read everything and move nothing.
   const { lights, dropped: left, inboundMore: more, ...head } = room;
-  return {
+  const tail = { lights, dropped: left, inboundMore: more };
+  const body = {
     ...head,
     props: dressed.props,
     curios: placeCurios(dressed, curioDraws(dressed), near),
     finish: finishFor(seed, layout.bays.length),
-    lights,
-    dropped: left,
-    inboundMore: more,
   };
+  return { ...body, decals: placeDecals({ ...body, ...tail }), ...tail };
 }
 
 /**
@@ -741,11 +747,13 @@ export function generateRoom(place: PlaceInput): RoomSpec {
  * that read the heroes run again round them (2.6e C15): the heroes sorted
  * by `HERO_ORDER` (a copy; the list handed in is left as it is), the
  * props dressed afresh (`dressRoom`, which keeps off what the heroes
- * reserve), then the curios placed afresh on those props with the room's
+ * reserve), the curios placed afresh on those props with the room's
  * own draws (`curioDraws`) and its neighbours (`nearFor(place)`), as
- * `generateRoom` places them. Nothing else of the room moves: the layout,
- * the fixtures, the furniture, the scaffold, the finish and the lights are
- * the room's own, and the fields keep their order. The heroes are taken as given:
+ * `generateRoom` places them, and then the decals laid afresh
+ * (`placeDecals`), which keep off the new heroes and props. Nothing else
+ * of the room moves: the layout, the fixtures, the furniture, the
+ * scaffold, the finish and the lights are the room's own, and the fields
+ * keep their order. The heroes are taken as given:
  * nothing here checks that they fit, so the caller stands them where the
  * hero pass would allow. `withHeroes(place, generateRoom(place),
  * generateRoom(place).heroes)` is `generateRoom(place)` again.
@@ -757,8 +765,9 @@ export function withHeroes(
 ): RoomSpec {
   const standing: RoomSpec = { ...room, heroes: [...heroes].sort(HERO_ORDER) };
   const dressed: RoomSpec = { ...standing, props: dressRoom(standing) };
-  return {
+  const placed: RoomSpec = {
     ...dressed,
     curios: placeCurios(dressed, curioDraws(dressed), nearFor(place)),
   };
+  return { ...placed, decals: placeDecals(placed) };
 }
