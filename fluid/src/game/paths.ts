@@ -4,13 +4,15 @@
  * reached from the C64 screen rather than typed in by hand, and there is no
  * `/game` alias or redirect into it any more.
  *
- * Every place in the station is an engram, and every engram already has an
- * address in the app: `/d/<domain>/e/<permalink>`. The game does not invent a
- * second scheme beside it. It puts the same path under a `π` prefix, so a
- * place converts to its reading page and back by adding or dropping that
- * prefix, with no lookup table and no second encoder that could drift from the
- * first. The F key's "open this in Fluid" and the arrival after a reload both
- * rest on that.
+ * Every place in the station stands for a page the app already has: the
+ * airlock for the front page, a bridge for its domain's page, a deck for a
+ * folder (`?path=`) and an engram's room for its reading page
+ * (`/d/<domain>/e/<permalink>`). The game does not invent a second scheme
+ * beside those. It puts the same route under a `π` prefix (a deck adds only
+ * its `section`), so a place converts to its Fluid page and back by adding
+ * or dropping that prefix, with no lookup table and no second encoder that
+ * could drift from the first. The F key's "open this in Fluid" and the
+ * arrival after a reload both rest on that.
  *
  * A domain's bridge, the room built from its MANIFEST, has the station
  * address `bridgeAddress` names and the domain's own route under the
@@ -42,12 +44,11 @@ const GAME_SEGMENT = "π";
  * The prefix every game route sits under, in the form `history` itself
  * settles on.
  *
- * `session.ts` compares a route this module builds against
- * `window.location.pathname` directly (`if (window.location.pathname !==
- * path) opts.navigate(path)`), and both browsers and jsdom always report
- * that pathname percent-encoded, never as the raw character - that is the
- * one fact this file's header used to only assert and `paths.test.ts` now
- * pins with a failing-raw-form test. A prefix built from the raw character
+ * `session.ts` compares a route `gameRouteOf` builds against
+ * `window.location.pathname + window.location.search` directly, replacing
+ * the URL only when the two differ, and both browsers and jsdom always
+ * report that pathname percent-encoded, never as the raw character, which
+ * `paths.test.ts` pins with a failing-raw-form test. A prefix built from the raw character
  * would therefore never string-equal what the location bar actually holds,
  * and the route would `replace` the URL on every landing instead of only
  * when it must. Encoding it here with the same `encodeURIComponent` a
