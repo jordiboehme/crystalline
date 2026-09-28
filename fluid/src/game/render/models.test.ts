@@ -1707,3 +1707,260 @@ describe("terminal variants (2.7 Task 6)", () => {
     });
   });
 });
+
+/** The frame every `decorAt` piece stands in: (4.5, 3), turn 0. */
+const DECOR_FRAME = frameForDecor(decorAt("generator", 0));
+
+/** A decor variant's static parts, with their bounds in the piece's own `[a, d, h]`. */
+function decorParts(kind: DecorKind, variant: number): LocalBox[] {
+  return buildOneDecor(decorAt(kind, variant)).parts.map((part) => {
+    const s = shape(part.points.map((q) => toLocal(DECOR_FRAME, q)));
+    return { part, lo: s.lo, hi: s.hi };
+  });
+}
+
+/** Every triangle normal of a part, in the piece's own `[a, d, h]`. */
+function decorNormals(b: LocalBox): V3[] {
+  const ps = b.part.points.map((q) => toLocal(DECOR_FRAME, q));
+  const out: V3[] = [];
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [p0, p1, p2] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!p0 || !p1 || !p2) continue;
+    const g = cross(sub(p1, p0), sub(p2, p0));
+    if (Math.hypot(...g) < 1e-9) continue;
+    out.push(unit(g));
+  }
+  return out;
+}
+
+/** Whether a part's recorded tint is the room's accent mark (2.7 C8). */
+const accented = (b: LocalBox) => b.part.tint?.join() === accentTint(1).join();
+/** A part's centre along `a`, `d` or `h`. */
+const mid = (b: LocalBox, k: 0 | 1 | 2) => (b.lo[k] + b.hi[k]) / 2;
+/** A revolved part: a cylinder, a lathe or a ring. */
+const upright = (b: LocalBox) =>
+  b.part.method === "cylinder" || b.part.method === "lathe";
+
+/**
+ * What makes each new decor variant that variant (2.7 Task 7's table), on
+ * its recorded parts in its own terms. Entry `v - 1` is variant `v`'s
+ * check; each holds for its variant and fails for variant 0. Where the
+ * table's words alone hold on variant 0 too, the check adds what the
+ * design says on top (named on each).
+ */
+const DECOR_SIGNATURES: Partial<
+  Record<DecorKind, ((ps: LocalBox[]) => boolean)[]>
+> = {
+  "command-console": [
+    // v1, the straight console: no yawed frame. Every flat part's faces
+    // stand square to the piece: each normal runs along it or not at all.
+    (ps) =>
+      ps
+        .filter((b) =>
+          ["box", "bevelBox", "extrude", "panel"].includes(b.part.method),
+        )
+        .every((b) =>
+          decorNormals(b).every(
+            (n) => Math.abs(n[0]) < 1e-3 || Math.abs(n[0]) > 1 - 1e-3,
+          ),
+        ),
+    // v2, the horseshoe: at least three screens, and (beyond the table's
+    // words, which variant 0's three screens meet) at least three of them
+    // turned off the piece's front, the wings curving round the chair.
+    (ps) => {
+      const screens = ps.filter((b) => b.part.method === "panel" && glows(b));
+      const turned = screens.filter((b) =>
+        decorNormals(b).every((n) => Math.abs(n[0]) > 0.2),
+      );
+      return screens.length >= 3 && turned.length >= 3;
+    },
+  ],
+  "captain-chair": [
+    // v1: two glowing panels at arm height, one on each arm.
+    (ps) => {
+      const lit = ps.filter(
+        (b) => glows(b) && b.lo[2] >= 0.55 && b.hi[2] <= 0.9,
+      );
+      return lit.some((b) => mid(b, 0) < 0) && lit.some((b) => mid(b, 0) > 0);
+    },
+  ],
+  "round-table": [
+    // v1: no lathe column under the top: no revolved part stands on the
+    // floor under the table's middle and reaches up towards the top.
+    (ps) =>
+      !ps.some(
+        (b) =>
+          upright(b) &&
+          Math.hypot(mid(b, 0), mid(b, 1)) < 0.2 &&
+          b.lo[2] < 0.3 &&
+          b.hi[2] > 0.5,
+      ),
+  ],
+  "council-chair": [
+    // v1: a back wider than the seat (the seat is the accent part).
+    (ps) => {
+      const seat = ps.find(accented);
+      if (!seat) return false;
+      return ps.some(
+        (b) =>
+          b.lo[2] >= seat.hi[2] - EPS && extent(b, 0) >= extent(seat, 0) + 0.1,
+      );
+    },
+    // v2: a lathe shell at least 0.5 m across.
+    (ps) =>
+      ps.some(
+        (b) =>
+          b.part.method === "lathe" &&
+          extent(b, 0) >= 0.5 &&
+          extent(b, 1) >= 0.5,
+      ),
+  ],
+  generator: [
+    // v1: a cylinder whose axis is horizontal, a drum at least 1 m long
+    // and 0.6 m across.
+    (ps) =>
+      ps.some(
+        (b) =>
+          b.part.method === "cylinderAlong" &&
+          extent(b, 0) >= 1 &&
+          extent(b, 2) >= 0.6,
+      ),
+    // v2: two cylinders taller than 1.2 m.
+    (ps) => ps.filter((b) => upright(b) && extent(b, 2) > 1.2).length >= 2,
+  ],
+  "pipe-run": [
+    // v1: three pipe axes, and (beyond the table's words, which variant 0's
+    // three flat pipes meet) bundled, not all at one height, with at least
+    // one valve wheel.
+    (ps) => {
+      const pipes = ps.filter(
+        (b) => b.part.method === "cylinderAlong" && extent(b, 0) >= 1,
+      );
+      const axes = new Set(
+        pipes.map((b) => `${mid(b, 1).toFixed(2)},${mid(b, 2).toFixed(2)}`),
+      );
+      const hs = pipes.map((b) => mid(b, 2));
+      return (
+        axes.size >= 3 &&
+        Math.max(...hs) - Math.min(...hs) > 0.05 &&
+        ps.some((b) => b.part.method === "ring")
+      );
+    },
+  ],
+  "shelf-row": [
+    // v1: at least 24 drawer fronts: flat boxes 0.1 to 0.5 m wide and 0.1
+    // to 0.35 m tall, at most 3 cm deep.
+    (ps) =>
+      ps.filter(
+        (b) =>
+          b.part.method === "box" &&
+          extent(b, 1) <= 0.03 + EPS &&
+          extent(b, 0) >= 0.1 &&
+          extent(b, 0) <= 0.5 &&
+          extent(b, 2) >= 0.1 &&
+          extent(b, 2) <= 0.35,
+      ).length >= 24,
+    // v2: at least four horizontal cylinders (the tube rolls).
+    (ps) => ps.filter((b) => b.part.method === "cylinderAlong").length >= 4,
+  ],
+  "lab-island": [
+    // v1: a part taller than 0.35 m standing on the top, wholly past the
+    // bench surface's far end (a 0.5, `DECOR_SURFACES`): variant 0's fume
+    // hood stands outside the surface too, at the other end, so the far
+    // end is what tells them apart.
+    (ps) =>
+      ps.some(
+        (b) => b.lo[0] >= 0.5 && b.lo[2] >= 0.96 - EPS && b.hi[2] - 0.96 > 0.35,
+      ),
+  ],
+  "specimen-tank": [
+    // v1, the square tank: no cylinder taller than 0.5 m, and (beyond the
+    // table's words, which variant 0 meets, its tall glass being a lathe)
+    // no lathe either.
+    (ps) => !ps.some((b) => upright(b) && extent(b, 2) > 0.5),
+    // v2: three glowing cores, each at least 0.8 m tall on its own axis.
+    (ps) => {
+      const cores = ps.filter(
+        (b) => upright(b) && glows(b) && extent(b, 2) >= 0.8,
+      );
+      const axes = new Set(
+        cores.map((b) => `${mid(b, 0).toFixed(1)},${mid(b, 1).toFixed(1)}`),
+      );
+      return cores.length >= 3 && axes.size >= 3;
+    },
+  ],
+};
+
+/**
+ * How many parts of each decor variant carry the room's accent mark (2.7
+ * C9), entry `v` for variant `v`. Variant 0 re-tints parts it already had:
+ * the console's three kick strips (it has no trim under its screens), the
+ * captain's and the council chair's seat, the round table's rim ring, the
+ * generator's ring round its core, the pipe run's brackets (cross bar and
+ * two side posts each, five brackets in `HALL`, so this count follows the
+ * hall), the shelf row's two end panels, the lab island's sink rim (it has
+ * no edge band) and the specimen tank's collar ring (it has no ring on its
+ * cap). Variants 1 and 2 carry the parts their recipes' docs name.
+ */
+const DECOR_ACCENT_PARTS: Record<DecorKind, readonly number[]> = {
+  "command-console": [3, 3, 5],
+  "captain-chair": [1, 1],
+  "round-table": [1, 1],
+  "council-chair": [1, 1, 1],
+  generator: [1, 1, 2],
+  "pipe-run": [15, 2],
+  "shelf-row": [2, 2, 2],
+  "lab-island": [1, 2],
+  "specimen-tank": [1, 1, 3],
+};
+
+describe("decor variants (2.7 Task 7)", () => {
+  it("raises every decor kind to its count (2.7 C2)", () => {
+    // Mutation caught: a count left at 1, so no new variant is ever built.
+    expect(VARIANT_COUNTS.decor).toEqual({
+      "command-console": 3,
+      "captain-chair": 2,
+      "round-table": 2,
+      "council-chair": 3,
+      generator: 3,
+      "pipe-run": 2,
+      "shelf-row": 3,
+      "lab-island": 2,
+      "specimen-tank": 3,
+    });
+  });
+
+  for (const kind of DECOR_KINDS)
+    for (const [i, check] of (DECOR_SIGNATURES[kind] ?? []).entries())
+      it(`builds ${kind} variant ${String(i + 1)} to its design (2.7 Task 7)`, () => {
+        // Mutation caught: the variant built as variant 0 (the check must
+        // fail there, so it cannot pass on any build of the kind).
+        expect(VARIANT_COUNTS.decor[kind]).toBeGreaterThan(i + 1);
+        expect(check(decorParts(kind, i + 1))).toBe(true);
+        expect(check(decorParts(kind, 0))).toBe(false);
+      });
+
+  it("names a design for every new decor variant", () => {
+    // Mutation caught: a count raised with no signature to hold it.
+    for (const kind of DECOR_KINDS)
+      expect((DECOR_SIGNATURES[kind] ?? []).length, kind).toBe(
+        VARIANT_COUNTS.decor[kind] - 1,
+      );
+  });
+
+  it("paints the room's accent on each variant's trim parts only (2.7 C9)", () => {
+    // Mutation caught: an accent part left in its old colour, one painted
+    // twice, a glowing part (a screen, a core, a lit panel) in the accent,
+    // or a baked colour used instead of the mark.
+    expect(Object.keys(DECOR_ACCENT_PARTS).length).toBe(DECOR_KINDS.length);
+    for (const kind of DECOR_KINDS) {
+      const counts = DECOR_ACCENT_PARTS[kind];
+      expect(counts.length, kind).toBe(VARIANT_COUNTS.decor[kind]);
+      counts.forEach((n, v) => {
+        const painted = decorParts(kind, v).filter(accented);
+        expect(painted.length, `${kind} variant ${String(v)}`).toBe(n);
+        for (const b of painted) expect(GLOWING).not.toContain(b.part.flag);
+      });
+    }
+  });
+});

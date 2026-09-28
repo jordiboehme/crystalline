@@ -1204,11 +1204,12 @@ const VARIANTS_HALL_KIND_ORDER: readonly DecorKind[] = [
 ];
 
 /**
- * Every decor kind and variant the variants hall stands, in hall order:
- * kind by kind (`VARIANTS_HALL_KIND_ORDER`), variant by variant. Read off
- * `VARIANT_COUNTS.decor`, so it grows the day Tasks 4 to 7 raise a count.
- * Consumed by Tasks 4 to 7 (their stills) and Task 11 (its decals), and
- * pinned against `variantsHallRoom`'s own `room.decor` by `canned.test.ts`.
+ * Every decor kind and variant the variants hall stands once, in hall
+ * order: kind by kind (`VARIANTS_HALL_KIND_ORDER`), variant by variant.
+ * Read off `VARIANT_COUNTS.decor`, so it follows every count. The stills
+ * of the model tasks and of the decals frame these pieces, and
+ * `canned.test.ts` pins them against the head of `variantsHallRoom`'s own
+ * `room.decor` (the council row, `VARIANTS_HALL_COUNCIL`, follows them).
  */
 export const VARIANTS_HALL_DECOR: readonly {
   kind: DecorKind;
@@ -1219,6 +1220,30 @@ export const VARIANTS_HALL_DECOR: readonly {
     variant,
   })),
 );
+
+/**
+ * The variants hall's council row: one round table and six council chairs
+ * round it, as a generated council chamber stands them (`decorFor` in
+ * `generate.ts`: 1.25 cells out, each turned to face the table as near as
+ * a quarter turn allows), all six chairs in one variant, the set a room
+ * draws (2.7 C4). It stands in the hall's southern half, west of the
+ * entrance lane, after the one-of-each pieces (`VARIANTS_HALL_DECOR`), so
+ * `?at=decor:<kind>:<n>` still frames those by their variant.
+ */
+export const VARIANTS_HALL_COUNCIL = {
+  table: 1,
+  chairs: 1,
+  /** How far each chair stands from the table's centre, in cells. */
+  radius: 1.25,
+} as const;
+
+/**
+ * How many doors' worth of north wall the variants hall asks `planLayout`
+ * for. No door stands there; the need only widens the hall (`2 * north +
+ * 1` cells, `layout.ts`) so every decor variant's row fits in its northern
+ * half and the council row fits beside the entrance lane in its southern.
+ */
+const VARIANTS_HALL_NORTH = 5;
 
 /** The variants hall's one light level, steady everywhere, as `galleryRoom`'s. */
 const VARIANTS_HALL_LIGHT = 210;
@@ -1262,7 +1287,9 @@ const DECOR_ROW_SAFETY = 0.1;
  * which variant it draws. `pipe-run`
  * (`decorFootprint` null, C13) packs at `PIPE_HALF * 2`, a piece hanging
  * from the ceiling with no floor box of its own, so it still keeps its row
- * neighbours' clearance without ever being measured against the floor.
+ * neighbours' clearance without ever being measured against the floor; it
+ * stands turned a quarter (`variantsHallRoom`), its length running across
+ * the rows, so two runs in one row never cross each other.
  * Throws, naming the kind and variant, when a piece finds no row left: a
  * hall too small for its own decor list is a bug in this file, never a
  * silent overlap (`row`'s own rule, above).
@@ -1319,7 +1346,44 @@ function variantsHallDecorPlacements(
   return placed;
 }
 
-/** How many machines the variants hall stands: every kind's own variant count, summed (2.7 C2 starts every kind at 1). */
+/**
+ * The variants hall's council row (`VARIANTS_HALL_COUNCIL`): the table in
+ * the hall's southern half, as far west as its chairs keep
+ * `USE_LANE_DEPTH` plus `DECOR_ROW_SAFETY` clear of the west wall, and
+ * its six chairs round it.
+ */
+function variantsHallCouncil(hall: Rect, seed: number): Decor[] {
+  const C = VARIANTS_HALL_COUNCIL;
+  const chair = FOOTPRINTS.decor["council-chair"];
+  const reach = C.radius * CELL + (chair === null ? 0 : chair.width / 2);
+  const cx =
+    (hall.x0 * CELL + USE_LANE_DEPTH + DECOR_ROW_SAFETY + reach) / CELL;
+  const cy = hall.y0 + ((hall.y1 - hall.y0) * 3) / 4;
+  const out: Decor[] = [
+    {
+      kind: "round-table",
+      x: cx,
+      y: cy,
+      turn: 0,
+      variant: C.table,
+      seed: seedFor(seed, "council", "table"),
+    },
+  ];
+  for (let k = 0; k < 6; k++) {
+    const angle = (k * Math.PI) / 3;
+    out.push({
+      kind: "council-chair",
+      x: Math.round((cx + C.radius * Math.sin(angle)) * 1000) / 1000,
+      y: Math.round((cy - C.radius * Math.cos(angle)) * 1000) / 1000,
+      turn: Math.round((angle + Math.PI) / (Math.PI / 2)) % 4,
+      variant: C.chairs,
+      seed: seedFor(seed, "council", "chair", k),
+    });
+  }
+  return out;
+}
+
+/** How many machines the variants hall stands: every kind's own variant count, summed (2.7 C2). */
 const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
   (a, b) => a + b,
   0,
@@ -1329,14 +1393,17 @@ const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
  * The variants hall (2.7 C24): a room built by hand rather than generated,
  * standing one of every machine kind and variant along the east wall and
  * the bays that need adds beyond it, one of every terminal variant on the
- * west wall, and one of every decor kind and variant on the floor
- * (`VARIANTS_HALL_DECOR`), for the dev-only route `?hall=variants` and the
- * `?at=machine:<n>`, `?at=terminal:<n>` and `?at=decor:<kind>:<n>` shots
- * Tasks 4 to 7 and 11 judge their models with.
+ * west wall, one of every decor kind and variant on the floor
+ * (`VARIANTS_HALL_DECOR`) and a council row of six matching chairs round a
+ * table (`VARIANTS_HALL_COUNCIL`), for the dev-only route `?hall=variants`
+ * and the `?at=machine:<n>`, `?at=terminal:<n>` and `?at=decor:<kind>:<n>`
+ * shots the models and the decals are judged with.
  *
- * `planLayout({ north: 0, west: VARIANT_COUNTS.terminal, east:
- * VARIANTS_HALL_MACHINES, south: 0, any: 0, hatches: 0 })` sizes the hall
- * from those two counts alone; the machines and terminals are then handed
+ * `planLayout({ north: VARIANTS_HALL_NORTH, west: VARIANT_COUNTS.terminal,
+ * east: VARIANTS_HALL_MACHINES, south: 0, any: 0, hatches: 0 })` sizes the
+ * hall: its width from the north need (no door stands there, it only makes
+ * room for the decor), its depth from the terminals and machines; the
+ * machines and terminals are then handed
  * the slot pool's own `"east"` and `"west"` preferences in turn, the same
  * pool `galleryRoom`'s fixtures draw from, which fills the hall's own wall
  * first and, once a demand outgrows it, the bays the layout added to hold
@@ -1358,7 +1425,7 @@ export function variantsHallRoom(): RoomSpec {
   const seed = seedFor(GAME_VERSION, "variants-hall");
   const condition = "clean";
   const layout = planLayout({
-    north: 0,
+    north: VARIANTS_HALL_NORTH,
     west: VARIANT_COUNTS.terminal,
     east: VARIANTS_HALL_MACHINES,
     south: 0,
@@ -1420,11 +1487,12 @@ export function variantsHallRoom(): RoomSpec {
       kind,
       x: p.x,
       y: p.y,
-      turn: 0,
+      turn: kind === "pipe-run" ? 1 : 0,
       variant,
       seed: seedFor(seed, "decor", kind, variant),
     };
   });
+  decor.push(...variantsHallCouncil(layout.hall, seed));
 
   const lights: LightZone[] = [];
   for (let y0 = 0; y0 < layout.depth; y0 += 4) {

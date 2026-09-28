@@ -50,6 +50,7 @@ import {
   galleryRoom,
   heroHallRoom,
   row,
+  VARIANTS_HALL_COUNCIL,
   VARIANTS_HALL_DECOR,
   variantsHallRoom,
 } from "./canned";
@@ -684,9 +685,18 @@ describe("the variants hall (2.7 C24)", () => {
     expect(terminals.map((f) => f.variant ?? 0)).toEqual(
       Array.from({ length: VARIANT_COUNTS.terminal }, (_, v) => v),
     );
+    // Then the council row: its table and six chairs of one variant.
+    const council = VARIANTS_HALL_COUNCIL;
     expect(
       room.decor.map((d) => ({ kind: d.kind, variant: d.variant ?? 0 })),
-    ).toEqual(VARIANTS_HALL_DECOR);
+    ).toEqual([
+      ...VARIANTS_HALL_DECOR,
+      { kind: "round-table", variant: council.table },
+      ...Array.from({ length: 6 }, () => ({
+        kind: "council-chair",
+        variant: council.chairs,
+      })),
+    ]);
   });
 
   it("keeps every piece on the floor, clear of the others and of every lane", () => {
