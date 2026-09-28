@@ -2285,6 +2285,33 @@ impl AuthStore {
             .and_then(|row| cell_text(&row, 0)))
     }
 
+    /// The account behind a live session, as [`AuthStore::session_user`]
+    /// answers it, but as a pure read: nothing is pruned and `last_seen_at` is
+    /// not stamped. `None` for a token that names no live session and for a
+    /// disabled account.
+    ///
+    /// For a caller that re-checks a session it already holds rather than one
+    /// serving a request: an open event stream asks this every few seconds for
+    /// the life of a tab, and a write each time would both make every open tab
+    /// read as a fresh sighting and queue every stream's check behind the
+    /// store's writes.
+    pub async fn session_user_quiet(&self, token: &str) -> Result<Option<User>> {
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED}
+                     FROM sessions s JOIN users u ON u.name = s.user_name
+                     WHERE s.token_hash = ?1 AND s.expires_at > ?2"
+                ),
+                vec![Value::Text(token_hash(token)), Value::Integer(now)],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .filter(|user| !user.disabled))
+    }
+
     /// How many session rows exist, live and expired alike. A diagnostic, and
     /// what pins the reuse invariant in tests: a probe that minted per call
     /// would show here as a growing count.
@@ -5030,6 +5057,59 @@ mod tests {
         assert!(store.session_user("not-a-token").await.unwrap().is_none());
         // The live session survived the expired one's prune.
         assert!(store.session_user(&live.token).await.unwrap().is_some());
+    }
+
+    /// The quiet lookup answers what `session_user` answers and writes
+    /// nothing. Catches a lookup that stamped `last_seen_at` (every open tab
+    /// would read as a fresh sighting) or pruned (a write per check), and
+    /// one that let a disabled account or an expired session through.
+    #[tokio::test]
+    async fn the_quiet_session_lookup_reads_without_writing() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+        let expired = store.create_session("ada", -1).await.unwrap();
+        let seen = store.user("ada").await.unwrap().unwrap().last_seen;
+        let user = store
+            .session_user_quiet(&live.token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((user.name.as_str(), user.role), ("ada", Role::Editor));
+        assert!(
+            store
+                .session_user_quiet(&expired.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .session_user_quiet("not-a-token")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.user("ada").await.unwrap().unwrap().last_seen,
+            seen,
+            "not stamped"
+        );
+        assert_eq!(
+            store.session_count().await.unwrap(),
+            2,
+            "the expired row was not pruned"
+        );
+        store.set_role("ada", Role::Viewer).await.unwrap();
+        let user = store
+            .session_user_quiet(&live.token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.role, Role::Viewer, "the stored role, read now");
     }
 
     /// `ensure_session` issues at most one session per account: the first call

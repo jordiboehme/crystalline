@@ -353,7 +353,7 @@ async fn a_user_outside_a_private_domain_never_hears_it_and_the_admin_does() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_private_domains_rename_and_removal_are_silent_to_an_outsider_and_heard_by_a_member() {
-    // Section J (k), ruled 2026-09-27: the old name leaves the privacy
+    // Ruled 2026-09-27: the old name leaves the privacy
     // records with the change itself, so the engine resolves its audience
     // eagerly, at the moment of the change, and that snapshot is what the
     // stream checks, never a session's cache and never the registry's
@@ -403,7 +403,7 @@ async fn a_private_domains_rename_and_removal_are_silent_to_an_outsider_and_hear
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_members_revoked_access_is_captured_before_a_rename_so_they_do_not_hear_it() {
-    // Section J (k), ruled 2026-09-27: the audience is what the engine
+    // Ruled 2026-09-27: the audience is what the engine
     // resolves eagerly at the moment of the change, never a session's own
     // cache, which is still within VISIBILITY_TTL two seconds after a
     // revocation and would otherwise still answer "member".
@@ -598,7 +598,7 @@ async fn no_identity_is_401_the_anonymous_viewer_is_200_and_read_only_serves_it(
 
     let published = serve(true, true).await;
     // `lab` is private, so the anonymous viewer's stream is filtered like
-    // any anonymous read (R1, P20; review I3).
+    // any anonymous read: a session hears only what it could read itself.
     published
         .auth
         .set_domain_visibility("lab", true, "root")
@@ -667,7 +667,7 @@ async fn read_to_end(resp: &mut reqwest::Response, within: Duration) -> (Vec<Str
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_session_ends_its_stream_at_the_next_refresh() {
-    // Catches the identity frozen at connect (review I1, ruled): the session
+    // Catches the identity frozen at connect: the session
     // is revoked (what a logout does to it), and the first event after the
     // refresh is due ends the stream instead of being written.
     let fx = serve(false, false).await;
@@ -684,6 +684,52 @@ async fn a_revoked_session_ends_its_stream_at_the_next_refresh() {
     assert!(
         !seen.iter().any(|chunk| chunk.contains("event: engram")),
         "nothing is written to a session that is gone: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_stream_of_a_revoked_session_ends_without_an_event() {
+    // Catches a re-check that waits for an event: nothing is written while
+    // the stream waits, and the stream (and its place under the caps) still
+    // ends within one refresh interval of the revocation.
+    let fx = serve(false, false).await;
+    let cookie = login(fx.addr, "ada", "adapw").await;
+    let mut resp = open(fx.addr, Some(&cookie), None).await;
+    fx.auth.delete_session(&cookie).await.unwrap();
+    let (seen, ended) = read_to_end(&mut resp, PAST_TTL + Duration::from_secs(2)).await;
+    assert!(ended, "the idle stream ends on its own");
+    assert!(
+        !seen.iter().any(|chunk| chunk.contains("event:")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_streams_refresh_writes_nothing_to_the_accounts_store() {
+    // Catches the refresh going through the request path's session lookup,
+    // which prunes and stamps `last_seen_at`: an open tab would read as a
+    // fresh sighting every ten seconds, and every stream's check would queue
+    // behind the store's writes.
+    let fx = serve(false, false).await;
+    let cookie = login(fx.addr, "ada", "adapw").await;
+    let mut resp = open(fx.addr, Some(&cookie), None).await;
+    let seen = fx.auth.user("ada").await.unwrap().unwrap().last_seen;
+    assert!(seen.is_some(), "the open request itself was a sighting");
+    tokio::time::sleep(PAST_TTL).await;
+    fx.engine
+        .edit_engram(&edit("eng", "alpha", "after the refresh interval"))
+        .await
+        .unwrap();
+    let frames = read_frames(&mut resp, 1, Duration::from_secs(3)).await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "the refreshed stream still delivers: {frames:?}"
+    );
+    assert_eq!(
+        fx.auth.user("ada").await.unwrap().unwrap().last_seen,
+        seen,
+        "the idle re-check and the refresh left last_seen_at alone"
     );
 }
 
@@ -708,8 +754,8 @@ async fn a_disabled_account_ends_its_stream_at_the_next_refresh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_demoted_admin_loses_admin_visibility_at_the_next_refresh() {
-    // Catches the connect-time `admin` flag kept for the life of the stream
-    // (review I1, ruled): `chief` hears the private `lab` as an admin, is
+    // Catches the connect-time `admin` flag kept for the life of the
+    // stream: `chief` hears the private `lab` as an admin, is
     // demoted, and after the refresh hears `eng` only.
     let fx = serve(false, false).await;
     fx.auth
@@ -748,7 +794,7 @@ async fn a_demoted_admin_loses_admin_visibility_at_the_next_refresh() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plain_member_hears_a_private_domain_and_its_rename() {
-    // Review M5: the `Accounts` path end to end for a member who is neither
+    // The captured `Accounts` audience end to end for a member who is neither
     // the owner nor an admin.
     let fx = serve(false, false).await;
     fx.auth
@@ -794,7 +840,7 @@ async fn a_plain_member_hears_a_private_domain_and_its_rename() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_account_holds_at_most_thirty_two_streams() {
-    // Review M3, ruled: the thirty-third stream of one account is refused
+    // The thirty-third stream of one account is refused
     // 503 with `Retry-After`, while another account still subscribes.
     let fx = serve(false, false).await;
     let ada = login(fx.addr, "ada", "adapw").await;

@@ -9,7 +9,7 @@
 //! removal). That audience is checked directly against this session's
 //! identity: neither this subscriber's cache nor a fresh call is consulted,
 //! since both can answer from a registry the change is in the middle of
-//! altering (Section J (k), ruled 2026-09-27). Such an event also marks the
+//! altering (Jordi's ruling, 2026-09-27). Such an event also marks the
 //! cache stale, so the frame that follows it (a rename's new name) is checked
 //! against the records as they are after the change rather than a cache from
 //! before it. A draft event reaches the draft's owner alone. A client that
@@ -320,6 +320,11 @@ struct Subscriber {
     /// `None` for a scope that hides nothing; the hidden names otherwise.
     hidden: Option<HashSet<String>>,
     resolved_at: Instant,
+    /// When the account behind the stream was last re-checked. An idle
+    /// stream re-checks it every [`VISIBILITY_TTL`] on its own, so a logout
+    /// or a revocation ends it (and frees its slot) without waiting for an
+    /// event.
+    checked_at: Instant,
     /// Set by an event that carried a captured audience (the change it
     /// announced moved the privacy records), by a lag (such an event may be
     /// among the ones lost) and by a failed re-resolution: `hidden` is
@@ -343,6 +348,24 @@ enum Step {
     Skip,
     /// The session behind the stream is gone: end it.
     End,
+}
+
+/// What the live half of [`Subscriber::next`] woke up to.
+// One value on the stack per wake-up; boxing the envelope would allocate for
+// every event to save nothing.
+#[allow(clippy::large_enum_variant)]
+enum Woke {
+    Shutdown,
+    Recheck,
+    Received(Result<Envelope, RecvError>),
+}
+
+/// Resolves at `deadline`; never, for `None`.
+async fn at(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => futures::future::pending().await,
+    }
 }
 
 /// Whether this session may hear one event.
@@ -386,6 +409,7 @@ impl Subscriber {
             scope,
             hidden,
             resolved_at: Instant::now(),
+            checked_at: Instant::now(),
             stale: false,
             receiver,
             backlog: VecDeque::new(),
@@ -405,23 +429,33 @@ impl Subscriber {
             let envelope = match self.backlog.pop_front() {
                 Some(envelope) => envelope,
                 None => {
-                    // `None` is the daemon shutting down. Selected into a
-                    // value first, so the branch below may borrow `self`
-                    // again.
-                    let received = tokio::select! {
+                    // Selected into a value first, so the arms below may
+                    // borrow `self` again.
+                    let recheck_at = self
+                        .account
+                        .is_some()
+                        .then(|| self.checked_at + VISIBILITY_TTL);
+                    let woke = tokio::select! {
                         biased;
-                        _ = closed(&mut self.shutdown) => None,
-                        received = self.receiver.recv() => Some(received),
+                        _ = closed(&mut self.shutdown) => Woke::Shutdown,
+                        _ = at(recheck_at) => Woke::Recheck,
+                        received = self.receiver.recv() => Woke::Received(received),
                     };
-                    match received {
-                        None | Some(Err(RecvError::Closed)) => return None,
-                        Some(Err(RecvError::Lagged(_))) => {
+                    match woke {
+                        Woke::Shutdown | Woke::Received(Err(RecvError::Closed)) => return None,
+                        Woke::Recheck => {
+                            if self.recheck().await {
+                                continue;
+                            }
+                            return None;
+                        }
+                        Woke::Received(Err(RecvError::Lagged(_))) => {
                             // A rename's captured frame may be among the
                             // lost ones, so the cache is not trusted past it.
                             self.stale = true;
                             return Some(reset_frame());
                         }
-                        Some(Ok(envelope)) => envelope,
+                        Woke::Received(Ok(envelope)) => envelope,
                     }
                 }
             };
@@ -472,8 +506,8 @@ impl Subscriber {
     /// `audience`, when `Some`, is the snapshot the engine itself resolved
     /// at the moment of a change that takes the name out of the privacy
     /// records (a domain's rename, under its old name, and its removal;
-    /// Section J (k), ruled 2026-09-27, and ruling K2 for the engram events
-    /// under that name). A frame with none of its own is checked against the
+    /// ruled 2026-09-27; the engram events under that name carry it too,
+    /// since a path leaks the name as surely as the domain event does). A frame with none of its own is checked against the
     /// capture the bus holds for its domain right now, since it may have sat
     /// in the channel from before the capture began. A captured audience is
     /// checked directly, against this session's own identity, and neither
@@ -517,11 +551,33 @@ impl Subscriber {
         if admitted { Seen::Yes } else { Seen::No }
     }
 
+    /// The idle re-check: whether the account behind the stream still holds
+    /// it. `false` ends the stream. A changed role marks the cache stale, so
+    /// the next event re-resolves what it may see; a store that cannot
+    /// answer is asked again at the next tick.
+    async fn recheck(&mut self) -> bool {
+        let refreshed = self.refresh_identity().await;
+        self.checked_at = Instant::now();
+        match refreshed {
+            Refreshed::Gone => false,
+            Refreshed::Same(scope) => {
+                if scope != self.scope {
+                    self.scope = scope;
+                    self.stale = true;
+                }
+                true
+            }
+            Refreshed::Unknown => true,
+        }
+    }
+
     /// Re-read who is listening, then what they may see. On success the
     /// scope and the hidden set are current and the cache is fresh; on
     /// failure the cache stays stale so the next event tries again.
     async fn refresh(&mut self) -> Refreshed {
-        let scope = match self.refresh_identity().await {
+        let refreshed = self.refresh_identity().await;
+        self.checked_at = Instant::now();
+        let scope = match refreshed {
             Refreshed::Same(scope) => scope,
             other => {
                 self.stale = true;
@@ -544,8 +600,11 @@ impl Subscriber {
         }
     }
 
-    /// Resolve the request's credentials again, the way the guard resolved
-    /// them when the stream opened. An account stream is `Gone` when they no
+    /// Resolve the request's credentials again, reading only (see
+    /// `auth::resolve_quiet`: a refresh writes nothing to the accounts
+    /// store, so many streams re-checking at once never queue behind its
+    /// writes or stamp their owners as just seen). An account stream is
+    /// `Gone` when they no
     /// longer resolve to that account (logged out, session revoked or
     /// expired, account deleted or disabled) and `Same` with a scope rebuilt
     /// from the stored role otherwise, so a demoted admin loses admin
@@ -555,13 +614,14 @@ impl Subscriber {
         let Some(account) = &self.account else {
             return Refreshed::Same(self.scope.clone());
         };
-        match super::auth::resolve(&self.state, &self.headers).await {
-            Ok(identity) => match &identity.user {
-                Some(user) if !user.disabled && user.name.trim().to_lowercase() == *account => {
-                    Refreshed::Same(identity.scope())
-                }
-                _ => Refreshed::Gone,
-            },
+        match super::auth::resolve_quiet(&self.state, &self.headers, account).await {
+            Ok(Some(user)) if user.name.trim().to_lowercase() == *account => {
+                Refreshed::Same(Scope::User {
+                    account: user.name,
+                    admin: user.role == crate::Role::Admin,
+                })
+            }
+            Ok(_) => Refreshed::Gone,
             Err(e) if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN => {
                 Refreshed::Gone
             }
@@ -741,7 +801,7 @@ mod tests {
         // Catches a check that honoured the captured audience on `domain`
         // events alone, or on live events alone: the bus stamps it on engram
         // events under a renamed or removed name and on the ring entries
-        // already held for it (ruling K2), and this session's cache (which
+        // already held for it, and this session's cache (which
         // hides nothing) would let the path through.
         let (_dir, state) = state().await;
         let bus = state.engine.changes();
@@ -766,7 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_frame_queued_before_a_capture_is_checked_against_the_capture() {
-        // Catches the delivery-time lookup dropped (ledger N2): an event
+        // Catches the delivery-time lookup dropped: an event
         // announced before the capture began sits in the channel with no
         // audience of its own, and the ring re-stamp cannot reach it.
         let (_dir, state) = state().await;
@@ -792,9 +852,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_cache_is_re_resolved_once_it_is_older_than_the_ttl() {
-        // Catches the age half of the refresh dropped (review I2): P14's
-        // "a revocation lands within ten seconds" and its converse rest on
-        // it. The engine hides nothing, so a re-resolution clears the stale
+        // Catches the age half of the refresh dropped: "a revocation lands
+        // within ten seconds" and its converse (a new member starts hearing)
+        // rest on it. The engine hides nothing, so a re-resolution clears the stale
         // `eng` from the cache, and a fresh cache is trusted as it is.
         let (_dir, state) = state().await;
         let bus = state.engine.changes();
@@ -810,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lag_marks_the_cache_stale() {
-        // Catches a lag that trusted the cache afterwards (review M2): the
+        // Catches a lag that trusted the cache afterwards: the
         // lost events may include a rename's captured frame, so the next
         // frame is checked against the records as they are now.
         let (_dir, state) = state().await;
@@ -836,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_account_whose_session_no_longer_resolves_ends_its_stream() {
-        // Catches the identity frozen at connect (review I1): the request
+        // Catches the identity frozen at connect: the request
         // carries no credential the store knows, so the refresh finds no
         // account behind it and the stream ends instead of writing.
         let (_dir, state) = state().await;

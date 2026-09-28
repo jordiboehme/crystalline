@@ -618,6 +618,44 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
     })
 }
 
+/// Who a held request's credentials name now, for an open event stream
+/// re-checking the account it was opened as, `account` (folded). The same
+/// credential [`resolve`] would pick, read without writing anything: no
+/// session prune, no `last_seen_at` stamp, no account provisioned, no
+/// identity link pruned. A stream asks this every few seconds for the life
+/// of a tab, and [`resolve`]'s writes would record each open tab as a fresh
+/// sighting and queue every stream behind the store's writes.
+///
+/// In a header mode the proxy asserts the same header on every request, and
+/// the held one never changes, so what can change is the account itself: it
+/// is read by name. With a session cookie the session is read, so a logout
+/// or a revocation shows. `Ok(None)` when nothing live answers: the session
+/// is gone or the account is gone or disabled.
+pub(crate) async fn resolve_quiet(
+    state: &RestState,
+    headers: &HeaderMap,
+    account: &str,
+) -> Result<Option<User>, ApiError> {
+    let trusted = state.auth_cfg.trusted_header.as_ref().is_some_and(|name| {
+        headers
+            .get(name)
+            .and_then(|raw| raw.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let proxied = state.auth_cfg.proxy_headers && forwarded_subject(headers)?.is_some();
+    if trusted || proxied {
+        return Ok(state
+            .auth
+            .user(account)
+            .await?
+            .filter(|user| !user.disabled));
+    }
+    match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+        Some(cookie) => Ok(state.auth.session_user_quiet(cookie.value()).await?),
+        None => Ok(None),
+    }
+}
+
 /// The CSRF token a header-mode identity's mutating requests must echo.
 ///
 /// The settlement gives a header identity a real session too: `/auth/me` mints
