@@ -35,6 +35,13 @@ export default defineConfig({
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(version),
   },
+  build: {
+    // The size check (scripts/bundle-budget.ts) reads the chunk graph from
+    // this manifest; a plain `pnpm build` skips it, since it lands in
+    // `dist/.vite/manifest.json` and would otherwise be served alongside the
+    // app the service crate embeds.
+    manifest: process.env.FLUID_BUNDLE_REPORT === "1",
+  },
   server: {
     // Same-origin in development too: the browser only ever talks to the Vite
     // server, which forwards /api to the real daemon. The API has no CORS
