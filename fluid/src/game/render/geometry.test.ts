@@ -2,18 +2,27 @@ import { describe, expect, it } from "vitest";
 
 import { boxKey } from "../world/box";
 import { BLINK_GROUPS } from "./blink";
-import { CANNED_BRIDGE, CANNED_HUB, heroHallRoom } from "../world/canned";
+import {
+  CANNED_BRIDGE,
+  CANNED_HUB,
+  galleryRoom,
+  heroHallRoom,
+} from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
 import { plainFinish } from "../world/finish";
 import { generateRoom } from "../world/generate";
 import { BAY, isFloor, wallRuns } from "../world/layout";
-import { edgeKey } from "../world/sites";
+import { HERO_FOOTING } from "../world/footprints";
+import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
+import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
+import { edgeKey, edgeOf } from "../world/sites";
 import type { PlaceInput, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
 import {
   ACCENT_MARK,
   ACCENT_STRIPE,
   FLAG,
+  UNDER_STRIPE,
   FLOATS_PER_VERTEX,
   LINTEL,
   WALL_PATTERN_LOOK,
@@ -26,9 +35,11 @@ import { DECAL_LIFT } from "./kit";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS, accentFor, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
+import { buildHeroMesh } from "./models/heroes";
 import { buildInteriorMesh } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
 import { COLUMN } from "./models/interior/console";
+import { buildPropMesh } from "./models/props";
 
 const EPS = 1e-4;
 
@@ -485,6 +496,27 @@ function stripeQuads(
   return out;
 }
 
+/**
+ * True when a prop or hero mesh, built at the origin against its wall
+ * (`z` 0, the room towards `-z`), has a face that looks into the room from
+ * between the wall and `DECAL_LIFT` and reaches into `ACCENT_STRIPE`'s
+ * band: the stripe, `DECAL_LIFT` off the wall, would be drawn over it.
+ */
+function underStripe(m: MeshData): boolean {
+  return triangles(m).some((t) => {
+    if (!t.every((v) => v.normal[2] < -1 + EPS)) return false;
+    const zs = t.map((v) => v.pos[2]);
+    if (Math.max(...zs) - Math.min(...zs) > EPS) return false;
+    const depth = -(zs[0] ?? 0);
+    if (depth < -EPS || depth > DECAL_LIFT + EPS) return false;
+    const ys = t.map((v) => v.pos[1]);
+    return (
+      Math.min(...ys) < ACCENT_STRIPE.h1 - EPS &&
+      Math.max(...ys) > ACCENT_STRIPE.h0 + EPS
+    );
+  });
+}
+
 describe("the accent stripe (2.7 C8, C9)", () => {
   it("runs the accent stripe on every full wall but fixture edges and the entrance (2.7 C9)", () => {
     // Mutation caught: a stripe on a door's edge, on the entrance, on a
@@ -525,6 +557,56 @@ describe("the accent stripe (2.7 C8, C9)", () => {
     );
     expect(accentFor(room, LOOKS.aperture)).toEqual(LOOKS.aperture.accents[3]);
   });
+
+  it("holds UNDER_STRIPE to exactly the wall props and wall heroes with a face under the stripe (2.7 C9)", () => {
+    // Mutation caught: the saucer poster dropped from `UNDER_STRIPE` (the
+    // stripe runs across its sheet and band again), or a kind listed that
+    // has no face under the stripe (the stripe skips a wall for nothing).
+    const props = new Set<string>();
+    for (const kind of PROP_KINDS) {
+      if (PROP_CATALOGUE[kind].anchor !== "wall") continue;
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
+        if (underStripe(buildPropMesh(kind, v, LOOKS.aperture)))
+          props.add(kind);
+    }
+    const heroes = new Set<string>();
+    for (const kind of HERO_KINDS) {
+      if (HERO_FOOTING[kind] === "free") continue;
+      for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++)
+        if (underStripe(buildHeroMesh(kind, v, LOOKS.aperture)))
+          heroes.add(kind);
+    }
+    expect(props).toEqual(new Set(UNDER_STRIPE.props));
+    expect(heroes).toEqual(new Set(UNDER_STRIPE.heroes));
+    expect(props.has("saucer-poster")).toBe(true);
+  }, 30_000);
+
+  it("draws no stripe on the saucer poster's edge (2.7 C9)", () => {
+    // Mutation caught: the stripe drawn on every free wall edge again,
+    // running across the poster's sheet and band in the gallery (which
+    // holds one, plain finish) and in the first reseeded bridge the
+    // generator gives one.
+    const reseeded = Array.from({ length: 100 }, (_, i) =>
+      generateRoom({ ...CANNED_BRIDGE, permalink: `bridge-${String(i)}` }),
+    ).find((r) => r.props.some((p) => p.kind === "saucer-poster"));
+    expect(reseeded).toBeDefined();
+    const rooms = [galleryRoom(), reseeded!];
+    let covered = 0;
+    for (const room of rooms) {
+      const edges = new Set(
+        room.props
+          .filter((p) => p.kind === "saucer-poster")
+          .map((p) => edgeKey(edgeOf(p))),
+      );
+      covered += edges.size;
+      const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+      expect(stripes.length).toBeGreaterThan(0);
+      // A single-edge wall prop lies inside its own edge, so a stripe on
+      // any other edge cannot overlap it.
+      for (const q of stripes) expect(edges.has(q.edge), q.edge).toBe(false);
+    }
+    expect(covered).toBe(rooms.length);
+  }, 30_000);
 });
 
 /**

@@ -46,7 +46,8 @@
  * the corridor's, so a bay or the corridor always reads as a space of its
  * own. Every other room's full wall quads also carry the accent stripe
  * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
- * fixture edges, the entrance edge and lintels. The models themselves are
+ * fixture edges, the entrance edge, lintels and the edges of the wall
+ * props and heroes that lie under it (`UNDER_STRIPE`, the saucer poster). The models themselves are
  * built by the recipes in `models/`, with the modelling kit of `kit.ts`,
  * and always keep `LAYER.panel` whatever the room's wall patterns. Last
  * come the room's decals (`buildDecals` in `models/decals.ts`, 2.7 C20,
@@ -54,9 +55,18 @@
  * wall, face or floor, still in the one static array.
  */
 
+import { heroEdges } from "../world/heroes";
 import { lampBoxes } from "../world/lamps";
 import { STEP, doorwayColumns, isFloor } from "../world/layout";
-import type { Box, Rect, RoomSpec, Side } from "../world/types";
+import { edgeKey, edgeOf } from "../world/sites";
+import type {
+  Box,
+  HeroKind,
+  PropKind,
+  Rect,
+  RoomSpec,
+  Side,
+} from "../world/types";
 import { CELL } from "../world/units";
 import { BLINK_GROUPS } from "./blink";
 import { DECAL_LIFT, createKit } from "./kit";
@@ -170,11 +180,28 @@ export function accentTint(k: number): Rgb {
 /**
  * The accent stripe (2.7 C9): a band 0.08 m tall, from `h0` to `h1`
  * metres, one `DECAL_LIFT` proud of every full wall quad of the hall, the
- * bays and the corridor, except fixture edges, the entrance edge and
- * lintels. It carries the accent mark, so it takes the room's accent in
+ * bays and the corridor, except fixture edges, the entrance edge, lintels
+ * and the edges `UNDER_STRIPE` covers. It carries the accent mark, so it takes the room's accent in
  * every look.
  */
 export const ACCENT_STRIPE = { h0: 1.2, h1: 1.28 } as const;
+
+/**
+ * The wall props and wall heroes whose model lies under the accent stripe:
+ * a face that looks into the room between the wall and `DECAL_LIFT`,
+ * inside `ACCENT_STRIPE`'s band (the saucer poster's sheet and band). The
+ * stripe skips the whole of every edge one of them hangs on, as it skips a
+ * fixture's edge, so it never runs across a poster (2.7 C9). The geometry
+ * test scans every wall prop and wall hero variant and holds these sets to
+ * exactly the kinds that have such a face.
+ */
+export const UNDER_STRIPE: {
+  props: ReadonlySet<PropKind>;
+  heroes: ReadonlySet<HeroKind>;
+} = {
+  props: new Set<PropKind>(["saucer-poster"]),
+  heroes: new Set<HeroKind>(),
+};
 
 /**
  * The three wall patterns (2.7 C11), by `RoomSpec.finish`'s pattern index:
@@ -594,6 +621,17 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
     room.fixtures.map((f) => `${f.slot.x},${f.slot.y},${f.slot.side}`),
   );
   const entranceEdge = `${room.entrance.x},${room.entrance.y},s`;
+  // The edges a wall prop or wall hero lying under the stripe hangs on
+  // (`UNDER_STRIPE`): the stripe skips them whole.
+  const coveredEdges = new Set([
+    ...room.props
+      .filter((p) => UNDER_STRIPE.props.has(p.kind))
+      .map((p) => edgeKey(edgeOf(p))),
+    ...room.heroes
+      .filter((h) => UNDER_STRIPE.heroes.has(h.kind))
+      .flatMap(heroEdges)
+      .map(edgeKey),
+  ]);
   // Wall slots that are ways through keep their wall clear of baseboards.
   const openings = new Set(
     room.fixtures
@@ -622,8 +660,9 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
         flag: FLAG.lit,
       };
       // The accent stripe (2.7 C9) runs on the cell's own wall layer in
-      // the room's accent, and skips every fixture's edge and the
-      // entrance's. A room with fittings draws none.
+      // the room's accent, and skips every fixture's edge, the entrance's
+      // and every edge under a poster (`coveredEdges`). A room with
+      // fittings draws none.
       const stripe: Surface = {
         layer: patternLook.layer,
         tint: accentTint(1),
@@ -636,7 +675,12 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
         if (!isFloor(room.grid, nx, ny)) {
           edgeQuad(b, x, y, side, 0, H, 0, wall, scale);
           const key = `${x},${y},${side}`;
-          if (!fitted && !fixtureEdges.has(key) && key !== entranceEdge)
+          if (
+            !fitted &&
+            !fixtureEdges.has(key) &&
+            !coveredEdges.has(key) &&
+            key !== entranceEdge
+          )
             edgeQuad(
               b,
               x,
