@@ -592,8 +592,6 @@ const HOODED = {
   plate: 0.015,
   /** How much the hood's front edge rises over its back. */
   rise: 0.05,
-  /** How far the cheeks reach out at the bezel's foot. */
-  foot: 0.05,
   /** The side monitor: along the wall, height, and its housing's depth. */
   side: {
     a: [-0.435, -0.32],
@@ -623,9 +621,10 @@ const HOODED = {
 /**
  * Terminal variant 2, the hooded twin: variant 0's desk, key deck and CRT
  * with a sun hood over the screen (a plate rising to the front and two
- * cheeks tapering down the bezel's sides; the plate's underside stays
- * above the sight line from the use point, so the whole screen stays in
- * view), a metal board flat on the wall behind both screens, a small side
+ * gussets under its sides that stop at the screen's top edge, so no side
+ * of the hood hides the start or end of a line from an angle; the plate's
+ * underside stays above the sight line from the use point, so the whole
+ * screen stays in view), a metal board flat on the wall behind both screens, a small side
  * monitor on an arm from the board to the screen's left showing a few
  * steady green bars (a signal light, no text) and an arm chair with solid
  * sides on floor runners, its seat and back in the room's accent.
@@ -638,9 +637,9 @@ function hoodedTwin(r: Recipe): void {
   crt(r);
 
   // The hood: a plate over the housing, rising to its front edge, and two
-  // cheeks down the bezel's sides.
-  const [s0, s1] = [SCREEN_BOTTOM, SCREEN_BOTTOM + SCREEN_H];
-  const [b0, b1] = [s0 - BEZEL, s1 + BEZEL];
+  // gussets under its sides, none lower than the screen's top edge.
+  const s1 = SCREEN_BOTTOM + SCREEN_H;
+  const b1 = s1 + BEZEL;
   const bw = SCREEN_W / 2 + BEZEL;
   const front = CRT_FRONT + H.reach;
   profileAlong(
@@ -664,8 +663,7 @@ function hoodedTwin(r: Recipe): void {
       kitAt,
       f,
       [
-        [CRT_FRONT, b0],
-        [CRT_FRONT + H.foot, b0],
+        [CRT_FRONT, s1],
         [front, b1 + H.rise],
         [CRT_FRONT, b1],
       ],
