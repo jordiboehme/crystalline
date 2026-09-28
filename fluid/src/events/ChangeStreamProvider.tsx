@@ -126,8 +126,8 @@ export function ChangeStreamProvider({
     const detach = (hub ?? defaultHub()).attach({
       onEvent,
       // The path the query client runs for a 401: the probe answers, and
-      // the login screen replaces the shell and this provider.
-      onSessionEnded: () => {
+      // the login screen or the right account replaces what the shell shows.
+      recheckIdentity: () => {
         void queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
       },
       heldIdentity: () => queryClient.getQueryData(ME_QUERY_KEY),

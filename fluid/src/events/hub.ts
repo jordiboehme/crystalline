@@ -23,6 +23,12 @@
  *   reopened source, or the source of a tab that took over from a closed
  *   leader, opens, every tab resets once: the pages refetch what they show.
  *
+ * - Every frame names the account the leader's stream was opened as. A tab
+ *   whose shell shows somebody else drops it and asks the probe which of
+ *   the two is stale: a stale tab re-asks who is signed in and resets, a
+ *   stale leader re-checks its session and reopens as the cookie's account,
+ *   with a reset. Another account is never taken as a session that ended.
+ *
  * A tab takes part while anything in it wants the stream: a mounted
  * provider or a `subscribe` listener. It leaves when the last one goes.
  */
@@ -63,9 +69,12 @@ export type ChangeListener = (event: ChangeEvent) => void;
 export interface ChangeConsumer {
   /** Every frame, in order, the resets included. */
   onEvent(event: ChangeEvent): void;
-  /** The session behind the stream has ended; re-ask who is signed in. */
-  onSessionEnded(): void;
-  /** The capability answer this tab holds, to compare the probe against. */
+  /**
+   * Re-ask who is signed in: the session behind the stream ended, or it
+   * names somebody other than the one this tab shows.
+   */
+  recheckIdentity(): void;
+  /** The capability answer this tab holds: who its shell says is signed in. */
   heldIdentity(): unknown;
 }
 
@@ -83,7 +92,16 @@ export interface HubDeps {
   random?: () => number;
 }
 
-type Message = { type: "frame"; event: ChangeEvent } | { type: "ended" };
+/**
+ * What the tabs say to each other. A frame names the account the leader's
+ * stream was opened as, so a tab signed in as somebody else never takes
+ * it; `recheck` asks the leader to find out whether it still streams as the
+ * right account.
+ */
+type Message =
+  | { type: "frame"; event: ChangeEvent; account: string | null }
+  | { type: "ended" }
+  | { type: "recheck" };
 
 /**
  * A message from another tab of this app. Its frames were read by
@@ -91,8 +109,17 @@ type Message = { type: "frame"; event: ChangeEvent } | { type: "ended" };
  */
 function readMessage(value: unknown): Message | null {
   const type = asObject(value)?.type;
-  return type === "frame" || type === "ended" ? (value as Message) : null;
+  return type === "frame" || type === "ended" || type === "recheck"
+    ? (value as Message)
+    : null;
 }
+
+/** What the capability probe said about the cookie this browser holds now. */
+type Probed =
+  { kind: "is"; identity: string } | { kind: "ended" } | { kind: "unknown" };
+
+/** How long a tab that found a mismatch waits before it looks again. */
+export const RECHECK_QUIET_MS = 2_000;
 
 /** Who a `/auth/me` answer names: an account, the anonymous viewer, or nobody. */
 function identityOf(value: unknown): string | null {
@@ -127,6 +154,12 @@ export class ChangeHub {
    * until a provider attaches again (the shell after a new sign-in).
    */
   private dormant = false;
+  /** While this tab leads: the account its stream was opened as. */
+  private account: string | null = null;
+  /** While this tab leads: re-check the session and reconnect if it moved. */
+  private leaderRecheck: (() => void) | null = null;
+  private checking = false;
+  private quietUntil = 0;
 
   constructor(deps: HubDeps = {}) {
     this.deps = deps;
@@ -213,13 +246,75 @@ export class ChangeHub {
     if (!message) return;
     if (message.type === "ended") {
       this.sessionEnded(false);
+    } else if (message.type === "recheck") {
+      this.leaderRecheck?.();
     } else {
-      this.deliver(message.event);
+      this.deliver(message.event, message.account);
     }
   }
 
-  /** Hand one frame to everything in this tab that listens. */
-  private deliver(event: ChangeEvent): void {
+  /** Who this tab's shell says is signed in; `undefined` with no shell. */
+  private ownIdentity(): string | null | undefined {
+    for (const consumer of this.consumers) {
+      const held = consumer.heldIdentity();
+      if (held !== undefined) return identityOf(held);
+    }
+    return undefined;
+  }
+
+  private probeIdentity(): Promise<Probed> {
+    const probe = this.deps.sessionProbe ?? (() => api<unknown>("/auth/me"));
+    return probe().then(
+      (answer): Probed => {
+        const identity = identityOf(answer);
+        return identity === null ? { kind: "ended" } : { kind: "is", identity };
+      },
+      (error: unknown): Probed =>
+        error instanceof ApiProblem && error.status === 401
+          ? { kind: "ended" }
+          : { kind: "unknown" },
+    );
+  }
+
+  /**
+   * A frame streamed as another account than this tab shows. One of the
+   * two is stale: the probe says which. A stale tab re-asks who is signed
+   * in and resets, since the frames it dropped are lost to it; a stale
+   * leader is asked to re-check its session and reconnect.
+   */
+  private mismatch(account: string | null): void {
+    if (this.checking || Date.now() < this.quietUntil) return;
+    this.checking = true;
+    void this.probeIdentity().then((probed) => {
+      this.checking = false;
+      this.quietUntil = Date.now() + RECHECK_QUIET_MS;
+      if (probed.kind === "unknown") return;
+      const now = probed.kind === "is" ? probed.identity : null;
+      if (now !== this.ownIdentity()) {
+        for (const consumer of [...this.consumers]) consumer.recheckIdentity();
+        this.fanOut({ event: "reset" });
+      }
+      if (now !== null && now !== account) {
+        if (this.leaderRecheck) this.leaderRecheck();
+        else this.channel?.postMessage({ type: "recheck" });
+      }
+    });
+  }
+
+  /**
+   * Hand one frame to everything in this tab that listens, unless it was
+   * streamed as somebody other than the account this tab shows.
+   */
+  private deliver(event: ChangeEvent, account: string | null): void {
+    const own = this.ownIdentity();
+    if (own !== undefined && account !== null && own !== account) {
+      this.mismatch(account);
+      return;
+    }
+    this.fanOut(event);
+  }
+
+  private fanOut(event: ChangeEvent): void {
     for (const listener of [...this.listeners]) {
       // One listener's bug must not cost the page its own refresh, nor the
       // listeners after it their frame.
@@ -236,8 +331,9 @@ export class ChangeHub {
 
   /** A frame this tab read off its own source: here and in every other tab. */
   private broadcast(event: ChangeEvent): void {
-    this.channel?.postMessage({ type: "frame", event });
-    this.deliver(event);
+    const account = this.account;
+    this.channel?.postMessage({ type: "frame", event, account });
+    this.deliver(event, account);
   }
 
   private sessionEnded(announce: boolean): void {
@@ -247,7 +343,7 @@ export class ChangeHub {
     this.dormant = true;
     this.stop();
     for (const consumer of [...this.consumers]) {
-      consumer.onSessionEnded();
+      consumer.recheckIdentity();
     }
   }
 
@@ -262,26 +358,39 @@ export class ChangeHub {
       // stub) leads inert rather than throwing.
       return () => undefined;
     }
-    const probe = this.deps.sessionProbe ?? (() => api<unknown>("/auth/me"));
     let ended = false;
     let attempt = 0;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let detach: (() => void) | null = null;
-
-    const checkSession = async (): Promise<"valid" | "ended" | "unknown"> => {
-      try {
-        const now = identityOf(await probe());
-        if (now === null) return "ended";
-        for (const consumer of this.consumers) {
-          const held = consumer.heldIdentity();
-          if (held !== undefined && identityOf(held) !== now) return "ended";
+    // The account the stream opens as is the one this tab shows; a tab with
+    // no shell asks.
+    this.account = this.ownIdentity() ?? null;
+    if (this.consumers.size === 0) {
+      void this.probeIdentity().then((probed) => {
+        if (!ended && this.account === null && probed.kind === "is") {
+          this.account = probed.identity;
         }
-        return "valid";
-      } catch (error) {
-        return error instanceof ApiProblem && error.status === 401
-          ? "ended"
-          : "unknown";
+      });
+    }
+
+    /**
+     * Whether the session still stands, and as whom. Another account than
+     * the stream was opened as is never an ended session: the cookie now
+     * holds a live one, so the stream reconnects as it.
+     */
+    const checkSession = async (): Promise<
+      "valid" | "changed" | "ended" | "unknown"
+    > => {
+      const probed = await this.probeIdentity();
+      if (probed.kind !== "is") return probed.kind;
+      const was = this.account;
+      this.account = probed.identity;
+      // Learning the account of a stream nobody could name is no change.
+      if (was === null || was === probed.identity) return "valid";
+      if (this.ownIdentity() !== probed.identity) {
+        for (const consumer of [...this.consumers]) consumer.recheckIdentity();
       }
+      return "changed";
     };
 
     const scheduleRetry = (step: () => void) => {
@@ -298,7 +407,7 @@ export class ChangeHub {
         if (ended) return;
         if (state === "ended") {
           this.sessionEnded(true);
-        } else if (state === "valid") {
+        } else if (state === "valid" || state === "changed") {
           scheduleRetry(() => {
             connect(true);
           });
@@ -349,9 +458,29 @@ export class ChangeHub {
       };
     };
 
+    // Another tab saw frames streamed as an account its shell does not
+    // show and found this tab the stale one: if the session moved, the
+    // stream reopens as it, with a reset.
+    this.leaderRecheck = () => {
+      void checkSession().then((state) => {
+        if (ended) return;
+        if (state === "ended") {
+          this.sessionEnded(true);
+        } else if (state === "changed") {
+          detach?.();
+          detach = null;
+          if (retry) clearTimeout(retry);
+          retry = null;
+          connect(true);
+        }
+      });
+    };
+
     connect(handover);
     return () => {
       ended = true;
+      this.account = null;
+      this.leaderRecheck = null;
       if (retry) clearTimeout(retry);
       detach?.();
       detach = null;

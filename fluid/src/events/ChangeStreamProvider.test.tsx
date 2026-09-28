@@ -352,14 +352,32 @@ describe("the change stream in one tab", () => {
     expect(probe).toHaveBeenCalledTimes(1);
   });
 
-  it("a probe that names nobody, or somebody else, is a session that ended", async () => {
-    // The probe answers 200 with no identity for an ended cookie session,
-    // and as the anonymous viewer where an instance allows one.
+  it("a probe that names nobody is a session that ended", async () => {
+    // The probe answers 200 with no identity for an ended cookie session.
+    client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
+    await mount(
+      client,
+      <div />,
+      lone({
+        sessionProbe: () => Promise.resolve({ user: null, anonymous: false }),
+      }),
+    );
+    act(() => {
+      theSource().fail(2);
+    });
+    await settle();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+    await advance(60_000);
+    expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it("a probe that names another account is no ended session: the tab re-asks who is signed in and the stream reopens as that account", async () => {
+    // Catches a switched account read as a logout, which left every tab
+    // without live refresh until a reload.
     client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
     for (const answer of [
-      { user: null, anonymous: false },
-      { user: null, anonymous: true },
       { user: { name: "bob" }, anonymous: false },
+      { user: null, anonymous: true },
     ]) {
       cleanup();
       invalidate.mockClear();
@@ -376,8 +394,8 @@ describe("the change stream in one tab", () => {
       expect(invalidate, JSON.stringify(answer)).toHaveBeenCalledWith({
         queryKey: ME_QUERY_KEY,
       });
-      await advance(60_000);
-      expect(FakeEventSource.instances, JSON.stringify(answer)).toHaveLength(1);
+      await advance(1_000);
+      expect(FakeEventSource.instances, JSON.stringify(answer)).toHaveLength(2);
     }
   });
 
@@ -752,6 +770,158 @@ describe("one stream per browser", () => {
     await mount(recordingClient().client, <div />, secondHub);
     expect(FakeEventSource.instances, "back after a sign-in").toHaveLength(2);
     leave();
+  });
+
+  describe("when the tabs disagree about who is signed in", () => {
+    const me = (name: string) => ({ user: { name } });
+
+    /** Two tabs of one browser whose cookie now belongs to `cookie`. */
+    async function twoTabs(leaderShows: string, followerShows: string) {
+      const fake = browser();
+      let cookie = "bob";
+      const probe: SessionProbe = () => Promise.resolve(me(cookie));
+      const leader = recordingClient();
+      const follower = recordingClient();
+      leader.client.setQueryData(ME_QUERY_KEY, me(leaderShows));
+      follower.client.setQueryData(ME_QUERY_KEY, me(followerShows));
+      const leaderHub = fake.tab({ sessionProbe: probe });
+      const followerHub = fake.tab({ sessionProbe: probe });
+      const leaderView = await mount(leader.client, <div />, leaderHub);
+      const heard: string[] = [];
+      const leave = followerHub.subscribe((event) => heard.push(event.event));
+      const followerView = await mount(follower.client, <div />, followerHub);
+      return {
+        fake,
+        leader,
+        follower,
+        leaderHub,
+        followerHub,
+        leaderView,
+        followerView,
+        heard,
+        leave,
+        setCookie: (name: string) => {
+          cookie = name;
+        },
+      };
+    }
+
+    /** Emit one frame on `source` and let every tab's window flush. */
+    async function frameOn(source: FakeEventSource, permalink: string) {
+      act(() => {
+        source.emit("engram", engram(permalink), "9:1");
+      });
+      await settle();
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      await settle();
+    }
+
+    it("a leader whose shell is stale reconnects as the cookie's account and the other tab keeps its live refresh", async () => {
+      // The reviewer's case: the leader shows ada, the follower bob, the
+      // cookie is bob's, and the leader's source closes during a restart.
+      const tabs = await twoTabs("ada", "bob");
+      act(() => {
+        theSource().fail(2);
+      });
+      await settle();
+      expect(
+        tabs.leader.invalidate,
+        "the stale tab re-asks who is signed in",
+      ).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+      expect(
+        tabs.follower.invalidate,
+        "the follower's session did not end",
+      ).not.toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+      await advance(1_000);
+      expect(FakeEventSource.instances, "reopened as bob").toHaveLength(2);
+      act(() => {
+        sourceAt(1).open();
+      });
+      await settle();
+      expect(tabs.follower.resets(), "bob's tab resets once").toBe(1);
+      expect(
+        tabs.leader.resets(),
+        "the stale tab dropped the reset streamed as bob, and resets on its own",
+      ).toBe(1);
+      tabs.follower.invalidate.mockClear();
+      await frameOn(sourceAt(1), "alpha");
+      expect(tabs.follower.keys()).toContain(
+        JSON.stringify(["engram", "eng", "alpha"]),
+      );
+      expect(tabs.heard).toEqual(["reset", "engram"]);
+      tabs.leave();
+    });
+
+    it("a frame streamed as ada never reaches bob's tab, and bob's tab gets the leader to reconnect as bob", async () => {
+      const tabs = await twoTabs("ada", "bob");
+      await frameOn(theSource(), "alpha");
+      expect(tabs.follower.keys(), "no query of bob's tab").not.toContain(
+        JSON.stringify(["engram", "eng", "alpha"]),
+      );
+      expect(tabs.heard, "no listener of bob's tab").toEqual([]);
+      expect(tabs.leader.keys(), "ada's own tab still takes it").toContain(
+        JSON.stringify(["engram", "eng", "alpha"]),
+      );
+      // Bob's tab asked the probe, found the leader stale and asked it to
+      // re-check; the leader found bob and reopened.
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(theSource().readyState).toBe(2);
+      act(() => {
+        sourceAt(1).open();
+      });
+      await settle();
+      expect(tabs.follower.resets()).toBe(1);
+      tabs.follower.invalidate.mockClear();
+      await frameOn(sourceAt(1), "beta");
+      expect(tabs.follower.keys()).toContain(
+        JSON.stringify(["engram", "eng", "beta"]),
+      );
+      expect(tabs.heard).toEqual(["reset", "engram"]);
+      tabs.leave();
+    });
+
+    it("a logout and a new sign-in in another tab: the old account's frames stop at that tab until the leader follows", async () => {
+      const tabs = await twoTabs("ada", "ada");
+      tabs.setCookie("ada");
+      await frameOn(theSource(), "alpha");
+      expect(tabs.follower.keys()).toContain(
+        JSON.stringify(["engram", "eng", "alpha"]),
+      );
+      // In the follower's tab, ada logs out: its shell goes. Bob signs in
+      // there, and the shell comes back showing bob.
+      tabs.followerView.unmount();
+      tabs.leave();
+      tabs.setCookie("bob");
+      const bob = recordingClient();
+      bob.client.setQueryData(ME_QUERY_KEY, me("bob"));
+      const heard: string[] = [];
+      const leave = tabs.followerHub.subscribe((event) =>
+        heard.push(event.event),
+      );
+      await mount(bob.client, <div />, tabs.followerHub);
+      expect(FakeEventSource.instances, "still the one stream").toHaveLength(1);
+      await frameOn(theSource(), "gamma");
+      expect(bob.keys()).not.toContain(
+        JSON.stringify(["engram", "eng", "gamma"]),
+      );
+      expect(heard).toEqual([]);
+      expect(
+        FakeEventSource.instances,
+        "the leader reopened as bob",
+      ).toHaveLength(2);
+      act(() => {
+        sourceAt(1).open();
+      });
+      await settle();
+      expect(bob.resets()).toBe(1);
+      bob.invalidate.mockClear();
+      await frameOn(sourceAt(1), "delta");
+      expect(bob.keys()).toContain(JSON.stringify(["engram", "eng", "delta"]));
+      expect(heard).toEqual(["reset", "engram"]);
+      leave();
+    });
   });
 
   it("unmounting every tab lets go of the lock, the channels and the source", async () => {
