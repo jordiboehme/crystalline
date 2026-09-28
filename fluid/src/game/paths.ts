@@ -12,9 +12,9 @@
  * first. The F key's "open this in Fluid" and the arrival after a reload both
  * rest on that.
  *
- * A domain's bridge, its MANIFEST room, has the address `bridgeAddress`
- * names: the domain and the permalink `MANIFEST_PERMALINK`. The level
- * cheat's jump goes there.
+ * A domain's bridge, the room built from its MANIFEST, has the station
+ * address `bridgeAddress` names and the domain's own route under the
+ * prefix. The level cheat's jump and the console room's exit go there.
  *
  * `StationAddress` (M3 C1) widens this to every place the game can put a
  * player: the airlock and a deck have neither, so `PlaceAddress` alone
@@ -129,11 +129,12 @@ export function placeKeyOf(domain: string, permalink: string): string {
 export const MANIFEST_PERMALINK = "manifest";
 
 /**
- * The address of a domain's bridge, its MANIFEST room: where the level
- * cheat's jump goes (`Session.jump`).
+ * The station address of a domain's bridge (M3 C3), whose game route is
+ * the domain's own, `/π/d/<domain>`: where the level cheat's jump
+ * (`Session.jump`) and the console room's exit go.
  */
-export function bridgeAddress(domain: string): PlaceAddress {
-  return { domain, permalink: MANIFEST_PERMALINK };
+export function bridgeAddress(domain: string): StationAddress {
+  return { kind: "bridge", domain };
 }
 
 /**

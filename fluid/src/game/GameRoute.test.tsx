@@ -6,9 +6,10 @@
  * turns a device away before it draws a canvas. Then the probe is told
  * WebGL2 is there, and the context and the renderer are stubbed at their
  * modules, so the session's default factory runs without a GPU: the route
- * loads the place in its URL, loads the next one when the URL changes
- * under it (history included, also while a load is still in flight), and
- * stops asking the server anything once it is unmounted.
+ * loads the station address in its URL (the airlock, a bridge, a deck or
+ * an engram), loads the next one when the URL changes under it (history
+ * included, also while a load is still in flight), and stops asking the
+ * server anything once it is unmounted.
  */
 
 import {
@@ -76,7 +77,22 @@ const made = vi.hoisted(() => ({
   sessions: [] as { disposed: boolean }[],
   /** The options every session was created with, as the route passed them. */
   options: [] as SessionOptions[],
+  /** The reader's "open in Fluid" handler the route last handed its view. */
+  openFluid: null as (() => void) | null,
 }));
+
+// The real view, with the reader's F handler kept, so a test can press it
+// without walking up to a terminal.
+vi.mock("./ui/StationView", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ui/StationView")>();
+  return {
+    ...actual,
+    StationView: (props: Parameters<typeof actual.StationView>[0]) => {
+      made.openFluid = props.onOpenFluid;
+      return actual.StationView(props);
+    },
+  };
+});
 
 vi.mock("./render/renderer", () => ({
   createRenderer: () => {
@@ -197,12 +213,12 @@ function NavProbe({
   return null;
 }
 
-/** Records the router's pathname each time it changes. */
+/** Records the router's pathname and search each time they change. */
 function LocationProbe() {
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
   useEffect(() => {
-    location = pathname;
-  }, [pathname]);
+    location = pathname + search;
+  }, [pathname, search]);
   return null;
 }
 
@@ -233,13 +249,44 @@ function go(to: string | number) {
   });
 }
 
-/** The permalink of the room the renderer was last handed. */
-function lastRoom(): string | undefined {
+/** The room the renderer was last handed. */
+function lastRoomSpec(): { permalink: string; title: string } | undefined {
   const renderer = made.renderers.at(-1);
   const call = renderer?.setRoom.mock.calls.at(-1) as
-    [{ permalink: string }, unknown] | undefined;
-  return call?.[0].permalink;
+    [{ permalink: string; title: string }, unknown] | undefined;
+  return call?.[0];
 }
+
+/** The permalink of the room the renderer was last handed. */
+function lastRoom(): string | undefined {
+  return lastRoomSpec()?.permalink;
+}
+
+/** How many rooms the newest renderer was handed. */
+const roomsEntered = () => made.renderers.at(-1)?.setRoom.mock.calls.length;
+
+/** A tree level in the engine's own wire shape. */
+function treeResponse(path: string, permalinks: string[]) {
+  return {
+    domain: "eng",
+    path,
+    folders: path === "" ? ["notes"] : [],
+    engrams: permalinks.map((permalink) => ({
+      permalink,
+      title: permalink,
+      type: "engram",
+      status: "stable",
+    })),
+    truncated: false,
+    total: permalinks.length,
+  };
+}
+
+/** The tree of `eng`: its MANIFEST at the root, two engrams in `notes`. */
+const TREE: Answer = (path) =>
+  path.includes("path=notes")
+    ? treeResponse("notes", ["notes/one", "notes/two"])
+    : treeResponse("", ["manifest"]);
 
 /** A promise and the function that settles it. */
 function deferred<T>() {
@@ -272,6 +319,7 @@ beforeEach(() => {
   made.navigations.length = 0;
   made.sessions.length = 0;
   made.options.length = 0;
+  made.openFluid = null;
   gl.available = false;
   // jsdom has no `matchMedia`; the device check and the session's
   // pixel-ratio watch both ask it. A fine pointer and no coarse one: a
@@ -539,6 +587,7 @@ describe("GameRoute", () => {
     gl.available = true;
     window.localStorage.clear();
     serve({
+      "/domains/eng/tree": TREE,
       "/domains/eng/engrams/manifest": () => detailResponse("manifest", "eng"),
       "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
     });
@@ -564,10 +613,10 @@ describe("GameRoute", () => {
       expect(lastRoom()).toBe("manifest");
     });
     await settle(500);
-    expect(location).toBe("/%CF%80/d/eng/e/manifest");
+    expect(location).toBe("/%CF%80/d/eng");
     expect(made.navigations).toEqual([
       "/%CF%80/d/eng/e/alpha",
-      "/%CF%80/d/eng/e/manifest",
+      "/%CF%80/d/eng",
     ]);
     expect(
       asked().filter((p) => p === "/domains/eng/engrams/manifest"),
@@ -621,6 +670,91 @@ describe("GameRoute", () => {
     view.unmount();
   });
 
+  it("follows a location to another address, never to the one the session just entered (M3 C4, C5)", async () => {
+    // Mutation caught: the address the URL follows compared by its domain
+    // alone (the bridge, in the deck's own domain, would never be gone
+    // to), or not compared at all (the session's own replace would start
+    // a second journey to the deck it just entered).
+    gl.available = true;
+    serve({
+      "/domains/eng/tree": TREE,
+      "/domains/eng/engrams/manifest": () => detailResponse("manifest", "Eng"),
+      "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
+    });
+    // `section=1` is the first section spelt out: the session lands there
+    // and replaces the URL with the deck's own spelling, which leaves the
+    // section out, so the location changes under the route.
+    const view = renderAt("/%CF%80/d/eng?path=notes&section=1");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("notes/");
+    });
+    await settle(500);
+    // The route took the replaced URL for the address it had just entered.
+    expect(made.navigations).toEqual(["/%CF%80/d/eng?path=notes"]);
+    expect(location).toBe("/%CF%80/d/eng?path=notes");
+    expect(roomsEntered()).toBe(1);
+
+    go("/%CF%80/d/eng");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("manifest");
+    });
+    await settle(500);
+    expect(roomsEntered()).toBe(2);
+
+    go(-1);
+    await waitFor(() => {
+      expect(lastRoom()).toBe("notes/");
+    });
+    await settle(500);
+    expect(roomsEntered()).toBe(3);
+    expect(location).toBe("/%CF%80/d/eng?path=notes");
+    view.unmount();
+  });
+
+  it("starts in the airlock at /π and opens Fluid's front page on F there (M3 C25)", async () => {
+    // Mutation caught: the route still only matching an engram's path (the
+    // airlock would render Fluid's not-found page), or F reading an engram
+    // route off an address that has none.
+    gl.available = true;
+    serve();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const view = renderAt("/%CF%80");
+    await waitFor(() => {
+      expect(lastRoomSpec()?.title).toBe("AIRLOCK");
+    });
+    await settle(300);
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyF" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyF" }));
+      await new Promise((r) => setTimeout(r, 150));
+    });
+    expect(open).toHaveBeenCalledWith("/", "_blank", "noopener");
+    view.unmount();
+  });
+
+  it("opens a deck's folder page from the reader's F (M3 C25)", async () => {
+    // Mutation caught: the reader's F still building an engram route,
+    // which a deck has no permalink for.
+    gl.available = true;
+    serve({ "/domains/eng/tree": TREE });
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const view = renderAt("/%CF%80/d/eng?path=notes");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("notes/");
+    });
+    await settle(300);
+    expect(made.openFluid).not.toBeNull();
+    act(() => {
+      made.openFluid?.();
+    });
+    expect(open).toHaveBeenCalledWith(
+      "/d/eng?path=notes",
+      "_blank",
+      "noopener",
+    );
+    view.unmount();
+  });
+
   it.each(["/%CF%80/dev", "/%CF%80/dev/gallery"])(
     "ignores the word on %s",
     async (path) => {
@@ -628,6 +762,10 @@ describe("GameRoute", () => {
       window.localStorage.clear();
       serve();
       const view = renderAt(path);
+      // The dev screen is a lazy chunk: wait for its session, not a guess.
+      await waitFor(() => {
+        expect(made.sessions.length).toBeGreaterThan(0);
+      });
       await settle(300);
       await typeWord("idclev");
       await settle(200);

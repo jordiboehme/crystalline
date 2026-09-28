@@ -38,8 +38,9 @@
  * `?at=<kind>:<n>` still puts the player in front of the n-th fixture of
  * that kind, facing it, instead of the room's own entrance, to judge a
  * malfunctioning fixture without walking across the hall. `?fault=missing`
- * or `?fault=denied` answers
- * every travel with that failure instead of `SIGNAL LOST`, so every open
+ * or `?fault=denied` answers every travel with that failure (the session's
+ * loader seam, which answers what `loadStation` would) instead of
+ * `SIGNAL LOST`, so every open
  * door, portal and hatch in the gallery malfunctions once the player walks
  * into or crawls through it, and stays broken for the rest of the visit.
  * The sealed sliding door (`door:4`) and the sealed portal (`portal:2`)

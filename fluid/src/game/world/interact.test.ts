@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { stationOfPlace } from "../paths";
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
 import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
@@ -32,7 +33,7 @@ import {
   type DoorState,
 } from "./interact";
 import { PLAYER_RADIUS, blockersFor, type Player } from "./move";
-import type { Fixture, RoomSpec, WallSlot } from "./types";
+import type { Fixture, RoomSpec, StationAddress, WallSlot } from "./types";
 import { CELL } from "./units";
 
 const bridge = generateRoom(CANNED_BRIDGE);
@@ -336,7 +337,11 @@ describe("arrivalSpawn", () => {
     expect(Math.sin(got.yaw)).toBeCloseTo(Math.sin(want.yaw));
   }
 
-  const handbook = { domain: "station", permalink: "crew-handbook" };
+  const handbook: StationAddress = {
+    kind: "engram",
+    domain: "station",
+    permalink: "crew-handbook",
+  };
 
   it("puts a player who came through a door in front of the hatch back", () => {
     expectAt(
@@ -360,14 +365,18 @@ describe("arrivalSpawn", () => {
     expectAt(
       arrivalSpawn(bridge, {
         via: "hatch",
-        from: { domain: "station", permalink: "old-bridge" },
+        from: { kind: "engram", domain: "station", permalink: "old-bridge" },
       }),
       before(slidingIndex),
     );
     expectAt(
       arrivalSpawn(bridge, {
         via: "hatch",
-        from: { domain: "logistics", permalink: "cargo-manifest" },
+        from: {
+          kind: "engram",
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
       }),
       before(portalIndex),
     );
@@ -377,13 +386,59 @@ describe("arrivalSpawn", () => {
     expectAt(
       arrivalSpawn(bridge, {
         via: "door",
-        from: { domain: "station", permalink: "nowhere" },
+        from: { kind: "engram", domain: "station", permalink: "nowhere" },
       }),
       entrance,
     );
     // A hatch never leads back to a hatch.
     expectAt(arrivalSpawn(bridge, { via: "hatch", from: handbook }), entrance);
     expectAt(arrivalSpawn(bridge, null), entrance);
+  });
+
+  it("puts a player who came from a deck through a door at the entrance: no hatch leads to a deck (M3 C1)", () => {
+    // Mutation caught: a deck address compared as an engram (by its domain,
+    // or with its folder read as a permalink), which would stand the player
+    // in front of the hatch to a place in the deck's domain. The engram
+    // case beside it pins that a hatch back is still found.
+    const deck: StationAddress = {
+      kind: "deck",
+      domain: "station",
+      folder: "",
+      section: 0,
+    };
+    expectAt(arrivalSpawn(bridge, { via: "door", from: deck }), entrance);
+    expectAt(
+      arrivalSpawn(bridge, { via: "door", from: handbook }),
+      before(hatchIndex),
+    );
+  });
+
+  it("puts a player who came from a bridge in front of the hatch back to its MANIFEST (M3 C3)", () => {
+    // Mutation caught: only an engram `from` matched, so a walk from a
+    // bridge (whose hatch back names the MANIFEST engram, the bridge's own
+    // place) lands at the entrance instead of in front of the way back.
+    const back: RoomSpec = {
+      ...bridge,
+      fixtures: bridge.fixtures.map((f) =>
+        f.kind === "hatch"
+          ? { ...f, address: { domain: "station", permalink: "manifest" } }
+          : f,
+      ),
+    };
+    expectAt(
+      arrivalSpawn(back, {
+        via: "door",
+        from: { kind: "bridge", domain: "station" },
+      }),
+      before(hatchIndex),
+    );
+    expectAt(
+      arrivalSpawn(back, {
+        via: "door",
+        from: { kind: "bridge", domain: "logistics" },
+      }),
+      entrance,
+    );
   });
 });
 
@@ -468,7 +523,10 @@ describe("arrivals land on clear floor", () => {
         }
         if (f.address === null) continue;
         const via = f.kind === "hatch" ? "door" : "hatch";
-        const spot = arrivalSpawn(room, { via, from: f.address });
+        const spot = arrivalSpawn(room, {
+          via,
+          from: stationOfPlace(f.address),
+        });
         expect(
           isFloor(
             room.grid,

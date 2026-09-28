@@ -18,8 +18,9 @@ import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
 import { TICK_MS, type Clock } from "./core/loop";
-import { prefetchPlace, type LoadedPlace } from "./data/source";
-import { gameEngramRoute } from "./paths";
+import { prefetchPlace } from "./data/source";
+import type { LoadedStation } from "./data/station";
+import { addressOfGameLocation, domainOf, stationOfPlace } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
@@ -33,15 +34,26 @@ import {
   type Session,
   type SessionOptions,
 } from "./session";
-import { withArrivalBox } from "./world/arrival";
 import { boxFront, type DomainRow } from "./world/box";
-import { atConsoleExit } from "./world/consoleRoom";
-import { CANNED_BRIDGE, galleryRoom, heroHallRoom } from "./world/canned";
+import { airlockRoom } from "./world/airlock";
+import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
+import {
+  CANNED_BRIDGE,
+  CANNED_BRIDGE_DATA,
+  CANNED_DECK,
+  CANNED_DOMAINS,
+  CANNED_HANGAR,
+  galleryRoom,
+  heroHallRoom,
+} from "./world/canned";
+import { generateDeck, type DeckRow } from "./world/deck";
 import { NOT_FOUND, generateRoom } from "./world/generate";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
-import type { Fixture, RoomSpec } from "./world/types";
+import { withPadHeroes } from "./world/hangar";
+import { roomFor } from "./world/station";
+import type { Fixture, Hero, RoomSpec, StationAddress } from "./world/types";
 import { CELL } from "./world/units";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -296,16 +308,20 @@ afterEach(() => {
 });
 
 /**
- * The hero hall with the player at its first police box's front, and
- * that box's hero index.
+ * `room` (the hero hall unless given) shown at `at` (the hall's own
+ * address unless given) with the player at its first police box's front,
+ * and that box's hero index.
  *
  * `spotView`'s own front spot stands about 2.48 m out (`FRAME_BASE` plus
  * `FRAME_SCALE` times the box's 1.3 m footprint), farther than `REACH`
  * (2.2 m), so the box would never come into focus there. The spawn is
  * put `REACH - 0.4` m out along `boxFront`'s own frame instead.
  */
-function standAtBox(session: Session): number {
-  const room = heroHallRoom();
+function standAtBox(
+  session: Session,
+  room: RoomSpec = heroHallRoom(),
+  at: StationAddress = HALL_ADDRESS,
+): number {
   const index = room.heroes.findIndex((h) => h.kind === "police-box");
   if (index < 0) throw new Error("no police box in the hero hall");
   const front = boxFront(room.heroes[index]!);
@@ -317,10 +333,28 @@ function standAtBox(session: Session): number {
     y: wz / CELL - 0.5,
     yaw: Math.atan2(front.inward[0], front.inward[1]),
   };
-  session.showRoom({ ...room, spawn }, { pitch: 0 });
+  session.showRoom({ ...room, spawn }, { pitch: 0 }, at);
   frames(1);
   return index;
 }
+
+/** The hero hall's own address: the room the box tests stand a box in. */
+const HALL_ADDRESS: StationAddress = {
+  kind: "engram",
+  domain: heroHallRoom().domain,
+  permalink: heroHallRoom().permalink,
+};
+
+/** An engram's station address. */
+const engramAt = (domain: string, permalink: string): StationAddress => ({
+  kind: "engram",
+  domain,
+  permalink,
+});
+
+/** The domain of the address the session stands at, null for none. */
+const domainNow = (session: Session): string | null =>
+  session.current === null ? null : domainOf(session.current);
 
 /** The door fractions the last frame was drawn with. */
 const lastDoors = () =>
@@ -330,7 +364,7 @@ describe("go", () => {
   it("loads the place and navigates to its game route once", async () => {
     serve();
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     expect(hud.connector).toHaveBeenLastCalledWith(
       true,
       "alpha",
@@ -341,7 +375,7 @@ describe("go", () => {
     });
     expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/alpha");
     expect(roomsSet()).toEqual(["alpha"]);
-    expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
+    expect(session.current).toEqual(engramAt("eng", "alpha"));
     expect(hud.connector).toHaveBeenLastCalledWith(
       false,
       "alpha",
@@ -353,8 +387,8 @@ describe("go", () => {
     const alpha = deferred<unknown>();
     serve({ "/domains/eng/engrams/alpha": () => alpha.promise });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
-    session.go({ domain: "eng", permalink: "beta" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "beta" });
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(1);
     });
@@ -363,14 +397,14 @@ describe("go", () => {
     expect(navigate).toHaveBeenCalledTimes(1);
     expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/beta");
     expect(roomsSet()).toEqual(["beta"]);
-    expect(session.current).toEqual({ domain: "eng", permalink: "beta" });
+    expect(session.current).toEqual(engramAt("eng", "beta"));
   });
 
   it("drops a load that settles after dispose", async () => {
     const alpha = deferred<unknown>();
     serve({ "/domains/eng/engrams/alpha": () => alpha.promise });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     session.dispose();
     // Nothing reaches the HUD once the session is gone.
     for (const writer of Object.values(hud)) writer.mockClear();
@@ -387,7 +421,7 @@ describe("go", () => {
   it("takes the connector down when disposed while loading", () => {
     serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     session.dispose();
     expect(hud.connector).toHaveBeenLastCalledWith(
       false,
@@ -400,7 +434,7 @@ describe("go", () => {
   it("redraws the connector in the new look while loading", () => {
     serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
     key("keydown", "Digit4");
     frames(1);
@@ -431,11 +465,14 @@ describe("go", () => {
     // Back from beta through a hatch: the player arrives 1.6 m in front of
     // the door to beta, well inside the approach distance.
     session.go(
-      { domain: "eng", permalink: "alpha" },
-      { via: "hatch", from: { domain: "eng", permalink: "beta" } },
+      { kind: "engram", domain: "eng", permalink: "alpha" },
+      {
+        via: "hatch",
+        from: { kind: "engram", domain: "eng", permalink: "beta" },
+      },
     );
     await vi.waitFor(() => {
-      expect(session.current?.permalink).toBe("alpha");
+      expect(session.current).toEqual(engramAt("eng", "alpha"));
     });
     expect(prefetchMock).not.toHaveBeenCalled();
     frames(20);
@@ -450,15 +487,15 @@ describe("go", () => {
       },
     });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
-      expect(session.current?.permalink).toBe("alpha");
+      expect(session.current).toEqual(engramAt("eng", "alpha"));
     });
-    session.go({ domain: "eng", permalink: "beta" });
+    session.go({ kind: "engram", domain: "eng", permalink: "beta" });
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
     });
-    expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
+    expect(session.current).toEqual(engramAt("eng", "alpha"));
     expect(roomsSet()).toEqual(["alpha"]);
     expect(navigate).toHaveBeenCalledTimes(1);
   });
@@ -473,11 +510,11 @@ describe("go", () => {
       },
     });
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
     });
-    session.go({ domain: "eng", permalink: "beta" });
+    session.go({ kind: "engram", domain: "eng", permalink: "beta" });
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenCalledWith("SIGNAL LOST");
     });
@@ -489,16 +526,16 @@ describe("go", () => {
     serve();
     // Set with the raw character rather than its encoding: jsdom's own URL
     // parser normalizes it to `%CF%80` in `window.location.pathname` exactly
-    // as a real browser would, which is the fact `gameEngramRoute` is built
+    // as a real browser would, which is the fact `gameRouteOf` is built
     // to agree with (see `paths.ts`). If it built from the raw character
     // instead, this comparison in `session.ts` would never see the two
     // sides as equal, and `navigate` would fire below when it must not.
     window.history.replaceState(null, "", "/π/d/eng/e/alpha");
     expect(window.location.pathname).toBe("/%CF%80/d/eng/e/alpha");
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
-      expect(session.current?.permalink).toBe("alpha");
+      expect(session.current).toEqual(engramAt("eng", "alpha"));
     });
     expect(roomsSet()).toEqual(["alpha"]);
     expect(navigate).not.toHaveBeenCalled();
@@ -507,12 +544,9 @@ describe("go", () => {
   it("goes nowhere without a client and says the signal is lost", () => {
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
-    session.go({ domain: "station", permalink: "old-bridge" });
+    session.go({ kind: "engram", domain: "station", permalink: "old-bridge" });
     expect(hud.notice).toHaveBeenCalledWith("SIGNAL LOST");
-    expect(session.current).toEqual({
-      domain: "station",
-      permalink: "manifest",
-    });
+    expect(session.current).toEqual(engramAt("station", "manifest"));
     expect(apiMock).not.toHaveBeenCalled();
   });
 });
@@ -547,8 +581,11 @@ describe("a load in flight", () => {
     // Through a door from Beta: the player arrives in front of the hatch
     // back to Beta, facing into the room.
     session.go(
-      { domain: "eng", permalink: "alpha" },
-      { via: "door", from: { domain: "eng", permalink: "beta" } },
+      { kind: "engram", domain: "eng", permalink: "alpha" },
+      {
+        via: "door",
+        from: { kind: "engram", domain: "eng", permalink: "beta" },
+      },
     );
     frames(2);
     key("keydown", "Space");
@@ -556,7 +593,7 @@ describe("a load in flight", () => {
     frames(2);
     alpha.resolve(detailResponse("alpha", "Alpha"));
     await vi.waitFor(() => {
-      expect(session.current?.permalink).toBe("alpha");
+      expect(session.current).toEqual(engramAt("eng", "alpha"));
     });
     // Turn round to the hatch: a stale use would crawl back the moment it is
     // in front of the player.
@@ -591,7 +628,7 @@ describe("a load in flight", () => {
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     walkToScope();
-    session.go({ domain: "eng", permalink: "beta" });
+    session.go({ kind: "engram", domain: "eng", permalink: "beta" });
     frames(2);
     key("keydown", "Space");
     key("keyup", "Space");
@@ -603,7 +640,7 @@ describe("a load in flight", () => {
     // Still in front of the Scope terminal: the use pressed for the load's
     // room must not open the reader here.
     frames(5);
-    expect(session.current?.permalink).toBe("manifest");
+    expect(session.current).toEqual(engramAt("station", "manifest"));
     expect(hud.reader).not.toHaveBeenCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
     );
@@ -615,20 +652,20 @@ describe("a room the renderer refuses", () => {
   it("keeps the player in the old room and says ?LOAD ERROR", async () => {
     serve();
     const session = start();
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
-      expect(session.current?.permalink).toBe("alpha");
+      expect(session.current).toEqual(engramAt("eng", "alpha"));
     });
     frames(3);
     const before = eyeAt();
     renderer.setRoom.mockImplementation(() => {
       throw new Error("room needs 999 texture layers, the GPU holds 256");
     });
-    session.go({ domain: "eng", permalink: "beta" });
+    session.go({ kind: "engram", domain: "eng", permalink: "beta" });
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenCalledWith("?LOAD ERROR");
     });
-    expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
+    expect(session.current).toEqual(engramAt("eng", "alpha"));
     expect(navigate).toHaveBeenCalledTimes(1);
     expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng/e/alpha");
     // The player stands where they stood, in Alpha, and still walks there.
@@ -657,7 +694,7 @@ describe("a room the renderer refuses", () => {
     expect(hud.status).toHaveBeenLastCalledWith(
       expect.stringContaining("APERTURE"),
     );
-    expect(session.current?.permalink).toBe("manifest");
+    expect(session.current).toEqual(engramAt("station", "manifest"));
   });
 });
 
@@ -735,7 +772,7 @@ describe("the GPU context", () => {
     frames(2);
     expect(second.draw).toHaveBeenCalled();
     expect(first.draw).not.toHaveBeenCalled();
-    expect(session.current?.permalink).toBe("manifest");
+    expect(session.current).toEqual(engramAt("station", "manifest"));
   });
 });
 
@@ -745,7 +782,11 @@ describe("notices", () => {
     try {
       const session = start({ client: null });
       session.showCanned(CANNED_BRIDGE);
-      session.go({ domain: "station", permalink: "old-bridge" });
+      session.go({
+        kind: "engram",
+        domain: "station",
+        permalink: "old-bridge",
+      });
       expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
       vi.advanceTimersByTime(NOTICE_MS - 1);
       expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
@@ -769,7 +810,10 @@ describe("showRoom", () => {
     session.showRoom(built);
     expect(renderer.setRoom).toHaveBeenCalledTimes(1);
     expect(renderer.setRoom.mock.calls[0]?.[0]).toBe(built);
-    expect(session.current).toEqual({ domain: "dev", permalink: "gallery" });
+    // No address behind it (M3 C5), unless the caller names one.
+    expect(session.current).toBeNull();
+    session.showRoom(built, undefined, engramAt("dev", "gallery"));
+    expect(session.current).toEqual(engramAt("dev", "gallery"));
     frames(3);
     expect(lastCamera().eye[0]).toBeCloseTo((built.spawn.x + 0.5) * 2);
     expect(navigate).not.toHaveBeenCalled();
@@ -900,7 +944,7 @@ describe("the reader", () => {
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
     );
-    session.go({ domain: "station", permalink: "old-bridge" });
+    session.go({ kind: "engram", domain: "station", permalink: "old-bridge" });
     expect(hud.reader).toHaveBeenLastCalledWith(null);
 
     key("keydown", "Space");
@@ -1359,11 +1403,26 @@ describe("the level cheat", () => {
 
   it("jumps to a domain's bridge with an ordinary go and closes the select", async () => {
     serve({
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "",
+        folders: [],
+        engrams: [
+          {
+            permalink: "manifest",
+            title: "Eng",
+            type: "manifest",
+            status: "stable",
+          },
+        ],
+        truncated: false,
+        total: 1,
+      }),
       "/domains/eng/engrams/manifest": () => detailResponse("manifest", "Eng"),
       "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
     });
     const session = start({ onLevels: levels });
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(1);
     });
@@ -1383,8 +1442,8 @@ describe("the level cheat", () => {
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(2);
     });
-    expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng/e/manifest");
-    expect(session.current).toEqual({ domain: "eng", permalink: "manifest" });
+    expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/eng");
+    expect(session.current).toEqual({ kind: "bridge", domain: "eng" });
     expect(roomsSet()).toEqual(["alpha", "manifest"]);
     // The connector's closing call names the domain too, not just the
     // opening one.
@@ -1399,7 +1458,7 @@ describe("the level cheat", () => {
     const session = onBridge();
     type("idclev");
     frames(1);
-    session.go({ domain: "station", permalink: "old-bridge" });
+    session.go({ kind: "engram", domain: "station", permalink: "old-bridge" });
     expect(levels).toHaveBeenLastCalledWith(false);
 
     type("idclev");
@@ -1416,7 +1475,7 @@ describe("the level cheat", () => {
       },
     });
     const session = start({ onLevels: levels });
-    session.go({ domain: "eng", permalink: "alpha" });
+    session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     await vi.waitFor(() => {
       expect(hud.notice).toHaveBeenLastCalledWith(NOT_FOUND);
     });
@@ -1732,7 +1791,7 @@ describe("malfunctions", () => {
       if (door.kind !== "door" || door.address === null) {
         throw new Error("door 0 leads somewhere");
       }
-      session.go(door.address);
+      session.go(stationOfPlace(door.address));
       await flush();
       expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
       frames(60);
@@ -1755,7 +1814,11 @@ describe("malfunctions", () => {
       const session = start({
         client: null,
         load: () =>
-          Promise.resolve({ kind: "place" as const, place: CANNED_BRIDGE }),
+          Promise.resolve({
+            kind: "engram" as const,
+            place: CANNED_BRIDGE,
+            folder: "",
+          }),
       });
       session.showRoom(before(gallery, door0));
       const here = session.current;
@@ -1926,7 +1989,7 @@ describe("malfunctions", () => {
     });
     session.showRoom(before(gallery, door0));
     walkIn();
-    session.go({ domain: "dev", permalink: "elsewhere" });
+    session.go({ kind: "engram", domain: "dev", permalink: "elsewhere" });
     await flush();
     expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
     first.resolve({ kind: "missing" });
@@ -2003,12 +2066,25 @@ const row = (
  */
 const HALL = heroHallRoom().domain;
 
-/** Answers every place with the canned bridge moved to that address. */
-const okBridge: PlaceLoader = (a) =>
-  Promise.resolve({
-    kind: "place",
-    place: { ...CANNED_BRIDGE, domain: a.domain, permalink: a.permalink },
-  });
+/**
+ * Answers every address as `stationLoad` does: a bridge (every jump and
+ * every walk out of the console room goes to one) is the canned bridge
+ * moved to its domain, with the canned bridge data.
+ */
+const okBridge: PlaceLoader = (a, signal) => stationLoad(a, signal);
+
+/** The bridge room `okBridge` answers for `domain`, as `roomFor` builds it. */
+function bridgeRoomOf(domain: string): RoomSpec {
+  return roomFor(
+    {
+      kind: "bridge",
+      place: { ...CANNED_BRIDGE, domain, permalink: "manifest" },
+      bridge: { ...CANNED_BRIDGE_DATA, domain, display: domain },
+    },
+    null,
+    null,
+  ).room;
+}
 
 /**
  * A session with the console room switched on, its listing `rows` (a value
@@ -2062,7 +2138,7 @@ describe("the console room", () => {
     hud.connector.mockClear();
     walkIn();
     frames(1);
-    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+    expect(isConsole(lastRoom())).toBe(true);
     expect(hud.connector).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
     expect(session.current).toEqual(before);
@@ -2082,18 +2158,14 @@ describe("the console room", () => {
     backOut();
     expect(hud.connector).toHaveBeenCalledWith(true, "ops", expect.any(String));
     await vi.waitFor(() => {
-      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+      expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
     });
     const bridge = lastRoom();
-    const plain = generateRoom({
-      ...CANNED_BRIDGE,
-      domain: "ops",
-      permalink: "manifest",
-    });
+    const plain = bridgeRoomOf("ops");
     expect(bridge?.heroes.filter((h) => h.kind === "police-box").length).toBe(
       plain.heroes.filter((h) => h.kind === "police-box").length + 1,
     );
-    expect(session.current).toEqual({ domain: "ops", permalink: "manifest" });
+    expect(session.current).toEqual({ kind: "bridge", domain: "ops" });
   });
 
   it("a failed exit leaves the player inside and fires again only after the doorway is left (Review Focus 2)", async () => {
@@ -2116,7 +2188,7 @@ describe("the console room", () => {
     await flush();
     expect(calls).toBe(1);
     expect(hud.notice).toHaveBeenCalledWith(NOT_FOUND);
-    expect(lastRoom()?.interior).toBeDefined();
+    expect(isConsole(lastRoom())).toBe(true);
     key("keydown", "ArrowUp");
     frames(20);
     key("keyup", "ArrowUp");
@@ -2125,32 +2197,38 @@ describe("the console room", () => {
       expect(calls).toBe(2);
     });
     await vi.waitFor(() => {
-      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+      expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
     });
-    expect(session.current?.domain).toBe("ops");
+    expect(domainNow(session)).toBe("ops");
   });
 
   it("never cuts in while an overlay has the keys or a load is in flight, and a jump from inside leaves the room (Review Focus 4)", async () => {
     // Mutation caught: the walk-in without its modal or loading guard, or
     // a jump that lands with the arrival box.
     const levels = vi.fn<(open: boolean) => void>();
-    const slow = deferred<LoadedPlace>();
+    const slow = deferred<LoadedStation>();
     const load: PlaceLoader = (a, signal) =>
-      a.permalink === "slow" ? slow.promise : okBridge(a, signal);
+      a.kind === "engram" && a.permalink === "slow"
+        ? slow.promise
+        : okBridge(a, signal);
     const session = startWithConsole([row(HALL), row("ops")], load, levels);
     // Stand in the walk-in zone itself, so only the guards keep the cut out.
     const i = standAtBox(session);
     const h = heroHallRoom().heroes[i]!;
     const f = boxFront(h);
     const at = { x: f.x + f.inward[0] * 0.36, z: f.z + f.inward[1] * 0.36 };
-    session.showRoom({
-      ...heroHallRoom(),
-      spawn: {
-        x: at.x / CELL - 0.5,
-        y: at.z / CELL - 0.5,
-        yaw: Math.atan2(f.inward[0], f.inward[1]),
+    session.showRoom(
+      {
+        ...heroHallRoom(),
+        spawn: {
+          x: at.x / CELL - 0.5,
+          y: at.z / CELL - 0.5,
+          yaw: Math.atan2(f.inward[0], f.inward[1]),
+        },
       },
-    });
+      undefined,
+      HALL_ADDRESS,
+    );
     const shown = renderer.setRoom.mock.calls.length;
     type("idclev");
     frames(1);
@@ -2161,12 +2239,13 @@ describe("the console room", () => {
     key("keydown", "Space");
     key("keyup", "Space");
     frames(10); // half open
-    session.go({ domain: HALL, permalink: "slow" });
+    session.go({ kind: "engram", domain: HALL, permalink: "slow" });
     frames(20); // open now, the player in the zone, a load in flight
     expect(renderer.setRoom.mock.calls.length).toBe(shown);
     slow.resolve({
-      kind: "place",
+      kind: "engram",
       place: { ...CANNED_BRIDGE, domain: HALL, permalink: "slow" },
+      folder: "",
     });
     await flush();
     // Inside, a jump leaves like any go and lands without a box.
@@ -2175,11 +2254,9 @@ describe("the console room", () => {
     await flush();
     session.jump("ops");
     await vi.waitFor(() => {
-      expect(navigate).toHaveBeenCalledWith(gameEngramRoute("ops", "manifest"));
+      expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
     });
-    expect(lastRoom()).toEqual(
-      generateRoom({ ...CANNED_BRIDGE, domain: "ops", permalink: "manifest" }),
-    );
+    expect(lastRoom()).toEqual(bridgeRoomOf("ops"));
   });
 
   it("never cuts in while the level select is open, even with the doors swinging wide under it (Review Focus 4)", () => {
@@ -2191,14 +2268,18 @@ describe("the console room", () => {
     const i = standAtBox(session);
     const f = boxFront(heroHallRoom().heroes[i]!);
     const at = { x: f.x + f.inward[0] * 0.36, z: f.z + f.inward[1] * 0.36 };
-    session.showRoom({
-      ...heroHallRoom(),
-      spawn: {
-        x: at.x / CELL - 0.5,
-        y: at.z / CELL - 0.5,
-        yaw: Math.atan2(f.inward[0], f.inward[1]),
+    session.showRoom(
+      {
+        ...heroHallRoom(),
+        spawn: {
+          x: at.x / CELL - 0.5,
+          y: at.z / CELL - 0.5,
+          yaw: Math.atan2(f.inward[0], f.inward[1]),
+        },
       },
-    });
+      undefined,
+      HALL_ADDRESS,
+    );
     const shown = renderer.setRoom.mock.calls.length;
     key("keydown", "Space");
     key("keyup", "Space");
@@ -2213,7 +2294,7 @@ describe("the console room", () => {
     frames(2);
     // The guard was all that kept it out: with the select closed, it cuts.
     expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
-    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+    expect(isConsole(lastRoom())).toBe(true);
   });
 
   it("keeps the console room and the arrival box through a look switch and a restored context (Review Focus 5)", async () => {
@@ -2230,7 +2311,7 @@ describe("the console room", () => {
     await flush();
     backOut();
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("ops");
+      expect(domainNow(session)).toBe("ops");
     });
     const bridge = lastRoom();
     lastCanvas?.dispatchEvent(new Event("webglcontextlost"));
@@ -2248,10 +2329,17 @@ describe("the console room", () => {
     await flush();
     backOut();
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("ops");
+      expect(domainNow(session)).toBe("ops");
     });
-    const place = { ...CANNED_BRIDGE, domain: "ops", permalink: "manifest" };
-    const expected = withArrivalBox(place, generateRoom(place));
+    const expected = roomFor(
+      {
+        kind: "bridge",
+        place: { ...CANNED_BRIDGE, domain: "ops", permalink: "manifest" },
+        bridge: { ...CANNED_BRIDGE_DATA, domain: "ops", display: "ops" },
+      },
+      null,
+      "box",
+    );
     expect(expected.box).not.toBeNull();
     expect(lastRoom()).toEqual(expected.room);
     const key = `box:${String(expected.box)}`;
@@ -2271,7 +2359,7 @@ describe("the console room", () => {
     await flush();
     backOut();
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("ops");
+      expect(domainNow(session)).toBe("ops");
     });
     frames(20); // the arrival box's doors swing shut
     key("keydown", "ArrowLeft");
@@ -2294,7 +2382,7 @@ describe("the console room", () => {
       frames(1);
     key("keyup", "ArrowUp");
     expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
-    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+    expect(isConsole(lastRoom())).toBe(true);
   });
 
   it("walks back into the arrival box only after a step 1.2 m from its front, not a short one (2.6e C29)", async () => {
@@ -2307,7 +2395,7 @@ describe("the console room", () => {
     await flush();
     backOut();
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("ops");
+      expect(domainNow(session)).toBe("ops");
     });
     frames(20);
     key("keydown", "ArrowLeft");
@@ -2361,7 +2449,7 @@ describe("the console room", () => {
     expect(away()).toBeGreaterThanOrEqual(1.2);
     pushIn();
     expect(renderer.setRoom.mock.calls.length).toBe(shown + 1);
-    expect(lastRoom()?.interior?.length).toBeGreaterThan(0);
+    expect(isConsole(lastRoom())).toBe(true);
   });
 
   it("ends the console room's visit on any other entry: its doorway's spot in another room leads nowhere (Review Focus 4)", async () => {
@@ -2369,7 +2457,7 @@ describe("the console room", () => {
     // exit still fires at (6, 12) m in the next room.
     const loads: string[] = [];
     const load: PlaceLoader = (a, signal) => {
-      loads.push(a.domain);
+      loads.push(domainOf(a) ?? "");
       return okBridge(a, signal);
     };
     const session = startWithConsole([row(HALL), row("ops")], load);
@@ -2392,13 +2480,12 @@ describe("the console room", () => {
     // Mutation caught: the walk-in latched only after a successful cut, so
     // a refused room is rebuilt and refused on every tick in the doorway.
     renderer.setRoom.mockImplementation((room) => {
-      if (room.interior !== undefined) throw new Error("too many layers");
+      if (isConsole(room)) throw new Error("too many layers");
     });
     const session = startWithConsole([row(HALL), row("ops")], okBridge);
     standAtBox(session);
     const tries = () =>
-      renderer.setRoom.mock.calls.filter(([r]) => r.interior !== undefined)
-        .length;
+      renderer.setRoom.mock.calls.filter(([r]) => isConsole(r)).length;
     const errors = () =>
       hud.notice.mock.calls.filter(([t]) => t === "?LOAD ERROR").length;
     key("keydown", "Space");
@@ -2409,7 +2496,7 @@ describe("the console room", () => {
     key("keyup", "ArrowUp");
     expect(tries()).toBe(1);
     expect(errors()).toBe(1);
-    expect(session.current?.domain).toBe(HALL);
+    expect(domainNow(session)).toBe(HALL);
     key("keydown", "ArrowDown");
     frames(10);
     key("keyup", "ArrowDown");
@@ -2437,7 +2524,7 @@ describe("the console room", () => {
     expect(signals[0]?.aborted).toBe(false);
     session.jump("ops");
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("ops");
+      expect(domainNow(session)).toBe("ops");
     });
     expect(signals[0]?.aborted).toBe(true);
 
@@ -2453,11 +2540,11 @@ describe("the console room", () => {
     // Mutation caught: the exit without its loading guard, which would
     // abort the jump in favour of a random bridge.
     const listing = deferred<readonly DomainRow[] | null>();
-    const far = deferred<LoadedPlace>();
+    const far = deferred<LoadedStation>();
     const loads: string[] = [];
     const load: PlaceLoader = (a, signal) => {
-      loads.push(a.domain);
-      return a.domain === "far" ? far.promise : okBridge(a, signal);
+      loads.push(domainOf(a) ?? "");
+      return domainOf(a) === "far" ? far.promise : okBridge(a, signal);
     };
     const session = startWithConsole(listing.promise, load);
     standAtBox(session);
@@ -2470,11 +2557,12 @@ describe("the console room", () => {
     await flush();
     expect(loads).toEqual(["far"]);
     far.resolve({
-      kind: "place",
+      kind: "bridge",
       place: { ...CANNED_BRIDGE, domain: "far", permalink: "manifest" },
+      bridge: { ...CANNED_BRIDGE_DATA, domain: "far", display: "far" },
     });
     await vi.waitFor(() => {
-      expect(session.current?.domain).toBe("far");
+      expect(domainNow(session)).toBe("far");
     });
     expect(loads).toEqual(["far"]);
   });
@@ -2486,7 +2574,7 @@ describe("the console room", () => {
     try {
       const loads: string[] = [];
       const load: PlaceLoader = (a, signal) => {
-        loads.push(a.domain);
+        loads.push(domainOf(a) ?? "");
         return okBridge(a, signal);
       };
       const session = start({
@@ -2506,7 +2594,7 @@ describe("the console room", () => {
       frames(2);
       expect(loads).toEqual([HALL]);
       await vi.advanceTimersByTimeAsync(10);
-      expect(session.current).toEqual({ domain: HALL, permalink: "manifest" });
+      expect(session.current).toEqual({ kind: "bridge", domain: HALL });
     } finally {
       vi.useRealTimers();
     }
@@ -2518,7 +2606,7 @@ describe("the console room", () => {
     const listing = deferred<readonly DomainRow[] | null>();
     const loads: string[] = [];
     const load: PlaceLoader = (a, signal) => {
-      loads.push(a.domain);
+      loads.push(domainOf(a) ?? "");
       return okBridge(a, signal);
     };
     const session = startWithConsole(listing.promise, load);
@@ -2533,7 +2621,252 @@ describe("the console room", () => {
       expect(loads).toEqual([HALL]);
     });
     await vi.waitFor(() => {
-      expect(session.current).toEqual({ domain: HALL, permalink: "manifest" });
+      expect(session.current).toEqual({ kind: "bridge", domain: HALL });
     });
+  });
+});
+
+/** A notes deck's rows: `count` engrams in `notes`, in permalink order. */
+function notesRows(count: number): DeckRow[] {
+  return Array.from({ length: count }, (_, i) => {
+    const n = String(i).padStart(2, "0");
+    return {
+      permalink: `notes/n${n}`,
+      title: `Note ${n}`,
+      type: "engram",
+      status: "stable",
+    };
+  });
+}
+
+/**
+ * Answers every station address kind at once: the airlock over the canned
+ * listing, a bridge from the canned bridge moved to its domain, a deck of
+ * 60 engrams (three sections) for `notes` and of two for the root, and an
+ * engram from the canned bridge moved to its address.
+ */
+const stationLoad: PlaceLoader = (a) => {
+  switch (a.kind) {
+    case "airlock":
+      return Promise.resolve({
+        kind: "airlock",
+        input: { domains: CANNED_DOMAINS, here: null },
+      });
+    case "bridge":
+      return Promise.resolve({
+        kind: "bridge",
+        place: { ...CANNED_BRIDGE, domain: a.domain, permalink: "manifest" },
+        bridge: { ...CANNED_BRIDGE_DATA, domain: a.domain, display: a.domain },
+      });
+    case "deck": {
+      const rows = a.folder === "notes" ? notesRows(60) : notesRows(2);
+      return Promise.resolve({
+        kind: "deck",
+        input: {
+          domain: a.domain,
+          folder: a.folder,
+          rows,
+          subfolders: [],
+          total: rows.length,
+          truncated: false,
+        },
+        section: a.section,
+      });
+    }
+    case "engram":
+      return Promise.resolve({
+        kind: "engram",
+        place: { ...CANNED_BRIDGE, domain: a.domain, permalink: a.permalink },
+        folder: "",
+      });
+  }
+};
+
+/** Whether `room` is the console room: its own seed, not its fittings. */
+const isConsole = (room: RoomSpec | undefined) =>
+  room?.seed === consoleRoom().seed;
+
+describe("station addresses (M3)", () => {
+  it("lands on every address kind and replaces each URL at most once (Review Focus 3)", async () => {
+    // Mutation caught: the landing compared by pathname alone (a deck's
+    // `?path=` replaced on every landing), `current` read back from the
+    // `RoomSpec` or from the address asked for instead of the one entered
+    // (the MANIFEST route would stay an engram, an oversized or fractional
+    // section would never be clamped).
+    const starts: [string, StationAddress, string | null][] = [
+      ["/π", { kind: "airlock" }, null],
+      ["/π/d/eng", { kind: "bridge", domain: "eng" }, null],
+      [
+        "/π/d/eng?path=",
+        { kind: "deck", domain: "eng", folder: "", section: 0 },
+        null,
+      ],
+      [
+        "/π/d/eng?path=notes&section=3",
+        { kind: "deck", domain: "eng", folder: "notes", section: 2 },
+        null,
+      ],
+      [
+        "/π/d/eng/e/MANIFEST",
+        { kind: "bridge", domain: "eng" },
+        "/%CF%80/d/eng",
+      ],
+      // Past the last section: clamped to it when the deck is built (C8).
+      [
+        "/π/d/eng?path=notes&section=9",
+        { kind: "deck", domain: "eng", folder: "notes", section: 2 },
+        "/%CF%80/d/eng?path=notes&section=3",
+      ],
+      // Not a whole number: read as the first section.
+      [
+        "/π/d/eng?path=notes&section=1.5",
+        { kind: "deck", domain: "eng", folder: "notes", section: 0 },
+        "/%CF%80/d/eng?path=notes",
+      ],
+    ];
+    expect(starts.length).toBeGreaterThan(0);
+    for (const [url, entered, replaced] of starts) {
+      navigate.mockClear();
+      window.history.replaceState(null, "", url);
+      const asked = addressOfGameLocation(
+        window.location.pathname,
+        window.location.search,
+      );
+      if (asked === null) throw new Error(`not a game location: ${url}`);
+      const session = start({ load: stationLoad });
+      session.go(asked);
+      await vi.waitFor(() => {
+        expect(session.current, url).not.toBeNull();
+      });
+      expect(session.current, url).toEqual(entered);
+      if (replaced === null) {
+        expect(navigate, url).not.toHaveBeenCalled();
+      } else {
+        expect(navigate, url).toHaveBeenCalledTimes(1);
+        expect(navigate, url).toHaveBeenCalledWith(replaced);
+      }
+      // Landing there again replaces nothing: the URL names it now.
+      navigate.mockClear();
+      session.go(entered);
+      await flush();
+      expect(navigate, url).not.toHaveBeenCalled();
+      session.dispose();
+    }
+  });
+
+  it("enters the police box from a deck and walks out to a bridge (M3 T10-2)", async () => {
+    // Mutation caught: `cutIn` reading a permalink the address does not
+    // have (a deck has none, so the console room would lose the room's own
+    // key), or `current` moved off the deck while inside.
+    const hangar = generateDeck(CANNED_HANGAR, 0);
+    const pad = hangar.hangar?.pads[0];
+    if (pad === undefined) throw new Error("the hangar has no pad");
+    const box: Hero = {
+      kind: "police-box",
+      variant: 0,
+      x: (pad.x0 + pad.x1) / 2,
+      y: (pad.y0 + pad.y1) / 2,
+      turn: 0,
+      seed: pad.seed,
+    };
+    const room = withPadHeroes(hangar, [...hangar.heroes, box]);
+    const at: StationAddress = {
+      kind: "deck",
+      domain: CANNED_HANGAR.domain,
+      folder: CANNED_HANGAR.folder,
+      section: 0,
+    };
+    const session = startWithConsole(
+      [row(CANNED_HANGAR.domain), row("ops")],
+      stationLoad,
+    );
+    standAtBox(session, room, at);
+    walkIn();
+    expect(isConsole(lastRoom())).toBe(true);
+    expect(lastRoom()?.domain).toBe(CANNED_HANGAR.domain);
+    expect(lastRoom()?.permalink).toBe(hangar.permalink);
+    expect(hangar.permalink).toBe("cargo/flight-deck/");
+    expect(session.current).toEqual(at);
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "bridge", domain: "ops" });
+    });
+    expect(navigate).toHaveBeenLastCalledWith("/%CF%80/d/ops");
+  });
+
+  it("shows a deck door's engram title on the connector (M3 T10)", () => {
+    // Mutation caught: `labelFor` falling back to the permalink when the
+    // room's own door names the place (a deck carries no place to ask).
+    const deck = generateDeck(CANNED_DECK, 0);
+    const i = deck.fixtures.findIndex(
+      (f) => f.kind === "door" && f.address !== null,
+    );
+    const door = deck.fixtures[i];
+    if (door?.kind !== "door" || door.address === null) {
+      throw new Error("the deck has no door");
+    }
+    expect(door.label).not.toBe(door.address.permalink);
+    const session = start({ load: () => new Promise(() => undefined) });
+    session.showRoom(
+      { ...deck, spawn: wallFacingSpawn(door.slot) },
+      undefined,
+      {
+        kind: "deck",
+        domain: deck.domain,
+        folder: CANNED_DECK.folder,
+        section: 0,
+      },
+    );
+    key("keydown", "KeyW");
+    for (let t = 0; t < 80 && hud.connector.mock.calls.length === 0; t++)
+      frames(1);
+    key("keyup", "KeyW");
+    expect(hud.connector).toHaveBeenCalledWith(
+      true,
+      door.label,
+      expect.any(String),
+    );
+  });
+
+  it("says where the player is, as the status line does (M4's pause screen)", async () => {
+    // Mutation caught: `where` answering the raw title or the permalink
+    // instead of the status line's own upper-cased title, or a title for
+    // the console room, which the status line leaves out.
+    const session = startWithConsole([row(HALL), row("ops")], stationLoad);
+    expect(session.where).toBeNull();
+    session.showCanned(CANNED_BRIDGE);
+    expect(session.where).toBe(CANNED_BRIDGE.title.toUpperCase());
+    expect(session.where).not.toBe(CANNED_BRIDGE.title);
+    const status = () => hud.status.mock.calls.at(-1)?.[0] ?? "";
+    expect(status().startsWith(`${session.where ?? "?"}  |  `)).toBe(true);
+    session.go({ kind: "airlock" });
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "airlock" });
+    });
+    expect(session.where).toBe("AIRLOCK");
+    standAtBox(session);
+    walkIn();
+    expect(isConsole(lastRoom())).toBe(true);
+    expect(session.where).toBeNull();
+  });
+
+  it("never takes the airlock for the console room, though both carry fittings", async () => {
+    // Mutation caught: the console room told apart by `interior` (the
+    // airlock has one too), so a renderer that refuses the console room
+    // refuses the airlock with it.
+    const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+    expect(airlock.interior?.length).toBeGreaterThan(0);
+    expect(isConsole(airlock)).toBe(false);
+    expect(isConsole(consoleRoom())).toBe(true);
+    renderer.setRoom.mockImplementation((room) => {
+      if (isConsole(room)) throw new Error("too many layers");
+    });
+    const session = start({ load: stationLoad });
+    session.go({ kind: "airlock" });
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "airlock" });
+    });
+    expect(hud.notice).not.toHaveBeenCalledWith("?LOAD ERROR");
   });
 });

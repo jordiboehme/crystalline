@@ -54,9 +54,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { engramRoute } from "../../paths";
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
+import { fluidRouteOfStation } from "../paths";
 import type { Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { CLASSIC_KEYS } from "../ui/keys";
@@ -175,7 +175,7 @@ export default function LookDemo() {
   }, []);
   const readerOpenFluid = useCallback(() => {
     const current = sessionRef.current?.current;
-    if (current) openFluid(engramRoute(current.domain, current.permalink));
+    if (current) openFluid(fluidRouteOfStation(current));
   }, []);
 
   if (refusal !== null) return <DeviceRefusal />;

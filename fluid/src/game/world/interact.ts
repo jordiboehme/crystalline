@@ -31,12 +31,14 @@
  * `world/box.ts`'s (`boxFocus`, `stepBoxDoors`), not this module's.
  */
 
+import { sameStation, stationOfPlace } from "../paths";
 import type { Player } from "./move";
 import type {
   DoorStyle,
   Fixture,
   PlaceAddress,
   RoomSpec,
+  StationAddress,
   WallSlot,
 } from "./types";
 import { CELL } from "./units";
@@ -131,10 +133,15 @@ export type Travel = {
 };
 
 /**
- * How the player came into a room: the kind of way and the place it came
- * from. It decides where the player arrives (`arrivalSpawn`).
+ * How the player came into a room: the kind of way and the station address
+ * it came from (M3 C1). It decides where the player arrives
+ * (`arrivalSpawn`). An `exit` is the way up from an engram room to its
+ * deck and a `lift` a ride between the airlock, a bridge and the decks.
  */
-export type Arrival = { via: "door" | "portal" | "hatch"; from: PlaceAddress };
+export type Arrival = {
+  via: "door" | "portal" | "hatch" | "exit" | "lift";
+  from: StationAddress;
+};
 
 /**
  * A fixture's wall in world metres: the middle of the wall at floor level
@@ -421,7 +428,13 @@ export function hatchTravel(
  *   this room's hatch that leads back to A.
  * - Through a hatch back to A, the player arrives in front of this room's
  *   door or portal that leads to A.
- * - Otherwise (no arrival, or no fixture matches) at the entrance.
+ * - Otherwise (no arrival, an exit or a lift, or no fixture matches) at
+ *   the entrance.
+ *
+ * A way leads to a `PlaceAddress`, which is compared with `from` as the
+ * station address it names (`stationOfPlace`): an engram matches the way
+ * to it, a bridge the way to its domain's MANIFEST (M3 C3), and a deck or
+ * the airlock, which no door, portal or hatch leads to, never matches.
  *
  * In front means `ARRIVAL_DISTANCE` out from the fixture's wall point,
  * facing into the room, away from the wall: the way back is right behind
@@ -431,18 +444,20 @@ export function arrivalSpawn(
   room: RoomSpec,
   arrival: Arrival | null,
 ): { x: number; z: number; yaw: number } {
+  const leadsBack = (to: PlaceAddress) =>
+    arrival !== null && sameStation(stationOfPlace(to), arrival.from);
   const match =
-    arrival === null
+    arrival === null || arrival.via === "exit" || arrival.via === "lift"
       ? undefined
       : room.fixtures.find((f) => {
           if (arrival.via === "hatch") {
             return (
               (f.kind === "door" || f.kind === "portal") &&
               f.address !== null &&
-              samePlace(f.address, arrival.from)
+              leadsBack(f.address)
             );
           }
-          return f.kind === "hatch" && samePlace(f.address, arrival.from);
+          return f.kind === "hatch" && leadsBack(f.address);
         });
   if (match === undefined) {
     return {

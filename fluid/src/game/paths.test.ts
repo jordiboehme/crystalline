@@ -104,12 +104,14 @@ describe("placeKeyOf", () => {
 });
 
 describe("bridgeAddress", () => {
-  it("names a domain's MANIFEST room, whose game route mirrors its engram route", () => {
+  it("names a domain's bridge, whose game route is the domain's own (M3 C3)", () => {
+    // Mutation caught: the bridge still addressed as the MANIFEST engram
+    // (`/e/manifest` in its route), or its domain's space written as `+`.
     expect(MANIFEST_PERMALINK).toBe("manifest");
-    const bridge = bridgeAddress("platform eng");
-    expect(bridge).toEqual({ domain: "platform eng", permalink: "manifest" });
-    expect(gameEngramRoute(bridge.domain, bridge.permalink)).toBe(
-      "/%CF%80/d/platform%20eng/e/manifest",
+    expect(bridgeAddress("eng")).toEqual({ kind: "bridge", domain: "eng" });
+    expect(gameRouteOf(bridgeAddress("eng"))).toBe("/%CF%80/d/eng");
+    expect(gameRouteOf(bridgeAddress("platform eng"))).toBe(
+      "/%CF%80/d/platform%20eng",
     );
   });
 });

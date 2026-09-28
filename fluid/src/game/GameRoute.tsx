@@ -1,6 +1,10 @@
 /**
- * The game route: `/π/d/<domain>/e/<permalink>`, the station room of one
- * engram, and every room the player walks on to from there.
+ * The game route: every place of the station under `/π` (M3 C2, C4), read
+ * from the location itself with `addressOfGameLocation` - the airlock at
+ * `/π`, a domain's bridge at `/π/d/<domain>`, a deck at the same with
+ * `?path=<folder>` (and `&section=<n>`), an engram's room at
+ * `/π/d/<domain>/e/<permalink>`, and the airlock again for any other path
+ * under the prefix - and every room the player walks on to from there.
  *
  * Development only until milestone 4 gives it a way in: the route that
  * renders this exists only under `import.meta.env.DEV` (see `routes.tsx`),
@@ -12,13 +16,15 @@
  * there with `go`. The session is where the player is: when it lands in a
  * room it replaces the URL with that room's route, so a reload comes back
  * to the same room and the history is not filled with every door walked
- * through. That replace changes the params too, and the route must not
+ * through. That replace changes the location too, and the route must not
  * answer it with a second journey to the room the player just entered,
  * which would reload the room and lose where the door put them. So the
- * route keeps the one address the URL is following: the one it last sent
- * the session to, or, once the session lands somewhere of its own accord,
- * that place, set before the session's replace reaches the router. A new
- * URL is followed exactly when it names another address. It is not
+ * route keeps the one station address the URL is following: the one it
+ * last sent the session to, or, once the session lands somewhere of its
+ * own accord, the address it entered, set before the session's replace
+ * reaches the router. A new URL is followed exactly when it names another
+ * address (`sameStation`: kind, domain, folder and section, or
+ * permalink). It is not
  * compared with the room the player stands in: going back to that room
  * while another one is still loading must cancel the load, and going
  * forward again to a room that failed to load must try it again.
@@ -32,7 +38,8 @@
  * Typing `idclev` opens the level select over the station (`LevelSelect`):
  * the session says so through `onLevels`, which only this route passes, so
  * the look demo and the model gallery ignore the word. The select lists
- * the domains, marks the one in the URL, and on Enter or a click asks the
+ * the domains, marks the one the URL names (none in the airlock), and on
+ * Enter or a click asks the
  * session to `jump` to that domain's bridge, a journey like any other that
  * replaces the URL when it lands. Esc hands the keys back through
  * `closeLevels`.
@@ -43,32 +50,46 @@
  * the domain listing (`loadDomainRows`, the sidebar's own cached query).
  * The console room has no address: the URL keeps naming the room walked
  * in from, so a reload inside comes back there.
+ *
+ * F, in the room and in the CRT reader alike, opens the Fluid page of the
+ * address the player stands at (`fluidRouteOfStation`): `/` in the
+ * airlock, the domain page on a bridge, the folder on a deck, the engram's
+ * reading page in its room.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
-import { engramRoute } from "../paths";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
+import {
+  addressOfGameLocation,
+  domainOf,
+  fluidRouteOfStation,
+  sameStation,
+} from "./paths";
 import { createSession, type Session } from "./session";
 import { DeviceRefusal } from "./ui/DeviceRefusal";
 import { GAME_LEGEND } from "./ui/keys";
 import { LevelSelect } from "./ui/LevelSelect";
 import { StationView } from "./ui/StationView";
 import { useHud } from "./ui/useHud";
-import type { PlaceAddress } from "./world/types";
+import type { StationAddress } from "./world/types";
 
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
   window.open(path, "_blank", "noopener");
 }
 
-/** Whether two addresses name the same place. */
-function samePlace(a: PlaceAddress | null, b: PlaceAddress): boolean {
-  return a !== null && a.domain === b.domain && a.permalink === b.permalink;
+/**
+ * The station address a location names. The route only matches under the
+ * `π` prefix, so `addressOfGameLocation` answers an address there; the
+ * airlock stands in for the null it keeps for a path outside the prefix.
+ */
+function addressAt(pathname: string, search: string): StationAddress {
+  return addressOfGameLocation(pathname, search) ?? { kind: "airlock" };
 }
 
 /**
@@ -83,19 +104,18 @@ function samePlace(a: PlaceAddress | null, b: PlaceAddress): boolean {
  * and every later address reaches it through `go`.
  */
 export default function GameRoute() {
-  const params = useParams();
-  const domain = params.domain ?? "";
-  const permalink = params["*"] ?? "";
+  const { pathname, search } = useLocation();
+  const address = addressAt(pathname, search);
   const client = useQueryClient();
   const navigate = useNavigate();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sessionRef = useRef<Session | null>(null);
   const navigateRef = useRef(navigate);
-  const addressRef = useRef<PlaceAddress>({ domain, permalink });
+  const addressRef = useRef<StationAddress>(address);
   // The address the URL is following: the one this route last sent the
   // session to, or the one the session last landed in of its own accord.
-  // The params effect follows a URL that names any other address.
-  const requestedRef = useRef<PlaceAddress | null>(null);
+  // The location effect follows a URL that names any other address.
+  const requestedRef = useRef<StationAddress | null>(null);
   const { sink, view, connector, reader } = useHud();
   const [refusal] = useState<Refusal | null>(() =>
     refusalReason(detectEnvironment(hasWebGL2)),
@@ -107,8 +127,8 @@ export default function GameRoute() {
   }, [navigate]);
 
   useEffect(() => {
-    addressRef.current = { domain, permalink };
-  }, [domain, permalink]);
+    addressRef.current = addressAt(pathname, search);
+  }, [pathname, search]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -142,18 +162,18 @@ export default function GameRoute() {
   useEffect(() => {
     const session = sessionRef.current;
     if (session === null) return;
-    const address = { domain, permalink };
-    if (samePlace(requestedRef.current, address)) return;
-    requestedRef.current = address;
-    session.go(address);
-  }, [domain, permalink]);
+    const next = addressAt(pathname, search);
+    if (sameStation(requestedRef.current, next)) return;
+    requestedRef.current = next;
+    session.go(next);
+  }, [pathname, search]);
 
   const closeReader = useCallback(() => {
     sessionRef.current?.closeReader();
   }, []);
   const readerOpenFluid = useCallback(() => {
     const current = sessionRef.current?.current;
-    if (current) openFluid(engramRoute(current.domain, current.permalink));
+    if (current) openFluid(fluidRouteOfStation(current));
   }, []);
   const closeLevels = useCallback(() => {
     sessionRef.current?.closeLevels();
@@ -178,7 +198,11 @@ export default function GameRoute() {
         legend={GAME_LEGEND}
       />
       {levels && (
-        <LevelSelect current={domain} onJump={jump} onClose={closeLevels} />
+        <LevelSelect
+          current={domainOf(address) ?? ""}
+          onJump={jump}
+          onClose={closeLevels}
+        />
       )}
     </>
   );

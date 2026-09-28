@@ -8,12 +8,17 @@
  * `dispose`, so the shell renders once and the session writes the HUD
  * straight into the DOM.
  *
- * Places come in two ways. `go` loads one through Fluid's query cache
- * (`loadPlace`), or through the `load` seam when the session was given one,
- * with the connector shown while it loads, and replaces the room when it
- * lands; `showCanned` shows a place that is already in hand (the look demo's
- * bridge) at once, and `showRoom` a room built by hand (the model gallery).
- * A room is generated once per entry and kept until the next one.
+ * The session speaks station addresses (M3 C1): the airlock, a domain's
+ * bridge, a deck and an engram's room. Places come in two ways. `go` loads
+ * one through Fluid's query cache (`loadStation`), or through the `load`
+ * seam when the session was given one, with the connector shown while it
+ * loads, and replaces the room when it lands: `roomFor` builds the room and
+ * resolves the address entered (a deck's section), which becomes `current`
+ * and whose game route replaces the URL unless the location's pathname and
+ * search already spell it (C5). `showCanned` shows a place that is already
+ * in hand (the look demo's bridge) at once, at its engram address, and
+ * `showRoom` a room built by hand (the model gallery), at no address. A
+ * room is generated once per entry and kept until the next one.
  *
  * Loads race, and the session settles every race the same way: each `go`
  * takes a new generation and aborts the load before it, and a load whose
@@ -42,8 +47,9 @@
  * With `SessionOptions.consoleRoom` (the game route only), walking through
  * a box's open doors (`boxEntry`) cuts into the console room
  * (`world/consoleRoom.ts`): instantly, with no connector, no load and no
- * navigation. The session enters the console room under the domain and
- * permalink of the room left, so `current`, F and the URL keep naming that
+ * navigation. The session enters the console room under the domain of the
+ * room left and that room's own key (its `permalink`), and keeps the
+ * address walked in from as `current`, so F and the URL keep naming that
  * room, and a reload inside returns to it. The cut in starts reading the
  * domain listing. Walking into the console room's inner doors
  * (`atConsoleExit`) travels to the bridge of a domain picked from that
@@ -79,7 +85,9 @@
  * Keys, by `KeyboardEvent.code`, the classic layout plus WASD: Up and Down
  * (or W and S) walk, Left and Right turn, and strafe while Alt is held,
  * comma and period (or A and D) strafe, Shift held runs, Space uses what
- * the player faces, F opens the current engram in Fluid, I inverts the
+ * the player faces, F opens the current address's page in Fluid
+ * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
+ * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
  * and 1, 2 and 4 switch the look. Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
@@ -97,19 +105,27 @@
 
 import type { QueryClient } from "@tanstack/react-query";
 
-import { engramRoute } from "../paths";
 import { createCheatReader } from "./core/cheat";
 import { createInput } from "./core/input";
 import { createLoop, type Clock } from "./core/loop";
-import { loadPlace, prefetchPlace, type LoadedPlace } from "./data/source";
+import { prefetchPlace } from "./data/source";
+import { loadStation, type LoadedStation } from "./data/station";
 import { backbufferSize } from "./device";
 import { createContext } from "./gl/context";
-import { bridgeAddress, gameEngramRoute, placeKeyOf } from "./paths";
+import {
+  bridgeAddress,
+  canonicalStation,
+  domainOf,
+  fluidRouteOfStation,
+  gameRouteOf,
+  placeKeyOf,
+  sameStation,
+  stationOfPlace,
+} from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
 import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
-import { withArrivalBox } from "./world/arrival";
 import {
   boxEntry,
   boxFocus,
@@ -127,7 +143,6 @@ import {
   focusOf,
   hatchTravel,
   approaches,
-  samePlace,
   stepDoors,
   travelOf,
   type Arrival,
@@ -151,7 +166,9 @@ import {
   stepPlayer,
   type Player,
 } from "./world/move";
-import type { Box, PlaceAddress, PlaceInput, RoomSpec } from "./world/types";
+import { LIFT_WORDS, deckLabel } from "./world/lifts";
+import { roomFor } from "./world/station";
+import type { Box, PlaceInput, RoomSpec, StationAddress } from "./world/types";
 
 export type { Arrival } from "./world/interact";
 
@@ -267,22 +284,24 @@ export interface SessionOptions {
 }
 
 /**
- * Loads the place at `address` for a travel or a `go`, and settles as
- * `loadPlace` does: a place, or the reason there is none. It rejects with
- * an `AbortError` once `signal` aborts, and with anything else for a
- * failure the server did not explain (`?LOAD ERROR`). See
- * `SessionOptions.load`.
+ * Loads the station address `address` for a travel or a `go`, and settles
+ * as `loadStation` does: what the room is built from, or the reason there
+ * is none. It rejects with an `AbortError` once `signal` aborts, and with
+ * anything else for a failure the server did not explain (`?LOAD ERROR`).
+ * See `SessionOptions.load`.
  */
 export type PlaceLoader = (
-  address: PlaceAddress,
+  address: StationAddress,
   signal: AbortSignal,
-) => Promise<LoadedPlace>;
+) => Promise<LoadedStation>;
 
 /**
  * A running station.
  *
- * - `go` travels to a place: loads it and, once it lands, enters it, placed
- *   by `arrival` (see `arrivalSpawn`) or at the entrance. The connector's
+ * - `go` travels to a station address (M3 C1), in its canonical form
+ *   (`canonicalStation`: the MANIFEST's engram address is its domain's
+ *   bridge, C3): loads it and, once it lands, enters it, placed by
+ *   `arrival` (see `arrivalSpawn`) or at the entrance. The connector's
  *   label is `labelFor`'s, unless `label` is given, which shows that
  *   instead (`jump`'s domain name, C10).
  * - `showCanned` shows a place already in hand, with no load. Showing the
@@ -291,7 +310,10 @@ export type PlaceLoader = (
  * - `showRoom` shows a room built by hand, with no place behind it (the
  *   dev-only model gallery): no load, no navigation, the player at the
  *   room's entrance and every door shut. Its terminals open no reader,
- *   since there is no engram to read. `view`, when given, sets the
+ *   since there is no engram to read. `current` stays null (M3 C5) unless
+ *   `at` names the address the room stands for, a seam for the tests that
+ *   stand a hand-built room (a police box forced into a deck, say) where
+ *   the session would have entered it. `view`, when given, sets the
  *   player's pitch after entering, clamped to `MAX_PITCH` (C18, 2.6b): the
  *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
  *   for those dev seams only; every other caller omits it and keeps the
@@ -302,29 +324,35 @@ export type PlaceLoader = (
  *   it the keys back.
  * - `jump` goes to a domain's bridge (`bridgeAddress`), the level select's
  *   jump: a `go` from outside, so the player enters at the entrance. The
- *   connector names the domain, not the bridge's permalink (C10).
+ *   connector names the domain (C10).
  * - `closeLevels` tells the session the level select was closed, which
  *   gives it the keys back.
  * - `dispose` stops everything and frees the GPU objects. It takes the
  *   reader and the connector down; nothing is written to the HUD after it.
- * - `current` is the place the player is in, null before the first one.
- *   Inside the console room it is the room the player walked in from,
- *   since the console room has no address of its own.
+ * - `current` is the station address the player is in, the one the session
+ *   entered (a deck's section resolved), never read back from the room;
+ *   null before the first one and in a room `showRoom` showed without an
+ *   address. Inside the console room it is the address the player walked
+ *   in from, since the console room has no address of its own.
+ * - `where` is the room's label as the status line shows it, the room's
+ *   title upper-cased; null before the first room and in the console room,
+ *   which has no title.
  */
 export interface Session {
-  go(address: PlaceAddress, arrival?: Arrival | null, label?: string): void;
+  go(address: StationAddress, arrival?: Arrival | null, label?: string): void;
   showCanned(place: PlaceInput): void;
-  showRoom(room: RoomSpec, view?: { pitch: number }): void;
+  showRoom(room: RoomSpec, view?: { pitch: number }, at?: StationAddress): void;
   closeReader(): void;
   /**
    * Goes to a domain's bridge (`bridgeAddress`): the level select's jump.
-   * The connector names the domain, not the bridge's permalink (C10).
+   * The connector names the domain (C10).
    */
   jump(domain: string): void;
   /** The level select was closed: gives the session the keys back. */
   closeLevels(): void;
   dispose(): void;
-  readonly current: PlaceAddress | null;
+  readonly current: StationAddress | null;
+  readonly where: string | null;
 }
 
 /** Where the inverted-look choice is remembered: "1" inverted, "0" normal. */
@@ -347,8 +375,11 @@ export const LISTING_WAIT_MS = 5000;
 /** The notice for a refused or missing GPU. */
 const NO_DEVICE = "?DEVICE NOT PRESENT ERROR";
 
+/** The answers a load gives when there is no room to build. */
+type Failure = "missing" | "denied" | "offline";
+
 /** What each failed answer tells the player. */
-const FAILED: Record<Exclude<LoadedPlace["kind"], "place">, string> = {
+const FAILED: Record<Failure, string> = {
   missing: NOT_FOUND,
   denied: ACCESS_DENIED,
   offline: "SIGNAL LOST",
@@ -427,6 +458,17 @@ function writeInverted(inverted: boolean): void {
   }
 }
 
+/** Whether a load's answer is one of the three with no room to build. */
+function isFailure(
+  loaded: LoadedStation,
+): loaded is Extract<LoadedStation, { kind: Failure }> {
+  return (
+    loaded.kind === "missing" ||
+    loaded.kind === "denied" ||
+    loaded.kind === "offline"
+  );
+}
+
 /** Whether an error is the `AbortError` a cancelled load rejects with. */
 function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
@@ -446,7 +488,7 @@ export function createSession(opts: SessionOptions): Session {
   let lookId: LookId = opts.initialLook ?? "aperture";
   let inverted = readInverted();
   let place: PlaceInput | null = null;
-  let current: PlaceAddress | null = null;
+  let current: StationAddress | null = null;
   let room: RoomSpec | null = null;
   let blockers: Box[] = [];
   let lights: LightState | null = null;
@@ -487,7 +529,7 @@ export function createSession(opts: SessionOptions): Session {
    * The visit of the console room the player is in: the room walked in
    * from. Null outside it; every entry clears it and the cut in sets it.
    */
-  let inside: { from: PlaceAddress } | null = null;
+  let inside: { from: StationAddress } | null = null;
   /**
    * The listing the console room's exit picks from: undefined while it is
    * still read, null when it could not be read.
@@ -559,12 +601,20 @@ export function createSession(opts: SessionOptions): Session {
     }, ms);
   };
 
+  /**
+   * The room's label as the status line leads with it (`Session.where`):
+   * its title upper-cased, or null with no room or in the console room,
+   * which has no title.
+   */
+  const where = (): string | null =>
+    room === null || room.title === "" ? null : room.title.toUpperCase();
+
   const showStatus = () => {
     if (disposed) return;
     const parts = [LOOKS[lookId].name.toUpperCase()];
     if (room !== null) {
-      // The console room has no title: the line leaves it out.
-      if (room.title !== "") parts.unshift(room.title.toUpperCase());
+      const label = where();
+      if (label !== null) parts.unshift(label);
       parts.push(room.condition.toUpperCase());
     }
     parts.push(
@@ -580,24 +630,47 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /**
-   * The label the connector shows for a place: its title, when the room the
-   * player is in knows it (a relation, a wikilink or an inbound reference
-   * that leads there), else its permalink. `go`'s own `label` argument wins
-   * over this (the level select's jump, C10).
+   * The label the connector shows for a station address: a bridge says its
+   * domain, a deck its `deckLabel`, the airlock `AIRLOCK`. An engram says
+   * its title when the place the player is in knows it (a relation, a
+   * wikilink or an inbound reference that leads there), else the label of
+   * a door in the room that leads there (a deck's doors carry the
+   * engram's title, and a deck has no place to ask), else its permalink.
+   * `go`'s own `label` argument wins over this (the level select's jump,
+   * C10).
    */
-  const labelFor = (address: PlaceAddress): string => {
+  const labelFor = (address: StationAddress): string => {
+    switch (address.kind) {
+      case "airlock":
+        return LIFT_WORDS.airlock;
+      case "bridge":
+        return address.domain;
+      case "deck":
+        return deckLabel(address.domain, address.folder);
+      case "engram":
+        break;
+    }
     if (place !== null) {
       for (const r of [...place.relations, ...place.links]) {
         if (
           r.targetTitle !== null &&
           r.address !== null &&
-          samePlace(r.address, address)
+          sameStation(stationOfPlace(r.address), address)
         ) {
           return r.targetTitle;
         }
       }
       for (const h of place.inbound) {
-        if (samePlace(h.address, address)) return h.title;
+        if (sameStation(stationOfPlace(h.address), address)) return h.title;
+      }
+    }
+    for (const f of room?.fixtures ?? []) {
+      if (
+        f.kind === "door" &&
+        f.address !== null &&
+        sameStation(stationOfPlace(f.address), address)
+      ) {
+        return f.label;
       }
     }
     return address.permalink;
@@ -625,8 +698,11 @@ export function createSession(opts: SessionOptions): Session {
   /**
    * Enters a generated room: hands it to the renderer and resets everything
    * that belongs to the room before it. `next` is the place the room was
-   * generated from, or null for a room built by hand (`showRoom`), whose
-   * terminals then open no reader. `keep` keeps the player, the doors and
+   * generated from, or null for a room with none (the airlock, a deck, the
+   * console room, a room built by hand), whose terminals then open no
+   * reader. `address` becomes `current`: the station address entered, as
+   * `roomFor` resolved it, never read back from `built` (M3 C5). `keep`
+   * keeps the player, the doors and
    * this visit's failed ways and faults, for the same place shown again.
    * `spawn`, when given, places the player there (in metres) in place of
    * `arrivalSpawn` (the arrival box's step out). Every entry ends a visit
@@ -643,6 +719,7 @@ export function createSession(opts: SessionOptions): Session {
   const enter = (
     next: PlaceInput | null,
     built: RoomSpec,
+    address: StationAddress | null,
     arrival: Arrival | null,
     keep: boolean,
     spawn?: { x: number; z: number; yaw: number },
@@ -656,7 +733,7 @@ export function createSession(opts: SessionOptions): Session {
     room = built;
     blockers = blockersFor(room);
     lights = createLights(room.lights);
-    current = { domain: built.domain, permalink: built.permalink };
+    current = address;
     if (!keep || player === null) {
       const at = spawn ?? arrivalSpawn(room, arrival);
       player = { ...at, vx: 0, vz: 0, pitch: 0, bob: 0 };
@@ -684,16 +761,20 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /**
-   * A load of `travel` has settled: enters the place, or fails with the
-   * reason there is none. With `landing` `"box"` (the console room's exit)
-   * the room is entered with the arrival box (`withArrivalBox`), the player
-   * stepping out of it, its doors fully open and heading shut, and its
-   * walk-in latched; with no spot for the box, the room is entered plain.
+   * A load of `travel` has settled: builds the room (`roomFor`) and enters
+   * it at the address `roomFor` resolved, or fails with the reason there
+   * is none. With `landing` `"box"` (the console room's exit, which goes
+   * to a bridge) the room is entered with the arrival box
+   * (`withArrivalBox`), the player stepping out of it, its doors fully
+   * open and heading shut, and its walk-in latched; with no spot for the
+   * box, the room is entered plain. Once entered, the URL is replaced with
+   * the entered address's game route unless the location's pathname and
+   * search already spell it (M3 C5), so no address replaces itself.
    */
   const settle = (
     gen: number,
     arrival: Arrival | null,
-    loaded: LoadedPlace,
+    loaded: LoadedStation,
     label: string,
     landing: "box" | null,
   ) => {
@@ -701,7 +782,7 @@ export function createSession(opts: SessionOptions): Session {
     loading = false;
     controller = null;
     hud.connector(false, label, lookId);
-    if (loaded.kind !== "place") {
+    if (isFailure(loaded)) {
       fail(FAILED[loaded.kind]);
       // Only a missing or denied target breaks the way the travel went
       // through. A stale answer is dropped twice over: by the generation
@@ -721,27 +802,26 @@ export function createSession(opts: SessionOptions): Session {
       return;
     }
     travelling = null;
-    const generated = generateRoom(loaded.place);
-    const arrived =
-      landing === "box" ? withArrivalBox(loaded.place, generated) : null;
+    const built = roomFor(loaded, arrival, landing);
     if (
       !enter(
-        loaded.place,
-        arrived?.room ?? generated,
+        built.place,
+        built.room,
+        built.address,
         arrival,
         false,
-        arrived?.spawn ?? undefined,
+        built.spawn ?? undefined,
       )
     ) {
       return;
     }
-    if (arrived !== null && arrived.box !== null) {
-      boxes = new Map([[arrived.box, { open: 1, target: 0 }]]);
-      boxLatched = arrived.box;
+    if (built.box !== null) {
+      boxes = new Map([[built.box, { open: 1, target: 0 }]]);
+      boxLatched = built.box;
     }
-    const here = loaded.place;
-    const path = gameEngramRoute(here.domain, here.permalink);
-    if (window.location.pathname !== path) opts.navigate(path);
+    const path = gameRouteOf(built.address);
+    const { pathname, search } = window.location;
+    if (pathname + search !== path) opts.navigate(path);
   };
 
   /**
@@ -785,10 +865,10 @@ export function createSession(opts: SessionOptions): Session {
   /**
    * Loads `address` and enters it once it lands (`settle`): the journey
    * behind `go` and the console room's exit, which lands with `landing`
-   * `"box"`.
+   * `"box"`. Without `SessionOptions.load` it loads through `loadStation`.
    */
   const travel = (
-    address: PlaceAddress,
+    address: StationAddress,
     arrival: Arrival | null,
     label: string | undefined,
     landing: "box" | null,
@@ -797,9 +877,7 @@ export function createSession(opts: SessionOptions): Session {
     const gen = leave();
     const loader: PlaceLoader | null =
       opts.load ??
-      (client === null
-        ? null
-        : (a, signal) => loadPlace(client, a.domain, a.permalink, signal));
+      (client === null ? null : (a, signal) => loadStation(client, a, signal));
     if (loader === null) {
       fail(FAILED.offline);
       return;
@@ -826,57 +904,79 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   const go = (
-    address: PlaceAddress,
+    address: StationAddress,
     arrival: Arrival | null = null,
     label?: string,
   ) => {
-    travel(address, arrival, label, null);
+    travel(canonicalStation(address), arrival, label, null);
   };
 
   const showCanned = (next: PlaceInput) => {
     if (disposed) return;
     leave();
-    const same =
-      current !== null &&
-      samePlace(current, { domain: next.domain, permalink: next.permalink });
-    enter(next, generateRoom(next), null, same);
+    const address: StationAddress = {
+      kind: "engram",
+      domain: next.domain,
+      permalink: next.permalink,
+    };
+    const same = sameStation(current, address);
+    enter(next, generateRoom(next), address, null, same);
   };
 
-  const showRoom = (built: RoomSpec, view?: { pitch: number }) => {
+  const showRoom = (
+    built: RoomSpec,
+    view?: { pitch: number },
+    at?: StationAddress,
+  ) => {
     if (disposed) return;
     leave();
-    if (!enter(null, built, null, false) || view === undefined) return;
+    if (!enter(null, built, at ?? null, null, false) || view === undefined)
+      return;
     if (player === null) return;
     const pitch = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, view.pitch));
     player = { ...player, pitch };
     previous = player;
   };
 
+  /**
+   * Goes through a way: to the station address its place names (a way to
+   * the MANIFEST lands on the bridge, C3), arriving from `current`, or
+   * with no arrival when the room has no address (`showRoom`'s gallery).
+   */
   const takeTravel = (travel: Travel) => {
-    if (current === null) return;
     latched = travel.fixture;
-    go(travel.address, { via: travel.via, from: current });
+    go(
+      stationOfPlace(travel.address),
+      current === null ? null : { via: travel.via, from: current },
+    );
     // Only a travel the session took can mark its way failed (M2).
     if (loading) travelling = { gen: generation, fixture: travel.fixture };
   };
 
   /**
    * Walks into the police box: cuts to the console room at once, under the
-   * address of the room left (C12), and starts reading the listing its
-   * inner doors pick from, giving up on it after `LISTING_WAIT_MS`. Does
-   * nothing without the console room option or with no room to return to.
+   * station address of the room left (C12), which stays `current`, and
+   * starts reading the listing its inner doors pick from, giving up on it
+   * after `LISTING_WAIT_MS`. The console room carries the domain of that
+   * address (`""` for none) and the room left's own key, its `permalink`
+   * (a deck's is its folder's slug with a `/`, M3 C10): an address has no
+   * permalink of its own for anything but an engram. A box stands in any
+   * room the hero pass runs in (an engram room, a deck, a hangar, a
+   * bridge), never the airlock, which has no heroes. Does nothing without
+   * the console room option or with no room to return to.
    */
   const cutIn = () => {
     const options = opts.consoleRoom;
     const from = current;
-    if (options === undefined || from === null) return;
+    const key = room?.permalink;
+    if (options === undefined || from === null || key === undefined) return;
     leave();
     const built = {
       ...consoleRoom(),
-      domain: from.domain,
-      permalink: from.permalink,
+      domain: domainOf(from) ?? "",
+      permalink: key,
     };
-    if (!enter(null, built, null, false)) return;
+    if (!enter(null, built, from, null, false)) return;
     inside = { from };
     exitLatched = false;
     exitRows = undefined;
@@ -904,14 +1004,13 @@ export function createSession(opts: SessionOptions): Session {
   /**
    * Walks out of the console room's inner doors: travels to the bridge of
    * a domain picked from the listing (C13), the connector naming it, to
-   * land with the arrival box (C14).
+   * land with the arrival box (C14). The domain of `from`, the address
+   * walked in from, is the one the pick leaves out, and the one it falls
+   * back to.
    */
-  const walkOut = (from: PlaceAddress) => {
-    const picked = pickExitDomain(
-      exitRows ?? [],
-      from.domain,
-      exitSeed(from.domain, ticks),
-    );
+  const walkOut = (from: StationAddress) => {
+    const own = domainOf(from) ?? "";
+    const picked = pickExitDomain(exitRows ?? [], own, exitSeed(own, ticks));
     travel(bridgeAddress(picked), null, picked, "box");
   };
 
@@ -1100,7 +1199,7 @@ export function createSession(opts: SessionOptions): Session {
         lookFlash = true;
       }
       if (input.pressed("KeyF") && current !== null) {
-        opts.openFluid(engramRoute(current.domain, current.permalink));
+        opts.openFluid(fluidRouteOfStation(current));
       }
       if (matched) openLevels();
     }
@@ -1328,6 +1427,9 @@ export function createSession(opts: SessionOptions): Session {
     },
     get current() {
       return current;
+    },
+    get where() {
+      return where();
     },
   };
 }

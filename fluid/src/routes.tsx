@@ -96,17 +96,21 @@ const LookDemo = import.meta.env.DEV
   : null;
 
 /**
- * The station itself, one engram's room at `/π/d/<domain>/e/<permalink>`,
- * and only in development until the game gets a way in of its own.
+ * The station itself, every place in it under one splat, `/π/*`, and only
+ * in development until the game gets a way in of its own.
  *
  * Gated the way the look demo is, so a production build has neither the
- * chunk nor the route. It sits inside `RequireAuth`, since every room is an
- * engram the account reads, and outside `Layout`, full screen. The splat
- * carries the permalink with its slashes, as the reading screen's route
- * does, so the two addresses convert by adding or dropping the `π` prefix.
- * That prefix is the Unicode character itself, deliberately hard to type:
- * the game is an Easter egg, meant to be reached from the C64 screen rather
- * than typed in, and there is no `/game` alias into it any more.
+ * chunk nor the route. It sits inside `RequireAuth`, since every room is
+ * built from what the account reads, and outside `Layout`, full screen. The
+ * route reads the location itself (`addressOfGameLocation` in
+ * `game/paths.ts`): `/π` is the airlock, `/π/d/<domain>` a domain's bridge,
+ * the same with `?path=<folder>` a deck and `/π/d/<domain>/e/<permalink>`
+ * an engram's room, each Fluid's own address under the `π` prefix, and any
+ * other path under it the airlock. The dev routes above it are more
+ * specific and outrank the splat. That prefix is the Unicode character
+ * itself, deliberately hard to type: the game is an Easter egg, meant to be
+ * reached from the C64 screen rather than typed in, and there is no `/game`
+ * alias into it any more.
  */
 const GameRoute = import.meta.env.DEV
   ? lazy(() => import("./game/GameRoute"))
@@ -198,7 +202,7 @@ export function AppRoutes() {
         )}
         {GameRoute === null ? null : (
           <Route
-            path="/π/d/:domain/e/*"
+            path="/π/*"
             element={
               <Suspense fallback={null}>
                 <GameRoute />
