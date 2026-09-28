@@ -13,9 +13,8 @@
  * primitives as everything square. Everything static lands in the room's
  * one vertex array; the moving parts of every way (door leaves, a door's
  * hazard lamp and sparks, a hatch's lid, a portal's swirl disc, a lift's
- * leaves) come back
- * as movers, each its own small mesh, for the renderer to slide, blink or
- * scale (`render/parts.ts`).
+ * leaves) come back as movers, each its own small mesh, for the renderer
+ * to slide, blink or scale (`render/parts.ts`).
  *
  * Every model stays inside its footprint (`FOOTPRINTS` in
  * `world/footprints.ts`) or, for what is mounted on the wall, inside the

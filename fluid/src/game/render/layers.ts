@@ -10,10 +10,11 @@
  * labels of doors, portals, hatches, machine tags and exits are packed six
  * to a layer, one label per row, so a hub with forty tags and twenty doors
  * does not ask the GPU for sixty layers. A lift's call panel and a
- * station screen each get a whole layer too (M3 C7, C24). `layerPlan` is the one place that
- * decides where each piece of text goes: the geometry asks it for a key's
- * layer and v range, and the text renderer draws each request into the row
- * the plan gave it, so a label always lands on the quad it was drawn for.
+ * station screen each get a whole layer too (M3 C7, C24). `layerPlan` is
+ * the one place that decides where each piece of text goes: the geometry
+ * asks it for a key's layer and v range, and the text renderer draws each
+ * request into the row the plan gave it, so a label always lands on the
+ * quad it was drawn for.
  *
  * Every layer is square; a quad is not. A whole layer is drawn stretched
  * vertically by its quad's aspect and the quad squeezes it back. A label
@@ -84,7 +85,12 @@ export const ROW_INSET = 0.5;
  * letters keep their shape. A hatch label is a label; a poster is shaped
  * like the placard. A `panel` is a lift's call panel screen (M3 C7),
  * taller than wide: its quad in `models/lift.ts` takes its height from
- * this aspect and its width, so the two cannot drift apart.
+ * this aspect and its width, so the two cannot drift apart. A `station` is
+ * a station wall screen (M3 C20, C24): a terminal's style on a quad about
+ * four fifths as wide as its glass (wider still and a dithered look no
+ * longer reads a line letter by letter at 2 m), and `SCREEN_LINES` rows
+ * instead of a terminal's nine; its quad in `models/lift.ts` takes its
+ * width from this aspect.
  */
 export const ASPECT = {
   screen: 1.25,
@@ -93,6 +99,7 @@ export const ASPECT = {
   placard: 1.4,
   poster: 1.4,
   panel: 0.8,
+  station: 1.6,
 } as const;
 
 /** The kinds of text, which set a request's aspect and its drawing style. */
@@ -114,7 +121,7 @@ export const KEY_MARK = "\u0001";
  * the fixture's index in `room.fixtures`), the kind of quad, which sets
  * its aspect and style, the lines to draw, and for a label (`label` or
  * `hatch`) its row within its layer; a whole-layer request (`screen`,
- * `placard`, `poster`, `panel`) has `row` null.
+ * `placard`, `poster`, `panel`, `station`) has `row` null.
  */
 export interface TextRequest {
   key: string;
@@ -152,7 +159,7 @@ function isLabel(kind: TextKind): boolean {
  * category on the first line, a door, a portal, a machine and an exit a
  * one-line label (a sealed door or portal says why it is sealed instead),
  * and a hatch a one-line hatch label. A lift gives a `panel` (`liftLines`)
- * and a station screen a `screen` of its lines, the key mark in front of
+ * and a station screen a `station` of its lines, the key mark in front of
  * each line `keys` names. Labels and hatch labels are numbered in this
  * order, the `n`th taking row `n % LABEL_ROWS`; whole-layer requests have
  * no row.
@@ -205,7 +212,7 @@ export function textRequests(room: RoomSpec): TextRequest[] {
       case "screen":
         out.push({
           key: `screen:${i}`,
-          kind: "screen",
+          kind: "station",
           lines: f.lines.map((l, n) => (f.keys.includes(n) ? KEY_MARK + l : l)),
         });
         break;

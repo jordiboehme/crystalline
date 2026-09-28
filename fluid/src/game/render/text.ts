@@ -20,10 +20,11 @@
  * pictogram (`SIGNS.key`) in front of it, one glyph wide and as tall as the
  * line, in the line's own colour; the mark itself is never drawn. A lift's
  * call panel (`panel`) lists up to `LIFT_LINES` stops and two more lines
- * in amber on black, with no heading.
+ * in amber on black, with no heading. A station wall screen (`station`)
+ * is drawn in the terminal's style, `SCREEN_LINES` rows on a wide quad.
  */
 
-import { LIFT_LINES } from "../world/lifts";
+import { LIFT_LINES, SCREEN_LINES } from "../world/lifts";
 import {
   ASPECT,
   KEY_MARK,
@@ -78,6 +79,7 @@ export function colours(
   const petscii = look.terminal === "petscii";
   switch (kind) {
     case "screen":
+    case "station":
       return {
         background: petscii
           ? (C64_PALETTE[6] ?? look.palette.screen)
@@ -101,14 +103,26 @@ export function colours(
   }
 }
 
-/** How many lines a whole-layer kind shows: the rows it is cut into. */
-const ROWS: Record<Exclude<TextKind, "label" | "hatch">, number> = {
+/**
+ * How many lines a whole-layer kind shows: the rows it is cut into. A
+ * lift's panel shows every stop it lists, the overflow line and the note;
+ * a station screen every one of its `SCREEN_LINES`.
+ */
+export const ROWS: Record<Exclude<TextKind, "label" | "hatch">, number> = {
   screen: 9,
   placard: 5,
   poster: 5,
-  // Every stop the panel lists, the overflow line and the note.
   panel: LIFT_LINES + 2,
+  station: SCREEN_LINES,
 };
+
+/**
+ * True for the kinds drawn in a terminal's style: a reverse-video heading
+ * and scanlines (a terminal's screen and a station screen).
+ */
+function crt(kind: TextKind): boolean {
+  return kind === "screen" || kind === "station";
+}
 
 /**
  * Draws one line of a multi-line request at `(x, y)` in the logical space,
@@ -134,11 +148,8 @@ function drawLine(
   ctx.translate(x, y);
   ctx.scale(px / 16, px / 16);
   ctx.strokeStyle = colour;
-  ctx.fillStyle = colour;
-  ctx.lineWidth = 1;
   SIGNS.key(ctx);
   ctx.restore();
-  ctx.fillStyle = colour;
   ctx.fillText(line.slice(KEY_MARK.length), x + px, y, width - px);
 }
 
@@ -194,7 +205,7 @@ function drawRequest(
     lines.slice(0, rows).forEach((line, i) => {
       const heading = i === 0 && request.kind !== "panel";
       ctx.font = `${heading ? "bold " : ""}${glyph}px ui-monospace, Menlo, Consolas, monospace`;
-      if (heading && request.kind === "screen") {
+      if (heading && crt(request.kind)) {
         // Headings in reverse video, as the CRT reader will draw them.
         ctx.fillStyle = css(ink);
         ctx.fillRect(px * 0.3, px * 0.4, size - px * 0.6, px);
@@ -219,7 +230,7 @@ function drawRequest(
         );
       }
     });
-    if (request.kind === "screen") {
+    if (crt(request.kind)) {
       // Scanlines.
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.fillStyle = "rgb(0 0 0 / 0.25)";

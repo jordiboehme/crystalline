@@ -146,7 +146,7 @@ function riseUnder(ctx: ModelContext, top: number, travel: number): number {
 }
 
 /** Where a door's leaves go: each into a mover of its own. */
-interface Leaves {
+export interface Leaves {
   /** Builds one leaf into a kit of its own, a mover along `axis`. */
   add(axis: V3, travel: number, build: (k: Kit) => void): void;
   movers: Mover[];
@@ -156,7 +156,7 @@ interface Leaves {
  * The leaves of door `index`, keyed `key`: each one a `leaf` mover built
  * in a fresh builder with a kit on the door's frame, at rest gain 1.
  */
-function leaves(f: Frame, key: string, index: number): Leaves {
+export function leaves(f: Frame, key: string, index: number): Leaves {
   const movers: Mover[] = [];
   return {
     movers,

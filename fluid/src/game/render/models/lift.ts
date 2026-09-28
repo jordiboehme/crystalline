@@ -17,22 +17,17 @@
  *   and a leaf parked west of the doors would leave the wall band.
  * - The **screen** is a dark bezel 1.6 by 0.9 m, its bottom at 1.4 m,
  *   around glass in the text layer's own background colour, with the
- *   `screen:<i>` text quad in the middle at the screen kind's aspect, and
- *   one green status lamp under it.
+ *   `screen:<i>` text quad (kind `station`, `SCREEN_LINES` rows) as tall
+ *   as the glass less a 0.02 m margin and centred on it, and one green
+ *   status lamp under it.
  * - The **exit** is the sliding door (`slidingDoor`) with its label drawn
  *   under `exit:<i>` and a small plate on its west jamb showing the
  *   `door` pictogram; its leaves, lamp and sparks keep the door keys.
  */
 
 import type { Fixture } from "../../world/types";
-import {
-  FLAG,
-  accentTint,
-  createBuilder,
-  type Surface,
-  type V3,
-} from "../geometry";
-import { DECAL_LIFT, createKit, frameForSlot, type Frame } from "../kit";
+import { FLAG, accentTint, type Surface, type V3 } from "../geometry";
+import { DECAL_LIFT, frameForSlot } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import { PICTOGRAM, colours } from "../text";
 import {
@@ -44,7 +39,7 @@ import {
   type ModelContext,
   type Mover,
 } from "./common";
-import { slidingDoor } from "./doors";
+import { leaves, slidingDoor } from "./doors";
 
 type Lift = Extract<Fixture, { kind: "lift" }>;
 type Screen = Extract<Fixture, { kind: "screen" }>;
@@ -98,7 +93,7 @@ const STRIP = { a0: -0.75, a1: 0.25, h0: 2.28, h1: 2.32, d: 0.015 } as const;
 
 /** The call panel on the pier: along, heights and its face's depth. */
 const PANEL = { a0: 0.5, a1: 0.8, h0: 1.1, h1: 1.65, d: FRAME_D + 0.035 };
-/** The panel's screen: its width, its top, and the margin round it. */
+/** The panel's screen: its width and its top. */
 const PANEL_SCREEN_W = 0.26;
 const PANEL_SCREEN_TOP = 1.63;
 /** The two call buttons: their height, radius, centres and depth. */
@@ -108,28 +103,6 @@ const BUTTON_A = [0.595, 0.705] as const;
 const BUTTON_D = 0.01;
 /** The buttons' glow: a warm white, the same in every look. */
 const BUTTON_TINT: V3 = [1, 0.9, 0.7];
-
-/** A leaf of the lift: a `leaf` mover under the door key, sliding east. */
-function leafMover(
-  f: Frame,
-  index: number,
-  travel: number,
-  build: (k: ReturnType<typeof createKit>) => void,
-): Mover {
-  const b = createBuilder();
-  build(createKit(b, f));
-  return {
-    key: `door:${index}`,
-    part: "leaf",
-    fixture: index,
-    mesh: b.build(),
-    axis: [...f.along],
-    travel,
-    pivot: null,
-    rest: 1,
-    swing: 0,
-  };
-}
 
 /**
  * The lift: frame, lit strip, call panel and its two leaves, returned as
@@ -220,15 +193,16 @@ export function buildLift(
     );
   });
 
-  // The leaves, brushed metal: each slides east until its west edge is
-  // just inside the pier, the far one twice as far as the near one.
-  const leaf = (edges: readonly [number, number, number, number]) => {
-    const [a0, a1, d0, d1] = edges;
-    return leafMover(f, index, LIFT_POCKET.a0 + PARK_GAP - a0, (m) => {
+  // The leaves, brushed metal, as the doors' leaf movers under the door
+  // key: each slides east until its west edge is just inside the pier,
+  // the far one twice as far as the near one.
+  const out = leaves(f, `door:${index}`, index);
+  for (const [a0, a1, d0, d1] of [FAR_LEAF, NEAR_LEAF]) {
+    out.add([...f.along], LIFT_POCKET.a0 + PARK_GAP - a0, (m) => {
       m.bevelBox(a0, a1, d0, d1, o.h0, o.h1 + TUCK / 2, 0.006, s.metal);
     });
-  };
-  return [leaf(FAR_LEAF), leaf(NEAR_LEAF)];
+  }
+  return out.movers;
 }
 
 /** The wall screen's bezel: half width, bottom, top and depth. */
@@ -238,6 +212,24 @@ const SCREEN_TOP = 2.3;
 const BEZEL_D = 0.06;
 /** How wide the bezel's rim is round the glass. */
 const BEZEL_RIM = 0.04;
+
+/**
+ * The wall screen's glass inside the bezel: `half` its half width along
+ * the wall, `h0` to `h1` its height. The text quad spans it less
+ * `TEXT_MARGIN` at the top and bottom, at `ASPECT.station`.
+ */
+export const SCREEN_GLASS = {
+  half: SCREEN_HALF - BEZEL_RIM,
+  h0: SCREEN_BOTTOM + BEZEL_RIM,
+  h1: SCREEN_TOP - BEZEL_RIM,
+} as const;
+/**
+ * The patch of the panel texture the glass shows: `size` square from
+ * `(at, at)`, inside one of the texture's four tiles and clear of the
+ * bevel lines at 0 and 0.5, which would otherwise draw a line across the
+ * middle of the glass.
+ */
+const GLASS_UV = { at: 0.1, size: 0.3 } as const;
 /** The text quad's margin inside the glass, top and bottom. */
 const TEXT_MARGIN = 0.02;
 /** The status lamp under the screen: its centre along, height and size. */
@@ -248,11 +240,12 @@ const LAMP_SIZE = 0.04;
 const LAMP_GREEN: V3 = [0.35, 1, 0.45];
 
 /**
- * The wall screen: the bezel, the glass in the screen text's background
- * colour, the `screen:<index>` text quad centred on it at `ASPECT.screen`
- * (the glass is wider than that aspect, so the text keeps its shape and
- * the glass either side reads as the same dark screen), and one status
- * lamp on a small mount under it.
+ * The wall screen: the bezel, the glass in the station text's background
+ * colour, the `screen:<index>` text quad as tall as the glass less
+ * `TEXT_MARGIN` top and bottom and centred on it, its width taken from
+ * `ASPECT.station` so the quad and the text layer cannot drift apart
+ * (the glass either side reads as the same screen), and one status lamp
+ * on a small mount under it.
  */
 export function buildScreen(
   kitAt: KitAt,
@@ -272,18 +265,23 @@ export function buildScreen(
     0.012,
     s.dark,
   );
-  const [g0, g1] = [SCREEN_BOTTOM + BEZEL_RIM, SCREEN_TOP - BEZEL_RIM];
-  const glassHalf = SCREEN_HALF - BEZEL_RIM;
+  // The glass samples one plain patch of the panel texture
+  // (`GLASS_UV`), clear of its bevel lines, so no seam crosses the glass.
+  const { half: glassHalf, h0: g0, h1: g1 } = SCREEN_GLASS;
   k.panel(
     -glassHalf,
     glassHalf,
     BEZEL_D + DECAL_LIFT,
     g0,
     g1,
-    s.glow(colours("screen", ctx.look).background),
+    s.glow(colours("station", ctx.look).background),
+    GLASS_UV.size,
+    GLASS_UV.size,
+    GLASS_UV.at,
+    GLASS_UV.at,
   );
   const h = g1 - g0 - 2 * TEXT_MARGIN;
-  const half = (h * ASPECT.screen) / 2;
+  const half = (h * ASPECT.station) / 2;
   textPanel(
     k,
     ctx,

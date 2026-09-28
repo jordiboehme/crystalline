@@ -37,7 +37,7 @@ import {
   frameForSlot,
   type Frame,
 } from "./kit";
-import { LAYER, TEXT_BASE, layerPlan } from "./layers";
+import { ASPECT, LAYER, TEXT_BASE, layerPlan } from "./layers";
 import { LOOKS } from "./looks";
 import {
   add,
@@ -78,7 +78,7 @@ import {
   type Mover,
 } from "./models";
 import { CASE_GLASS } from "./models/machines";
-import { LIFT_OPENING, LIFT_POCKET } from "./models/lift";
+import { LIFT_OPENING, LIFT_POCKET, SCREEN_GLASS } from "./models/lift";
 import { LIFT_WORDS } from "../world/lifts";
 import { liftsHallRoom } from "../world/canned";
 
@@ -736,6 +736,39 @@ describe("fixture models", () => {
               );
             expect(plates(leafParts)).toHaveLength(2);
             expect(plates(built.parts)).toEqual([]);
+          });
+        }
+
+        if (fx.kind === "screen") {
+          it("spreads its text across the glass at the station aspect (M3 C24)", () => {
+            // Mutation caught: the text quad sized at the terminal's
+            // `ASPECT.screen` (1.0 m of 1.52 m glass), or at an aspect of
+            // its own that drifts from the text layer's.
+            const text = built.parts.filter(
+              (p) => p.method === "panel" && p.layer === 11,
+            );
+            expect(text).toHaveLength(1);
+            const local = (text[0]?.points ?? []).map((q) => toLocal(wall, q));
+            const as = local.map((q) => q[0]);
+            const hs = local.map((q) => q[2]);
+            const w = Math.max(...as) - Math.min(...as);
+            const h = Math.max(...hs) - Math.min(...hs);
+            expect(w / h).toBeCloseTo(ASPECT.station, 6);
+            // 1.25 m of 1.52 m glass at `ASPECT.station` 1.6: the text keeps
+            // a glyph width a dithered look still reads at 2 m.
+            expect(w).toBeGreaterThanOrEqual(0.8 * 2 * SCREEN_GLASS.half);
+            expect(w).toBeLessThanOrEqual(2 * SCREEN_GLASS.half);
+          });
+        }
+
+        if (fx.kind === "exit") {
+          it("is never sealed: no hazard plate on its leaves (M3 C28)", () => {
+            // Mutation caught: the exit built as a sealed sliding door.
+            const leafParts = partsOf(built, "leaf");
+            expect(leafParts.length).toBeGreaterThan(0);
+            expect(leafParts.filter((p) => p.layer === LAYER.hazard)).toEqual(
+              [],
+            );
           });
         }
 

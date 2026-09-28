@@ -3,7 +3,8 @@ import { describe, expect, it } from "vitest";
 import { PROP_CATALOGUE } from "../world/props";
 import { LAYER_SIZE } from "./layers";
 import { LOOK_ORDER, LOOKS } from "./looks";
-import { colours, flipRows, PICTOGRAM, SIGN_PICTOGRAMS } from "./text";
+import { LIFT_LINES, SCREEN_LINES } from "../world/lifts";
+import { colours, flipRows, PICTOGRAM, ROWS, SIGN_PICTOGRAMS } from "./text";
 
 describe("flipRows", () => {
   it("turns the image upside down so row 0 is the bottom, as GL expects", () => {
@@ -76,6 +77,29 @@ describe("colours", () => {
       expect(ink).toHaveLength(3);
       expect(ink).not.toEqual(background);
     }
+  });
+});
+
+describe("the station screen's text (M3 C20, C24)", () => {
+  it("shares the terminal screen's colours, so the glass matches the text", () => {
+    // Mutation caught: the `station` case given colours of its own, so the
+    // screen's glass (drawn in the screen background) drifts from its text.
+    expect(LOOK_ORDER.length).toBeGreaterThan(0);
+    for (const id of LOOK_ORDER) {
+      expect(colours("station", LOOKS[id])).toEqual(
+        colours("screen", LOOKS[id]),
+      );
+    }
+  });
+});
+
+describe("ROWS", () => {
+  it("draws every line a lift panel and a station screen are given", () => {
+    // Mutation caught: the panel cut to 9 rows (the overflow line and the
+    // note lost from every lift panel), the station screen to the
+    // terminal's 9 (the airlock directory's last lines lost).
+    expect(ROWS.panel).toBe(LIFT_LINES + 2);
+    expect(ROWS.station).toBe(SCREEN_LINES);
   });
 });
 

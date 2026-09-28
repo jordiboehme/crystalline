@@ -49,9 +49,9 @@
  * The gallery, the hero hall and the lifts hall take a plain finish
  * (`plainFinish`: accent 0, wall pattern 0 everywhere); the variants hall
  * shows every wall pattern (`variantsHallRoom`). The gallery, the hero
- * hall and the lifts hall carry no decals (`decals: []`); the variants hall carries one of every decal kind
- * and tile on its south wall and its floor, and both stencils
- * (`variantsHallDecals`).
+ * hall and the lifts hall carry no decals (`decals: []`); the variants
+ * hall carries one of every decal kind and tile on its south wall and its
+ * floor, and both stencils (`variantsHallDecals`).
  */
 
 import { seedFor } from "../core/seed";
@@ -79,7 +79,7 @@ import {
   type Layout,
   type SlotPref,
 } from "./layout";
-import { LIFT_WORDS, airlockStops, deckLabel } from "./lifts";
+import { LIFT_WORDS, airlockStops, deckLabel, moreLine } from "./lifts";
 import { PROP_CATALOGUE, PROP_KINDS, USE_LANE_DEPTH } from "./props";
 import { wallAnchor } from "./sites";
 import type {
@@ -1239,6 +1239,23 @@ const LIFTS_HALL_DOMAINS: readonly { name: string; private: boolean }[] = [
 }));
 
 /**
+ * The domain lines of the lifts hall's screen, after its heading and its
+ * count: nine names, one of them twenty characters long, the longest a
+ * judge should read letter by letter, then the screen's overflow line.
+ */
+const LIFTS_HALL_SCREEN_DOMAINS = [
+  "beacon",
+  "cobalt",
+  "delta",
+  "research-notebook-22",
+  "ember",
+  "fjord",
+  "garnet",
+  "harbor",
+  "iris",
+];
+
+/**
  * The lifts hall (M3 C7, C24, C28): the gallery's room for the station's
  * three fixture kinds, for the dev-only route `/π/dev/gallery?hall=lifts`,
  * built by hand in a plain nine by six hall (`LIFTS_HALL_NEED`).
@@ -1250,8 +1267,11 @@ const LIFTS_HALL_DOMAINS: readonly { name: string; private: boolean }[] = [
  *   the key and the `> ` mark on one stop, the key alone on another, the
  *   overflow line and the note.
  * - The **screen** faces it across the hall on the north wall's centre
- *   edge, reading a private domain's name (the key on its heading) and
- *   its count, as a bridge's screen reads.
+ *   edge, all `SCREEN_LINES` of it: a private domain's name (the key on
+ *   its heading) and its count, as a bridge's screen reads, then a
+ *   directory of domains as the airlock's reads (`LIFTS_HALL_SCREEN_DOMAINS`,
+ *   the key on `delta`, one name twenty characters long) and an overflow
+ *   line.
  * - The **exit** stands on the south wall two cells east of the lift,
  *   labelled as the root deck, so it is judged from inside the room as an
  *   engram room's exit is seen.
@@ -1282,8 +1302,13 @@ export function liftsHallRoom(): RoomSpec {
     {
       kind: "screen",
       slot: { x: entrance.x, y: layout.hall.y0, side: "n" },
-      lines: ["atlas", `42 ${LIFT_WORDS.engrams}`],
-      keys: [0],
+      lines: [
+        "atlas",
+        `42 ${LIFT_WORDS.engrams}`,
+        ...LIFTS_HALL_SCREEN_DOMAINS,
+        moreLine(3),
+      ],
+      keys: [0, 4],
       seed: seedFor(seed, "screen"),
     },
     {

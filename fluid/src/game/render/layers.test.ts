@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_HUB, liftsHallRoom } from "../world/canned";
 import { generateRoom } from "../world/generate";
-import { LIFT_WORDS } from "../world/lifts";
+import { LIFT_LINES, LIFT_WORDS } from "../world/lifts";
 import type { Fixture, LiftStop, RoomSpec } from "../world/types";
 import {
   KEY_MARK,
@@ -147,9 +147,28 @@ describe("textRequests for the station's fixtures (M3 C7, C24, C28)", () => {
     expect(requests.map((r) => r.lines)).toEqual([["A", "> B", "C"]]);
   });
 
+  it("writes no overflow line for a lift of exactly LIFT_LINES stops", () => {
+    // Mutation caught: the overflow test written `>=`, which gives a lift
+    // of ten stops a `+0 MORE` line.
+    const labels = Array.from(
+      { length: LIFT_LINES },
+      (_, i) => `S${String(i)}`,
+    );
+    const requests = textRequests(
+      only(
+        lift(
+          labels.map((l) => stop(l)),
+          null,
+        ),
+      ),
+    );
+    expect(requests.map((r) => r.lines)).toEqual([labels]);
+  });
+
   it("marks only a screen's key lines, and labels an exit under its own key", () => {
     // Mutation caught: the key on every line of a screen, or on none; the
-    // exit's label keyed `door:<i>` or drawn as a whole layer.
+    // screen drawn as a terminal's `screen` kind (9 rows at the terminal's
+    // aspect); the exit's label keyed `door:<i>` or drawn as a whole layer.
     const requests = textRequests(
       only(
         {
@@ -171,7 +190,7 @@ describe("textRequests for the station's fixtures (M3 C7, C24, C28)", () => {
     expect(requests).toEqual([
       {
         key: "screen:0",
-        kind: "screen",
+        kind: "station",
         row: null,
         lines: [`${KEY_MARK}ALPHA`, "3 ENGRAMS"],
       },
