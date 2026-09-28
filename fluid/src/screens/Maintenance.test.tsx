@@ -270,6 +270,49 @@ function acknowledgedTwinPayload() {
   });
 }
 
+/** One possible contradiction between two engrams, in the engine's own shape. */
+function contradictionPayload() {
+  return evolvePayload({
+    total: 1,
+    count: 1,
+    families: [{ family: "meaning", findings: 1 }],
+    queue: [
+      {
+        n: 1,
+        priority: 85,
+        rule: "V302",
+        class: "judgment",
+        domain: "eng",
+        permalink: "ci-runtime",
+        title: "CI runtime",
+        line: 7,
+        finding:
+          '"The build uses Node 20" (CI runtime) against "The build uses Node 18" (Node version) read as a contradiction at probability 0.91',
+        evidence:
+          "eng/ci-runtime line 7; eng/node-version line 5; probability 0.91; model mdeberta-v3-base-xnli-2mil7",
+        fix: "read both then supersede or close a window or acknowledge V302",
+        scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
+        counterpart: "node-version",
+        counterpart_title: "Node version",
+        counterpart_line: 5,
+        probability: 0.91,
+      },
+    ],
+    actions: [
+      {
+        rule: "V302",
+        summary: "possible contradiction",
+        instruction:
+          "The model read these two observations as contradicting each other.",
+      },
+    ],
+    acknowledged: {
+      total: 0,
+      by_family: { temporal: 0, structure: 0, redundancy: 0, meaning: 0 },
+    },
+  });
+}
+
 /** A sweep whose acknowledgment was given for evidence that has since moved. */
 function stalePayload() {
   const base = evolvePayload();
@@ -302,14 +345,21 @@ function cappedPayload() {
   });
 }
 
-/** A sweep that found nothing at all. */
-function cleanPayload() {
+/**
+ * A sweep that found nothing at all.
+ *
+ * Takes overrides for the same reason `evolvePayload` does: a cap can fire
+ * with an empty page (V302's pair cap is the case in point), and that is a
+ * different question from what the queue itself holds.
+ */
+function cleanPayload(overrides: Record<string, unknown> = {}) {
   return evolvePayload({
     total: 0,
     count: 0,
     families: [],
     queue: [],
     actions: [],
+    ...overrides,
   });
 }
 
@@ -728,7 +778,9 @@ describe("the maintenance screen", () => {
   });
 
   it("says an empty queue is good news rather than a failure", async () => {
-    await open({ "/evolve": cleanPayload });
+    // Wrapped rather than passed bare: `cleanPayload` now takes overrides, and
+    // a route handler is called with the path as its first argument.
+    await open({ "/evolve": () => cleanPayload() });
 
     expect(await screen.findByText(/nothing is waiting/i)).toBeVisible();
     // The one thing on this screen that must never wear an alert.
@@ -755,6 +807,31 @@ describe("the maintenance screen", () => {
 
     expect(
       await screen.findByText(/eng - findings capped at 200/),
+    ).toBeVisible();
+  });
+
+  it("names a cap even when the queue it capped is otherwise empty", async () => {
+    // V302's pair cap can leave nothing in the page at all - the note that
+    // some pairs were not scored yet, or that the model is blocked, still has
+    // to be said, or a reader sees good news that is really an incomplete
+    // sweep. Both strings are the engine's own
+    // (crates/index/src/sweep/contradictions.rs), not invented for this test.
+    await open({
+      "/evolve": () =>
+        cleanPayload({
+          truncations: [
+            "V302: 3 related pairs not scored yet (the daemon scores them after embedding)",
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)",
+          ],
+        }),
+    });
+
+    expect(await screen.findByText(/nothing is waiting/i)).toBeVisible();
+    expect(
+      await screen.findByText(/3 related pairs not scored yet/),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/contradiction model could not be loaded/),
     ).toBeVisible();
   });
 
@@ -1144,6 +1221,50 @@ describe("acknowledging a finding", () => {
       rule: "V301",
       note: "distinct, linked",
       scope: "eng/hub, eng/second",
+    });
+  });
+
+  it("draws a V302 row with both engrams linked and the probability, and acknowledges the pair of lines", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": contradictionPayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    const row = defined(
+      rows(await section(/^Meaning/))[0],
+      "the possible contradiction",
+    );
+    expect(row).toHaveTextContent(
+      "read as a contradiction at probability 0.91",
+    );
+    expect(
+      within(row).getByRole("link", { name: "CI runtime" }),
+    ).toHaveAttribute("href", "/d/eng/e/ci-runtime");
+    expect(
+      within(row).getByRole("link", { name: "Node version" }),
+    ).toHaveAttribute("href", "/d/eng/e/node-version");
+    // The chip, named for a screen reader and drawn as the bare number.
+    expect(within(row).getByText("Probability")).toBeInTheDocument();
+    expect(within(row).getByText("0.91")).toBeInTheDocument();
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    // Empty is omitted rather than sent, same as every other row: `ackBody`
+    // drops a note that trims to nothing.
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "ci-runtime",
+      rule: "V302",
+      scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
     });
   });
 

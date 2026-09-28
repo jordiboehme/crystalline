@@ -204,6 +204,10 @@ describe("the evolve payload", () => {
       // named by its engram and its rule, and sends neither.
       scope: null,
       ackScope: null,
+      // Both are `V302`'s alone: a row that fires on no counterpart reads as
+      // neither having one nor scoring anything.
+      counterpart: null,
+      probability: null,
     });
     expect(defined(queue.queue[1], "the second finding").line).toBe(12);
     expect(queue.actions).toContainEqual({
@@ -456,6 +460,89 @@ describe("the acknowledgment fields", () => {
     expect(finding.acknowledged).toBe(false);
     expect(finding.ackStale).toBe(true);
     expect(finding.ackNote).toBe("lineage citation, keep");
+  });
+
+  it("reads a V302 row's counterpart and probability, and nulls them elsewhere", () => {
+    const queue = readEvolveQueue({
+      queue: [
+        {
+          n: 1,
+          priority: 85,
+          rule: "V302",
+          class: "judgment",
+          domain: "eng",
+          permalink: "ci-runtime",
+          title: "CI runtime",
+          line: 7,
+          finding: "a possible contradiction",
+          evidence: "e",
+          fix: "f",
+          scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
+          counterpart: "node-version",
+          counterpart_title: "Node version",
+          counterpart_line: 5,
+          probability: 0.91,
+        },
+        {
+          n: 2,
+          priority: 50,
+          rule: "V006",
+          class: "judgment",
+          domain: "eng",
+          permalink: "p",
+          title: "P",
+          line: null,
+          finding: "f",
+          evidence: "e",
+          fix: "x",
+        },
+      ],
+    });
+
+    expect(queue.queue[0]?.counterpart).toEqual({
+      permalink: "node-version",
+      title: "Node version",
+      line: 5,
+    });
+    expect(queue.queue[0]?.probability).toBe(0.91);
+    expect(queue.queue[1]?.counterpart).toBeNull();
+    expect(queue.queue[1]?.probability).toBeNull();
+  });
+
+  it("falls back to the permalink for a counterpart with no title, and drops one with no permalink", () => {
+    // A counterpart without its permalink would be a link to nowhere, so it
+    // is read as no counterpart at all rather than half of one.
+    expect(
+      readEvolveQueue({
+        queue: [
+          {
+            n: 1,
+            priority: 1,
+            rule: "V302",
+            domain: "eng",
+            permalink: "a",
+            counterpart_title: "Untitled",
+            probability: 0.5,
+          },
+        ],
+      }).queue[0]?.counterpart,
+    ).toBeNull();
+
+    expect(
+      readEvolveQueue({
+        queue: [
+          {
+            n: 1,
+            priority: 1,
+            rule: "V302",
+            domain: "eng",
+            permalink: "a",
+            counterpart: "b",
+            probability: 0.5,
+          },
+        ],
+      }).queue[0]?.counterpart,
+    ).toEqual({ permalink: "b", title: "b", line: null });
   });
 });
 

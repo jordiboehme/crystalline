@@ -653,6 +653,14 @@ function FindingRow({
           <span className="sr-only">{"Finding class "}</span>
           {finding.class}
         </Chip>
+        {finding.probability !== null && (
+          <Chip>
+            <span className="sr-only">{"Probability "}</span>
+            <span className="tabular-nums">
+              {finding.probability.toFixed(2)}
+            </span>
+          </Chip>
+        )}
         {finding.acknowledged && <Chip>acknowledged</Chip>}
         {anchored ? (
           <Link
@@ -672,6 +680,26 @@ function FindingRow({
         </span>
       </div>
       <p className="mt-1 text-sm">{finding.finding}</p>
+      {finding.counterpart !== null && (
+        <p className="text-caption mt-0.5 text-slate-500 dark:text-slate-400">
+          {/*
+            "Read as", not "against": every visible V302 sentence says
+            "possible" or "read as" rather than stating the two engrams
+            contradict, and this is the one line here that names the other
+            engram.
+          */}
+          {"Read as contradicting "}
+          <Link
+            to={engramRoute(finding.domain, finding.counterpart.permalink)}
+            className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+          >
+            {finding.counterpart.title}
+          </Link>
+          {finding.counterpart.line !== null &&
+            ` line ${String(finding.counterpart.line)}`}
+          {". A model's reading, never a verdict."}
+        </p>
+      )}
       <p className="text-caption mt-0.5 font-mono break-words text-slate-500 dark:text-slate-400">
         {finding.evidence}
       </p>

@@ -24,6 +24,7 @@
 
 import { api, encodeSegment } from "./client";
 import { asArray, asNumber, asObject, asString } from "./json";
+import type { JsonObject } from "./json";
 import type { AckBody } from "./model";
 
 /** The detector families, in the catalog's own order. */
@@ -146,14 +147,14 @@ export interface EvolveFinding {
   /** The note the matching or stale acknowledgment carries, when it has one. */
   ackNote: string | null;
   /**
-   * The evidence this row fired on, which the sweep sends for `V301` alone.
-   *
-   * It is the one rule that fires more than once on an engram - an engram can
-   * be the semantic twin of several others - so the engram and the rule do not
-   * name the finding and this is what tells two rows apart. Send it back to
-   * acknowledge the pair that was read rather than whichever one the server
-   * would have picked. Null for every other rule, which answers for its engram
-   * and has nothing to choose between.
+   * The evidence this row fired on, which the sweep sends for `V301` and
+   * `V302` alone. They are the two rules that fire more than once on an
+   * engram - an engram can be the semantic twin of several others, and
+   * several of its lines can read as contradicting another engram's - so the
+   * engram and the rule do not name the finding and this is what tells two
+   * rows apart. Send it back to acknowledge the pair that was read rather
+   * than whichever one the server would have picked. Null for every other
+   * rule, which answers for its engram and has nothing to choose between.
    */
   scope: string | null;
   /**
@@ -167,6 +168,16 @@ export interface EvolveFinding {
    * nothing in particular.
    */
   ackScope: string | null;
+  /**
+   * The other engram of a `V302` row: its permalink in the row's own domain,
+   * its title and the line of its observation. Null for every other rule.
+   */
+  counterpart: { permalink: string; title: string; line: number | null } | null;
+  /**
+   * The model's contradiction probability for a `V302` row, 0 to 1, as the
+   * finding text states it. Null for every other rule.
+   */
+  probability: number | null;
 }
 
 /** What acknowledgments kept out of the queue. */
@@ -258,6 +269,21 @@ function readClass(value: unknown): EvolveClass {
   return value === "mechanical" ? "mechanical" : DEFAULT_EVOLVE_CLASS;
 }
 
+/** A `V302` row's other engram, or null when the row names none. */
+function counterpartOf(
+  record: JsonObject | null,
+): EvolveFinding["counterpart"] {
+  const permalink = asString(record?.counterpart);
+  if (permalink === null) {
+    return null;
+  }
+  return {
+    permalink,
+    title: asString(record?.counterpart_title) ?? permalink,
+    line: asNumber(record?.counterpart_line),
+  };
+}
+
 /**
  * Read one finding, or null when it names neither a rule nor a domain.
  *
@@ -302,6 +328,10 @@ function readFinding(value: unknown): EvolveFinding | null {
     ackNote: asString(record?.ack_note),
     scope: asString(record?.scope),
     ackScope: asString(record?.ack_scope),
+    // Both halves or nothing: a counterpart without its permalink would be a
+    // link to nowhere.
+    counterpart: counterpartOf(record),
+    probability: asNumber(record?.probability),
   };
 }
 
@@ -490,10 +520,11 @@ export async function acknowledgeFinding(
 /**
  * Take an acknowledgment back, leaving the engram's other rules alone.
  *
- * A rule has one acknowledgment, so this takes back one - except `V301`, which
- * has one per twin pair. Pass the row's own {@link EvolveFinding.ackScope},
- * the entry the engram actually holds, and the engram's other pairs stay
- * silenced; omit it and every pair goes at once.
+ * A rule has one acknowledgment, so this takes back one - except `V301` and
+ * `V302`, which have one per pair. Pass the row's own
+ * {@link EvolveFinding.ackScope}, the entry the engram actually holds, and
+ * the engram's other pairs stay silenced; omit it and every pair goes at
+ * once.
  */
 export async function unacknowledgeFinding(
   domain: string,
