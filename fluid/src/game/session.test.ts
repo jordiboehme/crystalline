@@ -36,6 +36,7 @@ import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
   LIFT_RIDE_MS,
+  LOOK_NOTICE_MS,
   LISTING_WAIT_MS,
   NOTICE_MS,
   RECONFIGURING,
@@ -3317,6 +3318,61 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     }
   });
 
+  it("ends the ride's sound once when the stop fails, the load errors or a new place drops the ride (M4 F16)", async () => {
+    // Mutation caught: the arrive sent only for a landing that enters a
+    // room (a failed stop keeps the hum), or dropped from the load's
+    // error path or from `leave`.
+    const arrives = (cues: readonly Cue[]) =>
+      cues.filter((c) => c.kind === "ride" && c.phase === "arrive").length;
+    const cases: {
+      name: string;
+      load: PlaceLoader;
+      after: (session: Session) => void;
+    }[] = [
+      {
+        name: "missing",
+        load: (a, signal) =>
+          a.kind === "bridge"
+            ? Promise.resolve({ kind: "missing" })
+            : stationLoad(a, signal),
+        after: () => undefined,
+      },
+      {
+        name: "error",
+        load: (a, signal) =>
+          a.kind === "bridge"
+            ? Promise.reject(new Error("broken"))
+            : stationLoad(a, signal),
+        after: () => undefined,
+      },
+      {
+        name: "leave",
+        load: (a, signal) =>
+          a.kind === "bridge"
+            ? new Promise<LoadedStation>(() => undefined)
+            : stationLoad(a, signal),
+        after: (session) => {
+          session.jump("eng");
+        },
+      },
+    ];
+    for (const c of cases) {
+      const { cues, sink } = recordSound();
+      const { session } = atDeckLift(c.load, undefined, sink);
+      pressUse();
+      session.ride(stopTo("bridge"));
+      expect(cues.at(-1), c.name).toEqual({ kind: "ride", phase: "depart" });
+      expect(arrives(cues), c.name).toBe(0);
+      c.after(session);
+      await flush();
+      crank(LIFT_RIDE_MS + 200);
+      await flush();
+      expect(arrives(cues), c.name).toBe(1);
+      expect(session.current?.kind, c.name).toBe("deck");
+      session.dispose();
+    }
+  });
+
   it("rides to the stop the lift already stands at by only closing the overlay", () => {
     // Mutation caught: `stop.here` ignored, so picking the current section
     // starts a ride and reloads the deck the player is already standing in
@@ -4833,6 +4889,117 @@ describe("sound cues (M4 Task 7)", () => {
     const order = kinds(cues);
     expect(order.indexOf("door")).toBeLessThan(order.indexOf("travel"));
     expect(order.lastIndexOf("room")).toBeGreaterThan(order.indexOf("travel"));
+  });
+
+  it("sends no step while anything is modal or a place loads", () => {
+    // Mutation caught: steps sent while the player may not move (the
+    // stride still drifts on after the keys are taken).
+    const takes: { name: string; take: (s: Session) => void }[] = [
+      {
+        name: "busy",
+        take: (s) => {
+          s.setBusy(true);
+        },
+      },
+      {
+        name: "loading",
+        take: (s) => {
+          s.go(engramAt("eng", "beta"));
+        },
+      },
+    ];
+    for (const { name, take } of takes) {
+      for (let walk = 6; walk <= 40; walk += 2) {
+        const { cues, sink } = recordSound();
+        const session = start({
+          client: null,
+          load: () => new Promise<LoadedStation>(() => undefined),
+          sound: sink,
+        });
+        session.showRoom(backFromBulkhead(), undefined, GALLERY_AT);
+        key("keydown", "ShiftLeft");
+        key("keydown", "KeyW");
+        frames(walk);
+        const mark = cues.length;
+        take(session);
+        frames(20);
+        key("keyup", "KeyW");
+        key("keyup", "ShiftLeft");
+        expect(
+          cues.slice(mark).some((c) => c.kind === "step"),
+          `${name} after ${String(walk)}`,
+        ).toBe(false);
+        session.dispose();
+      }
+    }
+  });
+
+  it("marks a running step, and a walking one not", () => {
+    // Mutation caught: the run flag not carried.
+    for (const running of [false, true]) {
+      const { cues, sink } = recordSound();
+      const session = start({ client: null, sound: sink });
+      session.showRoom(backFromBulkhead(), undefined, GALLERY_AT);
+      if (running) key("keydown", "ShiftLeft");
+      key("keydown", "KeyW");
+      frames(30);
+      key("keyup", "KeyW");
+      key("keyup", "ShiftLeft");
+      const steps = cues.filter(
+        (c): c is Extract<Cue, { kind: "step" }> => c.kind === "step",
+      );
+      expect(steps.length).toBeGreaterThanOrEqual(2);
+      expect(steps.every((c) => c.run === running)).toBe(true);
+      session.dispose();
+    }
+  });
+
+  it("sends the police box's doors as they turn", () => {
+    // Mutation caught: the boxes' doors left out of the cues.
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    standAtBox(session);
+    cues.length = 0;
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    frames(20);
+    const doors = cues.filter((c) => c.kind === "door");
+    expect(doors).toHaveLength(1);
+    expect(doors[0]).toMatchObject({ sound: "box", open: true });
+  });
+
+  it("sends nothing once disposed", () => {
+    // Mutation caught: the dispose guard on the cues removed.
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    session.dispose();
+    cues.length = 0;
+    session.jump("eng");
+    expect(cues).toEqual([]);
+  });
+
+  it("keeps the mute notice up for LOOK_NOTICE_MS", () => {
+    // Mutation caught: the notice held for the failure notice's length.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { sink } = recordSound([true]);
+      const session = start({ client: null, sound: sink });
+      session.showCanned(CANNED_BRIDGE);
+      frames(1);
+      key("keydown", "KeyM");
+      frames(1);
+      key("keyup", "KeyM");
+      expect(hud.notice).toHaveBeenLastCalledWith("SOUND OFF");
+      vi.advanceTimersByTime(LOOK_NOTICE_MS - 1);
+      expect(hud.notice).toHaveBeenLastCalledWith("SOUND OFF");
+      vi.advanceTimersByTime(1);
+      expect(hud.notice).toHaveBeenLastCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("mutes on M and flashes the state", () => {

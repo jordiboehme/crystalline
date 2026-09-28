@@ -23,11 +23,14 @@ import type { Player } from "../world/move";
 import type { RoomSpec } from "../world/types";
 
 /**
- * What a door-like thing sounds as: a door by its style, a hatch's lid,
- * a lift's doors, a room's exit and a police box's doors.
+ * What a door-like thing sounds as: a door by its style, a room's exit
+ * and a police box's doors. A hatch and a lift send no door cue: a
+ * hatch's lid has no door state (Space at it travels at once, so its pop
+ * is the `travel` cue `hatch`), and a lift's doors only ever head shut
+ * (C27), so their opening and closing are the `ride` cues' `depart` and
+ * `arrive`.
  */
-export type DoorSound =
-  "sliding" | "bulkhead" | "blast" | "hatch" | "lift" | "exit" | "box";
+export type DoorSound = "sliding" | "bulkhead" | "blast" | "exit" | "box";
 
 /**
  * The drone a room loops (C22): an engram room's by its condition, the
@@ -154,8 +157,6 @@ function fixtureSound(f: RoomSpec["fixtures"][number]): DoorSound | null {
   switch (f.kind) {
     case "door":
       return f.style;
-    case "hatch":
-    case "lift":
     case "exit":
       return f.kind;
     default:
