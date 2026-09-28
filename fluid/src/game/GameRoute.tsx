@@ -44,6 +44,14 @@
  * replaces the URL when it lands. Esc hands the keys back through
  * `closeLevels`.
  *
+ * Space at a lift opens its stops over the station (`LiftSelect`): the
+ * session says so through `onLift`, which only this route passes, so the
+ * look demo and the model gallery ignore the key. The overlay lists the
+ * lift's own stops, in the lift's own order, and on Enter or a click asks
+ * the session to `ride` to that stop's index in the lift's stops, a journey
+ * like any other that replaces the URL when it lands. Esc hands the keys
+ * back through `closeLift`.
+ *
  * Only this route passes the session its `consoleRoom` option, so only
  * here does walking through a police box's open doors lead into the
  * console room, and its inner doors out to a domain's bridge picked from
@@ -74,9 +82,10 @@ import { createSession, type Session } from "./session";
 import { DeviceRefusal } from "./ui/DeviceRefusal";
 import { GAME_LEGEND } from "./ui/keys";
 import { LevelSelect } from "./ui/LevelSelect";
+import { LiftSelect } from "./ui/LiftSelect";
 import { StationView } from "./ui/StationView";
 import { useHud } from "./ui/useHud";
-import type { StationAddress } from "./world/types";
+import type { LiftStop, StationAddress } from "./world/types";
 
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
@@ -121,6 +130,10 @@ export default function GameRoute() {
     refusalReason(detectEnvironment(hasWebGL2)),
   );
   const [levels, setLevels] = useState(false);
+  const [lift, setLift] = useState<{
+    stops: LiftStop[];
+    note: string | null;
+  } | null>(null);
 
   useEffect(() => {
     navigateRef.current = navigate;
@@ -146,6 +159,7 @@ export default function GameRoute() {
       openFluid,
       forceRgba8: false,
       onLevels: setLevels,
+      onLift: setLift,
       consoleRoom: { domains: (signal) => loadDomainRows(client, signal) },
     });
     sessionRef.current = session;
@@ -184,6 +198,12 @@ export default function GameRoute() {
   const jump = useCallback((name: string) => {
     sessionRef.current?.jump(name);
   }, []);
+  const closeLift = useCallback(() => {
+    sessionRef.current?.closeLift();
+  }, []);
+  const ride = useCallback((stop: number) => {
+    sessionRef.current?.ride(stop);
+  }, []);
 
   if (refusal !== null) return <DeviceRefusal />;
   return (
@@ -202,6 +222,14 @@ export default function GameRoute() {
           current={domainOf(address) ?? ""}
           onJump={jump}
           onClose={closeLevels}
+        />
+      )}
+      {lift !== null && (
+        <LiftSelect
+          stops={lift.stops}
+          note={lift.note}
+          onRide={ride}
+          onClose={closeLift}
         />
       )}
     </>
