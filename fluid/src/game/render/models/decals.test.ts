@@ -352,9 +352,9 @@ describe("the decal recipe", () => {
   });
 
   it(`keeps a room's decals under ${String(DECAL_BUDGET)} triangles: the hub at every condition and at the cap (2.7 C21)`, () => {
-    // Mutation caught: a stencil drawn a quad per pixel instead of per
-    // run, or dark runs drawn too, which takes the derelict hub past the
-    // budget.
+    // Mutation caught: a stencil's runs drawn as boxes (six faces each,
+    // as `pixelBoxes` lays them) instead of one quad each, which takes the
+    // derelict hub past the budget.
     expect(DECAL_BUDGET).toBe(1500);
     const rooms = [
       ...["stable", "draft", "deprecated", "archived"].map((status) =>
