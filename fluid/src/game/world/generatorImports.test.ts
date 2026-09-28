@@ -98,6 +98,12 @@ function resolveFrom(importer: string, spec: string): string | null {
 /** The session side, as paths from `fluid/src/game/`; a folder covers what is under it. */
 const SESSION_SIDE = [
   "world/diff",
+  "world/move",
+  "world/malfunction",
+  "world/interact",
+  "world/box",
+  "world/arrival",
+  "world/station",
   "data/changes",
   "audio",
   "ui",

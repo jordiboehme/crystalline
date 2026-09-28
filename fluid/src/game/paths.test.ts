@@ -10,25 +10,29 @@ import {
   domainOf,
   fluidRouteOf,
   fluidRouteOfStation,
-  gameEngramRoute,
   gameRouteOf,
   placeKeyOf,
   sameStation,
   stationOfPlace,
 } from "./paths";
 
-describe("gameEngramRoute", () => {
+/** An engram address, for the tests that only care about its route. */
+function engramAt(domain: string, permalink: string): StationAddress {
+  return { kind: "engram", domain, permalink };
+}
+
+describe("gameRouteOf, an engram address", () => {
   it("mirrors the engram route under the encoded π prefix", () => {
-    expect(gameEngramRoute("eng", "notes/deep/gamma")).toBe(
+    expect(gameRouteOf(engramAt("eng", "notes/deep/gamma"))).toBe(
       "/%CF%80/d/eng/e/notes/deep/gamma",
     );
   });
 
   it("encodes segments the way engramRoute does", () => {
-    expect(gameEngramRoute("my eng", "a b/c d")).toBe(
+    expect(gameRouteOf(engramAt("my eng", "a b/c d"))).toBe(
       "/%CF%80/d/my%20eng/e/a%20b/c%20d",
     );
-    expect(gameEngramRoute("my eng", "a b/c d")).toBe(
+    expect(gameRouteOf(engramAt("my eng", "a b/c d"))).toBe(
       `/%CF%80${engramRoute("my eng", "a b/c d")}`,
     );
   });
@@ -44,7 +48,7 @@ describe("gameEngramRoute", () => {
     const encodedPathname = new URL("/%CF%80/d/eng/e/x", "http://example.test")
       .pathname;
     expect(rawPathname).toBe(encodedPathname);
-    expect(gameEngramRoute("eng", "x")).toBe(rawPathname);
+    expect(gameRouteOf(engramAt("eng", "x"))).toBe(rawPathname);
   });
 
   it("would NOT match window.location.pathname if built from the raw character", () => {
@@ -54,7 +58,7 @@ describe("gameEngramRoute", () => {
     const rawBuilt = `/${"π"}${engramRoute("eng", "x")}`;
     const browserPathname = new URL(rawBuilt, "http://example.test").pathname;
     expect(rawBuilt).not.toBe(browserPathname);
-    expect(gameEngramRoute("eng", "x")).toBe(browserPathname);
+    expect(gameRouteOf(engramAt("eng", "x"))).toBe(browserPathname);
   });
 });
 
@@ -69,7 +73,7 @@ describe("fluidRouteOf", () => {
     ["encoded prefix with trailing slash", "/%CF%80/", "/"],
     [
       "a game engram route round-tripped",
-      gameEngramRoute("eng", "x y/z"),
+      gameRouteOf(engramAt("eng", "x y/z")),
       engramRoute("eng", "x y/z"),
     ],
     [
@@ -140,11 +144,42 @@ describe("station addresses (M3 C1 to C5)", () => {
       "/%CF%80/d/e/e/e/x",
       "/d/e/e/e/x",
     ],
+    [
+      { kind: "deck", domain: "eng", folder: "?", section: 0 },
+      "/%CF%80/d/eng?path=%3F",
+      "/d/eng?path=%3F",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "%", section: 0 },
+      "/%CF%80/d/eng?path=%25",
+      "/d/eng?path=%25",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "'", section: 0 },
+      "/%CF%80/d/eng?path=%27",
+      "/d/eng?path='",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "a/b c/d", section: 0 },
+      "/%CF%80/d/eng?path=a%2Fb%20c%2Fd",
+      "/d/eng?path=a%2Fb%20c%2Fd",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "x.md", section: 0 },
+      "/%CF%80/d/eng?path=x.md",
+      "/d/eng?path=x.md",
+    ],
   ];
 
   it("round-trips every address kind through its route, awkward names included (Review Focus 1)", () => {
     // Mutation caught: a section written 0-based, `path` written with
-    // URLSearchParams (a space as `+`), a domain called `e` read as an engram route.
+    // URLSearchParams (a space as `+`), a domain called `e` read as an engram
+    // route. The `?`, `%`, `'`, `a/b c/d` and `x.md` folders pin punctuation
+    // `encodeURIComponent` treats differently from a browser's own query
+    // serialiser (`'` above all, M3 fix wave): `url.pathname + url.search`
+    // is what a real landing compares against, so that is what `game` names
+    // here, while `fluidRouteOfStation`'s own raw builder output (`fluid`)
+    // is compared unnormalised.
     expect(cases.length).toBeGreaterThan(0);
     for (const [address, game, fluid] of cases) {
       const url = new URL(gameRouteOf(address), "http://x");
@@ -157,12 +192,28 @@ describe("station addresses (M3 C1 to C5)", () => {
   it("reads the MANIFEST route as the bridge and an unknown game path as the airlock", () => {
     // Mutation caught: a nested `manifest` canonicalised, an unknown game
     // path answered null (the route would render nothing), a bad section
-    // number passed through.
+    // number passed through, or `=== "MANIFEST"` replacing the
+    // case-insensitive compare (caught directly here rather than only
+    // through interact.test.ts's arrivalSpawn test).
     expect(
       canonicalStation({
         kind: "engram",
         domain: "eng",
         permalink: "MANIFEST",
+      }),
+    ).toEqual({ kind: "bridge", domain: "eng" });
+    expect(
+      canonicalStation({
+        kind: "engram",
+        domain: "eng",
+        permalink: "manifest",
+      }),
+    ).toEqual({ kind: "bridge", domain: "eng" });
+    expect(
+      canonicalStation({
+        kind: "engram",
+        domain: "eng",
+        permalink: "Manifest",
       }),
     ).toEqual({ kind: "bridge", domain: "eng" });
     expect(

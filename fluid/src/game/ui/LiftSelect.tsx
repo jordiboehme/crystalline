@@ -19,7 +19,9 @@
  * field is prevented, so a click never takes the focus from the field. The
  * field swallows auto-repeat until its first fresh key, so a key still held
  * from opening the overlay types nothing. While the filter matches nothing,
- * one line says so and Enter does nothing.
+ * one line says so and Enter does nothing; a lift with no stops at all
+ * (never a filter's doing) says so with its own distinct line, `NO STOPS`,
+ * so an empty listing never misreads as a filter miss.
  *
  * The session already released the pointer lock and stopped reading keys
  * when it opened the overlay; the host unmounts it when the session says
@@ -37,6 +39,7 @@ import {
   LIFT_LIST,
   LIFT_PRIVATE,
   LIFT_TITLE,
+  NO_STOPS,
   NO_SUCH_STOP,
   liftRows,
 } from "./lift";
@@ -123,7 +126,8 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
     };
   }, [shown, at, onRide, onClose]);
 
-  const status = shown.length === 0 ? NO_SUCH_STOP : null;
+  const status =
+    stops.length === 0 ? NO_STOPS : shown.length === 0 ? NO_SUCH_STOP : null;
   const position =
     shown.length === 0 ? "0/0" : `${String(at + 1)}/${String(shown.length)}`;
 

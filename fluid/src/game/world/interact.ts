@@ -214,11 +214,6 @@ export function yawFacing(inward: readonly [number, number]): number {
   return Math.atan2(-inward[0], -inward[1]) + 0;
 }
 
-/** Whether two addresses name the same place. */
-export function samePlace(a: PlaceAddress, b: PlaceAddress): boolean {
-  return a.domain === b.domain && a.permalink === b.permalink;
-}
-
 /**
  * Whether the player is walking up to the way in `slot`: in front of its
  * wall (never behind it, where a bay or the backlink corridor can lie a

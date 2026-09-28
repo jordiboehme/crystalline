@@ -50,7 +50,8 @@ export interface TextSlot {
  * (a ceiling pipe run is sized to stay inside it) and where each text key
  * is drawn. `textLayer` takes the keys of `layers.ts` (`terminal:<i>`,
  * `door:<i>`, `portal:<i>`, `hatch:<i>`, `tag:<i>`, `poster:<i>`,
- * `placard`) and throws on a key it does not know.
+ * `lift:<i>`, `screen:<i>`, `exit:<i>`, `placard`) and throws on a key it
+ * does not know.
  */
 export interface ModelContext {
   look: Look;

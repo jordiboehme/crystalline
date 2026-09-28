@@ -21,11 +21,10 @@
  * `StationAddress` (M3 C1) widens this to every place the game can put a
  * player: the airlock and a deck have neither, so `PlaceAddress` alone
  * cannot name them. `gameRouteOf` and `fluidRouteOfStation` build a station
- * address's game and Fluid routes the same way `gameEngramRoute` builds an
- * engram's; `addressOfGameLocation` reads a game location back into one, the
- * `PlaceAddress` sibling of `fluidRouteOf`. `addressOfRoute` is the same
- * reading for a plain Fluid engram route, used both here and by
- * `data/place.ts`'s reference resolver.
+ * address's game and Fluid routes; `addressOfGameLocation` reads a game
+ * location back into one, the `PlaceAddress` sibling of `fluidRouteOf`.
+ * `addressOfRoute` is the same reading for a plain Fluid engram route, used
+ * both here and by `data/place.ts`'s reference resolver.
  */
 
 import { domainRoute, engramRoute, folderRoute } from "../paths";
@@ -42,11 +41,14 @@ import type { PlaceAddress, StationAddress } from "./world/types";
  * Building a URL to hand to `navigate` is a different problem, solved by
  * `GAME_PREFIX` (from `launch.ts`, the one game module the main chunk
  * carries): the prefix in the form `history` itself settles on.
- * `session.ts` compares a route `gameRouteOf` builds against
- * `window.location.pathname + window.location.search` directly, replacing
- * the URL only when the two differ, and both browsers and jsdom always
- * report that pathname percent-encoded, never as the raw character, which
- * `paths.test.ts` pins with a failing-raw-form test. A prefix built from
+ * `session.ts` compares a route `gameRouteOf` builds, read back through
+ * `URL` first, against `window.location.pathname + window.location.search`,
+ * replacing the URL only when the two differ (the `URL` read-back also
+ * catches a folder name with a character `encodeURIComponent` leaves
+ * unescaped, such as `'`, which a browser's own query serialiser writes
+ * `%27`). Both browsers and jsdom always report the location's pathname
+ * percent-encoded, never as the raw character, which `paths.test.ts` pins
+ * with a failing-raw-form test. A prefix built from
  * the raw character would therefore never string-equal what the location
  * bar actually holds, and the route would `replace` the URL on every
  * landing instead of only when it must. The prefix is spelled the way
@@ -58,17 +60,6 @@ import type { PlaceAddress, StationAddress } from "./world/types";
  * case a browser would have canonicalized for you.
  */
 const GAME_SEGMENT = "π";
-
-/**
- * The game's address of one engram: Fluid's engram route under the `π`
- * prefix.
- *
- * Built from `engramRoute`, so the permalink's segments are encoded one by one
- * and its slashes stay slashes, exactly as the reading screen's own links are.
- */
-export function gameEngramRoute(domain: string, permalink: string): string {
-  return `${GAME_PREFIX}${engramRoute(domain, permalink)}`;
-}
 
 /**
  * The Fluid route a game path mirrors: the same path without its `π`
@@ -168,9 +159,10 @@ export function addressOfRoute(href: string): PlaceAddress | null {
 }
 
 /**
- * The game route of a station address (M3 C2), under the same `π` prefix
- * `gameEngramRoute` builds: for an engram it is `gameEngramRoute` itself,
- * since both defer to `engramRoute`.
+ * The game route of a station address (M3 C2), under the `π` prefix
+ * (`GAME_PREFIX`): for an engram it defers to `engramRoute` directly, the
+ * builder that also encodes the permalink's segments one by one for the
+ * plain Fluid route `fluidRouteOfStation` gives the same address.
  *
  * A deck's `folder` goes through `folderRoute`, which already encodes it
  * with `encodeURIComponent` and writes `?path=<folder>` for every folder but
@@ -182,9 +174,10 @@ export function addressOfRoute(href: string): PlaceAddress | null {
  * C1) writes none, since both land on the same page.
  *
  * `URLSearchParams` is never used to write here: it spells a space `+`, not
- * the `%20` `folderRoute` chose, and C5's landing compares pathname and
- * search verbatim - the two spellings would never agree, and the session
- * would replace the URL on every landing instead of only when it must.
+ * the `%20` `folderRoute` chose. C5's landing reads this route back through
+ * `URL` before comparing it to the location bar (session.ts), which absorbs
+ * that one difference along with anything else a browser's own query
+ * serialiser would normalise, such as an unescaped `'`.
  */
 export function gameRouteOf(address: StationAddress): string {
   switch (address.kind) {

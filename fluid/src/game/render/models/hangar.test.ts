@@ -329,8 +329,11 @@ describe("buildHangar (M3 C15)", () => {
           (v) => Math.abs(v.y - PAD_TOP) < EPS && inPlan(p, v),
         );
         expect(coat.length).toBeGreaterThan(0);
-        // The coat covers the whole pad: its corners are the pad's.
+        // The coat covers the whole pad: all four of its corners are the
+        // pad's own, not a shrunk or offset patch (M3 fix wave, M11).
         expect(Math.min(...coat.map((v) => v.x))).toBeCloseTo(p.x0, 6);
+        expect(Math.max(...coat.map((v) => v.x))).toBeCloseTo(p.x1, 6);
+        expect(Math.min(...coat.map((v) => v.z))).toBeCloseTo(p.z0, 6);
         expect(Math.max(...coat.map((v) => v.z))).toBeCloseTo(p.z1, 6);
         for (const v of coat) {
           expect(v.flag).toBe(FLAG.decal);

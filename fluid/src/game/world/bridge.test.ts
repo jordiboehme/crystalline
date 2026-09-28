@@ -164,6 +164,26 @@ describe("withBridge (M3 C20, C21)", () => {
     ).toEqual([LIFT_WORDS.airlock]);
   });
 
+  it("lists a domain's folders with no root deck and no note (M3 fix wave, Task 5)", () => {
+    // Mutation caught: `rootDeck: false` ignored while folders are present,
+    // so a domain with no engrams of its own still lists a `DECK 1`, or the
+    // `NO DECKS` note fired for a domain that does have folders to show.
+    const room = generateRoom(CANNED_BRIDGE);
+    const fitted = withBridge(CANNED_BRIDGE, room, {
+      ...CANNED_BRIDGE_DATA,
+      rootDeck: false,
+    });
+    const lift = fitted.fixtures.find((f) => f.kind === "lift");
+    expect(lift?.kind === "lift" ? lift.note : "not a lift").toBeNull();
+    const labels = lift?.kind === "lift" ? lift.stops.map((s) => s.label) : [];
+    expect(labels).not.toContain(deckLabel("station", ""));
+    expect(labels).toEqual([
+      LIFT_WORDS.airlock,
+      deckLabel("station", "engineering"),
+      deckLabel("station", "logs"),
+    ]);
+  });
+
   it("keeps the screen's lane clear and composes with the arrival box (Review Focus 5)", () => {
     // Mutation caught: the re-dress skipped (a prop stays in the new
     // lane), withArrivalBox applied before withBridge (the box ignores

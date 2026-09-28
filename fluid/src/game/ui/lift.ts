@@ -4,7 +4,10 @@
  *
  * Every string the overlay shows is here: the title is the word a lift's
  * panel answers to, `NO SUCH STOP` is the line for a filter that matches
- * nothing, and the rest follow the HUD's own voice. The stops keep the
+ * nothing, `NO STOPS` the line for a lift that lists none at all (an
+ * account that can read no domain, at the airlock), so an empty listing
+ * never reads as a filter miss, and the rest follow the HUD's own voice.
+ * The stops keep the
  * lift's own order (never sorted: the fixture already ordered them, M3
  * C24), filtered by a trimmed, case-insensitive substring of the stop's
  * label (`filterLevels`, `./levels`), and shown as a window of `LEVEL_ROWS`
@@ -29,6 +32,8 @@ export const LIFT_FIELD = "Stop name";
 export const LIFT_LIST = "Stops";
 /** The one line shown when no stop matches the filter. */
 export const NO_SUCH_STOP = "NO SUCH STOP";
+/** The one line shown when the lift lists no stops at all, filter or not. */
+export const NO_STOPS = "NO STOPS";
 /** The mark after the stop the lift already stands at. */
 export const LIFT_HERE = "HERE";
 /** The accessible text of the key drawn before a private stop's label. */

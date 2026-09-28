@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiftStop } from "../world/types";
 import { LiftSelect } from "./LiftSelect";
 import { LEVEL_ROWS } from "./levels";
-import { LIFT_FOOTER, NO_SUCH_STOP } from "./lift";
+import { LIFT_FOOTER, NO_STOPS, NO_SUCH_STOP } from "./lift";
 
 /** One stop, with every field but the label defaulted. */
 function stop(label: string, key = false, here = false): LiftStop {
@@ -85,6 +85,16 @@ describe("LiftSelect", () => {
     expect(screen.getByText("0/0")).toBeInTheDocument();
     fireEvent.keyDown(field, { key: "Enter" });
     expect(onRide).not.toHaveBeenCalled();
+  });
+
+  it("says NO STOPS, not NO SUCH STOP, when the lift lists no stops at all", () => {
+    // Mutation caught: an empty listing (never a filter's doing) reading as
+    // a filter miss, which would leave a reader with no domains believing
+    // they typed a bad filter into an empty field.
+    renderSelect([]);
+    expect(screen.getByText(NO_STOPS)).toBeInTheDocument();
+    expect(screen.queryByText(NO_SUCH_STOP)).toBeNull();
+    expect(screen.getByText("0/0")).toBeInTheDocument();
   });
 
   it("moves the selection with the arrows, clamped, resets it on a new filter", () => {

@@ -2697,7 +2697,12 @@ describe("station addresses (M3)", () => {
     // `?path=` replaced on every landing), `current` read back from the
     // `RoomSpec` or from the address asked for instead of the one entered
     // (the MANIFEST route would stay an engram, an oversized or fractional
-    // section would never be clamped).
+    // section would never be clamped), or the built route compared to the
+    // location bar without itself being read back through `URL` first (M3
+    // fix wave, M10b): the `it's` folder below has a `'` `encodeURIComponent`
+    // leaves unescaped while `window.history.replaceState` normalises it to
+    // `%27`, so an unnormalised compare would replace the URL on every
+    // landing, this one included, instead of never.
     const starts: [string, StationAddress, string | null][] = [
       ["/π", { kind: "airlock" }, null],
       ["/π/d/eng", { kind: "bridge", domain: "eng" }, null],
@@ -2727,6 +2732,13 @@ describe("station addresses (M3)", () => {
         "/π/d/eng?path=notes&section=1.5",
         { kind: "deck", domain: "eng", folder: "notes", section: 0 },
         "/%CF%80/d/eng?path=notes",
+      ],
+      // A folder with a `'`: normalised the same way on both sides, so it
+      // never replaces the URL (M3 fix wave, M10b).
+      [
+        "/π/d/eng?path=it's",
+        { kind: "deck", domain: "eng", folder: "it's", section: 0 },
+        null,
       ],
     ];
     expect(starts.length).toBeGreaterThan(0);
@@ -3164,6 +3176,28 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     expect(open).toBeLessThan(1);
     frames(20);
     expect(lastDoors().get(`door:${String(lift)}`)).toBe(0);
+  });
+
+  it("rides to the stop the lift already stands at by only closing the overlay", () => {
+    // Mutation caught: `stop.here` ignored, so picking the current section
+    // starts a ride and reloads the deck the player is already standing in
+    // instead of just closing the overlay.
+    const { session, onLift } = atDeckLift(stationLoad);
+    pressUse();
+    expect(opened(onLift)).toHaveLength(1);
+    const stops = liftOf(deck).stops;
+    const here = stops.findIndex((s) => s.here);
+    expect(here).toBeGreaterThanOrEqual(0);
+    const rooms = renderer.setRoom.mock.calls.length;
+    session.ride(here);
+    expect(onLift).toHaveBeenLastCalledWith(null);
+    expect(hud.connector).not.toHaveBeenCalledWith(
+      true,
+      stops[here]?.label,
+      expect.any(String),
+    );
+    expect(renderer.setRoom.mock.calls.length).toBe(rooms);
+    expect(session.current).toEqual(DECK_AT);
   });
 
   it("re-reads a failed airlock listing from its lift", () => {

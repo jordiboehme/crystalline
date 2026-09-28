@@ -800,8 +800,9 @@ describe("ExploreRoute", () => {
     ]);
     expect(within(options[1]!).getByText("HERE")).toBeInTheDocument();
 
-    // A pick rides with its own index in the stops array (1: "Bridge"),
-    // not a position in whatever the overlay currently shows.
+    // Rides with the clicked row's own index in the stops array (1:
+    // "Bridge"); LiftSelect.test.tsx covers a filtered or windowed list's
+    // index separately from its on-screen position, not repeated here.
     fireEvent.click(options[1]!);
     expect(rideSpy).toHaveBeenCalledTimes(1);
     expect(rideSpy).toHaveBeenCalledWith(1);
@@ -817,17 +818,21 @@ describe("ExploreRoute", () => {
     // Mutation caught: the address the URL follows compared by its domain
     // alone (the bridge, in the deck's own domain, would never be gone
     // to), or not compared at all (the session's own replace would start
-    // a second journey to the deck it just entered).
+    // a second journey to the deck it just entered). `section=999` is
+    // built to also catch `requestedRef` dropped on the session's own
+    // navigate (M3 fix wave, M10c): a merely redundant `section=1` lands
+    // exactly where it was asked, so `requestedRef` never has to move for
+    // the test to pass; `notes` holds one section, so `999` clamps to a
+    // different one (0) when the deck is built, and only an updated
+    // `requestedRef` stops the params effect from sending the session
+    // there a second time once the URL changes under it.
     gl.available = true;
     serve({
       "/domains/eng/tree": TREE,
       "/domains/eng/engrams/manifest": () => detailResponse("manifest", "Eng"),
       "/domains/eng/inbound/manifest": () => EMPTY_INBOUND,
     });
-    // `section=1` is the first section spelt out: the session lands there
-    // and replaces the URL with the deck's own spelling, which leaves the
-    // section out, so the location changes under the route.
-    const view = renderAt("/%CF%80/d/eng?path=notes&section=1");
+    const view = renderAt("/%CF%80/d/eng?path=notes&section=999");
     await waitFor(() => {
       expect(lastRoom()).toBe("notes/");
     });

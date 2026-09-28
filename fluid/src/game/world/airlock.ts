@@ -104,7 +104,7 @@ export const AXIS = (AIRLOCK_CELLS - 1) / 2;
  */
 export const AIRLOCK_CEILING = 8.5;
 
-/** The airlock's light level on DOOM's scale, steady everywhere. */
+/** The airlock's light level on the lights' 0 to 255 scale, steady everywhere. */
 const AIRLOCK_LIGHT = 208;
 
 /**

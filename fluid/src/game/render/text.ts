@@ -251,10 +251,12 @@ export interface TextLayer {
 
 /**
  * Every text layer of a plan drawn for a look, one canvas per layer: a
- * screen, poster or placard fills its layer alone, and the labels that
- * share a layer are drawn each into its row (`ROW_HEIGHT` texels at
- * `row * ROW_HEIGHT` from the top), the rows below the last label left
- * dark. Layers come back in ascending order, each once.
+ * terminal screen, a poster, the placard, a lift's call panel or a
+ * station screen each fill their own layer alone, and the labels that
+ * share a layer (a door, a portal, a machine tag, an exit or a hatch) are
+ * drawn each into its row (`ROW_HEIGHT` texels at `row * ROW_HEIGHT` from
+ * the top), the rows below the last label left dark. Layers come back in
+ * ascending order, each once.
  */
 export function drawTextLayers(
   plan: LayerPlan,

@@ -308,5 +308,5 @@ describe("the walk (M3 C7, C12, C28)", () => {
     );
     for (const folder of foldersOf("station"))
       expect(deckFolders.has(`station:${folder}`), folder).toBe(true);
-  }, 60_000);
+  });
 });

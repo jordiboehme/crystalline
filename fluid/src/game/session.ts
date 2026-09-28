@@ -947,8 +947,17 @@ export function createSession(opts: SessionOptions): Session {
     else if (arrival?.via === "door" && arrival.from.kind === "deck")
       startOpen("exit");
     const path = gameRouteOf(built.address);
+    // `path` is built with `encodeURIComponent` (M3 C2), which leaves a
+    // character like `'` unescaped, while a browser's own query
+    // serialiser writes it `%27` - `window.location.search` is always
+    // that normalised spelling. Reading `path` back through `URL` before
+    // comparing puts both sides through the same normalisation, so a
+    // folder name that needs it does not replace the URL on every
+    // landing.
+    const target = new URL(path, window.location.origin);
+    const normalized = target.pathname + target.search;
     const { pathname, search } = window.location;
-    if (pathname + search !== path) opts.navigate(path);
+    if (pathname + search !== normalized) opts.navigate(path);
   };
 
   /**
@@ -1259,7 +1268,9 @@ export function createSession(opts: SessionOptions): Session {
    * doors are already heading shut (`stepDoors` never opens them). The
    * ride starts now on the session's clock; its landing waits for
    * `LIFT_RIDE_MS` (`settle`). A failed stop is a notice only (C29): no
-   * `travelling`, so no way is marked.
+   * `travelling`, so no way is marked. Picking the stop the lift already
+   * stands at (`stop.here`) just closes the overlay: no ride, no reload of
+   * the room the player is already standing in.
    */
   const rideLift = (index: number) => {
     if (disposed) return;
@@ -1267,6 +1278,7 @@ export function createSession(opts: SessionOptions): Session {
     const stop = lift?.kind === "lift" ? lift.stops[index] : undefined;
     if (stop === undefined) return;
     closeLift();
+    if (stop.here) return;
     const start = now();
     go(
       stop.to,
