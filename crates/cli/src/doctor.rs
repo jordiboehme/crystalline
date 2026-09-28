@@ -37,12 +37,16 @@
 //! another domain holds here (shadowed), one several domains claim, an alias
 //! that does not resolve, a team domain whose MANIFEST declares no name, a
 //! derived domain still waiting to take its declared name, and links that
-//! spell a domain by a name only this machine uses. `--fix` removes orphan
-//! rows, the empty index rows removed domains left behind, and stale service
-//! artifacts, and respells those links; the rest, including the whole
-//! GitHub, environment, harnesses and provisioning sections, are
-//! report-only, and every finding
-//! that has a fix points at the right next command.
+//! spell a domain by a name only this machine uses; (l) a file whose
+//! frontmatter holds a key more than once (`verify` rule `E010`), which no
+//! sync can index. `--fix` removes orphan rows, the empty index rows removed
+//! domains left behind, and stale service artifacts, respells those links,
+//! and keeps one copy of a repeated frontmatter key whose copies all agree
+//! (in a team domain the copy the base snapshot has; in a domain that
+//! reviews changes only when that restores the base); the rest, including
+//! the whole GitHub, environment, harnesses and provisioning sections, are
+//! report-only, and every finding that has a fix points at the right next
+//! command.
 //!
 //! The index reads are socket-first, the same shape `sync_dispatch` uses: a
 //! running daemon holds the index file, so its stamps are asked for over ctl
@@ -53,7 +57,7 @@
 //! the ones that do and what to do about it, and that counts as one
 //! unresolved problem so the exit code still says something is wrong.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -67,7 +71,7 @@ use crystalline_index::{
 };
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
-use crystalline_remote::state::{OriginState, verify_base};
+use crystalline_remote::state::{OriginState, read_base_file, verify_base};
 use crystalline_service::EnvOverlay;
 use crystalline_service::instance;
 use serde::{Deserialize, Serialize};
@@ -142,7 +146,8 @@ pub struct DomainDoctor {
     pub orphans_removed: usize,
     /// On-disk `.md` files not yet present in the index. Holds only files that
     /// parse; a file whose frontmatter fails to parse is never merely
-    /// unsynced, so it is reported under `unsyncable` instead.
+    /// unsynced, so it is reported under `unsyncable` (or, for a repeated
+    /// key, under `duplicate_keys`) instead.
     pub unindexed: Vec<String>,
     /// On-disk `.md` files that cannot be indexed at all, because their
     /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
@@ -150,6 +155,9 @@ pub struct DomainDoctor {
     pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
+    /// Files whose frontmatter holds a key more than once (`verify` rule
+    /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
+    pub duplicate_keys: Vec<DuplicateKeyFile>,
     /// MANIFEST policy keys - `generated_indexes`, `sharing` - whose declared
     /// value is not one the domain recognizes, each with the value it is read
     /// as. Empty when every declared policy parses and for a domain with no
@@ -192,6 +200,29 @@ pub struct EncodingIssue {
     /// The human message from `verify`.
     pub message: String,
 }
+
+/// A file whose frontmatter holds a top-level key more than once (`verify`
+/// rule `E010`), so no sync can index it, with what `--fix` did about it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateKeyFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// Every repeated key, with the lines of its copies and whether they agree.
+    pub keys: Vec<crystalline_core::frontmatter::DuplicateKey>,
+    /// Whether `--fix` would repair this file (every repeat agrees, the result
+    /// parses and, in a reviewing domain, restores the base). Decided on every
+    /// run, so the report only sends a person to `--fix` when it would work.
+    pub fixable: bool,
+    /// Whether `--fix` removed the extra copies in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) the file as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_fixed: Option<String>,
+}
+
+/// What `--fix` says about a reviewing domain's file it will not rewrite.
+const REVIEWED_NOTE: &str =
+    "This domain reviews changes, so --fix leaves it: fix it in the repository";
 
 /// A MANIFEST policy key whose declared value nobody recognizes, with what
 /// the domain reads it as. Reported, never fixed: a policy is a decision.
@@ -840,6 +871,7 @@ impl DoctorReport {
             n += d.unindexed.len();
             n += d.unsyncable.len();
             n += d.encoding_issues.len();
+            n += d.duplicate_keys.iter().filter(|f| !f.fixed).count();
         }
         if self.service.lock_stale && !self.service.lock_removed {
             n += 1;
@@ -1679,6 +1711,7 @@ async fn check_domain_checks(
     // path, the unindexed set does not, so they are normalised to the same
     // shape before comparing.
     let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
+    let mut duplicate_paths: BTreeSet<String> = BTreeSet::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
         for issue in report.issues {
             match issue.rule {
@@ -1693,10 +1726,57 @@ async fn check_domain_checks(
                     unsyncable_by_path
                         .insert(relative_slash_path(&path, &issue.path), issue.message);
                 }
+                "E010" => {
+                    duplicate_paths.insert(relative_slash_path(&path, &issue.path));
+                }
                 _ => {}
             }
         }
     }
+
+    // (l) A frontmatter key held more than once (E010): one entry per file,
+    // and with --fix one copy is kept when all copies agree. In a team
+    // domain the copy the base snapshot has is the one kept, so a file
+    // whose only local change was the extra copy stops being a change.
+    let base_dir = entry
+        .origin
+        .as_ref()
+        .and_then(|_| config::origin_state_dir(name).ok());
+    for rel in duplicate_paths {
+        let file = path.join(&rel);
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let keys = crystalline_core::frontmatter::duplicate_keys(&source);
+        if keys.is_empty() {
+            continue;
+        }
+        let base = base_dir
+            .as_deref()
+            .and_then(|dir| read_base_file(dir, &rel).ok().flatten())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let plan = plan_duplicate_fix(&source, base.as_deref(), entry.is_overlay());
+        let mut report = DuplicateKeyFile {
+            path: rel,
+            keys,
+            fixable: plan.is_ok(),
+            fixed: false,
+            not_fixed: plan.as_ref().err().cloned(),
+        };
+        if fix && let Ok(text) = plan {
+            match std::fs::write(&file, text) {
+                Ok(()) => report.fixed = true,
+                Err(e) => report.not_fixed = Some(format!("Writing the file failed: {e}")),
+            }
+        }
+        d.duplicate_keys.push(report);
+    }
+    let blocked: HashSet<String> = d
+        .duplicate_keys
+        .iter()
+        .filter(|f| !f.fixed)
+        .map(|f| f.path.clone())
+        .collect();
 
     // (a) + (b): DB orphans and unindexed files, from whichever route reached
     // the index. `domain_id` stays `None` on the daemon-served route, which is
@@ -1746,15 +1826,21 @@ async fn check_domain_checks(
         // A path with an E001 finding is not merely unsynced, it cannot be
         // indexed at all until its frontmatter is fixed - split it out.
         let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
-        unindexed.retain(|p| match unsyncable_by_path.remove(p) {
-            Some(message) => {
-                unsyncable.push(UnsyncableFile {
-                    path: p.clone(),
-                    message,
-                });
-                false
+        unindexed.retain(|p| {
+            // A repeated frontmatter key is its own finding, above.
+            if blocked.contains(p) {
+                return false;
             }
-            None => true,
+            match unsyncable_by_path.remove(p) {
+                Some(message) => {
+                    unsyncable.push(UnsyncableFile {
+                        path: p.clone(),
+                        message,
+                    });
+                    false
+                }
+                None => true,
+            }
         });
         d.unsyncable = unsyncable;
 
@@ -1781,6 +1867,25 @@ async fn check_domain_checks(
     }
 
     Ok(d)
+}
+
+/// What `--fix` would write for a file with repeated keys, or why it leaves
+/// the file. A reviewing domain's folder only moves through a merge, so there
+/// the fix only counts when it restores the base snapshot byte for byte.
+fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Result<String, String> {
+    use crystalline_core::frontmatter::{Collapse, collapse_duplicate_keys};
+    match collapse_duplicate_keys(source, base) {
+        Collapse::Collapsed(text) if reviewing && base != Some(text.as_str()) => {
+            Err(REVIEWED_NOTE.to_string())
+        }
+        Collapse::Collapsed(text) => Ok(text),
+        Collapse::ValuesDiffer(_) => Err(
+            "Another key in this file has different values, so --fix leaves the file".to_string(),
+        ),
+        Collapse::Unchanged | Collapse::NotRepairable => {
+            Err("It does not parse without the extra copies either".to_string())
+        }
+    }
 }
 
 /// Every `.md` file under `root`, relative and forward-slashed, skipping
@@ -2724,6 +2829,41 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
             }
         }
+        for f in &d.duplicate_keys {
+            // "rerun with --fix" only when --fix would repair the whole file;
+            // otherwise every key is named for a person to fix by hand.
+            let mixed = f.keys.iter().any(|k| !k.same_value);
+            for k in &f.keys {
+                let lines = crystalline_core::frontmatter::line_list(&k.lines);
+                let _ = if f.fixed {
+                    writeln!(out, "  fixed {}: kept one `{}` line", f.path, k.key)
+                } else if !k.same_value {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with different values (verify rule E010): keep the right one and delete the other",
+                        f.path, k.key
+                    )
+                } else if mixed {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010): delete one of the lines",
+                        f.path, k.key
+                    )
+                } else if let Some(note) = &f.not_fixed {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010). {note}",
+                        f.path, k.key
+                    )
+                } else {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010), rerun with --fix to keep one copy",
+                        f.path, k.key
+                    )
+                };
+            }
+        }
         // "ok" is a claim about everything, so a domain whose index checks
         // never ran does not get to make it.
         if d.manifest_present
@@ -2732,6 +2872,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             && d.unindexed.is_empty()
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
+            && d.duplicate_keys.iter().all(|f| f.fixed)
             && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");

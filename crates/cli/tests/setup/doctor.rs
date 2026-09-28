@@ -349,6 +349,140 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
     );
 }
 
+const REPEATED_STATUS: &str = "---\ntype: engram\ntitle: Dup\npermalink: dup\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\nstatus: current\n---\n\nBody for Dup with enough content.\n\nSecond line.\n";
+
+/// A file whose frontmatter holds `status` twice with the same value is its
+/// own finding, not a merely unindexed file, and `--fix` keeps one copy.
+#[test]
+fn reports_and_fixes_a_frontmatter_key_held_twice_with_one_value() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "dup.md", REPEATED_STATUS);
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let domain = &report["domains"][0];
+    assert_eq!(
+        domain["duplicate_keys"],
+        serde_json::json!([{
+            "path": "dup.md",
+            "keys": [{ "key": "status", "lines": [7, 9], "same_value": true }],
+            "fixable": true,
+            "fixed": false
+        }]),
+        "{report}"
+    );
+    assert!(
+        !domain["unindexed"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dup.md")),
+        "a file no sync can index is not merely unindexed: {report}"
+    );
+
+    let mut human = bin();
+    let _home = shield_ambient_home(&mut human);
+    let stdout = String::from_utf8(
+        human
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("[problem] dup.md repeats the frontmatter key `status` on lines 7 and 9 with the same value (verify rule E010), rerun with --fix to keep one copy"),
+        "{stdout}"
+    );
+
+    let mut fix = bin();
+    let _home = shield_ambient_home(&mut fix);
+    let fixed_out = String::from_utf8(
+        fix.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        fixed_out.contains("fixed dup.md: kept one `status` line"),
+        "{fixed_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(domain_dir.join("dup.md")).unwrap(),
+        REPEATED_STATUS.replacen(
+            "recorded_at: 2026-01-01\nstatus: current\n",
+            "recorded_at: 2026-01-01\n",
+            1
+        )
+    );
+}
+
+/// Copies with different values are a person's call: reported, never written.
+#[test]
+fn leaves_a_key_held_twice_with_different_values_to_a_person() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    let source = "---\ntype: engram\ntitle: Bad\npermalink: bad\nstatus: a\nstatus: a\ntags: [a]\ntags: [b]\nrecorded_at: 2026-01-01\n---\n\nBody.\n";
+    write(&domain_dir, "bad.md", source);
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let stdout = String::from_utf8(
+        cmd.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("[problem] bad.md repeats the frontmatter key `tags` on lines 7 and 8 with different values (verify rule E010): keep the right one and delete the other"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[problem] bad.md repeats the frontmatter key `status` on lines 5 and 6 with the same value (verify rule E010): delete one of the lines"),
+        "the agreeing key is named for a person too: {stdout}"
+    );
+    assert!(
+        !stdout.contains("rerun with --fix"),
+        "--fix cannot fix this file, so doctor must not send anyone there: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(domain_dir.join("bad.md")).unwrap(),
+        source,
+        "nothing is half fixed"
+    );
+}
+
 /// The plain invocation on a machine with no daemon: nothing to ask, so the
 /// index is opened here and every index-backed check runs exactly as it
 /// always did. The daemon route must not change what a person sees when there
@@ -1061,6 +1195,101 @@ fn github_section_reports_missing_origin_state_as_a_problem() {
     };
     let human = String::from_utf8(human).unwrap();
     assert!(human.contains("no origin state on disk"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// In a team domain, the copy the base snapshot has is the one that stays,
+/// so the file is byte-equal to the base again and no change is pending.
+#[test]
+#[cfg(unix)]
+fn the_fix_in_a_team_domain_keeps_the_copy_the_base_has() {
+    let (home, state_dir) = isolated_home("dup-base");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let domain_dir = work.path().join("kb-brand");
+    write_team_domain_config(&config, &domain_dir);
+
+    let base = "---\ntype: manifest\ntitle: Brand\npermalink: manifest\nstatus: stable\ndomain_name: brand\n---\n\n# Brand\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n";
+    let local = base.replacen("title: Brand\n", "title: Brand\ndomain_name: brand\n", 1);
+    std::fs::write(domain_dir.join("MANIFEST.md"), &local).unwrap();
+    let origin_dir = state_dir.join("origins/brand");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(origin_dir.join("base/MANIFEST.md"), base).unwrap();
+    std::fs::write(
+        origin_dir.join("state.json"),
+        format!(
+            r#"{{"version":1,"repo":"acme/brand-knowledge","branch":"main","base_commit":"abc123","ref_etag":null,"last_checked":null,"files":{{"MANIFEST.md":{{"sha256":"{}","size":{}}}}},"proposals":[],"history":[],"conflicts":[]}}"#,
+            sha256_hex(base.as_bytes()),
+            base.len()
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let _ = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert();
+    assert_eq!(
+        std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap(),
+        base,
+        "keeping the first copy would leave a one-line change pending"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A domain that reviews changes only moves through a merge: doctor restores
+/// the base when it can and otherwise leaves the file and says why.
+#[test]
+#[cfg(unix)]
+fn the_fix_in_a_reviewing_domain_only_restores_the_base() {
+    let (home, state_dir) = isolated_home("dup-review");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let domain_dir = work.path().join("kb-brand");
+    write_team_domain_config(&config, &domain_dir);
+    let reviewing = std::fs::read_to_string(&config).unwrap().replacen(
+        "    origin:\n",
+        "    review: overlay\n    origin:\n",
+        1,
+    );
+    std::fs::write(&config, reviewing).unwrap();
+
+    let base =
+        "---\ntype: manifest\ntitle: Brand\npermalink: manifest\nstatus: stable\n---\n\n# Brand\n";
+    let local = "---\ntype: manifest\ntitle: Brand\ndomain_name: brand\npermalink: manifest\nstatus: stable\ndomain_name: brand\n---\n\n# Brand\n";
+    std::fs::write(domain_dir.join("MANIFEST.md"), local).unwrap();
+    let origin_dir = state_dir.join("origins/brand");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(origin_dir.join("base/MANIFEST.md"), base).unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let stdout = String::from_utf8(
+        cmd.args(["doctor", "--fix", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .assert()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout
+            .contains("This domain reviews changes, so --fix leaves it: fix it in the repository"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap(),
+        local
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
