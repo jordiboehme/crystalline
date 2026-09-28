@@ -25,6 +25,8 @@
  *   (H12): the doors' warning lamps and the heroes' steady lights.
  * - `blink` to `blink + 7`: a signal light whose gain is its blink
  *   channel's, one flag per group of the hero's blink bank (`blink.ts`).
+ * - `decal`: a decal (2.7 C20), lit as `lit` but with no edge lines, and
+ *   first alpha-tested against an ordered threshold.
  *
  * Every face is wound counter-clockwise seen from the side its normal points
  * to: the room shell faces inward, boxes face outward and wall panels face
@@ -46,7 +48,10 @@
  * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
  * fixture edges, the entrance edge and lintels. The models themselves are
  * built by the recipes in `models/`, with the modelling kit of `kit.ts`,
- * and always keep `LAYER.panel` whatever the room's wall patterns.
+ * and always keep `LAYER.panel` whatever the room's wall patterns. Last
+ * come the room's decals (`buildDecals` in `models/decals.ts`, 2.7 C20,
+ * C21): quads on the decal atlas with `FLAG.decal`, `DECAL_LIFT` off their
+ * wall, face or floor, still in the one static array.
  */
 
 import { lampBoxes } from "../world/lamps";
@@ -64,6 +69,7 @@ import {
   type ModelContext,
   type Mover,
 } from "./models";
+import { buildDecals } from "./models/decals";
 import { buildHeroMovers } from "./models/heroes";
 import { buildInteriorMovers } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
@@ -88,6 +94,10 @@ export const FLOATS_PER_VERTEX = 13;
  * - `blink`: the first of `BLINK_GROUPS` flags `blink + g`, a signal light
  *   whose gain is its blink channel's: the group `g` of the bank named by
  *   the instance slot (`blinkFlag`, H11).
+ * - `decal`: a decal (2.7 C20), the first number past the blink groups:
+ *   the shader discards its fragment where the texel's alpha is under the
+ *   ordered threshold at its pixel, then lights it as `lit` with no edge
+ *   lines.
  */
 export const FLAG = {
   lit: 0,
@@ -97,12 +107,13 @@ export const FLAG = {
   lamp: 4,
   signal: 5,
   blink: 6,
+  decal: 14,
 } as const;
 
 /** A blink group's flag: `FLAG.blink + group`, group 0 to 7. */
 export type BlinkFlag = 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
 
-/** Every flag a surface may carry: one of `FLAG`, or a blink group's. */
+/** Every flag a surface may carry: one of `FLAG` (the decal's among them), or a blink group's. */
 type Flag = (typeof FLAG)[keyof typeof FLAG] | BlinkFlag;
 
 /** The flag of blink group `group`; throws outside 0 to `BLINK_GROUPS - 1`. */
@@ -529,7 +540,8 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
 /**
  * The whole room: the shell built on the grid, a lamp panel per light zone,
  * the hazard baseboards and scaffold frames of a room under construction,
- * and every fixture and piece of furniture as its detailed model. Text
+ * every fixture and piece of furniture as its detailed model, and last
+ * the room's decals (`buildDecals`, 2.7 C21). Text
  * quads take their layer and row from `layerPlan(room)`. Pure and
  * deterministic: the same room and look give the same floats.
  *
@@ -669,5 +681,6 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
     movers.push(...buildInteriorMovers(piece, i, look)),
   );
   for (const d of room.decor) buildDecor(kitAt, d, ctx);
+  buildDecals(kitAt, b, room);
   return { static: b.build(), movers };
 }

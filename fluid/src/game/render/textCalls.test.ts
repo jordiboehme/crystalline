@@ -36,6 +36,9 @@ import type { InteriorKind } from "../world/types";
 import { buildInterior, buildInteriorMovers } from "./models/interior";
 import * as pixels from "./models/heroes/pixels";
 import { buildProp } from "./models/props";
+import { buildDecals } from "./models/decals";
+import { galleryRoom } from "../world/canned";
+import type { Decal } from "../world/types";
 
 const recorded = vi.hoisted(() => [] as string[]);
 
@@ -164,5 +167,37 @@ describe("no text on the console room's fittings (2.6e C20)", () => {
     }
     expect(recorded).toEqual([]);
     expect(marked).toEqual([]);
+  });
+});
+
+describe("readable text set by the deck and bay stencils (2.7 C19)", () => {
+  it("sets no string but the allowed ones for any deck, bay or letter, on a wall or the floor", () => {
+    // Mutation caught: a stencil set from a template string ("DECK 23") or
+    // a number set whole ("23"), which is on no list.
+    const decals: Decal[] = [];
+    for (let n = 1; n <= 99; n++)
+      for (const letter of [0, 1, 2, 3, 4])
+        for (const lines of [1, 2] as const)
+          decals.push({
+            kind: "stencil",
+            on: lines === 2 ? "wall" : "floor",
+            x: 2.5,
+            y: lines === 2 ? 3 : 2.5,
+            turn: 0,
+            along: 0,
+            h: lines === 2 ? 1.5 : 0,
+            width: lines === 2 ? 0.9 : 1.0,
+            length: 0.3,
+            variant: 0,
+            seed: 0,
+            stencil: { deck: n, bay: n, letter, lines },
+          });
+    recorded.length = 0;
+    const b = createBuilder();
+    buildDecals((f) => createKit(b, f), b, { ...galleryRoom(), decals });
+    expect(recorded.length).toBeGreaterThan(0);
+    const list = readable();
+    for (const t of new Set(recorded))
+      expect(list.has(t), JSON.stringify(t)).toBe(true);
   });
 });

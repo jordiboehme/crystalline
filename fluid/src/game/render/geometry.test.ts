@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { boxKey } from "../world/box";
+import { BLINK_GROUPS } from "./blink";
 import { CANNED_BRIDGE, CANNED_HUB, heroHallRoom } from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
 import { plainFinish } from "../world/finish";
@@ -597,5 +598,32 @@ describe("wall patterns (2.7 C11)", () => {
       room.finish.bayWalls[0],
     );
     expect(room.finish.bayWalls[0]).not.toBe(room.finish.hallWalls);
+  });
+});
+
+describe("the decals in the static mesh (2.7 C20, C21)", () => {
+  it("gives the decals a flag of their own, past the blink groups (2.7 C20)", () => {
+    // Mutation caught: the decal flag sharing a blink group's number, which
+    // would draw every decal as a blinking light.
+    expect(FLAG.decal).toBe(FLAG.blink + BLINK_GROUPS);
+    expect(Object.values(FLAG).filter((f) => f === FLAG.decal)).toHaveLength(1);
+  });
+
+  it("builds a room's decals into its static mesh, and none into a room without any (2.7 C21)", () => {
+    // Mutation caught: `buildRoomMesh` never calling the decal recipe, or
+    // the hand-built rooms drawing decals they do not have.
+    const count = (room: RoomSpec) => {
+      const m = buildRoomMesh(room, LOOKS.aperture).static;
+      let n = 0;
+      for (let i = 0; i < m.count; i++)
+        if (m.vertices[i * FLOATS_PER_VERTEX + 12] === FLAG.decal) n++;
+      return n;
+    };
+    const bridge = generateRoom(CANNED_BRIDGE);
+    expect(bridge.decals.length).toBeGreaterThan(0);
+    expect(count(bridge)).toBeGreaterThanOrEqual(6 * bridge.decals.length);
+    expect(heroHallRoom().decals).toEqual([]);
+    expect(count(heroHallRoom())).toBe(0);
+    expect(count(consoleRoom())).toBe(0);
   });
 });

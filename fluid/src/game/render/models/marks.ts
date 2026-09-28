@@ -20,9 +20,13 @@
  * `readonly string[]` of lines, set through `textBlock`/`markLines`
  * (`heroes/pixels.ts`), never a picture of its own.
  *
+ * The deck and bay stencils' words, numerals and letters (2.7 C19) live
+ * here too, and `stencilMarks` sets a stencil from them, mark by mark.
+ *
  * Comments here name props by their shape, never an original.
  */
 
+import type { StencilText } from "../../world/types";
 import type { Rgb } from "../looks";
 
 /** Every approved string of 2.6d and 2.6f, by the prop that draws it. */
@@ -85,7 +89,51 @@ export const MARKS = {
     "CAUTION RADIOACTIVE MATERIAL",
     "PLUTONIUM HANDLE WITH CARE",
   ],
+
+  /** The wall stencil's first word, over the deck's number (2.7 C19). */
+  deckWord: "DECK",
+  /** Every stencil's word before the bay's number (2.7 C19). */
+  bayWord: "BAY",
+  /** The stencils' numerals, each set on its own, by its value: `numerals[7]` is "7". */
+  numerals: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+  /** The overflow bays' letters after the bay's number, bay 1 to 4: `bayLetters[0]` is "A". */
+  bayLetters: ["A", "B", "C", "D"],
 } as const;
+
+/**
+ * A stencil's marks (2.7 C19), line by line, each line's marks in reading
+ * order: the wall's two lines (`lines` 2) are the deck word and the deck's
+ * numerals over the bay word and the bay's numerals; a floor stencil's one
+ * line is the bay's alone. An overflow bay's letter (`letter` 1 to 4)
+ * follows the bay's numerals. Every mark is one of `MARKS`' own literals,
+ * so the recipe hands `textRows` nothing but approved strings, and a
+ * number is set digit by digit, never as a string made from it. The
+ * recipe lays the marks with the font's own advance, a space after the
+ * word. Throws on a number outside 1 to 99 or a letter outside 0 to 4,
+ * which no placed stencil carries.
+ */
+export function stencilMarks(t: StencilText): readonly (readonly string[])[] {
+  const digits = (n: number): string[] => {
+    if (!Number.isInteger(n) || n < 1 || n > 99)
+      throw new Error(`stencilMarks: no number ${String(n)}`);
+    const out: string[] = [];
+    for (let m = n; m > 0; m = Math.floor(m / 10)) {
+      const mark = MARKS.numerals[m % 10];
+      if (mark === undefined) throw new Error("stencilMarks: no numeral");
+      out.unshift(mark);
+    }
+    return out;
+  };
+  if (!Number.isInteger(t.letter) || t.letter < 0 || t.letter > 4)
+    throw new Error(`stencilMarks: no letter ${String(t.letter)}`);
+  const letter = t.letter === 0 ? undefined : MARKS.bayLetters[t.letter - 1];
+  const bay = [
+    MARKS.bayWord,
+    ...digits(t.bay),
+    ...(letter === undefined ? [] : [letter]),
+  ];
+  return t.lines === 2 ? [[MARKS.deckWord, ...digits(t.deck)], bay] : [bay];
+}
 
 /** The capsule maker's round C: `o` the outer ring, `#` the C, open to the right. */
 export const CAPSULE_LOGO: readonly string[] = [

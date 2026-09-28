@@ -14,6 +14,7 @@ import {
   MARKS,
   SIGNATURE,
   SPACE_BADGE,
+  stencilMarks,
 } from "./marks";
 
 const strings = (): string[] =>
@@ -114,5 +115,37 @@ describe("the approved marks", () => {
           glyph.join(),
         );
     }
+  });
+
+  it("sets a stencil word by word and character by character, the digits in order (2.7 C19)", () => {
+    // Mutation caught: the digits reversed, the letter left out or put on
+    // the deck line, the deck line missing on a wall stencil, or the words
+    // swapped.
+    expect(
+      stencilMarks({ deck: 23, bay: 7, letter: 0, lines: 2 }).map((l) =>
+        l.join("|"),
+      ),
+    ).toEqual(["DECK|2|3", "BAY|7"]);
+    expect(
+      stencilMarks({ deck: 5, bay: 40, letter: 2, lines: 1 }).map((l) =>
+        l.join("|"),
+      ),
+    ).toEqual(["BAY|4|0|B"]);
+    expect(MARKS.numerals).toHaveLength(10);
+    expect(MARKS.bayLetters).toHaveLength(4);
+  });
+
+  it("refuses a stencil it cannot set (2.7 C19)", () => {
+    // Mutation caught: a letter past D or a number past 99 set anyway,
+    // from an entry that is not there (an `undefined` mark).
+    expect(() =>
+      stencilMarks({ deck: 1, bay: 1, letter: 5, lines: 1 }),
+    ).toThrow();
+    expect(() =>
+      stencilMarks({ deck: 100, bay: 1, letter: 0, lines: 2 }),
+    ).toThrow();
+    expect(() =>
+      stencilMarks({ deck: 1, bay: 0, letter: 0, lines: 1 }),
+    ).toThrow();
   });
 });

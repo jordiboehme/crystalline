@@ -40,6 +40,7 @@ import {
 import {
   dressingSites,
   edgeKey,
+  edgeOf as anchorEdge,
   fitsFloor,
   turnForSide,
   wallAnchor,
@@ -57,6 +58,10 @@ import {
 import { plainFinish } from "./finish";
 import { MACHINE_KINDS } from "./generate";
 import { VARIANT_COUNTS } from "./variants";
+import { ACCENT_STRIPE } from "../render/geometry";
+import { DECAL_TILES } from "../render/textures";
+import { bayNumber, deckNumber } from "./decals";
+import { CELL } from "./units";
 import type {
   Box,
   DecorKind,
@@ -712,6 +717,100 @@ describe("the variants hall (2.7 C24)", () => {
         if (i !== j) expect(overlaps(b, c)).toBe(false);
       });
       for (const lane of sites.lanes) expect(overlaps(b, lane)).toBe(false);
+    });
+  });
+
+  it("lays one of every decal kind and tile on its south wall and its floor, and both stencils (2.7 C24)", () => {
+    // Mutation caught: a kind or a tile missing from the wall or the
+    // floor, a stencil left out, a decal on a fixture's edge or across the
+    // accent stripe, two decals overlapping, or a floor decal on a lane,
+    // on a footprint or off the floor.
+    const want = (["chevrons", "arrow", "grime", "streak", "rust"] as const)
+      .flatMap((k) => DECAL_TILES[k].map((_, v) => `${k}:${String(v)}`))
+      .sort();
+    expect(want.length).toBe(10);
+    const on = (where: string) =>
+      room.decals.filter((d) => d.on === where && d.kind !== "stencil");
+    expect(
+      on("wall")
+        .map((d) => `${d.kind}:${String(d.variant)}`)
+        .sort(),
+    ).toEqual(want);
+    expect(
+      on("floor")
+        .map((d) => `${d.kind}:${String(d.variant)}`)
+        .sort(),
+    ).toEqual(want);
+    expect(room.decals.filter((d) => d.on === "face")).toEqual([]);
+    const stencils = room.decals.filter((d) => d.kind === "stencil");
+    const text = {
+      deck: deckNumber(room.domain, room.permalink),
+      bay: bayNumber(room.domain, room.permalink),
+      letter: 0,
+    };
+    expect(stencils.map((d) => [d.on, d.stencil])).toEqual([
+      ["wall", { ...text, lines: 2 }],
+      ["floor", { ...text, lines: 1 }],
+    ]);
+
+    // The wall: the hall's south wall, off every fixture edge (the wall
+    // stencil on the entrance's east neighbour, as C19 stands it), inside
+    // its edge, clear of the stripe and of each other.
+    const sites = dressingSites(room);
+    const walls = room.decals.filter((d) => d.on === "wall");
+    const south = room.hall.y1 - 1;
+    for (const d of walls) {
+      const e = anchorEdge(d);
+      expect(e.side).toBe("s");
+      expect(e.y).toBe(south);
+      expect(sites.fixtureEdges.has(edgeKey(e))).toBe(false);
+      expect(Math.abs(d.along) + d.width / 2).toBeLessThanOrEqual(CELL / 2);
+      const clear =
+        d.h + d.length <= ACCENT_STRIPE.h0 || d.h >= ACCENT_STRIPE.h1;
+      expect(clear).toBe(true);
+    }
+    const stencilEdge = anchorEdge(stencils[0]!);
+    expect([stencilEdge.x, stencilEdge.y]).toEqual([
+      room.entrance.x + 1,
+      room.entrance.y,
+    ]);
+    walls.forEach((d, i) =>
+      walls.forEach((c, j) => {
+        if (i >= j || edgeKey(anchorEdge(d)) !== edgeKey(anchorEdge(c))) return;
+        const apart =
+          Math.abs(d.along - c.along) >= (d.width + c.width) / 2 ||
+          d.h >= c.h + c.length ||
+          c.h >= d.h + d.length;
+        expect(apart).toBe(true);
+      }),
+    );
+
+    // The floor: on the floor, clear of every lane, footprint and other
+    // floor decal.
+    const floors = room.decals.filter((d) => d.on === "floor");
+    const boxOf = (d: (typeof floors)[number]): Box => {
+      const side = d.turn % 2 === 1;
+      const hx = (side ? d.length : d.width) / 2;
+      const hz = (side ? d.width : d.length) / 2;
+      return {
+        x0: d.x * CELL - hx,
+        x1: d.x * CELL + hx,
+        z0: d.y * CELL - hz,
+        z1: d.y * CELL + hz,
+      };
+    };
+    const boxes = floors.map(boxOf);
+    const decor = room.decor
+      .map(decorFootprint)
+      .filter((b): b is Box => b !== null);
+    boxes.forEach((b, i) => {
+      expect(fitsFloor(room, b)).toBe(true);
+      for (const lane of sites.lanes) expect(overlaps(b, lane)).toBe(false);
+      for (const t of [...sites.taken, ...decor])
+        expect(overlaps(b, t)).toBe(false);
+      boxes.forEach((c, j) => {
+        if (i !== j) expect(overlaps(b, c)).toBe(false);
+      });
     });
   });
 });

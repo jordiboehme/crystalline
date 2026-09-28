@@ -193,6 +193,18 @@ void main() {
  * nudged `LIGHT_NUDGE` metres along the surface normal, which every wall
  * turns towards its floor cell. A texel of 0 is legal: a dark cell.
  *
+ * A decal (`FLAG.decal`, 2.7 C20) takes the lit path with no edge lines,
+ * after an alpha test: its texel's alpha, read whatever `uTextureMix` is,
+ * against the 4x4 ordered threshold at its pixel (`bayer4`, each step
+ * offset half a step so no threshold is 0). A texel below it is
+ * discarded, so a hard-edged shape (a chevron, an arrow, a stencil's
+ * pixel) stays crisp and a soft one (grime, a streak, rust) fades in a
+ * stipple, the old ordered-dither look, with no blending and no sorting.
+ * The test comes right after the texture read, so a discarded fragment
+ * writes nothing. The atlas's colour is white, so a decal's colour is its
+ * tint in every look, and the shapes survive Freescape 64, whose texture
+ * mix is 0.
+ *
  * The uv's screen-space derivatives are taken once, at the top of `main`
  * before any early return, so they are defined for every fragment of the
  * quad; the edge lines and the grime lookup (`textureGrad`) share them. The
@@ -244,6 +256,20 @@ float cellLevel(vec3 p, vec3 n) {
   return texture(uLightGrid, cell / uGridSize).r;
 }
 
+// The 4x4 ordered (Bayer) thresholds a decal's alpha is tested against,
+// each offset half a step so the lowest is above 0 and a clear texel is
+// always discarded.
+const float BAYER4[16] = float[16](
+  0.0, 8.0, 2.0, 10.0,
+  12.0, 4.0, 14.0, 6.0,
+  3.0, 11.0, 1.0, 9.0,
+  15.0, 7.0, 13.0, 5.0);
+
+float bayer4(vec2 p) {
+  ivec2 q = ivec2(mod(floor(p), 4.0));
+  return (BAYER4[q.y * 4 + q.x] + 0.5) / 16.0;
+}
+
 float edgeLine(vec2 uv, vec2 fw, float width) {
   vec2 g = abs(fract(uv - 0.5) - 0.5) / max(fw, vec2(1e-4));
   return 1.0 - clamp(min(g.x, g.y) / width, 0.0, 1.0);
@@ -253,7 +279,9 @@ void main() {
   vec2 dx = dFdx(vUv);
   vec2 dy = dFdy(vUv);
   vec2 fw = abs(dx) + abs(dy);
-  vec3 texel = texture(uTextures, vec3(vUv, vLayer)).rgb;
+  vec4 texel4 = texture(uTextures, vec3(vUv, vLayer));
+  vec3 texel = texel4.rgb;
+  if (vFlag == ${String(FLAG.decal)} && texel4.a < bayer4(gl_FragCoord.xy)) discard;
   vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
   float level = cellLevel(vWorld, vNormal);
   vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);

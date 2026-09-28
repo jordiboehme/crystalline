@@ -43,7 +43,10 @@
  *
  * The gallery and the hero hall take a plain finish (`plainFinish`: accent
  * 0, wall pattern 0 everywhere); the variants hall shows every wall
- * pattern (`variantsHallRoom`). All three carry no decals (`decals: []`).
+ * pattern (`variantsHallRoom`). The gallery and the hero hall carry no
+ * decals (`decals: []`); the variants hall carries one of every decal kind
+ * and tile on its south wall and its floor, and both stencils
+ * (`variantsHallDecals`).
  */
 
 import { seedFor } from "../core/seed";
@@ -57,6 +60,7 @@ import {
   hostSurfaces,
   type HostSurface,
 } from "./curios";
+import { bayNumber, deckNumber } from "./decals";
 import { PROP_ORDER } from "./dress";
 import { plainFinish } from "./finish";
 import { FOOTPRINTS, PIPE_HALF } from "./footprints";
@@ -75,6 +79,8 @@ import { wallAnchor } from "./sites";
 import type {
   Curio,
   CurioKind,
+  Decal,
+  DecalKind,
   Decor,
   DecorKind,
   Fixture,
@@ -1385,6 +1391,167 @@ function variantsHallCouncil(hall: Rect, seed: number): Decor[] {
   return out;
 }
 
+/**
+ * The decal kinds and tiles the variants hall lays, one of each on its
+ * south wall and one of each on its floor (2.7 C24): every tile of the
+ * atlas but the stencils' solid one (`DECAL_TILES` in `render/textures.ts`,
+ * whose counts `canned.test.ts` checks this list against).
+ */
+const VARIANTS_HALL_DECAL_KINDS: readonly {
+  kind: Exclude<DecalKind, "stencil">;
+  variants: number;
+}[] = [
+  { kind: "chevrons", variants: 2 },
+  { kind: "arrow", variants: 1 },
+  { kind: "grime", variants: 3 },
+  { kind: "streak", variants: 2 },
+  { kind: "rust", variants: 2 },
+];
+
+/**
+ * The size of each variants-hall sample decal, in metres: `width` across
+ * and `length` up the wall or along the floor decal's turn.
+ */
+const VARIANTS_HALL_DECAL_SIZE: Record<
+  Exclude<DecalKind, "stencil">,
+  { width: number; length: number }
+> = {
+  chevrons: { width: 1.2, length: 0.3 },
+  arrow: { width: 0.6, length: 0.9 },
+  grime: { width: 0.9, length: 0.9 },
+  streak: { width: 0.6, length: 0.9 },
+  rust: { width: 0.6, length: 0.9 },
+};
+
+/**
+ * The variants hall's decals (2.7 C24), hand-placed:
+ *
+ * - **The wall**: one of every kind and tile (`VARIANTS_HALL_DECAL_KINDS`)
+ *   on the hall's south wall, three to an edge, 0.55 by 0.8 m from 0.3 m
+ *   up (under the accent stripe), on the south row's free edges west and
+ *   east of the entrance (x 0, 2, 8 and 10, each between two machines),
+ *   and the wall stencil, `DECK n` over `BAY m`, on the entrance's east
+ *   neighbour edge, where C19 stands it (1.5 m up, 0.9 by 0.3 m). Turning
+ *   round at the spawn shows them all.
+ * - **The floor**: two rows east of the entrance lane, a little ahead of
+ *   the spawn: the chevrons, the arrow (pointing south, to the entrance)
+ *   and the floor stencil `BAY m`, then the grime, streaks and rust, each
+ *   at its own size (`VARIANTS_HALL_DECAL_SIZE`), clear of every lane and
+ *   footprint.
+ *
+ * The deck and bay numbers are the hall's own address's (`deckNumber`,
+ * `bayNumber`: a permalink at the domain's root is deck 1).
+ */
+function variantsHallDecals(
+  room: Pick<RoomSpec, "hall" | "entrance" | "domain" | "permalink">,
+  seed: number,
+): Decal[] {
+  const samples = VARIANTS_HALL_DECAL_KINDS.flatMap(({ kind, variants }) =>
+    Array.from({ length: variants }, (_, variant) => ({ kind, variant })),
+  );
+  const seedOf = (...parts: (string | number)[]) =>
+    seedFor(seed, "decal", ...parts);
+  const text = {
+    deck: deckNumber(room.domain, room.permalink),
+    bay: bayNumber(room.domain, room.permalink),
+    letter: 0,
+  };
+  const south = room.hall.y1 - 1;
+  const ent = room.entrance;
+
+  // The wall: three to an edge, then the stencil.
+  const edges = [0, 2, 8, 10];
+  const along = [-0.62, 0, 0.62];
+  const out: Decal[] = samples.map(({ kind, variant }, i) => {
+    const a = wallAnchor({
+      x: edges[Math.floor(i / along.length)] ?? 0,
+      y: south,
+      side: "s",
+    });
+    return {
+      kind,
+      on: "wall",
+      x: a.x,
+      y: a.y,
+      turn: a.turn,
+      along: along[i % along.length] ?? 0,
+      h: 0.3,
+      width: 0.55,
+      length: 0.8,
+      variant,
+      seed: seedOf("wall", kind, variant),
+    };
+  });
+  const sign = wallAnchor({ x: ent.x + 1, y: ent.y, side: "s" });
+  out.push({
+    kind: "stencil",
+    on: "wall",
+    x: sign.x,
+    y: sign.y,
+    turn: sign.turn,
+    along: 0,
+    h: 1.5,
+    width: 0.9,
+    length: 0.3,
+    variant: 0,
+    seed: seedOf("stencil", "wall"),
+    stencil: { ...text, lines: 2 },
+  });
+
+  // The floor: two rows, left to right from just east of the entrance lane.
+  const start = (ent.x + 1) * CELL + 0.4;
+  const rows: {
+    y: number;
+    gap: number;
+    items: { kind: DecalKind; variant: number; turn: number }[];
+  }[] = [
+    {
+      y: ent.y - 2.5,
+      gap: 0.3,
+      items: [
+        { kind: "chevrons", variant: 0, turn: 0 },
+        { kind: "chevrons", variant: 1, turn: 0 },
+        { kind: "arrow", variant: 0, turn: 2 },
+        { kind: "stencil", variant: 0, turn: 0 },
+      ],
+    },
+    {
+      y: ent.y - 1.3,
+      gap: 0.25,
+      items: samples
+        .filter((d) => d.kind !== "chevrons" && d.kind !== "arrow")
+        .map((d) => ({ ...d, turn: 0 })),
+    },
+  ];
+  for (const line of rows) {
+    let x = start;
+    for (const { kind, variant, turn } of line.items) {
+      const size =
+        kind === "stencil"
+          ? { width: 1.0, length: 0.3 }
+          : VARIANTS_HALL_DECAL_SIZE[kind];
+      out.push({
+        kind,
+        on: "floor",
+        x: (x + size.width / 2) / CELL,
+        y: line.y,
+        turn,
+        along: 0,
+        h: 0,
+        width: size.width,
+        length: size.length,
+        variant,
+        seed: seedOf("floor", kind, variant),
+        ...(kind === "stencil"
+          ? { stencil: { ...text, lines: 1 as const } }
+          : {}),
+      });
+      x += size.width + line.gap;
+    }
+  }
+  return out;
+}
+
 /** How many machines the variants hall stands: every kind's own variant count, summed (2.7 C2). */
 const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
   (a, b) => a + b,
@@ -1420,8 +1587,9 @@ const VARIANTS_HALL_MACHINES = Object.values(VARIANT_COUNTS.machine).reduce(
  * per four by four block that holds any floor, as `galleryRoom`'s and
  * `heroHallRoom`'s. Accent 0, and its hall, bays and corridor in wall
  * patterns 0, then 1, 2, 1, 2 bay by bay and 1, so the hall and its bays
- * show all three patterns (2.7 C11). The same call gives the same room
- * byte for byte.
+ * show all three patterns (2.7 C11). One of every decal kind and tile on
+ * its south wall and its floor, and both stencils (`variantsHallDecals`).
+ * The same call gives the same room byte for byte.
  */
 export function variantsHallRoom(): RoomSpec {
   const seed = seedFor(GAME_VERSION, "variants-hall");
@@ -1546,7 +1714,15 @@ export function variantsHallRoom(): RoomSpec {
       bayWalls: [1, 2, 1, 2].slice(0, layout.bays.length),
       corridorWalls: 1,
     },
-    decals: [],
+    decals: variantsHallDecals(
+      {
+        hall: layout.hall,
+        entrance: layout.entrance,
+        domain: "station",
+        permalink: "variants-hall",
+      },
+      seed,
+    ),
     lights,
     dropped: 0,
     inboundMore: 0,

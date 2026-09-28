@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
 import { LAYER, LAYER_SIZE } from "./layers";
-import { baseLayers, valueNoise } from "./textures";
+import {
+  DECAL_TILES,
+  baseLayers,
+  decalLayer,
+  tileRect,
+  valueNoise,
+} from "./textures";
 
 describe("baseLayers", () => {
   const layers = baseLayers(32, 1);
@@ -70,11 +76,61 @@ describe("baseLayers", () => {
     expect(bright(midRow)).toBe(0);
   });
 
-  it("leaves the decal layer transparent until the atlas is drawn", () => {
-    // Mutation caught: the decal layer opaque (every decal a solid square).
+  it("hands out the decal atlas as the decal layer (2.7 C20)", () => {
+    // Mutation caught: the decal layer left blank (no decal is ever drawn)
+    // or opaque (every decal a solid square).
     const decal = baseLayers(LAYER_SIZE, 1)[LAYER.decal];
-    expect(decal).toBeDefined();
-    expect(decal!.every((v, i) => i % 4 !== 3 || v === 0)).toBe(true);
+    expect(decal).toEqual(decalLayer(LAYER_SIZE));
+    expect(decal!.some((v, i) => i % 4 === 3 && v > 0)).toBe(true);
+    expect(decal!.some((v, i) => i % 4 === 3 && v === 0)).toBe(true);
+  });
+
+  it("draws every decal tile's shape in its alpha, inside a clear margin (2.7 C20)", () => {
+    // Mutation caught: a tile left empty, a tile that fills its margin (mip
+    // bleed into its neighbour), or the arrow pointing down.
+    const d = decalLayer(LAYER_SIZE);
+    const alpha = (x: number, y: number) =>
+      d[(y * LAYER_SIZE + x) * 4 + 3] ?? 0;
+    const tiles = Object.values(DECAL_TILES).flat();
+    expect(tiles.length).toBeGreaterThan(0);
+    for (const t of tiles) {
+      const x0 = (t % 4) * 64;
+      const y0 = Math.floor(t / 4) * 64;
+      let inside = 0;
+      for (let y = 0; y < 64; y++)
+        for (let x = 0; x < 64; x++) {
+          const a = alpha(x0 + x, y0 + y);
+          const margin = x < 4 || y < 4 || x >= 60 || y >= 60;
+          if (margin) expect(a).toBe(0);
+          else if (a > 0) inside++;
+        }
+      expect(inside).toBeGreaterThan(200);
+    }
+    // The arrow (tile 2) points to the tile's high v. A byte layer is not
+    // flipped (`flipRows` is for canvas layers only), so its row 0 is v 0:
+    // the head (wide) lies in the upper rows 32 to 59, the shaft (narrow)
+    // in rows 4 to 31.
+    const width = (row: number) =>
+      Array.from({ length: 64 }, (_, x) => alpha(2 * 64 + x, row)).filter(
+        (a) => a > 127,
+      ).length;
+    const widest = (from: number, to: number) =>
+      Math.max(...Array.from({ length: to - from }, (_, i) => width(from + i)));
+    expect(widest(32, 60)).toBeGreaterThan(2 * widest(4, 32));
+  });
+
+  it("maps a tile's rectangle inside its own margin (2.7 C20)", () => {
+    // Mutation caught: a rectangle over the whole tile (its margin's clear
+    // texels at every decal's edge) or over the wrong tile.
+    for (const t of Object.values(DECAL_TILES).flat()) {
+      const r = tileRect(t);
+      const x0 = (t % 4) * 64;
+      const y0 = Math.floor(t / 4) * 64;
+      expect(r.u0 * LAYER_SIZE).toBeCloseTo(x0 + 4, 6);
+      expect(r.u1 * LAYER_SIZE).toBeCloseTo(x0 + 60, 6);
+      expect(r.v0 * LAYER_SIZE).toBeCloseTo(y0 + 4, 6);
+      expect(r.v1 * LAYER_SIZE).toBeCloseTo(y0 + 60, 6);
+    }
   });
 
   it("draws hazard stripes in two clearly different tones", () => {

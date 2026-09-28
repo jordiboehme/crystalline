@@ -116,3 +116,30 @@ it("swaps the accent mark for uAccent in the vertex shader (2.7 C8)", () => {
   );
   expect(ACCENT_MARK).toBeLessThan(0);
 });
+
+describe("the scene shader's decal branch", () => {
+  it("alpha-tests a decal against the ordered threshold and never draws its edges (2.7 C20)", () => {
+    // Mutation caught: no discard (every decal an opaque square), the test on
+    // the tinted colour instead of the texel's alpha (Freescape would lose
+    // the shapes), or edge lines on decals in the Aperture look.
+    expect(FLAG.decal).toBe(14);
+    expect(SCENE_FS).toContain("float bayer4(vec2 p)");
+    expect(SCENE_FS).toMatch(
+      /if \(vFlag == 14 && texel4\.a < bayer4\(gl_FragCoord\.xy\)\) discard;/,
+    );
+    expect(SCENE_FS).toContain(
+      "bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == 0);",
+    );
+  });
+
+  it("never lets the lowest ordered threshold keep a clear texel (2.7 C20)", () => {
+    // Mutation caught: thresholds starting at 0, where `0.0 < 0.0` keeps
+    // one fragment in sixteen of a decal's clear margin, a dotted square
+    // round every decal.
+    expect(SCENE_FS).toMatch(/\(BAYER4\[[^\]]+\] \+ 0\.5\) \/ 16\.0/);
+    // The discard comes before any colour is written.
+    expect(SCENE_FS.indexOf("discard;")).toBeLessThan(
+      SCENE_FS.indexOf("outColour ="),
+    );
+  });
+});

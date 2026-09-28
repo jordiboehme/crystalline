@@ -28,8 +28,8 @@ import type { RoomSpec } from "../world/types";
  * asking the texture code, and the text layers start right after them at
  * `TEXT_BASE`. `ribbed` and `plated` are the shell's two alternative wall
  * patterns (2.7 C11), read only by the geometry's wall, lintel and stripe
- * quads; every model keeps `panel`. `decal` is the decal atlas (2.7 C12),
- * fully transparent until the atlas is drawn onto it.
+ * quads; every model keeps `panel`. `decal` is the decal atlas (2.7 C12,
+ * C20, `decalLayer` in `textures.ts`), its shapes in their alpha.
  */
 export const LAYER = {
   panel: 0,

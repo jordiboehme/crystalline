@@ -7,15 +7,18 @@
  * a swirl the shader scrolls, grime is fractal noise the shader lays over
  * any surface by the look's grime amount, ribbed is six vertical ribs with
  * a groove at mid-height, and plated is one riveted plate (2.7 C11). The
- * decal layer starts fully transparent; its atlas is drawn separately. Each
- * is a plain RGBA byte array so it can be tested without a GPU and uploaded
- * as one layer of the texture array.
+ * decal layer is the decal atlas (`decalLayer`, 2.7 C20): a 4 by 4 sheet
+ * of tiles whose shapes live in their alpha alone, which the scene shader
+ * tests against an ordered threshold. Each is a plain RGBA byte array so
+ * it can be tested without a GPU and uploaded as one layer of the texture
+ * array.
  *
  * Surfaces are generated mostly light and grey; colour comes from the look's
  * tint in the shader, which is what lets one set of layers serve every look.
  */
 
 import { createRng, type Rng } from "../core/seed";
+import type { DecalKind } from "../world/types";
 import { LAYER } from "./layers";
 
 /** RGBA bytes of one square layer. */
@@ -115,8 +118,8 @@ function isRivet(x: number, y: number, size: number): boolean {
 
 /**
  * Layers 0 to `LAYER.decal`: every procedural layer, with `pictogram` a
- * blank the browser draws its pictograms over and `decal` a blank its
- * atlas is drawn over.
+ * blank the browser draws its pictograms over and `decal` the decal atlas
+ * (`decalLayer`).
  */
 export function baseLayers(size: number, seed: number): Pixels[] {
   const rng = createRng(seed);
@@ -189,9 +192,7 @@ export function baseLayers(size: number, seed: number): Pixels[] {
     if (isRivet(x, y, size)) v = 250;
     return [v, v, v];
   });
-  // Fully transparent (every byte 0, including alpha) until the atlas is
-  // drawn onto it.
-  const decal: Pixels = new Uint8Array(size * size * 4);
+  const decal = decalLayer(size);
 
   const out: Pixels[] = [];
   out[LAYER.panel] = panel;
@@ -205,5 +206,225 @@ export function baseLayers(size: number, seed: number): Pixels[] {
   out[LAYER.ribbed] = ribbed;
   out[LAYER.plated] = plated;
   out[LAYER.decal] = decal;
+  return out;
+}
+
+/** How many tiles the decal atlas has a side (2.7 C20). */
+const ATLAS_TILES = 4;
+
+/**
+ * The side of a decal tile in the atlas's own texel units, and its clear
+ * margin (2.7 C20): at the 256-texel layer a tile is 64 texels and its
+ * outer 4 texels on every side are fully transparent, so a coarser mip
+ * level never bleeds one tile's shape into its neighbour. A layer of
+ * another size scales the whole sheet.
+ */
+const TILE = 64;
+const MARGIN = 4;
+
+/**
+ * The decal atlas's tiles by kind (2.7 C20), row by row from the layer's
+ * first row: chevrons 0 and 1, the arrow 2, grime 3 to 5, streaks 6 and 7,
+ * rust 8 and 9, and the solid tile 15, whose alpha is full inside its
+ * margin, for the stencils' pixels (a stencil draws from `solid`, never
+ * from a tile of its own). Tiles 10 to 14 are empty. A decal's `variant`
+ * indexes its kind's list.
+ */
+export const DECAL_TILES: Readonly<
+  Record<DecalKind | "solid", readonly number[]>
+> = {
+  chevrons: [0, 1],
+  arrow: [2],
+  grime: [3, 4, 5],
+  streak: [6, 7],
+  rust: [8, 9],
+  stencil: [15],
+  solid: [15],
+};
+
+/**
+ * A window of a decal tile as a uv rectangle of the layer: the tile's
+ * texels `from` to `to` both ways, in the 64-texel tile's own units. A
+ * byte layer is uploaded as it is (only canvas layers are flipped), so
+ * `v` 0 is the layer's first row and a tile's high `v` is its top.
+ */
+export function tileWindow(
+  tile: number,
+  from: number,
+  to: number,
+): { u0: number; v0: number; u1: number; v1: number } {
+  const col = tile % ATLAS_TILES;
+  const row = Math.floor(tile / ATLAS_TILES);
+  const at = (cell: number, texel: number) =>
+    (cell * TILE + texel) / (TILE * ATLAS_TILES);
+  return {
+    u0: at(col, from),
+    v0: at(row, from),
+    u1: at(col, to),
+    v1: at(row, to),
+  };
+}
+
+/**
+ * A decal tile's uv rectangle (2.7 C20): the tile inside its clear
+ * margin, `u0` to `u1` left to right and `v0` to `v1` bottom to top, so a
+ * quad mapped onto it shows the tile's whole shape and none of the
+ * margin's clear texels at its edges.
+ */
+export function tileRect(tile: number): {
+  u0: number;
+  v0: number;
+  u1: number;
+  v1: number;
+} {
+  return tileWindow(tile, MARGIN, TILE - MARGIN);
+}
+
+/** `x` eased from 0 at `a` to 1 at `b`, as GLSL's `smoothstep`. */
+function smooth(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/** A tile's alpha, 0 to 1, at texel `(x, y)` of its 64 by 64 (y 0 its bottom). */
+type TileShape = (x: number, y: number) => number;
+
+/**
+ * Hazard stripes (2.7 C20): bars 16 texels wide at 45 degrees, one way
+ * (`mirror` false) or the other, hard edged. The pattern repeats every 32
+ * texels both ways, so any 32 by 32 window of it tiles seamlessly.
+ */
+const chevrons =
+  (mirror: boolean): TileShape =>
+  (x, y) =>
+    (((mirror ? x - y + TILE : x + y) % 32) + 32) % 32 < 16 ? 1 : 0;
+
+/** An arrow pointing to the tile's top: a shaft in rows 4 to 31, a head in 32 to 59, hard edged. */
+const arrow: TileShape = (x, y) => {
+  const cx = x + 0.5 - TILE / 2;
+  if (y < 32) return Math.abs(cx) < 6 ? 1 : 0;
+  const half = (26 * (TILE - MARGIN - 0.5 - y)) / (TILE - MARGIN - 0.5 - 32);
+  return Math.abs(cx) < half ? 1 : 0;
+};
+
+/**
+ * Fractal noise over one tile, two octaves of `valueNoise`, 0 to 1: the
+ * texture of grime and of a rust blotch.
+ */
+function tileNoise(rng: Rng): (x: number, y: number) => number {
+  const a = valueNoise(TILE, rng, 4);
+  const b = valueNoise(TILE, rng, 8);
+  const c = valueNoise(TILE, rng, 16);
+  return (x, y) => {
+    const i = y * TILE + x;
+    return ((a[i] ?? 0) * 4 + (b[i] ?? 0) * 2 + (c[i] ?? 0)) / 7;
+  };
+}
+
+/**
+ * A grime blob: fractal noise, strongest in the tile's middle and falling
+ * to nothing well before its margin, soft edged, so the shader's ordered
+ * threshold stipples it.
+ */
+function grime(rng: Rng): TileShape {
+  const n = tileNoise(rng);
+  return (x, y) => {
+    const r =
+      Math.hypot(x + 0.5 - TILE / 2, y + 0.5 - TILE / 2) / (TILE / 2 - MARGIN);
+    const fall = 1 - smooth(0.4, 0.92, r);
+    return Math.min(1, Math.max(0, (n(x, y) * fall - 0.18) * 2.4));
+  };
+}
+
+/**
+ * Drips hanging from the tile's top (its high rows): a soft band along the
+ * top and five to seven drips of their own width and length below it, each
+ * strongest where it leaves the top and fading along its length.
+ */
+function drips(rng: Rng): TileShape {
+  const top = TILE - MARGIN - 1;
+  const count = rng.int(5, 7);
+  const list = Array.from({ length: count }, () => ({
+    x: rng.range(12, TILE - 12),
+    w: rng.range(1.5, 4.5),
+    len: rng.range(18, 50),
+  }));
+  return (x, y) => {
+    const cx = x + 0.5;
+    const across =
+      1 - smooth(TILE / 2 - 12, TILE / 2 - MARGIN - 1, Math.abs(cx - TILE / 2));
+    const band = smooth(top - 10, top, y) * 0.7 * across;
+    let a = band;
+    for (const d of list) {
+      const down = top - y;
+      if (down < 0 || down > d.len) continue;
+      const g = Math.exp(-(((cx - d.x) / d.w) ** 2));
+      a = Math.max(a, g * Math.pow(1 - down / d.len, 0.6) * 0.95);
+    }
+    return a;
+  };
+}
+
+/** Rust: drips as a streak's, under a noisy blotch at the tile's top. */
+function rust(rng: Rng): TileShape {
+  const drip = drips(rng);
+  const n = tileNoise(rng);
+  const cx = rng.range(26, 38);
+  const cy = TILE - MARGIN - 9;
+  return (x, y) => {
+    const r = Math.hypot(x + 0.5 - cx, (y + 0.5 - cy) * 1.6) / 14;
+    const blotch = (1 - smooth(0.45, 1, r)) * (0.55 + 0.45 * n(x, y));
+    return Math.max(drip(x, y), blotch);
+  };
+}
+
+/**
+ * The decal atlas (2.7 C20), `size` texels a side: a 4 by 4 sheet of
+ * tiles, each shape drawn in its tile's alpha with a clear margin all
+ * round (`DECAL_TILES` names the tiles): two sets of hazard stripes, the
+ * arrow (pointing to its tile's top), three grime blobs, two streaks of
+ * drips from the top, two rust bleeds (drips under a blotch) and the solid
+ * tile. The chevrons, the arrow and the solid tile are hard edged, alpha 0
+ * or 1, so the shader's alpha test keeps them crisp; grime, streaks and
+ * rust fade softly, so the test stipples them. Every colour byte is white
+ * (255): a decal's colour is its tint, which the texture then leaves
+ * alone in every look. The same size gives the same bytes; the atlas draws
+ * from a fixed seed of its own.
+ */
+export function decalLayer(size: number): Pixels {
+  const rng = createRng(0xdeca1);
+  const shapes = new Map<number, TileShape>([
+    [0, chevrons(false)],
+    [1, chevrons(true)],
+    [2, arrow],
+    [3, grime(rng)],
+    [4, grime(rng)],
+    [5, grime(rng)],
+    [6, drips(rng)],
+    [7, drips(rng)],
+    [8, rust(rng)],
+    [9, rust(rng)],
+    [15, () => 1],
+  ]);
+  const tile = size / ATLAS_TILES;
+  const out = new Uint8Array(size * size * 4).fill(255);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const t = Math.floor(y / tile) * ATLAS_TILES + Math.floor(x / tile);
+      // The texel's place in its tile, in the 64-texel tile's units.
+      const tx = Math.floor(((x % tile) + 0.5) * (TILE / tile));
+      const ty = Math.floor(((y % tile) + 0.5) * (TILE / tile));
+      const margin =
+        tx < MARGIN ||
+        ty < MARGIN ||
+        tx >= TILE - MARGIN ||
+        ty >= TILE - MARGIN;
+      const shape = shapes.get(t);
+      const a = margin || shape === undefined ? 0 : shape(tx, ty);
+      out[(y * size + x) * 4 + 3] = Math.round(
+        Math.min(1, Math.max(0, a)) * 255,
+      );
+    }
+  }
   return out;
 }

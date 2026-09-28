@@ -25,7 +25,8 @@
 import { describe, expect, it } from "vitest";
 
 /**
- * Every hero, curio and prop recipe file and `marks.ts`, raw, by path:
+ * Every hero, curio and prop recipe file, `marks.ts` and the decal
+ * recipe (`decals.ts`, whose stencils set deck and bay numbers), raw, by path:
  * gathered by glob, so a batch file a later task adds is scanned without
  * anyone listing it. `pixels.ts` is left out (its glyph keys are the font,
  * not text drawn), and so are the tests.
@@ -33,7 +34,11 @@ import { describe, expect, it } from "vitest";
 const SOURCES = Object.fromEntries(
   Object.entries(
     import.meta.glob<string>(
-      ["./models/{heroes,curios,props}/*.ts", "./models/marks.ts"],
+      [
+        "./models/{heroes,curios,props}/*.ts",
+        "./models/marks.ts",
+        "./models/decals.ts",
+      ],
       {
         query: "?raw",
         import: "default",
@@ -122,6 +127,20 @@ const READABLE = new Set([
   "RADIOACTIVE III",
   "CAUTION RADIOACTIVE MATERIAL",
   "PLUTONIUM HANDLE WITH CARE",
+  // The deck and bay stencils (2.7 C19): the two words, the numerals ("1"
+  // to "5" are above, the capsules' numbers) and the overflow bays'
+  // letters, each set on its own.
+  "DECK",
+  "BAY",
+  "0",
+  "6",
+  "7",
+  "8",
+  "9",
+  "A",
+  "B",
+  "C",
+  "D",
 ]);
 
 /**
@@ -229,6 +248,7 @@ describe("readable text in the recipes", () => {
       "rare",
       "walker",
       "marks",
+      "decals",
     ])
       expect(
         Object.keys(SOURCES).some((p) => p.endsWith(`/${name}.ts`)),
