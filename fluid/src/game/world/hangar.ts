@@ -32,7 +32,9 @@
  *   heroes in the hangar and re-runs the dressing, the curios and the
  *   decals round them, as `withHeroes` does for an engram room.
  *   `hangarHeroes` is what the hangar heroes will be; it is empty until the
- *   prop round builds them, and `generateDeck` does not call the seam.
+ *   prop round builds them. `generateDeck` ends a hangar with
+ *   `withPadHeroes(room, [...room.heroes, ...hangarHeroes(room)])`, which
+ *   changes nothing while the list is empty.
  *
  * The generator side: it imports the seed, the folder helpers, the layout,
  * the passes it re-runs and the leaf `hangarShape.ts`; never `deck.ts` at

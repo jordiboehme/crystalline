@@ -24,6 +24,7 @@ import {
 } from "./hangar";
 import hangarSource from "./hangar.ts?raw";
 import {
+  gantryBeams,
   gantryLegEdges,
   gantryLegs,
   padBox,
@@ -31,8 +32,8 @@ import {
 } from "./hangarShape";
 import hangarShapeSource from "./hangarShape.ts?raw";
 import { heroEdges, isTallHero } from "./heroes";
-import { LANE_DEPTH, LANE_WIDTH } from "./props";
-import { dressingSites, edgeKey, edgeOf, overlaps } from "./sites";
+import { LANE_DEPTH, LANE_WIDTH, PROP_CATALOGUE, SPAN_CELLS } from "./props";
+import { dressingSites, edgeKey, edgeOf, overlaps, spanBox } from "./sites";
 import type { Box, Decal, Hero, RoomSpec } from "./types";
 import { CELL } from "./units";
 
@@ -204,6 +205,8 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     const pads = hangar.pads.map(padBox);
     expect(pads.length).toBe(2);
     expect(room.props.length).toBeGreaterThan(0);
+    expect(room.heroes.length).toBeGreaterThan(0);
+    expect(room.curios.length).toBeGreaterThan(0);
     for (const pad of pads) {
       for (const p of room.props) {
         const box = propFootprint(p);
@@ -261,6 +264,13 @@ describe("the hangar deck (M3 C13 to C18)", () => {
       expect(sites.free.has(k), k).toBe(false);
     }
     const keptSet = new Set(kept);
+    expect(
+      room.props.filter((p) => p.anchor === "wall").length,
+    ).toBeGreaterThan(0);
+    expect(room.decals.filter((d) => d.on === "wall").length).toBeGreaterThan(
+      0,
+    );
+    expect(room.heroes.flatMap(heroEdges).length).toBeGreaterThan(0);
     for (const p of room.props)
       if (p.anchor === "wall")
         expect(keptSet.has(edgeKey(edgeOf(p))), p.kind).toBe(false);
@@ -270,6 +280,49 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     for (const h of room.heroes)
       for (const e of heroEdges(h))
         expect(keptSet.has(edgeKey(e)), h.kind).toBe(false);
+  });
+
+  it("hangs no ceiling span across or along a gantry", () => {
+    // Mutation caught: the span lines not keeping off the gantries' beams
+    // (a duct run through a truss or its catwalk).
+    const folders: string[] = [];
+    for (let f = 0; folders.length < 20; f++)
+      if (isHangar("station", `bay${String(f)}`))
+        folders.push(`bay${String(f)}`);
+    const rooms = [
+      hangarRoom(),
+      ...folders.map((folder) =>
+        generateDeck(
+          {
+            domain: "station",
+            folder,
+            rows: [],
+            subfolders: [],
+            total: 0,
+            truncated: false,
+          },
+          0,
+        ),
+      ),
+    ];
+    expect(rooms.length).toBe(21);
+    let spans = 0;
+    for (const room of rooms) {
+      expect(room.space).toBe("hangar");
+      const beams = gantryBeams(room);
+      expect(beams.length).toBe(2);
+      for (const p of room.props) {
+        if (!PROP_CATALOGUE[p.kind].span) continue;
+        spans++;
+        const box =
+          p.turn === 0
+            ? spanBox("x", { x: p.x - SPAN_CELLS / 2, y: p.y - 0.5 })
+            : spanBox("y", { x: p.x - 0.5, y: p.y - SPAN_CELLS / 2 });
+        for (const b of beams)
+          expect(overlaps(box, b), `${room.permalink} ${p.kind}`).toBe(false);
+      }
+    }
+    expect(spans).toBeGreaterThan(0);
   });
 
   it("stands heroes on the pads through the seam (C18)", () => {
@@ -294,6 +347,11 @@ describe("the hangar deck (M3 C13 to C18)", () => {
     const fitted = withPadHeroes(room, [...room.heroes, ...onPads]);
     expect(fitted.heroes.length).toBe(room.heroes.length + 2);
     for (const h of onPads) expect(fitted.heroes).toContainEqual(h);
+    expect(fitted.props.length).toBeGreaterThan(0);
+    expect(fitted.curios.length).toBeGreaterThan(0);
+    expect(
+      fitted.decals.filter((d) => d.on === "floor").length,
+    ).toBeGreaterThan(0);
     for (const h of onPads) {
       const foot = heroFootprint(h);
       for (const p of fitted.props) {

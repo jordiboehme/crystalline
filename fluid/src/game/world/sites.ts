@@ -84,10 +84,11 @@
  *   the same way from the north end over the rows `hall.y0 + 1` to
  *   `hall.y1 - 2`. A line is kept only when none of its segments'
  *   `spanBox`es overlaps a decor footprint, a box of `room.scaffold`, a
- *   lamp's box (`lampBoxes`) or a pipe run's box (`pipeRunBox`): the lab
- *   island's duct, the specimen tanks and the scaffold poles reach the
- *   ceiling, a span under a lamp would hide it, and a pipe run hangs in the
- *   span band (E3). A line is dropped whole, never cut short. Every span
+ *   lamp's box (`lampBoxes`), a pipe run's box (`pipeRunBox`) or, in a
+ *   hangar, a gantry's beam (`gantryBeams`, M3 C15): the lab island's
+ *   duct, the specimen tanks and the scaffold poles reach the ceiling, a
+ *   span under a lamp would hide it, a pipe run hangs in the span band
+ *   (E3), and a span would run through a gantry's truss or catwalk. A line is dropped whole, never cut short. Every span
  *   stays at least one full cell (2 m) off every hall wall, past the
  *   ceiling band along the walls (1.2 m) where the runs, loops, beacon and
  *   loose cables hang. Which palette hangs a span, and on which line, is
@@ -128,7 +129,7 @@ import {
   footprintOf,
   pipeRunBox,
 } from "./footprints";
-import { gantryLegEdges, gantryLegs, padBox } from "./hangarShape";
+import { gantryBeams, gantryLegEdges, gantryLegs, padBox } from "./hangarShape";
 import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
@@ -699,7 +700,7 @@ function spanLines(room: SiteBase): SpanLine[] {
     const run = pipeRunBox(d, hall);
     if (run !== null) solid.push(run);
   }
-  solid.push(...room.scaffold, ...lampBoxes(room));
+  solid.push(...room.scaffold, ...lampBoxes(room), ...gantryBeams(room));
   const lines: SpanLine[] = [];
   const keep = (line: SpanLine) => {
     const clear = line.segments.every((c) => {

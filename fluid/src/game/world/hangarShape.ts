@@ -3,13 +3,15 @@
  * the gantry legs' wall edges and boxes, and where the pad stencils lie.
  * Pure arithmetic on a `HangarSpec`, shared by the site rules
  * (`dressingSites`: the pads and the legs are taken boxes, the leg edges
- * carry nothing), the decals (`placeDecals` lays the pad stencils) and the
+ * carry nothing, the span lines keep off the beams), the decals (`placeDecals` lays the pad stencils) and the
  * room mesh (Task 8 draws the pads and the gantries from the same numbers).
  *
  * - A pad's box is its cells in metres.
  * - Each gantry stands on a leg at each end of its beam: on the west wall
  *   edge `(0, y, w)` and the east wall edge `(width - 1, y, e)` of its row.
  *   A leg's box is `GANTRY_LEG` against that edge, centred on the row.
+ * - A gantry's beam in plan is its truss and its catwalk (`GANTRY_BEAM`),
+ *   wall to wall; no ceiling span crosses or runs along it.
  * - A pad's stencil lies 1 m inside its south rim, centred across it,
  *   reading from the south; the pads are lettered 1, 2, ... in pad order.
  *
@@ -27,6 +29,33 @@ import { CELL } from "./units";
  * dressing out of it.
  */
 export const GANTRY_LEG = { along: 1.0, out: 0.6 } as const;
+
+/**
+ * A gantry's beam in plan, in metres (M3 C15): the truss `half` either side
+ * of its row's centre line and the catwalk `catwalk` wide along its south
+ * side. The room mesh draws them to these numbers, and no ceiling span is
+ * hung across or along them (`gantryBeams`).
+ */
+export const GANTRY_BEAM = { half: 0.4, catwalk: 1.0 } as const;
+
+/**
+ * The gantries' beams in plan, in metres, one box per gantry in order: wall
+ * to wall, from `GANTRY_BEAM.half` north of its row's centre line to the
+ * catwalk's south edge. The span lines keep off them (`dressingSites`).
+ * None on a room with no hangar.
+ */
+export function gantryBeams(room: Pick<RoomSpec, "width" | "hangar">): Box[] {
+  if (room.hangar === undefined) return [];
+  return room.hangar.gantries.map((g) => {
+    const z = (g.y + 0.5) * CELL;
+    return {
+      x0: 0,
+      x1: room.width * CELL,
+      z0: z - GANTRY_BEAM.half,
+      z1: z + GANTRY_BEAM.half + GANTRY_BEAM.catwalk,
+    };
+  });
+}
 
 /** A pad's floor box in metres: its cells, `x1` and `y1` exclusive. */
 export function padBox(p: Pad): Box {

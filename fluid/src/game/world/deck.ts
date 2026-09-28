@@ -38,7 +38,8 @@
  * n) beside the bay door. Its zones are lit at `HANGAR_LIGHT`, steady, and
  * it reserves no centre column: a hangar is a hall, not a corridor. The
  * lift, the screen's lines, the doors' style and seeds and `furnish` are
- * the hub's.
+ * the hub's; then the pad heroes (`hangarHeroes`, none yet) stand with the
+ * room's own through `withPadHeroes` (M3 C18).
  *
  * Every door is a `sliding` door with `relType` `""`, labelled with the
  * engram's title: the tree carries no salience, so every door is the same
@@ -71,8 +72,10 @@ import {
   HANGAR_DEPTH,
   HANGAR_LIGHT,
   HANGAR_WIDTH,
+  hangarHeroes,
   hangarLayout,
   isHangar,
+  withPadHeroes,
 } from "./hangar";
 import {
   LIFT_WORDS,
@@ -273,11 +276,12 @@ export function generateDeck(input: DeckInput, section: number): RoomSpec {
     dropped: 0,
     inboundMore: 0,
   };
-  return furnish(
-    base,
-    NO_NEAR,
-    plan.hangar === null ? centreLane(entrance.x, depth) : NO_RESERVE,
-  );
+  if (plan.hangar === null)
+    return furnish(base, NO_NEAR, centreLane(entrance.x, depth));
+  // A hangar stands its pad heroes through the seam (M3 C18), with its own
+  // heroes; `hangarHeroes` is empty until the hangar heroes are built.
+  const room = furnish(base, NO_NEAR, NO_RESERVE);
+  return withPadHeroes(room, [...room.heroes, ...hangarHeroes(room)]);
 }
 
 /**
