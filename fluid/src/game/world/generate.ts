@@ -63,6 +63,11 @@
  *    bay stencils, never over text and never under a footprint. They read
  *    everything and move nothing.
  *
+ * Steps 8 to 11 are `furnish`: every generator that lays a room out ends
+ * there, `generateRoom` with the place's neighbours and the deck hub
+ * (`world/deck.ts`, M3 C9) with none. `lightsFor` is shared the same way,
+ * so a hand-laid deck is lit as a generated room is.
+ *
  * The forced-hero seam (2.6e C15): `withHeroes` stands a given set of
  * heroes in a room the generator built and re-runs steps 8, 9 and 11
  * round them, exactly as `generateRoom` runs them round its own draws: the
@@ -93,9 +98,11 @@ import { HERO_ORDER, heroDraws, placeHeroes } from "./heroes";
 import { nearOf, type Neighbour } from "./neighbours";
 import { decorVariant, machineVariant, terminalVariant } from "./variants";
 import {
+  NO_RESERVE,
   dressingSites,
   type CurioBase,
   type Near,
+  type Reserved,
   type RoomBase,
 } from "./sites";
 import { sectionsOf } from "./sections";
@@ -403,7 +410,7 @@ function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
  * lights it already had, and one whose hatches move into a corridor, which
  * shifts the hall east in the grid, keeps the hall's lights too.
  */
-function lightsFor(
+export function lightsFor(
   roomSeed: number,
   grid: readonly string[],
   hall: Rect,
@@ -719,18 +726,40 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     dropped,
     inboundMore,
   };
+  return furnish(base, nearFor(place));
+}
+
+/**
+ * The furnishing of a laid-out room (steps 8 to 11 of the module doc): the
+ * tail every generator shares once its floor plan, fixtures, furniture,
+ * scaffold and lights are set in `base`. The heroes stand first
+ * (`placeHeroes` with the room's own draws and sites, skipping what `near`
+ * draws), then `dressRoom` adds the props, keeping off what the heroes
+ * reserve and what `reserved` names (none by default), then the curios on
+ * the dressed room, the finish by the room's seed and its bay count, and
+ * the decals on the finished room. A room with no neighbours passes
+ * `NO_NEAR`.
+ *
+ * The heroes replace `base.heroes` in place, and the lights, `dropped` and
+ * `inboundMore` move to the end, so the keys (and the goldens) read
+ * fixtures, decor, scaffold, heroes, props, curios, finish, decals,
+ * lights, whatever builder laid the base out. `generateRoom` ends here;
+ * the deck hub (`world/deck.ts`) is laid out by hand and ends here too.
+ */
+export function furnish(
+  base: RoomBase,
+  near: Near,
+  reserved: Reserved = NO_RESERVE,
+): RoomSpec {
   // The heroes stand before the dressing, which keeps off what they
-  // reserve. They replace the empty list in place, so the keys (and the
-  // goldens) read fixtures, decor, scaffold, heroes, props, curios, finish,
-  // decals, lights.
-  const near = nearFor(place);
+  // reserve.
   const room: RoomBase = {
     ...base,
     heroes: placeHeroes(base, heroDraws(base), dressingSites(base), near),
   };
   // The curios come last, on the dressed room, since shelves and filing
   // cabinets are props; they read everything and move nothing.
-  const dressed: CurioBase = { ...room, props: dressRoom(room) };
+  const dressed: CurioBase = { ...room, props: dressRoom(room, reserved) };
   // The decals come after the curios and the finish, on the finished
   // room; they read everything and move nothing.
   const { lights, dropped: left, inboundMore: more, ...head } = room;
@@ -739,7 +768,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     ...head,
     props: dressed.props,
     curios: placeCurios(dressed, curioDraws(dressed), near),
-    finish: finishFor(seed, layout.bays.length),
+    finish: finishFor(base.seed, base.bays.length),
   };
   return { ...body, decals: placeDecals({ ...body, ...tail }), ...tail };
 }

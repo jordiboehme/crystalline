@@ -65,6 +65,14 @@
  * east of the lift. `?at=lift:0`, `?at=screen:0` and `?at=exit:0` put the
  * player in front of each. The lift and the exit lead nowhere in the
  * gallery.
+ *
+ * `?hall=deck` (M3 C8 to C10) shows the deck hub `generateDeck` builds of
+ * `CANNED_DECK`, for judging the corridor, its doors, the deck lift at the
+ * entrance and the deck's screen at the north end: its first section (24
+ * doors), or the one `?section=<n>` names (1-based, as the game's route
+ * spells it; `?section=2` is the short section the deck golden pins). The
+ * spawn is the deck's own, in front of the lift; `?at=screen:0` stands in
+ * front of the screen. The doors and the lift lead nowhere in the gallery.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -77,12 +85,14 @@ import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import {
+  CANNED_DECK,
   galleryRoom,
   heroHallRoom,
   liftsHallRoom,
   variantsHallRoom,
 } from "../world/canned";
 import { consoleRoom } from "../world/consoleRoom";
+import { generateDeck } from "../world/deck";
 import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
 import { spotView } from "./spots";
 
@@ -119,7 +129,12 @@ export default function Gallery() {
             ? variantsHallRoom()
             : hall === "lifts"
               ? liftsHallRoom()
-              : galleryRoom();
+              : hall === "deck"
+                ? generateDeck(
+                    CANNED_DECK,
+                    Math.max(0, Number(params.get("section") ?? "1") - 1 || 0),
+                  )
+                : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"

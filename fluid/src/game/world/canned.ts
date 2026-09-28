@@ -20,6 +20,10 @@
  * construction extras, and whose north wall is all doors. It is the second
  * golden room.
  *
+ * `CANNED_DECK` is no engram but a folder, one level of a tree as the deck
+ * hub is built from it: thirty engrams in `crew/logs`, two sections, two
+ * subfolders. `generateDeck(CANNED_DECK, 1)` is the deck golden.
+ *
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
  * model gallery: one of every model the station draws, machines in bays 1
  * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
@@ -67,6 +71,7 @@ import {
 } from "./curios";
 import { bayNumber, deckNumber } from "./decals";
 import { PROP_ORDER } from "./dress";
+import type { DeckInput, DeckRow } from "./deck";
 import { plainFinish } from "./finish";
 import { FOOTPRINTS, PIPE_HALF } from "./footprints";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
@@ -322,6 +327,67 @@ export const CANNED_HUB: PlaceInput = {
     { category: "decision", content: "Every deck keeps its own stores." },
     { category: null, content: "Paint the corridor blue next refit." },
   ],
+};
+
+/** One row of `CANNED_DECK`: an engram directly in `crew/logs`. */
+function logRow(
+  slug: string,
+  title: string,
+  type: string | null,
+  status: string | null,
+): DeckRow {
+  return { permalink: `crew/logs/${slug}`, title, type, status };
+}
+
+/**
+ * A folder as the deck hub sees it (M3 C8 to C10): `crew/logs` in domain
+ * `station`, thirty engrams directly in it and two subfolders, as the
+ * tree answers a level. Thirty rows make two sections, 24 and 6, so the
+ * deck golden (`generateDeck(CANNED_DECK, 1)`) pins the short second
+ * section, its section line and its `SECTION` stops. The rows are given
+ * out of permalink order, with varied types and statuses, so the golden
+ * also pins the sort. The folder's name is picked so it is no hangar
+ * (`seedFor("hangar", "station", "crew/logs") % 5` is 3, M3 C13): the
+ * golden stays a plain hub. Nothing here is fetched.
+ */
+export const CANNED_DECK: DeckInput = {
+  domain: "station",
+  folder: "crew/logs",
+  rows: [
+    logRow("watch-rota", "Watch Rota", "reference", "stable"),
+    logRow("arrival-day", "Arrival Day", "engram", "stable"),
+    logRow("hull-breach-drill", "Hull Breach Drill", "runbook", "stable"),
+    logRow("zero-g-lessons", "Zero G Lessons", "guide", "draft"),
+    logRow("cargo-count", "Cargo Count", "reference", "stable"),
+    logRow("tea-rations", "Tea Rations", "decision", "stable"),
+    logRow("beacon-check", "Beacon Check", "runbook", "stable"),
+    logRow("night-shift", "Night Shift", "engram", "stable"),
+    logRow("dock-seven", "Dock Seven", "engram", "archived"),
+    logRow("filter-swap", "Filter Swap", "runbook", "draft"),
+    logRow("quiet-hours", "Quiet Hours", "decision", "stable"),
+    logRow("garden-bay", "Garden Bay", "engram", "stable"),
+    logRow("radio-silence", "Radio Silence", "engram", "deprecated"),
+    logRow("long-orbit", "Long Orbit", "engram", "stable"),
+    logRow("engine-tune", "Engine Tune", "runbook", "stable"),
+    logRow("star-chart", "Star Chart", "reference", "stable"),
+    logRow("medical-check", "Medical Check", "guide", "stable"),
+    logRow("open-hatch", "Open Hatch", "engram", null),
+    logRow("vent-noise", "Vent Noise", "engram", "draft"),
+    logRow("upgrade-plan", "Upgrade Plan", "decision", "proposed"),
+    logRow("kitchen-fire", "Kitchen Fire", "engram", "archived"),
+    logRow("solar-flare", "Solar Flare", "engram", "stable"),
+    logRow("jump-count", "Jump Count", "reference", "stable"),
+    logRow("x-ray-log", "X Ray Log", "engram", "stable"),
+    logRow("ice-mining", "Ice Mining", "engram", "stable"),
+    logRow("lost-glove", "Lost Glove", null, "stable"),
+    logRow("yard-visit", "Yard Visit", "engram", "stable"),
+    logRow("power-cut", "Power Cut", "engram", "deprecated"),
+    logRow("relay-fault", "Relay Fault", "runbook", "stable"),
+    logRow("supply-run", "Supply Run", "engram", "stable"),
+  ],
+  subfolders: ["drills", "Old Logs"],
+  total: 30,
+  truncated: false,
 };
 
 /** The gallery's domain and permalink; no engram lives there. */

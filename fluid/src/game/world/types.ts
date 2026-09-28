@@ -17,6 +17,10 @@
  * generated room has the key, and an absent key is not written by
  * `JSON.stringify`, so the goldens do not see it.
  *
+ * The station's other spaces (a deck's hub, the airlock, a hangar) carry
+ * `space`, the kind of space they are; an engram room never has the key,
+ * so the engram goldens do not see it either.
+ *
  * `StationAddress` is a third family beside them: not what a room is built
  * from or turns into, but where in the station one is - the pure address
  * space `paths.ts`, `world/folders.ts` and the session agree on.
@@ -729,6 +733,15 @@ export interface RoomSpec {
   seed: number;
   domain: string;
   permalink: string;
+  /**
+   * The kind of station space a room is when it is not an engram's room
+   * (M3 C9, C14, C24): `airlock` for the domain overview, `deck` for a
+   * folder's hub, `hangar` for the hangar variant of a deck. Absent on
+   * every engram room (`generateRoom` never sets it), so the engram
+   * goldens carry no such key. The builders set it right after
+   * `permalink`, which is where the goldens read it.
+   */
+  space?: "airlock" | "deck" | "hangar";
   title: string;
   archetype: Archetype;
   condition: Condition;
