@@ -272,6 +272,12 @@ export class FakeAudioContext implements AudioContextLike {
   readonly buffers: FakeBuffer[] = [];
   /** `resume`, `suspend` and `close`, in call order. */
   readonly calls: ("resume" | "suspend" | "close")[] = [];
+  /**
+   * When true, `resume` and `suspend` leave `state` as it is until
+   * `settle()`, as a real context does while its promise is pending.
+   */
+  deferred = false;
+  private pending: AudioContextState | null = null;
 
   constructor(sampleRate = 48000) {
     this.sampleRate = sampleRate;
@@ -339,7 +345,7 @@ export class FakeAudioContext implements AudioContextLike {
     if (this.state === "closed") {
       return Promise.reject(new Error("InvalidStateError: closed"));
     }
-    this.state = "running";
+    this.change("running");
     return Promise.resolve();
   }
 
@@ -348,8 +354,21 @@ export class FakeAudioContext implements AudioContextLike {
     if (this.state === "closed") {
       return Promise.reject(new Error("InvalidStateError: closed"));
     }
-    this.state = "suspended";
+    this.change("suspended");
     return Promise.resolve();
+  }
+
+  /** Applies the state the last deferred `resume` or `suspend` asked for. */
+  settle(): void {
+    if (this.pending !== null && this.state !== "closed") {
+      this.state = this.pending;
+    }
+    this.pending = null;
+  }
+
+  private change(next: AudioContextState): void {
+    if (this.deferred) this.pending = next;
+    else this.state = next;
   }
 
   close(): Promise<void> {

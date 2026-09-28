@@ -82,6 +82,33 @@ describe("createMixer", () => {
     await settle();
   });
 
+  // Mutation caught: a state gate on `suspend` or `resume` (a pause right
+  // after an unlock whose resume has not landed would be skipped, and a
+  // Safari context "interrupted" by a call would never be woken).
+  it("calls through while a state is pending and wakes an interrupted context", () => {
+    const ctx = new FakeAudioContext();
+    ctx.deferred = true;
+    const mixer = createMixer({ borrow: () => ctx });
+    mixer.unlock();
+    expect(ctx.state).toBe("suspended");
+    mixer.suspend();
+    expect(ctx.calls).toEqual(["resume", "suspend"]);
+    ctx.settle();
+    expect(ctx.state).toBe("suspended");
+    mixer.unlock();
+    expect(ctx.calls).toEqual(["resume", "suspend", "resume"]);
+
+    const called = new FakeAudioContext();
+    called.state = "interrupted";
+    const woken = createMixer({ borrow: () => called });
+    woken.resume();
+    expect(called.calls).toEqual(["resume"]);
+    expect(woken.running).toBe(true);
+    called.state = "interrupted";
+    woken.unlock();
+    expect(called.calls).toEqual(["resume", "resume"]);
+  });
+
   // Mutation caught: `make` called at creation (outside the user's
   // gesture, where Safari refuses to start a context), or on every unlock.
   it("makes a context on unlock when none was borrowed", () => {

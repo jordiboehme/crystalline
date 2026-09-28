@@ -15,6 +15,10 @@
  *   delay is then linear too) and in 20 ms pieces where the pitch moves
  *   (the delay then follows 1 / pitch, which a single line would bend).
  *   The line is made long enough for the lowest pitch at the widest pulse.
+ *   The two halves meet in one gain that levels the pulse with the other
+ *   waves: a pulse of width w swings between 2w and 2w - 2, so its peak is
+ *   `2 * max(w, 1 - w)` (1 for a square, 1.8 at width 0.1), and the gain is
+ *   the inverse of that, scheduled from the width the same way.
  * - **The resonant filter swept over time.** A biquad whose cutoff follows
  *   the voice's step list, its resonance the voice's `q`.
  * - **50 Hz arpeggios.** Nothing to build: an arpeggio is a pitch step list
@@ -26,12 +30,18 @@
  * seeded noise (`noiseBuffer`), never an unseeded random, so a render is the
  * same every time (M4 C29).
  *
+ * Every parameter a step list drives holds its first step's value from the
+ * patch start, so nothing sounds at a node's default (440 Hz, a delay of
+ * 0) before the first step, and `valueAt` reads the schedule as it plays.
+ * An exponential step is floored at `MIN_EXP`, since WebAudio throws on a
+ * ramp to 0.
+ *
  * One voice is: its source(s), then the filter if it has one, then its
  * envelope gain, then a tremolo gain if it has one (a sine LFO feeding
  * that gain's parameter). Every voice meets in the patch's own level gain,
  * which feeds `dest`. Stopping a patch ramps that level to zero (no click)
  * and stops every source when the ramp ends; once the last source has
- * ended, the whole graph is disconnected.
+ * ended, the whole graph is disconnected (a patch with no voices at once).
  *
  * Only the base context interface is used, so a patch renders the same on
  * a live context and an offline one.
@@ -46,6 +56,7 @@ import type {
   ScheduledSourceLike,
 } from "./context";
 import {
+  MIN_EXP,
   patchLength,
   valueAt,
   type Env,
@@ -76,11 +87,11 @@ const MIN_HZ = 1;
 /** Headroom on the pulse's delay line beyond the longest delay it needs. */
 const DELAY_MARGIN_S = 0.01;
 
-/** The piece length of the pulse's delay where the pitch ramps. */
-const DELAY_PIECE_S = 0.02;
-
-/** The smallest target an exponential ramp is given (WebAudio throws on 0). */
-const MIN_EXP = 1e-4;
+/**
+ * The piece length of a schedule derived from step lists (the pulse's
+ * delay and level) where an input moves along a curve.
+ */
+const PIECE_S = 0.02;
 
 /** The organ's partials: index is the harmonic, value its sine amplitude. */
 const ORGAN_PARTIALS = [0, 1, 0.5, 0.35, 0.25, 0, 0.12] as const;
@@ -124,7 +135,6 @@ export function playPatch(
   const made: AudioNodeLike[] = [];
   const sources: Source[] = [];
   const level = ctx.createGain();
-  level.gain.value = 1;
   level.connect(dest);
   made.push(level);
 
@@ -192,6 +202,7 @@ export function playPatch(
     for (const node of made) node.disconnect();
   };
   for (const source of sources) source.node.onended = release;
+  if (sources.length === 0) level.disconnect();
 
   return {
     get end() {
@@ -224,8 +235,9 @@ interface VoiceSources {
 
 /**
  * The sources of one voice: one oscillator, the pulse's two saws, or a
- * noise player. For the pulse the outputs are the first saw and the delay
- * line the second saw already feeds through its inverter.
+ * noise player. For the pulse the output is the levelling gain in which
+ * the first saw and the delay line (fed by the second saw through its
+ * inverter) meet.
  */
 function sourcesOf(
   ctx: BaseAudioContextLike,
@@ -277,10 +289,29 @@ function sourcesOf(
       const flip = track(ctx.createGain());
       flip.gain.value = -1;
       const delay = track(ctx.createDelay(MAX_WIDTH / lowest + DELAY_MARGIN_S));
-      scheduleDelay(delay.delayTime, width, pitch, when);
+      scheduleDerived(
+        delay.delayTime,
+        [width, pitch],
+        [pitch],
+        (read) => clampWidth(read(width)) / Math.max(MIN_HZ, read(pitch)),
+        when,
+      );
+      const sum = track(ctx.createGain());
+      scheduleDerived(
+        sum.gain,
+        [width],
+        [width],
+        (read) => {
+          const w = clampWidth(read(width));
+          return 1 / (2 * Math.max(w, 1 - w));
+        },
+        when,
+      );
       inverted.connect(flip);
       flip.connect(delay);
-      return { play: [direct, inverted], outs: [direct, delay] };
+      direct.connect(sum);
+      delay.connect(sum);
+      return { play: [direct, inverted], outs: [sum] };
     }
   }
 }
@@ -321,12 +352,19 @@ function envelope(
   param.linearRampToValueAtTime(0, start + length + env.r);
 }
 
-/** Schedules a step list on `param`, its times counted from `when`. */
+/**
+ * Schedules a step list on `param`, its times counted from `when`, holding
+ * the first value from `when` on.
+ */
 function applySteps(
   param: AudioParamLike,
   steps: readonly Step[],
   when: number,
 ): void {
+  const first = steps[0];
+  if (first !== undefined && first.at > 0) {
+    param.setValueAtTime(first.value, when);
+  }
   steps.forEach((step, i) => {
     const time = when + step.at;
     if (i === 0 || step.ramp === undefined) {
@@ -339,45 +377,53 @@ function applySteps(
   });
 }
 
+/** A pulse width inside the narrowest and widest pulse. */
+function clampWidth(w: number): number {
+  return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w));
+}
+
+/** Reads one step list at the moment a derived value is computed for. */
+type Read = (steps: readonly Step[]) => number;
+
 /**
- * Schedules the pulse's delay, `width / pitch`, from `when`. At each step
- * time of either list: a ramp to the value the segment before it arrives
- * at (when either list moves in that segment), then a jump to the new
- * value when a step jumps. A segment in which the pitch moves is cut into
- * `DELAY_PIECE_S` pieces, since 1 / pitch is no straight line.
+ * Schedules a value derived from step lists (`compute`) on `param`, from
+ * `when`: held at its start value from `when`, then at each step time of
+ * any list a ramp to the value the segment before it arrives at (when a
+ * list moves in that segment) and a jump to the new value when a step
+ * jumps. A segment in which one of the `curved` lists moves is cut into
+ * `PIECE_S` pieces, since `compute` bends there (the delay's 1 / pitch,
+ * the level's 1 / width); elsewhere it is linear in what moves.
  */
-function scheduleDelay(
+function scheduleDerived(
   param: AudioParamLike,
-  width: readonly Step[],
-  pitch: readonly Step[],
+  lists: readonly (readonly Step[])[],
+  curved: readonly (readonly Step[])[],
+  compute: (read: Read) => number,
   when: number,
 ): void {
-  const delayAt = (w: number, p: number): number =>
-    Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w)) / Math.max(MIN_HZ, p);
-  const times = [...new Set([...width, ...pitch].map((s) => s.at))].sort(
-    (a, b) => a - b,
-  );
+  const at = (t: number): number => compute((steps) => valueAt(steps, t));
+  const times = [
+    ...new Set(lists.flatMap((steps) => steps.map((s) => s.at))),
+  ].sort((a, b) => a - b);
   let prev: number | null = null;
   for (const t of times) {
-    const right = delayAt(valueAt(width, t), valueAt(pitch, t));
+    const right = at(t);
     if (prev === null) {
+      if (t > 0) param.setValueAtTime(right, when);
       param.setValueAtTime(right, when + t);
       prev = t;
       continue;
     }
-    const pitchMoves = movesBefore(pitch, t);
-    if (pitchMoves || movesBefore(width, t)) {
-      if (pitchMoves) {
-        const pieces = Math.max(1, Math.ceil((t - prev) / DELAY_PIECE_S));
+    const bends = curved.some((steps) => movesBefore(steps, t));
+    if (bends || lists.some((steps) => movesBefore(steps, t))) {
+      if (bends) {
+        const pieces = Math.max(1, Math.ceil((t - prev) / PIECE_S));
         for (let j = 1; j < pieces; j++) {
           const tj = prev + ((t - prev) * j) / pieces;
-          param.linearRampToValueAtTime(
-            delayAt(valueAt(width, tj), valueAt(pitch, tj)),
-            when + tj,
-          );
+          param.linearRampToValueAtTime(at(tj), when + tj);
         }
       }
-      const left = delayAt(valueBefore(width, t), valueBefore(pitch, t));
+      const left = compute((steps) => valueBefore(steps, t));
       param.linearRampToValueAtTime(left, when + t);
       if (Math.abs(right - left) > 1e-12) param.setValueAtTime(right, when + t);
     } else {
@@ -393,15 +439,19 @@ function movesBefore(steps: readonly Step[], t: number): boolean {
   return i > 0 && steps[i]?.ramp !== undefined;
 }
 
-/** A step list's value just before `t`: what a ramp arriving at `t` reaches. */
+/**
+ * A step list's value just before `t`: what a ramp arriving at `t`
+ * reaches, or what was held until a step that jumps at `t`.
+ */
 function valueBefore(steps: readonly Step[], t: number): number {
   const i = steps.findIndex((s) => s.at >= t);
   if (i < 0) return valueAt(steps, t);
   const next = steps[i] as Step;
   if (i === 0) return next.value;
-  const prev = steps[i - 1] as Step;
-  if (next.ramp === undefined) return prev.value;
-  return valueAt([prev, next], t);
+  if (next.at > t || next.ramp !== undefined) {
+    return valueAt(steps.slice(0, i + 1), t);
+  }
+  return valueAt(steps.slice(0, i), t);
 }
 
 /**

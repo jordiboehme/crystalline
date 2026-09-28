@@ -23,6 +23,14 @@
  * silent: `ctx` and every `bus` are null and every method does nothing,
  * so the game runs the same without sound. No method ever throws, and a
  * refused `resume` or `suspend` is swallowed (Review Focus 5).
+ *
+ * `unlock`, `resume` and `suspend` call through to the context whatever
+ * its `state` reads. Both calls are idempotent, and `state` changes only
+ * when the promise settles, so a gate on it would skip a pause that comes
+ * right after an unlock still settling (or a resume after a suspend still
+ * settling). It would also never wake a context Safari marked
+ * `"interrupted"`, which is neither running nor suspended. Only a closed
+ * context is left alone: it cannot come back.
  */
 
 import type {
@@ -73,9 +81,12 @@ export interface Mixer {
   readonly running: boolean;
   /** From a user gesture: resumes the context, making one when there is none yet. */
   unlock(): void;
-  /** Suspends the context (the pause, a hidden tab). */
+  /** Suspends the context (the pause, a hidden tab), whatever its state reads. */
   suspend(): void;
-  /** Resumes a suspended context; never makes one (it may run outside a gesture). */
+  /**
+   * Resumes the context, also an interrupted one, whatever its state reads;
+   * never makes one (it may run outside a gesture).
+   */
   resume(): void;
   /** Whether sound is muted. */
   readonly muted: boolean;
@@ -129,13 +140,13 @@ export function createMixer(source: ContextSource = {}): Mixer {
         owned = true;
         graph = build(ctx, muted);
       }
-      if (ctx.state !== "running") quietly((c) => c.resume());
+      quietly((c) => c.resume());
     },
     suspend() {
-      if (ctx?.state === "running") quietly((c) => c.suspend());
+      quietly((c) => c.suspend());
     },
     resume() {
-      if (ctx?.state === "suspended") quietly((c) => c.resume());
+      quietly((c) => c.resume());
     },
     get muted() {
       return muted;

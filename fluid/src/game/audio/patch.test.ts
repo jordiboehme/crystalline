@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MIN_EXP,
   arpeggio,
   midiHz,
   patchLength,
@@ -107,6 +108,24 @@ describe("valueAt", () => {
       { at: 2, value: 400, ramp: "exp" as const },
     ];
     expect(valueAt(steps, 1)).toBeCloseTo(200, 10);
+  });
+
+  // Mutation caught: an exponential ramp from 0 interpolated linearly
+  // (WebAudio holds the earlier value when it is not positive), or a ramp
+  // to 0 read as 0 (the synth floors the target at MIN_EXP).
+  it("reads exponential ramps as WebAudio plays them", () => {
+    const fromZero = [
+      { at: 0, value: 0 },
+      { at: 1, value: 100, ramp: "exp" as const },
+    ];
+    expect(valueAt(fromZero, 0.5)).toBe(0);
+    expect(valueAt(fromZero, 1)).toBe(100);
+    const toZero = [
+      { at: 0, value: 100 },
+      { at: 1, value: 0, ramp: "exp" as const },
+    ];
+    expect(valueAt(toZero, 1)).toBe(MIN_EXP);
+    expect(valueAt(toZero, 0.5)).toBeCloseTo(Math.sqrt(100 * MIN_EXP), 12);
   });
 
   // Mutation caught: the time before the first step reading zero.

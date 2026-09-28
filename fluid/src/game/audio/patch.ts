@@ -128,30 +128,48 @@ export function patchLength(patch: Patch): number {
 }
 
 /**
+ * The smallest target an exponential step reaches. WebAudio throws on an
+ * exponential ramp to 0, so the synth floors every `exp` step's value here,
+ * and `valueAt` reads it the same way.
+ */
+export const MIN_EXP = 1e-4;
+
+/** The value a step arrives at as the synth schedules it. */
+function arrival(step: Step): number {
+  return step.ramp === "exp" ? Math.max(step.value, MIN_EXP) : step.value;
+}
+
+/**
  * A step list's value at `t` (seconds from the patch start), the way
- * WebAudio plays the same schedule: the first value before the first
- * step, the ramps interpolated, a plain step held until the next, the last
- * value held after the end. Zero for an empty list. The synth reads it to
- * schedule the pulse's delay from two lists whose steps fall at different
- * times.
+ * WebAudio plays the synth's schedule of it: the first value before the
+ * first step (the synth holds it from the patch start), the ramps
+ * interpolated, a plain step held until the next, the last value held
+ * after the end. An `exp` step arrives at its value floored at `MIN_EXP`,
+ * and an exponential ramp from a value that is not positive holds that
+ * value until the step, as WebAudio does. Zero for an empty list. The
+ * synth reads it to schedule the pulse's delay and level from lists whose
+ * steps fall at different times.
  */
 export function valueAt(steps: readonly Step[], t: number): number {
   const first = steps[0];
   if (first === undefined) return 0;
-  if (t <= first.at) return first.value;
+  if (t < first.at) return first.value;
   let prev = first;
+  let from = first.value;
   for (let i = 1; i < steps.length; i++) {
     const next = steps[i] as Step;
     if (t < next.at) {
       const span = next.at - prev.at;
-      if (next.ramp === undefined || span <= 0) return prev.value;
+      if (next.ramp === undefined || span <= 0) return from;
+      const to = arrival(next);
       const f = (t - prev.at) / span;
-      if (next.ramp === "exp" && prev.value > 0 && next.value > 0) {
-        return prev.value * (next.value / prev.value) ** f;
+      if (next.ramp === "exp") {
+        return from > 0 ? from * (to / from) ** f : from;
       }
-      return prev.value + (next.value - prev.value) * f;
+      return from + (to - from) * f;
     }
     prev = next;
+    from = arrival(next);
   }
-  return prev.value;
+  return from;
 }
