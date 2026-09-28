@@ -714,6 +714,12 @@ impl Engine {
                     set_frontmatter_field(source, key, &date.format("%Y-%m-%d").to_string())
                 })
             }
+            "resource" | "source_version" => Ok(match value {
+                // Plain text, written through the YAML emitter so a URL with
+                // `: ` or `#` stays one quoted scalar.
+                Some(v) => set_frontmatter_field(source, key, v),
+                None => remove_frontmatter_field(source, key),
+            }),
             "salience" => {
                 let Some(raw) = value else {
                     return Ok(remove_frontmatter_field(source, "salience"));
@@ -846,5 +852,63 @@ impl Engine {
             out = remove_frontmatter_field(&out, field);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod settable_keys_tests {
+    use super::*;
+
+    const SOURCE: &str = "---\ntype: engram\ntitle: T\npermalink: t\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nbody\n";
+
+    /// A value each key's arm accepts.
+    fn value_for(key: &str) -> Option<String> {
+        Some(match key {
+            "status" => "stable".to_string(),
+            "valid_from" | "valid_to" | "stale_after" | "source_date" => "2026-02-01".to_string(),
+            "salience" => "5".to_string(),
+            _ => "x".to_string(),
+        })
+    }
+
+    fn set(key: &str) -> Result<String> {
+        let p = EditParams {
+            identifier: "t".to_string(),
+            domain: "d".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(key.to_string()),
+            value: value_for(key),
+            ..EditParams::default()
+        };
+        Engine::apply_set_frontmatter(SOURCE, &p, "t", "tester", None, None)
+    }
+
+    #[test]
+    fn every_listed_key_has_an_arm_and_an_unlisted_key_is_refused() {
+        // `evolve_ack` needs a draft the sweep computed, so its arm answers
+        // with its own value message here; what matters is that no listed key
+        // falls through to the refusal.
+        for key in SETTABLE_FRONTMATTER_KEYS {
+            if let Err(e) = set(key) {
+                assert!(
+                    !e.to_string().contains("cannot set"),
+                    "{key} is listed but has no arm: {e}"
+                );
+            }
+        }
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"resource"));
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"source_version"));
+        for key in [
+            "title",
+            "permalink",
+            "type",
+            "tags",
+            "recorded_at",
+            "generated",
+            "not_a_key",
+        ] {
+            let e = set(key).expect_err(key).to_string();
+            assert!(e.contains(&format!("cannot set '{key}'")), "{key}: {e}");
+        }
     }
 }

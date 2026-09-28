@@ -477,8 +477,8 @@ enum Command {
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
         /// The frontmatter field to assign, for set_frontmatter: status,
-        /// valid_from, valid_to, stale_after, source_date, salience or
-        /// verified.
+        /// valid_from, valid_to, stale_after, source_date, resource,
+        /// source_version, salience or verified.
         #[arg(long)]
         key: Option<String>,
         /// The value to assign, for set_frontmatter. Omit to remove the field;

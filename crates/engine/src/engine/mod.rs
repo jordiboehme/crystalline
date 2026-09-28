@@ -190,18 +190,22 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
-/// the lifecycle surface an agent tends while keeping knowledge honest. Every
-/// other key is refused there, because identity (`permalink`, `title`, `type`),
-/// classification (`tags`), the record of when knowledge was captured
-/// (`recorded_at`) and the write provenance (`generated`) are owned by the
-/// tools that maintain them and a blind assignment would corrupt an address, a
-/// history or the index.
+/// the lifecycle surface an agent tends while keeping knowledge honest.
+/// `resource` and `source_version` are the source a piece of knowledge was
+/// taken from and the version of it that was read; a re-ingest moves both.
+/// Every other key is refused there, because identity (`permalink`, `title`,
+/// `type`), classification (`tags`), the record of when knowledge was
+/// captured (`recorded_at`) and the write provenance (`generated`) are owned
+/// by the tools that maintain them and a blind assignment would corrupt an
+/// address, a history or the index.
 pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "status",
     "valid_from",
     "valid_to",
     "stale_after",
     "source_date",
+    "resource",
+    "source_version",
     "salience",
     "verified",
     "evolve_ack",

@@ -195,4 +195,14 @@ mod tests {
             "the old MANIFEST.md sentence is gone"
         );
     }
+
+    #[test]
+    fn the_capture_skill_lists_the_provenance_keys_as_settable() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        assert!(
+            capture
+                .contains("`source_date`, `resource`, `source_version`, `salience` and `verified`"),
+            "capture skill lists resource and source_version as settable"
+        );
+    }
 }

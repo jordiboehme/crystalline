@@ -3749,6 +3749,82 @@ async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
     assert!(err.contains("set_frontmatter requires key"), "{err}");
 }
 
+/// Provenance is writable after the fact: a re-ingest moves an engram's
+/// resource to the new commit and a record's source_version with it (#105).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_writes_and_clears_resource_and_source_version() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry Doc", "content": "- [fact] a\n- [fact] b\n- [fact] c" }),
+    )
+    .await
+    .unwrap();
+
+    let url = "https://github.com/acme/api/blob/0a1b2c3d/docs/retry: notes.md#L10";
+    for (key, value) in [("resource", url), ("source_version", "0a1b2c3d")] {
+        call(
+            peer,
+            "edit_engram",
+            json!({ "domain": "eng", "identifier": "retry-doc", "operation": "set_frontmatter", "key": key, "value": value }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    }
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "retry-doc", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["frontmatter"]["resource"], json!(url));
+    let text = std::fs::read_to_string(h.root.join("eng/retry-doc.md")).unwrap();
+    let parsed = crystalline_core::parse_engram(&text).unwrap();
+    assert_eq!(parsed.frontmatter.resource.as_deref(), Some(url));
+    assert_eq!(
+        parsed
+            .frontmatter
+            .extra
+            .get("source_version")
+            .and_then(|v| v.as_str()),
+        Some("0a1b2c3d")
+    );
+
+    // An omitted value removes the key, like the date keys.
+    call(
+        peer,
+        "edit_engram",
+        json!({ "domain": "eng", "identifier": "retry-doc", "operation": "set_frontmatter", "key": "resource" }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(h.root.join("eng/retry-doc.md")).unwrap();
+    assert!(!text.contains("resource:"), "{text}");
+}
+
+/// edit_engram's copy names the provenance keys set_frontmatter accepts, so an
+/// agent reconciling an ingested engram finds the verb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_settable_provenance() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let edit = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram tool present");
+    let description = edit.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("source_date, resource, source_version, salience"),
+        "edit_engram lists the provenance keys: {description}"
+    );
+}
+
 /// A date key goes through the temporal write contract, so a timestamp is
 /// rejected with the standard message and a sentinel bound is dropped rather
 /// than written.
