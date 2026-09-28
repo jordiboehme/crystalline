@@ -205,4 +205,29 @@ mod tests {
             "capture skill lists resource and source_version as settable"
         );
     }
+
+    #[test]
+    fn the_skills_teach_per_engram_provenance_and_citing_it() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        for needle in [
+            "- ingested_from [[",
+            "`[source]`",
+            "/blob/{sha}/{path}",
+            "V111",
+        ] {
+            assert!(capture.contains(needle), "capture skill lacks {needle}");
+        }
+        let routing = skill("crystalline-routing").unwrap().content;
+        assert!(
+            routing.contains("cite the location"),
+            "routing skill lacks the citing rule"
+        );
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        for needle in ["ingested_from", "cite that location"] {
+            assert!(
+                desktop.contains(needle),
+                "consolidated skill lacks {needle}"
+            );
+        }
+    }
 }
