@@ -139,6 +139,23 @@ describe("PauseScreen", () => {
     expect(onLeave).not.toHaveBeenCalled();
   });
 
+  it("ignores a held Enter or Space and leaves a focused button's Enter to the button", () => {
+    // Mutation caught: the repeat not checked on Enter and Space (a held
+    // key would continue), the focused-button return dropped (Enter on a
+    // focused RUN/STOP would continue as well as leave).
+    const { onContinue } = renderPause(-Infinity);
+    press("Enter", true);
+    press(" ", true);
+    expect(onContinue).not.toHaveBeenCalled();
+    const runStop = screen.getByRole("button", { name: RUN_STOP_LABEL });
+    runStop.focus();
+    fireEvent.keyDown(runStop, { key: "Enter" });
+    fireEvent.keyDown(runStop, { key: " " });
+    expect(onContinue).not.toHaveBeenCalled();
+    press("Enter");
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves on Esc while CONT still waits", () => {
     const { onLeave } = renderPause(t);
     pass(PAUSE_ESC_GUARD_MS);

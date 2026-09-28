@@ -1124,6 +1124,54 @@ describe("ExploreRoute", () => {
     },
   );
 
+  it("names the room a load landed in while paused (M4 C6a)", async () => {
+    // Mutation caught: the screen's label kept from the moment of the
+    // pause, while the way out already leads to the room landed in.
+    gl.available = true;
+    serve();
+    let options: SessionOptions | null = null;
+    const at = {
+      current: { kind: "engram", domain: "eng", permalink: "alpha" },
+      where: "ALPHA",
+    } as { current: StationAddress; where: string };
+    sessionStub.factory = (opts) => {
+      options = opts;
+      const base = stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() });
+      return {
+        ...base,
+        get current() {
+          return at.current;
+        },
+        get where() {
+          return at.where;
+        },
+      };
+    };
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(options).not.toBeNull();
+    });
+    act(() => {
+      options?.onPause?.(true);
+    });
+    const dialog = await screen.findByRole("dialog", { name: "Paused" });
+    expect(within(dialog).getByText("BREAK IN ALPHA")).toBeInTheDocument();
+    // A load in flight lands under the pause and replaces the URL.
+    at.current = { kind: "engram", domain: "eng", permalink: "beta" };
+    at.where = "BETA";
+    act(() => {
+      options?.navigate("/%CF%80/d/eng/e/beta");
+    });
+    expect(within(dialog).getByText("BREAK IN BETA")).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "RUN/STOP (ESC)" }),
+    );
+    await waitFor(() => {
+      expect(location).toBe("/d/eng/e/beta");
+    });
+    view.unmount();
+  });
+
   it.each(["/%CF%80/dev", "/%CF%80/dev/gallery"])(
     "ignores the word on %s",
     async (path) => {

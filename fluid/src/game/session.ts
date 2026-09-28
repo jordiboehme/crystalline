@@ -128,9 +128,11 @@
  * session modal (C9). A load in flight does not stop a pause; it settles
  * under it. While paused the session is modal: the tick drains the keys
  * and returns, so nothing moves, no door, fault or light steps and nothing
- * is travelled to, while the frame keeps being drawn. The host shows its
- * pause screen from `onPause` and ends the pause with `resume`, in the
- * gesture that asks for the lock again; a new place (`leave`) ends it too.
+ * is travelled to; nothing is drawn under the host's screen either, and
+ * the shader's clock holds still, so no effect jumps on resume. The host
+ * shows its pause screen from `onPause` and ends the pause with `resume`,
+ * in the gesture that asks for the lock again; a new place (`leave`) ends
+ * it too.
  * `setBusy` holds the station modal the same way for a screen of the
  * host's (the connecting screen), without a pause. Going down pauses
  * nothing: both listeners are removed before the input releases the lock.
@@ -700,7 +702,13 @@ export function createSession(opts: SessionOptions): Session {
   let frameSum = 0;
   let frameCount = 0;
   let lastReport = now();
-  const started = now();
+  /**
+   * When the shader's clock started, moved on by every pause's span, so
+   * its effects hold still while paused and go on without a jump.
+   */
+  let started = now();
+  /** When the pause began, on the session's clock; null while running. */
+  let pausedAt: number | null = null;
   /** The last `renderer.setRoom` call's time, in ms; null before the first. */
   let lastBuildMs: number | null = null;
 
@@ -1341,6 +1349,7 @@ export function createSession(opts: SessionOptions): Session {
   const pause = () => {
     if (disposed || modal()) return;
     paused = true;
+    pausedAt = now();
     input.clear();
     cheat?.reset();
     setPrompt(null);
@@ -1352,12 +1361,14 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Ends the pause without asking for the lock, for `resume` and a new
-   * place (`leave`): forgets the keys pressed on the pause screen and
-   * tells the host. Returns whether a pause was ended.
+   * place (`leave`): moves the shader's clock on by the paused span,
+   * forgets the keys pressed on the pause screen and tells the host. Returns whether a pause was ended.
    */
   const closePause = (): boolean => {
     if (disposed || !paused) return false;
     paused = false;
+    if (pausedAt !== null) started += now() - pausedAt;
+    pausedAt = null;
     input.clear();
     cheat?.reset();
     opts.onPause?.(false);
@@ -1680,6 +1691,9 @@ export function createSession(opts: SessionOptions): Session {
           lastReport = t;
           showStatus();
         }
+        // Paused, the screen covers the station: nothing is drawn, and the
+        // last frame stays as it was (M4 C6).
+        if (paused) return;
         if (player === null || previous === null || lights === null) return;
         const lerp = (a: number, b: number) => a + (b - a) * alpha;
         renderer?.draw(

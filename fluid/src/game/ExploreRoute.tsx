@@ -70,8 +70,9 @@
  * nothing else open (the session's own decision, `onPause`), and the route
  * shows the pause screen (`PauseScreen`) over the still station, with the
  * room's label and the time the lock ended taken from the session as it
- * paused. `CONT` resumes the session inside its own click or key, which
- * asks for the lock again. `RUN/STOP` or Esc is the way out: the route
+ * paused (the label again when a load lands under the pause). `CONT`
+ * resumes the session inside its own click or key, which asks for the
+ * lock again. `RUN/STOP` or Esc is the way out: the route
  * replaces its own history entry with the Fluid page of the place the
  * player is at (`fluidRouteOfStation`), so Back from that page never goes
  * into the station again. Before the first room lands the session is at
@@ -180,6 +181,9 @@ export default function ExploreRoute() {
         // The session landed somewhere of its own accord: that is now the
         // address the URL is following, not the one this route asked for.
         requestedRef.current = sessionRef.current?.current ?? null;
+        // A load that landed under the pause: the screen names that room.
+        const where = sessionRef.current?.where ?? null;
+        setPause((p) => (p === null ? p : { ...p, where }));
         void navigateRef.current(path, { replace: true });
       },
       openFluid,

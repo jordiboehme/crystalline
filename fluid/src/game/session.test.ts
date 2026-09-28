@@ -17,6 +17,7 @@ import { ApiProblem, api } from "../api/client";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
+import { RELOCK_DELAY_MS } from "./core/input";
 import { TICK_MS, type Clock } from "./core/loop";
 import { prefetchPlace } from "./data/source";
 import type { LoadedStation } from "./data/station";
@@ -3525,6 +3526,69 @@ describe("the pause (M4 C6 to C9)", () => {
     session.resume();
     session.resume();
     expect(onPause.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("asks for the lock again on resume, once (C8)", () => {
+    // Mutation caught: `resume` ending the pause without asking for the
+    // lock (CONT would leave the player unlocked, to click once more).
+    const onPause = pauseSpy();
+    const session = start({ client: null, onPause });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    const canvas = lastCanvas;
+    if (canvas === null) throw new Error("no canvas");
+    const request = vi.fn(() => Promise.resolve());
+    Object.defineProperty(canvas, "requestPointerLock", {
+      configurable: true,
+      value: request,
+    });
+    lock();
+    unlock();
+    expect(session.paused).toBe(true);
+    // Past the browser's wait for a new lock.
+    const later = session.lockEndedAt + RELOCK_DELAY_MS + 1;
+    vi.spyOn(performance, "now").mockReturnValue(later);
+    session.resume();
+    expect(request).toHaveBeenCalledTimes(1);
+    session.resume();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgets a key pressed on the pause screen when it resumes", () => {
+    // Mutation caught: `closePause` not clearing the input (a W pressed
+    // while paused and still held would walk the player off on resume).
+    const session = start({ client: null, onPause: pauseSpy() });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    session.pause();
+    key("keydown", "KeyW");
+    frames(2);
+    const eye = lastCamera().eye;
+    session.resume();
+    frames(10);
+    key("keyup", "KeyW");
+    expect(lastCamera().eye).toEqual(eye);
+  });
+
+  it("draws nothing while paused and holds the shader's time across it (M4 C6)", () => {
+    // Mutation caught: the draw not skipped while paused, or the paused
+    // span not taken off the time (the effects would jump on resume).
+    const session = start({ client: null, onPause: pauseSpy() });
+    session.showCanned(CANNED_BRIDGE);
+    frames(3);
+    const drawn = renderer.draw.mock.calls.length;
+    const before = renderer.draw.mock.calls.at(-1)?.[2] ?? NaN;
+    session.pause();
+    frames(35);
+    now += 5000;
+    frames(35);
+    expect(renderer.draw.mock.calls.length).toBe(drawn);
+    session.resume();
+    frames(1);
+    expect(renderer.draw.mock.calls.length).toBe(drawn + 1);
+    const after = renderer.draw.mock.calls.at(-1)?.[2] ?? NaN;
+    expect(after).toBeGreaterThan(before);
+    expect(after - before).toBeLessThan(0.1);
   });
 
   it("stamps when the lock ended, for the pause screen's wait (C8)", () => {
