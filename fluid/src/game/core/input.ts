@@ -25,6 +25,11 @@
  * presses came in, which a per-code set cannot give. It leaves out
  * auto-repeat, same as `pressed`, but also leaves out a press held with
  * Ctrl, Cmd or Alt, which `pressed` still answers true for.
+ *
+ * A keydown another listener cancelled before this one heard it (a
+ * `preventDefault` in the capture phase, the way the connecting screen
+ * takes the key that skips it) is not taken at all: it is neither held
+ * nor pressed nor typed. The keyup is always taken.
  */
 
 /** The live input state of one canvas. */
@@ -107,6 +112,9 @@ export function createInput(
   const isLocked = () => doc.pointerLockElement === target;
 
   const onKeyDown = (e: KeyboardEvent) => {
+    // A key something before this listener cancelled was taken there (the
+    // connecting screen's skip, M4 C26 and C9): no command, no step.
+    if (e.defaultPrevented) return;
     if (!e.repeat) {
       edges.add(e.code);
       if (!e.ctrlKey && !e.metaKey && !e.altKey) {

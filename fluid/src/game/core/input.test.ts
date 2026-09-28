@@ -29,6 +29,29 @@ describe("createInput", () => {
     expect(input.pressed("Digit1")).toBe(false);
   });
 
+  // Mutation caught: a key a screen of the host's cancelled taken as a
+  // command anyway (the key that skips the connecting screen, M4 C26).
+  it("leaves a key another listener already cancelled alone", () => {
+    input = createInput(document.createElement("canvas"));
+    const cancel = (e: Event) => {
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", cancel, true);
+    try {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { code: "KeyF", cancelable: true }),
+      );
+    } finally {
+      window.removeEventListener("keydown", cancel, true);
+    }
+    expect(input.held("KeyF")).toBe(false);
+    expect(input.pressed("KeyF")).toBe(false);
+    expect(input.typed()).toEqual([]);
+    // Not cancelled: taken as always.
+    key("keydown", "KeyF");
+    expect(input.pressed("KeyF")).toBe(true);
+  });
+
   it("clears held keys on blur, hidden and lock loss", () => {
     input = createInput(document.createElement("canvas"));
     key("keydown", "KeyW");

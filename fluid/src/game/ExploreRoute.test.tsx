@@ -1616,6 +1616,51 @@ describe("ExploreRoute", () => {
       third.unmount();
     });
 
+    // Mutation caught: the input taking a key the connecting screen
+    // cancelled (the key that skips the screen also acts in the station:
+    // F opening a Fluid tab, W walking).
+    it("takes the key that skips the connecting screen as no command (M4 C26)", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      serve();
+      const open = vi.spyOn(window, "open").mockImplementation(() => null);
+      const view = renderAt("/%CF%80");
+      const dialog = await screen.findByRole("dialog", CONNECTING);
+      await waitFor(() => {
+        expect(lastRoomSpec()?.title).toBe("AIRLOCK");
+      });
+      await settle(300);
+      const pressF = async (target: Element | Window) => {
+        await act(async () => {
+          target.dispatchEvent(
+            new KeyboardEvent("keydown", {
+              code: "KeyF",
+              key: "f",
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+          target.dispatchEvent(
+            new KeyboardEvent("keyup", {
+              code: "KeyF",
+              key: "f",
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+          await new Promise((r) => setTimeout(r, 150));
+        });
+      };
+      await pressF(dialog);
+      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+      expect(open).not.toHaveBeenCalled();
+      // The next F is the station's again.
+      await pressF(window);
+      expect(open).toHaveBeenCalledWith("/", "_blank", "noopener");
+      view.unmount();
+    });
+
     // Mutation caught: the gate bypassed (every drop in a flapping minute
     // would hang up and flash), the notice or the hang-up missing, or the
     // carrier heard on a second subscription.
