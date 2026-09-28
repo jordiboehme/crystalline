@@ -6801,8 +6801,9 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         // may SAY whose draft they mean, and this is what checks it.
         ("engine.rs", "granted_draft_named"),
         // The freshness check in front of that refusal: a link whose draft has
-        // gone refuses nothing.
-        ("engine.rs", "screen_granted_path"),
+        // gone refuses nothing. `screen_granted_path` reaches it through this
+        // one, which a capture calls directly to name the path it built.
+        ("engine.rs", "screen_granted_path_named"),
         // Which of the owner's files a join carries: the references are read
         // off the granted draft itself.
         ("engine.rs", "screen_joined_attachment"),

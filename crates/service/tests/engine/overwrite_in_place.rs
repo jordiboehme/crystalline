@@ -462,3 +462,135 @@ async fn an_overwrite_in_review_mode_drafts_the_owning_path() {
         .unwrap();
     assert!(team["content"].as_str().unwrap().contains("The old rule."));
 }
+
+#[tokio::test]
+async fn a_joined_refusal_names_the_path_the_caller_built_never_a_file_in_the_owners_draft() {
+    let (_tmp, engine, _scratch) = fixture(
+        true,
+        &[(
+            OWNER,
+            engram("Code Review Standards", PERMALINK, "The old rule."),
+        )],
+    )
+    .await;
+    // Ada drafts the granted page, and privately a plan she keeps under a
+    // file name of her own that no base file has.
+    engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Ada's rule.",
+                true,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    engine
+        .write_engram_as(
+            &capture("Secret Plan", Some("conventions"), "Ada's plan.", false),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    engine
+        .move_engram_as(
+            &MoveParams {
+                identifier: "conventions/secret-plan".to_string(),
+                domain: "notes".to_string(),
+                destination: "conventions/Secret Plan.md".to_string(),
+                destination_domain: None,
+                permalink: Some("keep".to_string()),
+                update_links: None,
+            },
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    let hers = engine
+        .read_engram(&read_as("conventions/secret-plan"), &ada())
+        .await
+        .unwrap();
+    assert_eq!(hers["path"], "conventions/Secret Plan.md", "{hers}");
+
+    // Bob's grant covers one page: the refusal names the path he built from
+    // his own title, never the name of a file only ada's draft holds.
+    let (bob, join) = bob_in_adas_draft();
+    let err = engine
+        .write_engram_joined(
+            &capture("Secret Plan", Some("conventions"), "x", true),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "this session is working inside ada's draft of 'conventions/Code Review Standards.md', so a write to 'conventions/secret-plan.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+    );
+    assert!(!err.contains("Secret Plan.md"), "{err}");
+}
+
+#[tokio::test]
+async fn an_overwrite_never_lands_on_a_manifest_with_a_custom_permalink() {
+    let manifest = "---\ntype: manifest\ntitle: notes\npermalink: routing\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Everything about notes\n\n## When to Use\n\n- Route here for notes questions\n".to_string();
+    let (tmp, engine, _scratch) = fixture(false, &[("MANIFEST.md", manifest.clone())]).await;
+    let err = engine
+        .write_engram(&capture("routing", None, "Not routing.", true))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "a new engram cannot be written at the domain root as MANIFEST.md: in this domain that file is the MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder"
+    );
+    let notes = tmp.path().join("notes");
+    assert_eq!(
+        std::fs::read_to_string(notes.join("MANIFEST.md")).unwrap(),
+        manifest
+    );
+    assert!(!notes.join("routing.md").exists());
+}
+
+#[tokio::test]
+async fn a_write_the_index_refuses_leaves_the_file_as_it_found_it() {
+    let old = engram("Code Review Standards", PERMALINK, "The old rule.");
+    let (tmp, engine, _scratch) = fixture(false, &[(OWNER, old.clone())]).await;
+    let notes = tmp.path().join("notes");
+    // A transaction left open makes the index's own BEGIN fail, after the
+    // file is already written: the one failure the pre-checks cannot see.
+    let store = engine.store();
+    store.lock().await.begin().await.unwrap();
+
+    let replaced = engine
+        .write_engram(&capture(
+            "Code Review Standards",
+            Some("conventions"),
+            "The new rule.",
+            true,
+        ))
+        .await;
+    assert!(replaced.is_err(), "{replaced:?}");
+    assert_eq!(
+        std::fs::read_to_string(notes.join(OWNER)).unwrap(),
+        old,
+        "the old bytes are put back"
+    );
+
+    let created = engine
+        .write_engram(&capture("Fresh Page", None, "New.", false))
+        .await;
+    assert!(created.is_err(), "{created:?}");
+    assert!(
+        !notes.join("fresh-page.md").exists(),
+        "a new file is removed"
+    );
+
+    store.lock().await.rollback().await.unwrap();
+}

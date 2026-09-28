@@ -357,10 +357,12 @@ impl Engine {
             .await;
         // A join is into ONE draft: screened on where the capture would land,
         // or on the slug path when no landing could be worked out, and ahead of
-        // every refusal that names something inside the owner's draft.
+        // every refusal that names something inside the owner's draft. The
+        // refusal names `rel`, the path the caller built: the landing can be
+        // a file only the owner's draft holds.
         if let Some(join) = join {
             let screened = landing.as_deref().unwrap_or(&rel);
-            self.screen_granted_path(&p.domain, screened, scope, Some(join))
+            self.screen_granted_path_named(&p.domain, screened, &rel, scope, Some(join))
                 .await?;
         }
 
@@ -734,7 +736,7 @@ impl Engine {
         // named who is in the room over that page would have disclosed it
         // ahead of the gate that refuses.
         if let Some(join) = join.filter(|_| view.joined().is_some()) {
-            self.screen_granted_path(&p.domain, &path, scope, Some(join))
+            self.screen_granted_path_named(&p.domain, &path, &rel, scope, Some(join))
                 .await
                 .ok()?;
         }
@@ -1638,6 +1640,25 @@ impl Engine {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<()> {
+        self.screen_granted_path_named(domain, path, path, scope, join)
+            .await
+    }
+
+    /// [`Engine::screen_granted_path`], screening `path` but naming `shown`
+    /// when a join refuses a write that lands elsewhere.
+    ///
+    /// A capture is screened on its landing path, which for an overwrite can
+    /// be a file that only the owner's draft holds, under a name the caller
+    /// never saw. The caller's grant covers one page, so the refusal names
+    /// the path the caller built from their own title instead.
+    pub(super) async fn screen_granted_path_named(
+        &self,
+        domain: &str,
+        path: &str,
+        shown: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<()> {
         if let Some(join) = join {
             if join.path != path {
                 // A join whose own draft has gone is not a join to a different
@@ -1657,7 +1678,7 @@ impl Engine {
                 return Err(EngineError::Refused(joined_write_is_elsewhere(
                     &join.owner,
                     &join.path,
-                    path,
+                    shown,
                 )));
             }
             return Ok(());
@@ -1798,5 +1819,88 @@ mod put_back_tests {
         std::fs::write(&fresh, "new").unwrap();
         put_back(&fresh, None);
         assert!(!fresh.exists());
+    }
+}
+
+#[cfg(test)]
+mod landing_race_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+
+    const MANIFEST: &str = "---\ntype: manifest\ntitle: notes\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Everything about notes\n\n## When to Use\n\n- Route here for notes questions\n";
+    const OWNER: &str = "conventions/Code Review Standards.md";
+    const RENAMED: &str = "conventions/code-review-standards-old.md";
+    const ENGRAM: &str = "---\ntype: engram\ntitle: Code Review Standards\npermalink: conventions/code-review-standards\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Code Review Standards\n\nThe old rule.\n";
+
+    /// The owner moves while an overwrite waits for the write lock: the
+    /// landing settled under the lock differs from the one worked out
+    /// before it, and the write is refused with nothing written.
+    #[tokio::test]
+    async fn an_overwrite_whose_owner_moves_while_it_waits_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("conventions")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        std::fs::write(root.join(OWNER), ENGRAM).unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root.clone()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        // Hold the lock the overwrite will wait on.
+        let lock = engine.write_lock(&join_rel(&root, OWNER));
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .write_engram(&WriteParams {
+                        domain: "notes".to_string(),
+                        title: "Code Review Standards".to_string(),
+                        content: "The new rule.".to_string(),
+                        folder: Some("conventions".to_string()),
+                        engram_type: None,
+                        tags: Vec::new(),
+                        status: None,
+                        metadata: None,
+                        overwrite: true,
+                        share_link: None,
+                        model: None,
+                    })
+                    .await
+            })
+        };
+        // The writer holds its own handle on the lock once it waits on it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The owner is renamed in its folder, permalink kept, and indexed.
+        std::fs::rename(root.join(OWNER), root.join(RENAMED)).unwrap();
+        engine
+            .sync_paths("notes", vec![OWNER.to_string(), RENAMED.to_string()])
+            .await
+            .unwrap();
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "the engram 'conventions/code-review-standards' in domain 'notes' moved while this write waited. Nothing was written; try again"
+        );
+        assert!(
+            !root.join(OWNER).exists(),
+            "nothing written at the old landing"
+        );
+        assert_eq!(std::fs::read_to_string(root.join(RENAMED)).unwrap(), ENGRAM);
     }
 }
