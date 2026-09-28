@@ -435,12 +435,38 @@ fn text_of(block: Option<&KeyBlock>) -> Option<&str> {
     block.map(|b| b.text.as_str())
 }
 
-/// Upstream's key order, with each key only local has placed right after its
-/// nearest preceding local key (first when it has none).
-fn key_order<'s>(local: &'s [KeyBlock], upstream: &'s [KeyBlock]) -> Vec<&'s KeyBlock> {
-    let mut order: Vec<&KeyBlock> = upstream.iter().collect();
+/// Whether `side` holds the keys it shares with `base` in another relative
+/// order than `base` does.
+fn reordered(base: &[KeyBlock], side: &[KeyBlock]) -> bool {
+    let at: Vec<usize> = side
+        .iter()
+        .filter_map(|block| base.iter().position(|b| b.parsed_key == block.parsed_key))
+        .collect();
+    at.windows(2).any(|w| w[0] > w[1])
+}
+
+/// Local's key order when only local reordered the keys it shares with the
+/// base, upstream's otherwise (always upstream's when the base has no keys).
+/// A key only the other side has goes right after its nearest preceding key
+/// of that side (first when it has none).
+fn key_order<'s>(
+    base: &[KeyBlock],
+    local: &'s [KeyBlock],
+    upstream: &'s [KeyBlock],
+) -> Vec<&'s KeyBlock> {
+    if reordered(base, local) && !reordered(base, upstream) {
+        interleave(local, upstream)
+    } else {
+        interleave(upstream, local)
+    }
+}
+
+/// `leading`'s order, with each key only `other` has placed right after its
+/// nearest preceding `other` key (first when it has none).
+fn interleave<'s>(leading: &'s [KeyBlock], other: &'s [KeyBlock]) -> Vec<&'s KeyBlock> {
+    let mut order: Vec<&KeyBlock> = leading.iter().collect();
     let mut after: Option<usize> = None;
-    for block in local {
+    for block in other {
         match order.iter().position(|b| b.parsed_key == block.parsed_key) {
             Some(at) => after = Some(at),
             None => {
@@ -453,6 +479,28 @@ fn key_order<'s>(local: &'s [KeyBlock], upstream: &'s [KeyBlock]) -> Vec<&'s Key
     order
 }
 
+/// The three block texts line-merged by `line_merge`, with the merged value,
+/// when the result is exactly one block of the same key ending in a line
+/// ending.
+fn merge_block(
+    base: &KeyBlock,
+    local: &KeyBlock,
+    upstream: &KeyBlock,
+    line_merge: LineMerge<'_>,
+) -> Option<(String, Value)> {
+    let merged = line_merge(&base.text, &local.text, &upstream.text)?;
+    let mut cut = key_blocks(&merged)?;
+    if !cut.preamble.is_empty()
+        || cut.blocks.len() != 1
+        || cut.blocks[0].parsed_key != local.parsed_key
+        || !merged.ends_with('\n')
+    {
+        return None;
+    }
+    let value = cut.blocks.pop()?.value;
+    Some((merged, value))
+}
+
 /// One key's result by the table on [`merge_frontmatter`]: `Ok(Some(text))`
 /// writes that block, `Ok(None)` drops the key, `Err(())` is a conflict.
 fn pick(
@@ -463,11 +511,21 @@ fn pick(
 ) -> Result<Option<String>, ()> {
     let owned = |text: Option<&str>| text.map(str::to_string);
     if value_of(local) == value_of(upstream) {
-        // Same value: upstream's spelling, unless only local re-spelled it.
+        // Same value: the spelling of the side that re-spelled it; when both
+        // did, their line merge if it keeps the value, else local's.
+        if text_of(local) == text_of(upstream) || text_of(local) == text_of(base) {
+            return Ok(owned(text_of(upstream)));
+        }
         if text_of(upstream) == text_of(base) {
             return Ok(owned(text_of(local)));
         }
-        return Ok(owned(text_of(upstream)));
+        if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
+            && let Some((merged, value)) = merge_block(b, l, u, line_merge)
+            && value == l.value
+        {
+            return Ok(Some(merged));
+        }
+        return Ok(owned(text_of(local)));
     }
     if value_of(local) == value_of(base) {
         return Ok(owned(text_of(upstream)));
@@ -476,12 +534,7 @@ fn pick(
         return Ok(owned(text_of(local)));
     }
     if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
-        && let Some(merged) = line_merge(&b.text, &l.text, &u.text)
-        && let Some(cut) = key_blocks(&merged)
-        && cut.preamble.is_empty()
-        && cut.blocks.len() == 1
-        && cut.blocks[0].parsed_key == l.parsed_key
-        && merged.ends_with('\n')
+        && let Some((merged, _)) = merge_block(b, l, u, line_merge)
     {
         return Ok(Some(merged));
     }
@@ -506,20 +559,24 @@ fn pick(
 ///
 /// | case | result |
 /// |---|---|
-/// | L equals U | U's text; L's text when U's text is byte-equal to B's (only local re-spelled it); absent on both: the key is gone |
+/// | L equals U | U's text when L's text is byte-equal to U's or B's; L's text when U's text is byte-equal to B's (only local re-spelled it); when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text (also when there is no B); absent on both: the key is gone |
 /// | L equals B | U's text (only upstream changed or removed it) |
 /// | U equals B | L's text (only local changed, added or removed it) |
 /// | otherwise, all three present | the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key |
 /// | otherwise | conflict |
 ///
 /// The preamble follows the first three rules, compared as text; changed
-/// differently on both sides it is a conflict. Keys come in upstream's
-/// order, a key only local has right after its nearest preceding local key
-/// (first when it has none). The delimiter lines are upstream's and every
-/// block is written as the chosen side's exact text. The merged frontmatter
-/// always follows upstream's key order, so a pull that changes only the body
-/// still resets a local reordering of keys; no value is lost by this, since
-/// order is the only thing that moves.
+/// differently on both sides it is a conflict. Keys come in local's order
+/// when local reordered the keys it shares with the base and upstream did
+/// not reorder the keys it shares with the base; a key only upstream has
+/// then goes right after its nearest preceding upstream key (first when it
+/// has none). Otherwise, and always when the base has no keys (no base, or
+/// one without frontmatter), keys come in upstream's order, a key only local
+/// has right after its nearest preceding local key (first when it has none).
+/// So a local reordering survives a pull that changes only the body or only
+/// values, and an upstream reordering wins over a local one. The delimiter
+/// lines are upstream's and every block is written as the chosen side's
+/// exact text.
 pub fn merge_frontmatter<'a>(
     base: Option<&'a str>,
     local: &'a str,
@@ -566,7 +623,7 @@ pub fn merge_frontmatter<'a>(
     };
     let mut head = String::from(u.open);
     head.push_str(&preamble);
-    for block in key_order(&ls.blocks, &us.blocks) {
+    for block in key_order(&bs.blocks, &ls.blocks, &us.blocks) {
         let key = &block.parsed_key;
         match pick(
             find(&bs.blocks, key),
@@ -1240,6 +1297,115 @@ mod tests {
         assert_eq!(
             merge_text(Some("base\n"), broken_local, "upstream\n", &fixed),
             MergedText::Clean(merged.to_string())
+        );
+    }
+
+    /// SCOTTY with `title` and `permalink` swapped.
+    fn scotty_title_after_permalink(text: &str) -> String {
+        text.replace(
+            "title: Scotty\npermalink: manifest\n",
+            "permalink: manifest\ntitle: Scotty\n",
+        )
+    }
+
+    #[test]
+    fn a_local_reorder_survives_a_body_only_upstream_change() {
+        let local = scotty_title_after_permalink(SCOTTY);
+        let upstream = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let expected = with(&local, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_key_only_upstream_added_lands_after_its_upstream_predecessor_in_a_local_order() {
+        let local = scotty_title_after_permalink(SCOTTY);
+        let upstream = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        let expected = with(&local, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn an_upstream_reorder_wins_when_local_kept_the_base_order() {
+        let local = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let upstream = scotty_title_after_permalink(SCOTTY);
+        let expected = with(&upstream, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn when_both_sides_reordered_upstreams_order_wins() {
+        let local = scotty_title_after_permalink(SCOTTY);
+        let upstream = SCOTTY.replace(
+            "tags:\n  - manifest\nstatus: stable\n",
+            "status: stable\ntags:\n  - manifest\n",
+        );
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(upstream.clone())
+        );
+    }
+
+    #[test]
+    fn without_a_base_upstreams_order_wins() {
+        let local = scotty_title_after_permalink(SCOTTY);
+        assert_eq!(
+            merge_text(None, &local, SCOTTY, &trivial),
+            MergedText::Clean(SCOTTY.to_string())
+        );
+    }
+
+    #[test]
+    fn a_local_comment_survives_an_upstream_requoting_of_the_same_value() {
+        let local = SCOTTY.replace("status: stable", "status: stable # keep");
+        let upstream = SCOTTY.replace("status: stable", "status: \"stable\"");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(local.clone())
+        );
+    }
+
+    #[test]
+    fn both_respellings_of_an_equal_list_are_line_merged() {
+        let local = SCOTTY.replace("tags:\n", "tags:\n  # keep\n");
+        let upstream = SCOTTY.replace("  - manifest\n", "  - \"manifest\"\n");
+        let merge = tags_merged_as("tags:\n  # keep\n  - \"manifest\"\n");
+        let expected = SCOTTY.replace(
+            "tags:\n  - manifest\n",
+            "tags:\n  # keep\n  - \"manifest\"\n",
+        );
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &merge),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_line_merge_of_two_respellings_that_changes_the_value_keeps_local() {
+        let local = SCOTTY.replace("tags:\n", "tags:\n  # keep\n");
+        let upstream = SCOTTY.replace("  - manifest\n", "  - \"manifest\"\n");
+        let merge = tags_merged_as("tags:\n  - other\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &merge),
+            MergedText::Clean(local.clone())
+        );
+    }
+
+    #[test]
+    fn a_key_both_added_with_one_value_in_two_spellings_keeps_local_spelling() {
+        let local = with(SCOTTY, "title: Scotty\n", "domain_name: 'scotty'\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(local.clone())
         );
     }
 }
