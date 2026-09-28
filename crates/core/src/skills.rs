@@ -146,4 +146,26 @@ mod tests {
         assert!(routing.content.starts_with("---\n"));
         assert!(skill("crystalline-nonesuch").is_none());
     }
+
+    #[test]
+    fn the_skills_teach_the_cross_domain_link_form() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        assert!(
+            capture.contains("`[[<domain>:<Title or permalink>]]`"),
+            "capture skill lacks the link form"
+        );
+        assert!(
+            capture.contains("This rule covers tool arguments only"),
+            "capture skill still reads like a ban"
+        );
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        assert!(
+            desktop.contains("`[[domain:Target]]`"),
+            "consolidated skill lacks the link form"
+        );
+        assert!(
+            desktop.contains("`[[<domain>:<Title or permalink>]]`"),
+            "consolidated skill lacks the relation form"
+        );
+    }
 }

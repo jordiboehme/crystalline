@@ -4,7 +4,9 @@
 //! built once across every scanned Domain, so a `[[domain:Target]]` link can
 //! resolve against a domain other than the one it was written in. A target
 //! whose named domain is outside the scan set cannot be judged broken or
-//! sound, so it is only ever informational (`L006`), never a warning.
+//! sound, so it is only ever informational (`L006`), never a warning. A bare
+//! target that does not resolve in its own domain is looked up in the rest of
+//! the scan set, and L001 names the prefixed link when one holds it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -192,12 +194,15 @@ fn check_target(
             }
         }
         Resolution::Unresolved => {
+            // A bare target resolves only in its own domain. When the scan set
+            // holds it elsewhere, the fix is one prefix away, so name it.
+            let found = found_elsewhere(&target.target, &domain.name, domain_names, lookup);
             sink.emit(
                 &file.path,
                 line,
                 "L001",
                 Severity::Warning,
-                format!("broken wikilink to `{}`", target.target),
+                broken_bare_message(&target.target, &found),
                 None,
             );
         }
@@ -226,6 +231,52 @@ fn check_target(
                 );
             }
         }
+    }
+}
+
+/// The other domains of the scan set that hold `target` as a permalink or a
+/// title, in the scan set's sorted order. `own` is left out: a bare target
+/// was already looked up there and missed.
+fn found_elsewhere<'a>(
+    target: &str,
+    own: &str,
+    domain_names: &BTreeSet<&'a str>,
+    lookup: &LookupTable,
+) -> Vec<&'a str> {
+    domain_names
+        .iter()
+        .copied()
+        .filter(|d| *d != own)
+        .filter(|d| {
+            lookup.by_permalink(d, target).is_some() || lookup.by_title(d, target).is_some()
+        })
+        .collect()
+}
+
+/// L001's text for a bare link: the plain message, plus the domains that hold
+/// the target and the prefixed link to write when there are any.
+fn broken_bare_message(target: &str, found: &[&str]) -> String {
+    if found.is_empty() {
+        return format!("broken wikilink to `{target}`");
+    }
+    let names: Vec<String> = found.iter().map(|d| format!("`{d}`")).collect();
+    let links: Vec<String> = found
+        .iter()
+        .map(|d| format!("`[[{d}:{target}]]`"))
+        .collect();
+    format!(
+        "broken wikilink to `{target}` (found in {}, link it as {})",
+        join_list(&names, "and"),
+        join_list(&links, "or")
+    )
+}
+
+/// `a`, `a and b`, `a, b and c`: no comma before the last item.
+fn join_list(items: &[String], last: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [head @ .., tail] => format!("{} {last} {tail}", head.join(", ")),
     }
 }
 
@@ -290,4 +341,60 @@ fn find_urls(line: &str) -> Vec<String> {
         rest = &tail[end..];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_link_found_nowhere_keeps_the_plain_message() {
+        assert_eq!(
+            broken_bare_message("Some Title", &[]),
+            "broken wikilink to `Some Title`"
+        );
+    }
+
+    #[test]
+    fn a_bare_link_found_in_one_other_domain_names_the_prefixed_form() {
+        assert_eq!(
+            broken_bare_message("Some Title", &["other-domain"]),
+            "broken wikilink to `Some Title` (found in `other-domain`, link it as `[[other-domain:Some Title]]`)"
+        );
+    }
+
+    #[test]
+    fn several_domains_are_listed_in_order_without_an_oxford_comma() {
+        assert_eq!(
+            broken_bare_message("X", &["a", "b"]),
+            "broken wikilink to `X` (found in `a` and `b`, link it as `[[a:X]]` or `[[b:X]]`)"
+        );
+        assert_eq!(
+            broken_bare_message("X", &["a", "b", "c"]),
+            "broken wikilink to `X` (found in `a`, `b` and `c`, link it as `[[a:X]]`, `[[b:X]]` or `[[c:X]]`)"
+        );
+    }
+
+    #[test]
+    fn found_elsewhere_matches_title_or_permalink_and_skips_the_own_domain() {
+        let mut lookup = LookupTable::new();
+        lookup.insert("own", "local", "Local");
+        lookup.insert("ops", "runbook", "Some Title");
+        lookup.insert("pay", "some-title", "Other");
+        lookup.insert("zzz", "unrelated", "Unrelated");
+        let names: BTreeSet<&str> = ["own", "ops", "pay", "zzz"].into_iter().collect();
+        assert_eq!(
+            found_elsewhere("some title", "own", &names, &lookup),
+            vec!["ops"]
+        );
+        assert_eq!(
+            found_elsewhere("some-title", "own", &names, &lookup),
+            vec!["pay"]
+        );
+        lookup.insert("own", "dup", "Some Title");
+        assert_eq!(
+            found_elsewhere("Some Title", "own", &names, &lookup),
+            vec!["ops"]
+        );
+    }
 }
