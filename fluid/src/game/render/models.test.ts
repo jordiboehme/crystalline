@@ -77,6 +77,7 @@ import {
   type ModelContext,
   type Mover,
 } from "./models";
+import { CASE_GLASS } from "./models/machines";
 
 /**
  * Every kit made while a model builds, the models' own mover kits
@@ -1536,6 +1537,30 @@ describe("model variants (2.7)", () => {
     const hashes = variantZeroHashes();
     expect(Object.keys(hashes).length).toBe(1 + 12 + 9);
     expect(hashes).toEqual(VARIANT_ZERO_HASHES);
+  });
+
+  it("tints the glass case's panes a pale blue-grey glass, not the tag's hue darkened (2.7 Task 5 ruling)", () => {
+    // Mutation caught: the panes back in `shade(hue, 0.3)`, which read as
+    // a dark cabinet rather than glass.
+    const [r, g, b] = CASE_GLASS;
+    expect(g).toBeGreaterThanOrEqual(r);
+    expect(b).toBeGreaterThan(g);
+    // Grey with a little blue, pale but a low glow.
+    expect(b - r).toBeLessThanOrEqual(0.15);
+    expect(r).toBeGreaterThanOrEqual(0.3);
+    expect(b).toBeLessThanOrEqual(0.5);
+    const m = buildOne(machineAt("containment", 1)).static;
+    let panes = 0;
+    for (let i = 0; i < m.count; i++) {
+      const o = i * FLOATS_PER_VERTEX;
+      const tint = [9, 10, 11].map((k) => m.vertices[o + k]);
+      if (tint.every((c, k) => c === Math.fround(CASE_GLASS[k] ?? NaN))) {
+        expect(m.vertices[o + 12]).toBe(FLAG.emissive);
+        panes++;
+      }
+    }
+    // Four panes, each a box of at least four faces of six vertices.
+    expect(panes).toBeGreaterThanOrEqual(4 * 4 * 6);
   });
 
   it("draws every variant its count names, and throws on one past it (2.7 C2)", () => {

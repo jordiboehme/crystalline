@@ -3104,6 +3104,14 @@ function treatmentChair({ k, s, ctx, out, accent2 }: Recipe) {
   );
 }
 
+/**
+ * The glass case's panes: a pale blue-grey glass tint with a low glow
+ * (drawn `s.glow`), not the tag's hue darkened, which read as a dark
+ * cabinet. The panes stay opaque (no blending), so the core stays hidden
+ * and the beam shows above and below them.
+ */
+export const CASE_GLASS: Rgb = [0.36, 0.42, 0.48];
+
 /** The glass case: the plinth, the posts, the panes, the core, the cap. */
 const GLASS_CASE = {
   plinth: 0.3,
@@ -3119,10 +3127,10 @@ const GLASS_CASE = {
 
 /**
  * Containment variant 1, a glass case: a square plinth, four corner posts
- * holding four tinted panes that stop short of the plinth and the cap, a
- * core glowing in a beam between two emitter dishes (held on thin rods,
- * the beam shows as bright bands in the gaps), and a square cap with a
- * port and a conduit to the wall. The ring round the cap's port carries
+ * holding four panes of pale glass (`CASE_GLASS`) that stop short of the
+ * plinth and the cap, a core glowing in a beam between two emitter dishes
+ * (held on thin rods, the beam shows as bright bands in the gaps), and a
+ * square cap with a port and a conduit to the wall. The ring round the cap's port carries
  * the tag's second accent.
  */
 function glassCase({ k, s, hue, out, accent2 }: Recipe) {
@@ -3145,7 +3153,7 @@ function glassCase({ k, s, hue, out, accent2 }: Recipe) {
     for (const dd of [d - x, d + x])
       k.box(a - w, a + w, dd - w, dd + w, G.plinth, c0, s.dark);
   // The panes, each between two posts.
-  const glass = s.glow(shade(hue, 0.3));
+  const glass = s.glow(CASE_GLASS);
   const [g0, g1] = G.panes;
   const t = 0.005;
   for (const dd of [d - x, d + x])
