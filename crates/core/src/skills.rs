@@ -170,29 +170,30 @@ mod tests {
     }
 
     #[test]
-    fn the_skills_teach_the_file_path_identifier() {
-        let capture = skill("crystalline-capture").unwrap().content;
-        assert!(
-            capture.contains(
-                "with or without `.md` (a path spelled like a permalink needs the `.md`)"
-            ),
-            "capture skill lacks the narrowed path identifier rule"
-        );
-        let desktop = skill("crystalline-intelligence").unwrap().content;
-        assert!(
-            desktop.contains(
-                "with or without `.md` (a path spelled like a permalink needs the `.md`)"
-            ),
-            "consolidated skill lacks the narrowed path identifier rule"
-        );
+    fn the_skills_teach_that_a_miss_names_the_permalink() {
+        let hint = "A file path is not an identifier: a miss names the permalink it probably meant";
+        for name in ["crystalline-capture", "crystalline-intelligence"] {
+            let content = skill(name).unwrap().content;
+            assert!(content.contains(hint), "{name} lacks the miss hint");
+            assert!(
+                !content.contains("file path inside the domain"),
+                "{name} still offers the file path as an identifier"
+            );
+            assert!(
+                !content.contains("with or without `.md`"),
+                "{name} still offers the file path as an identifier"
+            );
+        }
         let routing = skill("crystalline-routing").unwrap().content;
         assert!(
-            routing.contains("The file path `MANIFEST.md` resolves"),
-            "routing skill still calls MANIFEST.md no identifier"
+            routing.contains(
+                "The filename `MANIFEST.md` is not an identifier, and a miss names the permalink it probably meant"
+            ),
+            "routing skill calls MANIFEST.md no identifier and names the hint"
         );
         assert!(
-            !routing.contains("is not an identifier"),
-            "the old MANIFEST.md sentence is gone"
+            !routing.contains("`MANIFEST.md` resolves"),
+            "routing skill no longer says MANIFEST.md resolves"
         );
     }
 
