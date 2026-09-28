@@ -53,7 +53,6 @@ hf-hub = { version = "1.0.0", default-features = false, features = ["rustls-tls"
 # esaxx C++ trainer or progress bar; keeps musl static builds clean. Only the
 # JSON tokenizer load and encode paths are used.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-pulldown-cmark = "0.13.4"
 # The PostgreSQL backend. `tls-rustls` shares reqwest's rustls (ring provider)
 # rather than pulling OpenSSL, so the musl static release binaries stay
 # self-contained; the runtime query API is used (no compile-time macros) so no
