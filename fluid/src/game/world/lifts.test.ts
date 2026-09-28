@@ -16,6 +16,7 @@ import {
   moreLine,
 } from "./lifts";
 import liftsSource from "./lifts.ts?raw";
+import type { LiftStop } from "./types";
 
 describe("the lift stops (M3 C7, C12, C24)", () => {
   it("lists the airlock's domains by label with keys on the private ones", () => {
@@ -82,6 +83,45 @@ describe("the lift stops (M3 C7, C12, C24)", () => {
     ]);
     expect(deckStops("eng", "a", ["A-Z"], 0, []).map((s) => s.label)).toEqual([
       "BRIDGE",
+    ]);
+  });
+
+  it("pins every stop whole: its label, where it rides, its key and its mark", () => {
+    // Mutation caught: a section stop riding to section 0 instead of its
+    // own, the AIRLOCK stop riding to the bridge, the BRIDGE stop riding to
+    // the airlock, `key: true` on a deck stop.
+    const stop = (
+      label: string,
+      to: LiftStop["to"],
+      key = false,
+      here = false,
+    ): LiftStop => ({ label, to, key, here });
+    const deck = (folder: string, section = 0) =>
+      ({ kind: "deck", domain: "eng", folder, section }) as const;
+    expect(
+      airlockStops(
+        [
+          { name: "zeta", private: false },
+          { name: "Alpha", private: true },
+        ],
+        "zeta",
+      ),
+    ).toEqual([
+      stop("Alpha", { kind: "bridge", domain: "Alpha" }, true),
+      stop("zeta", { kind: "bridge", domain: "zeta" }, false, true),
+    ]);
+    expect(bridgeStops("eng", ["zoo", "Alpha"], true)).toEqual([
+      stop("AIRLOCK", { kind: "airlock" }),
+      stop("DECK 1", deck("")),
+      stop(deckLabel("eng", "Alpha"), deck("Alpha")),
+      stop(deckLabel("eng", "zoo"), deck("zoo")),
+    ]);
+    expect(deckStops("eng", "a/b", ["A-F", "G-Z"], 1, ["c"])).toEqual([
+      stop("BRIDGE", { kind: "bridge", domain: "eng" }),
+      stop("UP", deck("a")),
+      stop("SECTION A-F", deck("a/b", 0)),
+      stop("SECTION G-Z", deck("a/b", 1), false, true),
+      stop(deckLabel("eng", "a/b/c"), deck("a/b/c")),
     ]);
   });
 

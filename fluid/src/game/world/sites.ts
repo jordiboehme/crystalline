@@ -531,6 +531,10 @@ export function dressingSites(room: SiteBase): DressingSites {
       case "screen":
         lanes.push(footprint(f.slot, sheet));
         break;
+      default:
+        // Every fixture kind names its lane: a new kind is a type error
+        // here until it is added to one of the cases above.
+        f satisfies never;
     }
   }
   const sign = stencilEdge(room);

@@ -7,10 +7,10 @@
  * spec's line, and the rest follow the HUD's voice. Each domain is one row
  * (`levelsOf`), keyed and jumped to by its local name and found by every
  * name it answers to. The list is sorted by the lowercased label and then
- * by code point (C12), filtered by a trimmed, case-insensitive substring of
- * any of those names (C12), and shown as a window of `LEVEL_ROWS` rows
- * around the selection (C15), which moves one row at a time and stops at
- * both ends (C13).
+ * by UTF-16 code unit (C12), filtered by a trimmed, case-insensitive
+ * substring of any of those names (C12), and shown as a window of
+ * `LEVEL_ROWS` rows around the selection (C15), which moves one row at a
+ * time and stops at both ends (C13).
  */
 
 import type { DomainSummary } from "../../api/domains";
@@ -106,8 +106,9 @@ export function hereKey(
 }
 
 /**
- * The items sorted by lowercased label, then by code point (C12): `byLabel`,
- * the comparator the airlock's lift sorts its domains with too (M3 C24).
+ * The items sorted by lowercased label, then by UTF-16 code unit (C12):
+ * `byLabel`, the comparator the airlock's lift sorts its domains with too
+ * (M3 C24).
  */
 export function sortLevels<T>(
   items: readonly T[],

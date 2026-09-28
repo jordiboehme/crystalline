@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
+import { seedFor } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import { curioBox } from "./curios";
 import { heroFootprint, propFootprint } from "./footprints";
@@ -34,7 +35,7 @@ function entranceLane(room: RoomSpec): Box {
 
 describe("withExit (M3 C28)", () => {
   it("puts one exit on the entrance edge and leaves every other fixture as it was", () => {
-    // Mutation caught: the exit on the wrong edge, inserted before other fixtures (shifting door:<i> keys), added twice.
+    // Mutation caught: the exit on the wrong edge, inserted before other fixtures (shifting door:<i> keys), added twice, its label or its seed not the ones asked for.
     const room = generateRoom(CANNED_WORKSHOP);
     const to = {
       kind: "deck",
@@ -47,7 +48,9 @@ describe("withExit (M3 C28)", () => {
     expect(out.fixtures.at(-1)).toMatchObject({
       kind: "exit",
       slot: { ...room.entrance, side: "s" },
+      label: "DECK 1",
       to,
+      seed: seedFor(room.seed, "exit"),
     });
     expect(withExit(out, to, "DECK 1")).toEqual(out);
   });

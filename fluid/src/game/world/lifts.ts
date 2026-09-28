@@ -61,9 +61,11 @@ export const LIFT_WORDS = {
 } as const;
 
 /**
- * How many lines a lift's call panel shows. A lift with more stops than
- * that shows the first `LIFT_LINES - 1` and `moreLine` for the rest; the
- * overlay lists them all.
+ * How many stops a lift's call panel lists: at most `LIFT_LINES` stop
+ * labels, then `moreLine` for the stops left out (only when some are),
+ * then the lift's `note` when it has one. So a panel of 14 stops and a
+ * note reads 10 labels, `+4 MORE` and the note, 12 lines. The overlay
+ * lists every stop.
  */
 export const LIFT_LINES = 10;
 
