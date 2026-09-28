@@ -510,3 +510,81 @@ describe("the decal recipe", () => {
     expect(wall[0]![1]).toBeGreaterThan(mid);
   });
 });
+
+describe("the airlock's hazard ring (M3 C24)", () => {
+  const ringDecal: Decal = {
+    kind: "ring",
+    on: "floor",
+    x: 5.5,
+    y: 5.5,
+    turn: 0,
+    along: 0,
+    h: 0,
+    width: 6.4,
+    length: 0.5,
+    variant: 0,
+    seed: 0,
+  };
+  const built = () => {
+    const b = createBuilder();
+    buildDecals((f) => createKit(b, f), b, {
+      ...galleryRoom(),
+      decals: [ringDecal],
+    });
+    return b.build();
+  };
+
+  it("lays a black band and the yellow stripes over it, round its centre, facing up", () => {
+    // Mutation caught: the band not closed round (too few pieces or a
+    // wrong angle), a piece wound face down, the stripes at the band's
+    // height (fighting it) or off the chevrons' tiles, a piece off the
+    // band's radii.
+    const mesh = built();
+    const vs = Array.from({ length: mesh.count }, (_, i) => vertexAt(mesh, i));
+    expect(vs.length).toBeGreaterThan(0);
+    const cx = ringDecal.x * CELL;
+    const cz = ringDecal.y * CELL;
+    const outer = ringDecal.width / 2;
+    const inner = outer - ringDecal.length;
+    const angles = new Set<number>();
+    for (let i = 0; i + 2 < vs.length; i += 3) {
+      const [a, b, c] = [vs[i]!, vs[i + 1]!, vs[i + 2]!];
+      // Counter-clockwise seen from above: the face's normal points up.
+      const up =
+        (b.p[2] - a.p[2]) * (c.p[0] - a.p[0]) -
+        (b.p[0] - a.p[0]) * (c.p[2] - a.p[2]);
+      expect(up).toBeGreaterThan(0);
+      for (const v of [a, b, c]) {
+        expect(v.n).toEqual([0, 1, 0]);
+        expect(v.flag).toBe(FLAG.decal);
+        const r = Math.hypot(v.p[0] - cx, v.p[2] - cz);
+        expect(r).toBeGreaterThanOrEqual(inner - 1e-6);
+        expect(r).toBeLessThanOrEqual(outer + 1e-6);
+        angles.add(
+          Math.round(Math.atan2(v.p[2] - cz, v.p[0] - cx) * 1000) / 1000,
+        );
+      }
+    }
+    // Pieces all the way round: at least 12 distinct corner angles, spread
+    // over every quarter.
+    expect(angles.size).toBeGreaterThanOrEqual(12);
+    for (const q of [0, 1, 2, 3]) {
+      const lo = -Math.PI + (q * Math.PI) / 2;
+      expect([...angles].some((t) => t >= lo && t < lo + Math.PI / 2)).toBe(
+        true,
+      );
+    }
+    const base = vs.filter((v) => Math.abs(v.p[1] - DECAL_LIFT) < 1e-9);
+    const stripes = vs.filter((v) => Math.abs(v.p[1] - 2 * DECAL_LIFT) < 1e-9);
+    expect(base.length + stripes.length).toBe(vs.length);
+    expect(base.length).toBe(stripes.length);
+    const tinted = (v: Vertex, t: readonly number[]) =>
+      v.tint.every((c, k) => Math.abs(c - (t[k] ?? NaN)) < 1e-6);
+    for (const v of base) expect(tinted(v, DECAL_TINT.ringBase)).toBe(true);
+    for (const v of stripes) {
+      expect(tinted(v, DECAL_TINT.ring)).toBe(true);
+      const tile = Math.floor(v.v * 4 - 1e-9) * 4 + Math.floor(v.u * 4 - 1e-9);
+      expect(DECAL_TILES.chevrons).toContain(tile);
+    }
+  });
+});

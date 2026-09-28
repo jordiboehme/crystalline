@@ -375,17 +375,21 @@ export function touching(p: Shape, q: Shape): boolean {
  * part of a hero, built once at the origin; a part with no points (an
  * empty primitive) is dropped rather than counted loose. `floor` is where
  * parts are held from: 0, or a hovering hero's lift (`heroLift`, C4).
+ * `ceiling`, when given, holds a part whose highest point reaches it too:
+ * a fitting hung from the ceiling (the airlock's iris light, M3 C24).
  */
 export function looseParts(
   parts: readonly Part[],
   wall: Frame | null,
   floor = 0,
+  ceiling = Infinity,
 ): string[] {
   const solid = parts.filter((p) => p.points.length > 0);
   const shapes = solid.map((p) => shape(p.points));
   const held = shapes.map(
     (s) =>
       s.lo[1] <= floor + 1e-4 ||
+      s.hi[1] >= ceiling - 1e-4 ||
       (wall !== null && s.points.some((q) => toLocal(wall, q)[1] <= 1e-4)),
   );
   for (let changed = true; changed;) {

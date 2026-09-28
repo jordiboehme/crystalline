@@ -42,7 +42,6 @@ import {
   interiorHalf,
   type InteriorRecipe,
 } from "./common";
-import type { InteriorKind } from "../../../world/types";
 
 /**
  * The roundel wall's grid (C5, with the research note's size, C24a): each
@@ -438,4 +437,4 @@ export const WALL_RECIPES = {
   "roundel-wall": roundelWall,
   "inner-doors": innerDoors,
   scanner,
-} satisfies Record<Exclude<InteriorKind, "console">, InteriorRecipe>;
+} satisfies Record<"roundel-wall" | "inner-doors" | "scanner", InteriorRecipe>;

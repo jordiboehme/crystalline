@@ -83,10 +83,16 @@
  *
  * `?hall=airlock` (M3 C24) shows the airlock `airlockRoom` builds of
  * `CANNED_DOMAINS`, for judging the round chamber, its light, the lift at
- * the entrance and the domain directory opposite it with the key on the
- * private domain. The spawn is the airlock's own, in front of the lift
- * facing the directory; `?at=lift:0` and `?at=screen:0` stand in front of
- * each. The lift leads nowhere in the gallery.
+ * the entrance, the outer hatch opposite it with its beacons and the
+ * directory board over it (the key on the private domain), the iris light,
+ * the hazard ring and the suit lockers. The spawn is the airlock's own, in
+ * front of the lift facing the hatch; `?at=lift:0` stands in front of the
+ * lift and `?at=screen:0` in front of the hatch under the board. The lift
+ * leads nowhere in the gallery.
+ *
+ * `?pitch=<degrees>` (dev-only, any hall) starts the view tilted up
+ * (positive) or down by that much, clamped as the mouse is, for stills of
+ * a ceiling or of a board hung high.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -188,9 +194,20 @@ export default function Gallery() {
       ...(load === undefined ? {} : { load }),
     });
     sessionRef.current = session;
+    // `?pitch=<degrees>` tilts the first view up (positive) or down, for a
+    // still of a ceiling or a board hung high.
+    const tilt = Number(params.get("pitch") ?? "");
+    const pitch =
+      Number.isFinite(tilt) && params.has("pitch")
+        ? (tilt * Math.PI) / 180
+        : null;
     session.showRoom(
       roomView === null ? base : { ...base, spawn: roomView.spawn },
-      roomView === null ? undefined : { pitch: roomView.pitch },
+      pitch !== null
+        ? { pitch }
+        : roomView === null
+          ? undefined
+          : { pitch: roomView.pitch },
     );
     return () => {
       sessionRef.current = null;

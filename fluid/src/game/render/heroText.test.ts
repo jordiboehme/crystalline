@@ -25,8 +25,10 @@
 import { describe, expect, it } from "vitest";
 
 /**
- * Every hero, curio and prop recipe file, `marks.ts` and the decal
- * recipe (`decals.ts`, whose stencils set deck and bay numbers), raw, by path:
+ * Every hero, curio and prop recipe file, `marks.ts`, the decal recipe
+ * (`decals.ts`, whose stencils set deck and bay numbers and the airlock's
+ * `CYCLE`) and the airlock's fittings (`interior/airlock.ts`, whose outer
+ * hatch sets its stencil, M3 C24), raw, by path:
  * gathered by glob, so a batch file a later task adds is scanned without
  * anyone listing it. `pixels.ts` is left out (its glyph keys are the font,
  * not text drawn), and so are the tests.
@@ -38,6 +40,7 @@ const SOURCES = Object.fromEntries(
         "./models/{heroes,curios,props}/*.ts",
         "./models/marks.ts",
         "./models/decals.ts",
+        "./models/interior/airlock.ts",
       ],
       {
         query: "?raw",
@@ -141,6 +144,10 @@ const READABLE = new Set([
   "B",
   "C",
   "D",
+  // The airlock's words (M3 C24): its outer hatch's stencil and the
+  // floor stencils inside its hazard ring.
+  "AIRLOCK",
+  "CYCLE",
 ]);
 
 /**
@@ -191,6 +198,8 @@ const MARKS_ONLY = [
   "RADIOACTIVE III",
   "CAUTION RADIOACTIVE MATERIAL",
   "PLUTONIUM HANDLE WITH CARE",
+  "AIRLOCK",
+  "CYCLE",
 ];
 
 /** A source with its comments stripped: comments name constants in backticks (`CLUSTER`); only code draws. */
@@ -249,6 +258,7 @@ describe("readable text in the recipes", () => {
       "walker",
       "marks",
       "decals",
+      "airlock",
     ])
       expect(
         Object.keys(SOURCES).some((p) => p.endsWith(`/${name}.ts`)),

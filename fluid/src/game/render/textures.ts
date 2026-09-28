@@ -232,10 +232,11 @@ const MARGIN = 4;
  * rust 8 and 9, and the solid tile 15, whose alpha is full inside its
  * margin, for the stencils' pixels (a stencil draws one point of `solid`
  * and has no entry of its own). Tiles 10 to 14 are empty. A decal's `variant`
- * indexes its kind's list.
+ * indexes its kind's list. The airlock's hazard ring (M3 C24) draws the
+ * chevrons' tiles and the solid tile and has no entry of its own either.
  */
 export const DECAL_TILES: Readonly<
-  Record<Exclude<DecalKind, "stencil"> | "solid", readonly number[]>
+  Record<Exclude<DecalKind, "stencil" | "ring"> | "solid", readonly number[]>
 > = {
   chevrons: [0, 1],
   arrow: [2],

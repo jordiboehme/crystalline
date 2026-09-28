@@ -4,11 +4,13 @@ import { boxKey } from "../world/box";
 import { BLINK_GROUPS } from "./blink";
 import {
   CANNED_BRIDGE,
+  CANNED_DOMAINS,
   CANNED_HUB,
   CANNED_WORKSHOP,
   galleryRoom,
   heroHallRoom,
 } from "../world/canned";
+import { airlockRoom } from "../world/airlock";
 import { consoleRoom } from "../world/consoleRoom";
 import { plainFinish } from "../world/finish";
 import { generateRoom } from "../world/generate";
@@ -217,6 +219,25 @@ for (const [name, place] of ROOMS) {
 }
 
 describe("buildRoomMesh details", () => {
+  it("hangs no lamp panel in the airlock, whose iris light is its lamp, and winds its whole shell and ring (M3 C24)", () => {
+    // Mutation caught: the airlock's zone hanging a rectangular lamp panel
+    // under its iris light, or a ring piece or shell face wound the wrong
+    // way.
+    const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+    const mesh = buildRoomMesh(airlock, LOOKS.day).static;
+    expect(mesh.count).toBeGreaterThan(0);
+    expect(worstWinding(mesh)).toBeGreaterThan(0.999);
+    expect(all(mesh).filter((v) => v.flag === FLAG.lamp)).toEqual([]);
+    for (const v of all(mesh))
+      expect(v.pos[1]).toBeLessThanOrEqual(airlock.ceiling + EPS);
+    // The console room, whose light has no iris, still hangs its lamps.
+    expect(
+      all(buildRoomMesh(consoleRoom(), LOOKS.day).static).some(
+        (v) => v.flag === FLAG.lamp,
+      ),
+    ).toBe(true);
+  });
+
   it("keeps everything under a low ceiling", () => {
     const room: RoomSpec = { ...generateRoom(CANNED_BRIDGE), ceiling: 3 };
     for (const v of all(buildRoomMesh(room, LOOKS.day).static)) {

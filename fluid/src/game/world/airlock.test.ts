@@ -9,15 +9,21 @@ import { GAME_VERSION } from "../version";
 import {
   AIRLOCK_CEILING,
   AIRLOCK_GRID,
+  AXIS,
+  BEACON_OFFSET,
+  LOCKER_ROWS,
+  RING,
   airlockRoom,
   type AirlockInput,
 } from "./airlock";
 import airlockSource from "./airlock.ts?raw";
 import { CANNED_DOMAINS } from "./canned";
+import { INTERIOR_CATALOGUE, interiorFootprint } from "./consoleRoom";
 import airlockGolden from "./golden/airlock.json?raw";
 import { isFloor } from "./layout";
 import { LIFT_WORDS, SCREEN_LINES, byLabel, moreLine } from "./lifts";
 import type { Fixture, RoomSpec } from "./types";
+import { CELL } from "./units";
 
 type Domains = NonNullable<AirlockInput["domains"]>;
 
@@ -45,22 +51,38 @@ function screenOf(room: RoomSpec): Extract<Fixture, { kind: "screen" }> {
 
 describe("the airlock (M3 C24)", () => {
   it("is round, lit and bare", () => {
-    // Mutation caught: a square grid, the dressing run on the airlock, a
-    // dim or flickering zone, a floor cell left outside every zone.
+    // Mutation caught: a square grid, corners cut in steps of more than
+    // one cell a row (a notched square), a lopsided row, the dressing run
+    // on the airlock, a dim or flickering zone, a floor cell left outside
+    // every zone.
     const room = airlockRoom({ domains: CANNED_DOMAINS, here: null });
     expect(AIRLOCK_GRID).toEqual([
-      "  ....  ",
-      " ...... ",
-      "........",
-      "........",
-      "........",
-      "........",
-      " ...... ",
-      "  ....  ",
+      "   .....   ",
+      "  .......  ",
+      " ......... ",
+      "...........",
+      "...........",
+      "...........",
+      "...........",
+      "...........",
+      " ......... ",
+      "  .......  ",
+      "   .....   ",
     ]);
     expect(room.grid).toEqual(AIRLOCK_GRID);
-    expect([room.width, room.depth]).toEqual([8, 8]);
-    expect(room.entrance).toEqual({ x: 3, y: 7 });
+    expect([room.width, room.depth]).toEqual([11, 11]);
+    // Round: every row centred, and each corner steps in one cell a row,
+    // over at least three rows, both ways.
+    const lefts = room.grid.map((row) => row.length - row.trimStart().length);
+    room.grid.forEach((row, y) => {
+      expect(row.trim().length + 2 * (lefts[y] ?? 0), `row ${String(y)}`).toBe(
+        room.width,
+      );
+      if (y > 0)
+        expect(Math.abs((lefts[y] ?? 0) - (lefts[y - 1] ?? 0))).toBeLessThan(2);
+    });
+    expect(lefts.filter((l) => l > 0).length).toBeGreaterThanOrEqual(6);
+    expect(room.entrance).toEqual({ x: 5, y: 10 });
     expect(room.ceiling).toBe(AIRLOCK_CEILING);
     expect(room.space).toBe("airlock");
     expect(room.condition).toBe("clean");
@@ -69,7 +91,6 @@ describe("the airlock (M3 C24)", () => {
     expect(room.props).toEqual([]);
     expect(room.heroes).toEqual([]);
     expect(room.curios).toEqual([]);
-    expect(room.decals).toEqual([]);
     expect(room.decor).toEqual([]);
     expect(room.scaffold).toEqual([]);
     expect(room.fixtures.map((f) => f.kind)).toEqual(["lift", "screen"]);
@@ -88,7 +109,93 @@ describe("the airlock (M3 C24)", () => {
         );
         expect(lit, `cell ${String(x)},${String(y)}`).toBe(true);
       }
-    expect(floor).toBe(52);
+    expect(floor).toBe(97);
+  });
+
+  it("stands the lift, the hatch, the directory and the iris light on the room's axis", () => {
+    // Mutation caught: a fixture or a fitting off the axis (the half cell
+    // the first airlock was off by), the beacons not mirrored about it,
+    // the directory drawn at the wall screen's size.
+    const room = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+    const middle = room.width / 2;
+    expect(AXIS + 0.5).toBe(middle);
+    expect(liftOf(room).slot).toEqual({
+      x: AXIS,
+      y: room.depth - 1,
+      side: "s",
+    });
+    const screen = screenOf(room);
+    expect(screen.slot).toEqual({ x: AXIS, y: 0, side: "n" });
+    expect(screen.large).toBe(true);
+    const pieces = room.interior ?? [];
+    const of = (kind: string) => pieces.filter((p) => p.kind === kind);
+    const [hatch] = of("outer-hatch");
+    expect(hatch).toMatchObject({ x: middle, y: 0, turn: 2, variant: 0 });
+    expect(of("outer-hatch")).toHaveLength(1);
+    const beacons = of("beacon");
+    expect(beacons.map((b) => [b.variant, b.y, b.turn])).toEqual([
+      [0, 0, 2],
+      [1, 0, 2],
+    ]);
+    expect((beacons[0]?.x ?? NaN) - middle).toBeCloseTo(-BEACON_OFFSET, 9);
+    expect((beacons[1]?.x ?? NaN) - middle).toBeCloseTo(BEACON_OFFSET, 9);
+    expect(of("iris-light")).toEqual([
+      expect.objectContaining({ x: middle, y: middle, turn: 0 }),
+    ]);
+  });
+
+  it("carries the hatch's beacons, the iris light, the lockers and the ring (M3 C24)", () => {
+    // Mutation caught: a fitting or a decal missing, the iris light hung
+    // anywhere but at the ceiling, a locker off the walls' straight runs
+    // or out of the grid, the ring off the floor's centre, a CYCLE
+    // stencil outside the ring or not reading a word.
+    const room = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+    const pieces = room.interior ?? [];
+    expect(pieces.map((p) => p.kind).slice(0, 4)).toEqual([
+      "outer-hatch",
+      "beacon",
+      "beacon",
+      "iris-light",
+    ]);
+    expect(INTERIOR_CATALOGUE["iris-light"].top).toBe(AIRLOCK_CEILING);
+    const lockers = pieces.filter((p) => p.kind === "suit-locker");
+    expect(lockers).toHaveLength(2 * 2 * LOCKER_ROWS.length);
+    for (const l of lockers) {
+      const box = interiorFootprint(l);
+      if (box === null) throw new Error("a locker with no footprint");
+      // On the west or east wall, whose cell and its neighbours along the
+      // wall are all floor: a straight run, clear of the steps.
+      const x = l.x < 1 ? 0 : room.width - 1;
+      expect([0, room.width]).toContain(l.x);
+      const y = Math.floor(l.y);
+      for (const dy of [-1, 0, 1])
+        expect(isFloor(room.grid, x, y + dy), `${String(x)},${String(y)}`).toBe(
+          true,
+        );
+      expect(box.z0).toBeGreaterThanOrEqual(y * CELL);
+      expect(box.z1).toBeLessThanOrEqual((y + 1) * CELL);
+    }
+    const middle = room.width / 2;
+    const [ring, ...stencils] = room.decals;
+    expect(ring).toMatchObject({
+      kind: "ring",
+      on: "floor",
+      x: middle,
+      y: middle,
+      width: RING.width,
+      length: RING.band,
+    });
+    expect(stencils).toHaveLength(2);
+    for (const s of stencils) {
+      expect(s).toMatchObject({ kind: "stencil", on: "floor", word: "cycle" });
+      expect(s.stencil).toBeUndefined();
+      const reach = Math.hypot(
+        s.width / 2,
+        Math.abs(s.y - middle) * CELL + s.length / 2,
+      );
+      expect(reach).toBeLessThan(RING.width / 2 - RING.band);
+    }
+    expect(stencils.map((s) => s.turn).sort()).toEqual([0, 2]);
   });
 
   it("lists every domain on the lift and on the directory, keys on the private ones", () => {
@@ -101,7 +208,7 @@ describe("the airlock (M3 C24)", () => {
     ];
     const small = airlockRoom({ domains: three, here: "mill" });
     const lift = liftOf(small);
-    expect(lift.slot).toEqual({ x: 3, y: 7, side: "s" });
+    expect(lift.slot).toEqual({ x: 5, y: 10, side: "s" });
     expect(lift.note).toBeNull();
     expect(lift.stops).toEqual([
       {
@@ -124,7 +231,7 @@ describe("the airlock (M3 C24)", () => {
       },
     ]);
     const screen = screenOf(small);
-    expect(screen.slot).toEqual({ x: 3, y: 0, side: "n" });
+    expect(screen.slot).toEqual({ x: 5, y: 0, side: "n" });
     expect(screen.lines).toEqual([
       LIFT_WORDS.airlock,
       "Atlas",
@@ -162,7 +269,8 @@ describe("the airlock (M3 C24)", () => {
 
   it("says when the listing failed", () => {
     // Mutation caught: a failed listing drawn as an empty station (no
-    // line), the note missing from the lift (the lift's retry reads it).
+    // line), the note missing from the lift (its status line), an empty
+    // listing drawn with stops, keys or a note.
     const room = airlockRoom({ domains: null, here: null });
     const lift = liftOf(room);
     expect(lift.stops).toEqual([]);
@@ -173,14 +281,17 @@ describe("the airlock (M3 C24)", () => {
     // An empty listing is no failure: the heading alone, no note.
     const empty = airlockRoom({ domains: [], here: null });
     expect(liftOf(empty).note).toBeNull();
+    expect(liftOf(empty).stops).toEqual([]);
     expect(screenOf(empty).lines).toEqual([LIFT_WORDS.airlock]);
+    expect(screenOf(empty).keys).toEqual([]);
   });
 
   it("keeps airlock.ts on the generator side: no ui, render or session imports", () => {
-    // Mutation caught: an import of `ui/`, `render/` or a session module
-    // into the generator side.
+    // Mutation caught: an import of `ui/`, `render/`, the session
+    // (`../session`) or a session-side world module (`move`, `malfunction`,
+    // `interact`, `box`, `arrival`, `station`) into the generator side.
     expect(airlockSource).not.toMatch(
-      /\b(?:from|import)\s*\(?\s*["'](?:\.\.\/(?:ui|render)(?:\/[^"']*)?|\.\/(?:move|malfunction|interact|box|arrival|station))["']/,
+      /\b(?:from|import)\s*\(?\s*["'](?:\.\.\/(?:ui|render|session)(?:\/[^"']*)?|\.\/(?:move|malfunction|interact|box|arrival|station))["']/,
     );
   });
 

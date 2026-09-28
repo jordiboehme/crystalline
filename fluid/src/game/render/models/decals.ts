@@ -33,10 +33,15 @@
  *   tile (a uv of no extent), so it is full alpha at any distance and never
  *   stippled by a coarse mip level.
  *
+ * - The airlock's hazard **ring** (M3 C24) is a black band round its
+ *   centre with the chevrons' yellow stripes over it (`ring`), and its
+ *   `CYCLE` stencils read a word (`wordMarks`) instead of a bay.
+ *
  * Colours (`DECAL_TINT`, C20): chevrons yellow, arrows the room's accent
  * (`accentTint`), grime, streaks and rust their own dark shades, the wall
- * stencil dark and the floor stencil light. A decal adds no text layer and
- * no text key: its only text is the stencil's pixels.
+ * stencil dark and the floor stencil light, a word stencil dark and the
+ * ring's stripes yellow over black. A decal adds no text layer and no
+ * text key: its only text is the stencil's pixels.
  */
 
 import { HERO_FRONT } from "../../world/footprints";
@@ -58,7 +63,7 @@ import type { Rgb } from "../looks";
 import { DECAL_TILES, tileRect, tileWindow } from "../textures";
 import type { KitAt } from "./common";
 import { runsOf, textRows } from "./heroes/pixels";
-import { stencilMarks } from "./marks";
+import { stencilMarks, wordMarks } from "./marks";
 
 /**
  * The decals' colours (2.7 C20): hazard yellow chevrons, grime, streaks
@@ -72,6 +77,9 @@ export const DECAL_TINT = {
   rust: [0.45, 0.2, 0.08],
   wallStencil: [0.1, 0.1, 0.1],
   floorStencil: [0.9, 0.88, 0.82],
+  wordStencil: [0.1, 0.1, 0.1],
+  ring: [0.95, 0.72, 0.1],
+  ringBase: [0.06, 0.06, 0.06],
 } as const satisfies Record<string, Rgb>;
 
 /** The most triangles a room's decals may take (2.7 C21). */
@@ -228,9 +236,11 @@ function surfaceOf(d: Decal): Surface {
     d.kind === "arrow"
       ? accentTint(1)
       : d.kind === "stencil"
-        ? d.on === "floor"
-          ? DECAL_TINT.floorStencil
-          : DECAL_TINT.wallStencil
+        ? d.word !== undefined
+          ? DECAL_TINT.wordStencil
+          : d.on === "floor"
+            ? DECAL_TINT.floorStencil
+            : DECAL_TINT.wallStencil
         : DECAL_TINT[d.kind];
   return { layer: LAYER.decal, tint, flag: FLAG.decal };
 }
@@ -242,8 +252,13 @@ function surfaceOf(d: Decal): Surface {
  * line. Row 0 of each line is its top.
  */
 function stencilRows(d: Decal): string[][] {
-  if (d.stencil === undefined) return [];
-  return stencilMarks(d.stencil).map((marks) => {
+  const lines =
+    d.word !== undefined
+      ? wordMarks(d.word)
+      : d.stencil !== undefined
+        ? stencilMarks(d.stencil)
+        : [];
+  return lines.map((marks) => {
     const rows = Array.from({ length: GLYPH_ROWS }, () => "");
     marks.forEach((mark, i) => {
       const glyphs = textRows(mark);
@@ -298,6 +313,88 @@ function stencil(kitAt: KitAt, b: Builder, d: Decal): void {
 }
 
 /**
+ * One flat quad `lift` above the floor through the four points (metres,
+ * `[x, z]`) with the four uvs, wound counter-clockwise seen from above
+ * whichever way the points run, so it faces up like the floor.
+ */
+function flatPiece(
+  b: Builder,
+  points: readonly (readonly [number, number])[],
+  uvs: readonly (readonly [number, number])[],
+  lift: number,
+  s: Surface,
+): void {
+  const [p0, p1, p2] = points;
+  if (!p0 || !p1 || !p2) return;
+  // The normal's height of (p1 - p0) x (p2 - p0), with y up: positive when
+  // the points run counter-clockwise seen from above.
+  const up =
+    (p1[1] - p0[1]) * (p2[0] - p0[0]) - (p1[0] - p0[0]) * (p2[1] - p0[1]);
+  const order = up > 0 ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2];
+  for (const i of order) {
+    const p = points[i];
+    const uv = uvs[i];
+    if (p && uv) b.vertex([p[0], lift, p[1]], [0, 1, 0], uv[0], uv[1], s);
+  }
+}
+
+/**
+ * The hazard ring (M3 C24): a black band `length` wide inside the outer
+ * diameter `width`, round the decal's centre, and over it, one
+ * `DECAL_LIFT` higher, the chevrons' yellow stripes. The band is cut into
+ * near-square pieces round the ring, each showing one repeat of the
+ * chevron tile (`CHEVRON_WINDOW`), so the stripes run on round the ring;
+ * the black shows through their gaps. The black samples one point of the
+ * solid tile, as a stencil's pixels do.
+ */
+function ring(b: Builder, d: Decal): void {
+  const cx = d.x * CELL;
+  const cz = d.y * CELL;
+  const outer = d.width / 2;
+  const inner = Math.max(0, outer - d.length);
+  const n = Math.max(12, Math.round((Math.PI * (outer + inner)) / d.length));
+  const tiles = DECAL_TILES.chevrons;
+  const stripes = tileWindow(
+    tiles[d.variant % tiles.length] ?? tiles[0] ?? 0,
+    CHEVRON_WINDOW.from,
+    CHEVRON_WINDOW.to,
+  );
+  const solid = tileRect(DECAL_TILES.solid[0] ?? 15);
+  const dot: [number, number] = [
+    (solid.u0 + solid.u1) / 2,
+    (solid.v0 + solid.v1) / 2,
+  ];
+  const base: Surface = {
+    layer: LAYER.decal,
+    tint: DECAL_TINT.ringBase,
+    flag: FLAG.decal,
+  };
+  const top = surfaceOf(d);
+  const at = (r: number, t: number): [number, number] => [
+    cx + r * Math.cos(t),
+    cz + r * Math.sin(t),
+  ];
+  for (let i = 0; i < n; i++) {
+    const t0 = (2 * Math.PI * i) / n;
+    const t1 = (2 * Math.PI * (i + 1)) / n;
+    const points = [at(inner, t0), at(inner, t1), at(outer, t1), at(outer, t0)];
+    flatPiece(b, points, [dot, dot, dot, dot], DECAL_LIFT, base);
+    flatPiece(
+      b,
+      points,
+      [
+        [stripes.u0, stripes.v0],
+        [stripes.u1, stripes.v0],
+        [stripes.u1, stripes.v1],
+        [stripes.u0, stripes.v1],
+      ],
+      2 * DECAL_LIFT,
+      top,
+    );
+  }
+}
+
+/**
  * Builds every decal of `room.decals` into the static mesh (2.7 C20, C21):
  * wall and face decals through `kitAt`, floor decals straight into `b`.
  * Reads the room's decals and its condition (a room under construction
@@ -308,6 +405,10 @@ export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
   for (const d of room.decals) {
     if (d.kind === "stencil") {
       stencil(kitAt, b, d);
+      continue;
+    }
+    if (d.kind === "ring") {
+      ring(b, d);
       continue;
     }
     const tiles = DECAL_TILES[d.kind];

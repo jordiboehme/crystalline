@@ -37,6 +37,7 @@ import { buildInterior, buildInteriorMovers } from "./models/interior";
 import * as pixels from "./models/heroes/pixels";
 import { buildProp } from "./models/props";
 import { buildDecals } from "./models/decals";
+import { MARKS } from "./models/marks";
 import { galleryRoom } from "../world/canned";
 import type { Decal } from "../world/types";
 
@@ -137,7 +138,7 @@ describe("readable text set while the recipes build", () => {
   });
 });
 
-describe("no text on the console room's fittings (2.6e C20)", () => {
+describe("no text on the fittings but the airlock's word (2.6e C20, M3 C24)", () => {
   it("records the pixel-mark helpers, so the check below is not vacuous", () => {
     // Mutation caught: the wrappers not live, so a mark on a fitting
     // would pass unseen.
@@ -148,12 +149,16 @@ describe("no text on the console room's fittings (2.6e C20)", () => {
     expect(recorded.length).toBeGreaterThan(0);
   });
 
-  it("sets no text and lays no mark on any interior kind or variant, in any look", () => {
+  it("sets no text and lays no mark on any console room kind or variant, in any look", () => {
     // Mutation caught: a label or a pixel mark on a piece (a caption on
     // the scanner, a number on the inner doors, a figure on a console
     // panel's dial or on the rotor).
-    const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
-    expect(kinds.length).toBe(4);
+    const kinds: InteriorKind[] = [
+      "roundel-wall",
+      "inner-doors",
+      "scanner",
+      "console",
+    ];
     expect(Object.values(LOOKS).length).toBeGreaterThan(1);
     const pieces = consoleRoom().interior ?? [];
     expect(pieces.some((p) => p.kind === "console")).toBe(true);
@@ -167,6 +172,27 @@ describe("no text on the console room's fittings (2.6e C20)", () => {
     }
     expect(recorded).toEqual([]);
     expect(marked).toEqual([]);
+  });
+
+  it("sets the airlock's word on its outer hatch alone, and nothing on its other fittings (M3 C24)", () => {
+    // Mutation caught: a word of the hatch's own spelled past `MARKS`, a
+    // second mark on the hatch, or text on a beacon, the iris light or a
+    // suit locker.
+    const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
+    expect(kinds.length).toBe(8);
+    for (const look of Object.values(LOOKS))
+      for (const kind of kinds.slice(4))
+        for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
+          recorded.length = 0;
+          marked.length = 0;
+          buildInterior(fresh(), kind, v, look);
+          expect(recorded, kind).toEqual(
+            kind === "outer-hatch" ? [MARKS.airlockWord] : [],
+          );
+          expect(marked, kind).toEqual(
+            kind === "outer-hatch" ? ["pixelPanel"] : [],
+          );
+        }
   });
 });
 
@@ -192,9 +218,25 @@ describe("readable text set by the deck and bay stencils (2.7 C19)", () => {
             seed: 0,
             stencil: { deck: n, bay: n, letter, lines },
           });
+    // The airlock's floor stencil reads a word (M3 C24).
+    decals.push({
+      kind: "stencil",
+      on: "floor",
+      x: 2.5,
+      y: 2.5,
+      turn: 0,
+      along: 0,
+      h: 0,
+      width: 2.0,
+      length: 0.5,
+      variant: 0,
+      seed: 0,
+      word: "cycle",
+    });
     recorded.length = 0;
     const b = createBuilder();
     buildDecals((f) => createKit(b, f), b, { ...galleryRoom(), decals });
+    expect(recorded).toContain(MARKS.cycleWord);
     expect(recorded.length).toBeGreaterThan(0);
     const list = readable();
     for (const t of new Set(recorded))

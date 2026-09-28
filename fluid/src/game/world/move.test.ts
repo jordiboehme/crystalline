@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB, galleryRoom } from "./canned";
+import { airlockRoom } from "./airlock";
+import { CANNED_DOMAINS } from "./canned";
 import { consoleRoom, interiorFootprint } from "./consoleRoom";
 import {
   FIXTURE_DEPTH,
@@ -863,5 +865,50 @@ describe("the console room's console (2.6e C8)", () => {
     expect(p.x).toBeCloseTo(6);
     expect(p.z).toBeGreaterThanOrEqual(box.z1 + PLAYER_RADIUS - 1e-6);
     expect(p.z).toBeLessThan(box.z1 + PLAYER_RADIUS + 0.05);
+  });
+});
+
+describe("the airlock's fittings (M3 C24)", () => {
+  const r = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+  const bs = blockersFor(r);
+  const pieces = r.interior ?? [];
+  const boxOf = (kind: string) => {
+    const piece = pieces.find((p) => p.kind === kind);
+    if (piece === undefined) throw new Error(`no ${kind}`);
+    const box = interiorFootprint(piece);
+    if (box === null) throw new Error(`no ${kind} footprint`);
+    return box;
+  };
+
+  it("walks the player from the lift under the iris light to the outer hatch, and stops there", () => {
+    // Mutation caught: the iris light given a footprint (a box in the
+    // middle of the floor the player walks into), or the hatch none (the
+    // player walks into its wheel).
+    const hatch = boxOf("outer-hatch");
+    let p = spawnPlayer(r);
+    const x = p.x;
+    for (let i = 0; i < 200; i++)
+      p = stepPlayer(p, { ...idle, forward: 1, run: true }, r, bs);
+    expect(p.x).toBeCloseTo(x);
+    expect(p.z).toBeGreaterThanOrEqual(hatch.z1 + PLAYER_RADIUS - 1e-6);
+    expect(p.z).toBeLessThan(hatch.z1 + PLAYER_RADIUS + 0.05);
+  });
+
+  it("stops the player at a suit locker", () => {
+    // Mutation caught: the lockers left flush (no footprint), so the
+    // player walks into them to the wall.
+    const lockers = pieces.filter((p) => p.kind === "suit-locker");
+    expect(lockers.length).toBeGreaterThan(0);
+    const west = lockers
+      .map((l) => interiorFootprint(l))
+      .filter((b): b is Box => b !== null && b.x0 < 1);
+    expect(west.length).toBeGreaterThan(0);
+    const reach = Math.max(...west.map((b) => b.x1));
+    // Stand in the middle of the room facing west, and walk.
+    let p = { ...spawnPlayer(r), z: (r.depth * CELL) / 2, yaw: Math.PI / 2 };
+    for (let i = 0; i < 200; i++)
+      p = stepPlayer(p, { ...idle, forward: 1, run: true }, r, bs);
+    expect(p.x).toBeGreaterThanOrEqual(reach + PLAYER_RADIUS - 1e-6);
+    expect(p.x).toBeLessThan(reach + PLAYER_RADIUS + 0.05);
   });
 });

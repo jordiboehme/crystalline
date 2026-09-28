@@ -68,16 +68,28 @@ export const EXIT_HALF = 1.0;
 export const EXIT_X = 6;
 
 /**
- * Each fitting kind's footing and size (C5 to C8): `flush` on a wall (its
- * back on the wall at `d = 0`, out to `depth`) or `free` (centred on its
- * point), `width` along the wall or across, `depth` out from the wall or
- * front to back, `top` its height and `variants` how many it has. The
- * roundel walls and the inner doors run to 0.05 m under the 4 m ceiling.
+ * How a fitting stands (C5 to C8, M3 C24): `flush` on a wall (its back on
+ * the wall at `d = 0`, out to `depth`; the grid's wall stops the player),
+ * `backed` against a wall the same way but deep enough to walk into, so it
+ * collides over its whole box; `free` on the floor, centred on its point;
+ * `overhead` hung from the ceiling, centred on its point, clear over the
+ * player's head.
+ */
+export type InteriorFooting = "flush" | "backed" | "free" | "overhead";
+
+/**
+ * Each fitting kind's footing and size (C5 to C8, M3 C24): its footing
+ * (`InteriorFooting`), `width` along the wall or across, `depth` out from
+ * the wall or front to back, `top` its height and `variants` how many it
+ * has. The roundel walls and the inner doors run to 0.05 m under the
+ * console room's 4 m ceiling. The airlock's iris light runs up to the
+ * airlock's ceiling (`AIRLOCK_CEILING`, which `airlock.test.ts` holds this
+ * `top` to), and the two beacon variants blink in turn.
  */
 export const INTERIOR_CATALOGUE: Record<
   InteriorKind,
   {
-    footing: "flush" | "free";
+    footing: InteriorFooting;
     width: number;
     depth: number;
     top: number;
@@ -106,21 +118,59 @@ export const INTERIOR_CATALOGUE: Record<
     variants: 1,
   },
   console: { footing: "free", width: 2.4, depth: 2.4, top: 2.45, variants: 1 },
+  "outer-hatch": {
+    footing: "backed",
+    width: 4.2,
+    depth: 0.45,
+    top: 3.95,
+    variants: 1,
+  },
+  beacon: { footing: "flush", width: 0.3, depth: 0.32, top: 3.0, variants: 2 },
+  "iris-light": {
+    footing: "overhead",
+    width: 4.4,
+    depth: 4.4,
+    top: 8.5,
+    variants: 1,
+  },
+  "suit-locker": {
+    footing: "backed",
+    width: 0.9,
+    depth: 0.6,
+    top: 2.3,
+    variants: 1,
+  },
 };
 
 /**
  * The box a fitting makes the player walk round, in metres: the console's
  * `width` by `depth` centred on its point and turned with it (C8: the box
  * round the desk, so at the hexagon's corners the player stops a little
- * short), and null for a flush piece, which hangs on a wall the grid
- * already stops the player at.
+ * short); a backed piece's `width` by `depth` out from its wall point
+ * (M3 C24: the outer hatch, whose wheel stands out at arm's length, and a
+ * suit locker); and null for a flush piece, which hangs on a
+ * wall the grid already stops the player at, and for an overhead one,
+ * which hangs over the player's head.
  */
 export function interiorFootprint(p: InteriorPiece): Box | null {
   const entry = INTERIOR_CATALOGUE[p.kind];
-  if (entry.footing === "flush") return null;
   const hw = entry.width / 2;
-  const hd = entry.depth / 2;
-  return turnedBox(p.x, p.y, p.turn, { a0: -hw, a1: hw, d0: -hd, d1: hd });
+  switch (entry.footing) {
+    case "flush":
+    case "overhead":
+      return null;
+    case "backed":
+      return turnedBox(p.x, p.y, p.turn, {
+        a0: -hw,
+        a1: hw,
+        d0: 0,
+        d1: entry.depth,
+      });
+    case "free": {
+      const hd = entry.depth / 2;
+      return turnedBox(p.x, p.y, p.turn, { a0: -hw, a1: hw, d0: -hd, d1: hd });
+    }
+  }
 }
 
 /** The console room's light: one steady level for all four zones (C3). */

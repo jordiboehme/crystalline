@@ -1,5 +1,5 @@
 /**
- * The console room's fittings as models (2.6e C2): one mesh per fitting
+ * The hand-built rooms' fittings as models (2.6e C2, M3 C24): one mesh per fitting
  * kind, variant and look, built in code with the modelling kit like every
  * other model, and drawn instanced as a family of their own
  * (`interiorInstances` in `instances.ts`, keyed `interior:<kind>:<variant>`).
@@ -18,11 +18,12 @@
  *
  * The wall pieces (the roundel wall, the inner doors and the scanner) are
  * built in `walls.ts`, the console with its column's frame in
- * `console.ts`. The family's
+ * `console.ts`, the airlock's outer hatch, beacons, iris light and suit
+ * lockers in `airlock.ts`. The family's
  * test (`interiorModels.test.ts`) builds every kind and variant, places it
  * at every turn it can take and checks its envelope (`interiorHalf`), the
  * winding, that nothing glows in mid-air, that no part floats clear of the
- * floor or its wall, the triangle budget (C19) and that blinking parts
+ * floor, its wall or (hung from it) the ceiling, the triangle budget (C19) and that blinking parts
  * appear exactly in the kinds whose bank blinks.
  */
 
@@ -32,6 +33,7 @@ import { createBuilder, type MeshData } from "../../geometry";
 import { createKit, frameAt } from "../../kit";
 import type { Look } from "../../looks";
 import { surfaces, type KitAt, type Mover } from "../common";
+import { AIRLOCK_RECIPES } from "./airlock";
 import type { InteriorRecipe } from "./common";
 import { CONSOLE_RECIPES, rotorMover } from "./console";
 import { WALL_RECIPES } from "./walls";
@@ -40,6 +42,7 @@ import { WALL_RECIPES } from "./walls";
 const RECIPES = {
   ...WALL_RECIPES,
   ...CONSOLE_RECIPES,
+  ...AIRLOCK_RECIPES,
 } satisfies Record<InteriorKind, InteriorRecipe>;
 
 /**

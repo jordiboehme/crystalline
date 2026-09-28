@@ -1,7 +1,8 @@
 /**
- * What every console room fitting's recipe shares (2.6e C2, C4): the shape
- * of a recipe, each kind's blink bank, the sizes a recipe reads and the
- * room's fixed colours.
+ * What every hand-built room fitting's recipe shares (2.6e C2, C4, M3
+ * C24): the shape of a recipe, each kind's blink bank, the sizes a recipe
+ * reads and the console room's fixed colours, which the airlock's shell
+ * shares.
  *
  * A fitting's mesh is built like a hero's: once per kind, variant and look,
  * at the origin in `frameAt([0, 0, 0], 0)`, and drawn instanced, turned by
@@ -54,14 +55,20 @@ export type InteriorRecipe = (r: {
  * Each fitting kind's blink bank: the roundel walls' glowing roundels
  * breathe softly (the `soft` bank, 2.6e C26: never far under their peak,
  * which stays under the bloom threshold), the console's small lights
- * twinkle out of step, and the inner doors and the scanner have no
- * blinking light.
+ * twinkle out of step, the airlock's two beacons (M3 C24) take turns on
+ * the `swap` bank (one in groups 0 to 3, the other in 4 to 7, each half
+ * `SWAP_TICS` long), and the inner doors, the scanner, the outer hatch,
+ * the iris light and the suit lockers have no blinking light.
  */
 export const INTERIOR_BANK = {
   "roundel-wall": "soft",
   "inner-doors": "steady",
   scanner: "steady",
   console: "twinkle",
+  "outer-hatch": "steady",
+  beacon: "swap",
+  "iris-light": "steady",
+  "suit-locker": "steady",
 } as const satisfies Record<InteriorKind, BlinkBank>;
 
 /**
@@ -101,8 +108,8 @@ export const CONSOLE_SHELL: { wall: Rgb; floor: Rgb; ceiling: Rgb } = {
 /**
  * A fitting's half width and its depth range in the recipe's local terms:
  * `a` from `-hw` to `hw`; `d` from `d0` to `d1`, which is `-depth / 2` to
- * `depth / 2` for the free console and `0` to `depth` for a flush piece;
- * and its `top`. Read the sizes from here, never repeat them in a recipe.
+ * `depth / 2` for a free or overhead piece (the console, the iris light)
+ * and `0` to `depth` for a flush or backed one; and its `top`. Read the sizes from here, never repeat them in a recipe.
  */
 export function interiorHalf(kind: InteriorKind): {
   hw: number;
@@ -111,7 +118,7 @@ export function interiorHalf(kind: InteriorKind): {
   top: number;
 } {
   const entry = INTERIOR_CATALOGUE[kind];
-  const free = entry.footing === "free";
+  const free = entry.footing === "free" || entry.footing === "overhead";
   return {
     hw: entry.width / 2,
     d0: free ? -entry.depth / 2 : 0,

@@ -7,42 +7,45 @@
   "title": "AIRLOCK",
   "archetype": "bridge",
   "condition": "clean",
-  "width": 8,
-  "depth": 8,
+  "width": 11,
+  "depth": 11,
   "grid": [
-    "  ....  ",
-    " ...... ",
-    "........",
-    "........",
-    "........",
-    "........",
-    " ...... ",
-    "  ....  "
+    "   .....   ",
+    "  .......  ",
+    " ......... ",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    " ......... ",
+    "  .......  ",
+    "   .....   "
   ],
   "hall": {
     "x0": 0,
     "y0": 0,
-    "x1": 8,
-    "y1": 8
+    "x1": 11,
+    "y1": 11
   },
   "bays": [],
   "corridor": null,
   "entrance": {
-    "x": 3,
-    "y": 7
+    "x": 5,
+    "y": 10
   },
-  "ceiling": 4.5,
+  "ceiling": 8.5,
   "spawn": {
-    "x": 3,
-    "y": 7,
+    "x": 5,
+    "y": 10,
     "yaw": 0
   },
   "fixtures": [
     {
       "kind": "lift",
       "slot": {
-        "x": 3,
-        "y": 7,
+        "x": 5,
+        "y": 10,
         "side": "s"
       },
       "stops": [
@@ -98,7 +101,7 @@
     {
       "kind": "screen",
       "slot": {
-        "x": 3,
+        "x": 5,
         "y": 0,
         "side": "n"
       },
@@ -113,7 +116,8 @@
       "keys": [
         4
       ],
-      "seed": 7385514928632225
+      "seed": 7385514928632225,
+      "large": true
     }
   ],
   "decor": [],
@@ -127,43 +131,188 @@
     "bayWalls": [],
     "corridorWalls": 0
   },
-  "decals": [],
+  "decals": [
+    {
+      "kind": "ring",
+      "on": "floor",
+      "x": 5.5,
+      "y": 5.5,
+      "turn": 0,
+      "along": 0,
+      "h": 0,
+      "width": 6.4,
+      "length": 0.5,
+      "variant": 0,
+      "seed": 1207436677692922
+    },
+    {
+      "kind": "stencil",
+      "on": "floor",
+      "x": 5.5,
+      "y": 6.25,
+      "turn": 0,
+      "along": 0,
+      "h": 0,
+      "width": 2.4,
+      "length": 0.6,
+      "variant": 0,
+      "seed": 422120068889600,
+      "word": "cycle"
+    },
+    {
+      "kind": "stencil",
+      "on": "floor",
+      "x": 5.5,
+      "y": 4.75,
+      "turn": 2,
+      "along": 0,
+      "h": 0,
+      "width": 2.4,
+      "length": 0.6,
+      "variant": 0,
+      "seed": 5145455634037891,
+      "word": "cycle"
+    }
+  ],
+  "interior": [
+    {
+      "kind": "outer-hatch",
+      "variant": 0,
+      "x": 5.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 4199580554318644
+    },
+    {
+      "kind": "beacon",
+      "variant": 0,
+      "x": 4.15,
+      "y": 0,
+      "turn": 2,
+      "seed": 2881467650190628
+    },
+    {
+      "kind": "beacon",
+      "variant": 1,
+      "x": 6.85,
+      "y": 0,
+      "turn": 2,
+      "seed": 7267751642459437
+    },
+    {
+      "kind": "iris-light",
+      "variant": 0,
+      "x": 5.5,
+      "y": 5.5,
+      "turn": 0,
+      "seed": 5237682273928173
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 4.26,
+      "turn": 1,
+      "seed": 7627570786110180
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 4.74,
+      "turn": 1,
+      "seed": 696307223332463
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 5.26,
+      "turn": 1,
+      "seed": 885289084114445
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 5.74,
+      "turn": 1,
+      "seed": 1428880790875797
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 6.26,
+      "turn": 1,
+      "seed": 6995852425568874
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 0,
+      "y": 6.74,
+      "turn": 1,
+      "seed": 5102410860368815
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 4.26,
+      "turn": 3,
+      "seed": 7588402142566661
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 4.74,
+      "turn": 3,
+      "seed": 7479415388158976
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 5.26,
+      "turn": 3,
+      "seed": 8788399733931082
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 5.74,
+      "turn": 3,
+      "seed": 1163067164193636
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 6.26,
+      "turn": 3,
+      "seed": 1663104896819153
+    },
+    {
+      "kind": "suit-locker",
+      "variant": 0,
+      "x": 11,
+      "y": 6.74,
+      "turn": 3,
+      "seed": 2208777274222565
+    }
+  ],
   "lights": [
     {
       "x0": 0,
       "y0": 0,
-      "x1": 4,
-      "y1": 4,
+      "x1": 11,
+      "y1": 11,
       "level": 208,
       "special": "steady",
       "seed": 3988596014013250
-    },
-    {
-      "x0": 4,
-      "y0": 0,
-      "x1": 8,
-      "y1": 4,
-      "level": 208,
-      "special": "steady",
-      "seed": 1590520971745498
-    },
-    {
-      "x0": 0,
-      "y0": 4,
-      "x1": 4,
-      "y1": 8,
-      "level": 208,
-      "special": "steady",
-      "seed": 8649110178527689
-    },
-    {
-      "x0": 4,
-      "y0": 4,
-      "x1": 8,
-      "y1": 8,
-      "level": 208,
-      "special": "steady",
-      "seed": 2980712148659083
     }
   ],
   "dropped": 0,

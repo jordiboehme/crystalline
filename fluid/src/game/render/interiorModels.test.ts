@@ -1,7 +1,7 @@
 /**
- * The console room's fittings as models (2.6e C2, C19): every kind and
- * variant, built at the origin and placed as the GPU places an instance at
- * every turn it can take, against the family's rules. The console's rotor,
+ * The hand-built rooms' fittings as models (2.6e C2, C19, M3 C24): every
+ * kind and variant, built at the origin and placed as the GPU places an
+ * instance at every turn it can take, against the family's rules. The console's rotor,
  * built as a mover outside the instanced mesh, is recorded on its own and
  * held to the same rules at its rest height.
  */
@@ -52,16 +52,27 @@ const FREE_AT = { x: 3, y: 3 } as const;
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 
 /**
- * Each kind's triangle budget (C19): a wall of roundels and the scanner
- * under 1500, the inner doors under 3000, the console with its column's
- * frame under 4000.
+ * Each kind's triangle budget (C19, M3 C24): a wall of roundels, the
+ * scanner, a beacon and a suit locker under 1500, the inner doors under
+ * 3000, the console with its column's frame, the outer hatch and the iris
+ * light under 4000.
  */
 const BUDGET = {
   "roundel-wall": 1500,
   "inner-doors": 3000,
   scanner: 1500,
   console: 4000,
+  "outer-hatch": 4000,
+  beacon: 1500,
+  "iris-light": 4000,
+  "suit-locker": 1500,
 } as const satisfies Record<InteriorKind, number>;
+
+/** Whether a kind stands against a wall: flush or backed (M3 C24). */
+const onWall = (kind: InteriorKind): boolean => {
+  const footing = INTERIOR_CATALOGUE[kind].footing;
+  return footing === "flush" || footing === "backed";
+};
 
 /** The rotor's triangle budget (C19): the console's one mover, under 1000. */
 const ROTOR_BUDGET = 1000;
@@ -85,11 +96,12 @@ function buildRecorded(
 }
 
 /**
- * The turns a kind can take: the four sides for a flush piece, turn 0 for
- * the console, which stands only at the room's centre.
+ * The turns a kind can take: the four sides for a piece on a wall, turn 0
+ * for the console and the iris light, which stand only at their room's
+ * centre.
  */
 const turnsOf = (kind: InteriorKind): number[] =>
-  INTERIOR_CATALOGUE[kind].footing === "flush" ? [0, 1, 2, 3] : [0];
+  onWall(kind) ? [0, 1, 2, 3] : [0];
 
 /**
  * The fitting at turn `t`: centred on `FREE_AT` for the console, on the
@@ -101,7 +113,7 @@ function pieceAt(
   variant: number,
   t: number,
 ): { piece: InteriorPiece; at: V3; edge: WallSlot | null } {
-  if (INTERIOR_CATALOGUE[kind].footing === "free") {
+  if (!onWall(kind)) {
     return {
       piece: { kind, variant, x: FREE_AT.x, y: FREE_AT.y, turn: t, seed: 0 },
       at: [FREE_AT.x * CELL, 0, FREE_AT.y * CELL],
@@ -121,7 +133,7 @@ function pieceAt(
 const triangles: string[] = [];
 
 describe("interior models (2.6e C2)", () => {
-  it("has the four kinds", () => {
+  it("has the eight kinds", () => {
     // Mutation caught: a kind dropped from the catalogue, which every loop
     // below would then skip.
     expect(KINDS).toEqual([
@@ -129,6 +141,10 @@ describe("interior models (2.6e C2)", () => {
       "inner-doors",
       "scanner",
       "console",
+      "outer-hatch",
+      "beacon",
+      "iris-light",
+      "suit-locker",
     ]);
   });
 
@@ -148,10 +164,11 @@ describe("interior models (2.6e C2)", () => {
 
       it(`${kind} variant ${String(v)} stands on the floor or its wall`, () => {
         // Mutation caught: a part hung in mid-air, clear of the floor, the
-        // wall and every other part.
+        // wall, the ceiling (for an overhead piece) and every other part.
         expect(parts.length).toBeGreaterThan(0);
-        const wall = entry.footing === "flush" ? frameAt([0, 0, 0], 0) : null;
-        expect(looseParts(parts, wall)).toEqual([]);
+        const wall = onWall(kind) ? frameAt([0, 0, 0], 0) : null;
+        const ceiling = entry.footing === "overhead" ? entry.top : Infinity;
+        expect(looseParts(parts, wall, 0, ceiling)).toEqual([]);
       });
 
       it(`${kind} variant ${String(v)} stays under its triangle budget (C19)`, () => {
@@ -207,7 +224,7 @@ describe("interior models (2.6e C2)", () => {
     // with no light for its bank to move. Checked per kind, not per
     // variant: a wall of roundels without a glowing one is a variant of a
     // blinking kind (C5).
-    expect(KINDS.length).toBe(4);
+    expect(KINDS.length).toBe(8);
     for (const kind of KINDS) {
       const variants = Array.from(
         { length: INTERIOR_CATALOGUE[kind].variants },
@@ -220,11 +237,28 @@ describe("interior models (2.6e C2)", () => {
     }
   });
 
+  it("keeps each beacon lit at its low: a steady base and a dome on its own half of the swap bank (M3 C24)", () => {
+    // Mutation caught: a beacon with no steady light (fully dark in its
+    // low half, the lights lesson), or both beacons in one group, so they
+    // blink together instead of in turn.
+    expect(INTERIOR_BANK.beacon).toBe("swap");
+    const groups = [0, 1].map((v) => {
+      const parts = buildRecorded("beacon", v).parts;
+      expect(parts.some((p) => p.flag === FLAG.signal)).toBe(true);
+      const blinking = parts.filter((p) => p.flag >= FLAG.blink);
+      expect(blinking.length).toBeGreaterThan(0);
+      return new Set(blinking.map((p) => p.flag - FLAG.blink));
+    });
+    const [first, second] = groups;
+    expect([...(first ?? [])].every((g) => g < 4)).toBe(true);
+    expect([...(second ?? [])].every((g) => g >= 4)).toBe(true);
+  });
+
   it("keeps every fitting's colours in every look (C4)", () => {
     // Mutation caught: a fitting painted with a look's colour (`s.body`,
     // `s.panel`, `s.dark`), which would turn the room's white beige in one
     // look and grey in another, or the console's panels with it.
-    expect(KINDS.length).toBe(4);
+    expect(KINDS.length).toBe(8);
     expect(Object.values(LOOKS).length).toBeGreaterThan(1);
     for (const kind of KINDS)
       for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {

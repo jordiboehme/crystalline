@@ -28,12 +28,15 @@
  * surface the curio stands on (`Curio.h`), not the floor, and its slot is
  * its kind's blink bank (`CURIO_BANK`, C16).
  *
- * The console room's fittings are the fourth family (2.6e C2), in a key
- * space of their own (`interiorKey`, `interior:<kind>:<variant>`), built
- * once at the origin by `buildInteriorMesh` (`models/interior/index.ts`).
- * An instance stands on the floor, and its slot is its kind's blink bank
- * (`INTERIOR_BANK`), which the console's small lights and the roundels'
- * glow pulse with. Only a room with `interior` has any.
+ * The hand-built rooms' fittings (the console room's, 2.6e C2; the
+ * airlock's, M3 C24) are the fourth family, in a key space of their own
+ * (`interiorKey`, `interior:<kind>:<variant>`), built once at the origin
+ * by `buildInteriorMesh` (`models/interior/index.ts`). An instance stands
+ * at floor level (a fitting hung from the ceiling, the airlock's iris
+ * light, is built at its own height in its mesh), and its slot is its
+ * kind's blink bank (`INTERIOR_BANK`), which the console's small lights,
+ * the roundels' glow and the airlock's beacons pulse with. Only a room
+ * with `interior` has any.
  */
 
 import type {
@@ -275,9 +278,9 @@ export function curioInstances(room: RoomSpec): CurioGroup[] {
 }
 
 /**
- * The console room's fittings as instance groups, one per distinct kind
- * and variant, sorted by key. Each instance is `x * CELL`, 0 (every
- * fitting stands on the floor), `y * CELL`, the turn and its kind's blink
+ * The hand-built rooms' fittings as instance groups, one per distinct
+ * kind and variant, sorted by key. Each instance is `x * CELL`, 0 (every
+ * fitting's mesh starts at floor level), `y * CELL`, the turn and its kind's blink
  * bank slot (`bankSlot(INTERIOR_BANK[kind])`). A room without `interior`
  * (every generated room) gives no groups. A pure function: the same room
  * gives equal arrays.

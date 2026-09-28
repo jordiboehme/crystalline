@@ -12,10 +12,11 @@
  * for byte, which is what the golden tests pin and what lets a live change be
  * diffed room against room.
  *
- * One hand-built room, the console room (`consoleRoom.ts`), also carries
- * `interior`: its fittings, a family of their own (`InteriorPiece`). No
- * generated room has the key, and an absent key is not written by
- * `JSON.stringify`, so the goldens do not see it.
+ * Two hand-built rooms, the console room (`consoleRoom.ts`) and the
+ * airlock (`airlock.ts`), also carry `interior`: their fittings, a family
+ * of their own (`InteriorPiece`). No generated room has the key, and an
+ * absent key is not written by `JSON.stringify`, so the goldens do not see
+ * it.
  *
  * The station's other spaces (a deck's hub, the airlock, a hangar) carry
  * `space`, the kind of space they are; an engram room never has the key,
@@ -301,6 +302,12 @@ export type Fixture =
       /** The indices of the lines drawn with the key pictogram. */
       keys: number[];
       seed: number;
+      /**
+       * The airlock's directory (M3 C24): a board `SCREEN_SCALE` times the
+       * wall screen's size, hung high over the outer hatch. Absent on every
+       * other screen, so their goldens carry no such key.
+       */
+      large?: true;
     }
   | {
       kind: "exit";
@@ -522,21 +529,32 @@ export interface Hero {
 }
 
 /**
- * The fittings of the console room (2.6e C2), named by their shape: a wall
- * of roundels, the inner doors, the scanner and the console. They are not
- * heroes: no pool draws them and no generated room carries them.
+ * The fittings of the hand-built rooms, named by their shape: the console
+ * room's (2.6e C2) wall of roundels, inner doors, scanner and console, and
+ * the airlock's (M3 C24) outer hatch, the amber beacons beside it, the
+ * iris light in its ceiling and its suit lockers. They are not heroes: no
+ * pool draws them and no generated room carries them.
  */
 export type InteriorKind =
-  "roundel-wall" | "inner-doors" | "scanner" | "console";
+  | "roundel-wall"
+  | "inner-doors"
+  | "scanner"
+  | "console"
+  | "outer-hatch"
+  | "beacon"
+  | "iris-light"
+  | "suit-locker";
 
 /**
- * One fitting of the console room, with a hero's conventions: `x` and `y`
- * in `Decor`'s continuous cell units, the centre of its box for the free
- * console and its wall point for a flush wall piece (`wallAnchor` in
- * `sites.ts`; the inner doors, two edges wide, at the point between their
- * two edges); `turn` 0-3 quarter turns clockwise from facing north, a wall
- * piece taking its wall's `turnForSide`; `variant` indexes the kind's
- * variants in `INTERIOR_CATALOGUE` (`consoleRoom.ts`); `seed` its own seed.
+ * One fitting of a hand-built room, with a hero's conventions: `x` and `y`
+ * in `Decor`'s continuous cell units, the centre of its box for a free or
+ * overhead piece (the console, the iris light) and its wall point for a
+ * piece on a wall (`wallAnchor` in `sites.ts`; the inner doors, two edges
+ * wide, at the point between their two edges; a beacon or a locker moved
+ * along its wall from an edge's point); `turn` 0-3 quarter turns clockwise
+ * from facing north, a wall piece taking its wall's `turnForSide`;
+ * `variant` indexes the kind's variants in `INTERIOR_CATALOGUE`
+ * (`consoleRoom.ts`); `seed` its own seed.
  */
 export interface InteriorPiece {
   kind: InteriorKind;
@@ -674,9 +692,18 @@ export interface Finish {
   corridorWalls: number;
 }
 
-/** The decal kinds (2.7 C14). */
+/**
+ * The decal kinds (2.7 C14), and the airlock's hazard `ring` round its
+ * floor's centre (M3 C24), which no generated room lays.
+ */
 export type DecalKind =
-  "chevrons" | "arrow" | "grime" | "streak" | "rust" | "stencil";
+  "chevrons" | "arrow" | "grime" | "streak" | "rust" | "stencil" | "ring";
+
+/**
+ * The words a floor stencil may read instead of a bay (M3 C24): `cycle`,
+ * the airlock's floor stencil inside its hazard ring.
+ */
+export type StencilWord = "cycle";
 
 /** What a decal lies on: a wall edge, the floor, or a large crate's face. */
 export type DecalOn = "wall" | "floor" | "face";
@@ -702,7 +729,14 @@ export interface StencilText {
  * turn). `along` moves it along a wall or face, in metres, in its frame's
  * `along` direction. `h` its bottom edge in metres (0 on the floor).
  * `width` across and `length` up (wall, face) or along `turn` (floor), in
- * metres. `variant` picks the kind's tile. `stencil` only on a stencil.
+ * metres. `variant` picks the kind's tile. `stencil` only on a stencil
+ * that reads a deck and a bay, `word` only on one that reads a word (M3
+ * C24): a stencil carries one or the other.
+ *
+ * A `ring` (M3 C24) lies on the floor centred on `x`, `y`: `width` its
+ * outer diameter and `length` the width of its band, in metres, drawn in
+ * the chevrons' hazard stripes all the way round; `turn`, `along` and `h`
+ * are 0.
  */
 export interface Decal {
   kind: DecalKind;
@@ -717,6 +751,7 @@ export interface Decal {
   variant: number;
   seed: number;
   stencil?: StencilText;
+  word?: StencilWord;
 }
 
 /**
@@ -812,13 +847,15 @@ export interface RoomSpec {
    * arrows, grime, streaks, rust and the deck and bay stencils, placed
    * after the curios as pure data, never over text. Written after the
    * finish and before the lights, the goldens' key order. A hand-built
-   * room has none.
+   * room lays its own or none: the airlock its hazard ring and its two
+   * `CYCLE` stencils, the others none.
    */
   decals: Decal[];
   /**
-   * The console room's fittings, 2.6e C2; absent on every generated room.
-   * Drawn instanced as their own family (`interiorInstances`), and the
-   * free-standing ones collide (`interiorFootprint`).
+   * The fittings of a hand-built room (the console room's, 2.6e C2; the
+   * airlock's, M3 C24); absent on every generated room. Drawn instanced
+   * as their own family (`interiorInstances`), and the free-standing and
+   * wall-backed ones collide (`interiorFootprint`).
    */
   interior?: InteriorPiece[];
   lights: LightZone[];

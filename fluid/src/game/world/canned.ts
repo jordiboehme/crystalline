@@ -1669,7 +1669,7 @@ function variantsHallCouncil(hall: Rect, seed: number): Decor[] {
  * whose counts `canned.test.ts` checks this list against).
  */
 const VARIANTS_HALL_DECAL_KINDS: readonly {
-  kind: Exclude<DecalKind, "stencil">;
+  kind: Exclude<DecalKind, "stencil" | "ring">;
   variants: number;
 }[] = [
   { kind: "chevrons", variants: 2 },
@@ -1684,7 +1684,7 @@ const VARIANTS_HALL_DECAL_KINDS: readonly {
  * and `length` up the wall or along the floor decal's turn.
  */
 const VARIANTS_HALL_DECAL_SIZE: Record<
-  Exclude<DecalKind, "stencil">,
+  Exclude<DecalKind, "stencil" | "ring">,
   { width: number; length: number }
 > = {
   chevrons: { width: 1.2, length: 0.3 },
@@ -1774,7 +1774,11 @@ function variantsHallDecals(
   const rows: {
     y: number;
     gap: number;
-    items: { kind: DecalKind; variant: number; turn: number }[];
+    items: {
+      kind: Exclude<DecalKind, "ring">;
+      variant: number;
+      turn: number;
+    }[];
   }[] = [
     {
       y: ent.y - 2.5,

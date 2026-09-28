@@ -38,9 +38,10 @@
  * grid's edge, the same rule `wallSlots` uses for the walls fixtures stand
  * against. The uv of every shell quad is its world position in metres times
  * its wall pattern's uv scale, so the seams run unbroken across cells of
- * the same pattern. A room with `interior` (the console room, 2.6e C4)
- * draws its shell in `CONSOLE_SHELL`'s fixed tints on pattern 0's layer,
- * whatever the look; its flush fittings cover the walls. Every other
+ * the same pattern. A room with `interior` (the console room, 2.6e C4,
+ * and the airlock, M3 C24) draws its shell in `CONSOLE_SHELL`'s fixed
+ * tints on pattern 0's layer, whatever the look, with no accent stripe;
+ * the console room's flush fittings cover its walls. Every other
  * room's walls, lintels and stripe read their cell's own wall pattern
  * (`wallPatternOf`, `WALL_PATTERN_LOOK`, 2.7 C11): the hall's, a bay's or
  * the corridor's, so a bay or the corridor always reads as a space of its
@@ -590,15 +591,17 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  * (`wallPatternOf`, `WALL_PATTERN_LOOK`, 2.7 C11): the hall's, a bay's or
  * the corridor's, whichever rectangle the cell falls in, pattern 0 always
  * on a room with fittings. Lamps and scaffolding share the hall's ceiling
- * height, which bays and the corridor share too.
+ * height, which bays and the corridor share too. Every light zone hangs a
+ * lamp panel, except in the airlock (M3 C24), which is lit by the iris
+ * light in its ceiling instead.
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const b = createBuilder();
   const p = look.palette;
   const H = room.ceiling;
   const doorways = doorwayColumns(room);
-  // A room with fittings (the console room) keeps its own colours and
-  // pattern 0 in every look (2.6e C4); every other room takes the look's
+  // A room with fittings (the console room, the airlock) keeps its own
+  // colours and pattern 0 in every look (2.6e C4); every other room takes the look's
   // colours and each cell's own wall pattern (2.7 C11).
   const fitted = room.interior !== undefined;
   const wallTint = fitted ? CONSOLE_SHELL.wall : p.panel;
@@ -708,8 +711,9 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
     }
   }
 
-  // One lamp panel per light zone, just under the ceiling.
-  for (const l of lampBoxes(room))
+  // One lamp panel per light zone, just under the ceiling; none in the
+  // airlock, whose light is its iris light (M3 C24).
+  for (const l of room.space === "airlock" ? [] : lampBoxes(room))
     flatQuad(b, l.x0, l.x1, l.z0, l.z1, H - LAMP_DROP, false, {
       layer: LAYER.ceiling,
       tint: p.lamp,

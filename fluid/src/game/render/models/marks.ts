@@ -21,12 +21,15 @@
  * (`heroes/pixels.ts`), never a picture of its own.
  *
  * The deck and bay stencils' words, numerals and letters (2.7 C19) live
- * here too, and `stencilMarks` sets a stencil from them, mark by mark.
+ * here too, and `stencilMarks` sets a stencil from them, mark by mark; so
+ * do the airlock's words (M3 C24): its hatch's stencil and its floor's
+ * `CYCLE`, which `wordMarks` sets.
  *
  * Comments here name props by their shape, never an original.
  */
 
-import type { StencilText } from "../../world/types";
+import { LIFT_WORDS } from "../../world/lifts";
+import type { StencilText, StencilWord } from "../../world/types";
 import type { Rgb } from "../looks";
 
 /** Every approved string of 2.6d and 2.6f, by the prop that draws it. */
@@ -98,7 +101,25 @@ export const MARKS = {
   numerals: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
   /** The overflow bays' letters after the bay's number, bay 1 to 4: `bayLetters[0]` is "A". */
   bayLetters: ["A", "B", "C", "D"],
+
+  /** The airlock's outer hatch's stencil (M3 C24): the lift's own word for the place. */
+  airlockWord: LIFT_WORDS.airlock,
+  /** The airlock's floor stencils inside its hazard ring (M3 C24). */
+  cycleWord: "CYCLE",
 } as const;
+
+/**
+ * A word stencil's marks (M3 C24): one line of one mark, the word's own
+ * literal from `MARKS`, so a floor stencil that reads a word hands
+ * `textRows` an approved string as a deck and bay stencil does.
+ */
+export function wordMarks(word: StencilWord): readonly (readonly string[])[] {
+  const marks = { cycle: MARKS.cycleWord } as const satisfies Record<
+    StencilWord,
+    string
+  >;
+  return [[marks[word]]];
+}
 
 /**
  * A stencil's marks (2.7 C19), line by line, each line's marks in reading

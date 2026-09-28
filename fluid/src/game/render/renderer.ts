@@ -28,9 +28,9 @@
  * (`hero:<kind>:<variant>`), their slot their kind's blink bank. Curios
  * are the third family, in a key space of their own
  * (`curio:<kind>:<variant>`), each instance at the height of the surface
- * it stands on and its slot its kind's blink bank. The console room's
- * fittings are the fourth (`interior:<kind>:<variant>`), standing on the
- * floor, their slot their kind's blink bank. The group's family picks the
+ * it stands on and its slot its kind's blink bank. The hand-built rooms'
+ * fittings are the fourth (`interior:<kind>:<variant>`), placed at floor
+ * level, their slot their kind's blink bank. The group's family picks the
  * builder (`buildGroupMesh`). Each kind and variant the room
  * needs is built once as its own mesh in the look's colours and kept in a
  * cache keyed by the group's key; the cache is cleared when the look's id

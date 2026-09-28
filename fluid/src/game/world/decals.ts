@@ -261,6 +261,7 @@ const TILES = {
   streak: 2,
   rust: 2,
   stencil: 1,
+  ring: 2,
 } satisfies Record<DecalKind, number>;
 
 /** The sort order of the kinds (step 8). */
@@ -271,6 +272,7 @@ const KIND_ORDER = {
   streak: 3,
   rust: 4,
   grime: 5,
+  ring: 6,
 } satisfies Record<DecalKind, number>;
 
 /** A condition's rank, 0 clean to 3 derelict: a streak's length grows with it. */

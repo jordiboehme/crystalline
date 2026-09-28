@@ -19,7 +19,9 @@
  *   around glass in the text layer's own background colour, with the
  *   `screen:<i>` text quad (kind `station`, `SCREEN_LINES` rows) as tall
  *   as the glass less a 0.02 m margin and centred on it, and one green
- *   status lamp under it.
+ *   status lamp under it. A screen with `large` (the airlock's directory,
+ *   M3 C24) is the same screen `SCREEN_SCALE` times the size, its bezel
+ *   from `BOARD_BOTTOM` up, over the airlock's outer hatch.
  * - The **exit** is the sliding door (`slidingDoor`) with its label drawn
  *   under `exit:<i>` and a small plate on its west jamb showing the
  *   `door` pictogram; its leaves, lamp and sparks keep the door keys.
@@ -214,15 +216,86 @@ const BEZEL_D = 0.06;
 const BEZEL_RIM = 0.04;
 
 /**
- * The wall screen's glass inside the bezel: `half` its half width along
- * the wall, `h0` to `h1` its height. The text quad spans it less
+ * How many times the wall screen's size the airlock's directory board is
+ * (a screen with `large`, M3 C24): its bezel, glass, text quad and status
+ * lamp all scale by it, so it keeps the screen's proportions.
+ */
+export const SCREEN_SCALE = 4;
+
+/**
+ * Where the directory board's bezel starts, in metres up (M3 C24): over
+ * the airlock's outer hatch, whose frame tops out below it.
+ */
+export const BOARD_BOTTOM = 4.0;
+
+/**
+ * One screen's measures: the bezel's half width, bottom and top, its
+ * depth and rim, and the status lamp's centre along, height and size.
+ */
+interface ScreenShape {
+  half: number;
+  bottom: number;
+  top: number;
+  depth: number;
+  rim: number;
+  lampA: number;
+  lampH: number;
+  lampSize: number;
+}
+
+/** The status lamp under the screen: its centre along, height and size. */
+const LAMP_A = 0.7;
+const LAMP_H = 1.33;
+const LAMP_SIZE = 0.04;
+
+/** The wall screen's measures. */
+const WALL_SCREEN: ScreenShape = {
+  half: SCREEN_HALF,
+  bottom: SCREEN_BOTTOM,
+  top: SCREEN_TOP,
+  depth: BEZEL_D,
+  rim: BEZEL_RIM,
+  lampA: LAMP_A,
+  lampH: LAMP_H,
+  lampSize: LAMP_SIZE,
+};
+
+/**
+ * The directory board's measures: the wall screen's scaled by
+ * `SCREEN_SCALE` about its bottom edge and lifted to `BOARD_BOTTOM`.
+ */
+const BOARD: ScreenShape = {
+  half: SCREEN_HALF * SCREEN_SCALE,
+  bottom: BOARD_BOTTOM,
+  top: BOARD_BOTTOM + (SCREEN_TOP - SCREEN_BOTTOM) * SCREEN_SCALE,
+  depth: BEZEL_D * SCREEN_SCALE,
+  rim: BEZEL_RIM * SCREEN_SCALE,
+  lampA: LAMP_A * SCREEN_SCALE,
+  lampH: BOARD_BOTTOM - (SCREEN_BOTTOM - LAMP_H) * SCREEN_SCALE,
+  lampSize: LAMP_SIZE * SCREEN_SCALE,
+};
+
+/** A screen's measures: the board's for `large`, the wall screen's else. */
+export function screenShape(fx: Pick<Screen, "large">): ScreenShape {
+  return fx.large === true ? BOARD : WALL_SCREEN;
+}
+
+/**
+ * A screen's glass inside the bezel: `half` its half width along the
+ * wall, `h0` to `h1` its height. The text quad spans it less
  * `TEXT_MARGIN` at the top and bottom, at `ASPECT.station`.
  */
-export const SCREEN_GLASS = {
-  half: SCREEN_HALF - BEZEL_RIM,
-  h0: SCREEN_BOTTOM + BEZEL_RIM,
-  h1: SCREEN_TOP - BEZEL_RIM,
-} as const;
+export function screenGlass(fx: Pick<Screen, "large">): {
+  half: number;
+  h0: number;
+  h1: number;
+} {
+  const g = screenShape(fx);
+  return { half: g.half - g.rim, h0: g.bottom + g.rim, h1: g.top - g.rim };
+}
+
+/** The wall screen's glass (`screenGlass` of a screen without `large`). */
+export const SCREEN_GLASS = screenGlass({});
 /**
  * The patch of the panel texture the glass shows: `size` square from
  * `(at, at)`, inside one of the texture's four tiles and clear of the
@@ -232,10 +305,6 @@ export const SCREEN_GLASS = {
 const GLASS_UV = { at: 0.1, size: 0.3 } as const;
 /** The text quad's margin inside the glass, top and bottom. */
 const TEXT_MARGIN = 0.02;
-/** The status lamp under the screen: its centre along, height and size. */
-const LAMP_A = 0.7;
-const LAMP_H = 1.33;
-const LAMP_SIZE = 0.04;
 /** The status lamp's colour: a steady green. */
 const LAMP_GREEN: V3 = [0.35, 1, 0.45];
 
@@ -245,7 +314,9 @@ const LAMP_GREEN: V3 = [0.35, 1, 0.45];
  * `TEXT_MARGIN` top and bottom and centred on it, its width taken from
  * `ASPECT.station` so the quad and the text layer cannot drift apart
  * (the glass either side reads as the same screen), and one status lamp
- * on a small mount under it.
+ * on a small mount under it. A screen with `large` (the airlock's
+ * directory) is the same model at `SCREEN_SCALE` times the size, from
+ * `BOARD_BOTTOM` up (`screenShape`).
  */
 export function buildScreen(
   kitAt: KitAt,
@@ -255,23 +326,24 @@ export function buildScreen(
 ): Mover[] {
   const k = kitAt(frameForSlot(fx.slot));
   const s = surfaces(ctx.look);
+  const g = screenShape(fx);
   k.bevelBox(
-    -SCREEN_HALF,
-    SCREEN_HALF,
+    -g.half,
+    g.half,
     0,
-    BEZEL_D,
-    SCREEN_BOTTOM,
-    SCREEN_TOP,
-    0.012,
+    g.depth,
+    g.bottom,
+    g.top,
+    0.012 * (g.depth / BEZEL_D),
     s.dark,
   );
   // The glass samples one plain patch of the panel texture
   // (`GLASS_UV`), clear of its bevel lines, so no seam crosses the glass.
-  const { half: glassHalf, h0: g0, h1: g1 } = SCREEN_GLASS;
+  const { half: glassHalf, h0: g0, h1: g1 } = screenGlass(fx);
   k.panel(
     -glassHalf,
     glassHalf,
-    BEZEL_D + DECAL_LIFT,
+    g.depth + DECAL_LIFT,
     g0,
     g1,
     s.glow(colours("station", ctx.look).background),
@@ -280,7 +352,8 @@ export function buildScreen(
     GLASS_UV.at,
     GLASS_UV.at,
   );
-  const h = g1 - g0 - 2 * TEXT_MARGIN;
+  const margin = TEXT_MARGIN * (g.depth / BEZEL_D);
+  const h = g1 - g0 - 2 * margin;
   const half = (h * ASPECT.station) / 2;
   textPanel(
     k,
@@ -288,28 +361,30 @@ export function buildScreen(
     `screen:${index}`,
     -half,
     half,
-    BEZEL_D + DECAL_LIFT,
-    g0 + TEXT_MARGIN,
-    g1 - TEXT_MARGIN,
+    g.depth + DECAL_LIFT,
+    g0 + margin,
+    g1 - margin,
     { tint: [1, 1, 1], flag: FLAG.emissive },
   );
   // The status lamp on its mount.
-  const l = LAMP_SIZE / 2;
+  const l = g.lampSize / 2;
+  const rim = 0.015 * (g.depth / BEZEL_D);
+  const mount = 0.03 * (g.depth / BEZEL_D);
   k.box(
-    LAMP_A - l - 0.015,
-    LAMP_A + l + 0.015,
+    g.lampA - l - rim,
+    g.lampA + l + rim,
     0,
-    0.03,
-    LAMP_H - l - 0.015,
-    LAMP_H + l + 0.015,
+    mount,
+    g.lampH - l - rim,
+    g.lampH + l + rim,
     s.dark,
   );
   k.panel(
-    LAMP_A - l,
-    LAMP_A + l,
-    0.03 + DECAL_LIFT,
-    LAMP_H - l,
-    LAMP_H + l,
+    g.lampA - l,
+    g.lampA + l,
+    mount + DECAL_LIFT,
+    g.lampH - l,
+    g.lampH + l,
     s.signal(LAMP_GREEN),
   );
   return [];

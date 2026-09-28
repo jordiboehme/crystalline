@@ -78,7 +78,17 @@ import {
   type Mover,
 } from "./models";
 import { CASE_GLASS } from "./models/machines";
-import { LIFT_OPENING, LIFT_POCKET, SCREEN_GLASS } from "./models/lift";
+import {
+  BOARD_BOTTOM,
+  LIFT_OPENING,
+  LIFT_POCKET,
+  SCREEN_GLASS,
+  SCREEN_SCALE,
+  screenGlass,
+  screenShape,
+} from "./models/lift";
+import { AIRLOCK_CEILING } from "../world/airlock";
+import { INTERIOR_CATALOGUE } from "../world/consoleRoom";
 import { LIFT_WORDS } from "../world/lifts";
 import { liftsHallRoom } from "../world/canned";
 
@@ -934,6 +944,78 @@ describe("the exit's label (M3 C28)", () => {
       `door:${String(index)}`,
     ]);
   });
+});
+
+describe("the airlock's directory board (M3 C24)", () => {
+  // A screen with `large`: the wall screen at `SCREEN_SCALE` times its
+  // size from `BOARD_BOTTOM` up, over the outer hatch. It is too wide for
+  // the one-cell band above, so it is held to a band of its own width.
+  for (const side of SIDES) {
+    const slot = slotOn(side);
+    const wall = frameForSlot(slot);
+    const fx: Fixture = {
+      kind: "screen",
+      slot,
+      lines: ["A", "B"],
+      keys: [0],
+      seed: 9,
+      large: true,
+    };
+    const built = buildOne(fx, AIRLOCK_CEILING);
+    const g = screenShape(fx);
+
+    describe(`on the ${side} wall`, () => {
+      it("stays inside its own width, the wall band's depth and the airlock's ceiling, over the hatch", () => {
+        // Mutation caught: the board drawn at the wall screen's size or
+        // height, or reaching past its bezel's width, out of the band or
+        // into the ceiling.
+        const band = footprint(slot, { along: 2 * g.half, out: FLUSH_DEPTH });
+        const points = all(built).flatMap((m) => positions(m));
+        expect(points.length).toBeGreaterThan(0);
+        const hatch = INTERIOR_CATALOGUE["outer-hatch"];
+        expect(BOARD_BOTTOM).toBeGreaterThan(hatch.top);
+        for (const p of points) {
+          expect(inBox(band, p, EPS)).toBe(true);
+          expect(p[1]).toBeLessThanOrEqual(AIRLOCK_CEILING - HEADROOM + EPS);
+          // Nothing hangs down into the outer hatch under the board.
+          if (Math.abs(toLocal(wall, p)[0]) <= hatch.width / 2)
+            expect(p[1]).toBeGreaterThanOrEqual(hatch.top);
+        }
+        expect(g.half).toBeCloseTo(SCREEN_SCALE * 0.8, 9);
+        expect(g.top - g.bottom).toBeCloseTo(SCREEN_SCALE * 0.9, 9);
+      });
+
+      it("winds every triangle with its normal, stays under budget and glows only on its body", () => {
+        // Mutation caught: a face wound the wrong way, the board grown past
+        // the fixture budget, a lamp or glass hung clear of the bezel.
+        for (const m of all(built)) {
+          expect(m.count).toBeGreaterThan(0);
+          expect(worstWinding(m)).toBeGreaterThan(0.999);
+        }
+        expect(triangleCount(built)).toBeLessThan(4000);
+        expect(floatingGlow(allParts(built), wall)).toEqual([]);
+        expect(sunkDecals(built, wall)).toEqual([]);
+      });
+
+      it("spreads its text across the glass at the station aspect", () => {
+        // Mutation caught: the text quad left at the wall screen's size on
+        // the larger glass.
+        const glass = screenGlass(fx);
+        const text = built.parts.filter(
+          (p) => p.method === "panel" && p.layer === 11,
+        );
+        expect(text).toHaveLength(1);
+        const local = (text[0]?.points ?? []).map((q) => toLocal(wall, q));
+        const as = local.map((q) => q[0]);
+        const hs = local.map((q) => q[2]);
+        const w = Math.max(...as) - Math.min(...as);
+        const h = Math.max(...hs) - Math.min(...hs);
+        expect(w / h).toBeCloseTo(ASPECT.station, 6);
+        expect(w).toBeGreaterThanOrEqual(0.8 * 2 * glass.half);
+        expect(w).toBeLessThanOrEqual(2 * glass.half);
+      });
+    });
+  }
 });
 
 describe("decor models", () => {
