@@ -74,6 +74,15 @@ export interface Look {
     everywhere: boolean;
     /** Line width in pixels. */
     width: number;
+    /**
+     * How the seams on the shell fade with distance, in metres from the
+     * eye: at full strength up to `from`, gone from `to` on, a smooth step
+     * between. It keeps a long corridor's far end, where the seams crowd
+     * into a few pixels, from washing out to white; the walls keep their
+     * colour, only the lines fade, and the near view is unchanged. Null
+     * for a look without seams everywhere. Frames never fade.
+     */
+    fade: { from: number; to: number } | null;
   };
   /** 1 textured, 0 solid colours only. */
   textureMix: number;
@@ -160,6 +169,7 @@ export const LOOKS: Record<LookId, Look> = {
       strength: 1.6,
       everywhere: false,
       width: 1.2,
+      fade: null,
     },
     textureMix: 1,
     flat: false,
@@ -202,6 +212,7 @@ export const LOOKS: Record<LookId, Look> = {
       strength: 2.2,
       everywhere: true,
       width: 1.4,
+      fade: { from: 15, to: 25 },
     },
     textureMix: 1,
     flat: false,
@@ -239,7 +250,13 @@ export const LOOKS: Record<LookId, Look> = {
     minLight: 0.15,
     bands: 8,
     grime: 0,
-    edge: { colour: c64(1), strength: 0.6, everywhere: false, width: 1 },
+    edge: {
+      colour: c64(1),
+      strength: 0.6,
+      everywhere: false,
+      width: 1,
+      fade: null,
+    },
     textureMix: 0,
     flat: true,
     dither: true,

@@ -213,7 +213,11 @@ void main() {
  * With `uEdgeEverywhere` (look 2) the room's shell (`FLAG.shell`) draws
  * them too, in the look's edge colour; a plain `lit` surface (a prop, a
  * hero, a fitting, a terminal) never does. The shell is lit exactly as
- * `lit`: no early return tests its flag.
+ * `lit`: no early return tests its flag. The shell's seams fade with the
+ * fragment's distance from the eye over `uEdgeFade` (the look's
+ * `edge.fade`, from and to in metres; 0, 0 for none): at full strength
+ * nearer than its first value, gone past its second. A frame's lines
+ * never fade.
  *
  * The uv's screen-space derivatives are taken once, at the top of `main`
  * before any early return, so they are defined for every fragment of the
@@ -250,6 +254,7 @@ uniform vec3 uEdgeColour;
 uniform float uEdgeStrength;
 uniform float uEdgeWidth;
 uniform bool uEdgeEverywhere;
+uniform vec2 uEdgeFade;
 uniform float uGrimeLayer;
 uniform float uLdr;
 uniform float uBlink[${String(BLINK_CHANNELS)}];
@@ -337,6 +342,9 @@ void main() {
   bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == ${String(FLAG.shell)});
   if (framed) {
     float e = edgeLine(vUv, fw, uEdgeWidth);
+    if (vFlag == ${String(FLAG.shell)} && uEdgeFade.y > 0.0) {
+      e *= 1.0 - smoothstep(uEdgeFade.x, uEdgeFade.y, dist);
+    }
     vec3 edgeColour = vFlag == 3 ? vTint : uEdgeColour;
     colour += edgeColour * e * uEdgeStrength * mix(1.0, 0.45, uLdr);
   }

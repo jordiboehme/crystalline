@@ -594,6 +594,11 @@ export function createRenderer(
         scene.uniform("uEdgeEverywhere"),
         look.edge.everywhere ? 1 : 0,
       );
+      gl.uniform2f(
+        scene.uniform("uEdgeFade"),
+        look.edge.fade?.from ?? 0,
+        look.edge.fade?.to ?? 0,
+      );
       gl.uniform1f(scene.uniform("uLdr"), caps.color === "rgba8" ? 1 : 0);
       // The blink banks' gains; `uBlink` names the whole array.
       gl.uniform1fv(scene.uniform("uBlink"), blink);

@@ -198,3 +198,39 @@ describe("the scene shader's seams in look 2", () => {
       expect(LOOKS[id].edge.everywhere, id).toBe(id === "aperture");
   });
 });
+
+describe("the fade of look 2's seams with distance", () => {
+  it("keeps the fade distances in the look's edge settings: look 2 only, starting near 15 m and gone by 25 m", () => {
+    // Mutation caught: look 2's fade dropped (null, the far end washes out
+    // again), a fade starting in the near view, or one given to a look
+    // without seams everywhere.
+    const fade = LOOKS.aperture.edge.fade;
+    expect(fade).not.toBeNull();
+    expect(fade?.from).toBeGreaterThanOrEqual(15);
+    expect(fade?.to).toBeGreaterThan(fade?.from ?? Infinity);
+    expect(fade?.to).toBeLessThanOrEqual(25);
+    for (const id of LOOK_ORDER.filter((id) => id !== "aperture"))
+      expect(LOOKS[id].edge.fade, id).toBeNull();
+  });
+
+  it("scales the shell's seam by the distance from the eye, and never a frame's line", () => {
+    // Mutation caught: the seam left at full strength whatever the
+    // distance (the scaling line dropped), the fade applied to the frames
+    // too, or the uniform fed a constant instead of the look's fade.
+    expect(SCENE_FS).toContain("uniform vec2 uEdgeFade;");
+    const framed = SCENE_FS.slice(SCENE_FS.indexOf("bool framed"));
+    expect(framed).toContain(
+      `if (vFlag == ${String(FLAG.shell)} && uEdgeFade.y > 0.0) {\n      e *= 1.0 - smoothstep(uEdgeFade.x, uEdgeFade.y, dist);\n    }`,
+    );
+    expect(framed.indexOf("smoothstep(uEdgeFade")).toBeLessThan(
+      framed.indexOf("colour += edgeColour * e"),
+    );
+    // `dist` is the fragment's distance from the eye, taken before.
+    expect(
+      SCENE_FS.indexOf("float dist = distance(uEye, vWorld);"),
+    ).toBeLessThan(SCENE_FS.indexOf("bool framed"));
+    expect(rendererSource).toMatch(
+      /scene\.uniform\("uEdgeFade"\),\s*look\.edge\.fade\?\.from \?\? 0,\s*look\.edge\.fade\?\.to \?\? 0,/,
+    );
+  });
+});
