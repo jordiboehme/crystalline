@@ -126,7 +126,7 @@ Pick the most precise bullet category for `- [category] content #tag`:
 - `[idea]`, `[proposal]`, `[poc]` - speculative or draft content; never mark speculation as `[fact]` or `[decision]`
 - `[source]` - a further location an engram was distilled from, one URL per bullet; `resource` holds the main one
 
-Relations connect engrams to each other: `- depends_on [[Other Engram]]`, or a quoted multi-word type like `- "relates to" [[Other Engram]]`. A bare `[[Title]]` or `[[permalink]]` resolves only inside the engram's own domain. To reach an engram in another domain, put that domain's name in front: `[[<domain>:<Title or permalink>]]`, as in `- depends_on [[payments:Retry Queue Architecture]]`, and the same form works for a prose link. `crystalline verify` reports a bare link whose target lives only in another domain as L001 and names the prefixed link to write.
+Relations connect engrams to each other: `- depends_on [[Other Engram]]`, or a quoted multi-word type like `- "relates to" [[Other Engram]]`. A bare `[[Title]]` or `[[permalink]]` resolves only inside the engram's own domain. To reach an engram in another domain, put that domain's name in front: `[[<domain>:<Title or permalink>]]`, as in `- depends_on [[payments:Retry Queue Architecture]]`, and the same form works for a prose link. `crystalline verify` reports a bare link that does not resolve in its own domain as L001. It names the domain that holds the target and the prefixed link to write only when both domains are verified together (`crystalline verify <this domain> <other domain>`); verifying one domain alone gives the plain broken-link message, which does not mean the target exists nowhere.
 
 ## Temporal fields
 
