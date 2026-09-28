@@ -58,9 +58,9 @@ import {
 } from "./common";
 
 /**
- * What a decor recipe gets, including which variant to draw: `RECIPES`
- * holds each kind's recipes in variant order, and `buildDecor` picks the
- * one `variant` names (2.7 C1, C2).
+ * What a decor recipe gets. `RECIPES` holds each kind's recipes in variant
+ * order, and `buildDecor` picks the one `decor.variant` names (2.7 C1, C2)
+ * and throws on a variant the kind does not have.
  */
 interface Recipe {
   k: Kit;
@@ -69,7 +69,6 @@ interface Recipe {
   s: Surfaces;
   ctx: ModelContext;
   decor: Decor;
-  variant: number;
 }
 
 /** Builds a piece of furniture at its point, turned with it. */
@@ -81,15 +80,16 @@ export function buildDecor(
   const f = frameForDecor(decor);
   const variant = decor.variant ?? 0;
   const recipes = RECIPES[decor.kind];
-  const recipe = recipes[variant] ?? recipes[0];
-  recipe?.({
+  const recipe = recipes[variant];
+  if (recipe === undefined)
+    throw new Error(`decor ${decor.kind}: no variant ${String(variant)}`);
+  recipe({
     k: kitAt(f),
     kitAt,
     f,
     s: surfaces(ctx.look),
     ctx,
     decor,
-    variant,
   });
 }
 

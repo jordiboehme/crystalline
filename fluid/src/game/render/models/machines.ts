@@ -43,7 +43,8 @@ type Machine = Extract<Fixture, { kind: "machine" }>;
 /**
  * What a recipe gets: its kits, the look's surfaces, the tag's colour, the
  * tag's second accent (`accent2`, 2.7 C10: `look.accents[tagAccent(tag)]`,
- * baked into one trim part of every variant) and which variant it draws.
+ * baked into one trim part of every variant). Each variant is its own
+ * recipe, so none is told which variant it draws.
  */
 interface Recipe {
   k: Kit;
@@ -56,7 +57,6 @@ interface Recipe {
   /** Half the footprint along the wall, and how far out it reaches. */
   half: number;
   out: number;
-  variant: number;
   accent2: Rgb;
 }
 
@@ -71,7 +71,8 @@ const trim = (s: Surface, accent2: Rgb): Surface => ({ ...s, tint: accent2 });
  * Builds a machine and its tag strip against its wall slot. Its random
  * details are drawn from `machineModelSeed(fx.tag)`, the tag alone, never
  * the fixture's own `seed`, so the same tag is the same machine, part for
- * part, in every room (2.7 C5, Review Focus 2).
+ * part, in every room (2.7 C5, Review Focus 2). Throws on a variant the
+ * kind has no recipe for.
  */
 export function buildMachine(
   kitAt: KitAt,
@@ -85,8 +86,10 @@ export function buildMachine(
   const hue = hueToRgb(fx.hue, 0.85, 0.55);
   const recipes = RECIPES[fx.machine];
   const variant = fx.variant ?? 0;
-  const recipe = recipes[variant] ?? recipes[0];
-  recipe?.({
+  const recipe = recipes[variant];
+  if (recipe === undefined)
+    throw new Error(`machine ${fx.machine}: no variant ${String(variant)}`);
+  recipe({
     k,
     kitAt,
     f,
@@ -96,7 +99,6 @@ export function buildMachine(
     rng: createRng(machineModelSeed(fx.tag)),
     half: size.along / 2,
     out: size.out,
-    variant,
     accent2: ctx.look.accents[tagAccent(fx.tag)] ?? ctx.look.palette.metal,
   });
   tagStrip(k, ctx, `tag:${index}`, hue);

@@ -171,8 +171,8 @@ const deckAt = (d: number) =>
 
 /**
  * What a terminal recipe gets: its kit, the frame, the look's surfaces, the
- * room context, the fixture's own index (its text layer's key) and which
- * variant is being drawn.
+ * room context and the fixture's own index (its text layer's key). Each
+ * variant is its own recipe (`TERMINAL_RECIPES`).
  */
 interface Recipe {
   k: Kit;
@@ -181,12 +181,11 @@ interface Recipe {
   s: Surfaces;
   ctx: ModelContext;
   index: number;
-  variant: number;
 }
 
 /**
  * Builds the terminal against its wall slot, from its variant (absent
- * reads as 0, 2.7 C6).
+ * reads as 0, 2.7 C6); throws on a variant there is no recipe for.
  */
 export function buildTerminal(
   kitAt: KitAt,
@@ -196,7 +195,9 @@ export function buildTerminal(
 ): void {
   const f = frameForSlot(fx.slot);
   const variant = fx.variant ?? 0;
-  const recipe = TERMINAL_RECIPES[variant] ?? terminal0;
+  const recipe = TERMINAL_RECIPES[variant];
+  if (recipe === undefined)
+    throw new Error(`terminal: no variant ${String(variant)}`);
   recipe({
     k: kitAt(f),
     kitAt,
@@ -204,7 +205,6 @@ export function buildTerminal(
     s: surfaces(ctx.look),
     ctx,
     index,
-    variant,
   });
 }
 

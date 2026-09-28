@@ -1520,6 +1520,35 @@ describe("model variants (2.7)", () => {
     expect(hashes).toEqual(VARIANT_ZERO_HASHES);
   });
 
+  it("draws every variant its count names, and throws on one past it (2.7 C2)", () => {
+    // Mutation caught: a recipe table shorter or longer than its
+    // `VARIANT_COUNTS` entry, or an unknown variant quietly drawn as
+    // variant 0 (the old `?? recipes[0]` fallback).
+    expect(MACHINE_KINDS.length).toBe(12);
+    for (const kind of MACHINE_KINDS) {
+      const n = VARIANT_COUNTS.machine[kind];
+      for (let v = 0; v < n; v++)
+        expect(
+          () => buildOne(machineAt(kind, v)),
+          `${kind} ${String(v)}`,
+        ).not.toThrow();
+      expect(() => buildOne(machineAt(kind, n)), kind).toThrow(kind);
+    }
+    const t = VARIANT_COUNTS.terminal;
+    for (let v = 0; v < t; v++)
+      expect(() => buildOne(terminalAt(v))).not.toThrow();
+    expect(() => buildOne(terminalAt(t))).toThrow("terminal");
+    for (const kind of DECOR_KINDS) {
+      const n = VARIANT_COUNTS.decor[kind];
+      for (let v = 0; v < n; v++)
+        expect(
+          () => buildOneDecor(decorAt(kind, v)),
+          `${kind} ${String(v)}`,
+        ).not.toThrow();
+      expect(() => buildOneDecor(decorAt(kind, n)), kind).toThrow(kind);
+    }
+  });
+
   it("makes every pair of a kind's variants differ in shape (2.7 C2)", () => {
     // Mutation caught: a variant built as another (delta 0), or one that
     // only recolours (the same voxels).
