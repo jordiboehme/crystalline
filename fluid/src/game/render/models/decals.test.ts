@@ -9,9 +9,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../../world/canned";
+import {
+  CANNED_BRIDGE,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
+  galleryRoom,
+} from "../../world/canned";
 import { generateRoom } from "../../world/generate";
-import { galleryRoom } from "../../world/canned";
 import { HERO_FRONT } from "../../world/footprints";
 import type { Decal, RoomSpec } from "../../world/types";
 import { CELL } from "../../world/units";
