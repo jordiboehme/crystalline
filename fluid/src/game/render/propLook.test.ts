@@ -80,11 +80,14 @@ function rooms(look: Look): MeshData[] {
 describe("look 2's light grey set dressing", () => {
   it("keeps the grey in look 2's settings, light but darker than its walls", () => {
     // Mutation caught: the grey taken off the look, a dark grey (the
-    // prototype's), or one as light as the walls it must stand off.
+    // prototype's), or one too light to stand off the walls in bright
+    // light (the first tuning's #bdbdb8).
     const body = LOOKS.aperture.propBody?.body;
     if (body === undefined) throw new Error("look 2 has no prop body");
     const lum = (c: Rgb) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     expect(lum(body)).toBeGreaterThan(0.6);
+    // Dark enough to stand off the walls in the bright hangar too.
+    expect(lum(body)).toBeLessThan(0.72);
     expect(lum(body)).toBeLessThan(lum(LOOKS.aperture.palette.panel) - 0.15);
   });
 

@@ -8,6 +8,7 @@ import type { Prop, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
 import { LOOKS } from "./looks";
 import {
+  MARGIN,
   SHADOW_TEXELS,
   casterDarkness,
   casterSoftness,
@@ -72,10 +73,16 @@ describe("contact shadows", () => {
     expect(sample(along, CX, CZ + 0.6)).toBeLessThan(0.1);
     expect(sample(across, CX, CZ + 0.6)).toBeGreaterThan(0.5);
     expect(sample(across, CX + 0.6, CZ)).toBeLessThan(0.1);
-    // Nothing past the soft edge.
+    // Nearly full darkness half a margin past the footprint's edge, so
+    // the shadow shows round the prop's foot, then nothing past the soft
+    // edge.
     const [c] = shadowCasters(along);
     if (c === undefined) throw new Error("no caster");
-    const clear = c.hx + casterSoftness(c) + 1 / SHADOW_TEXELS;
+    expect(MARGIN).toBeGreaterThan(0);
+    expect(sample(along, CX + c.hx + MARGIN / 2, CZ)).toBeGreaterThan(
+      0.85 * casterDarkness(c),
+    );
+    const clear = c.hx + MARGIN + casterSoftness(c) + 1 / SHADOW_TEXELS;
     expect(sample(along, CX + clear, CZ)).toBe(0);
   });
 
@@ -106,7 +113,7 @@ describe("contact shadows", () => {
     expect(casterSoftness(large)).toBeGreaterThan(casterSoftness(small));
     const huge = { x: 0, z: 0, hx: 10, hz: 10, round: false };
     expect(casterDarkness(huge)).toBeLessThanOrEqual(1);
-    expect(casterSoftness(huge)).toBeLessThanOrEqual(0.45);
+    expect(casterSoftness(huge)).toBeLessThanOrEqual(0.5);
   });
 
   it("casts a wall-standing locker bank's patch in front of its wall, along it", () => {
@@ -138,13 +145,14 @@ describe("contact shadows", () => {
     }
   });
 
-  it("stays subtle and appears only in look 2", () => {
-    // Mutation caught: a contact shadow in look 1 or 3, or one that darks
-    // the floor by more than 70 percent.
+  it("shows on look 2's dark floor without blacking it out, and appears only in look 2", () => {
+    // Mutation caught: a contact shadow in look 1 or 3, one back at the
+    // first strength (0.7, too faint on the dark floor), or one that
+    // blacks the floor out.
     expect(LOOKS.day.contactShadow).toBeUndefined();
     expect(LOOKS.freescape.contactShadow).toBeUndefined();
     const k = LOOKS.aperture.contactShadow ?? 0;
-    expect(k).toBeGreaterThan(0.3);
-    expect(k).toBeLessThanOrEqual(0.7);
+    expect(k).toBeGreaterThan(0.75);
+    expect(k).toBeLessThanOrEqual(0.9);
   });
 });

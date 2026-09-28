@@ -79,21 +79,27 @@ export interface Caster {
 /** How dark a patch's middle gets, 0 to 1: a little darker as the footprint grows. */
 export function casterDarkness(c: Caster): number {
   const size = 2 * Math.sqrt(c.hx * c.hz);
-  return Math.min(1, 0.8 + 0.1 * size);
+  return Math.min(1, 0.85 + 0.1 * size);
 }
 
 /**
- * How far a patch's soft edge runs past the footprint, in metres; it
- * starts `EDGE_IN` of that inside it. A little wider as the footprint
- * grows, never wider than `SOFT_MAX`.
+ * How far a patch's soft edge runs past the footprint grown by `MARGIN`,
+ * in metres; it starts `EDGE_IN` of that inside it. A little wider as the
+ * footprint grows, never wider than `SOFT_MAX`.
  */
 export function casterSoftness(c: Caster): number {
   const size = 2 * Math.sqrt(c.hx * c.hz);
-  return Math.min(SOFT_MAX, 0.15 + 0.1 * size);
+  return Math.min(SOFT_MAX, 0.2 + 0.1 * size);
 }
 
 /** The widest soft edge, in metres. */
-const SOFT_MAX = 0.45;
+const SOFT_MAX = 0.5;
+
+/**
+ * How far past its footprint a patch keeps its full darkness, in metres,
+ * so the shadow shows round the prop's foot on the dark floor.
+ */
+export const MARGIN = 0.05;
 
 /** How far inside the footprint the soft edge starts, as a share of its width. */
 const EDGE_IN = 0.5;
@@ -183,10 +189,11 @@ export function contactShadows(room: RoomSpec): {
   const width = room.width * CELL * SHADOW_TEXELS;
   const depth = room.depth * CELL * SHADOW_TEXELS;
   const texels = new Uint8Array(width * depth);
-  for (const c of shadowCasters(room)) {
-    const soft = casterSoftness(c);
+  for (const foot of shadowCasters(room)) {
+    const c = { ...foot, hx: foot.hx + MARGIN, hz: foot.hz + MARGIN };
+    const soft = casterSoftness(foot);
     const inset = Math.min(soft * EDGE_IN, c.hx, c.hz);
-    const dark = casterDarkness(c);
+    const dark = casterDarkness(foot);
     const tx0 = Math.max(0, Math.floor((c.x - c.hx - soft) * SHADOW_TEXELS));
     const tx1 = Math.min(
       width - 1,
@@ -201,8 +208,8 @@ export function contactShadows(room: RoomSpec): {
       const z = (tz + 0.5) / SHADOW_TEXELS;
       for (let tx = tx0; tx <= tx1; tx++) {
         const x = (tx + 0.5) / SHADOW_TEXELS;
-        // 1 from `inset` inside the footprint in, falling smoothly to 0
-        // at `soft` outside it.
+        // 1 from `inset` inside the grown footprint in, falling smoothly
+        // to 0 at `soft` outside it.
         const t = Math.min(
           1,
           Math.max(0, (soft - outside(c, x, z)) / (soft + inset)),

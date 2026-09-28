@@ -16,6 +16,7 @@ import { CELL } from "../world/units";
 import {
   ACCENT_MARK,
   FLAG,
+  FLOATS_PER_VERTEX,
   PROP_MARK,
   accentTint,
   createBuilder,
@@ -40,6 +41,7 @@ import {
   type Part,
 } from "./modelChecks";
 import { FLUSH_DEPTH, HEADROOM } from "./models";
+import { WALL_STANDING } from "./models/props/wall";
 import {
   CEILING_DROP,
   CEILING_OUT,
@@ -82,6 +84,31 @@ function buildRecorded(
   const parts: Part[] = [];
   buildProp(recordingKitAt(builder, parts), kind, variant, { look });
   return { mesh: builder.build(), parts };
+}
+
+/**
+ * The surface of a mesh's triangles carrying the prop's own mark, and of
+ * all its triangles, in square metres.
+ */
+function markedArea(m: MeshData): { part: number; whole: number } {
+  const at = positions(m);
+  let part = 0;
+  let whole = 0;
+  for (let i = 0; i + 2 < m.count; i += 3) {
+    const [a, b, c] = [at[i], at[i + 1], at[i + 2]];
+    if (a === undefined || b === undefined || c === undefined) continue;
+    const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    const area =
+      Math.hypot(
+        (u[1] ?? 0) * (w[2] ?? 0) - (u[2] ?? 0) * (w[1] ?? 0),
+        (u[2] ?? 0) * (w[0] ?? 0) - (u[0] ?? 0) * (w[2] ?? 0),
+        (u[0] ?? 0) * (w[1] ?? 0) - (u[1] ?? 0) * (w[0] ?? 0),
+      ) / 2;
+    whole += area;
+    if (m.vertices[i * FLOATS_PER_VERTEX + 9] === PROP_MARK) part += area;
+  }
+  return { part, whole };
 }
 
 /** Where an instance goes: its world offset, in metres. */
@@ -347,10 +374,11 @@ describe("prop models", () => {
   });
 
   it("paints at most one small part of each prop in its own accent in look 2, and nothing in the room's", () => {
-    // Mutation caught: two parts marked (two locker doors, every barrel of
-    // the cluster, a handle on every drawer), a whole body or bank marked
-    // (the part would fill most of the prop), a room accent part left in
-    // (the barrel's ribs beside its own band), a kind that loses its only
+    // Mutation caught: two parts marked (two locker handles, every barrel
+    // of the cluster, a handle on every drawer), a large part marked (a
+    // whole locker door, a whole lid, a seat or a body: its surface would
+    // pass the small part's share), a room accent part left in (the
+    // barrel's ribs beside its own band), a kind that loses its only
     // coloured part, or a part that glows.
     const look = propLook(LOOKS.aperture);
     const OWN = [
@@ -369,32 +397,51 @@ describe("prop models", () => {
       "tool-cart",
       "trolley",
     ];
-    const volume = (lo: V3, hi: V3) =>
-      Math.max(hi[0] - lo[0], 0.01) *
-      Math.max(hi[1] - lo[1], 0.01) *
-      Math.max(hi[2] - lo[2], 0.01);
     for (const kind of PROP_KINDS)
       for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++) {
         const at = `${kind} variant ${String(v)}`;
-        const { parts } = buildRecorded(kind, v, look);
+        const { mesh, parts } = buildRecorded(kind, v, look);
         const own = parts.filter((p) => p.tint?.[0] === PROP_MARK);
         expect(
           parts.filter((p) => p.tint?.[0] === ACCENT_MARK),
           at,
         ).toEqual([]);
-        // The storage shelf's bare variant has no part to give.
-        const bare = kind === "storage-shelf" && v === 1;
-        expect(own.length, at).toBe(OWN.includes(kind) && !bare ? 1 : 0);
-        for (const p of own) {
-          expect(GLOWING, at).not.toContain(p.flag);
-          const whole = shape(parts.flatMap((q) => q.points));
-          const part = shape(p.points);
-          expect(
-            volume(part.lo, part.hi) / volume(whole.lo, whole.hi),
-            at,
-          ).toBeLessThan(0.2);
-        }
+        expect(own.length, at).toBe(OWN.includes(kind) ? 1 : 0);
+        for (const p of own) expect(GLOWING, at).not.toContain(p.flag);
+        if (own.length === 0) continue;
+        const { part, whole } = markedArea(mesh);
+        // A handle, a band, a stripe, a small panel or a rim: under a
+        // quarter of a square metre (a locker door or a crate's lid is about
+        // two) and under a sixth of the prop's own surface (a small prop's
+        // seat or body would pass the first).
+        expect(part, at).toBeLessThan(0.25);
+        expect(part / whole, at).toBeLessThan(0.15);
       }
+  });
+
+  it("gives the contact shadows the wall-standing props' bodies exactly as the recipes build them", () => {
+    // Mutation caught: a shadow extent typed apart from the recipe's (the
+    // two drift), or a recipe body moved without its shadow.
+    const f0 = frameAt([0, 0, 0], 0);
+    for (const [kind, sizes] of Object.entries(WALL_STANDING) as [
+      PropKind,
+      readonly { a0: number; a1: number; depth: number }[],
+    ][])
+      sizes.forEach((size, v) => {
+        const bodies = buildRecorded(kind, v, LOOKS.day).parts.filter(
+          (p) => p.method === "bevelBox",
+        );
+        const local = bodies.flatMap((p) =>
+          p.points.map((q) => toLocal(f0, q)),
+        );
+        const at = `${kind} variant ${String(v)}`;
+        expect(Math.min(...local.map((q) => q[0])), at).toBeCloseTo(size.a0, 5);
+        expect(Math.max(...local.map((q) => q[0])), at).toBeCloseTo(size.a1, 5);
+        expect(Math.max(...local.map((q) => q[1])), at).toBeCloseTo(
+          size.depth,
+          5,
+        );
+      });
   });
 
   it("keeps the tool cart's drawer fronts visibly proud of its own red body, not buried inside it (2.7 C9)", () => {

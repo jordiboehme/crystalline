@@ -15,7 +15,7 @@
  * other wall prop carries it.
  *
  * In a look with `propAccents` a prop paints exactly one part in its own
- * accent instead (`s.own`) and the slits turn dark metal: one locker door,
+ * accent instead (`s.own`) and the slits turn dark metal: one locker handle,
  * the breaker box's lever (variant 0) or the bar across its two boxes
  * (variant 1) and a trim along the conduit cabinet's top. A
  * part only that look draws is added only there.
@@ -60,19 +60,13 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     const a0 = -inner + i * (width + gap);
     const a1 = a0 + width;
     k.box(a0, a1, L.depth - 0.03, L.depth - 0.005, 0.05, L.h1 - 0.05, s.panel);
-    // In a look with the prop's own accent, the second door takes it, a
-    // hair proud of the body (the doors sit inside it), its slits with it.
-    const door = s.own(s.panel, 0.9);
-    const own = i === 1 && door !== s.panel;
-    if (own) k.box(a0, a1, L.depth, L.depth + 0.006, 0.05, L.h1 - 0.05, door);
-    const proud = own ? 0.01 : 0;
     for (let j = 0; j < 3; j++) {
       const h0 = L.h1 - 0.2 - j * 0.07;
       k.box(
         a0 + 0.04,
         a1 - 0.04,
-        L.depth - 0.005 + proud,
-        L.depth + proud,
+        L.depth - 0.005,
+        L.depth,
         h0,
         h0 + 0.02,
         j === 0 ? s.accent() : s.dark,
@@ -85,7 +79,7 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       L.depth + 0.03,
       L.h1 / 2 - 0.09,
       L.h1 / 2 + 0.09,
-      s.metal,
+      i === 1 ? s.own(s.metal) : s.metal,
     );
   }
 }
@@ -695,8 +689,17 @@ function toolBoard({ k, s, ctx, variant }: Parameters<PropRecipe>[0]): void {
   }
 }
 
-/** The conduit cabinet: its depth and the horizontal conduit's height. */
-const CONDUIT = { depth: 0.28, runH: 2.15 };
+/**
+ * The conduit cabinet: its depth, the horizontal conduit's height, variant
+ * 0's one cabinet from `a0` to `a1` along the wall, and variant 1's two
+ * cabinets, which run from `-half` to `-gap` and from `gap` to `half`.
+ */
+const CONDUIT = {
+  depth: 0.28,
+  runH: 2.15,
+  one: { a0: -0.55, a1: 0.25 },
+  two: { half: 0.88, gap: 0.06 },
+};
 
 /**
  * The wall props that stand on the floor against their wall, per variant:
@@ -712,8 +715,8 @@ export const WALL_STANDING: Partial<
     depth: LOCKER.depth,
   })),
   "conduit-cabinet": [
-    { a0: -0.55, a1: 0.25, depth: CONDUIT.depth },
-    { a0: -0.88, a1: 0.88, depth: CONDUIT.depth },
+    { ...CONDUIT.one, depth: CONDUIT.depth },
+    { a0: -CONDUIT.two.half, a1: CONDUIT.two.half, depth: CONDUIT.depth },
   ],
 };
 
@@ -727,7 +730,8 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const C = CONDUIT;
   const d = C.depth / 2;
   if (variant === 0) {
-    k.bevelBox(-0.55, 0.25, 0, C.depth, 0, 1.9, 0.015, s.body);
+    const { a0, a1 } = C.one;
+    k.bevelBox(a0, a1, 0, C.depth, 0, 1.9, 0.015, s.body);
     const seam = -0.15;
     k.box(
       seam - 0.004,
@@ -751,7 +755,7 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // prop's own accent.
     const trim = s.own(s.body);
     if (trim !== s.body)
-      k.box(-0.55, 0.25, C.depth - 0.01, C.depth + 0.004, 1.78, 1.84, trim);
+      k.box(a0, a1, C.depth - 0.01, C.depth + 0.004, 1.78, 1.84, trim);
     for (const a of [-0.4, 0.1]) k.cylinder(a, d, 1.9, 2.2, 0.03, 8, s.metal);
     k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
     for (const a of [-0.85, 0.85]) {
@@ -766,9 +770,10 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       );
     }
   } else {
+    const { half, gap } = C.two;
     for (const [a0, a1] of [
-      [-0.88, -0.06],
-      [0.06, 0.88],
+      [-half, -gap],
+      [gap, half],
     ] as const) {
       k.bevelBox(a0, a1, 0, C.depth, 0, 1.7, 0.015, s.body);
       const mid = (a0 + a1) / 2;
