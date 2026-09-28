@@ -29,6 +29,7 @@
  */
 
 import { domainRoute, engramRoute, folderRoute } from "../paths";
+import { GAME_PREFIX } from "./launch";
 import type { PlaceAddress, StationAddress } from "./world/types";
 
 /**
@@ -36,29 +37,27 @@ import type { PlaceAddress, StationAddress } from "./world/types";
  * this same character literally in its route patterns, and React Router
  * matches that pattern whether the browser sends the raw character or its
  * percent-encoding - so the pattern side never has to choose a spelling.
- * Building a URL to hand to `navigate` is a different problem, solved below.
- */
-const GAME_SEGMENT = "π";
-
-/**
- * The prefix every game route sits under, in the form `history` itself
- * settles on.
+ * `fluidRouteOf` compares a decoded segment against it.
  *
+ * Building a URL to hand to `navigate` is a different problem, solved by
+ * `GAME_PREFIX` (from `launch.ts`, the one game module the main chunk
+ * carries): the prefix in the form `history` itself settles on.
  * `session.ts` compares a route `gameRouteOf` builds against
  * `window.location.pathname + window.location.search` directly, replacing
  * the URL only when the two differ, and both browsers and jsdom always
  * report that pathname percent-encoded, never as the raw character, which
- * `paths.test.ts` pins with a failing-raw-form test. A prefix built from the raw character
- * would therefore never string-equal what the location bar actually holds,
- * and the route would `replace` the URL on every landing instead of only
- * when it must. Encoding it here with the same `encodeURIComponent` a
- * browser's own normalization agrees with (uppercase hex, `%CF%80`) keeps
- * the two sides byte-for-byte identical. A hand-typed `/%cf%80/...` still
- * matches on the way in (`fluidRouteOf` below, and the route pattern
- * itself); it only costs one harmless replace up to the uppercase form,
- * same as any other case a browser would have canonicalized for you.
+ * `paths.test.ts` pins with a failing-raw-form test. A prefix built from
+ * the raw character would therefore never string-equal what the location
+ * bar actually holds, and the route would `replace` the URL on every
+ * landing instead of only when it must. The prefix is spelled the way
+ * `encodeURIComponent` spells this character and a browser's own
+ * normalization agrees (uppercase hex, `%CF%80`), which keeps the two sides
+ * byte-for-byte identical. A hand-typed `/%cf%80/...` still matches on the
+ * way in (`fluidRouteOf` below, and the route pattern itself); it only
+ * costs one harmless replace up to the uppercase form, same as any other
+ * case a browser would have canonicalized for you.
  */
-const GAME_PREFIX = `/${encodeURIComponent(GAME_SEGMENT)}`;
+const GAME_SEGMENT = "π";
 
 /**
  * The game's address of one engram: Fluid's engram route under the `π`

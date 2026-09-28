@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   GAME_BUDGET_BYTES,
   MAIN_GUIDELINE_BYTES,
+  ROUTE_REQUIRED,
   gameFiles,
   mainFile,
   measure,
@@ -93,6 +94,12 @@ describe("the /π route's size (M4 C30)", () => {
     expect(required.annotations.some((l) => l.startsWith("::error::"))).toBe(
       true,
     );
+  });
+
+  it("requires the route in every build (F6)", () => {
+    // Mutation caught: `ROUTE_REQUIRED` left false, so a build that lost
+    // the route would pass with a notice.
+    expect(ROUTE_REQUIRED).toBe(true);
   });
 
   it("fails above the budget and only warns above the guideline", () => {
@@ -232,13 +239,11 @@ describe("the CLI's cleanup guarantee (M4 Task 11 fix round 1)", () => {
   });
 
   it("still cleans up, and reports correctly, on the ordinary path", () => {
+    // The ordinary path is a build with the route, which ships (F6).
     const cleanup = vi.fn();
     const writeSummary = vi.fn();
     const result = runBudgetCheck({
-      readManifest: () =>
-        JSON.stringify({
-          "index.html": { file: "assets/index-a.js", isEntry: true },
-        }),
+      readManifest: () => JSON.stringify(manifest),
       gzipSize: () => 1,
       writeSummary,
       cleanup,
@@ -246,8 +251,8 @@ describe("the CLI's cleanup guarantee (M4 Task 11 fix round 1)", () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
     expect(writeSummary).toHaveBeenCalledTimes(1);
     expect(result.failed).toBe(false);
-    expect(result.annotations.some((l) => l.startsWith("::notice::"))).toBe(
-      true,
+    expect(result.annotations.some((l) => l.startsWith("::error::"))).toBe(
+      false,
     );
   });
 });

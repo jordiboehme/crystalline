@@ -6,7 +6,8 @@
  * over whatever lies behind it, the white doorway of an open police box
  * included (2.6e C28); the status line (room, look, condition, mouse hint) at
  * the bottom left, the frame time at the top right beside an optional key
- * legend, and a notice
+ * legend (the frame time only in a development build, where it is a
+ * measuring aid rather than something a player needs), and a notice
  * (`ACCESS DENIED`, `LOOK INVERTED`) in the middle. Over all of them, while
  * travelling, the connector.
  *
@@ -51,7 +52,7 @@ export function Hud({ view, connector, legend }: HudProps) {
         className={`absolute inset-x-0 top-0 flex justify-between gap-4 p-3 ${line}`}
       >
         <span>{legend ?? ""}</span>
-        <span ref={frame} />
+        {import.meta.env.DEV ? <span ref={frame} /> : null}
       </div>
       <div className={`absolute inset-x-0 bottom-0 p-3 ${line}`}>
         <span ref={status} />

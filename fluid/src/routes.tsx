@@ -83,43 +83,41 @@ const Profile = lazy(() => import("./screens/Profile"));
 const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
 
 /**
- * The station's look demo, and only in development.
+ * The station itself, every place in it under one splat, `/π/*`, lazy like
+ * the screens above so the app shell never pays for it.
+ *
+ * It ships in every build: the C64 screen behind the header's gem is its
+ * way in (`LOAD"GAME",8,1`). It sits inside `RequireAuth`, since every room
+ * is built from what the account reads, and outside `Layout`: the station
+ * is full screen, with no frame around it. The route reads the location
+ * itself (`addressOfGameLocation` in `game/paths.ts`): `/π` is the airlock,
+ * `/π/d/<domain>` a domain's bridge, the same with `?path=<folder>` a deck
+ * and `/π/d/<domain>/e/<permalink>` an engram's room, each Fluid's own
+ * address under the `π` prefix, and any other path under it the airlock.
+ * That prefix is the Unicode character itself, deliberately hard to type:
+ * the station is an Easter egg, meant to be reached from the C64 screen
+ * rather than typed in, and there is no `/game` alias into it.
+ */
+const GameRoute = lazy(() => import("./game/GameRoute"));
+
+/**
+ * The station's look demo at `/π/dev`, and only in development.
  *
  * `import.meta.env.DEV` is a constant the build replaces, so in a production
- * build this is `null`, the import below is dead code, and the whole game
- * folder never becomes a chunk. The route sits inside `RequireAuth` like
- * every other screen but outside `Layout`: the station is full screen, with
- * no frame around it.
+ * build this is `null`, the import below is dead code, and neither the
+ * chunk nor the route exists. Its route sits beside the station's, inside
+ * `RequireAuth` and outside `Layout`, and outranks the station's splat by
+ * being more specific.
  */
 const LookDemo = import.meta.env.DEV
   ? lazy(() => import("./game/dev/LookDemo"))
   : null;
 
 /**
- * The station itself, every place in it under one splat, `/π/*`, and only
- * in development until the game gets a way in of its own.
- *
- * Gated the way the look demo is, so a production build has neither the
- * chunk nor the route. It sits inside `RequireAuth`, since every room is
- * built from what the account reads, and outside `Layout`, full screen. The
- * route reads the location itself (`addressOfGameLocation` in
- * `game/paths.ts`): `/π` is the airlock, `/π/d/<domain>` a domain's bridge,
- * the same with `?path=<folder>` a deck and `/π/d/<domain>/e/<permalink>`
- * an engram's room, each Fluid's own address under the `π` prefix, and any
- * other path under it the airlock. The dev routes above it are more
- * specific and outrank the splat. That prefix is the Unicode character
- * itself, deliberately hard to type: the game is an Easter egg, meant to be
- * reached from the C64 screen rather than typed in, and there is no `/game`
- * alias into it any more.
- */
-const GameRoute = import.meta.env.DEV
-  ? lazy(() => import("./game/GameRoute"))
-  : null;
-
-/**
  * The model gallery at `/π/dev/gallery`: one room with every model the
  * station draws, for judging them. A development tool, like the look demo,
- * and gated the same way for good.
+ * and gated the same way for good: the station ships, its dev seams never
+ * do.
  */
 const Gallery = import.meta.env.DEV
   ? lazy(() => import("./game/dev/Gallery"))
@@ -176,6 +174,8 @@ export function AppRoutes() {
         {/*
           The look demo, full screen and so outside `Layout`. In a
           production build `LookDemo` is null and the route does not exist.
+          The dev routes are declared above the station's splat, which they
+          outrank anyway by being more specific.
         */}
         {LookDemo === null ? null : (
           <Route
@@ -188,7 +188,7 @@ export function AppRoutes() {
           />
         )}
         {/*
-          The gallery and the station itself, gated and placed the same way.
+          The gallery, gated and placed the same way.
         */}
         {Gallery === null ? null : (
           <Route
@@ -200,16 +200,17 @@ export function AppRoutes() {
             }
           />
         )}
-        {GameRoute === null ? null : (
-          <Route
-            path="/π/*"
-            element={
-              <Suspense fallback={null}>
-                <GameRoute />
-              </Suspense>
-            }
-          />
-        )}
+        {/*
+          The station itself, in every build: full screen, outside `Layout`.
+        */}
+        <Route
+          path="/π/*"
+          element={
+            <Suspense fallback={null}>
+              <GameRoute />
+            </Suspense>
+          }
+        />
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="/d/:domain" element={<DomainHome />} />

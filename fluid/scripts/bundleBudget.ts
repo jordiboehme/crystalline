@@ -15,9 +15,10 @@
  * the main set is never entered: a lazy chunk imports its own entry chunk
  * (Vite's manifest lists `index.html` in `GameRoute`'s `imports`), and
  * entering it from here would pull in every other lazy Fluid route through
- * the entry's own `dynamicImports`. A build made before the route ships has
- * no `GAME_ENTRY` key at all; `gameFiles` then returns `[]` rather than
- * throwing, and the report says so instead of failing (F6).
+ * the entry's own `dynamicImports`. A build without the route has no
+ * `GAME_ENTRY` key at all; `gameFiles` then returns `[]` rather than
+ * throwing, and the report fails with an error while `ROUTE_REQUIRED` holds,
+ * which it does: the route ships in every build (F6).
  */
 
 /** The manifest key of the game's lazy route entry (Vite keys a chunk by its source path). */
@@ -40,11 +41,12 @@ export const GAME_BUDGET_BYTES = 1_474_560;
 export const MAIN_GUIDELINE_BYTES = 176_584;
 
 /**
- * Whether a build without the `/π` route fails the check. Before the route
- * ships (M4 Task 2) its absence is expected and only a notice; Task 2 sets
- * this true, after which a build that lost the route is an error.
+ * Whether a build without the `/π` route fails the check. The route ships in
+ * every production build, so a build without it lost it by mistake (a gate
+ * put back around the route, a broken lazy import): its absence is an error,
+ * never the notice `reportLines` gives when this is false.
  */
-export const ROUTE_REQUIRED = false;
+export const ROUTE_REQUIRED = true;
 
 /** One entry of a Vite build manifest, as `vite build --manifest` writes it. */
 export interface ManifestChunk {

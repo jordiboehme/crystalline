@@ -2,7 +2,7 @@
  * The game route, mounted in the whole app on an in-memory history.
  *
  * jsdom has no WebGL2, so the route first has to refuse the device the way
- * the look demo does; that pins that the route exists in development and
+ * the look demo does; that pins that the route exists and
  * turns a device away before it draws a canvas. Then the probe is told
  * WebGL2 is there, and the context and the renderer are stubbed at their
  * modules, so the session's default factory runs without a GPU: the route
@@ -47,6 +47,7 @@ import {
   meResponse,
   userFixture,
 } from "../test/harness";
+import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
 import type { LiftStop } from "./world/types";
 
@@ -454,6 +455,36 @@ describe("GameRoute", () => {
       await screen.findByText("?DEVICE NOT PRESENT ERROR"),
     ).toBeInTheDocument();
     expect(asked()).not.toContain("/domains/eng/engrams/alpha");
+  });
+
+  it("releases the primed sound when it refuses the device (F38)", async () => {
+    // Mutation caught: the refusal leaving the context the launch primed
+    // open (nothing will ever borrow it).
+    let closed = 0;
+    class StubContext {
+      state = "suspended";
+      resume() {
+        return Promise.resolve();
+      }
+      close() {
+        closed += 1;
+        return Promise.resolve();
+      }
+    }
+    vi.stubGlobal("AudioContext", StubContext);
+    try {
+      primeAudio();
+      serve();
+      renderAt("/%CF%80/d/eng/e/alpha");
+      await screen.findByText("?DEVICE NOT PRESENT ERROR");
+      await waitFor(() => {
+        expect(closed).toBe(1);
+      });
+      expect(takePrimedAudio()).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+      releasePrimedAudio();
+    }
   });
 
   it("loads the place in its URL and follows the URL", async () => {

@@ -1,10 +1,11 @@
 /**
  * The HUD's prompt line stays readable whatever lies behind it (2.6e C28):
- * over the white doorway of an open police box as over a dark wall.
+ * over the white doorway of an open police box as over a dark wall. And the
+ * frame time is a development aid, drawn only in a development build.
  */
 
 import { render } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Hud, PROMPT_BACKING } from "./Hud";
 import type { HudView } from "./useHud";
@@ -64,5 +65,40 @@ describe("the HUD's prompt (2.6e C28)", () => {
     expect(el.className).toMatch(/(?:^|\s)left-1\/2(?:\s|$)/);
     expect(el.className).toMatch(/(?:^|\s)-translate-x-1\/2(?:\s|$)/);
     expect(el.hidden).toBe(true);
+  });
+});
+
+describe("the HUD's frame line", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** The element the frame line's ref was bound to, or null for none. */
+  function mountedFrame(): HTMLElement | null {
+    let frame: HTMLElement | null = null;
+    const view: HudView = {
+      prompt: () => undefined,
+      status: () => undefined,
+      frame: (el) => {
+        frame = el;
+      },
+      notice: () => undefined,
+    };
+    render(
+      <Hud
+        view={view}
+        connector={{ active: false, label: "", look: "aperture" }}
+      />,
+    );
+    return frame;
+  }
+
+  it("shows the frame line only in development", () => {
+    // Mutation caught: the gate dropped (the frame time drawn in a
+    // production build), or inverted (never drawn in development).
+    vi.stubEnv("DEV", true);
+    expect(mountedFrame()).toBeInstanceOf(HTMLElement);
+    vi.stubEnv("DEV", false);
+    expect(mountedFrame()).toBeNull();
   });
 });

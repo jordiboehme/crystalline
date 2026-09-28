@@ -6,9 +6,9 @@
  * `/π/d/<domain>/e/<permalink>`, and the airlock again for any other path
  * under the prefix - and every room the player walks on to from there.
  *
- * Development only until milestone 4 gives it a way in: the route that
- * renders this exists only under `import.meta.env.DEV` (see `routes.tsx`),
- * so a production build never contains it.
+ * The route ships in every build, as a lazy chunk of its own (see
+ * `routes.tsx`); the C64 screen behind the header's gem is its way in, and
+ * the launch primes the sound in its gesture (`launch.ts`).
  *
  * The URL and the session take turns. The URL is where the player means to
  * be: the session is started on it, and a URL that changes under a running
@@ -30,8 +30,10 @@
  * forward again to a room that failed to load must try it again.
  *
  * The device is refused before the first paint exactly as in the look
- * demo, and the session is created in an effect once the canvas exists and
- * disposed in its cleanup. The HUD is written by the session straight into
+ * demo, and a refused device releases the sound the launch primed, since
+ * nothing will ever borrow it (`releasePrimedAudio`). Otherwise the session
+ * is created in an effect once the canvas exists and disposed in its
+ * cleanup. The HUD is written by the session straight into
  * the DOM (`useHud`); the CRT reader is mounted while a terminal is read,
  * and closing it hands the keys back to the session.
  *
@@ -72,6 +74,7 @@ import { useLocation, useNavigate } from "react-router";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
+import { releasePrimedAudio } from "./launch";
 import {
   addressOfGameLocation,
   domainOf,
@@ -138,6 +141,10 @@ export default function GameRoute() {
   useEffect(() => {
     navigateRef.current = navigate;
   }, [navigate]);
+
+  useEffect(() => {
+    if (refusal !== null) releasePrimedAudio();
+  }, [refusal]);
 
   useEffect(() => {
     addressRef.current = addressAt(pathname, search);
