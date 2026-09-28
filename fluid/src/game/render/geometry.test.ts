@@ -59,6 +59,7 @@ import { CONSOLE_SHELL } from "./models/interior/common";
 import { COLUMN } from "./models/interior/console";
 import { buildDecor, buildFixture, type ModelContext } from "./models";
 import { buildCurioMesh } from "./models/curios";
+import { buildHangar } from "./models/hangar";
 import { buildPropMesh } from "./models/props";
 
 const EPS = 1e-4;
@@ -984,6 +985,41 @@ describe("look 2's seams on the room shell only", () => {
         ).toEqual([]);
       }
     }
+  });
+
+  it("marks the hangar's bay door, pads and gantries and the scaffolding as shell", () => {
+    // Mutation caught: b.markShell() called before buildHangar, or before
+    // the scaffold, so the hangar's structure or the scaffold poles would
+    // stay lit and lose their seams.
+    const hangar = generateDeck(CANNED_HANGAR, 0);
+    expect(hangar.hangar).toBeDefined();
+    const own = createBuilder();
+    buildHangar(own, hangar, LOOKS.aperture);
+    const flags = asBuilt(
+      buildRoomMesh(hangar, LOOKS.aperture).static.vertices,
+      own.build(),
+    );
+    expect(flags.some((f) => f.own === FLAG.lit)).toBe(true);
+    expect(
+      flags.filter((f) =>
+        f.own === FLAG.lit ? f.room !== FLAG.shell : f.room !== f.own,
+      ),
+    ).toEqual([]);
+
+    // Without fixtures and furniture the only metal left is the scaffold.
+    const building: RoomSpec = {
+      ...generateRoom({ ...CANNED_BRIDGE, status: "draft" }),
+      fixtures: [],
+      decor: [],
+    };
+    expect(building.scaffold.length).toBeGreaterThan(0);
+    const poles = all(buildRoomMesh(building, LOOKS.aperture).static).filter(
+      (v) => v.layer === LAYER.metal,
+    );
+    expect(poles.length).toBeGreaterThan(0);
+    expect(
+      poles.filter((v) => v.flag !== FLAG.shell).map((v) => v.flag),
+    ).toEqual([]);
   });
 
   it("keeps the seams on every way through, screen and sign, leaves included, and on no terminal or machine", () => {
