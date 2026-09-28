@@ -2,17 +2,17 @@
  * The station's GLSL: one shader for every surface, four small ones for the
  * bloom and the final picture.
  *
- * The surface shader does DOOM's diminishing light: the cell's level minus a
- * term that grows with distance, clamped to the look's floor and quantised
- * into bands, so light falls off in visible steps the way DOOM's COLORMAP
- * did. The level comes from the room's light grid, a small R8 texture with
- * one texel per grid cell that the renderer refills every frame (see
- * `render/lightgrid.ts`), so a room lights any number of zones at the cost
- * of one texture read. On top come the neon edge lines, drawn where a
- * surface's uv (in metres) crosses a whole number, antialiased with the uv's
- * screen-space derivatives; they are added above 1.0 so the bloom picks them
- * up. The portal surface scrolls its swirl layer and brightens towards its
- * rim.
+ * The surface shader does the classic banded distance light: the cell's
+ * level minus a term that grows with distance, clamped to the look's floor
+ * and quantised into bands, so light falls off in visible steps the way an
+ * old palette-based colour map did. The level comes from the room's light
+ * grid, a small R8 texture with one texel per grid cell that the renderer
+ * refills every frame (see `render/lightgrid.ts`), so a room lights any
+ * number of zones at the cost of one texture read. On top come the neon edge
+ * lines, drawn where a surface's uv (in metres) crosses a whole number,
+ * antialiased with the uv's screen-space derivatives; they are added above
+ * 1.0 so the bloom picks them up. The portal surface scrolls its swirl
+ * layer and brightens towards its rim.
  *
  * Self-lit lights take their own path: the ceiling panels (`FLAG.lamp`)
  * follow their cell's light, but a signal light (`FLAG.signal`: a door's
@@ -332,7 +332,7 @@ void main() {
     base *= 1.0 - uGrime * grime * 0.85;
   }
 
-  // DOOM's diminishing light, then quantised into bands.
+  // The classic banded distance light: fall off, then quantise into bands.
   float dist = distance(uEye, vWorld);
   float lit = clamp(level * uLightScale * 1.25 - dist * uFalloff * (1.1 - level), uMinLight, 1.0);
   lit = floor(lit * uBands + 0.5) / uBands;

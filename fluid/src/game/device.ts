@@ -8,7 +8,8 @@
  *
  * The backbuffer follows the canvas's CSS size and the display's pixel
  * ratio, capped at 1.5: a Retina MacBook Air at full ratio spends most of
- * its GPU on pixels nobody can tell apart in a DOOM-style room.
+ * its GPU on pixels nobody can tell apart in a room with banded,
+ * pixel-sharp light.
  */
 
 /** Why a device is turned away: no WebGL2 at all, or no pointer but a finger. */

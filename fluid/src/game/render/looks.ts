@@ -14,7 +14,7 @@
  *   its ways through, doors in cyan and portals in orange. Props, heroes,
  *   fittings, decor, terminals and machines are plain shaded.
  * - Freescape 64: flat-shaded solid polygons, ordered dithering and the
- *   C64 palette, after Driller and the other Freescape games.
+ *   C64 palette: an 8-bit filled-polygon look.
  *
  * The game always runs in Aperture grid and has no key to switch looks;
  * the dev pages (the look demo and the model gallery) still start in any
@@ -54,11 +54,11 @@ export interface Look {
   };
   /** Multiplies every light level. */
   lightScale: number;
-  /** How quickly light falls off with distance (DOOM's diminishing light). */
+  /** How quickly light falls off with distance (the classic banded distance light). */
   falloff: number;
   /** The darkest a lit surface gets, 0 to 1. */
   minLight: number;
-  /** How many brightness bands the falloff is quantised to (DOOM: 32). */
+  /** How many brightness bands the falloff is quantised to (classically 32). */
   bands: number;
   /** 0 clean to 1 filthy. */
   grime: number;

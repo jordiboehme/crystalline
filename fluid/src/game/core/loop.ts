@@ -1,13 +1,13 @@
 /**
- * The station's heartbeat: logic at DOOM's 35 Hz, pictures as fast as the
- * display asks for them.
+ * The station's heartbeat: logic at the classic 35 Hz tick, pictures as
+ * fast as the display asks for them.
  *
  * Movement, light specials and every other rule advance in fixed 1/35 s
  * ticks, so they behave the same on a 60 Hz laptop and a 144 Hz monitor, and
- * DOOM's light constants (counted in tics) can be used as written. Rendering
- * runs on `requestAnimationFrame` and receives how far the clock is between
- * the last tick and the next one, so the camera can be interpolated and does
- * not stutter at 35 steps a second.
+ * the classic light specials' constants (counted in tics) can be used as
+ * written. Rendering runs on `requestAnimationFrame` and receives how far
+ * the clock is between the last tick and the next one, so the camera can be
+ * interpolated and does not stutter at 35 steps a second.
  *
  * A frame longer than `MAX_FRAME_MS` is cut short. A tab that was hidden for
  * ten minutes would otherwise come back owing twenty thousand ticks and run
@@ -15,7 +15,7 @@
  * nobody was looking.
  */
 
-/** Logic ticks per second, DOOM's `TICRATE`. */
+/** Logic ticks per second, the classic 35 Hz tick rate. */
 export const TICK_HZ = 35;
 
 /** The length of one tick in milliseconds. */

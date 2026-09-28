@@ -5,8 +5,8 @@
  * A band of diagonal hazard stripes wipes across the screen and the
  * destination is spelled out under it, `CONNECTING` and the place's title,
  * in the look the station is drawn in: black and yellow for the day shift,
- * the lab's cyan on black for the aperture grid, and the C64's light blue on
- * blue for the Freescape look. It covers the canvas while the next room is
+ * cyan on black for the aperture grid, and the C64's light blue on blue for
+ * the 8-bit filled-polygon look. It covers the canvas while the next room is
  * loaded and generated, so the player never sees a half-built room or the
  * old room with the new one's URL.
  *

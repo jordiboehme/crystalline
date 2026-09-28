@@ -83,8 +83,8 @@ describe("blink banks", () => {
   });
 });
 
-describe("the DOOM banks out of step", () => {
-  it("has every DOOM bank's groups differ on at least one tick in 700", () => {
+describe("the special-driven banks out of step", () => {
+  it("has every special-driven bank's groups differ on at least one tick in 700", () => {
     for (const bank of ["breathe", "status", "twinkle"] as const) {
       const b = createBlink();
       let differ = 0;
@@ -101,7 +101,7 @@ describe("the DOOM banks out of step", () => {
   });
 
   it("breathes every group through the same glow, each at its own phase", () => {
-    // Each breathe group runs DOOM's glow: the same set of levels, only
+    // Each breathe group runs the classic glow: the same set of levels, only
     // shifted in time, so a group's run over one long stretch holds the
     // same values as group 0's.
     const b = createBlink();

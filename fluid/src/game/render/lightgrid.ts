@@ -53,7 +53,7 @@ export function lightGrid(room: RoomSpec): LightGrid {
 
 /**
  * Writes one tick's light into `out`, one byte per cell of the grid: the
- * zone's level from `levels` (DOOM's 0 to 255 scale, in `room.lights`
+ * zone's level from `levels` (the 0 to 255 light scale, in `room.lights`
  * order, as `LightState.levels` holds them), rounded and clamped to 0..255,
  * and 0 for a void cell. `out` must hold `width * depth` bytes; it is
  * written in place so the renderer can reuse one array every tick.

@@ -131,7 +131,7 @@ export interface Camera {
  * - `resize` rebuilds the offscreen targets for a new canvas size in device
  *   pixels.
  * - `draw` renders one frame: `levels` holds the zones' current light
- *   levels (DOOM's 0 to 255 scale, in `room.lights` order), `seconds` the
+ *   levels (the 0 to 255 light scale, in `room.lights` order), `seconds` the
  *   time for the portal's swirl, `doors` each door's open fraction by its
  *   leaves' mover key (`door:<fixtureIndex>`), 0 closed to 1 open (a key
  *   that is missing is a closed door, and a fraction outside 0..1 is
@@ -244,8 +244,8 @@ interface Targets {
 }
 
 /**
- * Vertical field of view: 70 degrees, a little wider than DOOM's feel on a
- * tall screen.
+ * Vertical field of view: 70 degrees, a little wider than a classic
+ * corridor shooter's feel on a tall screen.
  */
 const FOV_Y = (70 * Math.PI) / 180;
 

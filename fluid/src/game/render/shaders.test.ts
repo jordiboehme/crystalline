@@ -61,7 +61,7 @@ describe("the scene shader's blink and signal paths", () => {
     const lamp = main.indexOf(`vFlag == ${String(FLAG.lamp)}`);
     const signal = main.indexOf(`vFlag == ${String(FLAG.signal)}`);
     const blink = main.indexOf(`vFlag >= ${String(FLAG.blink)}`);
-    const lit = main.indexOf("DOOM's diminishing light");
+    const lit = main.indexOf("The classic banded distance light");
     expect(lamp).toBeGreaterThan(0);
     expect(signal).toBeGreaterThan(lamp);
     expect(blink).toBeGreaterThan(signal);
@@ -121,8 +121,8 @@ it("swaps the accent mark for uAccent in the vertex shader (2.7 C8)", () => {
 describe("the scene shader's decal branch", () => {
   it("alpha-tests a decal against the ordered threshold and never draws its edges (2.7 C20)", () => {
     // Mutation caught: no discard (every decal an opaque square), the test on
-    // the tinted colour instead of the texel's alpha (Freescape would lose
-    // the shapes), or edge lines on decals in the Aperture look.
+    // the tinted colour instead of the texel's alpha (the untextured 8-bit
+    // look would lose the shapes), or edge lines on decals in look 2.
     expect(FLAG.decal).toBe(14);
     expect(SCENE_FS).toContain("float bayer4(vec2 p)");
     expect(SCENE_FS).toMatch(

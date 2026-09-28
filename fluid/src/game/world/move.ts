@@ -1,5 +1,5 @@
 /**
- * Walking: DOOM's feel, the station's walls.
+ * Walking: a classic corridor shooter's feel, the station's walls.
  *
  * Movement is fast with little inertia - the player reaches full speed in a
  * few ticks and stops almost as quickly - and the head bobs a little with the

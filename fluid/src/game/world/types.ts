@@ -657,7 +657,7 @@ export interface Box {
   z1: number;
 }
 
-/** DOOM's light specials, the ones the station uses. */
+/** The classic light specials, the ones the station uses. */
 export type LightSpecial = "steady" | "glow" | "flicker" | "strobe" | "failing";
 
 /** A rectangle of cells sharing one light level and special. */
@@ -668,7 +668,7 @@ export interface LightZone {
   x1: number;
   /** Exclusive. */
   y1: number;
-  /** DOOM's scale, 0 to 255. */
+  /** The light scale, 0 to 255. */
   level: number;
   special: LightSpecial;
   seed: number;

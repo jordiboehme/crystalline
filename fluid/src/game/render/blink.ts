@@ -12,11 +12,11 @@
  *
  * - `steady` (slot 0): every group at 1. The static room, the movers and
  *   the props all read slot 0, so they are unchanged.
- * - `breathe`: DOOM's glow special at level 255, one cycle recorded once
+ * - `breathe`: the classic glow special at level 255, one cycle recorded once
  *   from `createLights` (`GLOW_CYCLE`); each group reads it at its own
  *   seeded phase, since the glow itself draws no random numbers and would
  *   otherwise run every group in step.
- * - `status` and `twinkle`: DOOM's strobe and flicker specials, one light
+ * - `status` and `twinkle`: the classic strobe and flicker specials, one light
  *   zone of level 255 per group, each group with its own seed, so the
  *   groups of a bank are out of step.
  * - `swap`: groups 0 to 3 lit while 4 to 7 are low, the other way round
@@ -29,9 +29,9 @@
  *   just under the bloom threshold that must still read lit at its lowest
  *   (the console room's glowing roundels, 2.6e C26).
  *
- * A low group reads `BLINK_LOW`, a lit one 1; the DOOM banks move between
- * their special's low level and 255, divided by 255, and never below
- * `BLINK_LOW`.
+ * A low group reads `BLINK_LOW`, a lit one 1; the special-driven banks
+ * move between their special's low level and 255, divided by 255, and
+ * never below `BLINK_LOW`.
  *
  * Like the light specials (`lights.ts`), all of this runs on the CPU once
  * per 35 Hz tick, counted in ticks and seeded by names, so the
@@ -76,7 +76,7 @@ export const CHASE_TICS = 5;
 export const SOFT_FLOOR = 0.9;
 
 /**
- * The DOOM special behind each bank run as light zones: the strobe and the
+ * The light special behind each bank run as light zones: the strobe and the
  * flicker draw from each zone's seed, so their groups fall out of step by
  * themselves. The breathe bank's glow draws nothing and is phased by hand
  * (`GLOW_CYCLE`).
@@ -93,7 +93,7 @@ const SPECIAL: Partial<Record<BlinkBank, LightSpecial>> = {
 const GLOW_CYCLE_MAX = 1000;
 
 /**
- * One whole cycle of DOOM's glow at level 255, tick by tick from its start
+ * One whole cycle of the classic glow at level 255, tick by tick from its start
  * (255, heading down, through its low level and back up): recorded once
  * from `createLights` with a single glow zone, so the breathe bank moves
  * exactly as a glowing light zone does. It ends on the tick before the
@@ -146,11 +146,11 @@ export function createBlink(): BlinkState {
     { length: BLINK_GROUPS },
     (_, g) => seedFor("blink", "breathe", g) % GLOW_CYCLE.length,
   );
-  const doom = BLINK_BANKS.flatMap((bank) => {
+  const specialBanks = BLINK_BANKS.flatMap((bank) => {
     const special = SPECIAL[bank];
     return special === undefined ? [] : [{ at: base(bank), bank, special }];
   });
-  const zones: LightZone[] = doom.flatMap(({ bank, special }) =>
+  const zones: LightZone[] = specialBanks.flatMap(({ bank, special }) =>
     Array.from({ length: BLINK_GROUPS }, (_, g) => ({
       x0: 0,
       y0: 0,
@@ -164,11 +164,11 @@ export function createBlink(): BlinkState {
   const lights = createLights(zones);
   let ticks = 0;
   const fill = () => {
-    // DOOM's flicker and strobe low level is round(0.15 * 255) = 38, and
-    // 38 / 255 is 0.149, a hair under BLINK_LOW: every DOOM gain is
+    // The classic flicker and strobe low level is round(0.15 * 255) = 38,
+    // and 38 / 255 is 0.149, a hair under BLINK_LOW: every special's gain is
     // clamped, so no group of any bank is ever darker than a swap or chase
     // group. The glow's low level (0.4) is above it anyway.
-    doom.forEach(({ at }, k) => {
+    specialBanks.forEach(({ at }, k) => {
       for (let g = 0; g < BLINK_GROUPS; g++)
         gains[at + g] = Math.max(
           BLINK_LOW,
