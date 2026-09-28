@@ -186,8 +186,8 @@
  * cut into the console room, a re-check's re-entry or swap. `step` for
  * each footstep the tick's stride makes (`stepsBetween`), numbered through
  * the session, feet alternating, only while the player may move (not
- * while anything is modal or a place loads). `door` for every door, exit,
- * lift or police box whose target turned (`doorCues`), after the doors
+ * while anything is modal or a place loads). `door` for every door, exit
+ * or police box whose target turned (`doorCues`), after the doors
  * and the boxes stepped. `fault` for every broken way that started a run
  * (`faultCues`), after the faults stepped. `travel` for every way taken
  * (a door, a portal, a hatch, an exit) and a lift ride. `terminal` when
