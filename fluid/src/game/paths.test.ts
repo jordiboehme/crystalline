@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 
 import { engramRoute } from "../paths";
+import type { StationAddress } from "./world/types";
 import {
   MANIFEST_PERMALINK,
+  addressOfGameLocation,
   bridgeAddress,
+  canonicalStation,
   fluidRouteOf,
+  fluidRouteOfStation,
   gameEngramRoute,
+  gameRouteOf,
   placeKeyOf,
+  sameStation,
 } from "./paths";
 
 describe("gameEngramRoute", () => {
@@ -103,5 +109,86 @@ describe("bridgeAddress", () => {
     expect(gameEngramRoute(bridge.domain, bridge.permalink)).toBe(
       "/%CF%80/d/platform%20eng/e/manifest",
     );
+  });
+});
+
+describe("station addresses (M3 C1 to C5)", () => {
+  const cases: [StationAddress, string, string][] = [
+    [{ kind: "airlock" }, "/%CF%80", "/"],
+    [{ kind: "bridge", domain: "eng" }, "/%CF%80/d/eng", "/d/eng"],
+    [
+      { kind: "deck", domain: "eng", folder: "", section: 0 },
+      "/%CF%80/d/eng?path=",
+      "/d/eng",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "My Notes", section: 0 },
+      "/%CF%80/d/eng?path=My%20Notes",
+      "/d/eng?path=My%20Notes",
+    ],
+    [
+      { kind: "deck", domain: "eng", folder: "a&b#c", section: 2 },
+      "/%CF%80/d/eng?path=a%26b%23c&section=3",
+      "/d/eng?path=a%26b%23c",
+    ],
+    [
+      { kind: "engram", domain: "e", permalink: "e/x" },
+      "/%CF%80/d/e/e/e/x",
+      "/d/e/e/e/x",
+    ],
+  ];
+
+  it("round-trips every address kind through its route, awkward names included (Review Focus 1)", () => {
+    // Mutation caught: a section written 0-based, `path` written with
+    // URLSearchParams (a space as `+`), a domain called `e` read as an engram route.
+    expect(cases.length).toBeGreaterThan(0);
+    for (const [address, game, fluid] of cases) {
+      const url = new URL(gameRouteOf(address), "http://x");
+      expect(url.pathname + url.search).toBe(game);
+      expect(addressOfGameLocation(url.pathname, url.search)).toEqual(address);
+      expect(fluidRouteOfStation(address)).toBe(fluid);
+    }
+  });
+
+  it("reads the MANIFEST route as the bridge and an unknown game path as the airlock", () => {
+    // Mutation caught: a nested `manifest` canonicalised, an unknown game
+    // path answered null (the route would render nothing), a bad section
+    // number passed through.
+    expect(
+      canonicalStation({
+        kind: "engram",
+        domain: "eng",
+        permalink: "MANIFEST",
+      }),
+    ).toEqual({ kind: "bridge", domain: "eng" });
+    expect(
+      canonicalStation({
+        kind: "engram",
+        domain: "eng",
+        permalink: "notes/manifest",
+      }).kind,
+    ).toBe("engram");
+    expect(addressOfGameLocation("/%CF%80/foo", "")).toEqual({
+      kind: "airlock",
+    });
+    expect(addressOfGameLocation("/d/eng", "")).toBeNull();
+    expect(addressOfGameLocation("/%CF%80/d/eng", "?path=x&section=0")).toEqual(
+      { kind: "deck", domain: "eng", folder: "x", section: 0 },
+    );
+    expect(
+      addressOfGameLocation("/%CF%80/d/eng", "?path=x&section=zz"),
+    ).toEqual({ kind: "deck", domain: "eng", folder: "x", section: 0 });
+  });
+
+  it("never takes an unresolved deck for a resolved one", () => {
+    // Mutation caught: `null` compared as 0.
+    const deck = { kind: "deck", domain: "eng", folder: "x" } as const;
+    expect(
+      sameStation({ ...deck, section: null }, { ...deck, section: 0 }),
+    ).toBe(false);
+    expect(sameStation({ ...deck, section: 1 }, { ...deck, section: 1 })).toBe(
+      true,
+    );
+    expect(sameStation(null, { kind: "airlock" })).toBe(false);
   });
 });

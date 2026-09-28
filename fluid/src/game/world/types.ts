@@ -16,6 +16,10 @@
  * `interior`: its fittings, a family of their own (`InteriorPiece`). No
  * generated room has the key, and an absent key is not written by
  * `JSON.stringify`, so the goldens do not see it.
+ *
+ * `StationAddress` is a third family beside them: not what a room is built
+ * from or turns into, but where in the station one is - the pure address
+ * space `paths.ts`, `world/folders.ts` and the session agree on.
  */
 
 /** Where a reference lands, once the graph located it. */
@@ -23,6 +27,25 @@ export interface PlaceAddress {
   domain: string;
   permalink: string;
 }
+
+/**
+ * Where the game places a player (M3 C1): the pure address space the
+ * session, the routes and the generators agree on, kept apart from
+ * `PlaceAddress` because the airlock and a deck have neither an engram nor
+ * a permalink of their own.
+ *
+ * `folder` is the raw tree path a folder is found at, `""` for a domain's
+ * root. A deck's `section` is 0-based; `null` means unresolved - the section
+ * that holds the engram the player walked up from, or the first, resolved
+ * once the deck is built - so a session only ever holds and compares
+ * resolved addresses (`sameStation` in `paths.ts` treats `null` as unequal
+ * to any number, never as 0).
+ */
+export type StationAddress =
+  | { kind: "airlock" }
+  | { kind: "bridge"; domain: string }
+  | { kind: "deck"; domain: string; folder: string; section: number | null }
+  | { kind: "engram"; domain: string; permalink: string };
 
 /**
  * A relation or prose wikilink, as the engram detail parses it and the

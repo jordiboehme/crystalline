@@ -27,6 +27,11 @@
  * Each way also carries the type of the engram it leads to, read from the
  * same graph (2.6f C10), so the generator knows its neighbours' archetypes
  * without a request of its own.
+ *
+ * `addressOfRoute` (in `../paths`) reads a resolved wikilink's href back
+ * into an address: a plain Fluid engram route, the same shape
+ * `addressOfGameLocation` reads under the game's `π` prefix, so the two stay
+ * one fact rather than two copies.
  */
 
 import type { EngramDetail, EngramReference } from "../../api/engram";
@@ -39,10 +44,9 @@ import {
   referenceState,
   type WikilinkResolver,
 } from "../../wikilinks";
-import { placeKeyOf } from "../paths";
+import { addressOfRoute, placeKeyOf } from "../paths";
 import {
   HATCH_CAP,
-  type PlaceAddress,
   type PlaceInbound,
   type PlaceInput,
   type PlaceReference,
@@ -70,36 +74,6 @@ export interface PlaceSources {
   domains: DomainSpellings | undefined;
   inbound: InboundRefPage | null;
   targetSalience: ReadonlyMap<string, number | null>;
-}
-
-/**
- * Read an engram route (`/d/<domain>/e/<permalink>`) back into its address,
- * or null when it is not one.
- *
- * Split into segments and read by position rather than searched for `/e/`, so
- * a domain that happens to be called `e` still reads right. Every segment is
- * decoded on its own, the inverse of how `engramRoute` encoded it.
- */
-function addressOfRoute(href: string): PlaceAddress | null {
-  const [lead, d, domain, e, ...rest] = href.split("/");
-  if (
-    lead !== "" ||
-    d !== "d" ||
-    e !== "e" ||
-    domain === undefined ||
-    domain === "" ||
-    rest.length === 0
-  ) {
-    return null;
-  }
-  try {
-    return {
-      domain: decodeURIComponent(domain),
-      permalink: rest.map((segment) => decodeURIComponent(segment)).join("/"),
-    };
-  } catch {
-    return null;
-  }
 }
 
 /** Compare two strings by code unit, the same on every machine and locale. */
