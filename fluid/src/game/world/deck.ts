@@ -23,9 +23,11 @@
  *    first engrams are nearest the lift, and the deck's screen on the north
  *    wall's centre edge;
  * 4. lights the grid as a generated room of salience 5 (`lightsFor`) and
- *    hands the base to `furnish` with no neighbours, which stands the
- *    heroes, dresses the hall and lays the curios, the finish and the
- *    decals exactly as it does for an engram's room.
+ *    hands the base to `furnish` with no neighbours and the hall's centre
+ *    column reserved (`centreLane`), which stands the heroes, dresses the
+ *    hall and lays the curios, the finish and the decals as it does for an
+ *    engram's room, keeping every hero and floor prop out of that column,
+ *    so the corridor stays open from the lift to the screen.
  *
  * Every door is a `sliding` door with `relType` `""`, labelled with the
  * engram's title: the tree carries no salience, so every door is the same
@@ -52,9 +54,16 @@ import {
   sectionsOf,
 } from "./folders";
 import { furnish, lightsFor } from "./generate";
-import { LIFT_WORDS, deckLabel, deckStops, moreLine } from "./lifts";
-import { NO_NEAR, type RoomBase } from "./sites";
+import {
+  LIFT_WORDS,
+  deckLabel,
+  deckStops,
+  engramCount,
+  moreLine,
+} from "./lifts";
+import { NO_NEAR, type Reserved, type RoomBase } from "./sites";
 import type { Fixture, Rect, RoomSpec, WallSlot } from "./types";
+import { CELL } from "./units";
 
 /**
  * One engram directly in a folder, as the tree lists it: its permalink,
@@ -125,8 +134,9 @@ function deckSections(input: DeckInput): DeckRow[][] {
 /**
  * The deck's screen (M3 C8, C11, C12): the deck's label, then
  * `SECTION <label> (<i> OF <k>)` when the deck has more than one section,
- * then `<count> ENGRAMS` (the level's engrams less the root MANIFEST) or
- * `NO ENGRAMS`, then `+<n> MORE` for the rows the server cut.
+ * then how many engrams the level holds less the root MANIFEST
+ * (`engramCount`: `NO ENGRAMS`, `1 ENGRAM` or `<n> ENGRAMS`), then
+ * `+<n> MORE` for the rows the server cut.
  */
 function screenLines(
   input: DeckInput,
@@ -142,11 +152,7 @@ function screenLines(
     input.folder === "" &&
     input.rows.some((r) => isManifestPermalink(r.permalink));
   const count = Math.max(0, input.total - (manifest ? 1 : 0));
-  lines.push(
-    count === 0
-      ? LIFT_WORDS.noEngrams
-      : `${String(count)} ${LIFT_WORDS.engrams}`,
-  );
+  lines.push(engramCount(count));
   if (input.truncated) lines.push(moreLine(input.total - input.rows.length));
   return lines;
 }
@@ -251,7 +257,24 @@ export function generateDeck(input: DeckInput, section: number): RoomSpec {
     dropped: 0,
     inboundMore: 0,
   };
-  return furnish(base, NO_NEAR);
+  return furnish(base, NO_NEAR, centreLane(centre, depth));
+}
+
+/**
+ * What a deck hub keeps clear (M3 C9): its whole centre column, north wall
+ * to south wall, as a reserved box that no hero and no floor prop enters,
+ * so the corridor stays open from the lift to the screen. The sight line
+ * from the spawn to the screen's glass lies inside it. No edge is
+ * reserved, so wall props and runs are placed as in any room. A hangar is
+ * a hall, not a corridor, and takes no such box.
+ */
+function centreLane(centre: number, depth: number): Reserved {
+  return {
+    boxes: [
+      { x0: centre * CELL, x1: (centre + 1) * CELL, z0: 0, z1: depth * CELL },
+    ],
+    edges: new Set<string>(),
+  };
 }
 
 /**

@@ -234,16 +234,7 @@
   ],
   "decor": [],
   "scaffold": [],
-  "heroes": [
-    {
-      "kind": "black-slab",
-      "variant": 0,
-      "x": 2.5,
-      "y": 3.925,
-      "turn": 2,
-      "seed": 1132015230917138
-    }
-  ],
+  "heroes": [],
   "props": [
     {
       "kind": "extinguisher",

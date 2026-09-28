@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_DECK } from "./canned";
 import { deckRoomSection, generateDeck, type DeckInput } from "./deck";
-import { isManifestPermalink } from "./folders";
+import { folderDeck, isManifestPermalink } from "./folders";
+import { heroFootprint, propFootprint } from "./footprints";
 import deckGolden from "./golden/deck.json?raw";
 import { deckLabel } from "./lifts";
-import type { RoomSpec } from "./types";
+import { overlaps } from "./sites";
+import type { Box, RoomSpec } from "./types";
+import { CELL } from "./units";
 
 /**
  * A root deck in domain `station`: `n` engrams `e000`, `e001`, ... and the
@@ -45,6 +48,33 @@ function deckAt(n: number, total: number): DeckInput {
   return { ...whole, total, truncated: true };
 }
 
+/**
+ * A deck of folder `folder` in domain `station`: `n` engrams directly in
+ * it, permalinks under the folder's own name, no subfolders, the whole
+ * level.
+ */
+function folderDeckOf(folder: string, n: number): DeckInput {
+  return {
+    domain: "station",
+    folder,
+    rows: Array.from({ length: n }, (_, i) => ({
+      permalink: `${folder}/e${String(i).padStart(3, "0")}`,
+      title: `Entry ${String(i)}`,
+      type: "engram",
+      status: "stable",
+    })),
+    subfolders: [],
+    total: n,
+    truncated: false,
+  };
+}
+
+/** A deck's centre column, north wall to south wall, in metres. */
+function centreColumn(room: RoomSpec): Box {
+  const x = Math.floor(room.width / 2);
+  return { x0: x * CELL, x1: (x + 1) * CELL, z0: 0, z1: room.depth * CELL };
+}
+
 /** The lines of the room's screen. */
 function screenLines(room: RoomSpec): string[] {
   const screen = room.fixtures.find((f) => f.kind === "screen");
@@ -54,10 +84,13 @@ function screenLines(room: RoomSpec): string[] {
 describe("the deck hub (M3 C8 to C12)", () => {
   it("gives every engram of the level exactly one door across the sections (Review Focus 2)", () => {
     // Mutation caught: a door lost at a section's cut, a door made twice, the MANIFEST kept on the root deck.
-    const counts = [0, 1, 24, 25, 49];
-    expect(counts.length).toBeGreaterThan(0);
-    for (const n of counts) {
-      const input = deckOf(n);
+    const inputs = [0, 1, 24, 25, 48, 49].map(deckOf);
+    inputs.push(deckAt(500, 812));
+    expect(inputs.length).toBeGreaterThan(0);
+    for (const input of inputs) {
+      const n = input.rows.filter(
+        (r) => !isManifestPermalink(r.permalink),
+      ).length;
       const sections = Math.max(1, Math.ceil(n / 24));
       const seen: string[] = [];
       for (let s = 0; s < sections; s++)
@@ -91,6 +124,9 @@ describe("the deck hub (M3 C8 to C12)", () => {
       "e",
     ]);
     expect(doors[0]?.slot.y).toBe(room.depth - 2);
+    expect(doors.map((d) => d.slot.y).slice(0, 6)).toEqual([
+      24, 24, 22, 22, 20, 20,
+    ]);
     expect(
       doors.every(
         (d) => d.kind === "door" && d.style === "sliding" && d.relType === "",
@@ -105,6 +141,10 @@ describe("the deck hub (M3 C8 to C12)", () => {
     expect(screenLines(generateDeck(deckOf(10), 0))).toEqual([
       deckLabel("station", ""),
       "10 ENGRAMS",
+    ]);
+    expect(screenLines(generateDeck(deckOf(1), 0))).toEqual([
+      deckLabel("station", ""),
+      "1 ENGRAM",
     ]);
     expect(
       screenLines(generateDeck({ ...deckOf(0), subfolders: ["a"] }, 0)),
@@ -128,6 +168,56 @@ describe("the deck hub (M3 C8 to C12)", () => {
     expect(deckRoomSection(input, 9, "nowhere")).toBe(2);
     expect(deckRoomSection(input, null, null)).toBe(0);
   });
+
+  it("numbers a deck of a folder that is not its own slug like its label (M3 C6, C10)", () => {
+    // Mutation caught: the room's permalink made of the raw folder instead
+    // of its slug, so the stencils read another deck than the title.
+    const folders = ["Old Logs", "My Notes", "a/b c/d"];
+    expect(folders.length).toBeGreaterThan(0);
+    for (const folder of folders) {
+      const room = generateDeck(folderDeckOf(folder, 3), 0);
+      const deck = folderDeck("station", folder);
+      expect(room.title).toBe(deckLabel("station", folder));
+      expect(room.title.split(" ")[1]).toBe(String(deck));
+      const stencils = room.decals.filter((d) => d.stencil !== undefined);
+      expect(stencils.length).toBeGreaterThan(0);
+      for (const d of stencils) expect(d.stencil?.deck, folder).toBe(deck);
+    }
+  });
+
+  it("builds a section past either end as the nearest section, seed included", () => {
+    // Mutation caught: the seed taken from the section asked for instead of
+    // the clamped one, so one place becomes two rooms.
+    expect(generateDeck(CANNED_DECK, 9)).toEqual(generateDeck(CANNED_DECK, 1));
+    expect(generateDeck(CANNED_DECK, -3)).toEqual(generateDeck(CANNED_DECK, 0));
+  });
+
+  it("keeps the deck's centre column clear of heroes and floor props (M3 C9)", () => {
+    // Mutation caught: the centre box not handed to `furnish`, or the hero
+    // pass not keeping off `reserved`. The count of decks that still stand a
+    // hero catches a fix that keeps heroes out of decks altogether.
+    const rooms: RoomSpec[] = [];
+    for (let f = 0; f < 60; f++)
+      for (const n of [1, 3, 6, 10, 17, 24])
+        rooms.push(generateDeck(folderDeckOf(`f${String(f)}`, n), 0));
+    expect(rooms.length).toBe(360);
+    let withHero = 0;
+    for (const room of rooms) {
+      const lane = centreColumn(room);
+      if (room.heroes.length > 0) withHero++;
+      for (const h of room.heroes)
+        expect(
+          overlaps(heroFootprint(h), lane),
+          `${room.title} ${h.kind}`,
+        ).toBe(false);
+      for (const p of room.props) {
+        const box = propFootprint(p);
+        if (box !== null)
+          expect(overlaps(box, lane), `${room.title} ${p.kind}`).toBe(false);
+      }
+    }
+    expect(withHero).toBeGreaterThanOrEqual(100);
+  }, 30_000);
 
   it("builds the same deck twice and matches the golden byte for byte", () => {
     // Mutation caught: any change to the builder's output, key order included.

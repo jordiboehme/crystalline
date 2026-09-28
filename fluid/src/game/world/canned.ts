@@ -84,7 +84,13 @@ import {
   type Layout,
   type SlotPref,
 } from "./layout";
-import { LIFT_WORDS, airlockStops, deckLabel, moreLine } from "./lifts";
+import {
+  LIFT_WORDS,
+  airlockStops,
+  deckLabel,
+  engramCount,
+  moreLine,
+} from "./lifts";
 import { PROP_CATALOGUE, PROP_KINDS, USE_LANE_DEPTH } from "./props";
 import { wallAnchor } from "./sites";
 import type {
@@ -1370,7 +1376,7 @@ export function liftsHallRoom(): RoomSpec {
       slot: { x: entrance.x, y: layout.hall.y0, side: "n" },
       lines: [
         "atlas",
-        `42 ${LIFT_WORDS.engrams}`,
+        engramCount(42),
         ...LIFTS_HALL_SCREEN_DOMAINS,
         moreLine(3),
       ],

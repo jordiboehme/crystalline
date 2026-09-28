@@ -51,6 +51,7 @@ export const LIFT_WORDS = {
   up: "UP",
   deck: "DECK",
   section: "SECTION",
+  engram: "ENGRAM",
   engrams: "ENGRAMS",
   noDecks: "NO DECKS",
   noEngrams: "NO ENGRAMS",
@@ -83,6 +84,16 @@ export const SCREEN_LINES = 12;
 export function deckLabel(domain: string, folder: string): string {
   const deck = `${LIFT_WORDS.deck} ${String(folderDeck(domain, folder))}`;
   return folder === "" ? deck : `${deck} ${folderName(folder).toUpperCase()}`;
+}
+
+/**
+ * How many engrams a screen names (M3 C8, C12): `NO ENGRAMS` for none,
+ * `1 ENGRAM` for one, `<n> ENGRAMS` for more. The deck's screen and the
+ * bridge's count line both read it, so the two never spell a count apart.
+ */
+export function engramCount(n: number): string {
+  if (n === 0) return LIFT_WORDS.noEngrams;
+  return `${String(n)} ${n === 1 ? LIFT_WORDS.engram : LIFT_WORDS.engrams}`;
 }
 
 /** The overflow line of a panel or screen: `+<n> MORE`. */

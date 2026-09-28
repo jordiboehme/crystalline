@@ -734,8 +734,10 @@ export function generateRoom(place: PlaceInput): RoomSpec {
  * tail every generator shares once its floor plan, fixtures, furniture,
  * scaffold and lights are set in `base`. The heroes stand first
  * (`placeHeroes` with the room's own draws and sites, skipping what `near`
- * draws), then `dressRoom` adds the props, keeping off what the heroes
- * reserve and what `reserved` names (none by default), then the curios on
+ * draws, and keeping off `reserved.boxes` as they keep off a lane), then
+ * `dressRoom` adds the props, keeping off what the heroes reserve and what
+ * `reserved` names (none by default: `NO_RESERVE` leaves the sites the
+ * hero pass reads as they were), then the curios on
  * the dressed room, the finish by the room's seed and its bay count, and
  * the decals on the finished room. A room with no neighbours passes
  * `NO_NEAR`.
@@ -752,10 +754,16 @@ export function furnish(
   reserved: Reserved = NO_RESERVE,
 ): RoomSpec {
   // The heroes stand before the dressing, which keeps off what they
-  // reserve.
+  // reserve. They keep off `reserved.boxes` as they keep off a lane.
+  const sites = dressingSites(base);
   const room: RoomBase = {
     ...base,
-    heroes: placeHeroes(base, heroDraws(base), dressingSites(base), near),
+    heroes: placeHeroes(
+      base,
+      heroDraws(base),
+      { ...sites, lanes: [...sites.lanes, ...reserved.boxes] },
+      near,
+    ),
   };
   // The curios come last, on the dressed room, since shelves and filing
   // cabinets are props; they read everything and move nothing.

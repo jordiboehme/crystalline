@@ -13,6 +13,7 @@ import {
   byLabel,
   deckLabel,
   deckStops,
+  engramCount,
   moreLine,
 } from "./lifts";
 import liftsSource from "./lifts.ts?raw";
@@ -158,6 +159,14 @@ describe("the lift stops (M3 C7, C12, C24)", () => {
       `DECK ${String(folderDeck("eng", "notes/My Stuff"))} MY STUFF`,
     );
     expect(moreLine(7)).toBe("+7 MORE");
+  });
+
+  it("counts engrams on a screen, one in the singular and none in words", () => {
+    // Mutation caught: the plural kept for one engram, `0 ENGRAMS` written
+    // instead of `NO ENGRAMS`.
+    expect(engramCount(0)).toBe("NO ENGRAMS");
+    expect(engramCount(1)).toBe("1 ENGRAM");
+    expect(engramCount(42)).toBe("42 ENGRAMS");
   });
 
   it("sorts IDCLEV's rows with the same comparator", () => {

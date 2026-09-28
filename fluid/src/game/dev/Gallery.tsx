@@ -132,7 +132,10 @@ export default function Gallery() {
               : hall === "deck"
                 ? generateDeck(
                     CANNED_DECK,
-                    Math.max(0, Number(params.get("section") ?? "1") - 1 || 0),
+                    Math.max(
+                      0,
+                      Math.floor(Number(params.get("section") ?? "1")) - 1 || 0,
+                    ),
                   )
                 : galleryRoom();
     const at = params.get("at");
