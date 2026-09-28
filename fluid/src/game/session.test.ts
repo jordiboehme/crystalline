@@ -1674,6 +1674,27 @@ describe("malfunctions", () => {
     expect(hud.prompt).toHaveBeenCalledWith("SEALED ?FILE NOT FOUND");
   });
 
+  it("sends one fault cue per run of a stuttering door, placed (M4 C23, F15)", () => {
+    // Mutation caught: the fault cues not sent, or sent every frame.
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    session.showRoom(before(gallery, door4));
+    frames(60);
+    const runs = faultsSince().reduce(
+      (n, m, i, all) => (m.has(door4) && !all[i - 1]?.has(door4) ? n + 1 : n),
+      0,
+    );
+    expect(runs).toBeGreaterThanOrEqual(1);
+    const faults = cues.filter(
+      (c): c is Extract<Cue, { kind: "fault" }> => c.kind === "fault",
+    );
+    expect(faults).toHaveLength(runs);
+    faults.forEach((c, i) => {
+      expect(c).toMatchObject({ way: "door", run: i + 1 });
+      expect(c.gain).toBeGreaterThan(0.3);
+    });
+  });
+
   it("leaves a NO ROUTE door still", () => {
     const session = start({ client: null });
     session.showRoom(before(gallery, door3));
@@ -3265,6 +3286,8 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
       const { cues, sink } = recordSound();
       const { session } = atDeckLift(load, undefined, sink);
       pressUse();
+      // The lift's stops open with a terminal cue.
+      expect(cues.at(-1)).toEqual({ kind: "terminal" });
       const i = stopTo("bridge");
       const stop = liftOf(deck).stops[i]!;
       cues.length = 0;
@@ -4813,8 +4836,9 @@ describe("sound cues (M4 Task 7)", () => {
   });
 
   it("mutes on M and flashes the state", () => {
-    // Mutation caught: M read while modal.
-    const { sink } = recordSound([true, false]);
+    // Mutation caught: M read while modal; the reader's terminal cue
+    // missing.
+    const { cues, sink } = recordSound([true, false]);
     const session = start({ client: null, sound: sink });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
@@ -4838,6 +4862,7 @@ describe("sound cues (M4 Task 7)", () => {
     expect(hud.reader).toHaveBeenLastCalledWith(
       expect.objectContaining({ title: "Station Crystalline" }),
     );
+    expect(cues.at(-1)).toEqual({ kind: "terminal" });
     const notices = hud.notice.mock.calls.length;
     pressM();
     frames(2);
@@ -4857,6 +4882,18 @@ describe("sound cues (M4 Task 7)", () => {
     expect(
       hud.notice.mock.calls.some(([t]) => t !== null && t.startsWith("SOUND")),
     ).toBe(false);
+  });
+
+  it("sends a terminal cue when the level select opens", () => {
+    // Mutation caught: the level select opening silently.
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, onLevels: vi.fn(), sound: sink });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    cues.length = 0;
+    type("idclev");
+    frames(1);
+    expect(cues).toEqual([{ kind: "terminal" }]);
   });
 
   it("sends the police box's take-off and landing, and the jump", async () => {
