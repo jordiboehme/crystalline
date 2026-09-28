@@ -950,6 +950,12 @@ impl Engine {
                     .map(str::trim)
                     .filter(|h| !h.is_empty())
                     .map(str::to_string),
+                resource: fm
+                    .resource
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),
                 // Filled in by the caller that has the store: the sweep is

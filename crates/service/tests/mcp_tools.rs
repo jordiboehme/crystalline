@@ -3825,6 +3825,28 @@ async fn tool_descriptions_teach_settable_provenance() {
     );
 }
 
+/// evolve_engrams' copy names V111 and the verb that repairs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_v111() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let evolve = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "evolve_engrams")
+        .expect("evolve_engrams tool present");
+    let description = evolve.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("V111"),
+        "evolve_engrams names V111: {description}"
+    );
+    assert!(
+        description.contains("set_frontmatter key resource"),
+        "evolve_engrams names the repair: {description}"
+    );
+}
+
 /// A date key goes through the temporal write contract, so a timestamp is
 /// rejected with the standard message and a sentinel bound is dropped rather
 /// than written.

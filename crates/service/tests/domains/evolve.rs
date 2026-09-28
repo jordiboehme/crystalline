@@ -3167,3 +3167,69 @@ async fn f5_known_domains_covers_every_spelling_so_v102_never_calls_it_unregiste
         "eng is a domain's canonical name and must be recognized as registered: {evidence}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// V111 - an ingested engram that names no resource
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v111_fires_on_an_ingested_engram_without_resource_and_clears_once_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("eng");
+    std::fs::create_dir_all(dir.join("sources")).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        crystalline_core::manifest_template("eng", "2026-07-25"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("sources/ops-wiki.md"),
+        "---\ntype: ingestion\ntitle: Ops wiki\npermalink: sources/ops-wiki\ntags:\n  - ops\nstatus: stable\nrecorded_at: 2026-07-25\nresource: https://wiki.example/spaces/OPS\nsource_version: '1841'\n---\n\nExtracted the retry policy into [[retry-policy]].\n\n- [fact] left out the meeting notes\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("retry-policy.md"),
+        "---\ntype: engram\ntitle: Retry policy\npermalink: retry-policy\ntags:\n  - ops\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nHow retries back off.\n\n- [fact] retries double their wait\n- ingested_from [[sources/ops-wiki]]\n",
+    )
+    .unwrap();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::file(dir));
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+
+    let only_v111 = || EvolveParams {
+        domains: vec!["eng".to_string()],
+        rules: vec!["V111".to_string()],
+        limit: Some(10),
+        ..EvolveParams::default()
+    };
+    let v = sweep(&engine, "2026-07-26", only_v111()).await;
+    let queue = v["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1, "{v}");
+    assert_eq!(queue[0]["rule"], "V111");
+    assert_eq!(queue[0]["class"], "judgment");
+    assert_eq!(queue[0]["permalink"], "retry-policy");
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "retry-policy".to_string(),
+            domain: "eng".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some("resource".to_string()),
+            value: Some("https://wiki.example/pages/42".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    let v = sweep(&engine, "2026-07-26", only_v111()).await;
+    assert!(v["queue"].as_array().unwrap().is_empty(), "{v}");
+}
