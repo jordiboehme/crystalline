@@ -1056,8 +1056,101 @@ const BODY = LOOKS.aperture.palette.machine;
 const isBody = (b: LocalBox) => b.part.tint?.join() === BODY.join();
 const centreD = (b: LocalBox) => (b.lo[1] + b.hi[1]) / 2;
 
+/** Where the tag strip starts: it and its label sit at or above this height. */
+const TAG_ZONE = 2.5;
+/** Whether a part is the machine's own, not the tag strip or its label. */
+const belowTag = (b: LocalBox) => b.lo[2] < TAG_ZONE - EPS;
+const glows = (b: LocalBox) => GLOWING.includes(b.part.flag);
+/** A part's points in the north wall's local `[a, d, h]`. */
+const localPoints = (b: LocalBox): V3[] => {
+  const wall = frameForSlot(slotOn("n"));
+  return b.part.points.map((q) => toLocal(wall, q));
+};
+/** A part's extents, smallest first. */
+const extents = (b: LocalBox) =>
+  [extent(b, 0), extent(b, 1), extent(b, 2)].sort((x, y) => x - y);
 /**
- * What makes each new machine variant that variant (2.7 Task 4's table), on
+ * A part thin in two directions (at most 4 cm) and at least 15 cm long in
+ * the third: a bar, a rod or a strut.
+ */
+const thinBar = (b: LocalBox) => {
+  const [, e1 = 0, e2 = 0] = extents(b);
+  return e1 <= 0.04 + EPS && e2 >= 0.15;
+};
+/**
+ * Which way a flat bar in the wall's plane climbs along the wall: +1 when
+ * its end furthest along is higher than its other end, -1 when lower.
+ */
+const climb = (b: LocalBox) => {
+  const ps = localPoints(b);
+  const lo = ps.reduce((x, y) => (y[0] < x[0] ? y : x));
+  const hi = ps.reduce((x, y) => (y[0] > x[0] ? y : x));
+  return Math.sign(hi[2] - lo[2]);
+};
+/** Whether two ranges overlap by more than `EPS`. */
+const overlap = (lo0: number, hi0: number, lo1: number, hi1: number) =>
+  Math.min(hi0, hi1) - Math.max(lo0, lo1) > EPS;
+/** The height of a revolved part's widest point off its own axis. */
+const widestAt = (b: LocalBox) => {
+  const ca = (b.lo[0] + b.hi[0]) / 2;
+  const cd = (b.lo[1] + b.hi[1]) / 2;
+  let best = { r: -1, h: 0 };
+  for (const [a, d, h] of localPoints(b)) {
+    const r = Math.hypot(a - ca, d - cd);
+    if (r > best.r + EPS) best = { r, h };
+  }
+  return best.h;
+};
+/**
+ * Whether some parts of `methods`, each thin along the wall, together
+ * close a ring standing across the wall (its axis along it): their points
+ * seen from the side surround their common centre in all eight directions
+ * and none comes within `hole` of it. Returns the ring's centre and hole,
+ * or null.
+ */
+function uprightRing(
+  ps: readonly LocalBox[],
+  methods: readonly string[],
+  hole: number,
+): { a0: number; a1: number; d: number; h: number; r: number } | null {
+  const pool = ps.filter(
+    (b) =>
+      methods.includes(b.part.method) &&
+      extent(b, 0) <= 0.6 &&
+      extent(b, 1) >= 0.5 &&
+      extent(b, 2) >= 0.25,
+  );
+  for (const first of pool) {
+    const group = pool.filter((b) =>
+      overlap(b.lo[0], b.hi[0], first.lo[0], first.hi[0]),
+    );
+    const d =
+      (Math.min(...group.map((b) => b.lo[1])) +
+        Math.max(...group.map((b) => b.hi[1]))) /
+      2;
+    const h =
+      (Math.min(...group.map((b) => b.lo[2])) +
+        Math.max(...group.map((b) => b.hi[2]))) /
+      2;
+    const octants = new Set<number>();
+    let r = Infinity;
+    for (const b of group)
+      for (const [, pd, ph] of localPoints(b)) {
+        const angle = Math.atan2(ph - h, pd - d) + Math.PI;
+        octants.add(Math.min(7, Math.floor(angle / (Math.PI / 4))));
+        r = Math.min(r, Math.hypot(pd - d, ph - h));
+      }
+    if (octants.size === 8 && r >= hole) {
+      const a0 = Math.min(...group.map((b) => b.lo[0]));
+      const a1 = Math.max(...group.map((b) => b.hi[0]));
+      return { a0, a1, d, h, r };
+    }
+  }
+  return null;
+}
+
+/**
+ * What makes each new machine variant that variant (2.7 Tasks 4 and 5's tables), on
  * its recorded parts in the north wall's local terms. Entry `v - 1` is
  * variant `v`'s check; each holds for its variant and fails for variant 0.
  */
@@ -1232,6 +1325,164 @@ const SIGNATURES: Partial<
           extent(b, 2) > 2 * Math.max(extent(b, 0), extent(b, 1)),
       ).length >= 5,
   ],
+  "nav-table": [
+    // The round plotting table: a flat round top (a lathe or a disc) at
+    // table height as wide as the footprint is deep, 0.9 m across both ways.
+    (ps) =>
+      ps.some(
+        (b) =>
+          ["lathe", "cylinder"].includes(b.part.method) &&
+          b.lo[2] >= 0.5 &&
+          extent(b, 2) <= 0.2 &&
+          extent(b, 0) >= 0.9 - EPS &&
+          extent(b, 1) >= 0.9 - EPS,
+      ),
+    // The chart lectern: a glowing panel at least 0.6 m wide whose top edge
+    // is above 1.2 m (the tag strip aside).
+    (ps) =>
+      ps.some(
+        (b) => glows(b) && belowTag(b) && b.hi[2] > 1.2 && extent(b, 0) >= 0.6,
+      ),
+  ],
+  "comms-array": [
+    // The lattice mast: at least twelve thin bars.
+    (ps) => ps.filter((b) => belowTag(b) && thinBar(b)).length >= 12,
+    // The radio rack: no part above 1.6 m (the tag strip aside).
+    (ps) => !ps.some((b) => belowTag(b) && b.hi[2] > 1.6 + EPS),
+  ],
+  "reactor-coupling": [
+    // The lying coupling: a thick cylinder whose axis runs along the wall.
+    (ps) =>
+      ps.some(
+        (b) =>
+          b.part.method === "cylinderAlong" &&
+          extent(b, 0) >= 0.4 &&
+          extent(b, 1) >= 0.5 &&
+          extent(b, 2) >= 0.5,
+      ),
+    // The sphere vessel: a lathe at least 0.6 m across whose widest point
+    // is above 0.8 m.
+    (ps) =>
+      ps.some(
+        (b) =>
+          b.part.method === "lathe" && extent(b, 0) >= 0.6 && widestAt(b) > 0.8,
+      ),
+  ],
+  "cargo-loader": [
+    // The scissor lift: at least four flat bars in the wall's plane, each
+    // crossing another that climbs the other way on the same side.
+    (ps) => {
+      const bars = ps.filter(
+        (b) =>
+          b.part.method === "extrude" &&
+          extent(b, 1) <= 0.08 &&
+          extent(b, 0) >= 0.3 &&
+          extent(b, 2) >= 0.1,
+      );
+      return (
+        bars.filter((p) =>
+          bars.some(
+            (q) =>
+              climb(q) === -climb(p) &&
+              climb(p) !== 0 &&
+              overlap(p.lo[0], p.hi[0], q.lo[0], q.hi[0]) &&
+              overlap(p.lo[2], p.hi[2], q.lo[2], q.hi[2]) &&
+              Math.abs(centreD(p) - centreD(q)) <= 0.1,
+          ),
+        ).length >= 4
+      );
+    },
+    // The gantry hoist: a crate (every side at least 0.3 m) whose bottom is
+    // above 0.3 m with nothing under it: it hangs.
+    (ps) =>
+      ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          Math.min(extent(b, 0), extent(b, 1), extent(b, 2)) >= 0.3 &&
+          b.lo[2] > 0.3 &&
+          !ps.some(
+            (q) =>
+              q !== b &&
+              q.lo[2] < b.lo[2] - EPS &&
+              overlapsPlan(q, {
+                a0: b.lo[0],
+                a1: b.hi[0],
+                d0: b.lo[1],
+                d1: b.hi[1],
+              }),
+          ),
+      ),
+  ],
+  "med-scanner": [
+    // The ring scanner: a closed ring (lathe or extrude) standing across
+    // the bed, the bed's slab passing through its hole.
+    (ps) => {
+      const ring = uprightRing(ps, ["lathe", "extrude"], 0.2);
+      if (ring === null) return false;
+      return ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          extent(b, 0) >= 1.0 &&
+          extent(b, 2) <= 0.2 &&
+          overlap(b.lo[0], b.hi[0], ring.a0, ring.a1) &&
+          [b.lo[1], b.hi[1]].every((d) =>
+            [b.lo[2], b.hi[2]].every(
+              (h) => Math.hypot(d - ring.d, h - ring.h) < ring.r,
+            ),
+          ),
+      );
+    },
+    // The treatment chair: no bed slab (raised, at least 0.3 m deep and at
+    // most 0.3 m thick) longer than 1.2 m along the wall.
+    (ps) =>
+      !ps.some(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          belowTag(b) &&
+          b.lo[2] > 0.3 &&
+          extent(b, 0) > 1.2 &&
+          extent(b, 1) >= 0.3 &&
+          extent(b, 2) <= 0.3,
+      ),
+  ],
+  containment: [
+    // The glass case: four upright corner posts and no round shell (a
+    // cylinder or lathe at least 0.5 m across and 0.5 m tall).
+    (ps) =>
+      ps.filter(
+        (b) =>
+          BOXES.includes(b.part.method) &&
+          extent(b, 0) <= 0.08 &&
+          extent(b, 1) <= 0.08 &&
+          extent(b, 2) >= 0.8,
+      ).length >= 4 &&
+      !ps.some(
+        (b) =>
+          ["cylinder", "lathe"].includes(b.part.method) &&
+          extent(b, 0) >= 0.5 &&
+          extent(b, 2) >= 0.5,
+      ),
+    // The twin cells: glowing round parts at least 0.4 m tall on two
+    // upright axes at least 0.3 m apart.
+    (ps) => {
+      const cores = ps.filter(
+        (b) =>
+          glows(b) &&
+          ["cylinder", "lathe"].includes(b.part.method) &&
+          extent(b, 2) >= 0.4,
+      );
+      const axes: [number, number][] = [];
+      for (const b of cores) {
+        const at: [number, number] = [
+          (b.lo[0] + b.hi[0]) / 2,
+          (b.lo[1] + b.hi[1]) / 2,
+        ];
+        if (axes.every(([a, d]) => Math.hypot(a - at[0], d - at[1]) >= 0.3))
+          axes.push(at);
+      }
+      return axes.length >= 2;
+    },
+  ],
 };
 
 /**
@@ -1242,6 +1493,8 @@ const SIGNATURES: Partial<
  * the hydroponics grow light's two arms, the nav table's three metal keys,
  * the comms base's cross bar, the reactor's two collar rings, the loader's
  * mast head, the scanner's two bed rails and the containment cap's ring.
+ * Variants 1 and 2 carry the parts their recipes' docs name: the reactor's
+ * two collar rings and the twin cells' two cap rings among them.
  */
 const ACCENT_PARTS: Record<MachineKind, readonly number[]> = {
   workbench: [2, 3, 2],
@@ -1250,12 +1503,12 @@ const ACCENT_PARTS: Record<MachineKind, readonly number[]> = {
   "cryo-pod": [1, 1, 1],
   fabricator: [1, 1, 1],
   hydroponics: [2, 3, 1],
-  "nav-table": [3],
-  "comms-array": [1],
-  "reactor-coupling": [2],
-  "cargo-loader": [1],
-  "med-scanner": [2],
-  containment: [1],
+  "nav-table": [3, 1, 1],
+  "comms-array": [1, 1, 1],
+  "reactor-coupling": [2, 2, 2],
+  "cargo-loader": [1, 1, 1],
+  "med-scanner": [2, 1, 1],
+  containment: [1, 1, 2],
 };
 
 describe("model variants (2.7)", () => {
@@ -1282,7 +1535,7 @@ describe("model variants (2.7)", () => {
 
   for (const machine of MACHINE_KINDS)
     for (const [i, check] of (SIGNATURES[machine] ?? []).entries())
-      it(`builds ${machine} variant ${String(i + 1)} to its design (2.7 Task 4)`, () => {
+      it(`builds ${machine} variant ${String(i + 1)} to its design (2.7 Tasks 4 and 5)`, () => {
         // Mutation caught: the variant built as variant 0 (the check must
         // fail there, so it cannot pass on any build of the kind).
         expect(VARIANT_COUNTS.machine[machine]).toBeGreaterThan(i + 1);

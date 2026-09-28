@@ -31,6 +31,7 @@ import {
   shade,
   sideways,
   surfaces,
+  tiltedBar,
   type KitAt,
   type ModelContext,
   type Surfaces,
@@ -2194,6 +2195,1083 @@ function containment({ k, s, hue, out, accent2 }: Recipe) {
   k.box(-0.08, 0.08, 0, d, C.cap - 0.15, C.cap - 0.05, s.dark);
 }
 
+/** The round plotting table: the top, the pedestal, the dome of stars. */
+const PLOTTING_TABLE = {
+  radius: 0.45,
+  top: [0.84, 0.9],
+  foot: 0.34,
+  map: 0.38,
+  dome: 0.2,
+  stars: 10,
+  sides: 24,
+} as const;
+
+/**
+ * Nav table variant 1, a round plotting table: a round top as wide as the
+ * footprint is deep on a flared round pedestal and foot, a glowing star
+ * map inset in the top with stars scattered over it, and a glowing dome of
+ * stars over its centre. The rim ring on the top's edge carries the tag's
+ * second accent.
+ */
+function plottingTable({ k, s, ctx, rng, out, accent2 }: Recipe) {
+  const P = PLOTTING_TABLE;
+  const d = out / 2;
+  const r = Math.min(P.radius, d);
+  const [t0, t1] = P.top;
+  k.cylinder(0, d, 0, 0.08, P.foot, P.sides, s.dark);
+  k.lathe(
+    0,
+    d,
+    [
+      [0, 0.08],
+      [0.22, 0.08],
+      [0.14, 0.26],
+      [0.13, 0.66],
+      [0.26, t0],
+      [0, t0],
+    ],
+    P.sides,
+    s.body,
+  );
+  k.cylinder(0, d, t0, t1, r, P.sides, s.body);
+  k.ring(0, d, t1, r - 0.03, 0.025, 6, P.sides, trim(s.metal, accent2), "up");
+  // The star map, the stars over it and the dome over its centre.
+  const map = ctx.look.palette.door;
+  k.cylinder(0, d, t1, t1 + 0.005, P.map, P.sides, s.glow(shade(map, 0.55)));
+  for (let i = 0; i < P.stars; i++) {
+    const angle = rng.range(0, 2 * Math.PI);
+    const at = rng.range(P.dome + 0.04, P.map - 0.04);
+    const [a, dd] = [Math.sin(angle) * at, d + Math.cos(angle) * at];
+    k.box(
+      a - 0.01,
+      a + 0.01,
+      dd - 0.01,
+      dd + 0.01,
+      t1,
+      t1 + 0.012,
+      s.glow(ctx.look.palette.screenText),
+    );
+  }
+  const dome: [number, number][] = [];
+  for (let i = 0; i <= 6; i++) {
+    const t = (Math.PI / 2) * (i / 6);
+    dome.push([P.dome * Math.cos(t), t1 + P.dome * Math.sin(t)]);
+  }
+  k.lathe(0, d, [[0, t1], ...dome], 16, s.glow(map));
+}
+
+/** The chart lectern: its side profile, the chart's reach, the lean rail. */
+const CHART_LECTERN = {
+  half: 0.6,
+  base: [0.1, 0.5],
+  lip: [0.62, 1.15],
+  crown: [0.14, 1.62],
+  chart: [0.2, 0.56],
+  chartHalf: 0.52,
+  rail: [0.82, 0.68],
+} as const;
+
+/**
+ * Nav table variant 2, a chart lectern: a tall lectern on a plinth, its top
+ * sloping down from the wall towards the navigator, a wide glowing chart
+ * panel on the slope, a row of keys and a status light on its front, and a
+ * lean rail at stool height in front of it on two brackets. The rim along
+ * the top's front lip carries the tag's second accent.
+ */
+function chartLectern({ k, kitAt, f, s, ctx, hue, accent2 }: Recipe) {
+  const L = CHART_LECTERN;
+  const x = L.half;
+  const [b0, b1] = L.base;
+  const [ld, lh] = L.lip;
+  const [cd, ch] = L.crown;
+  k.bevelBox(-x - 0.08, x + 0.08, 0.04, b1 + 0.1, 0, 0.08, 0.02, s.dark);
+  profileAlong(
+    kitAt,
+    f,
+    [
+      [b0, 0.08],
+      [b1, 0.08],
+      [b1, 0.95],
+      [ld, lh],
+      [cd, ch],
+      [b0, ch],
+    ],
+    -x,
+    x,
+    s.body,
+  );
+  // The chart on the slope and the rim along the lip.
+  const at = (d: number) => lh + ((ld - d) / (ld - cd)) * (ch - lh);
+  const [m0, m1] = L.chart;
+  profileAlong(
+    kitAt,
+    f,
+    [
+      [m0, at(m0) - 0.01],
+      [m1, at(m1) - 0.01],
+      [m1, at(m1) + 0.008],
+      [m0, at(m0) + 0.008],
+    ],
+    -L.chartHalf,
+    L.chartHalf,
+    s.glow(ctx.look.palette.door),
+  );
+  k.box(
+    -x,
+    x,
+    ld - 0.04,
+    ld + 0.02,
+    lh - 0.05,
+    lh + 0.01,
+    trim(s.metal, accent2),
+  );
+  // Keys and a status light on the front face.
+  for (let i = 0; i < 5; i++) {
+    const a = -0.4 + i * 0.2;
+    k.box(a - 0.04, a + 0.04, b1, b1 + 0.02, 0.8, 0.84, s.dark);
+  }
+  k.box(-0.2, 0.2, b1, b1 + 0.01, 0.62, 0.65, s.glow(shade(hue, 0.9)));
+  // The lean rail on its two brackets.
+  const [rd, rh] = L.rail;
+  for (const a of [-x + 0.1, x - 0.14])
+    k.box(a, a + 0.04, b1, rd, rh - 0.03, rh + 0.01, s.metal);
+  k.cylinderAlong(-x, x, rd, rh, 0.025, 8, s.metal);
+}
+
+/** The lattice mast: its base, posts, rungs, cross antennas and tip. */
+const LATTICE_MAST = {
+  base: 0.25,
+  half: 0.1,
+  bar: 0.03,
+  top: 2.1,
+  rungs: [0.45, 0.85, 1.25, 1.65, 2.05],
+  cross: [1.45, 1.75, 1.95],
+  crossHalf: 0.42,
+  tip: [2.26, 2.32],
+} as const;
+
+/**
+ * Comms array variant 1, a lattice mast: a thin square mast of four corner
+ * posts on an equipment base, a rung on every face at five levels and a
+ * zigzag of braces up its front and back, three short cross antennas with
+ * upright tips near the top, and a thin rod over a cap with the tip
+ * glowing red at its end. The base's trim band carries the tag's second
+ * accent.
+ */
+function latticeMast({ k, s, hue, out, accent2 }: Recipe) {
+  const M = LATTICE_MAST;
+  const d = out / 2;
+  const [x, w] = [M.half, M.bar / 2];
+  k.bevelBox(-0.3, 0.3, 0.05, out - 0.05, 0, M.base, 0.03, s.body);
+  k.box(
+    -0.31,
+    0.31,
+    out - 0.06,
+    out - 0.04,
+    M.base - 0.07,
+    M.base - 0.03,
+    trim(s.dark, accent2),
+  );
+  k.box(
+    -0.2,
+    0.0,
+    out - 0.05,
+    out - 0.045,
+    0.08,
+    0.14,
+    s.glow(shade(hue, 0.9)),
+  );
+  // The four posts, the rungs and the braces.
+  const corners = [-x, x];
+  const depths = [d - x, d + x];
+  for (const a of corners)
+    for (const dd of depths)
+      k.box(a - w, a + w, dd - w, dd + w, M.base, M.top, s.metal);
+  for (const h of M.rungs) {
+    for (const dd of depths)
+      k.box(-x, x, dd - w + 0.005, dd + w - 0.005, h - 0.01, h + 0.01, s.metal);
+    for (const a of corners)
+      k.box(
+        a - w + 0.005,
+        a + w - 0.005,
+        d - x,
+        d + x,
+        h - 0.01,
+        h + 0.01,
+        s.metal,
+      );
+  }
+  for (let i = 0; i + 1 < M.rungs.length; i++) {
+    const [h0, h1] = [M.rungs[i] ?? 0, M.rungs[i + 1] ?? 0];
+    const angle = Math.atan2(h1 - h0, i % 2 ? -2 * x : 2 * x);
+    const bar = tiltedBar(
+      0,
+      (h0 + h1) / 2,
+      angle,
+      Math.hypot(2 * x, h1 - h0),
+      0.018,
+    );
+    for (const dd of depths) k.extrude(bar, dd - 0.008, dd + 0.008, s.dark);
+  }
+  // The cross antennas, each with a short upright tip at both ends.
+  for (const h of M.cross) {
+    k.cylinderAlong(-M.crossHalf, M.crossHalf, d, h, 0.012, 6, s.metal);
+    for (const a of [-M.crossHalf + 0.02, M.crossHalf - 0.02])
+      k.cylinder(a, d, h - 0.1, h + 0.1, 0.008, 5, s.metal);
+  }
+  // The cap, the rod and the glowing tip.
+  const [g0, g1] = M.tip;
+  k.box(-x - w, x + w, d - x - w, d + x + w, M.top, M.top + 0.03, s.dark);
+  k.cylinder(0, d, M.top + 0.03, g0, 0.012, 6, s.metal);
+  k.cylinder(0, d, g0, g1, 0.03, 8, s.glow(hueToRgb(0, 0.9, 0.55)));
+}
+
+/** The radio rack: the rack, its three sets, the dish and the microphone. */
+const RADIO_RACK = {
+  half: 0.5,
+  d: [0.06, 0.48],
+  top: 1.2,
+  sets: [
+    [0.14, 0.42],
+    [0.48, 0.76],
+    [0.82, 1.1],
+  ],
+  dish: { a: 0.2, d: 0.27, r: 0.22 },
+  mic: { a: -0.3, d: 0.32, stem: 1.4 },
+} as const;
+
+/**
+ * Comms array variant 2, a radio rack: a squat rack on a plinth holding
+ * three radio sets, each with a lit dial window and two tuning knobs, a
+ * dish folded flat on the rack's top on its hinge block, and a desk
+ * microphone beside it. Nothing reaches above 1.6 m. The plinth's trim
+ * band carries the tag's second accent.
+ */
+function radioRack({ k, s, ctx, hue, accent2 }: Recipe) {
+  const R = RADIO_RACK;
+  const x = R.half;
+  const [d0, d1] = R.d;
+  const top = R.top;
+  k.bevelBox(-x - 0.03, x + 0.03, d0 - 0.03, d1 + 0.04, 0, 0.08, 0.02, s.dark);
+  k.box(
+    -x - 0.04,
+    x + 0.04,
+    d1 + 0.04,
+    d1 + 0.06,
+    0.02,
+    0.06,
+    trim(s.dark, accent2),
+  );
+  k.bevelBox(-x, x, d0, d1, 0.08, top, 0.025, s.body);
+  // The radio sets: a face plate, a lit dial window and two knobs.
+  for (const [h0, h1] of R.sets) {
+    k.bevelBox(-x + 0.04, x - 0.04, d1, d1 + 0.03, h0, h1, 0.01, s.dark);
+    const f = d1 + 0.03;
+    k.panel(
+      -0.36,
+      0.06,
+      f + DECAL_LIFT,
+      h0 + 0.08,
+      h1 - 0.08,
+      s.glow(shade(hue, 0.8)),
+    );
+    for (const a of [0.2, 0.35]) {
+      k.extrude(discOutline(a, (h0 + h1) / 2, 0.045, 10), f, f + 0.03, s.metal);
+      k.box(
+        a - 0.005,
+        a + 0.005,
+        f + 0.03,
+        f + 0.035,
+        (h0 + h1) / 2,
+        (h0 + h1) / 2 + 0.04,
+        s.dark,
+      );
+    }
+  }
+  // The folded dish lying on its hinge block, face up.
+  const D = R.dish;
+  k.box(
+    D.a - 0.08,
+    D.a + 0.08,
+    D.d - 0.05,
+    D.d + 0.05,
+    top,
+    top + 0.05,
+    s.dark,
+  );
+  k.lathe(
+    D.a,
+    D.d,
+    [
+      [0, top + 0.05],
+      [D.r, top + 0.1],
+      [D.r, top + 0.12],
+      [0, top + 0.08],
+    ],
+    16,
+    s.panel,
+  );
+  k.cylinder(D.a, D.d, top + 0.08, top + 0.2, 0.01, 6, s.metal);
+  // The desk microphone: foot, stem and head.
+  const M = R.mic;
+  k.cylinder(M.a, M.d, top, top + 0.02, 0.06, 10, s.dark);
+  k.cylinder(M.a, M.d, top + 0.02, M.stem, 0.008, 6, s.metal);
+  k.lathe(
+    M.a,
+    M.d,
+    [
+      [0, M.stem],
+      [0.03, M.stem + 0.01],
+      [0.03, M.stem + 0.07],
+      [0, M.stem + 0.08],
+    ],
+    10,
+    s.dark,
+  );
+  k.box(
+    -x + 0.06,
+    -x + 0.2,
+    d1,
+    d1 + 0.005,
+    1.14,
+    1.17,
+    s.glow(ctx.look.palette.screenText),
+  );
+}
+
+/** The lying coupling: the drums, the core between them, the saddles. */
+const LYING_COUPLING = {
+  radius: 0.4,
+  axis: 0.62,
+  gap: 0.14,
+  end: 0.85,
+  core: 0.26,
+  saddles: [0.3, 0.65],
+  pipes: 0.5,
+  elbow: 1.3,
+} as const;
+
+/**
+ * Reactor coupling variant 1, a lying coupling: two thick drums lying
+ * along the wall end to end on saddles, a short glowing core between
+ * them, dark end plates and bands, and a riser pipe from each drum's back
+ * that bends into the wall on a flange. The collar ring at each drum's
+ * inner end carries the tag's second accent.
+ */
+function lyingCoupling({ k, kitAt, f, s, hue, out, accent2 }: Recipe) {
+  const C = LYING_COUPLING;
+  const d = out / 2;
+  const r = Math.min(C.radius, d - 0.05);
+  const h = C.axis;
+  const side = kitAt(sideways(f));
+  // In the quarter-turned frame a ring facing `inward` stands across the
+  // wall, its axis along it: `(a', d')` there is `(d', -a')` here.
+  const across = (a: number, radius: number, tube: number, sf: Surface) =>
+    side.ring(-d, a, h, radius, tube, 6, 16, sf, "inward");
+  for (const sign of [-1, 1]) {
+    const [i, o] = [sign * C.gap, sign * C.end];
+    k.cylinderAlong(i, o, d, h, r, 16, s.body);
+    k.cylinderAlong(o, o + sign * 0.03, d, h, r - 0.05, 16, s.dark);
+    across(sign * C.pipes, r, 0.025, s.dark);
+    across(i, C.core + 0.04, 0.05, trim(s.metal, accent2));
+    for (const a of C.saddles)
+      k.box(
+        sign * a - 0.05,
+        sign * a + 0.05,
+        d - 0.3,
+        d + 0.3,
+        0,
+        h - r + 0.08,
+        s.dark,
+      );
+    // The riser from the drum's back, its elbow and flange on the wall.
+    const p = sign * C.pipes;
+    k.cylinder(p, 0.12, h, C.elbow + 0.06, 0.06, 8, s.metal);
+    side.cylinderAlong(-0.12, 0, p, C.elbow, 0.06, 8, s.metal);
+    k.box(p - 0.1, p + 0.1, 0, 0.03, C.elbow - 0.1, C.elbow + 0.1, s.dark);
+  }
+  k.cylinderAlong(-C.gap, C.gap, d, h, C.core, 16, s.glow(hue));
+}
+
+/** The sphere vessel: the sphere, its ring stand, the band and the neck. */
+const SPHERE_VESSEL = {
+  radius: 0.4,
+  centre: 1.05,
+  stand: 0.75,
+  standRing: 0.28,
+  legs: 0.28,
+  neck: [1.43, 1.56],
+  pipes: [
+    [-0.18, 1.2],
+    [0.18, 0.88],
+  ],
+} as const;
+
+/**
+ * Reactor coupling variant 2, a sphere vessel: a sphere held in a ring
+ * stand on four legs over a round foot plate, a glowing band round its
+ * middle, two pipes from its back into the wall on flanges, and a neck on
+ * its crown with a pipe back to the wall. The stand's ring and the neck's
+ * collar carry the tag's second accent.
+ */
+function sphereVessel({ k, kitAt, f, s, hue, out, accent2 }: Recipe) {
+  const V = SPHERE_VESSEL;
+  const d = out / 2;
+  const r = Math.min(V.radius, d - 0.05);
+  const c = V.centre;
+  k.cylinder(0, d, 0, 0.05, 0.38, 16, s.dark);
+  for (let i = 0; i < 4; i++) {
+    const t = (Math.PI / 4) * (1 + 2 * i);
+    const [a, dd] = [Math.sin(t) * V.legs, d + Math.cos(t) * V.legs];
+    k.box(a - 0.025, a + 0.025, dd - 0.025, dd + 0.025, 0.05, V.stand, s.metal);
+  }
+  k.ring(0, d, V.stand, V.standRing, 0.04, 6, 16, trim(s.metal, accent2), "up");
+  const sphere: [number, number][] = [];
+  for (let i = 0; i <= 10; i++) {
+    const t = Math.PI * (i / 10 - 0.5);
+    sphere.push([r * Math.cos(t), c + r * Math.sin(t)]);
+  }
+  k.lathe(0, d, sphere, 16, s.body);
+  k.ring(0, d, c, r, 0.035, 6, 16, s.glow(hue), "up");
+  // The neck, its collar and the pipe from it back into the wall.
+  const [n0, n1] = V.neck;
+  const side = kitAt(sideways(f));
+  k.cylinder(0, d, n0 - 0.05, n1, 0.08, 10, s.metal);
+  k.ring(0, d, n1 - 0.04, 0.09, 0.025, 6, 10, trim(s.dark, accent2), "up");
+  side.cylinderAlong(-d, 0, 0, n1 - 0.05, 0.045, 8, s.metal);
+  k.box(-0.08, 0.08, 0, 0.03, n1 - 0.12, n1 + 0.02, s.dark);
+  // Two pipes from the sphere's back into the wall, each on a flange.
+  for (const [a, h] of V.pipes) {
+    side.cylinderAlong(-0.22, 0, a, h, 0.05, 8, s.metal);
+    k.box(a - 0.09, a + 0.09, 0, 0.03, h - 0.09, h + 0.09, s.dark);
+  }
+}
+
+/** The scissor lift: the frame, the two scissor stages, the platform. */
+const SCISSOR_LIFT = {
+  half: 0.8,
+  d: [0.1, 0.8],
+  base: 0.1,
+  deck: [0.66, 0.74],
+  arm: 0.65,
+  stages: [
+    [0.14, 0.38],
+    [0.42, 0.62],
+  ],
+  crate: { half: 0.42, d: [0.22, 0.72], top: 1.22 },
+  rail: 1.28,
+} as const;
+
+/**
+ * Cargo loader variant 1, a scissor lift: a low base frame, two stages of
+ * crossed arms on each side with pivot pins through the crossings, a deck
+ * on top with a guard rail along its back, and a crate strapped on the
+ * deck; a warning beacon glows on the rail's right post. The beacon's
+ * housing carries the tag's second accent.
+ */
+function scissorLift({ k, kitAt, f, s, accent2 }: Recipe) {
+  const L = SCISSOR_LIFT;
+  const x = L.half;
+  const [d0, d1] = L.d;
+  const [k0, k1] = L.deck;
+  k.bevelBox(-x, x, d0, d1, 0, L.base, 0.015, s.dark);
+  k.bevelBox(-x, x, d0, d1, k0, k1, 0.015, s.body);
+  // The arms: each stage an X, its two arms side by side on each face.
+  const side = kitAt(sideways(f));
+  const faces = [d0 + 0.02, d1 - 0.08];
+  for (const [h0, h1] of L.stages) {
+    const mid = (h0 + h1) / 2;
+    const angle = Math.atan2(h1 - h0, 2 * L.arm);
+    const length = Math.hypot(2 * L.arm, h1 - h0) + 0.05;
+    for (const face of faces) {
+      k.extrude(
+        tiltedBar(0, mid, angle, length, 0.05),
+        face,
+        face + 0.03,
+        s.metal,
+      );
+      k.extrude(
+        tiltedBar(0, mid, -angle, length, 0.05),
+        face + 0.03,
+        face + 0.06,
+        s.metal,
+      );
+    }
+    side.cylinderAlong(-d1 + 0.02, -d0 - 0.02, 0, mid, 0.02, 8, s.dark);
+    for (const a of [-L.arm, L.arm])
+      for (const h of [h0, h1])
+        side.cylinderAlong(-d1 + 0.02, -d0 - 0.02, a, h, 0.018, 6, s.dark);
+  }
+  // The crate, strapped, and the rail along the deck's back.
+  const C = L.crate;
+  const [c0, c1] = C.d;
+  k.bevelBox(
+    -C.half,
+    C.half,
+    c0,
+    c1,
+    k1,
+    C.top,
+    0.02,
+    s.tinted(hueToRgb(30, 0.55, 0.45)),
+  );
+  for (const a of [-0.2, 0.2])
+    k.box(a - 0.03, a + 0.03, c0 - 0.01, c1 + 0.01, k1, C.top + 0.01, s.dark);
+  for (const a of [-x + 0.02, x - 0.06])
+    k.box(a, a + 0.04, d0 + 0.02, d0 + 0.06, k1, L.rail, s.metal);
+  k.cylinderAlong(
+    -x + 0.02,
+    x - 0.02,
+    d0 + 0.04,
+    L.rail - 0.02,
+    0.02,
+    8,
+    s.metal,
+  );
+  // The beacon on the right post: its housing, then the lens.
+  const b = x - 0.04;
+  k.cylinder(
+    b,
+    d0 + 0.04,
+    L.rail,
+    L.rail + 0.06,
+    0.05,
+    10,
+    trim(s.dark, accent2),
+  );
+  k.cylinder(
+    b,
+    d0 + 0.04,
+    L.rail + 0.06,
+    L.rail + 0.14,
+    0.04,
+    10,
+    s.glow(hueToRgb(38, 0.95, 0.55)),
+  );
+}
+
+/** The gantry hoist: the frame, the beam, the chain and the hanging crate. */
+const GANTRY_HOIST = {
+  half: 0.85,
+  post: 0.08,
+  d: [0.1, 0.8],
+  beam: [1.9, 2.05],
+  trolley: 1.62,
+  links: 8,
+  link: 0.06,
+  hook: 1.08,
+  crate: { half: 0.35, d: [0.2, 0.7], h: [0.5, 0.95] },
+} as const;
+
+/**
+ * Cargo loader variant 2, a gantry hoist: two end frames of posts on foot
+ * rails joined by a beam overhead, a trolley and hoist motor under the
+ * beam, a chain down from it to a hook, a spreader bar and two slings
+ * holding a crate that hangs clear of the floor, and a control pendant
+ * on its cable. A warning beacon glows on the beam; its housing carries
+ * the tag's second accent.
+ */
+function gantryHoist({ k, s, accent2 }: Recipe) {
+  const G = GANTRY_HOIST;
+  const [x, p] = [G.half, G.post];
+  const [d0, d1] = G.d;
+  const [b0, b1] = G.beam;
+  const dc = (d0 + d1) / 2;
+  for (const a of [-x, x - p]) {
+    k.box(a, a + p, d0 - 0.05, d1 + 0.05, 0, 0.08, s.dark);
+    for (const dd of [d0, d1 - p])
+      k.bevelBox(a, a + p, dd, dd + p, 0.08, b0, 0.01, s.body);
+    k.box(a, a + p, d0, d1, b0 - 0.08, b0, s.body);
+  }
+  k.bevelBox(-x, x, dc - 0.06, dc + 0.06, b0, b1, 0.015, s.body);
+  // The trolley under the beam, the hoist motor and the chain.
+  k.box(-0.15, 0.15, dc - 0.09, dc + 0.09, b0 - 0.1, b0, s.dark);
+  k.bevelBox(
+    -0.12,
+    0.12,
+    dc - 0.07,
+    dc + 0.07,
+    G.trolley,
+    b0 - 0.1,
+    0.01,
+    s.metal,
+  );
+  for (let i = 0; i < G.links; i++) {
+    const h1 = G.trolley - i * G.link;
+    const wide = i % 2 === 0;
+    const [ah, dh] = wide ? [0.02, 0.006] : [0.006, 0.02];
+    k.box(-ah, ah, dc - dh, dc + dh, h1 - G.link - 0.01, h1, s.dark);
+  }
+  // The hook, the spreader bar, the slings and the crate.
+  const hook = G.trolley - G.links * G.link;
+  k.box(-0.02, 0.02, dc - 0.02, dc + 0.02, G.hook, hook, s.metal);
+  k.box(-0.05, 0.05, dc - 0.015, dc + 0.015, G.hook - 0.03, G.hook, s.metal);
+  const C = G.crate;
+  const [c0, c1] = C.h;
+  k.box(
+    -C.half,
+    C.half,
+    dc - 0.02,
+    dc + 0.02,
+    G.hook - 0.07,
+    G.hook - 0.03,
+    s.metal,
+  );
+  for (const a of [-C.half + 0.03, C.half - 0.05])
+    k.box(a, a + 0.02, dc - 0.01, dc + 0.01, c1, G.hook - 0.07, s.dark);
+  const [e0, e1] = C.d;
+  k.bevelBox(
+    -C.half,
+    C.half,
+    e0,
+    e1,
+    c0,
+    c1,
+    0.02,
+    s.tinted(hueToRgb(30, 0.55, 0.45)),
+  );
+  k.box(
+    -C.half - 0.01,
+    C.half + 0.01,
+    e0 - 0.01,
+    e1 + 0.01,
+    c0 + 0.18,
+    c0 + 0.23,
+    s.hazard,
+  );
+  // The pendant on its cable, and the beacon on the beam.
+  k.box(0.14, 0.15, dc - 0.005, dc + 0.005, 1.3, b0 - 0.1, s.dark);
+  k.bevelBox(0.11, 0.18, dc - 0.04, dc + 0.04, 1.12, 1.3, 0.01, s.metal);
+  k.cylinder(x - 0.2, dc, b1, b1 + 0.05, 0.05, 10, trim(s.dark, accent2));
+  k.cylinder(
+    x - 0.2,
+    dc,
+    b1 + 0.05,
+    b1 + 0.13,
+    0.04,
+    10,
+    s.glow(hueToRgb(38, 0.95, 0.55)),
+  );
+}
+
+/** The ring scanner: the ring, its lining, the bed and its pedestal. */
+const RING_SCANNER = {
+  ring: [0.3, 0.62],
+  centre: 0.74,
+  outer: 0.44,
+  inner: 0.3,
+  lining: [0.44, 0.48],
+  facets: 12,
+  bed: [0.6, 0.66],
+  pad: 0.72,
+  bedA: [-0.85, 0.78],
+  pedestal: [-0.75, -0.25],
+  monitor: [1.2, 1.5],
+} as const;
+
+/** Half an annulus in the `(d, h)` plane, from `from` to `from + PI`. */
+function halfAnnulus(
+  d: number,
+  h: number,
+  outer: number,
+  inner: number,
+  from: number,
+  facets: number,
+): [number, number][] {
+  const at = (r: number, t: number): [number, number] => [
+    d + Math.cos(t) * r,
+    h + Math.sin(t) * r,
+  ];
+  const out: [number, number][] = [];
+  for (let i = 0; i <= facets; i++)
+    out.push(at(outer, from + (Math.PI * i) / facets));
+  for (let i = facets; i >= 0; i--)
+    out.push(at(inner, from + (Math.PI * i) / facets));
+  return out;
+}
+
+/**
+ * Med scanner variant 1, a ring scanner: a thick upright ring standing
+ * across the bed on its feet, its inside lined with a glowing band, and a
+ * padded bed on a pedestal at the far end reaching through the ring as if
+ * slid into it, with a pillow, and the vitals monitor on the wall. The
+ * pedestal's trim band carries the tag's second accent.
+ */
+function ringScanner({ k, kitAt, f, s, ctx, hue, out, accent2 }: Recipe) {
+  const M = RING_SCANNER;
+  const dc = out / 2;
+  const c = M.centre;
+  const [x0, x1] = M.ring;
+  // The ring in two halves (an extruded outline cannot have a hole), its
+  // feet, and the glowing lining inside it.
+  for (const from of [0, Math.PI])
+    profileAlong(
+      kitAt,
+      f,
+      halfAnnulus(dc, c, M.outer, M.inner, from, M.facets),
+      x0,
+      x1,
+      s.body,
+    );
+  k.bevelBox(
+    x0 + 0.02,
+    x1 - 0.02,
+    dc - 0.3,
+    dc + 0.3,
+    0,
+    c - M.outer + 0.06,
+    0.02,
+    s.dark,
+  );
+  const [l0, l1] = M.lining;
+  for (const from of [0, Math.PI])
+    profileAlong(
+      kitAt,
+      f,
+      halfAnnulus(dc, c, M.inner, M.inner - 0.015, from, M.facets),
+      l0,
+      l1,
+      s.glow(hue),
+    );
+  // The bed, its pad and pillow, on its pedestal with the trim band.
+  const [p0, p1] = M.pedestal;
+  const [b0, b1] = M.bed;
+  const [a0, a1] = M.bedA;
+  k.bevelBox(p0, p1, dc - 0.15, dc + 0.15, 0, b0, 0.03, s.dark);
+  k.box(
+    p0 - 0.02,
+    p1 + 0.02,
+    dc - 0.17,
+    dc + 0.17,
+    b0 - 0.1,
+    b0 - 0.05,
+    trim(s.dark, accent2),
+  );
+  k.bevelBox(a0, a1, dc - 0.16, dc + 0.16, b0, b1, 0.015, s.body);
+  k.bevelBox(
+    a0 + 0.03,
+    a1 - 0.03,
+    dc - 0.14,
+    dc + 0.14,
+    b1,
+    M.pad,
+    0.025,
+    s.panel,
+  );
+  k.bevelBox(
+    a0 + 0.06,
+    a0 + 0.32,
+    dc - 0.11,
+    dc + 0.11,
+    M.pad,
+    M.pad + 0.05,
+    0.02,
+    s.panel,
+  );
+  // The vitals monitor.
+  const [m0, m1] = M.monitor;
+  k.bevelBox(-0.85, -0.45, 0, 0.08, m0, m1, 0.015, s.dark);
+  k.panel(
+    -0.82,
+    -0.48,
+    0.08 + DECAL_LIFT,
+    m0 + 0.03,
+    m1 - 0.03,
+    s.glow(ctx.look.palette.screenText),
+  );
+}
+
+/** The treatment chair: its pedestal, seat, back, leg rest and lamp arm. */
+const TREATMENT_CHAIR = {
+  seat: [0.42, 0.5],
+  seatA: [-0.3, 0.25],
+  d: [0.22, 0.68],
+  back: { from: [-0.3, 0.55], to: [-0.8, 1.15] },
+  legs: { from: [0.25, 0.52], to: [0.72, 0.28] },
+  arm: 2.0,
+  lamp: { a: 0.0, d: 0.5 },
+} as const;
+
+/**
+ * Med scanner variant 2, a treatment chair: a reclined padded chair on a
+ * round foot and a column, its seat, back and leg rest each a padded slab
+ * with a headrest and a foot plate, armrests on posts, and an overhead
+ * arm from a wall post holding a lamp whose lens glows over the chair.
+ * The column's trim band carries the tag's second accent.
+ */
+function treatmentChair({ k, s, ctx, out, accent2 }: Recipe) {
+  const T = TREATMENT_CHAIR;
+  const dc = out / 2;
+  const [s0, s1] = T.seat;
+  const [sa0, sa1] = T.seatA;
+  const [d0, d1] = T.d;
+  k.cylinder(-0.05, dc, 0, 0.08, 0.3, 16, s.dark);
+  k.bevelBox(-0.17, 0.07, dc - 0.12, dc + 0.12, 0.08, s0, 0.02, s.body);
+  k.box(
+    -0.19,
+    0.09,
+    dc - 0.14,
+    dc + 0.14,
+    s0 - 0.1,
+    s0 - 0.06,
+    trim(s.dark, accent2),
+  );
+  k.bevelBox(sa0, sa1, d0, d1, s0, s1, 0.02, s.body);
+  k.bevelBox(sa0, sa1, d0 + 0.02, d1 - 0.02, s1, s1 + 0.07, 0.03, s.panel);
+  // The back and the leg rest: tilted padded slabs across the chair.
+  const slab = (
+    from: readonly number[],
+    to: readonly number[],
+    thick: number,
+  ) => {
+    const [fa = 0, fh = 0] = from;
+    const [ta = 0, th = 0] = to;
+    const angle = Math.atan2(th - fh, ta - fa);
+    const bar = tiltedBar(
+      (fa + ta) / 2,
+      (fh + th) / 2,
+      angle,
+      Math.hypot(ta - fa, th - fh),
+      thick,
+    );
+    k.extrude(bar, d0 + 0.02, d1 - 0.02, s.panel);
+  };
+  slab(T.back.from, T.back.to, 0.1);
+  slab(T.legs.from, T.legs.to, 0.08);
+  const [ba, bh] = T.back.to;
+  k.bevelBox(
+    ba - 0.08,
+    ba + 0.1,
+    dc - 0.12,
+    dc + 0.12,
+    bh - 0.08,
+    bh + 0.08,
+    0.03,
+    s.panel,
+  );
+  const [la, lh] = T.legs.to;
+  k.box(
+    la - 0.02,
+    la + 0.04,
+    d0 + 0.04,
+    d1 - 0.04,
+    lh - 0.12,
+    lh + 0.02,
+    s.dark,
+  );
+  // The armrests on their posts.
+  for (const dd of [d0 - 0.04, d1])
+    k.box(-0.25, 0.15, dd, dd + 0.04, 0.72, 0.76, s.dark);
+  for (const dd of [d0 - 0.04, d1])
+    k.box(-0.07, -0.03, dd, dd + 0.04, s1, 0.72, s.metal);
+  // The overhead arm from the wall post, and the lamp over the chair.
+  const L = T.lamp;
+  k.bevelBox(-0.5, -0.38, 0, 0.08, 1.2, T.arm + 0.12, 0.015, s.dark);
+  k.box(-0.47, -0.41, 0.08, L.d + 0.03, T.arm, T.arm + 0.06, s.metal);
+  k.box(
+    -0.47,
+    L.a + 0.03,
+    L.d - 0.03,
+    L.d + 0.03,
+    T.arm - 0.06,
+    T.arm,
+    s.metal,
+  );
+  k.cylinder(L.a, L.d, T.arm - 0.12, T.arm - 0.06, 0.02, 8, s.metal);
+  k.lathe(
+    L.a,
+    L.d,
+    [
+      [0, T.arm - 0.3],
+      [0.17, T.arm - 0.3],
+      [0.17, T.arm - 0.26],
+      [0.06, T.arm - 0.12],
+      [0, T.arm - 0.12],
+    ],
+    14,
+    s.dark,
+  );
+  k.cylinder(
+    L.a,
+    L.d,
+    T.arm - 0.31,
+    T.arm - 0.3,
+    0.14,
+    14,
+    s.glow(ctx.look.palette.lamp),
+  );
+}
+
+/** The glass case: the plinth, the posts, the panes, the core, the cap. */
+const GLASS_CASE = {
+  plinth: 0.3,
+  half: 0.35,
+  post: 0.06,
+  panes: [0.46, 1.54],
+  cap: [1.7, 1.9],
+  core: 0.2,
+  coreAt: 1.0,
+  emitter: 0.14,
+  beam: 0.06,
+} as const;
+
+/**
+ * Containment variant 1, a glass case: a square plinth, four corner posts
+ * holding four tinted panes that stop short of the plinth and the cap, a
+ * core glowing in a beam between two emitter dishes (held on thin rods,
+ * the beam shows as bright bands in the gaps), and a square cap with a
+ * port and a conduit to the wall. The ring round the cap's port carries
+ * the tag's second accent.
+ */
+function glassCase({ k, s, hue, out, accent2 }: Recipe) {
+  const G = GLASS_CASE;
+  const d = out / 2;
+  const x = G.half;
+  const w = G.post / 2;
+  const [c0, c1] = G.cap;
+  k.bevelBox(
+    -x - 0.1,
+    x + 0.1,
+    d - x - 0.08,
+    d + x + 0.08,
+    0,
+    G.plinth,
+    0.03,
+    s.body,
+  );
+  for (const a of [-x, x])
+    for (const dd of [d - x, d + x])
+      k.box(a - w, a + w, dd - w, dd + w, G.plinth, c0, s.dark);
+  // The panes, each between two posts.
+  const glass = s.glow(shade(hue, 0.3));
+  const [g0, g1] = G.panes;
+  const t = 0.005;
+  for (const dd of [d - x, d + x])
+    k.box(-x + w, x - w, dd - t, dd + t, g0, g1, glass);
+  for (const a of [-x, x])
+    k.box(a - t, a + t, d - x + w, d + x - w, g0, g1, glass);
+  // The emitters, the rods, the beam and the core.
+  const e = G.emitter;
+  k.lathe(
+    0,
+    d,
+    [
+      [0, G.plinth],
+      [e, G.plinth],
+      [e, G.plinth + 0.03],
+      [0.04, G.plinth + 0.1],
+      [0, G.plinth + 0.1],
+    ],
+    12,
+    s.dark,
+  );
+  k.lathe(
+    0,
+    d,
+    [
+      [0, c0 - 0.1],
+      [0.04, c0 - 0.1],
+      [e, c0 - 0.03],
+      [e, c0],
+      [0, c0],
+    ],
+    12,
+    s.dark,
+  );
+  k.cylinder(0, d, G.plinth + 0.1, c0 - 0.1, 0.012, 6, s.metal);
+  k.cylinder(0, d, G.plinth + 0.1, c0 - 0.1, G.beam, 10, s.glow(hue));
+  const core: [number, number][] = [];
+  for (let i = 0; i <= 8; i++) {
+    const a = Math.PI * (i / 8 - 0.5);
+    core.push([G.core * Math.cos(a), G.coreAt + G.core * Math.sin(a)]);
+  }
+  k.lathe(0, d, core, 12, s.glow(hue));
+  // The cap, its port and ring, and the conduit.
+  k.bevelBox(
+    -x - 0.07,
+    x + 0.07,
+    d - x - 0.07,
+    d + x + 0.07,
+    c0,
+    c1,
+    0.03,
+    s.body,
+  );
+  k.cylinder(0, d, c1, c1 + 0.06, 0.14, 12, s.dark);
+  k.ring(0, d, c1 + 0.03, 0.15, 0.03, 6, 12, trim(s.metal, accent2), "up");
+  k.box(-0.08, 0.08, 0, d - x - 0.07, c0 + 0.05, c0 + 0.15, s.dark);
+}
+
+/** The twin cells: the shared base, each tank's place and parts. */
+const TWIN_CELLS = {
+  base: 0.28,
+  at: 0.42,
+  radius: 0.26,
+  glass: 0.22,
+  core: 0.14,
+  tank: [0.33, 1.47],
+  glassSpan: [0.4, 1.4],
+  cap: [1.52, 1.7],
+  ribs: [0.6, 0.9, 1.2],
+  header: 1.62,
+} as const;
+
+/**
+ * Containment variant 2, twin cells: one long base carrying two smaller
+ * tanks side by side, each a tinted glass shell round its own glowing
+ * core held by ribs, under its own cap, a header pipe joining the caps
+ * and a conduit to the wall, and a status panel glowing on the base's
+ * front. Each cap's ring carries the tag's second accent.
+ */
+function twinCells({ k, s, ctx, hue, half, out, accent2 }: Recipe) {
+  const T = TWIN_CELLS;
+  const d = out / 2;
+  const [t0, t1] = T.tank;
+  const [c0, c1] = T.cap;
+  k.bevelBox(
+    -half + 0.05,
+    half - 0.05,
+    0.05,
+    out - 0.05,
+    0,
+    T.base,
+    0.03,
+    s.body,
+  );
+  for (const a of [-T.at, T.at]) {
+    k.cylinder(a, d, T.base, c0, T.core, 12, s.glow(hue));
+    const [g0, g1] = T.glassSpan;
+    k.lathe(
+      a,
+      d,
+      [
+        [0, g0],
+        [T.glass, g0],
+        [T.glass, g1],
+        [0, g1],
+      ],
+      14,
+      s.glow(shade(hue, 0.3)),
+    );
+    k.cylinder(a, d, T.base, t0, T.radius, 14, s.dark);
+    for (const h of T.ribs)
+      k.ring(a, d, h, T.glass + 0.02, 0.022, 6, 14, s.metal, "up");
+    k.cylinder(a, d, t1, c0, T.radius, 14, s.dark);
+    k.cylinder(a, d, c0, c1, T.radius, 14, s.body);
+    k.cylinder(a, d, c1, c1 + 0.05, T.radius - 0.1, 12, trim(s.dark, accent2));
+  }
+  k.cylinderAlong(-T.at, T.at, d, T.header, 0.06, 10, s.metal);
+  k.box(-0.08, 0.08, 0, d, T.header - 0.05, T.header + 0.05, s.dark);
+  k.panel(
+    -0.15,
+    0.15,
+    out - 0.05 + DECAL_LIFT,
+    0.1,
+    0.2,
+    s.glow(ctx.look.palette.screenText),
+  );
+}
+
 /**
  * The recipes of every machine kind, one per variant (2.7 C2): entry 0 is
  * today's model (2.7 C1), and `VARIANT_COUNTS.machine` says how many each
@@ -2206,10 +3284,10 @@ const RECIPES: Record<MachineKind, readonly ((r: Recipe) => void)[]> = {
   "cryo-pod": [cryoPod, leaningPod, drumPod],
   fabricator: [fabricator, resinPrinter, armCell],
   hydroponics: [hydroponics, trayRack, tubeGarden],
-  "nav-table": [navTable],
-  "comms-array": [commsArray],
-  "reactor-coupling": [reactorCoupling],
-  "cargo-loader": [cargoLoader],
-  "med-scanner": [medScanner],
-  containment: [containment],
+  "nav-table": [navTable, plottingTable, chartLectern],
+  "comms-array": [commsArray, latticeMast, radioRack],
+  "reactor-coupling": [reactorCoupling, lyingCoupling, sphereVessel],
+  "cargo-loader": [cargoLoader, scissorLift, gantryHoist],
+  "med-scanner": [medScanner, ringScanner, treatmentChair],
+  containment: [containment, glassCase, twinCells],
 };
