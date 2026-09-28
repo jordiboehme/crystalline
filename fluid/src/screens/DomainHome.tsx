@@ -754,26 +754,6 @@ function DomainPage({
         />
       </section>
 
-      {/*
-        The MANIFEST's switches, as controls rather than as a panel of prose.
-        Drawn off the server's registry and only when it sent rows: a MANIFEST
-        that did not parse declares nothing and can declare nothing until it
-        is repaired, which the panel above is where somebody does.
-      */}
-      {manifest.data?.sections !== null &&
-        manifest.data?.sections !== undefined &&
-        manifest.data.sections.policies.length > 0 && (
-          <DomainPoliciesCard
-            domain={domain}
-            policies={manifest.data.sections.policies}
-            branch={syncStatus.data?.branch ?? null}
-            onRename={() => {
-              setRenamingOpen(true);
-            }}
-            renaming={isRenaming}
-          />
-        )}
-
       {importing && (
         <ImportArchiveDialog
           domain={domain}
@@ -800,8 +780,9 @@ function DomainPage({
 
       {/*
         The team's furniture comes after the engrams: who may reach the
-        domain and which way a write goes are settled once and read rarely,
-        so they sit below what a reader opens the page for.
+        domain, which way a write goes and the MANIFEST's own switches are
+        settled once and read rarely, so they sit below what a reader opens
+        the page for.
 
         No capability gate here: `GET /members` is served to any account that
         may see the domain at all, and the card itself decides what it may
@@ -821,6 +802,29 @@ function DomainPage({
       {capabilities.canShare && summary !== undefined && (
         <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
       )}
+
+      {/*
+        The MANIFEST's switches, as controls rather than as a panel of prose,
+        right beside review mode: `sharing` decides the same thing review mode's
+        own button does, and `generated_indexes` sits next to it because both
+        are registry rows rather than document text. Drawn off the server's
+        registry and only when it sent rows: a MANIFEST that did not parse
+        declares nothing and can declare nothing until it is repaired, which
+        the "Edit MANIFEST" link above the panel is where somebody does.
+      */}
+      {manifest.data?.sections !== null &&
+        manifest.data?.sections !== undefined &&
+        manifest.data.sections.policies.length > 0 && (
+          <DomainPoliciesCard
+            domain={domain}
+            policies={manifest.data.sections.policies}
+            branch={syncStatus.data?.branch ?? null}
+            onRename={() => {
+              setRenamingOpen(true);
+            }}
+            renaming={isRenaming}
+          />
+        )}
 
       {/*
         Last on the page: a copy of the domain, and the two ways of taking it
@@ -1341,9 +1345,10 @@ function EmptyFacet({
  * document, and the document is the source: the editor is where a change
  * goes, and these say what it currently says. The frontmatter switches are
  * the exception, and they are not here: they are controls, so they have a
- * card of their own below this section. Whether provisioning was allowed or
- * denied on this machine is not here either; that decision lives with the
- * `provision` tool, not with the domain's own description.
+ * card of their own, down with the domain's other team furniture rather
+ * than in this section. Whether provisioning was allowed or denied on this
+ * machine is not here either; that decision lives with the `provision`
+ * tool, not with the domain's own description.
  */
 function ManifestFacets({
   sections,

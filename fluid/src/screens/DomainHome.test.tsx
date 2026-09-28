@@ -254,6 +254,15 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/** Whether one element is drawn before another, in document order. */
+function precedes(before: Element, after: Element): boolean {
+  return (
+    (before.compareDocumentPosition(after) &
+      Node.DOCUMENT_POSITION_FOLLOWING) !==
+    0
+  );
+}
+
 /**
  * The screen itself, without the frame around it.
  *
@@ -414,8 +423,9 @@ describe("the domain screen", () => {
     expect(within(aliases).getByText("Multi_Word -> multi-word")).toBeVisible();
     expect(within(aliases).queryByText("No aliases")).toBeNull();
 
-    // The switches are their own card now, below the manifest rather than a
-    // fifth panel inside it, and every registry key has a row there.
+    // The switches are their own card, down with the domain's team
+    // furniture rather than a fifth panel inside the facets grid, and every
+    // registry key has a row there.
     const policies = screen.getByRole("region", { name: "Domain policies" });
     const generated = within(policies).getByRole("row", {
       name: /^generated_indexes/,
@@ -428,6 +438,23 @@ describe("the domain screen", () => {
     expect(
       within(policies).getByRole("row", { name: /^sharing/ }),
     ).toBeVisible();
+  });
+
+  it("draws the policies card with the team furniture, after review mode and before backup", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+
+    const engrams = await screen.findByRole("region", { name: "Engrams" });
+    const review = await screen.findByRole("region", { name: "Review mode" });
+    const policies = screen.getByRole("region", { name: "Domain policies" });
+    const backup = screen.getByRole("region", { name: "Backup" });
+    // The switches sit with the domain's other team furniture, below the
+    // engrams and right beside review mode, not under the MANIFEST's own
+    // boxes the way the card used to sit.
+    expect(precedes(engrams, policies)).toBe(true);
+    expect(precedes(review, policies)).toBe(true);
+    expect(precedes(policies, backup)).toBe(true);
   });
 
   it("draws a routing bullet's markdown instead of its punctuation", async () => {
