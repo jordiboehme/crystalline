@@ -2665,7 +2665,9 @@ async fn a_url_never_reaches_a_draft_through_its_path() {
 }
 
 /// A miss at a URL names the permalink, the way the resolver's own URL miss
-/// does, also where the reader's tombstone is what answers (#111).
+/// does, also where the reader's tombstone is what answers (#111). read_engram
+/// and edit_engram share the rule: both print the bare permalink, never the
+/// crystalline:// URL the caller passed.
 #[tokio::test]
 async fn a_tombstoned_url_miss_names_the_bare_permalink() {
     let f = review_fixture().await;
@@ -2708,6 +2710,23 @@ async fn a_tombstoned_url_miss_names_the_bare_permalink() {
         .await
         .expect_err("her deletion holds at the URL");
     assert_eq!(err.to_string(), "no engram 'plan' in domain 'team'");
+
+    // read_engram resolves through a different path than edit_engram
+    // (`Engine::resolve_shadowed` rather than `DomainView::resolve`), but the
+    // wording is the reader's, not the resolver's, so it must match exactly.
+    let read_err = f
+        .engine
+        .read_engram(
+            &ReadParams {
+                identifier: "crystalline://team/plan".to_string(),
+                domain: None,
+                share_link: None,
+            },
+            &alice,
+        )
+        .await
+        .expect_err("her deletion holds at the URL for read_engram too");
+    assert_eq!(read_err.to_string(), "no engram 'plan' in domain 'team'");
 }
 
 /// A draft is not a way around the domain screen. Alice's draft in a private

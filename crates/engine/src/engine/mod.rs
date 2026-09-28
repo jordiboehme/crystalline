@@ -66,7 +66,7 @@ use crate::changes::{
     Change, ChangeKind, DomainAudience, DomainChanged, EngramChanged, MovedFrom, change_label,
 };
 use crate::collab::session::AgentPeer;
-use crate::domain_view::DomainView;
+use crate::domain_view::{DomainView, shown};
 use crate::origin;
 use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
@@ -4174,7 +4174,7 @@ impl Engine {
             // because this identifier did not.
             let (desc, source) = view
                 .shadow(identifier, Ok((desc, source)), || {
-                    format!("no engram matches '{identifier}'")
+                    format!("no engram matches '{}'", shown(identifier))
                 })
                 .await?;
             return Ok((desc, source, Some(actor)));
@@ -4190,7 +4190,7 @@ impl Engine {
         let base = self.resolve_scoped(identifier, domain, hidden).await;
         let (desc, source) = view
             .shadow(identifier, base, || {
-                format!("no engram '{identifier}' in domain '{name}'")
+                format!("no engram '{}' in domain '{name}'", shown(identifier))
             })
             .await?;
         Ok((desc, source, Some(actor.to_string())))

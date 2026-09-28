@@ -73,7 +73,7 @@ use crate::share_staging::{OVERLAY_STAGING_DIR, OverlayStaging, write_staged_fil
 /// (`no engram 'plan' in domain 'team'`), anything else as written. A
 /// co-editing room addresses its engram by URL, and its misses keep reading
 /// like the bare permalink they always showed.
-fn shown(identifier: &str) -> String {
+pub(crate) fn shown(identifier: &str) -> String {
     CrystallineUrl::parse(identifier)
         .map(|url| url.permalink)
         .unwrap_or_else(|| identifier.to_string())
