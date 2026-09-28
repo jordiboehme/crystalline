@@ -516,7 +516,10 @@ fn pick(
 /// differently on both sides it is a conflict. Keys come in upstream's
 /// order, a key only local has right after its nearest preceding local key
 /// (first when it has none). The delimiter lines are upstream's and every
-/// block is written as the chosen side's exact text.
+/// block is written as the chosen side's exact text. The merged frontmatter
+/// always follows upstream's key order, so a pull that changes only the body
+/// still resets a local reordering of keys; no value is lost by this, since
+/// order is the only thing that moves.
 pub fn merge_frontmatter<'a>(
     base: Option<&'a str>,
     local: &'a str,
