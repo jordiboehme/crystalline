@@ -10,12 +10,20 @@ import { describe, expect, it } from "vitest";
 import { circleOverlapsBox } from "../dev/spots";
 import {
   ARRIVAL_LIFT_CLEARANCE,
+  ARRIVAL_LIFT_COLUMN,
   ARRIVAL_REACH,
+  ARRIVAL_SIDE_DEPTH,
   arrivalBoxCandidates,
   placeArrivalBox,
   withArrivalBox,
 } from "./arrival";
-import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
+import { withBridge } from "./bridge";
+import {
+  CANNED_BRIDGE,
+  CANNED_BRIDGE_DATA,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
+} from "./canned";
 import {
   HERO_FRONT,
   heroFootprint,
@@ -71,6 +79,29 @@ function narrowWithHatches(n = 8): PlaceInput {
     links: [],
     inbound,
     inboundTotal: n,
+  };
+}
+
+/**
+ * A bridge-typed place at `layout.ts`'s 5-cell minimum width: up to two
+ * north-wall ways (`relations`, the most a 5-wide hall's width formula
+ * allows) and up to one south-wall hatch (`hatches`, ditto) - the
+ * narrowest a real bridge gets, the shape the round-1 review measured as
+ * "probably the most common real one".
+ */
+function narrowBridge(relations: 0 | 1 | 2, hatches: 0 | 1): PlaceInput {
+  const inbound = Array.from({ length: hatches }, (_, i) => ({
+    address: { domain: CANNED_BRIDGE.domain, permalink: `in-${String(i)}` },
+    title: `In ${String(i)}`,
+    relType: "relates_to",
+  }));
+  return {
+    ...CANNED_BRIDGE,
+    permalink: `narrow-r${String(relations)}-h${String(hatches)}`,
+    relations: CANNED_BRIDGE.relations.slice(0, relations),
+    links: [],
+    inbound,
+    inboundTotal: hatches,
   };
 }
 
@@ -386,9 +417,21 @@ describe("the arrival box (2.6e C14)", () => {
         const f = propFootprint(p);
         return f !== null && overlaps(f, moat);
       });
-    // The narrow hall's own dressing stands a crate where the box goes.
-    expect(inMoat(built)).toBe(true);
-    const out = withArrivalBox(place, built);
+    // A crate planted right where the box is about to stand (whichever
+    // pass lands it, plain, against a side wall or the last resort): the
+    // redress must clear it regardless of which spot that turns out to be.
+    const crate: Prop = {
+      kind: "crate",
+      variant: 0,
+      anchor: "floor",
+      x: placed!.x,
+      y: placed!.y,
+      turn: 0,
+      seed: 1,
+    };
+    const withCrate: RoomSpec = { ...built, props: [...built.props, crate] };
+    expect(inMoat(withCrate)).toBe(true);
+    const out = withArrivalBox(place, withCrate);
     expect(out.box).not.toBeNull();
     expect(inMoat(out.room)).toBe(false);
   });
@@ -405,7 +448,10 @@ describe("the arrival box (2.6e C14)", () => {
       if (out.box === null) return;
       landed++;
       const h = out.room.heroes[out.box]!;
-      expect(h.turn).toBe(0);
+      // North (0) at the plain spot, or turned to face the hall's centre
+      // line when it fell back to standing against a side wall (1 from
+      // the west wall, 3 from the east, Jordi, M4 round 2).
+      expect([0, 1, 3]).toContain(h.turn);
       expect(inWalkway(out.room, out.box), place.permalink).toEqual([]);
       const s = out.spawn!;
       expect(
@@ -430,48 +476,146 @@ describe("the arrival box (2.6e C14)", () => {
     expect(landed / rooms).toBeGreaterThanOrEqual(MEASURED_MINUS_MARGIN);
   }, 30_000);
 
-  it("lands clear of the lift's column, off the path between the lift and the hall's centre (Jordi, M4)", () => {
-    // Mutation caught: the lift-clearance filter dropped, shrunk below two
-    // cells, or skipped for the "does not stand between" half of the rule,
-    // letting the box land beside the lift again and block the sightline
-    // between the lift and the room.
-    const wide = [
-      CANNED_BRIDGE,
-      CANNED_WORKSHOP,
-      CANNED_HUB,
-      narrowWithHatches(4),
-      narrowWithHatches(8),
-    ];
-    let checked = 0;
-    for (const place of wide) {
+  describe("round 2 (Jordi, M4): never on the lift's column, pass 2 lands on narrow bridges", () => {
+    /**
+     * The world box of the lift's own cell (`entrance.x`..+1 by
+     * `entrance.y`..+1): what "on the lift's column" and "the lift's
+     * approach cell" both mean, read straight off the room, not off the
+     * box's reported x the way a coarser dx check would.
+     */
+    const liftCell = (room: RoomSpec): Box => ({
+      x0: room.entrance.x * CELL,
+      x1: (room.entrance.x + 1) * CELL,
+      z0: room.entrance.y * CELL,
+      z1: (room.entrance.y + 1) * CELL,
+    });
+
+    /** True when `box`'s x range reaches into the lift's own column. */
+    const onLiftColumn = (box: Box, cell: Box): boolean =>
+      box.x1 > cell.x0 && box.x0 < cell.x1;
+
+    it("built through withBridge as station.ts builds a bridge, over many seeds of narrow and wide layouts: never on the lift's column or in its approach cell, and pass 2 lands most narrow rooms", () => {
+      // Mutation caught: the lift-clearance filter (pass 1) dropped or
+      // shrunk, `placeAgainstSideWall` (pass 2) skipped, or its column
+      // limit widened back to the hall's centre - proven below by hand.
+      const narrowLayouts: PlaceInput[] = [
+        narrowBridge(0, 0),
+        narrowBridge(1, 0),
+        narrowBridge(2, 0),
+        narrowBridge(0, 1),
+        narrowBridge(1, 1),
+        narrowBridge(2, 1),
+      ];
+      const wideLayouts: PlaceInput[] = [
+        CANNED_BRIDGE,
+        CANNED_WORKSHOP,
+        CANNED_HUB,
+      ];
+      const N = 150;
+      const report: string[] = [];
+
+      const sweep = (place: PlaceInput) => {
+        let p1 = 0;
+        let p2 = 0;
+        let p3 = 0;
+        let none = 0;
+        for (let i = 0; i < N; i++) {
+          const status = STATUSES[i % 4] ?? null;
+          const seeded: PlaceInput = {
+            ...place,
+            permalink: `${place.permalink}-seed${String(i)}`,
+            status,
+          };
+          const room = generateRoom(seeded);
+          const fitted = withBridge(seeded, room, CANNED_BRIDGE_DATA);
+          const out = withArrivalBox(seeded, fitted);
+          if (out.box === null) {
+            none++;
+            continue;
+          }
+          const h = out.room.heroes[out.box]!;
+          const foot = heroFootprint(h);
+          const cell = liftCell(room);
+          // The lift's own approach cell is off limits in every pass: the
+          // `fits` lane check `placeArrivalBox` shares across all three
+          // enforces this regardless of which one lands the box.
+          expect(overlaps(foot, cell), seeded.permalink).toBe(false);
+          const liftX = room.entrance.x + 0.5;
+          if (h.turn !== 0) {
+            p2++;
+            // Pass 2 never overlaps the column by construction
+            // (`ARRIVAL_LIFT_COLUMN`): it is the one assertion this
+            // sweep can make unconditionally about the column itself.
+            expect(onLiftColumn(foot, cell), seeded.permalink).toBe(false);
+          } else if (Math.abs(h.x - liftX) >= ARRIVAL_LIFT_CLEARANCE) {
+            p1++;
+            expect(onLiftColumn(foot, cell), seeded.permalink).toBe(false);
+          } else {
+            p3++;
+            // Pass 3 may land on the column, but only as the true last
+            // resort (Jordi's ruling): if it does, no wider spot exists,
+            // and passes 1 and 2 above already proved that for this room.
+          }
+        }
+        report.push(
+          `${place.permalink}: p1 ${String(p1)} p2 ${String(p2)} p3 ${String(p3)} none ${String(none)}`,
+        );
+        return { p1, p2, p3, none };
+      };
+
+      for (const layout of narrowLayouts) {
+        const { p2 } = sweep(layout);
+        // Pass 2 is the layout's only route off the lift's column at all
+        // (round 1's clearance never fits a 5-wide hall): it lands most
+        // of the time, not just as a rare escape.
+        expect(p2, layout.permalink).toBeGreaterThanOrEqual(N * 0.5);
+      }
+      for (const layout of wideLayouts) sweep(layout);
+
+      console.log("box-landing round 2 pass counts:\n" + report.join("\n"));
+    }, 60_000);
+
+    it("blocks every pass 1 and pass 2 spot on a narrow bridge, leaving only the lift's own column free in the deep band: pass 3 still lands the box there, exactly as the plain nearest-free rule always did (Review Focus, round 2)", () => {
+      // Mutation caught: the last, unrestricted search dropped, or run
+      // ahead of the lift-clearance and side-wall passes, so a landing
+      // that used to succeed on 99a938d1 turns into none.
+      const place = narrowBridge(0, 0);
       const room = generateRoom(place);
-      const out = withArrivalBox(place, room);
-      expect(out.box, place.permalink).not.toBeNull();
-      const h = out.room.heroes[out.box!]!;
-      checked++;
-      const liftX = room.entrance.x + 0.5;
-      const liftY = room.entrance.y + 1;
-      const centreX = (room.hall.x0 + room.hall.x1) / 2;
-      const centreY = (room.hall.y0 + room.hall.y1) / 2;
-      expect(Math.abs(h.x - liftX), place.permalink).toBeGreaterThanOrEqual(
-        ARRIVAL_LIFT_CLEARANCE - 1e-9,
-      );
-      const betweenX =
-        h.x >= Math.min(liftX, centreX) - 1e-9 &&
-        h.x <= Math.max(liftX, centreX) + 1e-9;
-      const betweenY =
-        h.y >= Math.min(liftY, centreY) - 1e-9 &&
-        h.y <= Math.max(liftY, centreY) + 1e-9;
-      expect(betweenX && betweenY, place.permalink).toBe(false);
-    }
-    expect(checked).toBe(wide.length);
-    // A hall too narrow to hold the clearance (5 cells wide, less than
-    // twice ARRIVAL_LIFT_CLEARANCE) still lands the box, falling back to
-    // the plain nearest free candidate: the rule never turns a landing
-    // that used to succeed into a null.
-    const narrow = generateRoom(narrowWithHatches(0));
-    expect(narrow.hall.x1 - narrow.hall.x0).toBeLessThan(5.5);
-    const out = withArrivalBox(narrowWithHatches(0), narrow);
-    expect(out.box).not.toBeNull();
+      // Pass 1 has no candidate to find on a 5-wide hall regardless (the
+      // only geometrically far-enough columns, at the walls themselves,
+      // always fail `standsFree`'s own wall clearance) - the two boxes
+      // below only need to starve pass 2: every column `columnsFromWall`
+      // would try, `ARRIVAL_LIFT_COLUMN` cells or farther from the lift's
+      // column, for the whole depth `depthsFromEntrance` searches.
+      const centreX = room.entrance.x + 0.5;
+      const deepZ1 = (room.hall.y1 - ARRIVAL_SIDE_DEPTH - 0.5 + 1) * CELL;
+      const westBlock: Box = {
+        x0: -CELL,
+        x1: (centreX - ARRIVAL_LIFT_COLUMN) * CELL,
+        z0: -CELL,
+        z1: deepZ1,
+      };
+      const eastBlock: Box = {
+        x0: (centreX + ARRIVAL_LIFT_COLUMN) * CELL,
+        x1: (room.hall.x1 + 1) * CELL,
+        z0: -CELL,
+        z1: deepZ1,
+      };
+      const blocked: RoomSpec = {
+        ...room,
+        scaffold: [...room.scaffold, westBlock, eastBlock],
+      };
+      const placed = placeArrivalBox(blocked);
+      expect(placed).not.toBeNull();
+      const h = placed!;
+      expect(h.turn).toBe(0);
+      const cell = liftCell(room);
+      const foot = heroFootprint(h);
+      // The only spot the two boxes leave free in the deep band is the
+      // lift's own column: pass 3 lands there because nothing else is
+      // free at all, exactly what "if any other free cell exists" rules
+      // out everywhere else and allows here.
+      expect(onLiftColumn(foot, cell)).toBe(true);
+    });
   });
 });
