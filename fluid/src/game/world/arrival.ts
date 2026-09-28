@@ -27,10 +27,15 @@
  * 3. Last resort, so a hall this cramped still lands the box exactly as
  *    it did before this rule existed: every `arrivalBoxCandidates` point
  *    again with no rule against the lift's column at all, nearest first.
- *    Passes 1 and 2 between them already claim every free spot at least
- *    `ARRIVAL_LIFT_COLUMN` cells off the column first, so this pass only
- *    ever has to fall nearer than that when the room leaves nothing else
- *    free in reach at all.
+ *    Nothing here stops this pass reaching a spot `ARRIVAL_LIFT_COLUMN`
+ *    cells or farther off the column - rows 0 and 1 beside the lift's own
+ *    wall fall outside both passes 1 and 2's own row rules, and a spot
+ *    past `ARRIVAL_REACH` falls outside every pass. In practice the
+ *    lift's own lane and the walkway rule `fits` already runs for every
+ *    pass rule those rows out too, so a landing sweep over real bridges
+ *    finds this pass on the lift's column only when nothing else in
+ *    reach is free - measured, not guaranteed by this function's shape
+ *    alone.
  *
  * Every pass takes a candidate when the box stands free (`standsFree` in
  * `heroes.ts`: a walkway of `HERO_WALKWAY` all round it, clear of every

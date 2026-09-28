@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { seedFor } from "../core/seed";
 import { circleOverlapsBox } from "../dev/spots";
 import {
   ARRIVAL_LIFT_CLEARANCE,
@@ -27,6 +28,7 @@ import {
 import {
   HERO_FRONT,
   heroFootprint,
+  pipeRunBox,
   propFootprint,
   turnedBox,
 } from "./footprints";
@@ -450,7 +452,7 @@ describe("the arrival box (2.6e C14)", () => {
       const h = out.room.heroes[out.box]!;
       // North (0) at the plain spot, or turned to face the hall's centre
       // line when it fell back to standing against a side wall (1 from
-      // the west wall, 3 from the east, Jordi, M4 round 2).
+      // the west wall, 3 from the east, Jordi, M4).
       expect([0, 1, 3]).toContain(h.turn);
       expect(inWalkway(out.room, out.box), place.permalink).toEqual([]);
       const s = out.spawn!;
@@ -476,7 +478,7 @@ describe("the arrival box (2.6e C14)", () => {
     expect(landed / rooms).toBeGreaterThanOrEqual(MEASURED_MINUS_MARGIN);
   }, 30_000);
 
-  describe("round 2 (Jordi, M4): never on the lift's column, pass 2 lands on narrow bridges", () => {
+  describe("round 1 (Jordi, M4): never on the lift's column, pass 2 lands on narrow bridges", () => {
     /**
      * The world box of the lift's own cell (`entrance.x`..+1 by
      * `entrance.y`..+1): what "on the lift's column" and "the lift's
@@ -493,6 +495,74 @@ describe("the arrival box (2.6e C14)", () => {
     /** True when `box`'s x range reaches into the lift's own column. */
     const onLiftColumn = (box: Box, cell: Box): boolean =>
       box.x1 > cell.x0 && box.x0 < cell.x1;
+
+    /**
+     * Whether a box of `room`'s own arrival seed, at `(x, y)` turned
+     * `turn`, would be one `placeArrivalBox` could take: the same
+     * `standsFree`, lane, moat and pipe checks its own `fits` closure
+     * runs, read independently here so the pass-3 branch below can prove
+     * passes 1 and 2 truly found nothing, not just that pass 3 ran.
+     */
+    const fitsAt = (
+      room: RoomSpec,
+      x: number,
+      y: number,
+      turn: number,
+    ): boolean => {
+      const seed = seedFor(room.seed, "arrival-box");
+      const box: Hero = { kind: "police-box", variant: 0, x, y, turn, seed };
+      const floor = heroFootprint(box);
+      if (!standsFree(room, floor)) return false;
+      const sites = dressingSites(room);
+      if (sites.lanes.some((l) => overlaps(l, floor))) return false;
+      const moat = grow(floor, HERO_CLEAR);
+      if (sites.taken.some((t) => overlaps(t, moat))) return false;
+      const pipes = room.decor
+        .map((d) => pipeRunBox(d, room.hall))
+        .filter((b) => b !== null);
+      if (pipes.some((p) => overlaps(p, moat))) return false;
+      return true;
+    };
+
+    /** True when no candidate pass 1 tries (turn 0, `dx >= ARRIVAL_LIFT_CLEARANCE`) fits `room`. */
+    const noPass1Spot = (room: RoomSpec, liftX: number): boolean =>
+      arrivalBoxCandidates(room).every(
+        (c) =>
+          Math.abs(c.x - liftX) < ARRIVAL_LIFT_CLEARANCE ||
+          !fitsAt(room, c.x, c.y, 0),
+      );
+
+    /**
+     * True when no candidate pass 2 tries fits `room`: every column
+     * `placeAgainstSideWall` would search from each wall in to
+     * `ARRIVAL_LIFT_COLUMN` cells off the lift's column, crossed with
+     * every row at least `ARRIVAL_SIDE_DEPTH` in from the lift's wall,
+     * turned to face the hall's centre (1 from the west wall, 3 from the
+     * east).
+     */
+    const noPass2Spot = (room: RoomSpec): boolean => {
+      const centreX = room.entrance.x + 0.5;
+      const south = room.entrance.y + 1;
+      const maxY = south - ARRIVAL_SIDE_DEPTH - 0.5;
+      const sides: readonly [number, number, number][] = [
+        [1, room.hall.x0, centreX - ARRIVAL_LIFT_COLUMN],
+        [3, room.hall.x1, centreX + ARRIVAL_LIFT_COLUMN],
+      ];
+      for (const [turn, wall, limit] of sides) {
+        const lo = Math.round(Math.min(wall, limit) * 2);
+        const hi = Math.round(Math.max(wall, limit) * 2);
+        for (let xi = lo; xi <= hi; xi++) {
+          for (
+            let yi = Math.round(room.hall.y0 * 2);
+            yi <= Math.round(maxY * 2);
+            yi++
+          ) {
+            if (fitsAt(room, xi / 2, yi / 2, turn)) return false;
+          }
+        }
+      }
+      return true;
+    };
 
     it("built through withBridge as station.ts builds a bridge, over many seeds of narrow and wide layouts: never on the lift's column or in its approach cell, and pass 2 lands most narrow rooms", () => {
       // Mutation caught: the lift-clearance filter (pass 1) dropped or
@@ -547,14 +617,25 @@ describe("the arrival box (2.6e C14)", () => {
             // (`ARRIVAL_LIFT_COLUMN`): it is the one assertion this
             // sweep can make unconditionally about the column itself.
             expect(onLiftColumn(foot, cell), seeded.permalink).toBe(false);
+            // Facing the hall's centre from whichever wall it pressed
+            // against (turn 1 west of the lift, turn 3 east), and at
+            // least ARRIVAL_SIDE_DEPTH rows in from the lift's own wall.
+            expect(h.turn, seeded.permalink).toBe(h.x < liftX ? 1 : 3);
+            expect(h.y, seeded.permalink).toBeLessThanOrEqual(
+              room.entrance.y + 1 - ARRIVAL_SIDE_DEPTH - 0.5 + 1e-9,
+            );
           } else if (Math.abs(h.x - liftX) >= ARRIVAL_LIFT_CLEARANCE) {
             p1++;
             expect(onLiftColumn(foot, cell), seeded.permalink).toBe(false);
           } else {
             p3++;
-            // Pass 3 may land on the column, but only as the true last
-            // resort (Jordi's ruling): if it does, no wider spot exists,
-            // and passes 1 and 2 above already proved that for this room.
+            // Pass 3 may land on the column or right beside it, but only
+            // as the true last resort (Jordi's ruling): independently
+            // reconstructed here, not just inferred from pass 3 having
+            // run, no candidate pass 1 or pass 2 would have tried fits
+            // this room either.
+            expect(noPass1Spot(fitted, liftX), seeded.permalink).toBe(true);
+            expect(noPass2Spot(fitted), seeded.permalink).toBe(true);
           }
         }
         report.push(
@@ -572,10 +653,10 @@ describe("the arrival box (2.6e C14)", () => {
       }
       for (const layout of wideLayouts) sweep(layout);
 
-      console.log("box-landing round 2 pass counts:\n" + report.join("\n"));
+      console.log("box-landing pass counts:\n" + report.join("\n"));
     }, 60_000);
 
-    it("blocks every pass 1 and pass 2 spot on a narrow bridge, leaving only the lift's own column free in the deep band: pass 3 still lands the box there, exactly as the plain nearest-free rule always did (Review Focus, round 2)", () => {
+    it("blocks every pass 1 and pass 2 spot on a narrow bridge, leaving only the lift's own column free in the deep band: pass 3 still lands the box there, exactly as the plain nearest-free rule always did (Review Focus)", () => {
       // Mutation caught: the last, unrestricted search dropped, or run
       // ahead of the lift-clearance and side-wall passes, so a landing
       // that used to succeed on 99a938d1 turns into none.
