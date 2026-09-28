@@ -295,7 +295,7 @@ export function surfaces(look: Look, own = false) {
     tint: shade(p.metal, 0.45),
     flag: FLAG.lit,
   };
-  return {
+  const all = {
     body: { layer: LAYER.panel, tint: p.machine, flag: FLAG.lit },
     panel: { layer: LAYER.panel, tint: p.panel, flag: FLAG.lit },
     metal: { layer: LAYER.metal, tint: p.metal, flag: FLAG.lit },
@@ -332,6 +332,8 @@ export function surfaces(look: Look, own = false) {
         ? { layer: LAYER.panel, tint: propMarkTint(k), flag: FLAG.lit }
         : fallback,
   } satisfies Record<string, Surface | ((...args: never[]) => Surface)>;
+  /** True when `own` marks a part: a part only that look draws may be added. */
+  return { ...all, owns: own };
 }
 
 /** The surfaces `surfaces` returns. */

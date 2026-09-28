@@ -65,7 +65,8 @@ import { PROP_BANK } from "./models/props/common";
 export const INSTANCE_FLOATS = 5;
 
 /**
- * A prop instance's turn float: its quarter turn, 0 to 3, plus four times
+ * A prop instance's turn float: its quarter turn, 0 to 3 (a stray turn
+ * wrapped, so it never shifts the pick), plus four times
  * one more than its accent pick (`propAccentPick` of its seed), so 4 to 23.
  * The vertex shader turns the instance by the float's low two bits and
  * takes the prop's own accent (`PROP_MARK`) from the rest; a hero, a curio
@@ -74,7 +75,7 @@ export const INSTANCE_FLOATS = 5;
  * without the prop's own mark never uses the pick.
  */
 export function propTurn(p: Pick<Prop, "turn" | "seed">): number {
-  return p.turn + 4 * (1 + propAccentPick(p.seed));
+  return (p.turn & 3) + 4 * (1 + propAccentPick(p.seed));
 }
 
 /**

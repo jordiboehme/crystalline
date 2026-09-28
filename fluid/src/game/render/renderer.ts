@@ -289,6 +289,8 @@ export function createRenderer(
   let light: GpuLight | null = null;
   // The room's contact shadow texture and its size in metres.
   let shadow: { texture: WebGLTexture; w: number; d: number } | null = null;
+  // The look's accents as `uAccents` takes them, built once per room load.
+  let accents = new Float32Array(0);
   let room: RoomSpec | null = null;
   let look: Look | null = null;
   let meshLook: LookId | null = null;
@@ -389,14 +391,13 @@ export function createRenderer(
   };
 
   /**
-   * The room's contact shadow texture (`contactShadows`): immutable R8
-   * storage, LINEAR so the patches stay soft between texels, clamped at
-   * the grid's edge.
+   * The room's contact shadow texture from its texels (`contactShadows`,
+   * painted before the old room is let go): immutable R8 storage, LINEAR
+   * so the patches stay soft between texels, clamped at the grid's edge.
    */
   const makeShadow = (
-    nextRoom: RoomSpec,
+    cs: ReturnType<typeof contactShadows>,
   ): { texture: WebGLTexture; w: number; d: number } => {
-    const cs = contactShadows(nextRoom);
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, cs.width, cs.depth);
@@ -480,6 +481,8 @@ export function createRenderer(
         if (!lookChanged && groupMeshes.has(g.key)) continue;
         fresh.set(g.key, buildGroupMesh(g, nextLook));
       }
+      // The contact shadow is painted on the CPU before the release too.
+      const nextShadow = contactShadows(nextRoom);
       releaseRoom();
       releaseGroupMeshes();
       if (lookChanged) {
@@ -544,7 +547,10 @@ export function createRenderer(
       }
       array.finish();
       light = makeLight(nextRoom);
-      shadow = makeShadow(nextRoom);
+      shadow = makeShadow(nextShadow);
+      accents = new Float32Array(
+        nextLookApplied.accents.flatMap((c) => [...c]),
+      );
       room = nextRoom;
       look = nextLookApplied;
     },
@@ -630,10 +636,7 @@ export function createRenderer(
         light.grid.depth,
       );
       gl.uniform3f(scene.uniform("uAccent"), ...accentFor(room, look));
-      gl.uniform3fv(
-        scene.uniform("uAccents"),
-        new Float32Array(look.accents.flatMap((c) => [...c])),
-      );
+      gl.uniform3fv(scene.uniform("uAccents"), accents);
       gl.uniform1f(scene.uniform("uLightScale"), look.lightScale);
       gl.uniform1f(scene.uniform("uFalloff"), look.falloff);
       gl.uniform1f(scene.uniform("uMinLight"), look.minLight);

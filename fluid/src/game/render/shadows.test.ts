@@ -108,7 +108,8 @@ describe("contact shadows", () => {
     // Mutation caught: one darkness for every size (big cabinets and
     // machines back on a painted pad), a darkness that grows with the
     // footprint, one keyed by kind rather than size (two equal footprints
-    // would differ), or softness without bound.
+    // would differ), a floor other than 0.55 (0.5), another slope, or
+    // softness without bound.
     const at = (hx: number, hz: number, round = false) => ({
       x: 0,
       z: 0,
@@ -126,11 +127,36 @@ describe("contact shadows", () => {
     expect(casterDarkness(machine)).toBeLessThan(0.9);
     expect(casterDarkness(console)).toBeLessThan(casterDarkness(machine));
     expect(casterDarkness(hero)).toBeLessThan(casterDarkness(console));
-    expect(casterDarkness(hero)).toBeGreaterThanOrEqual(0.5);
+    // The floor and the slope, exactly: a large hero sits on the floor,
+    // a 3 m by 1 m console at 1 - 0.35 * (1.732 - 0.8).
+    expect(casterDarkness(hero)).toBeCloseTo(0.55, 5);
+    expect(casterDarkness(console)).toBeCloseTo(
+      1 - 0.35 * (2 * Math.sqrt(0.75) - 0.8),
+      5,
+    );
     // Size alone: a round and a square patch of one footprint match.
     expect(casterDarkness(at(0.9, 0.45, true))).toBe(casterDarkness(machine));
     expect(casterSoftness(hero)).toBeGreaterThan(casterSoftness(barrel));
     expect(casterSoftness(at(10, 10))).toBeLessThanOrEqual(0.5);
+  });
+
+  it("gives a hero standing on the floor a patch, a flush hero none, and the console room's fittings theirs", () => {
+    // Mutation caught: flush heroes (on their wall) given a patch, or the
+    // fittings dropped from the casters.
+    const room: RoomSpec = {
+      ...roomWith([]),
+      heroes: [
+        { kind: "turret", variant: 0, x: 3, y: 3, turn: 0, seed: 1 },
+        { kind: "eye-panel", variant: 0, x: 5, y: 2, turn: 0, seed: 2 },
+      ],
+      interior: [{ kind: "console", variant: 0, x: 4, y: 4, turn: 0, seed: 3 }],
+    };
+    const cs = shadowCasters(room);
+    // The turret (0.9 m, round) and the console (2.4 m); no eye panel.
+    expect(cs.length).toBe(2);
+    expect(cs.map((c) => c.round)).toEqual([true, false]);
+    expect(cs[0]?.hx).toBeCloseTo(0.45, 5);
+    expect(cs[1]?.hx).toBeCloseTo(1.2, 5);
   });
 
   it("casts a wall-standing locker bank's patch in front of its wall, along it", () => {

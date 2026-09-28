@@ -21,13 +21,13 @@
  * In a look with `propAccents` a prop paints exactly one part in its own
  * accent instead (`s.own`), big enough to read from across a room but
  * never a whole door, lid or body, and the parts above turn dark metal: the
- * stool's seat, a stripe along the bench seat's front edge, the trolley's
- * grip bar, a trim along the tool cart's top front edge and up the filing
- * cabinet's front edge, a band all round one barrel or drum, a rim all
- * round a crate's lid, a band all round one crate of the stack, a stripe
- * on the storage shelf's top lip and the fume cabinet's flue. A part only
- * that look draws is added only there, so the other looks' meshes stay as
- * they were.
+ * stool's seat, a stripe along the bench seat's front edge, a band all
+ * round the trolley's deck, a trim along the tool cart's top front edge and
+ * up the filing cabinet's front edge, a band all round one barrel or drum,
+ * a rim all round a crate's lid, a band all round one crate of the stack,
+ * a stripe on the storage shelf's top lip and the fume cabinet's flue. A
+ * part only that look draws is added only there (`s.owns`), so the other
+ * looks' meshes stay as they were.
  */
 
 import type { Surface } from "../../geometry";
@@ -143,7 +143,7 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A rim all round the lid, drawn only in a look with the prop's own
     // accent.
     const rim = s.own(s.body);
-    if (rim !== s.body) {
+    if (s.owns) {
       const e = post * 0.7 + 0.01;
       lidRim(k, -hw + e, hw - e, -hd + e, hd - e, H, rim);
     }
@@ -154,7 +154,7 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A rim all round the lid, drawn only in a look with the prop's own
     // accent.
     const rim = s.own(s.body);
-    if (rim !== s.body) {
+    if (s.owns) {
       const e = 0.05;
       lidRim(k, -hw + e, hw - e, -hd + e, hd - e, CRATE_H.large, rim);
     }
@@ -179,7 +179,7 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A rim all round the small crate's lid, drawn only in a look with the
   // prop's own accent.
   const rim = s.own(s.body);
-  if (rim !== s.body) {
+  if (s.owns) {
     const e = 0.035;
     const h = H1 + CRATE_H.stackedSmall;
     lidRim(
@@ -348,7 +348,7 @@ function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A band all round the barrel between its ribs, drawn only in a look
     // with the prop's own accent.
     const band = s.own(s.body);
-    if (band !== s.body)
+    if (s.owns)
       barrelBand(k, 0, 0, Math.min(hw, hd) - 0.025, 0.36, 0.5, 12, band);
     return;
   }
@@ -365,7 +365,7 @@ function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // prop's own accent.
   const band = s.own(s.body);
   const [fa, fd] = positions[2] ?? [0, 0];
-  if (band !== s.body) barrelBand(k, fa, fd, r, 0.34, 0.47, 10, band);
+  if (s.owns) barrelBand(k, fa, fd, r, 0.34, 0.47, 10, band);
 }
 
 /** The trolley deck's thickness and the caster's radius. */
@@ -419,6 +419,13 @@ function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   }
   const deckH = T.caster + 0.16;
   trolleyDeck(k, s, hw, -hd + 0.03, hd - 0.03, deckH);
+  // A band all round the deck's edge, drawn only in a look with the prop's
+  // own accent.
+  if (s.owns) {
+    const band = s.own(s.metal);
+    const [a0, a1, d0, d1] = [-hw + 0.03, hw - 0.03, -hd + 0.03, hd - 0.03];
+    bandAround(k, a0, a1, d0, d1, deckH, deckH + T.deckT, band);
+  }
   if (variant === 1) {
     const upperH = deckH + 0.3;
     trolleyDeck(k, s, hw, -hd + 0.03, hd - 0.03, upperH);
@@ -439,19 +446,12 @@ function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const handleH0 = deckH + (variant === 1 ? 0.3 : 0);
   const handleTop = Math.min(handleH0 + 0.45, 0.95);
   const railA = hw - 0.1;
+  // Two upright posts from the deck's top up to the grip bar, which they
+  // hold.
   for (const a of [-railA, railA]) {
-    k.cylinderAlong(
-      a - 0.012,
-      a + 0.012,
-      -hd + 0.03,
-      (handleH0 + handleTop) / 2,
-      0.012,
-      6,
-      s.dark,
-    );
+    k.cylinder(a, -hd + 0.03, handleH0 + T.deckT, handleTop, 0.012, 6, s.dark);
   }
-  const grip = s.own(s.accent());
-  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, grip);
+  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, s.accent());
 }
 
 /**
@@ -532,9 +532,10 @@ function filingCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A trim strip up the front's left edge, drawn only in a look with the
   // prop's own accent.
   const trim = s.own(s.metal);
-  if (trim !== s.metal) {
+  if (s.owns) {
+    // In the margin left of the drawer fronts, which start 4 cm in.
     const a0 = -hw + C.inset;
-    k.box(a0, a0 + 0.03, front, front + 0.006, 0.02, H - 0.02, trim);
+    k.box(a0, -hw + 0.037, front, front + 0.006, 0.02, H - 0.02, trim);
   }
 }
 
@@ -575,7 +576,7 @@ function storageShelf({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A stripe along the top shelf's front lip, drawn only in a look with
     // the prop's own accent.
     const lip = s.own(s.metal);
-    if (i === shelves - 1 && lip !== s.metal)
+    if (i === shelves - 1 && s.owns)
       k.box(-hw + 0.05, hw - 0.05, hd - 0.03, hd - 0.024, h - 0.05, h, lip);
     if (variant === 0 && i < shelves - 1) {
       shelfBox(
@@ -683,7 +684,7 @@ function bench({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A stripe along the seat's front edge, drawn only in a look with the
   // prop's own accent.
   const edge = s.own(s.body);
-  if (edge !== s.body)
+  if (s.owns)
     k.box(-hw + 0.02, hw - 0.02, seatD1, seatD1 + 0.004, 0.42, 0.48, edge);
   const legA = hw - 0.08;
   for (const a of [-legA, legA]) {
@@ -967,7 +968,7 @@ function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A trim strip along the top's front edge, drawn only in a look with the
   // prop's own accent.
   const trim = s.own(s.metal);
-  if (trim !== s.metal)
+  if (s.owns)
     k.box(-hw + 0.02, hw - 0.02, hd - 0.06, hd - 0.02, top, top + 0.015, trim);
   for (const a of [-hw + 0.09, hw - 0.09]) {
     for (const d of [-hd + 0.09, hd - 0.09]) {
@@ -1147,7 +1148,7 @@ function crateStack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A band all round the middle crate, drawn only in a look with the
     // prop's own accent.
     const band = s.own(s.body);
-    if (band !== s.body)
+    if (s.owns)
       bandAround(k, offA - mw, offA + mw, -md, md, H0 + 0.3, H0 + 0.4, band);
     const sw = mw * 0.62;
     const sd = md * 0.62;
@@ -1193,7 +1194,7 @@ function crateStack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A band all round the big crate, drawn only in a look with the prop's
   // own accent.
   const band = s.own(s.body);
-  if (band !== s.body)
+  if (s.owns)
     bandAround(k, -hw + 0.02, hw - 0.02, -hd + 0.02, hd - 0.02, 1.1, 1.2, band);
 }
 
@@ -1236,7 +1237,7 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A band all round one drum on the upper deck, drawn only in a look
     // with the prop's own accent.
     const band = s.own(s.dark);
-    if (band !== s.dark) {
+    if (s.owns) {
       const h0 = (decks[1] ?? 0) + 0.04;
       barrelBand(k, -hw * 0.4, 0, dr, h0 + 0.34, h0 + 0.47, 8, band);
     }
@@ -1256,8 +1257,7 @@ function drumRack({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   // A band round the top drum's middle, drawn only in a look with the
   // prop's own accent.
   const band = s.own(s.metal);
-  if (band !== s.metal)
-    k.cylinderAlong(-0.07, 0.07, 0, 1.4, r + 0.004, 10, band);
+  if (s.owns) k.cylinderAlong(-0.07, 0.07, 0, 1.4, r + 0.004, 10, band);
 }
 
 /**

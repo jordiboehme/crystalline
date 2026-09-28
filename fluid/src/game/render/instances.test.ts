@@ -106,6 +106,12 @@ describe("propInstances", () => {
     // Seeds 0 to 4 give all five picks, 1 to 5.
     const five = picks([0, 1, 2, 3, 4].map((s) => one(s, 2.5, "crate")));
     expect(new Set(five)).toEqual(new Set([1, 2, 3, 4, 5]));
+    // A stray turn (5, one past a whole turn) wraps and keeps its pick.
+    const stray = propInstances({
+      ...workshop,
+      props: [{ ...one(77, 2.5, "crate"), turn: 5 }],
+    })[0]?.data[3];
+    expect(stray).toBe(1 + 4 * 3);
     // The same room gives the same floats.
     expect(propInstances(workshop)).toEqual(propInstances(workshop));
   });

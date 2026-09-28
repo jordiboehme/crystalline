@@ -17,7 +17,7 @@
  * In a look with `propAccents` a prop paints exactly one part in its own
  * accent instead (`s.own`) and the slits turn dark metal: a full-width
  * stripe across one locker door,
- * the breaker box's switch housing (variant 0) or the bar across its two boxes
+ * a stripe across the breaker box's front (variant 0) or the bar across its two boxes
  * (variant 1) and a trim along the conduit cabinet's top. A
  * part only that look draws is added only there.
  */
@@ -85,7 +85,7 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A full-width stripe across the second door, drawn only in a look
     // with the prop's own accent.
     const stripe = s.own(s.panel);
-    if (i === 1 && stripe !== s.panel)
+    if (i === 1 && s.owns)
       k.box(a0, a1, L.depth - 0.005, L.depth + 0.002, 1.3, 1.42, stripe);
   }
 }
@@ -387,8 +387,14 @@ function breakerBox({ k, s, kitAt, variant }: Parameters<PropRecipe>[0]): void {
       B.depth,
       mid - 0.1,
       mid + 0.1,
-      s.own(s.dark),
+      s.dark,
     );
+    // A stripe across the front's foot, drawn only in a look with the
+    // prop's own accent.
+    if (s.owns) {
+      const [d0, d1] = [B.depth - 0.01, B.depth + 0.002];
+      k.box(-B.half, B.half, d0, d1, B.h0 + 0.03, B.h0 + 0.06, s.own(s.dark));
+    }
     const f = frameAt([0, 0, 0], 0);
     const lever = yawed(f, B.half - 0.05, B.depth, -0.7);
     kitAt(lever).box(
@@ -760,7 +766,7 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     // A trim along the cabinet's top, drawn only in a look with the
     // prop's own accent.
     const trim = s.own(s.body);
-    if (trim !== s.body)
+    if (s.owns)
       k.box(a0, a1, C.depth - 0.01, C.depth + 0.004, 1.78, 1.84, trim);
     for (const a of [-0.4, 0.1]) k.cylinder(a, d, 1.9, 2.2, 0.03, 8, s.metal);
     k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
@@ -786,7 +792,7 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       // A trim along the left cabinet's top, drawn only in a look with the
       // prop's own accent.
       const trim = s.own(s.body);
-      if (a0 < 0 && trim !== s.body)
+      if (a0 < 0 && s.owns)
         k.box(a0, a1, C.depth - 0.01, C.depth + 0.004, 1.58, 1.64, trim);
       k.box(
         mid - 0.004,

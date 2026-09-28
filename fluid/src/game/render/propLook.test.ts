@@ -182,15 +182,17 @@ describe("looks 1 and 3", () => {
   it("draw every prop and two rooms' static meshes to the last bit as before look 2's set dressing", () => {
     // Mutation caught: any change to a prop or a room in look 1 or 3 (a
     // lid, band or trim drawn outside look 2, a grey or an own accent
-    // leaking in, a moved rib). The hashes were taken before the change.
+    // leaking in, a moved rib). The hashes were taken before the change,
+    // and the props' once more when the trolley's handle got real upright
+    // posts in every look (the only kind that moved: its two variants).
     expect({
       dayProps: fullHash(allProps(LOOKS.day)),
       freescapeProps: fullHash(allProps(LOOKS.freescape)),
       dayRooms: fullHash(rooms(LOOKS.day)),
       freescapeRooms: fullHash(rooms(LOOKS.freescape)),
     }).toEqual({
-      dayProps: "caada0f8",
-      freescapeProps: "8934a7c0",
+      dayProps: "348ac20c",
+      freescapeProps: "c1f5d544",
       dayRooms: "a031ce9c",
       freescapeRooms: "4941a294",
     });

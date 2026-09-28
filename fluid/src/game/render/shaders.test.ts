@@ -260,9 +260,26 @@ it("darkens only the floor by the contact shadow, as far as the look says", () =
   // after the bands (it would add a band edge of its own), or a strength
   // not taken from the look (looks 1 and 3 would get one).
   expect(SCENE_FS).toContain(
-    "if (vNormal.y > 0.9 && vWorld.y < 0.05) lit *= 1.0 - uContactShadow * contact;\n  lit = floor(lit * uBands + 0.5) / uBands;",
+    "if (vNormal.y > 0.9 && vWorld.y < 0.05) lit *= 1.0 - uContactShadow * textureLod(uShadow, vWorld.xz / uShadowSize, 0.0).r;\n  lit = floor(lit * uBands + 0.5) / uBands;",
   );
   expect(rendererSource).toMatch(
     /scene\.uniform\("uContactShadow"\),\s*look\.contactShadow \?\? 0/,
+  );
+});
+
+it("binds the contact shadow to a texture unit of its own", () => {
+  // Mutation caught: uShadow pointed at the light grid's unit (1) or the
+  // texture array's (0), or the shadow texture bound to another unit.
+  expect(rendererSource).toContain(
+    'gl.uniform1i(scene.uniform("uTextures"), 0);',
+  );
+  expect(rendererSource).toContain(
+    'gl.uniform1i(scene.uniform("uLightGrid"), 1);',
+  );
+  expect(rendererSource).toContain(
+    'gl.uniform1i(scene.uniform("uShadow"), 2);',
+  );
+  expect(rendererSource).toMatch(
+    /gl\.activeTexture\(gl\.TEXTURE2\);\s*gl\.bindTexture\(gl\.TEXTURE_2D, shadow\?\.texture \?\? null\);/,
   );
 });

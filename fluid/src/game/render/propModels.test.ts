@@ -449,7 +449,78 @@ describe("prop models", () => {
           volume(part.lo, part.hi) / volume(whole.lo, whole.hi),
           at,
         ).toBeLessThan(0.25);
+        // The part it sits on: the smallest unmarked panel or body (not a
+        // rod, a seam or a slit, thin two ways) whose box, grown by a
+        // centimetre, holds the accent's middle. A seat, a flue or a bar
+        // standing clear of the rest has none.
+        const mid: V3 = [0, 1, 2].map(
+          (k) => ((part.lo[k] ?? 0) + (part.hi[k] ?? 0)) / 2,
+        ) as unknown as V3;
+        const holds = (b: { lo: V3; hi: V3 }, p: V3, e: number) =>
+          [0, 1, 2].every(
+            (k) =>
+              (b.lo[k] ?? 0) - e <= (p[k] ?? 0) &&
+              (p[k] ?? 0) <= (b.hi[k] ?? 0) + e,
+          );
+        const host = parts
+          .filter((q) => q.tint?.[0] !== PROP_MARK)
+          .map((q) => shape(q.points))
+          .filter(
+            (b) =>
+              [0, 1, 2].filter((k) => (b.hi[k] ?? 0) - (b.lo[k] ?? 0) < 0.03)
+                .length < 2,
+          )
+          .filter((b) => holds(b, mid, 0.01))
+          .sort((x, y) => volume(x.lo, x.hi) - volume(y.lo, y.hi))[0];
+        if (host === undefined) continue;
+        // It stays on that part (a stripe on one door, not across the
+        // bank) ...
+        expect(
+          holds(host, part.lo, 0.02) && holds(host, part.hi, 0.02),
+          at,
+        ).toBe(true);
+        // ... and covers well under half of that part's largest face (a
+        // rim, not a lid). One side of the accent is half its surface.
+        const [e0 = 0, e1 = 0] = [0, 1, 2]
+          .map((k) => (host.hi[k] ?? 0) - (host.lo[k] ?? 0))
+          .sort((x, y) => y - x);
+        expect(markedArea(mesh).part / 2 / (e0 * e1), at).toBeLessThan(0.5);
       }
+  });
+
+  it("holds the trolley's grip bar on two upright posts that run from the deck up to it", () => {
+    // Mutation caught: the uprights drawn as short stubs across the handle
+    // (the old model's, which left the grip bar floating), or posts that
+    // stop short of the bar or of the deck.
+    const f0 = frameAt([0, 0, 0], 0);
+    for (let v = 0; v < PROP_CATALOGUE.trolley.variants; v++) {
+      const at = `trolley variant ${String(v)}`;
+      const { parts } = buildRecorded("trolley", v, LOOKS.day);
+      const local = (p: (typeof parts)[number]) =>
+        p.points.map((q) => toLocal(f0, q));
+      const extent = (p: (typeof parts)[number], k: number) => {
+        const xs = local(p).map((q) => q[k] ?? NaN);
+        return [Math.min(...xs), Math.max(...xs)] as const;
+      };
+      const grip = parts.filter((p) => p.method === "cylinderAlong").at(-1);
+      if (grip === undefined) throw new Error("no grip bar");
+      const [gripLo] = extent(grip, 2);
+      const [gripA0, gripA1] = extent(grip, 0);
+      const decks = parts.filter((p) => p.method === "bevelBox");
+      const posts = parts.filter((p) => {
+        if (p.method !== "cylinder") return false;
+        const [h0, h1] = extent(p, 2);
+        const [a0, a1] = extent(p, 0);
+        // Under the bar's ends, rising from a deck's top to the bar.
+        return (
+          a1 - a0 < 0.05 &&
+          (Math.abs(a0 - gripA0) < 0.03 || Math.abs(a1 - gripA1) < 0.03) &&
+          h1 >= gripLo - 1e-6 &&
+          decks.some((d) => Math.abs(extent(d, 2)[1] - h0) < 1e-6)
+        );
+      });
+      expect(posts.length, at).toBe(2);
+    }
   });
 
   it("gives the contact shadows the wall-standing props' bodies exactly as the recipes build them", () => {
