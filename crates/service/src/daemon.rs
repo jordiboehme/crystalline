@@ -3037,7 +3037,7 @@ mod tests {
     use super::*;
 
     /// The router `run_serve` builds ends an open event stream when the
-    /// daemon's shutdown watch flips (review M4). Catches `http_service`
+    /// daemon's shutdown watch flips. Catches `http_service`
     /// building the router without the watch, where a stream would hold
     /// the drain until its browser hung up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

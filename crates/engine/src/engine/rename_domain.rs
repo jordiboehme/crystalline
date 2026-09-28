@@ -301,7 +301,8 @@ impl Engine {
         let old_audience = self.domain_audience(old).await;
         // Every event under the old name from here on (the MANIFEST and
         // relink edits inside it, the room saves `close_editors` lands) and
-        // every one the ring holds for it carries the snapshot (ruling K2).
+        // every one the ring holds for it carries the snapshot: a path under
+        // the old name leaks the name as surely as the domain event does.
         let _captured = self.capture_audience(old, old_audience.clone());
 
         // An origin pull or share of this domain finishes first, and none

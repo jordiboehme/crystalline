@@ -88,8 +88,8 @@ pub struct EngramChanged {
     pub draft_of: Option<String>,
     /// Who may hear this event, when that was captured for its domain's name:
     /// set by the bus, never by a feed point, while the domain is being
-    /// renamed or removed (ruling K2, 2026-09-27: a path under the old name
-    /// leaks the name as surely as the domain event does). `None` keeps the
+    /// renamed or removed (ruled 2026-09-27: a path under the old name leaks
+    /// the name as surely as the domain event does). `None` keeps the
     /// ordinary per-session check. Never on the wire.
     #[serde(skip)]
     pub audience: Option<DomainAudience>,
@@ -324,7 +324,7 @@ impl ChangeBus {
     /// [`ChangeBus::release`]: every later announcement under that name is
     /// stamped with `audience`, and so is every entry the ring already holds
     /// for it, so a replay after the privacy records moved never reaches an
-    /// outsider (ruling K2). One pass over at most [`RING_CAPACITY`] entries.
+    /// outsider. One pass over at most [`RING_CAPACITY`] entries.
     pub fn capture(&self, domain: &str, audience: DomainAudience) {
         let mut ring = self.lock();
         for entry in ring.entries.iter_mut() {

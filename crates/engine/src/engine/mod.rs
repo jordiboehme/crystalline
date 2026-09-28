@@ -2471,8 +2471,8 @@ impl Engine {
     /// Announce one committed change. Never awaits, never blocks, never
     /// fails: called after the store call returned and with the store lock
     /// released (a verb's own per-path write lock may still be held; the
-    /// bus takes only its own short mutex), at every feed point the spec's
-    /// Part A lists and nowhere else.
+    /// bus takes only its own short mutex), at every place a change lands in
+    /// the store and nowhere else.
     pub(crate) fn announce(&self, change: Change) {
         if let Some(id) = self.changes.announce(change) {
             tracing::trace!(%id, "announced a change");
@@ -2604,7 +2604,8 @@ impl Engine {
     /// Capture `name`'s audience on the bus for as long as the returned hold
     /// lives: every event under that name, the domain event and the engram
     /// events a rename or removal emits under it alike, carries the snapshot,
-    /// and so does every event the ring already holds for it (ruling K2).
+    /// and so does every event the ring already holds for it, since a path
+    /// under the old name leaks the name as surely as the domain event does.
     /// Taken before the change starts; dropped once its last event is out.
     pub(crate) fn capture_audience(
         &self,

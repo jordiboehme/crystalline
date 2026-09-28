@@ -956,7 +956,8 @@ impl Engine {
         let audience = self.domain_audience(name).await;
         // From here every event under this name carries that snapshot: the
         // last room saves just below, the ring's earlier entries for it, and
-        // the domain event itself (ruling K2).
+        // the domain event itself, since a path under the name leaks it as
+        // surely as the domain event does.
         let _captured = self.capture_audience(name, audience.clone());
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,

@@ -608,11 +608,11 @@ async fn a_domain_removal_and_a_rename_announce_domain_events() {
         names.contains(&"oak".to_string()) && names.contains(&"elm".to_string()),
         "{names:?}"
     );
-    // Section J (k), ruled 2026-09-27: only the old name's audience is
+    // Ruled 2026-09-27: only the old name's audience is
     // captured, since it is the one leaving the privacy records; the new
     // name is re-keyed, not destroyed, so it keeps the ordinary lazy check.
     // This engine has no `DomainAccess` installed, so the capture fails
-    // closed: nobody but the machine owner (fix round 1, I3). The rename is
+    // closed: nobody but the machine owner. The rename is
     // not vetoed for it. The member-set case is
     // `a_private_domains_rename_and_removal_carry_the_captured_audience`.
     let old = domains.iter().find(|d| d.domain == "oak").unwrap();
@@ -691,7 +691,7 @@ async fn a_registration_that_binds_pending_links_announces_the_linking_domain() 
     );
 }
 
-// --- fix round 1 ------------------------------------------------------------
+// --- captured audiences over a real accounts store ------------------------
 
 /// `oak` made private to `keeper` with `mem` as a viewer, `boss` an instance
 /// admin and `out` a stranger, on an auth store installed on the engine.
@@ -733,7 +733,7 @@ fn oak_write(title: &str) -> WriteParams {
     }
 }
 
-/// Ruling k and K2: a private domain's rename captures who could read it
+/// Ruled 2026-09-27: a private domain's rename captures who could read it
 /// before the records move, and every event under the old name carries that
 /// snapshot: the domain event, the engram event of the rename's own MANIFEST
 /// step, and (the replay path) an event the ring held from before the

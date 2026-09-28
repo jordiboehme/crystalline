@@ -1214,7 +1214,7 @@ async fn a_converged_room_settles_and_still_merges_an_external_edit_cleanly() {
     assert!(on_disk.contains("a further thought"), "{on_disk}");
 }
 
-/// Ruling K2 with a room open: a rename and a removal each close the rooms of
+/// A captured audience with a room open: a rename and a removal each close the rooms of
 /// the domain first, and the save a closing room lands goes out under the old
 /// name. It must carry the audience captured before the room closed, never
 /// the ordinary check, which after the records move would no longer hide the
