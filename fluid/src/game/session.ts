@@ -89,7 +89,9 @@
  * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
  * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
- * and 1, 2 and 4 switch the look. Only the mouse looks up and down. The
+ * M turns the sound off and on (with `sound`: its `toggleMute`, the
+ * notice `SOUND OFF` or `SOUND ON`; without it M does nothing), and 1, 2
+ * and 4 switch the look. Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
  * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
  * reader is open it reads the keys itself: the session ignores its own
@@ -175,12 +177,43 @@
  * after it. So the room the pause screen names is the one the player sees
  * on continuing; a load of the player's own that lands under the pause
  * enters its room, and the host renames the screen through `navigate`.
+ *
+ * Sound (M4 C20 to C23): with `SessionOptions.sound`, the session sends a
+ * cue (`audio/cues.ts`) for every moment that makes a sound, as it writes
+ * the HUD, and never plays anything itself. `room` on every entry,
+ * with the room's ambience (`ambienceOf`, the dark room's once it goes
+ * dark) and seed: a load landing, a canned or hand-built room shown, the
+ * cut into the console room, a re-check's re-entry or swap. `step` for
+ * each footstep the tick's stride makes (`stepsBetween`), numbered through
+ * the session, feet alternating, only while the player may move (not
+ * while anything is modal or a place loads). `door` for every door, exit,
+ * lift or police box whose target turned (`doorCues`), after the doors
+ * and the boxes stepped. `fault` for every broken way that started a run
+ * (`faultCues`), after the faults stepped. `travel` for every way taken
+ * (a door, a portal, a hatch, an exit) and a lift ride. `terminal` when
+ * the reader, the level select or the lift's stops open, and on a text
+ * change's re-entry. `ride` `depart` as a ride starts, and `arrive` once
+ * as it ends, however it ends (its landing, held or not, a failed stop, a
+ * load error or a new place), so the ride's hum never outlasts it. `box`
+ * `takeoff` on the cut into the console room, and `landing` when the
+ * console room's exit lands on a bridge with the arrival box standing.
+ * `jump` on the level select's jump. Nothing is sent while paused (the
+ * tick returns first) or after `dispose`; suspending the sound under the
+ * pause is the host's, which hears of it through `onPause`.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
 
 import type { ChangeEvent } from "../api/events";
 import { COALESCE_MS } from "../events/ChangeStreamProvider";
+import {
+  ambienceOf,
+  doorCues,
+  faultCues,
+  stepsBetween,
+  type Cue,
+  type SoundSink,
+} from "./audio/cues";
 import { createCheatReader } from "./core/cheat";
 import { createInput } from "./core/input";
 import { createLoop, type Clock } from "./core/loop";
@@ -226,6 +259,7 @@ import {
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
+  doorKey,
   focusOf,
   hatchTravel,
   approaches,
@@ -346,6 +380,8 @@ export type RendererFactory = (
  *   See the member.
  * - `onPause`: the pause's channel; only the game route passes it. See
  *   the member.
+ * - `sound`: where the cues go (`audio/cues.ts`); only the game route
+ *   passes it. Without it the session is silent and M does nothing.
  */
 export interface SessionOptions {
   canvas: HTMLCanvasElement;
@@ -394,6 +430,11 @@ export interface SessionOptions {
    * gallery never pass it.
    */
   onPause?: (paused: boolean) => void;
+  /**
+   * Where the session sends its sound cues, as it writes text to `hud`
+   * (M4 C20 to C23), and whose mute M toggles. See the module doc.
+   */
+  sound?: SoundSink;
 }
 
 /**
@@ -610,7 +651,7 @@ const USE_KEY = "Space";
 const LOOK_KEYS = ["Digit1", "Digit2", "Digit4"] as const;
 
 /** Every key that commands the session, drained while the reader is open. */
-const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", ...LOOK_KEYS] as const;
+const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM", ...LOOK_KEYS] as const;
 
 /** The renderer on a real WebGL2 context. */
 const defaultFactory: RendererFactory = (canvas, options) => {
@@ -719,6 +760,10 @@ export function createSession(opts: SessionOptions): Session {
   let dipFlash = false;
   /** Whether the station is paused (M4 C6). */
   let paused = false;
+  /** The footsteps sent so far: the `n` of the next `step` cue. */
+  let steps = 0;
+  /** Whether a lift ride sent its `depart` and has not sent its `arrive`. */
+  let riding = false;
   /** Whether a screen of the host's holds the station (`setBusy`). */
   let busy = false;
   /**
@@ -864,6 +909,22 @@ export function createSession(opts: SessionOptions): Session {
     hud.notice(standingNotice());
   };
 
+  /** Sends a cue to the sound sink, if any; nothing once disposed. */
+  const cue = (c: Cue) => {
+    if (!disposed) opts.sound?.cue(c);
+  };
+
+  /**
+   * Ends a lift ride's sound: its `arrive`, once, whenever the ride ends
+   * (its landing, a failed stop, a load error, a new place), so the held
+   * ride hum never outlasts the ride.
+   */
+  const arrive = () => {
+    if (!riding) return;
+    riding = false;
+    cue({ kind: "ride", phase: "arrive" });
+  };
+
   const flash = (text: string, ms: number) => {
     lookFlash = false;
     dipFlash = false;
@@ -986,7 +1047,9 @@ export function createSession(opts: SessionOptions): Session {
    * of the console room: `inside` is cleared and its listing read aborted
    * (the cut in sets both again once it has entered). `landing` is the
    * landing the room was entered with (`land`'s), kept with `arrival` for
-   * the re-check (F35); every entry leaves the dark room behind.
+   * the re-check (F35); every entry leaves the dark room behind unless
+   * `darkNow` enters the darkened one (C19). Every entry sends a `room`
+   * cue with the room's ambience.
    *
    * The renderer is asked first. When it refuses the room, nothing of the
    * session has changed yet: the player stays in the room they were in,
@@ -1003,6 +1066,7 @@ export function createSession(opts: SessionOptions): Session {
     keep: boolean,
     spawn?: { x: number; z: number; yaw: number },
     landing: "box" | null = null,
+    darkNow = false,
   ): boolean => {
     if (!present(built, lookId)) {
       fail(LOAD_ERROR);
@@ -1016,7 +1080,7 @@ export function createSession(opts: SessionOptions): Session {
     current = address;
     entryArrival = arrival;
     entryLanding = landing;
-    dark = false;
+    dark = darkNow;
     if (!keep || player === null) {
       const at = spawn ?? arrivalSpawn(room, arrival);
       player = { ...at, vx: 0, vz: 0, pitch: 0, bob: 0 };
@@ -1043,6 +1107,7 @@ export function createSession(opts: SessionOptions): Session {
     placeNotice = null;
     showStanding();
     showStatus();
+    cue({ kind: "room", ambience: ambienceOf(room, dark), seed: room.seed });
     return true;
   };
 
@@ -1084,7 +1149,7 @@ export function createSession(opts: SessionOptions): Session {
     doors = new Map(doors).set(index, { open: 1, target: 0 });
     // A ride lands inside a tick that ends there, so the frame drawn next
     // reads the door open from here rather than from `stepDoors`.
-    doorOpen = new Map(doorOpen).set(`door:${String(index)}`, 1);
+    doorOpen = new Map(doorOpen).set(doorKey(index), 1);
   };
 
   /**
@@ -1109,6 +1174,7 @@ export function createSession(opts: SessionOptions): Session {
     loading = false;
     controller = null;
     hud.connector(false, label, lookId);
+    arrive();
     if (isFailure(loaded)) {
       fail(FAILED[loaded.kind]);
       // Only a missing or denied target breaks the way the travel went
@@ -1146,6 +1212,7 @@ export function createSession(opts: SessionOptions): Session {
     if (built.box !== null) {
       boxes = new Map([[built.box, { open: 1, target: 0 }]]);
       boxLatched = built.box;
+      cue({ kind: "box", phase: "landing" });
     }
     if (arrival?.via === "lift") startOpen("lift");
     else if (arrival?.via === "door" && arrival.from.kind === "deck")
@@ -1205,6 +1272,7 @@ export function createSession(opts: SessionOptions): Session {
     closePause();
     travelling = null;
     ride = null;
+    arrive();
     const gen = ++generation;
     controller?.abort();
     controller = null;
@@ -1272,6 +1340,7 @@ export function createSession(opts: SessionOptions): Session {
         controller = null;
         travelling = null;
         ride = null;
+        arrive();
         hud.connector(false, shown, lookId);
         if (!isAbort(error)) fail(LOAD_ERROR);
         retryCheck();
@@ -1321,6 +1390,7 @@ export function createSession(opts: SessionOptions): Session {
    */
   const takeTravel = (travel: Travel) => {
     latched = travel.fixture;
+    cue({ kind: "travel", via: travel.via });
     if (travel.via === "exit") {
       // Up to the deck (M3 C28). A failed exit is a notice only (C29):
       // without `travelling`, its failure marks no way.
@@ -1359,6 +1429,7 @@ export function createSession(opts: SessionOptions): Session {
       permalink: key,
     };
     if (!enter(null, built, from, null, false)) return;
+    cue({ kind: "box", phase: "takeoff" });
     inside = { from };
     exitLatched = false;
     exitRows = undefined;
@@ -1406,6 +1477,7 @@ export function createSession(opts: SessionOptions): Session {
       document.exitPointerLock?.();
     }
     setPrompt(null);
+    cue({ kind: "terminal" });
     hud.reader({
       title: place.title,
       content: place.content,
@@ -1444,6 +1516,7 @@ export function createSession(opts: SessionOptions): Session {
       document.exitPointerLock?.();
     }
     setPrompt(null);
+    cue({ kind: "terminal" });
     opts.onLevels(true);
   };
 
@@ -1483,6 +1556,7 @@ export function createSession(opts: SessionOptions): Session {
       document.exitPointerLock?.();
     }
     setPrompt(null);
+    cue({ kind: "terminal" });
     opts.onLift({ stops: lift.stops, note: lift.note });
   };
 
@@ -1557,7 +1631,12 @@ export function createSession(opts: SessionOptions): Session {
       current === null ? null : { via: "lift", from: current },
       stop.label,
     );
-    if (loading) ride = { start, held: null };
+    if (loading) {
+      ride = { start, held: null };
+      cue({ kind: "travel", via: "lift" });
+      cue({ kind: "ride", phase: "depart" });
+      riding = true;
+    }
   };
 
   /**
@@ -1603,10 +1682,20 @@ export function createSession(opts: SessionOptions): Session {
     next: PlaceInput | null,
     built: RoomSpec,
     address: StationAddress | null,
+    darkNow = false,
   ): boolean => {
     const saved = latches();
     if (
-      !enter(next, built, address, entryArrival, true, undefined, entryLanding)
+      !enter(
+        next,
+        built,
+        address,
+        entryArrival,
+        true,
+        undefined,
+        entryLanding,
+        darkNow,
+      )
     )
       return false;
     restoreLatches(saved);
@@ -1668,7 +1757,7 @@ export function createSession(opts: SessionOptions): Session {
       // airlock is never darkened; its load degrades instead.
       if (dark || address.kind === "airlock") return;
       const domain = domainOf(address) ?? room.domain;
-      if (!reenterKept(place, darkened(room, domain), current)) return;
+      if (!reenterKept(place, darkened(room, domain), current, true)) return;
       // The dark room's props are dressed again round its hatch, so the
       // spot the player kept may now be inside one: they step to the
       // nearest free floor, their view kept (as a reshape's swap does).
@@ -1691,6 +1780,7 @@ export function createSession(opts: SessionOptions): Session {
       case "text":
         if (!reenterKept(built.place, built.room, built.address)) return;
         dip = { kind: "flicker", at: stationTime(), next: null };
+        cue({ kind: "terminal" });
         followMove(built.address);
         return;
       case "shape":
@@ -1848,6 +1938,17 @@ export function createSession(opts: SessionOptions): Session {
   const axis = (plus: boolean, minus: boolean) =>
     (plus ? 1 : 0) - (minus ? 1 : 0);
 
+  /**
+   * Where every door is heading, keyed as `doorOpen` keys the fractions:
+   * what `doorCues` compares from tick to tick.
+   */
+  const doorTargets = (): Map<string, number> => {
+    const out = new Map<string, number>();
+    for (const [index, state] of doors) out.set(doorKey(index), state.target);
+    for (const [index, state] of boxes) out.set(boxKey(index), state.target);
+    return out;
+  };
+
   const tick = () => {
     ticks++;
     // A ride whose load settled early lands once it has lasted
@@ -1901,6 +2002,11 @@ export function createSession(opts: SessionOptions): Session {
         flash(inverted ? "LOOK INVERTED" : "LOOK NORMAL", LOOK_NOTICE_MS);
         lookFlash = true;
       }
+      if (input.pressed("KeyM")) {
+        const muted = opts.sound?.toggleMute();
+        if (muted !== undefined)
+          flash(muted ? "SOUND OFF" : "SOUND ON", LOOK_NOTICE_MS);
+      }
       const page = target ?? current;
       if (input.pressed("KeyF") && page !== null) {
         opts.openFluid(fluidRouteOfStation(page));
@@ -1931,6 +2037,7 @@ export function createSession(opts: SessionOptions): Session {
     const alt = anyHeld(ALT_KEYS);
     const left = input.held("ArrowLeft");
     const right = input.held("ArrowRight");
+    const run = !still && anyHeld(RUN_KEYS);
     previous = player;
     player = stepPlayer(
       player,
@@ -1945,11 +2052,17 @@ export function createSession(opts: SessionOptions): Session {
         turn: still || alt ? 0 : axis(left, right),
         lookDx: look.dx,
         lookDy: lookDelta(look.dy, inverted),
-        run: !still && anyHeld(RUN_KEYS),
+        run,
       },
       room,
       blockers,
     );
+    if (!still) {
+      for (let k = stepsBetween(previous.bob, player.bob); k > 0; k--) {
+        cue({ kind: "step", foot: steps % 2 === 0 ? 0 : 1, run, n: steps });
+        steps++;
+      }
+    }
 
     const focus = modal() ? null : focusOf(room, player, doors, failed);
     const boxAt =
@@ -1987,13 +2100,18 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
     const shut = upLatched === null ? NONE_SHUT : new Set([upLatched]);
+    const targetsBefore = doorTargets();
+    const faultsBefore = faults;
     doors = stepDoors(room, player, doors, pressedDoor, failed, shut);
     boxes = stepBoxDoors(room, boxes, pressedBox);
+    for (const c of doorCues(room, player, targetsBefore, doorTargets()))
+      cue(c);
     faults = stepFaults(room, player, faults, failed, pressedWay, doors);
+    for (const c of faultCues(room, player, faultsBefore, faults)) cue(c);
     faultNow = faultFrames(faults);
     doorOpen = new Map();
     for (const [index, state] of doors)
-      doorOpen.set(`door:${index}`, state.open);
+      doorOpen.set(doorKey(index), state.open);
     for (const [index, state] of boxes) doorOpen.set(boxKey(index), state.open);
     // The walk-in latch holds until the player has stepped
     // `BOX_LATCH_CLEAR` away from the latched box's front, whatever its
@@ -2149,6 +2267,7 @@ export function createSession(opts: SessionOptions): Session {
       retryCheck();
     },
     jump(domain) {
+      cue({ kind: "jump" });
       go(bridgeAddress(domain), null, domain);
     },
     closeLevels() {

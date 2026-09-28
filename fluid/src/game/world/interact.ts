@@ -123,6 +123,15 @@ export type Interactable = {
 export type DoorState = { open: number; target: 0 | 1 };
 
 /**
+ * The mover key of the doors of the fixture at `index` in `room.fixtures`:
+ * `door:<index>`, the key the renderer draws their leaves under and the
+ * session keeps their fraction under, beside the police boxes' `boxKey`.
+ */
+export function doorKey(index: number): string {
+  return `door:${String(index)}`;
+}
+
+/**
  * A way out of the room the player has just taken: through a door, a portal
  * or a hatch, which fixture it was, and the place it leads to; or up
  * through an exit (M3 C28), to the station address it opens onto, since a

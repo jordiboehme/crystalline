@@ -10,7 +10,7 @@
 export const CLASSIC_KEYS = "ARROWS MOVE · ALT STRAFE · SPACE USE · SHIFT RUN";
 
 /** The game route's legend: the classic keys, then the rest. */
-export const GAME_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT`;
+export const GAME_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND`;
 
 /**
  * The pause screen's legend: the game's keys, and M, which turns the

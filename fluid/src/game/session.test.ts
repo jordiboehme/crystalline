@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiProblem, api } from "../api/client";
 import type { ChangeEvent, EngramChange } from "../api/events";
 import { COALESCE_MS } from "../events/ChangeStreamProvider";
+import type { Cue, SoundSink } from "./audio/cues";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
@@ -219,6 +220,22 @@ function stubHud() {
   };
 }
 
+/**
+ * A sound sink that records every cue, and answers `toggleMute` from
+ * `mutes` in turn (false once they run out).
+ */
+function recordSound(mutes: readonly boolean[] = []) {
+  const cues: Cue[] = [];
+  let next = 0;
+  const sink = {
+    cue: vi.fn<SoundSink["cue"]>((c) => {
+      cues.push(c);
+    }),
+    toggleMute: vi.fn<SoundSink["toggleMute"]>(() => mutes[next++] ?? false),
+  };
+  return { cues, sink };
+}
+
 let client: QueryClient;
 let renderer: ReturnType<typeof stubRenderer>;
 let hud: ReturnType<typeof stubHud>;
@@ -266,6 +283,7 @@ function start(
     consoleRoom?: SessionOptions["consoleRoom"];
     onLift?: SessionOptions["onLift"];
     onPause?: SessionOptions["onPause"];
+    sound?: SessionOptions["sound"];
   } = {},
 ): Session {
   const factory: RendererFactory =
@@ -291,6 +309,7 @@ function start(
       : { consoleRoom: options.consoleRoom }),
     ...(options.onLift === undefined ? {} : { onLift: options.onLift }),
     ...(options.onPause === undefined ? {} : { onPause: options.onPause }),
+    ...(options.sound === undefined ? {} : { sound: options.sound }),
   });
   sessions.push(session);
   return session;
@@ -2989,12 +3008,14 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
   const atDeckLift = (
     load: PlaceLoader,
     onLevels?: (open: boolean) => void,
+    sound?: SessionOptions["sound"],
   ) => {
     const onLift = liftSpy();
     const session = start({
       load,
       onLift,
       ...(onLevels === undefined ? {} : { onLevels }),
+      ...(sound === undefined ? {} : { sound }),
     });
     session.showRoom(facingLift(deck), undefined, DECK_AT);
     frames(1);
@@ -3231,6 +3252,46 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     expect(open).toBeLessThan(1);
     frames(20);
     expect(lastDoors().get(`door:${String(lift)}`)).toBe(0);
+  });
+
+  it("sends the ride's depart, and its arrive whether the landing was held or not (M4 C23, F16)", async () => {
+    // Mutation caught: the arrive sent only for a held landing (a load
+    // slower than the ride keeps the hum going for good), or sent before
+    // the landing.
+    for (const lateMs of [200, LIFT_RIDE_MS + 500]) {
+      const settled = deferred<LoadedStation>();
+      const load: PlaceLoader = (a, signal) =>
+        a.kind === "bridge" ? settled.promise : stationLoad(a, signal);
+      const { cues, sink } = recordSound();
+      const { session } = atDeckLift(load, undefined, sink);
+      pressUse();
+      const i = stopTo("bridge");
+      const stop = liftOf(deck).stops[i]!;
+      cues.length = 0;
+      session.ride(i);
+      expect(cues).toEqual([
+        { kind: "travel", via: "lift" },
+        { kind: "ride", phase: "depart" },
+      ]);
+      crank(lateMs);
+      settled.resolve(await stationLoad(stop.to, new AbortController().signal));
+      await flush();
+      expect(cues.some((c) => c.kind === "ride" && c.phase === "arrive")).toBe(
+        session.current?.kind === "bridge",
+      );
+      for (let t = 0; t < 100 && session.current?.kind !== "bridge"; t++)
+        frames(1);
+      expect(session.current?.kind).toBe("bridge");
+      const arrive = cues.findIndex(
+        (c) => c.kind === "ride" && c.phase === "arrive",
+      );
+      expect(arrive).toBeGreaterThan(0);
+      expect(
+        cues.filter((c) => c.kind === "ride" && c.phase === "arrive"),
+      ).toHaveLength(1);
+      expect(cues.slice(arrive).some((c) => c.kind === "room")).toBe(true);
+      session.dispose();
+    }
   });
 
   it("rides to the stop the lift already stands at by only closing the overlay", () => {
@@ -4101,6 +4162,27 @@ describe("live changes (M4 C13 to C19)", () => {
     expect(session.current).toEqual(ROOM_AT);
   });
 
+  it("sends a terminal cue on a text change and the dark room's ambience when the room goes dark (M4 C17, C19, C22)", async () => {
+    // Mutation caught: the text change silent, the dark room entered with
+    // its lit ambience.
+    const { cues, sink } = recordSound();
+    const session = await standIn(placeOf(), { sound: sink });
+    cues.length = 0;
+    answers.set("hall", engramOf(retexted()));
+    session.changed(frameOf());
+    await run(COALESCE_MS + FLICKER_MS + 200);
+    expect(cues).toContainEqual({ kind: "terminal" });
+
+    cues.length = 0;
+    answers.set("hall", { kind: "denied" });
+    session.changed(frameOf());
+    await run(2000);
+    const ambiences = cues.flatMap((c) =>
+      c.kind === "room" ? [c.ambience] : [],
+    );
+    expect(ambiences).toEqual(["dark"]);
+  });
+
   it("keeps the latches on a text change: a player left in a doorway is not carried through", async () => {
     // Mutation caught: the keep path resetting the way latch (the player
     // standing in the doorway of a travel that failed is sent again).
@@ -4630,5 +4712,189 @@ describe("live changes (M4 C13 to C19)", () => {
         fluidRouteOfStation(HALL_ADDRESS),
       );
     });
+  });
+});
+
+describe("sound cues (M4 Task 7)", () => {
+  const gallery = galleryRoom();
+  const GALLERY_AT = engramAt(gallery.domain, gallery.permalink);
+
+  /** The gallery's bulkhead door that leads somewhere. */
+  const bulkhead = gallery.fixtures.findIndex(
+    (f) => f.kind === "door" && f.style === "bulkhead" && f.address !== null,
+  );
+
+  /**
+   * The gallery with the player three cells back from the bulkhead's
+   * cell, facing it, so the walk up to it takes a few strides.
+   */
+  const backFromBulkhead = (): RoomSpec => {
+    const f = gallery.fixtures[bulkhead];
+    if (f === undefined) throw new Error("no bulkhead");
+    const spawn = wallFacingSpawn(f.slot);
+    const w = wallPoint(f.slot);
+    const back = {
+      ...spawn,
+      x: spawn.x + w.inward[0] * 3,
+      y: spawn.y + w.inward[1] * 3,
+    };
+    expect(gallery.grid[back.y]?.[back.x]).toBe(".");
+    return { ...gallery, spawn: back };
+  };
+
+  const kinds = (cues: readonly Cue[]) => cues.map((c) => c.kind);
+
+  it("sends the cues of a walk through a door", async () => {
+    // Mutation caught: a cue missing at any of these points, the entry
+    // cue after the first step.
+    expect(bulkhead).toBeGreaterThanOrEqual(0);
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, load: stationLoad, sound: sink });
+    session.showRoom(backFromBulkhead(), undefined, GALLERY_AT);
+    expect(cues[0]).toEqual({
+      kind: "room",
+      ambience: gallery.condition,
+      seed: gallery.seed,
+    });
+
+    // Up to the shut bulkhead: footsteps, feet alternating.
+    key("keydown", "KeyW");
+    frames(70);
+    key("keyup", "KeyW");
+    frames(10);
+    const steps = cues.filter(
+      (c): c is Extract<Cue, { kind: "step" }> => c.kind === "step",
+    );
+    expect(steps.length).toBeGreaterThanOrEqual(2);
+    steps.forEach((s, i) => {
+      expect(s.foot).toBe(i % 2);
+      expect(s.run).toBe(false);
+      if (i > 0) expect(s.n).toBe(steps[i - 1]!.n + 1);
+    });
+    expect(kinds(cues).indexOf("room")).toBeLessThan(
+      kinds(cues).indexOf("step"),
+    );
+    expect(hud.prompt).toHaveBeenLastCalledWith(
+      expect.stringMatching(/^SPACE /),
+    );
+
+    // Space opens it: one door cue, open, placed ahead.
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    frames(20);
+    const doors = cues.filter((c) => c.kind === "door");
+    expect(doors).toHaveLength(1);
+    expect(doors[0]).toMatchObject({
+      kind: "door",
+      sound: "bulkhead",
+      open: true,
+    });
+    const placed = doors[0] as Extract<Cue, { kind: "door" }>;
+    expect(Math.abs(placed.pan)).toBeLessThan(0.5);
+    expect(placed.gain).toBeGreaterThan(0.3);
+    expect(placed.gain).toBeLessThanOrEqual(1);
+
+    // Through it: the travel, then the room it lands in.
+    const ups = () =>
+      hud.connector.mock.calls.filter(([active]) => active).length;
+    key("keydown", "KeyW");
+    for (let t = 0; t < 80 && ups() === 0; t++) frames(1);
+    key("keyup", "KeyW");
+    expect(cues.at(-1)).toEqual({ kind: "travel", via: "door" });
+    const travelAt = cues.length - 1;
+    await flush();
+    frames(1);
+    const landed = cues.slice(travelAt).find((c) => c.kind === "room");
+    expect(landed).toBeDefined();
+    const order = kinds(cues);
+    expect(order.indexOf("door")).toBeLessThan(order.indexOf("travel"));
+    expect(order.lastIndexOf("room")).toBeGreaterThan(order.indexOf("travel"));
+  });
+
+  it("mutes on M and flashes the state", () => {
+    // Mutation caught: M read while modal.
+    const { sink } = recordSound([true, false]);
+    const session = start({ client: null, sound: sink });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    const pressM = () => {
+      key("keydown", "KeyM");
+      frames(1);
+      key("keyup", "KeyM");
+    };
+    pressM();
+    expect(sink.toggleMute).toHaveBeenCalledTimes(1);
+    expect(hud.notice).toHaveBeenLastCalledWith("SOUND OFF");
+    pressM();
+    expect(sink.toggleMute).toHaveBeenCalledTimes(2);
+    expect(hud.notice).toHaveBeenLastCalledWith("SOUND ON");
+
+    // With the reader open, M is the reader's, and not replayed after.
+    walkToScope();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    const notices = hud.notice.mock.calls.length;
+    pressM();
+    frames(2);
+    session.closeReader();
+    frames(3);
+    expect(sink.toggleMute).toHaveBeenCalledTimes(2);
+    expect(hud.notice.mock.calls.length).toBe(notices);
+    session.dispose();
+
+    // Without a sink, M is nothing at all.
+    hud.notice.mockClear();
+    const silent = start({ client: null });
+    silent.showCanned(CANNED_BRIDGE);
+    frames(1);
+    pressM();
+    frames(2);
+    expect(
+      hud.notice.mock.calls.some(([t]) => t !== null && t.startsWith("SOUND")),
+    ).toBe(false);
+  });
+
+  it("sends the police box's take-off and landing, and the jump", async () => {
+    // Mutation caught: the landing cue on any bridge arrival.
+    const { cues, sink } = recordSound();
+    const session = start({
+      load: okBridge,
+      consoleRoom: { domains: () => Promise.resolve([row(HALL), row("ops")]) },
+      sound: sink,
+    });
+    standAtBox(session);
+    walkIn();
+    expect(isConsole(lastRoom())).toBe(true);
+    expect(cues).toContainEqual({ kind: "box", phase: "takeoff" });
+    // The cut in is an entry: the console room's hum.
+    expect(cues).toContainEqual({
+      kind: "room",
+      ambience: "console",
+      seed: consoleRoom().seed,
+    });
+    expect(cues).not.toContainEqual({ kind: "box", phase: "landing" });
+    await flush();
+    backOut();
+    await vi.waitFor(() => {
+      expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
+    });
+    expect(
+      cues.filter((c) => c.kind === "box" && c.phase === "landing"),
+    ).toHaveLength(1);
+
+    cues.length = 0;
+    session.jump("eng");
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "bridge", domain: "eng" });
+    });
+    expect(cues[0]).toEqual({ kind: "jump" });
+    expect(kinds(cues)).toContain("room");
+    expect(kinds(cues)).not.toContain("box");
+    expect(kinds(cues)).not.toContain("answer");
   });
 });
