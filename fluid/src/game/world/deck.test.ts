@@ -5,6 +5,7 @@ import { deckRoomSection, generateDeck, type DeckInput } from "./deck";
 import { folderDeck, isManifestPermalink } from "./folders";
 import { heroFootprint, propFootprint } from "./footprints";
 import deckGolden from "./golden/deck.json?raw";
+import { isHangar } from "./hangar";
 import { deckLabel } from "./lifts";
 import { overlaps } from "./sites";
 import type { Box, RoomSpec } from "./types";
@@ -195,12 +196,18 @@ describe("the deck hub (M3 C8 to C12)", () => {
   it("keeps the deck's centre column clear of heroes and floor props (M3 C9)", () => {
     // Mutation caught: the centre box not handed to `furnish`, or the hero
     // pass not keeping off `reserved`. The count of decks that still stand a
-    // hero catches a fix that keeps heroes out of decks altogether.
+    // hero catches a fix that keeps heroes out of decks altogether. The
+    // folders are the first sixty that are no hangar (M3 C13): a hangar is
+    // a hall, not a corridor, and keeps no centre column.
+    const folders: string[] = [];
+    for (let f = 0; folders.length < 60; f++)
+      if (!isHangar("station", `f${String(f)}`)) folders.push(`f${String(f)}`);
     const rooms: RoomSpec[] = [];
-    for (let f = 0; f < 60; f++)
+    for (const folder of folders)
       for (const n of [1, 3, 6, 10, 17, 24])
-        rooms.push(generateDeck(folderDeckOf(`f${String(f)}`, n), 0));
+        rooms.push(generateDeck(folderDeckOf(folder, n), 0));
     expect(rooms.length).toBe(360);
+    expect(rooms.every((r) => r.space === "deck")).toBe(true);
     let withHero = 0;
     for (const room of rooms) {
       const lane = centreColumn(room);

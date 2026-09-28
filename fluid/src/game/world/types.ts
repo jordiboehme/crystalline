@@ -20,7 +20,8 @@
  *
  * The station's other spaces (a deck's hub, the airlock, a hangar) carry
  * `space`, the kind of space they are; an engram room never has the key,
- * so the engram goldens do not see it either.
+ * so the engram goldens do not see it either. A hangar alone carries
+ * `hangar` (`HangarSpec`: its bay door, landing pads and gantries).
  *
  * `StationAddress` is a third family beside them: not what a room is built
  * from or turns into, but where in the station one is - the pure address
@@ -755,6 +756,43 @@ export interface Decal {
 }
 
 /**
+ * A landing pad on a hangar's floor (M3 C14): a square of cells, `x1` and
+ * `y1` exclusive, its own seed, and the hero envelope it keeps for the
+ * hangar heroes the pad hero seam stands on it (`withPadHeroes`), `w`
+ * across, `l` along and `h` up, in metres.
+ */
+export interface Pad {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  seed: number;
+  envelope: { w: number; l: number; h: number };
+}
+
+/**
+ * An overhead gantry in a hangar (M3 C15): a beam along row `y`'s centre,
+ * wall to wall, at height `h` in metres, standing on a leg at each end
+ * (`gantryLegEdges`).
+ */
+export interface Gantry {
+  y: number;
+  h: number;
+}
+
+/**
+ * A hangar's structure (M3 C14, C15): the bay door across the north wall's
+ * cells `x0` to `x1` (exclusive), `h` metres tall, shut and decorative; the
+ * landing pads; the gantries overhead. Structure, not props: the room mesh
+ * draws it.
+ */
+export interface HangarSpec {
+  bayDoor: { x0: number; x1: number; h: number };
+  pads: Pad[];
+  gantries: Gantry[];
+}
+
+/**
  * A room, ready to be meshed.
  *
  * The room is a grid of cells (see `world/layout.ts`): a main hall, and
@@ -777,6 +815,15 @@ export interface RoomSpec {
    * `permalink`, which is where the goldens read it.
    */
   space?: "airlock" | "deck" | "hangar";
+  /**
+   * A hangar's structure (M3 C14, C15): its bay door, its landing pads and
+   * its gantries, drawn by the room mesh and read by the dressing (the pads
+   * and the gantry legs are taken boxes, `world/hangarShape.ts`) and the
+   * decals (the pad stencils). Present on a hangar alone (`space:
+   * "hangar"`), absent on every other room, so no other golden sees it; the
+   * builder sets it right after `space`.
+   */
+  hangar?: HangarSpec;
   title: string;
   archetype: Archetype;
   condition: Condition;

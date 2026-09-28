@@ -27,6 +27,10 @@
  * hub is built from it: thirty engrams in `crew/logs`, two sections, two
  * subfolders. `generateDeck(CANNED_DECK, 1)` is the deck golden.
  *
+ * `CANNED_HANGAR` is a folder whose deck is a hangar (M3 C13):
+ * `cargo/Flight Deck`, one full section of 24 engrams.
+ * `generateDeck(CANNED_HANGAR, 0)` is the hangar golden.
+ *
  * `CANNED_DOMAINS` (M3 C24) is no place either but the domain listing the
  * airlock is built from: five domains, one private.
  * `airlockRoom({ domains: CANNED_DOMAINS, here: null })` is the airlock
@@ -435,6 +439,60 @@ export const CANNED_DECK: DeckInput = {
   ],
   subfolders: ["drills", "Old Logs"],
   total: 30,
+  truncated: false,
+};
+
+/** One row of `CANNED_HANGAR`: an engram directly in `cargo/Flight Deck`. */
+function bayRow(
+  slug: string,
+  title: string,
+  type: string | null,
+  status: string | null,
+): DeckRow {
+  return { permalink: `cargo/flight-deck/${slug}`, title, type, status };
+}
+
+/**
+ * A folder whose deck is a hangar (M3 C13 to C17): `cargo/Flight Deck` in
+ * domain `station`, 24 engrams directly in it (one full section) and one
+ * subfolder. The name is picked so its slug, `cargo/flight-deck`, hashes
+ * to a hangar (`seedFor("hangar", "station", "cargo/flight-deck") % 5` is
+ * 0) while its raw name does not (2), so a test that hashes the raw folder
+ * tells. `generateDeck(CANNED_HANGAR, 0)` is the hangar golden, and
+ * `?hall=hangar` shows it. The rows are given out of permalink order.
+ * Nothing here is fetched.
+ */
+export const CANNED_HANGAR: DeckInput = {
+  domain: "station",
+  folder: "cargo/Flight Deck",
+  rows: [
+    bayRow("pad-lights", "Pad Lights", "runbook", "stable"),
+    bayRow("arrivals-board", "Arrivals Board", "reference", "stable"),
+    bayRow("fuel-lines", "Fuel Lines", "runbook", "stable"),
+    bayRow("bay-door-seals", "Bay Door Seals", "runbook", "draft"),
+    bayRow("tug-schedule", "Tug Schedule", "reference", "stable"),
+    bayRow("landing-rules", "Landing Rules", "decision", "stable"),
+    bayRow("gantry-check", "Gantry Check", "runbook", "stable"),
+    bayRow("crate-count", "Crate Count", "reference", "stable"),
+    bayRow("deck-crew", "Deck Crew", "engram", "stable"),
+    bayRow("hull-scan", "Hull Scan", "guide", "stable"),
+    bayRow("night-landing", "Night Landing", "engram", "archived"),
+    bayRow("oxygen-carts", "Oxygen Carts", "engram", "stable"),
+    bayRow("quiet-launch", "Quiet Launch", "decision", "proposed"),
+    bayRow("radio-tower", "Radio Tower", "engram", "stable"),
+    bayRow("spare-parts", "Spare Parts", "reference", "stable"),
+    bayRow("tool-carts", "Tool Carts", "engram", null),
+    bayRow("umbilical-hose", "Umbilical Hose", "engram", "deprecated"),
+    bayRow("visitor-pass", "Visitor Pass", "engram", "stable"),
+    bayRow("wing-repair", "Wing Repair", "runbook", "draft"),
+    bayRow("yellow-lines", "Yellow Lines", "guide", "stable"),
+    bayRow("engine-wash", "Engine Wash", "runbook", "stable"),
+    bayRow("jump-drive", "Jump Drive", "engram", "stable"),
+    bayRow("magnet-clamps", "Magnet Clamps", null, "stable"),
+    bayRow("cargo-sleds", "Cargo Sleds", "engram", "stable"),
+  ],
+  subfolders: ["Old Hulls"],
+  total: 24,
   truncated: false,
 };
 

@@ -90,6 +90,15 @@
  * lift and `?at=screen:0` in front of the hatch under the board. The lift
  * leads nowhere in the gallery.
  *
+ * `?hall=hangar` (M3 C13 to C17) shows the hangar `generateDeck` builds of
+ * `CANNED_HANGAR`, for judging the hall, its doors on the west, east and
+ * south walls, the cargo round the empty landing pads, the pad stencils
+ * and the deck's lift and screen. The bay door, the pads' plates and the
+ * gantries are the room's `hangar` data, which the room mesh does not draw
+ * yet. The spawn is the hangar's own, in
+ * front of the lift; `?at=screen:0` stands in front of the screen. The
+ * doors and the lift lead nowhere in the gallery.
+ *
  * `?pitch=<degrees>` (dev-only, any hall) starts the view tilted up
  * (positive) or down by that much, clamped as the mouse is, for stills of
  * a ceiling or of a board hung high.
@@ -109,6 +118,7 @@ import {
   CANNED_BRIDGE_DATA,
   CANNED_DECK,
   CANNED_DOMAINS,
+  CANNED_HANGAR,
   galleryRoom,
   heroHallRoom,
   liftsHallRoom,
@@ -171,7 +181,9 @@ export default function Gallery() {
                     )
                   : hall === "airlock"
                     ? airlockRoom({ domains: CANNED_DOMAINS, here: null })
-                    : galleryRoom();
+                    : hall === "hangar"
+                      ? generateDeck(CANNED_HANGAR, 0)
+                      : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"

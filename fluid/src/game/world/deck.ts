@@ -29,6 +29,17 @@
  *    engram's room, keeping every hero and floor prop out of that column,
  *    so the corridor stays open from the lift to the screen.
  *
+ * A hangar folder (`isHangar`, M3 C13) takes the hangar's plan instead of
+ * step 2's and 3's slots: `hangarLayout` (`world/hangar.ts`) gives the 20
+ * by 16 cell hall, the entrance (10, 15), `space: "hangar"` with the
+ * `hangar` structure right after it, a 9 m ceiling, the door slots on the
+ * west, east, south and north walls clear of the bay door and the gantry
+ * legs (the doors take them in sorted order) and the screen's edge (4, 0,
+ * n) beside the bay door. Its zones are lit at `HANGAR_LIGHT`, steady, and
+ * it reserves no centre column: a hangar is a hall, not a corridor. The
+ * lift, the screen's lines, the doors' style and seeds and `furnish` are
+ * the hub's.
+ *
  * Every door is a `sliding` door with `relType` `""`, labelled with the
  * engram's title: the tree carries no salience, so every door is the same
  * style. The deck's seed is `seedFor(GAME_VERSION, "deck", domain, folder,
@@ -39,8 +50,9 @@
  * deck's own number (`deckNumber`, as `folderDeck` numbers it); nothing
  * reads it as an address.
  *
- * The generator side: this module imports `generate.ts`, the folder and
- * lift helpers and the shared site types, never the session's modules.
+ * The generator side: this module imports `generate.ts`, `hangar.ts`, the
+ * folder and lift helpers and the shared site types, never the session's
+ * modules.
  */
 
 import { seedFor } from "../core/seed";
@@ -55,14 +67,22 @@ import {
 } from "./folders";
 import { furnish, lightsFor } from "./generate";
 import {
+  HANGAR_CEILING,
+  HANGAR_DEPTH,
+  HANGAR_LIGHT,
+  HANGAR_WIDTH,
+  hangarLayout,
+  isHangar,
+} from "./hangar";
+import {
   LIFT_WORDS,
   deckLabel,
   deckStops,
   engramCount,
   moreLine,
 } from "./lifts";
-import { NO_NEAR, type Reserved, type RoomBase } from "./sites";
-import type { Fixture, Rect, RoomSpec, WallSlot } from "./types";
+import { NO_NEAR, NO_RESERVE, type Reserved, type RoomBase } from "./sites";
+import type { Fixture, HangarSpec, Rect, RoomSpec, WallSlot } from "./types";
 import { CELL } from "./units";
 
 /**
@@ -170,15 +190,12 @@ export function generateDeck(input: DeckInput, section: number): RoomSpec {
   const rows = sections[index] ?? [];
   const labels = sectionLabels(sections);
   const seed = deckSeed(input.domain, input.folder, index);
-  const depth = Math.min(
-    DECK_MAX_DEPTH,
-    Math.max(DECK_MIN_DEPTH, 2 * Math.ceil(rows.length / 2) + 2),
-  );
-  const grid = Array.from({ length: depth }, () => ".".repeat(DECK_WIDTH));
-  const hall: Rect = { x0: 0, y0: 0, x1: DECK_WIDTH, y1: depth };
-  const centre = Math.floor(DECK_WIDTH / 2);
-  const entrance = { x: centre, y: depth - 1 };
   const slug = folderSlug(input.folder);
+  const plan = isHangar(input.domain, input.folder)
+    ? hangarPlan(rows.length, seed)
+    : hubPlan(rows.length);
+  const { grid, width, depth, entrance } = plan;
+  const hall: Rect = { x0: 0, y0: 0, x1: width, y1: depth };
 
   const fixtures: Fixture[] = [
     {
@@ -196,14 +213,8 @@ export function generateDeck(input: DeckInput, section: number): RoomSpec {
     },
   ];
   rows.forEach((row, i) => {
-    const slot: WallSlot =
-      i % 2 === 0
-        ? { x: 0, y: depth - 2 - 2 * Math.floor(i / 2), side: "w" }
-        : {
-            x: DECK_WIDTH - 1,
-            y: depth - 2 - 2 * Math.floor(i / 2),
-            side: "e",
-          };
+    const slot = plan.doorSlots[i];
+    if (slot === undefined) return;
     fixtures.push({
       kind: "door",
       slot,
@@ -217,47 +228,121 @@ export function generateDeck(input: DeckInput, section: number): RoomSpec {
   });
   fixtures.push({
     kind: "screen",
-    slot: { x: centre, y: 0, side: "n" },
+    slot: plan.screen,
     lines: screenLines(input, labels, index),
     keys: [],
     seed: seedFor(seed, "screen"),
   });
 
+  const lights = lightsFor(
+    seed,
+    grid,
+    hall,
+    width,
+    depth,
+    DECK_SALIENCE,
+    "clean",
+  );
   const base: RoomBase = {
     version: GAME_VERSION,
     seed,
     domain: input.domain,
     permalink: slug === "" ? "" : `${slug}/`,
-    space: "deck",
+    space: plan.hangar === null ? "deck" : "hangar",
+    ...(plan.hangar === null ? {} : { hangar: plan.hangar }),
     title: deckLabel(input.domain, input.folder),
     archetype: "engineering",
     condition: "clean",
-    width: DECK_WIDTH,
+    width,
     depth,
     grid,
     hall,
     bays: [],
     corridor: null,
     entrance,
-    ceiling: DECK_CEILING,
+    ceiling: plan.ceiling,
     spawn: { ...entrance, yaw: 0 },
     fixtures,
     decor: [],
     scaffold: [],
     heroes: [],
-    lights: lightsFor(
-      seed,
-      grid,
-      hall,
-      DECK_WIDTH,
-      depth,
-      DECK_SALIENCE,
-      "clean",
-    ),
+    lights:
+      plan.hangar === null
+        ? lights
+        : lights.map((z) => ({ ...z, level: HANGAR_LIGHT })),
     dropped: 0,
     inboundMore: 0,
   };
-  return furnish(base, NO_NEAR, centreLane(centre, depth));
+  return furnish(
+    base,
+    NO_NEAR,
+    plan.hangar === null ? centreLane(entrance.x, depth) : NO_RESERVE,
+  );
+}
+
+/**
+ * A deck's floor plan: its grid and size, its entrance, the wall slots its
+ * doors take in sorted order, its screen's edge, its ceiling and, for a
+ * hangar, its structure (null for a hub).
+ */
+interface DeckPlan {
+  grid: string[];
+  width: number;
+  depth: number;
+  entrance: { x: number; y: number };
+  doorSlots: WallSlot[];
+  screen: WallSlot;
+  ceiling: number;
+  hangar: HangarSpec | null;
+}
+
+/**
+ * The hub's floor plan (M3 C9) for `n` engrams: 5 cells wide,
+ * `clamp(2 * ceil(n / 2) + 2, 6, 26)` deep, the entrance the south wall's
+ * centre cell, the doors alternating west (even index) and east (odd) at
+ * row `depth - 2 - 2 * floor(i / 2)`, the screen on the north wall's
+ * centre edge.
+ */
+function hubPlan(n: number): DeckPlan {
+  const depth = Math.min(
+    DECK_MAX_DEPTH,
+    Math.max(DECK_MIN_DEPTH, 2 * Math.ceil(n / 2) + 2),
+  );
+  const centre = Math.floor(DECK_WIDTH / 2);
+  const doorSlots = Array.from({ length: n }, (_, i): WallSlot =>
+    i % 2 === 0
+      ? { x: 0, y: depth - 2 - 2 * Math.floor(i / 2), side: "w" }
+      : {
+          x: DECK_WIDTH - 1,
+          y: depth - 2 - 2 * Math.floor(i / 2),
+          side: "e",
+        },
+  );
+  return {
+    grid: Array.from({ length: depth }, () => ".".repeat(DECK_WIDTH)),
+    width: DECK_WIDTH,
+    depth,
+    entrance: { x: centre, y: depth - 1 },
+    doorSlots,
+    screen: { x: centre, y: 0, side: "n" },
+    ceiling: DECK_CEILING,
+    hangar: null,
+  };
+}
+
+/** A hangar's floor plan (M3 C14, C15), from `hangarLayout`. */
+function hangarPlan(n: number, seed: number): DeckPlan {
+  const layout = hangarLayout({ rows: n, seed });
+  return {
+    grid: layout.grid,
+    width: HANGAR_WIDTH,
+    depth: HANGAR_DEPTH,
+    entrance: layout.entrance,
+    doorSlots: layout.doorSlots,
+    screen: layout.screen,
+    ceiling: HANGAR_CEILING,
+    hangar: layout.hangar,
+  };
 }
 
 /**

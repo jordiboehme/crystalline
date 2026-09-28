@@ -22,7 +22,9 @@
  *   edge, the placard's too; a slot no fixture took stays free), minus the
  *   entrance edge and the edges one cell either side of it along the same
  *   wall (`{x: e.x +- 1, y: e.y, side: "s"}`), minus every edge whose cell's
- *   x is in `doorwayColumns`. The removed edges are `noRun`, the edges no
+ *   x is in `doorwayColumns`, and in a hangar (`room.hangar`, M3 C15)
+ *   minus the bay door's span of the north wall and the gantry legs' edges
+ *   (`gantryLegEdges`). The removed edges are `noRun`, the edges no
  *   wall or ceiling run may cover either; free is exactly wall edges minus
  *   `noRun`, so the two never drift apart (ruling 6).
  * - **Lanes** (ruling 10), which floor props never enter:
@@ -45,7 +47,10 @@
  *   - every doorway column `c`: x from `(c - 1) * CELL` to `(c + 2) * CELL`,
  *     z over the column's floor rows, one cell wide on each side of it.
  * - **Taken.** `footprintOf` of every fixture, `decorFootprint` of every
- *   piece of decor, and every box of `room.scaffold`, with nulls dropped.
+ *   piece of decor, and every box of `room.scaffold`, with nulls dropped;
+ *   in a hangar also every pad's box (`padBox`) and every gantry leg's
+ *   (`gantryLegs`), M3 C16, so no hero, floor prop, curio or decal stands
+ *   on a pad or in a leg. A room with no `hangar` key adds nothing.
  * - **Corner zones.** For the hall and then each bay rectangle `r`, in that
  *   order: the four 2x2 blocks at `(r.x0, r.y0)`, `(r.x1 - 2, r.y0)`,
  *   `(r.x0, r.y1 - 2)` and `(r.x1 - 2, r.y1 - 2)`, keyed `"x0,y0"` of the
@@ -112,8 +117,8 @@
  * ways lead to draw raw (`nearOf` in `neighbours.ts` fills them), and a
  * weighted list less those kinds as far as the list allows.
  *
- * This is the generator side: it imports `footprints.ts`, `lamps.ts`,
- * `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
+ * This is the generator side: it imports `footprints.ts`, `hangarShape.ts`,
+ * `lamps.ts`, `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
  * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
  */
 
@@ -123,6 +128,7 @@ import {
   footprintOf,
   pipeRunBox,
 } from "./footprints";
+import { gantryLegEdges, gantryLegs, padBox } from "./hangarShape";
 import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
@@ -490,6 +496,23 @@ export const STENCIL_STRIP = {
 } as const;
 
 /**
+ * The wall edges a hangar keeps bare (M3 C15, C16): the bay door's span of
+ * the north wall and the gantry legs' edges, which join `noRun`, so no
+ * wall prop, run, wall hero or wall decal is hung across the bay door or
+ * buried in a leg. None in a room with no hangar.
+ */
+function hangarWallEdges(room: SiteBase): WallSlot[] {
+  if (room.hangar === undefined) return [];
+  const { x0, x1 } = room.hangar.bayDoor;
+  const span = Array.from({ length: x1 - x0 }, (_, i): WallSlot => ({
+    x: x0 + i,
+    y: 0,
+    side: "n",
+  }));
+  return [...span, ...gantryLegEdges(room)];
+}
+
+/**
  * Where props may go in a room: runs, free edges, lanes, taken footprints,
  * corner zones, wall-side cells, long walls, cluster blocks and span lines.
  * See the module doc for the rules.
@@ -507,6 +530,7 @@ export function dressingSites(room: SiteBase): DressingSites {
   for (let dx = -1; dx <= 1; dx++)
     noRun.add(edgeKey({ ...entrance, x: entrance.x + dx }));
   for (const e of edges) if (cols.has(e.x)) noRun.add(edgeKey(e));
+  for (const e of hangarWallEdges(room)) noRun.add(edgeKey(e));
   const free = new Set([...wallEdges].filter((k) => !noRun.has(k)));
 
   const lanes: Box[] = [];
@@ -577,6 +601,10 @@ export function dressingSites(room: SiteBase): DressingSites {
     if (box !== null) taken.push(box);
   }
   taken.push(...room.scaffold);
+  if (room.hangar !== undefined) {
+    taken.push(...room.hangar.pads.map(padBox));
+    taken.push(...gantryLegs(room));
+  }
 
   const nextToDoorway = (x: number, y: number) =>
     Object.values(STEP).some(([dx, dy]) =>

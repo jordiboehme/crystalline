@@ -20,7 +20,12 @@
  *    still checked, and the tests pin that it is always clear). Each
  *    overflow bay's `BAY mA` to `BAY mD` at the bay's centre, reading from
  *    the hall (turn 1: every bay lies east of the hall, so its top points
- *    east, away from the reader), when its box is clear. The numbers are
+ *    east, away from the reader), when its box is clear. In a hangar
+ *    (`room.hangar`, M3 C17) each pad's `BAY mA`, `BAY mB` at its
+ *    `padStencilSpots` spot, 1 m inside its south rim reading from the
+ *    south (turn 0), 1.0 by 0.3 m, laid outright (the pad is a taken box,
+ *    kept clear of everything else); a room with no `hangar` key lays none.
+ *    The numbers are
  *    `deckNumber` and `bayNumber` (C18). All the stencils of a room share
  *    one seed (they draw nothing), so the sort
  *    orders them by `y`, then `x`. A bay's letter is in `stencil.letter`,
@@ -86,6 +91,7 @@
  * was accepted is the box that is returned.
  *
  * This is the generator side: it imports `sites.ts`, `footprints.ts`,
+ * `hangarShape.ts`,
  * `props.ts`, `heroes.ts`, `layout.ts`, `types.ts`, `units.ts` and
  * `core/seed.ts`, never `generate.ts` (which imports it), `dress.ts` or
  * `render/`. The hand tables `STREAK_SOURCES` and `CRATE_FACES` copy their
@@ -100,6 +106,7 @@ import {
   heroFootprint,
   propFootprint,
 } from "./footprints";
+import { padStencilSpots } from "./hangarShape";
 import { heroReserve } from "./heroes";
 import { isFloor } from "./layout";
 import { PROP_CATALOGUE } from "./props";
@@ -471,6 +478,25 @@ export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
       stencil: text(i + 1, 1),
     });
   });
+  // A hangar's pad stencils (M3 C17): laid here, so every pass that re-runs
+  // the decals keeps them. A pad is a taken box, which the clear check
+  // refuses, so each is laid outright; later floor decals keep off it.
+  if (room.hangar !== undefined)
+    for (const spot of padStencilSpots(room.hangar)) {
+      const d = rounded({
+        ...stencil,
+        on: "floor",
+        x: spot.x,
+        y: spot.y,
+        turn: 0,
+        h: 0,
+        width: 1.0,
+        length: 0.3,
+        stencil: text(spot.letter, 1),
+      });
+      laid.push(floorBox(d));
+      fixed.push(d);
+    }
 
   // 2. Chevrons.
   const strip = (e: WallSlot, along: number, from: number, token: string) => {
