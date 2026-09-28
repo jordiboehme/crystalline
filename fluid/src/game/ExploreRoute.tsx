@@ -79,6 +79,18 @@
  * no place yet, and the way out leads to the page of the address the URL
  * last sent it to; the unmount that follows disposes the session.
  *
+ * The route owns the sound (M4 C28). With the session it makes a mixer
+ * (`audio/mixer.ts`) that borrows the context the launch primed in its
+ * gesture (`takePrimedAudio`, never closed here: the launch keeps it, so
+ * StrictMode's second mount borrows the same one, F29) or, on a reload with
+ * nothing primed, makes its own on the first click or key, and the director
+ * (`audio/director.ts`) the session sends its cues to. The context is
+ * suspended while the pause shows or the tab is hidden and resumed once
+ * neither holds; the mount resumes it too, since the first mount's cleanup
+ * in StrictMode suspended the one it borrowed. The unmount disposes the
+ * director, which closes the mixer: a context it made is closed, a borrowed
+ * one suspended and left to the launch.
+ *
  * The route listens to the change stream itself (M4 C13): `Layout`, whose
  * provider invalidates for every other screen, is not mounted here. The
  * mount marks the whole cache stale once before the first `go`, since the
@@ -98,11 +110,13 @@ import { useLocation, useNavigate } from "react-router";
 
 import { ME_QUERY_KEY } from "../auth/keys";
 import { subscribeToChanges } from "../events/ChangeStreamProvider";
+import { createDirector } from "./audio/director";
+import { createMixer } from "./audio/mixer";
 import { changeKeys } from "./data/changes";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
-import { releasePrimedAudio } from "./launch";
+import { releasePrimedAudio, takePrimedAudio } from "./launch";
 import {
   addressOfGameLocation,
   domainOf,
@@ -122,6 +136,16 @@ import type { LiftStop, StationAddress } from "./world/types";
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
   window.open(path, "_blank", "noopener");
+}
+
+/**
+ * A context of the mixer's own, made inside the gesture that unlocks it
+ * when the launch primed none (a reload); null without WebAudio.
+ */
+function makeAudioContext(): AudioContext | null {
+  const Ctor = (globalThis as { AudioContext?: new () => AudioContext })
+    .AudioContext;
+  return Ctor === undefined ? null : new Ctor();
 }
 
 /**
@@ -188,6 +212,17 @@ export default function ExploreRoute() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
+    const director = createDirector(
+      createMixer({ borrow: takePrimedAudio, make: makeAudioContext }),
+    );
+    // Quiet while the pause shows or the tab is hidden, playing otherwise.
+    let paused = false;
+    const syncSound = () => {
+      if (paused || document.visibilityState === "hidden") director.suspend();
+      else director.resume();
+    };
+    syncSound();
+    document.addEventListener("visibilitychange", syncSound);
     const session = createSession({
       canvas,
       client,
@@ -205,10 +240,13 @@ export default function ExploreRoute() {
       forceRgba8: false,
       onLevels: setLevels,
       onLift: setLift,
-      onPause: (paused) => {
+      sound: director,
+      onPause: (isPaused) => {
+        paused = isPaused;
+        syncSound();
         const running = sessionRef.current;
         setPause(
-          paused && running !== null
+          isPaused && running !== null
             ? { where: running.where, lockEndedAt: running.lockEndedAt }
             : null,
         );
@@ -249,6 +287,8 @@ export default function ExploreRoute() {
       sessionRef.current = null;
       requestedRef.current = null;
       session.dispose();
+      document.removeEventListener("visibilitychange", syncSound);
+      director.dispose();
     };
   }, [refusal, client, sink]);
 

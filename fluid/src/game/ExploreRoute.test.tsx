@@ -53,6 +53,8 @@ import {
   meResponse,
   userFixture,
 } from "../test/harness";
+import type { Director } from "./audio/director";
+import { FakeAudioContext } from "./audio/testContext";
 import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
 import type { LiftStop, StationAddress } from "./world/types";
@@ -191,6 +193,40 @@ vi.mock("./session", async (importOriginal) => {
     },
   };
 });
+
+/** Every director the route made, and every audio context constructed. */
+const sound = vi.hoisted(() => ({
+  directors: [] as import("./audio/director").Director[],
+  contexts: [] as import("./audio/testContext").FakeAudioContext[],
+}));
+
+vi.mock("./audio/director", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./audio/director")>();
+  return {
+    ...actual,
+    createDirector: (...args: Parameters<typeof actual.createDirector>) => {
+      const director = actual.createDirector(...args);
+      sound.directors.push(director);
+      return director;
+    },
+  };
+});
+
+/**
+ * Stands a recording context in for the browser's `AudioContext`, for the
+ * launch's prime and the mixer's own alike; every one made is kept.
+ */
+function stubAudio() {
+  vi.stubGlobal(
+    "AudioContext",
+    class extends FakeAudioContext {
+      constructor() {
+        super();
+        sound.contexts.push(this);
+      }
+    },
+  );
+}
 
 /**
  * The change stream as the route subscribes to it: every listener with its
@@ -441,6 +477,10 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   sessionStub.factory = null;
+  // The launch keeps the primed context across tests: none leaks on.
+  releasePrimedAudio();
+  sound.directors.length = 0;
+  sound.contexts.length = 0;
 });
 
 /**
@@ -1356,4 +1396,117 @@ describe("ExploreRoute", () => {
       view.unmount();
     },
   );
+
+  describe("sound (M4 C28)", () => {
+    /** Hides or shows the tab as the browser would. */
+    function setHidden(hidden: boolean) {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => (hidden ? "hidden" : "visible"),
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }
+
+    afterEach(() => {
+      // Back to jsdom's own getter on the prototype.
+      Reflect.deleteProperty(document, "visibilityState");
+    });
+
+    // Mutation caught: no sound sink handed to the session, no unlock on
+    // the first click of a reload (no context ever made), or a context the
+    // mixer made left open after the route went.
+    it("hands the session the director, makes the sound on the first click and closes it on unmount", async () => {
+      gl.available = true;
+      stubAudio();
+      serve();
+      const view = renderAt("/%CF%80");
+      await waitFor(() => {
+        expect(made.options.length).toBeGreaterThan(0);
+      });
+      const director: Director | undefined = sound.directors.at(-1);
+      expect(director).toBeDefined();
+      expect(made.options.at(-1)?.sound).toBe(director);
+      // Nothing primed (a reload): no context until a gesture.
+      expect(sound.contexts).toHaveLength(0);
+
+      const canvas = document.querySelector("canvas");
+      expect(canvas).not.toBeNull();
+      fireEvent.click(canvas!);
+      expect(sound.contexts).toHaveLength(1);
+      const ctx = sound.contexts[0]!;
+      expect(ctx.calls).toEqual(["resume"]);
+      expect(ctx.state).toBe("running");
+
+      await settle(300);
+      view.unmount();
+      expect(ctx.calls.at(-1)).toBe("close");
+    });
+
+    // Mutation caught: the suspend on the pause missing, the hidden tab
+    // left playing, or a resume while one of the two still holds.
+    it("suspends while paused or hidden and resumes after both", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      expect(ctx.state).toBe("running");
+      serve();
+      sessionStub.factory = (opts) =>
+        stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() });
+      const view = renderAt("/%CF%80");
+      await waitFor(() => {
+        expect(made.options.length).toBeGreaterThan(0);
+      });
+      const opts = made.options.at(-1)!;
+      expect(ctx.state).toBe("running");
+
+      act(() => opts.onPause?.(true));
+      expect(ctx.state).toBe("suspended");
+      // Shown again under the pause: still quiet.
+      act(() => setHidden(true));
+      act(() => setHidden(false));
+      expect(ctx.state).toBe("suspended");
+      act(() => opts.onPause?.(false));
+      expect(ctx.state).toBe("running");
+
+      act(() => setHidden(true));
+      expect(ctx.state).toBe("suspended");
+      // The pause ended while hidden: still quiet until shown.
+      act(() => opts.onPause?.(true));
+      act(() => opts.onPause?.(false));
+      expect(ctx.state).toBe("suspended");
+      act(() => setHidden(false));
+      expect(ctx.state).toBe("running");
+      view.unmount();
+    });
+
+    // Mutation caught: the primed context closed on unmount (StrictMode's
+    // second mount would borrow a dead one, F29), or left suspended by the
+    // first mount's cleanup so the second never plays (C26's check).
+    it("borrows the primed context and never closes it, also under StrictMode (F29, F38)", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      serve();
+      const view = renderAt("/%CF%80/d/eng/e/alpha", true);
+      await waitFor(() => {
+        expect(lastRoom()).toBe("alpha");
+      });
+      await settle(300);
+      // Two mounts, two directors, one context: the first mount's cleanup
+      // suspended it and the second resumed it.
+      expect(sound.directors.length).toBeGreaterThanOrEqual(2);
+      expect(sound.contexts).toHaveLength(1);
+      expect(ctx.calls).toContain("suspend");
+      expect(ctx.calls).not.toContain("close");
+      expect(ctx.state).toBe("running");
+      expect(takePrimedAudio()).toBe(ctx);
+
+      view.unmount();
+      expect(ctx.calls).not.toContain("close");
+      expect(ctx.state).toBe("suspended");
+      expect(takePrimedAudio()).toBe(ctx);
+    });
+  });
 });

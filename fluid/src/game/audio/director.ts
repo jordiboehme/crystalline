@@ -35,7 +35,8 @@
  * - **Gestures.** A click or a key on the window while the context is not
  *   running unlocks it (Safari may refuse the resume after a hidden tab,
  *   F29), inside that gesture; the first one also makes the context on a
- *   reload.
+ *   reload. Not between the host's `suspend` and `resume`: a click on the
+ *   pause screen leaves the sound off.
  *
  * `suspend` and `resume` are the host's (the pause and a hidden tab);
  * `dispose` stops everything, takes the listeners down and closes the
@@ -105,6 +106,8 @@ export function createDirector(mixer: Mixer): Director {
   let hum: PlayingPatch | null = null;
   /** Whether a ride arrived and its chime waits for the room it lands in. */
   let chimeOwed = false;
+  /** Whether the host suspended the sound (the pause, a hidden tab). */
+  let quiet = false;
 
   const held = () => (drone === null ? 0 : 1) + (hum === null ? 0 : 1);
 
@@ -253,8 +256,10 @@ export function createDirector(mixer: Mixer): Director {
     startDrone();
   };
 
+  // Not while the host keeps it quiet: a click on the pause screen must
+  // not bring the sound back under it.
   const onGesture = () => {
-    if (!mixer.running) unlock();
+    if (!quiet && !mixer.running) unlock();
   };
   window.addEventListener("click", onGesture, true);
   window.addEventListener("keydown", onGesture, true);
@@ -263,10 +268,14 @@ export function createDirector(mixer: Mixer): Director {
     cue,
     toggleMute: () => mixer.toggleMute(),
     suspend: () => {
-      if (!disposed) mixer.suspend();
+      if (disposed) return;
+      quiet = true;
+      mixer.suspend();
     },
     resume: () => {
-      if (!disposed) mixer.resume();
+      if (disposed) return;
+      quiet = false;
+      mixer.resume();
     },
     unlock,
     dispose() {

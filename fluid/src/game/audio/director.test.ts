@@ -258,6 +258,23 @@ describe("createDirector", () => {
     expect(ctx.calls).not.toContain("resume");
   });
 
+  // Mutation caught: a click on the pause screen (or while the tab is
+  // hidden) unlocking a context the host suspended on purpose.
+  it("leaves a suspended context quiet through gestures until resumed", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.suspend();
+    window.dispatchEvent(new MouseEvent("click"));
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "Enter" }));
+    expect(ctx.calls).toEqual(["suspend"]);
+    director.resume();
+    expect(ctx.calls).toEqual(["suspend", "resume"]);
+    // A resume the browser refused: the next gesture unlocks.
+    ctx.state = "suspended";
+    window.dispatchEvent(new MouseEvent("click"));
+    expect(ctx.calls).toEqual(["suspend", "resume", "resume"]);
+  });
+
   // Mutation caught: suspend and resume not passed to the mixer.
   it("suspends and resumes the context", () => {
     const { ctx, director } = setup();
