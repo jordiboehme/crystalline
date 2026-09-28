@@ -269,8 +269,8 @@ fn detects_unindexed_files_without_fixing_them() {
 }
 
 /// Reproduces a colleague's real-world report: a file whose frontmatter
-/// repeats a key never becomes indexed no matter how many times `sync` runs,
-/// so `doctor` must tell it apart from a file that is merely unsynced.
+/// does not parse never becomes indexed no matter how many times `sync`
+/// runs, so `doctor` must tell it apart from a file that is merely unsynced.
 /// Covers a nested path, since `verify` reports an absolute path and the
 /// unindexed set holds forward-slashed paths relative to the domain root -
 /// the two must be normalised to the same shape before they can be compared.
@@ -284,12 +284,12 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
     // A well-formed file that simply has not been synced yet.
     write(&domain_dir, "good.md", &engram("Good", "good"));
 
-    // A nested file whose frontmatter repeats the `tags` key: `verify` calls
+    // A nested file whose frontmatter has an unbalanced quote: `verify` calls
     // this E001, and no amount of syncing will ever index it.
     write(
         &domain_dir,
         "a/b/bad.md",
-        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+        "---\ntype: engram\ntitle: \"Bad\npermalink: bad\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
     );
 
     let mut cmd = bin();
@@ -308,7 +308,7 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
     assert_eq!(
         report["domains"][0]["unindexed"],
         serde_json::json!(["good.md"]),
-        "the duplicate-key file must not show up as merely unindexed: {report}"
+        "the broken file must not show up as merely unindexed: {report}"
     );
     let unsyncable = &report["domains"][0]["unsyncable"];
     assert_eq!(unsyncable[0]["path"], serde_json::json!("a/b/bad.md"));
@@ -316,7 +316,7 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
         unsyncable[0]["message"]
             .as_str()
             .unwrap()
-            .contains("duplicate entry with key"),
+            .contains("frontmatter YAML is invalid"),
         "unsyncable message should explain why: {unsyncable}"
     );
 
@@ -344,7 +344,7 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
         "unsyncable files get their own explanation: {stdout}"
     );
     assert!(
-        stdout.contains("a/b/bad.md: ") && stdout.contains("duplicate entry with key"),
+        stdout.contains("a/b/bad.md: ") && stdout.contains("frontmatter YAML is invalid"),
         "the unsyncable line names the file and the reason: {stdout}"
     );
 }

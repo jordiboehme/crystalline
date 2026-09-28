@@ -2268,7 +2268,7 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
     .unwrap();
     std::fs::write(
         docs.join("bad.md"),
-        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+        "---\ntype: engram\ntitle: \"Bad\npermalink: bad\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
     )
     .unwrap();
     let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
@@ -2320,13 +2320,13 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
             .map(|f| f["path"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>(),
         vec!["bad.md".to_string()],
-        "the duplicate-key file is the other class, not merely unsynced: {docs_report}"
+        "the broken file is the other class, not merely unsynced: {docs_report}"
     );
     assert!(
         docs_report["unsyncable"][0]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("duplicate entry with key"),
+            .contains("frontmatter YAML is invalid"),
         "the reason travels with it: {docs_report}"
     );
 
