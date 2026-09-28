@@ -54,6 +54,7 @@ import {
   userFixture,
 } from "../test/harness";
 import type { Director } from "./audio/director";
+import { CONNECTED_KEY, dialNumber } from "./audio/modem";
 import { FakeAudioContext } from "./audio/testContext";
 import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
@@ -85,7 +86,8 @@ const made = vi.hoisted(() => ({
     dispose: ReturnType<typeof vi.fn>;
   }[],
   navigations: [] as string[],
-  sessions: [] as { disposed: boolean }[],
+  /** Every session made: disposed or not, and every `setBusy` it was told. */
+  sessions: [] as { disposed: boolean; busy: boolean[] }[],
   /** The options every session was created with, as the route passed them. */
   options: [] as SessionOptions[],
   /** The reader's "open in Fluid" handler the route last handed its view. */
@@ -168,7 +170,13 @@ vi.mock("./session", async (importOriginal) => {
       made.options.push(opts);
       if (sessionStub.factory !== null) {
         const session = sessionStub.factory(opts);
-        made.sessions.push({ disposed: false });
+        const entry = { disposed: false, busy: [] as boolean[] };
+        made.sessions.push(entry);
+        const setBusy = session.setBusy.bind(session);
+        session.setBusy = (busy: boolean) => {
+          entry.busy.push(busy);
+          setBusy(busy);
+        };
         return session;
       }
       const session = actual.createSession({
@@ -182,8 +190,13 @@ vi.mock("./session", async (importOriginal) => {
           opts.onPause?.(paused);
         },
       });
-      const entry = { disposed: false };
+      const entry = { disposed: false, busy: [] as boolean[] };
       made.sessions.push(entry);
+      const setBusy = session.setBusy.bind(session);
+      session.setBusy = (busy: boolean) => {
+        entry.busy.push(busy);
+        setBusy(busy);
+      };
       const dispose = session.dispose.bind(session);
       session.dispose = () => {
         entry.disposed = true;
@@ -194,10 +207,17 @@ vi.mock("./session", async (importOriginal) => {
   };
 });
 
-/** Every director the route made, and every audio context constructed. */
+/**
+ * Every director the route made, every audio context constructed, and
+ * every number a director dialled.
+ */
 const sound = vi.hoisted(() => ({
   directors: [] as import("./audio/director").Director[],
   contexts: [] as import("./audio/testContext").FakeAudioContext[],
+  dials: [] as {
+    director: import("./audio/director").Director;
+    number: string;
+  }[],
 }));
 
 vi.mock("./audio/director", async (importOriginal) => {
@@ -207,6 +227,11 @@ vi.mock("./audio/director", async (importOriginal) => {
     createDirector: (...args: Parameters<typeof actual.createDirector>) => {
       const director = actual.createDirector(...args);
       sound.directors.push(director);
+      const dial = director.dial.bind(director);
+      director.dial = (number: string) => {
+        sound.dials.push({ director, number });
+        return dial(number);
+      };
       return director;
     },
   };
@@ -481,6 +506,10 @@ afterEach(() => {
   releasePrimedAudio();
   sound.directors.length = 0;
   sound.contexts.length = 0;
+  sound.dials.length = 0;
+  // The connecting screen shows once per tab session: every test starts a
+  // new one.
+  window.sessionStorage.clear();
 });
 
 /**
@@ -500,6 +529,7 @@ async function typeWord(word: string) {
 }
 
 const LEVELS = { name: "Jump to a domain" } as const;
+const CONNECTING = { name: "Connecting" } as const;
 const LIFT = { name: "Choose a stop" } as const;
 
 /** Two stops, the second the one the lift stands at: enough to pick from. */
@@ -542,6 +572,7 @@ function stubSession(
     pause: vi.fn(),
     resume: vi.fn(),
     setBusy: vi.fn(),
+    flash: vi.fn(),
     changed: vi.fn(),
     current: null,
     page: null,
@@ -1035,8 +1066,13 @@ describe("ExploreRoute", () => {
     // check (every overlay's Esc would pause under it); the pause never
     // reaching the route (no screen on the last Esc). The overlays'
     // `preventDefault` on Esc is the second guard (C9): with the modal
-    // check in place it cannot go red on its own, see the report.
+    // check in place it cannot go red on its own, see the report. The
+    // connecting screen's can (C9, M4 C26): it clears `busy` before the
+    // session hears the Esc, so its `preventDefault` alone keeps that Esc
+    // from pausing; mutation caught: the `preventDefault` dropped.
     gl.available = true;
+    stubAudio();
+    primeAudio();
     serve({ "/domains/eng/tree": TREE });
     const PAUSED = { name: "Paused" } as const;
     const esc = async (target: Element | Window = window) => {
@@ -1060,6 +1096,13 @@ describe("ExploreRoute", () => {
     // The reader, at the room's terminal.
     facing.kind = "terminal";
     const view = renderAt("/%CF%80/d/eng/e/alpha");
+    // The connecting screen, first: an Esc on it skips it and pauses
+    // nothing.
+    const connecting = await screen.findByRole("dialog", CONNECTING);
+    await esc(connecting);
+    expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+    expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
+    expect(made.pauses).toEqual([]);
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
@@ -1520,6 +1563,99 @@ describe("ExploreRoute", () => {
       view.unmount();
     });
 
+    // Mutation caught: the key set when the screen was skipped (a later
+    // launch in the tab would never dial in), the screen shown on every
+    // mount, or the session not held busy under it.
+    it("skips the connecting screen when the context is not running (Review Focus 5)", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      // A context the browser has not let run yet.
+      ctx.state = "suspended";
+      ctx.deferred = true;
+      serve();
+      const mountAt = async () => {
+        const view = renderAt("/%CF%80/d/eng/e/alpha");
+        await waitFor(() => {
+          expect(made.sessions.length).toBeGreaterThan(0);
+        });
+        await settle(50);
+        return view;
+      };
+      const first = await mountAt();
+      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+      expect(window.sessionStorage.getItem(CONNECTED_KEY)).toBeNull();
+      expect(sound.dials).toEqual([]);
+      expect(made.sessions.at(-1)?.busy).not.toContain(true);
+      first.unmount();
+
+      // Running: the screen shows, the key is set, the session is busy
+      // and the domain's number is dialled.
+      ctx.deferred = false;
+      ctx.state = "running";
+      const second = await mountAt();
+      const dialog = screen.getByRole("dialog", CONNECTING);
+      expect(window.sessionStorage.getItem(CONNECTED_KEY)).toBe("1");
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(true);
+      expect(sound.dials.map((d) => d.number)).toEqual([dialNumber("eng")]);
+      expect(sound.dials[0]?.director).toBe(sound.directors.at(-1));
+      await settle(1_000);
+      expect(within(dialog).getByText("ENG")).toBeInTheDocument();
+      // A click skips it and hands the session its keys back.
+      fireEvent.click(dialog);
+      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(false);
+      second.unmount();
+
+      // Again in the same tab session: nothing.
+      ctx.state = "running";
+      const third = await mountAt();
+      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+      expect(sound.dials).toHaveLength(1);
+      third.unmount();
+    });
+
+    // Mutation caught: the gate bypassed (every drop in a flapping minute
+    // would hang up and flash), the notice or the hang-up missing, or the
+    // carrier heard on a second subscription.
+    it("says NO CARRIER at most once a minute when the stream drops (M4 C27)", async () => {
+      gl.available = true;
+      serve();
+      const flash = vi.fn<(text: string) => void>();
+      sessionStub.factory = (opts) => ({
+        ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+        flash,
+      });
+      const view = renderAt("/%CF%80");
+      await waitFor(() => {
+        expect(stream.subs).toHaveLength(1);
+      });
+      const sub = stream.subs[0]!;
+      expect(sub.options?.identity).toBeDefined();
+      const onCarrier = sub.options?.onCarrier;
+      if (onCarrier === undefined) throw new Error("no carrier callback");
+      const carrier = vi.spyOn(sound.directors.at(-1)!, "carrier");
+      act(() => {
+        onCarrier(false);
+      });
+      expect(flash.mock.calls).toEqual([["NO CARRIER"]]);
+      expect(carrier.mock.calls).toEqual([[false]]);
+      act(() => {
+        onCarrier(true);
+      });
+      expect(carrier.mock.calls).toEqual([[false], [true]]);
+      // The second pair inside the minute: nothing.
+      act(() => {
+        onCarrier(false);
+        onCarrier(true);
+      });
+      expect(flash).toHaveBeenCalledTimes(1);
+      expect(carrier).toHaveBeenCalledTimes(2);
+      expect(stream.subs).toHaveLength(1);
+      view.unmount();
+    });
+
     // Mutation caught: the primed context closed on unmount (StrictMode's
     // second mount would borrow a dead one, F29), or left suspended by the
     // first mount's cleanup so the second never plays (C26's check).
@@ -1542,6 +1678,14 @@ describe("ExploreRoute", () => {
       expect(ctx.calls).not.toContain("close");
       expect(ctx.state).toBe("running");
       expect(takePrimedAudio()).toBe(ctx);
+      // The connecting screen stands over the second mount, and it is that
+      // mount's session that is held busy and its director that dials (M4
+      // C26, F41); mutation caught: the screen's state not carried over the
+      // remount (the second mount finds the key set and neither holds the
+      // session nor dials).
+      expect(screen.getByRole("dialog", CONNECTING)).toBeInTheDocument();
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(true);
+      expect(sound.dials.at(-1)?.director).toBe(sound.directors.at(-1));
 
       view.unmount();
       expect(ctx.calls).not.toContain("close");

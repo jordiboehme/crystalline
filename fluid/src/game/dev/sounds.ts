@@ -1,7 +1,7 @@
 /**
  * The sound board's list (`SoundBoard.tsx`): every patch the station plays
- * by a readable name (the effects, the drones and the signature sounds),
- * and the bus each plays on. Kept apart from the board
+ * by a readable name (the effects, the drones, the signature sounds and
+ * the modem's), and the bus each plays on. Kept apart from the board
  * so its component module exports components only.
  */
 
@@ -17,6 +17,7 @@ import {
   terminalPatch,
 } from "../audio/effects";
 import type { Bus } from "../audio/mixer";
+import { handshakePatch, hangupPatch, reconnectPatch } from "../audio/modem";
 import type { Patch } from "../audio/patch";
 import { landingPatch, takeoffPatch, tonesPatch } from "../audio/signature";
 
@@ -56,6 +57,9 @@ export const SOUNDS: Record<string, () => Patch> = {
   "wheeze takeoff": takeoffPatch,
   "wheeze landing": landingPatch,
   "five tones": tonesPatch,
+  "modem handshake": () => handshakePatch("555-0142"),
+  "modem reconnect": reconnectPatch,
+  "modem hang-up": hangupPatch,
 };
 
 /** The signature sounds' patch names (M4 C24). */
@@ -63,11 +67,18 @@ const SIGNATURES: ReadonlySet<string> = new Set(
   [takeoffPatch(), landingPatch(), tonesPatch()].map((p) => p.name),
 );
 
+/** The modem's patch names (M4 C26, C27). */
+const MODEMS: ReadonlySet<string> = new Set(
+  [handshakePatch(""), reconnectPatch(), hangupPatch()].map((p) => p.name),
+);
+
 /**
  * The bus a patch plays on: a drone on the ambience, the wheeze and the
- * tones on the signature bus, the rest on effects.
+ * tones on the signature bus, the modem's on the modem bus, the rest on
+ * effects.
  */
 export function busOf(patch: Patch): Bus {
   if (patch.name.startsWith("drone")) return "ambience";
+  if (MODEMS.has(patch.name)) return "modem";
   return SIGNATURES.has(patch.name) ? "signature" : "effects";
 }

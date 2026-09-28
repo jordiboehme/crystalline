@@ -518,6 +518,8 @@ export type PlaceLoader = (
  *   so it must be called from a user gesture. Not paused, it does nothing.
  * - `setBusy` holds the station modal for a screen of the host's, as an
  *   overlay does, with no pause and no lock released.
+ * - `flash` shows the host's notice (`NO CARRIER`, M4 C27) for
+ *   `NOTICE_MS`, as a failed load's, then the standing notice or none.
  * - `lockEndedAt` is when the pointer lock last ended, on
  *   `performance.now()`'s clock (`Input.lockEndedAt`): the lock is asked
  *   for again no sooner than `RELOCK_DELAY_MS` after it.
@@ -542,6 +544,7 @@ export interface Session {
   pause(): void;
   resume(): void;
   setBusy(busy: boolean): void;
+  flash(text: string): void;
   /**
    * One frame of the change stream, after the host made its keys stale:
    * follows a move of the current engram and re-checks the room when the
@@ -2332,6 +2335,9 @@ export function createSession(opts: SessionOptions): Session {
       input.clear();
       cheat?.reset();
       if (!next) retryCheck();
+    },
+    flash(text) {
+      flash(text, NOTICE_MS);
     },
     changed,
     dispose() {

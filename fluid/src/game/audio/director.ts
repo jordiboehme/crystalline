@@ -38,6 +38,11 @@
  *   the same call as the `arrive`, so the chime plays if a `room` cue comes
  *   before the next microtask, and a ride that ends without landing (a
  *   failed stop, a load error, a new place) stops its hum in silence.
+ * - **The modem.** `dial` plays the launch's dial-in (`audio/modem.ts`,
+ *   M4 C26) on the `modem` bus and answers its stop, which fades it out
+ *   over `DIAL_FADE_S`; `carrier` plays the hang-up on a drop and a short
+ *   handshake on a return (C27), also on the `modem` bus. Both are
+ *   one-shots under the cap, and a new dial cuts one still sounding.
  * - **Mute** is the master's alone (`toggleMute`, the mixer's): the cues
  *   play on into a silent master, so sound coming back mid-room brings the
  *   drone back at once.
@@ -65,6 +70,7 @@ import {
   terminalPatch,
 } from "./effects";
 import type { Bus, Mixer } from "./mixer";
+import { handshakePatch, hangupPatch, reconnectPatch } from "./modem";
 import type { Patch } from "./patch";
 import { landingPatch, takeoffPatch, tonesPatch } from "./signature";
 import { playPatch, type PlayingPatch } from "./synth";
@@ -75,8 +81,15 @@ export const VOICE_CAP = 24;
 /** How fast the ride's hum falls silent when the ride arrives. */
 export const RIDE_FADE_S = 0.04;
 
+/** How fast the dial-in falls silent when its screen is skipped or done. */
+export const DIAL_FADE_S = 0.04;
+
 /** The game's sound sink, with the lifecycle its host drives. */
 export interface Director extends SoundSink {
+  /** Dials `number` on the modem bus (M4 C26); answers its stop. */
+  dial(number: string): () => void;
+  /** The change stream went down or came back (M4 C27). */
+  carrier(up: boolean): void;
   /** Suspends the context: the pause, a hidden tab. */
   suspend(): void;
   /** Resumes the context after a suspend. */
@@ -118,6 +131,8 @@ export function createDirector(mixer: Mixer): Director {
   let hum: PlayingPatch | null = null;
   /** The five tones while they sound (a jump's or an answer's). */
   let tones: PlayingPatch | null = null;
+  /** The dial-in while it sounds. */
+  let dialing: PlayingPatch | null = null;
   /** Whether a ride arrived and its chime waits for the room it lands in. */
   let chimeOwed = false;
   /** Whether the host suspended the sound (the pause, a hidden tab). */
@@ -324,8 +339,27 @@ export function createDirector(mixer: Mixer): Director {
   window.addEventListener("click", onGesture, true);
   window.addEventListener("keydown", onGesture, true);
 
+  const dial = (number: string): (() => void) => {
+    dialing?.stop(DIAL_FADE_S);
+    const playing: PlayingPatch | null = shot(handshakePatch(number), {
+      bus: "modem",
+      onEnd: () => {
+        if (dialing === playing) dialing = null;
+      },
+    });
+    dialing = playing;
+    return () => {
+      playing?.stop(DIAL_FADE_S);
+    };
+  };
+
   return {
     cue,
+    dial,
+    carrier: (up) => {
+      if (disposed) return;
+      shot(up ? reconnectPatch() : hangupPatch(), { bus: "modem" });
+    },
     toggleMute: () => mixer.toggleMute(),
     suspend: () => {
       if (disposed) return;
@@ -352,6 +386,7 @@ export function createDirector(mixer: Mixer): Director {
       drone = null;
       hum = null;
       tones = null;
+      dialing = null;
       wanted = null;
       mixer.close();
     },

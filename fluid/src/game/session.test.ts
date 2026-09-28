@@ -899,6 +899,37 @@ describe("notices", () => {
   });
 });
 
+describe("flash", () => {
+  // Mutation caught: the timer not set (the notice stays for good), or
+  // the standing notice not brought back after it.
+  it("shows a notice for NOTICE_MS, then the standing one or none (M4 C27)", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const session = start({ client: null });
+      session.showCanned(CANNED_BRIDGE);
+      session.flash("NO CARRIER");
+      expect(hud.notice).toHaveBeenLastCalledWith("NO CARRIER");
+      vi.advanceTimersByTime(NOTICE_MS - 1);
+      expect(hud.notice).toHaveBeenLastCalledWith("NO CARRIER");
+      vi.advanceTimersByTime(1);
+      expect(hud.notice).toHaveBeenLastCalledWith(null);
+      session.dispose();
+
+      // Before the first room, over a place that could not be entered:
+      // that notice stands again after the flash.
+      const dark = start({ client: null });
+      dark.go({ kind: "engram", domain: "station", permalink: "old-bridge" });
+      expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
+      dark.flash("NO CARRIER");
+      expect(hud.notice).toHaveBeenLastCalledWith("NO CARRIER");
+      vi.advanceTimersByTime(NOTICE_MS);
+      expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("showRoom", () => {
   it("shows a room built by hand with no load and no navigation", () => {
     const built: RoomSpec = {

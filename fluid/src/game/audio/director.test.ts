@@ -2,8 +2,14 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { CROSSFADE_S } from "./ambience";
 import type { Cue } from "./cues";
-import { RIDE_FADE_S, VOICE_CAP, createDirector } from "./director";
+import {
+  DIAL_FADE_S,
+  RIDE_FADE_S,
+  VOICE_CAP,
+  createDirector,
+} from "./director";
 import { createMixer, type Mixer } from "./mixer";
+import { DTMF } from "./modem";
 import { midiHz } from "./patch";
 import {
   FakeAudioContext,
@@ -169,7 +175,41 @@ describe("createDirector", () => {
     expect(tonesPlayed()).toBe(2);
   });
 
-  // Mutation caught: the jump's tones played over an answer's.
+  // Mutation caught: the modem on another bus than its own, the dial's
+  // stop cutting the handshake without its fade, or a stop that does
+  // nothing.
+  it("dials on the modem bus and fades the handshake out on its stop (M4 C26)", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    const stop = director.dial("555-0142");
+    const modem = levelsInto(ctx, bus(mixer, "modem"));
+    expect(modem).toHaveLength(1);
+    expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(0);
+    // The first key dialled: 5, its row and its column.
+    expect(pitches(ctx).slice(0, 2)).toEqual([...DTMF["5"]!]);
+    ctx.currentTime = 1.5;
+    stop();
+    expect(fadeOf(modem[0]!)).toEqual([0, 1.5 + DIAL_FADE_S]);
+    expect(DIAL_FADE_S).toBe(0.04);
+  });
+
+  // Mutation caught: the hang-up and the reconnect swapped, or either on
+  // another bus than the modem's.
+  it("hangs up on a carrier down and shakes hands again on an up (M4 C27)", () => {
+    const heard = (up: boolean) => {
+      const { ctx, mixer, director } = setup();
+      disposers.push(() => director.dispose());
+      director.carrier(up);
+      expect(levelsInto(ctx, bus(mixer, "modem")), String(up)).toHaveLength(1);
+      expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(0);
+      return pitches(ctx);
+    };
+    expect(heard(true)).toContain(2100);
+    const down = heard(false);
+    expect(down).not.toContain(2100);
+    expect(down).toContain(90);
+  });
+
   it("cuts an answer's tones short for the jump's", () => {
     const { ctx, mixer, director } = setup();
     disposers.push(() => director.dispose());

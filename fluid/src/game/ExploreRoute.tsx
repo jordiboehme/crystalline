@@ -102,6 +102,22 @@
  * streamed as another account never reaches the station. A live change
  * that follows a moved engram replaces the URL through the same
  * `navigate` as a landing.
+ *
+ * The station dials in when it starts (M4 C26): on a mount whose context
+ * is running (a launch from the C64 screen primed it; a bare reload's
+ * waits for the first click) and once per tab session (`CONNECTED_KEY` in
+ * `sessionStorage`), the connecting screen (`Connecting`) shows over the
+ * first room while it loads, the session is held busy and the director
+ * dials the domain's number (`dialNumber`). The mixer is made first in the
+ * effect and read before anything resumes the context. When the screen is
+ * done or skipped the sound fades out and the session gets its keys back.
+ * The screen's state is kept in a ref across StrictMode's remount, so the
+ * second mount (whose context the first one's cleanup suspended, and which
+ * finds the key already set) holds its own session busy and dials on its
+ * own director. The same one subscription hears the carrier (C27): a drop
+ * hangs up (`director.carrier`) and flashes `NO CARRIER`, the return after
+ * it plays a short handshake, and `carrierGate` lets a pair sound at most
+ * once per `CARRIER_QUIET_MS`.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -112,6 +128,12 @@ import { ME_QUERY_KEY } from "../auth/keys";
 import { subscribeToChanges } from "../events/ChangeStreamProvider";
 import { createDirector } from "./audio/director";
 import { createMixer, makeAudioContext } from "./audio/mixer";
+import {
+  CARRIER_START,
+  CONNECTED_KEY,
+  carrierGate,
+  dialNumber,
+} from "./audio/modem";
 import { changeKeys } from "./data/changes";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
@@ -124,6 +146,7 @@ import {
   sameStation,
 } from "./paths";
 import { createSession, type Session } from "./session";
+import { Connecting } from "./ui/Connecting";
 import { DeviceRefusal } from "./ui/DeviceRefusal";
 import { GAME_LEGEND } from "./ui/keys";
 import { LevelSelect } from "./ui/LevelSelect";
@@ -136,6 +159,41 @@ import type { LiftStop, StationAddress } from "./world/types";
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
   window.open(path, "_blank", "noopener");
+}
+
+/** What the connecting screen shows: the number dialled and the place. */
+interface DialIn {
+  number: string;
+  name: string;
+}
+
+/** The notice over a dropped change stream (M4 C27). */
+const NO_CARRIER = "NO CARRIER";
+
+/** Whether this tab already dialled in (M4 C26); unreadable storage: no. */
+function dialledIn(): boolean {
+  try {
+    return window.sessionStorage.getItem(CONNECTED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markDialledIn(): void {
+  try {
+    window.sessionStorage.setItem(CONNECTED_KEY, "1");
+  } catch {
+    // Unwritable storage: the next mount dials in again.
+  }
+}
+
+/** The dial-in for `address`: its domain's number and name. */
+function dialInFor(address: StationAddress): DialIn {
+  const domain = domainOf(address);
+  return {
+    number: dialNumber(domain),
+    name: domain === null ? "STATION" : domain.toUpperCase(),
+  };
 }
 
 /**
@@ -180,6 +238,12 @@ export default function ExploreRoute() {
     stops: LiftStop[];
     note: string | null;
   } | null>(null);
+  // The connecting screen while it shows (M4 C26), in state for the render
+  // and in a ref that StrictMode's remount keeps; and the stop of its
+  // sound.
+  const [dialIn, setDialIn] = useState<DialIn | null>(null);
+  const dialInRef = useRef<DialIn | null>(null);
+  const hangUpRef = useRef<(() => void) | null>(null);
   // The pause, with what the screen shows taken from the session as it
   // paused: the room's label and when the lock ended. Null while running.
   const [pause, setPause] = useState<{
@@ -202,9 +266,16 @@ export default function ExploreRoute() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
-    const director = createDirector(
-      createMixer({ borrow: takePrimedAudio, make: makeAudioContext }),
-    );
+    // The mixer first: whether the launch's context runs is read before
+    // anything below resumes it (M4 C26, F41).
+    const mixer = createMixer({
+      borrow: takePrimedAudio,
+      make: makeAudioContext,
+    });
+    const dialling =
+      dialInRef.current ??
+      (mixer.running && !dialledIn() ? dialInFor(addressRef.current) : null);
+    const director = createDirector(mixer);
     // Quiet while the pause shows or the tab is hidden, playing otherwise.
     let paused = false;
     const syncSound = () => {
@@ -244,8 +315,25 @@ export default function ExploreRoute() {
       consoleRoom: { domains: (signal) => loadDomainRows(client, signal) },
     });
     sessionRef.current = session;
-    // Nothing of the route's own holds the station busy yet.
-    session.setBusy(false);
+    if (dialling !== null) {
+      // The connecting screen holds the station until it is done.
+      dialInRef.current = dialling;
+      markDialledIn();
+      session.setBusy(true);
+      hangUpRef.current = director.dial(dialling.number);
+      setDialIn(dialling);
+    } else {
+      session.setBusy(false);
+    }
+    // The carrier's sounds and notice, at most once a minute (M4 C27).
+    let carrier = CARRIER_START;
+    const onCarrier = (up: boolean) => {
+      const gate = carrierGate(carrier, up, performance.now());
+      carrier = gate.state;
+      if (!gate.play) return;
+      director.carrier(up);
+      if (!up) session.flash(NO_CARRIER);
+    };
     // Frames lost while the stream restarted for this route (M4 C13):
     // everything is marked stale, so the first room is read fresh.
     void client.invalidateQueries({ refetchType: "none" });
@@ -267,6 +355,7 @@ export default function ExploreRoute() {
             void client.invalidateQueries({ queryKey: ME_QUERY_KEY });
           },
         },
+        onCarrier,
       },
     );
     const first = addressRef.current;
@@ -274,6 +363,7 @@ export default function ExploreRoute() {
     session.go(first);
     return () => {
       unsubscribe();
+      hangUpRef.current = null;
       sessionRef.current = null;
       requestedRef.current = null;
       session.dispose();
@@ -291,6 +381,15 @@ export default function ExploreRoute() {
     session.go(next);
   }, [pathname, search]);
 
+  // The connecting screen is done or skipped: the sound fades, the
+  // station gets its keys back, inside the key or click that skipped it.
+  const connected = useCallback(() => {
+    hangUpRef.current?.();
+    hangUpRef.current = null;
+    dialInRef.current = null;
+    sessionRef.current?.setBusy(false);
+    setDialIn(null);
+  }, []);
   const closeReader = useCallback(() => {
     sessionRef.current?.closeReader();
   }, []);
@@ -352,6 +451,13 @@ export default function ExploreRoute() {
           note={lift.note}
           onRide={ride}
           onClose={closeLift}
+        />
+      )}
+      {dialIn !== null && (
+        <Connecting
+          number={dialIn.number}
+          name={dialIn.name}
+          onDone={connected}
         />
       )}
       {pause !== null && (

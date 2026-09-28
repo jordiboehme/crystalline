@@ -41,10 +41,13 @@ afterEach(() => {
 /** The signature sounds (M4 C24), on their own bus. */
 const SIGNATURES = ["wheeze takeoff", "wheeze landing", "five tones"];
 
+/** The modem's sounds (M4 C26, C27), on theirs. */
+const MODEMS = ["modem handshake", "modem reconnect", "modem hang-up"];
+
 describe("SOUNDS", () => {
   // Mutation caught: a door, a direction or a room kind left off the board
-  // (never heard before the ear check), a signature sound on the effects
-  // bus.
+  // (never heard before the ear check), a signature or a modem sound on
+  // the effects bus.
   it("lists every door both ways, every effect and every drone", () => {
     const names = Object.keys(SOUNDS);
     for (const sound of ["sliding", "bulkhead", "blast", "exit", "box"]) {
@@ -64,6 +67,7 @@ describe("SOUNDS", () => {
       "ride depart",
       "ride arrive",
       ...SIGNATURES,
+      ...MODEMS,
     ]) {
       expect(names).toContain(name);
     }
@@ -74,7 +78,9 @@ describe("SOUNDS", () => {
           ? "ambience"
           : SIGNATURES.includes(name)
             ? "signature"
-            : "effects",
+            : MODEMS.includes(name)
+              ? "modem"
+              : "effects",
       );
     }
   });

@@ -573,8 +573,12 @@ test("the station launches from the C64 screen and returns to the same page", as
       : "no webgl2";
   });
   console.log(`renderer: ${renderer}`);
-  // The connecting screen skips on any key.
+  // The connecting screen shows, since the launch's click primed the
+  // sound, and skips on any key.
+  const connecting = page.getByRole("dialog", { name: "Connecting" });
+  await expect(connecting).toBeVisible();
   await page.keyboard.press("Shift");
+  await expect(connecting).toHaveCount(0);
   // Wait for the room to land before pausing: the HUD's status line leads
   // with the room's title once the room is entered (before that it holds
   // only the mouse hint).
