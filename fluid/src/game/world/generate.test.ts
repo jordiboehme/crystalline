@@ -688,7 +688,8 @@ describe("generated variants (2.7 Task 9)", () => {
   });
 
   it("writes one variant per decor kind in a room, and each terminal's own", () => {
-    // Mutation caught: decor variants per piece, or terminals all sharing one.
+    // Mutation caught: decor variants per piece, decor written with no
+    // variant at all, or terminals all sharing one.
     const room = generateRoom(CANNED_HUB);
     const byKind = new Map<string, Set<number>>();
     for (const d of room.decor)
@@ -697,7 +698,10 @@ describe("generated variants (2.7 Task 9)", () => {
         (byKind.get(d.kind) ?? new Set()).add(d.variant ?? -1),
       );
     expect(byKind.size).toBeGreaterThan(0);
-    for (const vs of byKind.values()) expect(vs.size).toBe(1);
+    for (const vs of byKind.values()) {
+      expect(vs.size).toBe(1);
+      expect(vs.has(-1)).toBe(false);
+    }
     for (const f of room.fixtures)
       if (f.kind === "terminal")
         expect(f.variant).toBe(terminalVariant(f.seed));

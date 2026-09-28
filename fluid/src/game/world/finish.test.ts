@@ -14,7 +14,6 @@ describe("a room's finish (2.7 C8, C11)", () => {
     const halls = new Set<number>();
     for (const s of seeds) {
       const f = finishFor(s, 4);
-      expect(f).toEqual(finishFor(s, 4));
       expect(f.accent).toBeGreaterThanOrEqual(0);
       expect(f.accent).toBeLessThan(ACCENT_COUNT);
       accents.add(f.accent);
@@ -30,6 +29,19 @@ describe("a room's finish (2.7 C8, C11)", () => {
     }
     expect(accents.size).toBe(ACCENT_COUNT);
     expect(halls.size).toBe(WALL_PATTERNS);
+    // Pinned, so a pick that reads anything but its seed moves them.
+    expect(finishFor(seedFor("finish", 0), 4)).toEqual({
+      accent: 1,
+      hallWalls: 2,
+      bayWalls: [0, 1, 1, 0],
+      corridorWalls: 1,
+    });
+    expect(finishFor(seedFor("finish", 1), 4)).toEqual({
+      accent: 0,
+      hallWalls: 1,
+      bayWalls: [2, 2, 2, 0],
+      corridorWalls: 0,
+    });
   });
 
   it("gives a hand-built room accent 0 and pattern 0 on every wall", () => {

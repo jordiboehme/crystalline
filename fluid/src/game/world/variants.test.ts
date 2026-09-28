@@ -10,6 +10,7 @@ import {
   tagAccent,
   terminalVariant,
 } from "./variants";
+import type { DecorKind } from "./types";
 
 describe("variant picks (2.7 C4, C5, C10)", () => {
   it("picks a machine's variant, model seed and accent from its tag alone", () => {
@@ -20,11 +21,12 @@ describe("variant picks (2.7 C4, C5, C10)", () => {
     for (const kind of MACHINE_KINDS)
       for (const tag of tags) {
         const v = machineVariant(tag, kind);
-        expect(v).toBe(machineVariant(tag, kind));
         expect(v).toBeGreaterThanOrEqual(0);
         expect(v).toBeLessThan(VARIANT_COUNTS.machine[kind]);
       }
-    expect(machineModelSeed("reactor")).toBe(machineModelSeed("reactor"));
+    // Pinned: the canned bridge's REACTOR is fabricator variant 2.
+    expect(machineVariant("reactor", "fabricator")).toBe(2);
+    expect(machineModelSeed("reactor")).toBe(6706559873233248);
     expect(machineModelSeed("reactor")).not.toBe(machineModelSeed("reactors"));
     const accents = new Set(tags.map(tagAccent));
     expect([...accents].sort()).toEqual([0, 1, 2, 3, 4]);
@@ -46,11 +48,26 @@ describe("variant picks (2.7 C4, C5, C10)", () => {
     }
   });
 
-  it("gives every piece of one decor kind in a room the same variant", () => {
-    // Mutation caught: a decor variant keyed by the piece's own seed.
-    expect(decorVariant(123, "council-chair")).toBe(
-      decorVariant(123, "council-chair"),
+  it("picks a decor kind's variant from the room seed and the kind, and a terminal's from its seed, over the whole count", () => {
+    // Mutation caught: a pick keyed by anything else (the pinned values
+    // move), or one that misses a variant or leaves the count. That every
+    // piece of a kind in one room shares its variant is `generate.test.ts`'s
+    // one-variant test on the hub, since `decorVariant` never sees a piece.
+    expect([1, 2, 3, 123].map((s) => decorVariant(s, "council-chair"))).toEqual(
+      [0, 1, 1, 1],
     );
-    expect(terminalVariant(7)).toBe(terminalVariant(7));
+    expect([1, 2, 3, 7, 8, 9].map(terminalVariant)).toEqual([2, 1, 2, 2, 1, 0]);
+    const seeds = Array.from({ length: 300 }, (_, i) => i + 1);
+    for (const kind of Object.keys(VARIANT_COUNTS.decor) as DecorKind[]) {
+      const seen = new Set(seeds.map((s) => decorVariant(s, kind)));
+      expect(seen, kind).toEqual(
+        new Set(
+          Array.from({ length: VARIANT_COUNTS.decor[kind] }, (_, v) => v),
+        ),
+      );
+    }
+    expect(new Set(seeds.map(terminalVariant))).toEqual(
+      new Set(Array.from({ length: VARIANT_COUNTS.terminal }, (_, v) => v)),
+    );
   });
 });
