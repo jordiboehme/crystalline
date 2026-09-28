@@ -1162,3 +1162,38 @@ both_backends!(
     virtual_manifest_markdown_reads_the_database,
     virtual_manifest_markdown
 );
+
+// --- path identifier ---------------------------------------------------------
+
+async fn virtual_path_identifier(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    engine
+        .write_engram(&WriteParams {
+            folder: Some("guides".to_string()),
+            ..write_params(
+                "Agent Workflow Guide",
+                "- [fact] stored in the database\n- [fact] no file on disk\n- [fact] path is a column",
+            )
+        })
+        .await
+        .unwrap();
+    // The stored path column is `guides/agent-workflow-guide.md`: the `.md` form
+    // is the path, and it resolves on a domain that has no files at all.
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "guides/agent-workflow-guide.md".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["permalink"], "guides/agent-workflow-guide");
+}
+
+both_backends!(
+    a_virtual_engram_resolves_by_its_stored_path,
+    virtual_path_identifier
+);

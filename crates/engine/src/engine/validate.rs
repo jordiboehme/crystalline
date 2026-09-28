@@ -21,13 +21,10 @@ impl Engine {
         let store = self.store.lock().await;
         let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;
         let targets = if let Some(id) = &p.identifier {
-            match store.find_engram(&p.domain, id).await? {
-                Some(d) => vec![d],
-                None => {
-                    return Err(EngineError::NotFound(format!(
-                        "no engram '{id}' in domain '{}'",
-                        p.domain
-                    )));
+            match lookup_in_domain(&*store, &p.domain, id).await? {
+                DomainLookup::Found(d) => vec![d],
+                DomainLookup::Missing { suggest } => {
+                    return Err(EngineError::NotFound(domain_miss(id, &p.domain, &suggest)));
                 }
             }
         } else {

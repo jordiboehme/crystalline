@@ -107,7 +107,7 @@ Read a domain's `MANIFEST.md` (via `read_engram` or `browse_domain`) only when:
 
 Structure questions ("what does domain X cover", "what is domain X for", "which domain owns Y and what else does it hold") are the second case: they ask for the MANIFEST's own content, so the MANIFEST read is your first tool call, made before drafting any answer text. The routing line is a compressed derivative of the MANIFEST, not the source - answering from it and treating the read as optional confirmation is exactly the failure this rule prevents, however complete the routing line looks.
 
-Address the MANIFEST by its permalink, usually `manifest` - `{"identifier": "manifest", "domain": "x"}` or the `crystalline://x/manifest` URL. The filename `MANIFEST.md` is not an identifier; when unsure, `browse_domain` lists the real permalink.
+Address the MANIFEST by its permalink, usually `manifest` - `{"identifier": "manifest", "domain": "x"}` or the `crystalline://x/manifest` URL. The file path `MANIFEST.md` resolves too when you pass `domain`; when unsure, `browse_domain` lists the real permalink.
 
 Otherwise, search first. Reading every MANIFEST up front burns context for no benefit once the routing block already exists.
 

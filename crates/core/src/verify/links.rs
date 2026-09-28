@@ -397,4 +397,23 @@ mod tests {
             vec!["ops"]
         );
     }
+
+    #[test]
+    fn found_elsewhere_lists_several_domains_in_the_scan_sets_sorted_order() {
+        // Registered in reverse order, so the result's order comes from the
+        // scan set and not from the lookup table.
+        let mut lookup = LookupTable::new();
+        lookup.insert("zeta", "shared", "Shared Title");
+        lookup.insert("mid", "other", "Shared Title");
+        lookup.insert("alpha", "shared", "Alpha");
+        let names: BTreeSet<&str> = ["own", "zeta", "mid", "alpha"].into_iter().collect();
+        assert_eq!(
+            found_elsewhere("Shared Title", "own", &names, &lookup),
+            vec!["mid", "zeta"]
+        );
+        assert_eq!(
+            found_elsewhere("shared", "own", &names, &lookup),
+            vec!["alpha", "zeta"]
+        );
+    }
 }

@@ -2758,6 +2758,78 @@ pub trait Store: Send + Sync {
     async fn rollback(&self) -> Result<()>;
 }
 
+/// What a domain-scoped identifier names: an engram, or nothing plus the
+/// permalinks its slugified form points at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DomainLookup {
+    /// The engram the identifier names.
+    Found(EngramDescriptor),
+    /// Nothing; `suggest` holds the permalinks the identifier's slug matches,
+    /// sorted and deduplicated, for the caller's not-found message.
+    Missing {
+        /// The permalinks to name in a hint. Empty when nothing matched.
+        suggest: Vec<String>,
+    },
+}
+
+/// The one domain-scoped lookup every identifier-taking surface shares: the
+/// permalink, then the title (both [`Store::find_engram`]), then the file
+/// path inside the domain as written or with `.md` added, compared exactly.
+/// A miss carries the permalinks the identifier's slug matches - a row's own
+/// permalink or the slug of its path - so the caller can name the one that
+/// was meant.
+///
+/// The path rows come from the escaped, case-folded prefix listing and are
+/// compared byte for byte here, so a path in the wrong case never resolves: it
+/// becomes a hint instead. The listing cannot use the path index (`lower(path)
+/// LIKE`), which is accepted because it runs only after the two indexed
+/// lookups missed. An identifier whose stem is empty (`.md`) skips the path
+/// step: the backends drop an empty prefix and would list the whole domain.
+/// A free function rather than a trait method, so neither backend changes.
+/// Callers skip it for a domain the reader may not see, which keeps a hidden
+/// domain's miss free of hints.
+pub async fn lookup_in_domain(
+    store: &dyn Store,
+    dom: &str,
+    identifier: &str,
+) -> Result<DomainLookup> {
+    if let Some(d) = store.find_engram(dom, identifier).await? {
+        return Ok(DomainLookup::Found(d));
+    }
+    let stem = identifier.strip_suffix(".md").unwrap_or(identifier);
+    if stem.trim().is_empty() {
+        return Ok(DomainLookup::Missing {
+            suggest: Vec::new(),
+        });
+    }
+    let rows = store.list_engrams(dom, Some(stem), None).await?;
+    let with_md = format!("{stem}.md");
+    if let Some(d) = rows
+        .iter()
+        .find(|r| r.path == identifier)
+        .or_else(|| rows.iter().find(|r| r.path == with_md))
+    {
+        return Ok(DomainLookup::Found(d.clone()));
+    }
+    let slug = crystalline_core::path_permalink(identifier);
+    let mut suggest: Vec<String> = Vec::new();
+    if !slug.is_empty() && slug != identifier {
+        if let Some(d) = store.find_engram(dom, &slug).await?
+            && d.permalink == slug
+        {
+            suggest.push(d.permalink);
+        }
+        suggest.extend(
+            rows.iter()
+                .filter(|r| crystalline_core::path_permalink(&r.path) == slug)
+                .map(|r| r.permalink.clone()),
+        );
+        suggest.sort();
+        suggest.dedup();
+    }
+    Ok(DomainLookup::Missing { suggest })
+}
+
 #[cfg(test)]
 mod salience_tests {
     use super::{DEFAULT_SALIENCE_WEIGHT, salience_prior};

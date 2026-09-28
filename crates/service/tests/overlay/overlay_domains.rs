@@ -2598,6 +2598,21 @@ async fn screened_fixture() -> Fixture {
     f
 }
 
+/// A draft at a path no base row holds resolves by that path without `.md`,
+/// the same way a base row does (#111).
+#[tokio::test]
+async fn a_draft_resolves_by_its_path_without_md() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    f.draft("team", "alice", "notes/Fresh Idea.md", ALICE_NEW)
+        .await;
+    let text = f
+        .reads("notes/Fresh Idea", &alice)
+        .await
+        .expect("alice reads her draft by its path");
+    assert!(text.contains("a page only alice has"), "{text}");
+}
+
 /// A draft is not a way around the domain screen. Alice's draft in a private
 /// domain reads for her and is the same nothing a stranger gets about every
 /// other engram in there - and, crucially, about the domain itself.
@@ -2647,6 +2662,18 @@ async fn a_draft_in_a_hidden_domain_is_invisible_to_a_reader_who_cannot_see_the_
             "and it is the miss an engram nobody wrote produces: {miss}"
         );
     }
+    // `PLAN.md` slugifies to the base permalink `plan`: a reader who may see
+    // the domain is told so, one who may not gets the plain miss, byte for byte.
+    let hinted = f
+        .reads("PLAN.md", &alice)
+        .await
+        .expect_err("PLAN.md is no path here");
+    assert!(hinted.contains("Did you mean `plan`?"), "{hinted}");
+    let plain = f
+        .reads("PLAN.md", &stranger)
+        .await
+        .expect_err("a stranger reads nothing");
+    assert_eq!(plain, "no engram 'PLAN.md' in domain 'team'");
 
     // The same question through the two graph verbs, anchored at the
     // stranger's OWN draft, because that is the anchor the screen has to

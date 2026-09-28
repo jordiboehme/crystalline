@@ -10027,3 +10027,56 @@ parity!(
     a_draft_never_reaches_a_base_count_or_the_base_graph,
     a_draft_reaches_no_base_answer_through_its_children
 );
+
+/// The shared domain-scoped lookup: path as written, path plus `.md`, the
+/// slug hint from a permalink or from a path, and no path step for an empty
+/// stem (#111).
+async fn lookup_in_domain_resolves_paths_and_hints(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "guides/Agent Workflow Guide.md",
+        &engram("Workflow", "agent-guide", "engram", "", "one\ntwo\nthree\n"),
+    );
+    write(root, "a.md", &engram("A", "a", "engram", "", "body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+    ] {
+        match crystalline_index::lookup_in_domain(store, "d", identifier)
+            .await
+            .unwrap()
+        {
+            crystalline_index::DomainLookup::Found(found) => {
+                assert_eq!(found.permalink, "agent-guide", "{identifier}")
+            }
+            other => panic!("{identifier}: {other:?}"),
+        }
+    }
+    // Only the case differs: no resolution, and the hint comes from the path's slug.
+    assert_eq!(
+        crystalline_index::lookup_in_domain(store, "d", "guides/agent workflow guide")
+            .await
+            .unwrap(),
+        crystalline_index::DomainLookup::Missing {
+            suggest: vec!["agent-guide".to_string()]
+        }
+    );
+    // `.md` alone has an empty stem: no path step, no hint.
+    assert_eq!(
+        crystalline_index::lookup_in_domain(store, "d", ".md")
+            .await
+            .unwrap(),
+        crystalline_index::DomainLookup::Missing {
+            suggest: Vec::new()
+        }
+    );
+}
+
+parity!(
+    lookup_in_domain_resolves_paths_and_hints_on_both_backends,
+    lookup_in_domain_resolves_paths_and_hints
+);

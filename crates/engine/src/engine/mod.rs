@@ -42,15 +42,15 @@ use crystalline_core::{
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
-    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
-    EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
-    InboundQuery, IndexError, PathChange, RULES, RebuildKind, RecentFilter, ReindexHooks,
-    SearchMode, SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram, SweepInput,
-    SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
-    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
-    reindex_domains, resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain,
-    scan_paths,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats,
+    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
+    EngramRecord, EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode,
+    GraphSlice, HostClaim, InboundQuery, IndexError, PathChange, RULES, RebuildKind, RecentFilter,
+    ReindexHooks, SearchMode, SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram,
+    SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram,
+    configured_model_id, detect, is_retired_status, lookup_in_domain, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, rank, reindex_domains, resolve_forward_refs,
+    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::changes::{LocalChange, LocalChanges};
 use crystalline_remote::ops::{self, DiscardTarget};
@@ -4044,15 +4044,17 @@ impl Engine {
     }
 
     /// Resolve an identifier to a descriptor and the content source to read
-    /// it through. The grammar is deliberately two-form: a bare permalink or
-    /// title is domain-relative (within the passed `domain`, or across all
-    /// domains when none is passed) and a `crystalline://` URL is the one
-    /// absolute, cross-domain form - mirroring the `[[target]]` /
-    /// `[[domain:target]]` wikilink pair. A scheme-less `domain/permalink`
-    /// composite is not part of the grammar, since domain names are per-user
-    /// configuration and must never ride inside an identifier. Resolution
-    /// goes through the store, so a virtual domain (or any database-only
-    /// domain) resolves without a filesystem root.
+    /// it through. The grammar is deliberately two-form: a bare permalink,
+    /// title or, with a domain named, the file path inside it is
+    /// domain-relative (within the passed `domain`, or across all domains
+    /// when none is passed, where a path does not resolve) and a
+    /// `crystalline://` URL is the one absolute, cross-domain form -
+    /// mirroring the `[[target]]` / `[[domain:target]]` wikilink pair. A
+    /// scheme-less `domain/permalink` composite is not part of the grammar,
+    /// since domain names are per-user configuration and must never ride
+    /// inside an identifier. Resolution goes through the store, so a virtual
+    /// domain (or any database-only domain) resolves without a filesystem
+    /// root.
     async fn resolve(
         &self,
         identifier: &str,
@@ -4197,10 +4199,13 @@ impl Engine {
     /// A hidden domain resolves as an empty one rather than as a refusal: the
     /// lookup is skipped and the miss falls through to the very same
     /// [`EngineError::NotFound`] an engram that was never written produces,
-    /// byte for byte, because it is produced by the same line. That equality is
-    /// the property this whole path exists for - a caller must not be able to
-    /// tell "you may not see this" from "there is nothing here" - and it holds
-    /// by construction rather than by two messages being kept in step.
+    /// byte for byte, because it is produced by the same function,
+    /// [`domain_miss`], with no suggestions: [`lookup_in_domain`] never runs
+    /// for a hidden domain, so no hint can name what is in there. That
+    /// equality is the property this whole path exists for - a caller must
+    /// not be able to tell "you may not see this" from "there is nothing
+    /// here" - and it holds by construction rather than by two messages being
+    /// kept in step.
     ///
     /// The bare cross-domain form filters its matches before it counts them, so
     /// a hidden domain neither makes an identifier ambiguous nor gets its name
@@ -4230,28 +4235,21 @@ impl Engine {
 
         if let Some(dom) = domain {
             let found = if hidden.contains(dom) {
-                None
+                DomainLookup::Missing {
+                    suggest: Vec::new(),
+                }
             } else {
                 let store = self.store.lock().await;
-                store.find_engram(dom, identifier).await?
+                lookup_in_domain(&*store, dom, identifier).await?
             };
-            let d = found.ok_or_else(|| {
-                // The one wrong shape agents keep producing is the domain
-                // glued onto the permalink; the error teaches the fix so a
-                // stumble recovers in one step.
-                match identifier
-                    .strip_prefix(dom)
-                    .and_then(|r| r.strip_prefix('/'))
-                    .filter(|r| !r.is_empty())
-                {
-                    Some(rest) => EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{dom}'. An identifier without crystalline:// is domain-relative - retry with '{rest}'"
-                    )),
-                    None => EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{dom}'"
-                    )),
+            let d = match found {
+                DomainLookup::Found(d) => d,
+                DomainLookup::Missing { suggest } => {
+                    return Err(EngineError::NotFound(domain_miss(
+                        identifier, dom, &suggest,
+                    )));
                 }
-            })?;
+            };
             let source = self.read_source(dom);
             return Ok((d, source));
         }
@@ -4425,6 +4423,79 @@ impl Engine {
                     desc.permalink, desc.domain
                 ))
             })
+    }
+}
+
+/// The not-found text for a domain-scoped identifier. The prefix is the one a
+/// never-written engram has always produced and stays byte for byte; the
+/// glued-domain hint wins, then the slug hint.
+pub(crate) fn domain_miss(identifier: &str, dom: &str, suggest: &[String]) -> String {
+    // The one wrong shape agents keep producing is the domain glued onto the
+    // permalink; the error teaches the fix so a stumble recovers in one step.
+    if let Some(rest) = identifier
+        .strip_prefix(dom)
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|r| !r.is_empty())
+    {
+        return format!(
+            "no engram '{identifier}' in domain '{dom}'. An identifier without crystalline:// is domain-relative - retry with '{rest}'"
+        );
+    }
+    if suggest.is_empty() {
+        return format!("no engram '{identifier}' in domain '{dom}'");
+    }
+    let named: Vec<String> = suggest.iter().map(|p| format!("`{p}`")).collect();
+    format!(
+        "no engram '{identifier}' in domain '{dom}'. Did you mean {}?",
+        join_or(&named)
+    )
+}
+
+/// `a`, `a or b`, `a, b or c`: the list shape L001 uses, no Oxford comma.
+fn join_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [head @ .., tail] => format!("{} or {tail}", head.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod domain_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn a_domain_miss_keeps_its_prefix_and_lets_the_glued_hint_win() {
+        assert_eq!(
+            domain_miss("nope", "eng", &[]),
+            "no engram 'nope' in domain 'eng'"
+        );
+        assert_eq!(
+            domain_miss(
+                "guides/Agent Workflow Guide",
+                "eng",
+                &["guides/agent-workflow-guide".to_string()]
+            ),
+            "no engram 'guides/Agent Workflow Guide' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
+        );
+        assert_eq!(
+            domain_miss("A B", "eng", &["a-b".to_string(), "x/a-b".to_string()]),
+            "no engram 'A B' in domain 'eng'. Did you mean `a-b` or `x/a-b`?"
+        );
+        // Three or more read like L001's list: commas, then "or", no Oxford comma.
+        assert_eq!(
+            domain_miss(
+                "A B",
+                "eng",
+                &["a".to_string(), "b".to_string(), "c".to_string()]
+            ),
+            "no engram 'A B' in domain 'eng'. Did you mean `a`, `b` or `c`?"
+        );
+        // The glued-domain hint wins over any suggestion.
+        assert_eq!(
+            domain_miss("eng/Guide", "eng", &["eng/guide".to_string()]),
+            "no engram 'eng/Guide' in domain 'eng'. An identifier without crystalline:// is domain-relative - retry with 'Guide'"
+        );
     }
 }
 

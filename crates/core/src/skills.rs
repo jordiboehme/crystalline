@@ -168,4 +168,27 @@ mod tests {
             "consolidated skill lacks the relation form"
         );
     }
+
+    #[test]
+    fn the_skills_teach_the_file_path_identifier() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        assert!(
+            capture.contains("with or without `.md`"),
+            "capture skill lacks the path identifier"
+        );
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        assert!(
+            desktop.contains("with or without `.md`"),
+            "consolidated skill lacks the path identifier"
+        );
+        let routing = skill("crystalline-routing").unwrap().content;
+        assert!(
+            routing.contains("The file path `MANIFEST.md` resolves"),
+            "routing skill still calls MANIFEST.md no identifier"
+        );
+        assert!(
+            !routing.contains("is not an identifier"),
+            "the old MANIFEST.md sentence is gone"
+        );
+    }
 }

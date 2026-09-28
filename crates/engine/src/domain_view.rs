@@ -818,9 +818,10 @@ impl<'a> DomainView<'a> {
 
     /// One actor's own draft at an identifier, when no base row answers to it.
     ///
-    /// Matched by permalink, by title and by path, which is the same ladder
-    /// the base lookup offers, over the entries this actor holds. Tombstones
-    /// are skipped: a deletion is not an engram to find.
+    /// Matched by permalink, by title and by path with or without `.md`,
+    /// which is the same ladder the base lookup offers, over the entries this
+    /// actor holds. Tombstones are skipped: a deletion is not an engram to
+    /// find.
     pub(crate) async fn resolve_draft(
         &self,
         identifier: &str,
@@ -856,7 +857,8 @@ impl<'a> DomainView<'a> {
                 record.title.as_str(),
                 entry.path.as_str(),
             ];
-            if !names.iter().any(|name| *name == wanted) {
+            let path_stem = entry.path.strip_suffix(".md");
+            if !names.iter().any(|name| *name == wanted) && path_stem != Some(wanted.as_str()) {
                 continue;
             }
             return Ok(Some((

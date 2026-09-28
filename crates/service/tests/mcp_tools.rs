@@ -1852,6 +1852,145 @@ async fn a_domain_prefixed_identifier_never_resolves_and_the_error_teaches_the_f
     assert_eq!(read["title"], json!("Guide"));
 }
 
+/// A reference copied from the file tree - the folder plus the file name,
+/// with or without `.md` - resolves like the permalink does (#111).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_identifier_that_is_the_file_path_resolves_with_or_without_md() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    std::fs::write(
+        h.root.join("eng/guides/Agent Workflow Guide.md"),
+        "---\ntype: guide\ntitle: Agent Workflow Guide\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Agent Workflow Guide\n\n- [convention] agents read before they write #eng\n- [fact] the guide lives under guides #eng\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+    ] {
+        let read = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{identifier}: {e}"));
+        assert_eq!(read["title"], json!("Agent Workflow Guide"), "{identifier}");
+        assert_eq!(
+            read["permalink"],
+            json!("guides/agent-workflow-guide"),
+            "{identifier}"
+        );
+    }
+
+    // A write verb resolves through the same lookup.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "guides/Agent Workflow Guide", "domain": "eng",
+            "operation": "append", "content": "- [fact] edited by path #eng",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // So does validate_engrams' identifier.
+    call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "eng", "identifier": "guides/Agent Workflow Guide" }),
+    )
+    .await
+    .unwrap();
+}
+
+/// A path that differs from the file only in case - what a case-insensitive
+/// disk lets a person type - does not resolve silently: it misses and names
+/// the permalink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_in_the_wrong_case_misses_and_names_the_permalink() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    std::fs::write(
+        h.root.join("eng/guides/Agent Workflow Guide.md"),
+        "---\ntype: guide\ntitle: Workflow\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] only the case of the path differs #eng\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "guides/agent workflow guide", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains(
+            "no engram 'guides/agent workflow guide' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
+        ),
+        "{err}"
+    );
+
+    // A plain miss that slugifies to itself carries no hint.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "nope", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(!err.contains("Did you mean"), "{err}");
+}
+
+/// A custom permalink is found through its file path's slug, and the hint
+/// names the permalink the engram really answers to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hint_names_a_custom_permalink_found_through_the_path() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    std::fs::write(
+        h.root.join("eng/guides/Agent Workflow Guide.md"),
+        "---\ntype: guide\ntitle: Workflow\npermalink: agent-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] this one carries a custom permalink #eng\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let err = call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "guides/agent workflow guide", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("Did you mean `agent-guide`?"), "{err}");
+}
+
+/// The read_engram copy teaches the file-path identifier, so an agent that
+/// copies a reference from the file tree finds out it works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_path_identifiers() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let read = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "read_engram")
+        .expect("read_engram tool present");
+    let description = read.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("file path inside the domain"),
+        "read_engram teaches the file-path identifier: {description}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_filter_only_and_text_fallback() {
     let h = Harness::new(&["eng"]).await;
