@@ -22,10 +22,11 @@
  * and I inverts the vertical look.
  *
  * `options.props` false shows the place undressed: `session.showRoom` with
- * `generateRoom`'s props, heroes and curios stripped, rather than
- * `session.showCanned`, which is the dev-only comparison `?props=0` reads. That
- * path has no client-side `PlaceInput` kept by the session, so its terminals
- * open no reader; R still swaps the condition, rebuilding the same way.
+ * `generateRoom`'s props, heroes and curios stripped and its decals laid
+ * again (`undressedRoom`), rather than `session.showCanned`, which is the
+ * dev-only comparison `?props=0` reads. That path has no client-side
+ * `PlaceInput` kept by the session, so its terminals open no reader; R
+ * still swaps the condition, rebuilding the same way.
  *
  * `options.hero` forces a hero into the shown room, through the hero pass's
  * own forced-draws path and the shared forced-hero seam, `withHeroes` in
@@ -83,6 +84,7 @@ import {
   type CurioSlot,
   type SlotDraw,
 } from "../world/curios";
+import { placeDecals } from "../world/decals";
 import { NO_RARE, dressRoom, type RareDraws } from "../world/dress";
 import { generateRoom, nearFor, withHeroes } from "../world/generate";
 import {
@@ -252,11 +254,21 @@ function forcedCurioDraws(kind: CurioKind): CurioDraws {
 }
 
 /**
+ * `?props=0`'s room (`options.props` false): `generateRoom`'s room with its
+ * props, heroes and curios stripped and its decals laid again on what is
+ * left, so no face decal or streak stays behind for a prop that is gone.
+ */
+export function undressedRoom(place: PlaceInput): RoomSpec {
+  const bare = { ...generateRoom(place), props: [], heroes: [], curios: [] };
+  return { ...bare, decals: placeDecals(bare) };
+}
+
+/**
  * The room `place` becomes with curio `kind` forced into it: `generateRoom`'s
  * room, its curios replaced by `placeCurios` run again on the same room with
  * `forcedCurioDraws(kind)` in place of the room's own draws. Curios never
- * move anything else, so nothing here needs re-dressing the way
- * `roomWithForcedHero` does. `placed` is `kind` when it landed (it found a
+ * move anything else, and the decals never read them, so nothing here
+ * needs re-dressing or new decals the way `roomWithForcedHero` does. `placed` is `kind` when it landed (it found a
  * host among the room's own surfaces), else null: the caller reads it to
  * decide whether to say so on the HUD.
  */
@@ -288,9 +300,10 @@ export function forcedRareDraws(kind: RarePropKind): RareDraws {
 
 /**
  * The room `place` becomes with rare prop `kind` forced into it:
- * `generateRoom`'s room, its props dressed again with `forcedRareDraws`, and
+ * `generateRoom`'s room, its props dressed again with `forcedRareDraws`,
  * its curios placed again on the new props with the room's own draws and
- * neighbours, as `roomWithForcedHero` does.
+ * neighbours, and its decals laid again round the new props, as
+ * `roomWithForcedHero` does.
  * The heroes stay as drawn, and the dressing keeps clear of them as
  * `generateRoom`'s does. `placed` is `kind` when it landed, else null.
  */
@@ -304,13 +317,11 @@ export function roomWithForcedProp(
     props: dressRoom(built, NO_RESERVE, forcedRareDraws(kind)),
   };
   const placed = withProps.props.some((p) => p.kind === kind) ? kind : null;
-  return {
-    room: {
-      ...withProps,
-      curios: placeCurios(withProps, curioDraws(withProps), nearFor(place)),
-    },
-    placed,
+  const dressed: RoomSpec = {
+    ...withProps,
+    curios: placeCurios(withProps, curioDraws(withProps), nearFor(place)),
   };
+  return { room: { ...dressed, decals: placeDecals(dressed) }, placed };
 }
 
 /**
@@ -417,13 +428,7 @@ export function startDemo(
       placedProp = forced.placed;
       showBuilt(forced.room);
     } else if (withProps) session.showCanned(p);
-    else
-      session.showRoom({
-        ...generateRoom(p),
-        props: [],
-        heroes: [],
-        curios: [],
-      });
+    else session.showRoom(undressedRoom(p));
   };
   show(place);
 

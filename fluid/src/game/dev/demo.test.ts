@@ -14,6 +14,7 @@ import {
   rawCurios,
 } from "../world/curios";
 import { heroBlocker, propFootprint } from "../world/footprints";
+import { placeDecals } from "../world/decals";
 import { generateRoom, nearFor, roomSeed } from "../world/generate";
 import { RARE_PROP_KINDS } from "../world/props";
 import { overlaps } from "../world/sites";
@@ -22,6 +23,7 @@ import {
   roomWithForcedCurio,
   roomWithForcedHero,
   roomWithForcedProp,
+  undressedRoom,
 } from "./demo";
 
 describe("roomWithForcedHero", () => {
@@ -232,5 +234,32 @@ describe("the neighbours in the seams (2.6f C9)", () => {
     expect(withProp.room.curios.map((c) => c.kind)).not.toContain(
       "treasure-radar",
     );
+  });
+});
+
+describe("the dev rooms' decals", () => {
+  it("lays the decals again on every forced and undressed room, so none floats where a prop was", () => {
+    // Mutation caught: a forced prop room or the `?props=0` room keeping
+    // `generateRoom`'s decals (face decals where crates were, streaks
+    // under vents that are gone).
+    // Derelict, so there is grime to go stale: in these two the re-dressed
+    // props change the decals.
+    const derelict = (p: PlaceInput): PlaceInput => ({
+      ...p,
+      status: "archived",
+    });
+    const rooms = [
+      roomWithForcedProp(derelict(CANNED_BRIDGE), "saucer-poster").room,
+      roomWithForcedProp(derelict(CANNED_WORKSHOP), "gravity-console").room,
+      roomWithForcedHero(CANNED_WORKSHOP, "turret").room,
+      roomWithForcedCurio(CANNED_WORKSHOP, "treasure-radar").room,
+      undressedRoom(CANNED_WORKSHOP),
+      undressedRoom(derelict(CANNED_BRIDGE)),
+    ];
+    for (const room of rooms) {
+      const { decals, ...rest } = room;
+      expect(decals).toEqual(placeDecals(rest));
+    }
+    expect(undressedRoom(CANNED_WORKSHOP).props).toEqual([]);
   });
 });
