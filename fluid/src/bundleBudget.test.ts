@@ -9,7 +9,7 @@
  * `tsconfig.app.json` (see that file's exclude comment).
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   GAME_BUDGET_BYTES,
@@ -18,6 +18,7 @@ import {
   mainFile,
   measure,
   reportLines,
+  runBudgetCheck,
   type Manifest,
 } from "../scripts/bundleBudget.ts";
 
@@ -134,5 +135,119 @@ describe("the /π route's size (M4 C30)", () => {
     ];
     expect(all.length).toBeGreaterThan(0);
     expect(all.join("\n")).not.toMatch(/game/i);
+  });
+
+  it("the guideline is crossed only strictly above it, never at it (fix round 1)", () => {
+    // Mutation caught: `>=` for `>` on overGuideline, unlike the budget's own
+    // boundary this had no test until now.
+    const at = measure(manifest, (f) =>
+      f.includes("index") ? MAIN_GUIDELINE_BYTES : GAME_BUDGET_BYTES / 5,
+    );
+    expect(at.overGuideline).toBe(false);
+    const over = measure(manifest, (f) =>
+      f.includes("index") ? MAIN_GUIDELINE_BYTES + 1 : GAME_BUDGET_BYTES / 5,
+    );
+    expect(over.overGuideline).toBe(true);
+  });
+
+  it("comma-groups the literal budget number in the over-budget message (fix round 1)", () => {
+    // Mutation caught: interpolating GAME_BUDGET_BYTES ungrouped, producing
+    // "1474560" instead of "1,474,560" (Global Constraints quotes it grouped).
+    const over = measure(manifest, (f) =>
+      f.includes("index") ? 1 : GAME_BUDGET_BYTES / 5 + 1,
+    );
+    expect(reportLines(over).annotations).toContain(
+      `::error::the /π route's lazy chunks are ${over.gameBytes} B gzipped, over the 1,474,560 B budget`,
+    );
+  });
+
+  it("dedupes a file shared by two chunks in its own walk, by output file rather than manifest key (fix round 1)", () => {
+    // Mutation caught: deduping only on the manifest key (the `visited`
+    // guard), which pushes a css file shared by two different keys twice.
+    const dedupeManifest: Manifest = {
+      "index.html": { file: "assets/index-a.js", isEntry: true },
+      "src/game/GameRoute.tsx": {
+        file: "assets/GameRoute-e.js",
+        isDynamicEntry: true,
+        imports: ["index.html", "_a.js", "_b.js"],
+      },
+      "_a.js": { file: "assets/a.js", css: ["assets/shared.css"] },
+      "_b.js": { file: "assets/b.js", css: ["assets/shared.css"] },
+    };
+    expect(gameFiles(dedupeManifest).sort()).toEqual([
+      "assets/GameRoute-e.js",
+      "assets/a.js",
+      "assets/b.js",
+      "assets/shared.css",
+    ]);
+  });
+});
+
+describe("the CLI's cleanup guarantee (M4 Task 11 fix round 1)", () => {
+  it("removes dist/.vite even when the manifest is malformed, measure throws, or the summary write fails", () => {
+    // Mutation caught: dropping the `finally` (or narrowing the `try` to
+    // exclude the summary write), which skips `cleanup` on any of these throws.
+    const malformedManifest = vi.fn();
+    expect(() =>
+      runBudgetCheck({
+        readManifest: () => "{ not json",
+        gzipSize: () => 0,
+        writeSummary: () => {},
+        cleanup: malformedManifest,
+      }),
+    ).toThrow();
+    expect(malformedManifest).toHaveBeenCalledTimes(1);
+
+    const measureThrows = vi.fn();
+    expect(() =>
+      runBudgetCheck({
+        readManifest: () =>
+          JSON.stringify({
+            "index.html": { file: "assets/index-a.js", isEntry: true },
+          }),
+        gzipSize: () => {
+          throw new Error("ENOENT: no such asset file");
+        },
+        writeSummary: () => {},
+        cleanup: measureThrows,
+      }),
+    ).toThrow();
+    expect(measureThrows).toHaveBeenCalledTimes(1);
+
+    const summaryThrows = vi.fn();
+    expect(() =>
+      runBudgetCheck({
+        readManifest: () =>
+          JSON.stringify({
+            "index.html": { file: "assets/index-a.js", isEntry: true },
+          }),
+        gzipSize: () => 1,
+        writeSummary: () => {
+          throw new Error("EISDIR: illegal operation on a directory");
+        },
+        cleanup: summaryThrows,
+      }),
+    ).toThrow();
+    expect(summaryThrows).toHaveBeenCalledTimes(1);
+  });
+
+  it("still cleans up, and reports correctly, on the ordinary path", () => {
+    const cleanup = vi.fn();
+    const writeSummary = vi.fn();
+    const result = runBudgetCheck({
+      readManifest: () =>
+        JSON.stringify({
+          "index.html": { file: "assets/index-a.js", isEntry: true },
+        }),
+      gzipSize: () => 1,
+      writeSummary,
+      cleanup,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(writeSummary).toHaveBeenCalledTimes(1);
+    expect(result.failed).toBe(false);
+    expect(result.annotations.some((l) => l.startsWith("::notice::"))).toBe(
+      true,
+    );
   });
 });

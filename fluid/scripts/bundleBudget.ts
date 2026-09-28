@@ -98,7 +98,19 @@ export function gameFiles(manifest: Manifest): string[] {
   }
   const main = mainKeys(manifest);
   const visited = new Set<string>();
+  // Deduped by output file, not by manifest key (M4 Task 11 fix round 1): two
+  // different keys inside the game's own walk can list the same physical
+  // file (most plausibly a `css[]` entry a coarser code split shares between
+  // chunks), and counting it twice would overstate the route's bytes.
+  const seenFiles = new Set<string>();
   const files: string[] = [];
+  const addFile = (file: string): void => {
+    if (seenFiles.has(file)) {
+      return;
+    }
+    seenFiles.add(file);
+    files.push(file);
+  };
   const stack: string[] = [GAME_ENTRY];
   while (stack.length > 0) {
     const key = stack.pop();
@@ -110,9 +122,9 @@ export function gameFiles(manifest: Manifest): string[] {
       continue;
     }
     visited.add(key);
-    files.push(chunk.file);
+    addFile(chunk.file);
     for (const css of chunk.css ?? []) {
-      files.push(css);
+      addFile(css);
     }
     for (const imported of chunk.imports ?? []) {
       stack.push(imported);
@@ -131,6 +143,19 @@ export function mainFile(manifest: Manifest): string {
     throw new Error(`the manifest has no "${MAIN_ENTRY}" entry`);
   }
   return chunk.file;
+}
+
+/**
+ * Groups a non-negative integer's digits by thousands with commas
+ * (`1474560` -> `"1,474,560"`), the way the Global Constraints quote the
+ * budget literally in the over-budget message (M4 Task 11 fix round 1). A
+ * plain regex rather than `toLocaleString` so the output never depends on
+ * the running process's locale.
+ */
+function grouped(n: number): string {
+  return Math.trunc(n)
+    .toString()
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 /** The measured sizes of a build, and whether they cross the budget or the guideline. */
@@ -202,7 +227,7 @@ export function reportLines(
     );
     if (report.overBudget) {
       annotations.push(
-        `::error::the /π route's lazy chunks are ${report.gameBytes} B gzipped, over the ${GAME_BUDGET_BYTES} B budget`,
+        `::error::the /π route's lazy chunks are ${report.gameBytes} B gzipped, over the ${grouped(GAME_BUDGET_BYTES)} B budget`,
       );
       failed = true;
     }
@@ -217,4 +242,54 @@ export function reportLines(
   }
 
   return { annotations, summary, failed };
+}
+
+/** What `runBudgetCheck` reports back to its caller: the same shape `reportLines` returns, plus the per-file byte list the CLI's console output lists. */
+export interface BudgetCheckResult {
+  annotations: string[];
+  summary: string[];
+  files: { file: string; bytes: number }[];
+  failed: boolean;
+}
+
+/**
+ * Runs the full report against injected effects: parses the manifest text
+ * `readManifest` returns, measures it with `gzipSize`, turns the result into
+ * report lines with `reportLines`, and hands the summary to `writeSummary`.
+ *
+ * `cleanup` always runs, in a `finally`, whichever of `readManifest`,
+ * `JSON.parse`, `measure` or `writeSummary` throws or not (M4 Task 11 fix
+ * round 1): the caller (`bundle-budget.ts`) creates `dist/.vite` for this one
+ * report alone, and it must not survive a bad manifest, a manifest entry
+ * whose file is missing from `dist/assets`, or an unwritable
+ * `$GITHUB_STEP_SUMMARY` path any less than it survives a clean run. A throw
+ * still propagates once `cleanup` has run; this function cannot recover from
+ * a caller's bad input, only make sure the directory it made along the way
+ * is gone before the error reaches the caller.
+ *
+ * Kept here, free of `fs`/`zlib` like the rest of this module, so the
+ * cleanup guarantee is exercised by injecting plain functions in
+ * `src/bundleBudget.test.ts` rather than by touching a real filesystem.
+ */
+export function runBudgetCheck(deps: {
+  readManifest: () => string;
+  gzipSize: (file: string) => number;
+  writeSummary: (lines: string[]) => void;
+  cleanup: () => void;
+  routeRequired?: boolean;
+}): BudgetCheckResult {
+  try {
+    const manifest = JSON.parse(deps.readManifest()) as Manifest;
+    const report = measure(manifest, deps.gzipSize);
+    const lines = reportLines(report, deps.routeRequired ?? ROUTE_REQUIRED);
+    deps.writeSummary(lines.summary);
+    return {
+      annotations: lines.annotations,
+      summary: lines.summary,
+      files: report.files,
+      failed: lines.failed,
+    };
+  } finally {
+    deps.cleanup();
+  }
 }
