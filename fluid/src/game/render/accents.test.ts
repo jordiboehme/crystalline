@@ -5,7 +5,8 @@
  * and nowhere else in the set dressing. A hero, a curio, a fitting, a way
  * (a door, a portal, a hatch), a poster, the placard and a tag strip keep
  * their own colours or their meaning in every look, so none of them may
- * carry the mark.
+ * carry the mark. A machine carries its tag's second accent, baked in
+ * (2.7 C10), never the room's; a terminal carries the room's by design.
  */
 
 import { describe, expect, it } from "vitest";
@@ -13,10 +14,11 @@ import { describe, expect, it } from "vitest";
 import { CANNED_HUB } from "../world/canned";
 import { CURIO_CATALOGUE, CURIO_KINDS } from "../world/curios";
 import { INTERIOR_CATALOGUE } from "../world/consoleRoom";
-import { generateRoom } from "../world/generate";
+import { MACHINE_KINDS, generateRoom } from "../world/generate";
 import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
 import type { InteriorKind, RoomSpec } from "../world/types";
+import { VARIANT_COUNTS } from "../world/variants";
 import {
   ACCENT_MARK,
   FLOATS_PER_VERTEX,
@@ -120,4 +122,28 @@ describe("the room's accent (2.7 C9)", () => {
       );
     }
   }, 30_000);
+
+  it("never puts the room's accent on a machine or its tag strip, in any variant (2.7 C9, C10)", () => {
+    // Mutation caught: a machine recipe's trim drawn with `s.accent()` (the
+    // room's accent instead of the tag's baked second accent), or a tag
+    // strip that gains the mark.
+    const room = generateRoom(CANNED_HUB);
+    const i = room.fixtures.findIndex((f) => f.kind === "machine");
+    const fx = room.fixtures[i];
+    if (fx?.kind !== "machine") throw new Error("the hub holds no machine");
+    expect(MACHINE_KINDS.length).toBe(12);
+    for (const machine of MACHINE_KINDS)
+      for (let v = 0; v < VARIANT_COUNTS.machine[machine]; v++) {
+        const b = createBuilder();
+        buildFixture(
+          (f) => createKit(b, f),
+          { ...fx, machine, variant: v },
+          i,
+          contextFor(room),
+        );
+        expect(marked(b.build()), `${machine} variant ${String(v)}`).toBe(
+          false,
+        );
+      }
+  });
 });

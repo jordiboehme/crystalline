@@ -507,6 +507,51 @@ describe("decal placement (2.7 Task 10)", () => {
       expect(d.on).toBe("floor");
     }
     expect(decals.every((d) => full.some((f) => key(f) === key(d)))).toBe(true);
+    // Deeper cuts keep the order past the stains: at 60 the stains are
+    // gone and the faces are cut, at 30 only the never-dropped kinds stay.
+    // Mutation caught: faces, smears and streaks dropped in another order.
+    const group = (d: Decal) =>
+      d.on === "face"
+        ? "faces"
+        : d.kind === "grime"
+          ? d.on === "floor"
+            ? "stains"
+            : "smears"
+          : d.kind === "streak" || d.kind === "rust"
+            ? "streaks"
+            : "fixed";
+    const count = (list: Decal[]) => {
+      const n = { fixed: 0, streaks: 0, smears: 0, faces: 0, stains: 0 };
+      for (const d of list) n[group(d)]++;
+      return n;
+    };
+    const all = count(full);
+    const expected = (cap: number) => {
+      const n = { ...all };
+      let over = full.length - cap;
+      for (const k of ["stains", "faces", "smears", "streaks"] as const) {
+        const cut = Math.max(0, Math.min(over, n[k]));
+        n[k] -= cut;
+        over -= cut;
+      }
+      return n;
+    };
+    for (const cap of [60, 30])
+      expect(count(placeDecals(rest, cap)), `cap ${String(cap)}`).toEqual(
+        expected(cap),
+      );
+    const at60 = count(placeDecals(rest, 60));
+    expect(at60.stains).toBe(0);
+    expect(at60.faces).toBe(10);
+    expect(at60.smears).toBe(all.smears);
+    expect(at60.streaks).toBe(all.streaks);
+    expect(count(placeDecals(rest, 30))).toEqual({
+      fixed: 33,
+      streaks: 0,
+      smears: 0,
+      faces: 0,
+      stains: 0,
+    });
   });
 
   it("keeps the rate table C15's, rank by rank (2.7 C15)", () => {

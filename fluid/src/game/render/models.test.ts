@@ -418,29 +418,47 @@ function sunkDecals(b: Built, wall: Frame | null): string[] {
 
 describe("fixture models", () => {
   it("builds a tag's machine from the tag, never the room (Review Focus 2)", () => {
-    // 2.7 C5. Mutation caught: `createRng(fx.seed)` left in any recipe
-    // (tool lengths, bottle heights and LED picks would differ).
+    // 2.7 C5. Mutation caught: `createRng(fx.seed)` left in any recipe of
+    // any variant (tool lengths, bottle heights and LED picks would
+    // differ), or a recipe that reads the room's hall or ceiling.
     const slot = slotOn("n");
     const f = frameForSlot(slot);
     expect(MACHINE_KINDS.length).toBe(12);
-    for (const machine of MACHINE_KINDS) {
-      const at = (seed: number) =>
-        positions(
-          buildOne({
-            kind: "machine",
-            slot,
-            machine,
-            tag: "reactor",
-            hue: 140,
-            seed,
-          }).static,
-        ).map((p) =>
-          toLocal(f, p)
-            .map((c) => c.toFixed(5))
-            .join(","),
-        );
-      expect(at(5)).toEqual(at(987654321));
-    }
+    const other: Rect = { x0: 0, y0: 1, x1: 12, y1: 20 };
+    for (const machine of MACHINE_KINDS)
+      for (
+        let variant = 0;
+        variant < VARIANT_COUNTS.machine[machine];
+        variant++
+      ) {
+        const at = (seed: number, hall: Rect, ceiling: number) => {
+          const builder = createBuilder();
+          const { ctx } = context(ceiling);
+          buildFixture(
+            (fr) => createKit(builder, fr),
+            {
+              kind: "machine",
+              slot,
+              machine,
+              tag: "reactor",
+              hue: 140,
+              seed,
+              variant,
+            },
+            INDEX,
+            { ...ctx, hall },
+          );
+          return positions(builder.build()).map((p) =>
+            toLocal(f, p)
+              .map((c) => c.toFixed(5))
+              .join(","),
+          );
+        };
+        expect(
+          at(5, HALL, CEILING),
+          `${machine} variant ${String(variant)}`,
+        ).toEqual(at(987654321, other, HIGH_CEILING));
+      }
   });
 
   for (const side of SIDES) {
