@@ -272,9 +272,10 @@ export const LOOKS: Record<LookId, Look> = {
 /**
  * The colour a room's accent takes in `look` (2.7 C8): the look's accent at
  * the room's index, `look.accents[room.finish.accent]`. The renderer
- * uploads it as `uAccent` on every draw, so a look switch or a restored
- * context, which hand the same room back, give the new look's colour of
- * the same family. Black for an index past the set, which no finish holds.
+ * uploads it as `uAccent` on every draw, so a restored context, which
+ * hands the same room back, keeps it, and a dev page that picks another
+ * look (the look is fixed in play) gets that look's colour of the same
+ * family. Black for an index past the set, which no finish holds.
  */
 export function accentFor(room: { finish: Finish }, look: Look): Rgb {
   return look.accents[room.finish.accent] ?? [0, 0, 0];

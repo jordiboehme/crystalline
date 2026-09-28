@@ -37,10 +37,11 @@
  * changes and otherwise grows lazily, bounded by the prop, hero, curio and
  * fitting catalogues. The condition does not enter the key: it changes only
  * grime and light scale, never the palette a mesh is coloured from (a look test
- * pins that). The room's instance buffers depend only on the room, so a
- * look switch, which calls `setRoom` again with the very same room object,
- * keeps them and only rebuilds the small vertex arrays that bind them to
- * the new look's meshes.
+ * pins that). The look is fixed in play; only a dev page picks another,
+ * at its start. The room's instance buffers depend only on the room, so a
+ * `setRoom` with the very same room object in a new look keeps them and
+ * only rebuilds the small vertex arrays that bind them to the new look's
+ * meshes.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
  * calls on unmount. After a lost context the demo does not call it: the
@@ -419,8 +420,9 @@ export function createRenderer(
       // cannot be built leaves the old one on the GPU and drawn.
       const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
       const built = buildRoomMesh(nextRoom, nextLookApplied);
-      // A look switch hands the very same room back: its instance buffers
-      // stay. This is read before anything is released.
+      // The same room handed back (a restored context, or a new look,
+      // which only a dev page picks): its instance buffers stay. This is
+      // read before anything is released.
       const sameRoom = nextRoom === room;
       const lookChanged = nextLook.id !== meshLook;
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);

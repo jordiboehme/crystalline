@@ -117,7 +117,8 @@ const TURN_TABLE = [0, 1, 2, 3]
  * as `vTint`, so the fragment shader only ever sees real colours. The
  * renderer uploads `uAccent` on every draw from the look and the room
  * (`accentFor` in `looks.ts`), so a mesh built once per look takes each
- * room's accent, and a look switch or a restored context keeps it.
+ * room's accent, and a restored context keeps it. The look is fixed in
+ * play; only a dev page picks another.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;

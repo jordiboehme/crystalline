@@ -576,8 +576,8 @@ test("the station launches from the C64 screen and returns to the same page", as
   // The connecting screen skips on any key.
   await page.keyboard.press("Shift");
   // Wait for the room to land before pausing: the HUD's status line leads
-  // with the room's title once the room is entered (before that it names
-  // only the look and the mouse hint).
+  // with the room's title once the room is entered (before that it holds
+  // only the mouse hint).
   await expect(page.locator('[data-hud="status"]')).toContainText(
     "DEEP GAMMA NOTE",
   );
