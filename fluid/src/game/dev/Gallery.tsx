@@ -80,6 +80,13 @@
  * `?at=lift:0` stands in front of the lift, `?at=screen:0` in front of the
  * screen. Every door, portal and hatch leads nowhere in the gallery, as in
  * `galleryRoom`.
+ *
+ * `?hall=airlock` (M3 C24) shows the airlock `airlockRoom` builds of
+ * `CANNED_DOMAINS`, for judging the round chamber, its light, the lift at
+ * the entrance and the domain directory opposite it with the key on the
+ * private domain. The spawn is the airlock's own, in front of the lift
+ * facing the directory; `?at=lift:0` and `?at=screen:0` stand in front of
+ * each. The lift leads nowhere in the gallery.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -95,11 +102,13 @@ import {
   CANNED_BRIDGE,
   CANNED_BRIDGE_DATA,
   CANNED_DECK,
+  CANNED_DOMAINS,
   galleryRoom,
   heroHallRoom,
   liftsHallRoom,
   variantsHallRoom,
 } from "../world/canned";
+import { airlockRoom } from "../world/airlock";
 import { withBridge } from "../world/bridge";
 import { consoleRoom } from "../world/consoleRoom";
 import { generateDeck } from "../world/deck";
@@ -154,7 +163,9 @@ export default function Gallery() {
                       generateRoom(CANNED_BRIDGE),
                       CANNED_BRIDGE_DATA,
                     )
-                  : galleryRoom();
+                  : hall === "airlock"
+                    ? airlockRoom({ domains: CANNED_DOMAINS, here: null })
+                    : galleryRoom();
     const at = params.get("at");
     const roomView =
       hall === "console"

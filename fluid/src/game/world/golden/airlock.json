@@ -1,0 +1,171 @@
+{
+  "version": 3,
+  "seed": 2081446397870000,
+  "domain": "",
+  "permalink": "",
+  "space": "airlock",
+  "title": "AIRLOCK",
+  "archetype": "bridge",
+  "condition": "clean",
+  "width": 8,
+  "depth": 8,
+  "grid": [
+    "  ....  ",
+    " ...... ",
+    "........",
+    "........",
+    "........",
+    "........",
+    " ...... ",
+    "  ....  "
+  ],
+  "hall": {
+    "x0": 0,
+    "y0": 0,
+    "x1": 8,
+    "y1": 8
+  },
+  "bays": [],
+  "corridor": null,
+  "entrance": {
+    "x": 3,
+    "y": 7
+  },
+  "ceiling": 4.5,
+  "spawn": {
+    "x": 3,
+    "y": 7,
+    "yaw": 0
+  },
+  "fixtures": [
+    {
+      "kind": "lift",
+      "slot": {
+        "x": 3,
+        "y": 7,
+        "side": "s"
+      },
+      "stops": [
+        {
+          "label": "Archive",
+          "to": {
+            "kind": "bridge",
+            "domain": "Archive"
+          },
+          "key": false,
+          "here": false
+        },
+        {
+          "label": "beacon",
+          "to": {
+            "kind": "bridge",
+            "domain": "beacon"
+          },
+          "key": false,
+          "here": false
+        },
+        {
+          "label": "cargo",
+          "to": {
+            "kind": "bridge",
+            "domain": "cargo"
+          },
+          "key": false,
+          "here": false
+        },
+        {
+          "label": "galley",
+          "to": {
+            "kind": "bridge",
+            "domain": "galley"
+          },
+          "key": true,
+          "here": false
+        },
+        {
+          "label": "orbit",
+          "to": {
+            "kind": "bridge",
+            "domain": "orbit"
+          },
+          "key": false,
+          "here": false
+        }
+      ],
+      "note": null,
+      "seed": 5085340927337424
+    },
+    {
+      "kind": "screen",
+      "slot": {
+        "x": 3,
+        "y": 0,
+        "side": "n"
+      },
+      "lines": [
+        "AIRLOCK",
+        "Archive",
+        "beacon",
+        "cargo",
+        "galley",
+        "orbit"
+      ],
+      "keys": [
+        4
+      ],
+      "seed": 7385514928632225
+    }
+  ],
+  "decor": [],
+  "scaffold": [],
+  "heroes": [],
+  "props": [],
+  "curios": [],
+  "finish": {
+    "accent": 0,
+    "hallWalls": 0,
+    "bayWalls": [],
+    "corridorWalls": 0
+  },
+  "decals": [],
+  "lights": [
+    {
+      "x0": 0,
+      "y0": 0,
+      "x1": 4,
+      "y1": 4,
+      "level": 208,
+      "special": "steady",
+      "seed": 3988596014013250
+    },
+    {
+      "x0": 4,
+      "y0": 0,
+      "x1": 8,
+      "y1": 4,
+      "level": 208,
+      "special": "steady",
+      "seed": 1590520971745498
+    },
+    {
+      "x0": 0,
+      "y0": 4,
+      "x1": 4,
+      "y1": 8,
+      "level": 208,
+      "special": "steady",
+      "seed": 8649110178527689
+    },
+    {
+      "x0": 4,
+      "y0": 4,
+      "x1": 8,
+      "y1": 8,
+      "level": 208,
+      "special": "steady",
+      "seed": 2980712148659083
+    }
+  ],
+  "dropped": 0,
+  "inboundMore": 0
+}

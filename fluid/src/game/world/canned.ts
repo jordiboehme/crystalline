@@ -27,6 +27,11 @@
  * hub is built from it: thirty engrams in `crew/logs`, two sections, two
  * subfolders. `generateDeck(CANNED_DECK, 1)` is the deck golden.
  *
+ * `CANNED_DOMAINS` (M3 C24) is no place either but the domain listing the
+ * airlock is built from: five domains, one private.
+ * `airlockRoom({ domains: CANNED_DOMAINS, here: null })` is the airlock
+ * golden, and `?hall=airlock` shows it.
+ *
  * `galleryRoom` is no place at all but a room built by hand for the dev-only
  * model gallery: one of every model the station draws, machines in bays 1
  * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
@@ -72,6 +77,7 @@ import {
   hostSurfaces,
   type HostSurface,
 } from "./curios";
+import type { AirlockInput } from "./airlock";
 import type { BridgeInput } from "./bridge";
 import type { DeckInput, DeckRow } from "./deck";
 import { bayNumber, deckNumber } from "./decals";
@@ -213,6 +219,23 @@ export const CANNED_BRIDGE_DATA: BridgeInput = {
   folders: ["engineering", "logs"],
   rootDeck: true,
 };
+
+/**
+ * The domain listing the airlock is built from (M3 C24): five invented
+ * domains as `GET /domains` names them, given out of `byLabel` order and
+ * with one name capitalised, so the airlock golden
+ * (`airlockRoom({ domains: CANNED_DOMAINS, here: null })`) pins the sort
+ * of the lift's stops and the directory's lines; one of them, `galley`, is
+ * private, so the golden pins the key on its stop and its directory line.
+ * `?hall=airlock` shows the room. Nothing here is fetched.
+ */
+export const CANNED_DOMAINS: NonNullable<AirlockInput["domains"]> = [
+  { name: "orbit", private: false },
+  { name: "galley", private: true },
+  { name: "Archive", private: false },
+  { name: "beacon", private: false },
+  { name: "cargo", private: false },
+];
 
 /**
  * The workshop: a mid-size engineering runbook under construction, the room
