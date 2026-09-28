@@ -8,7 +8,9 @@
  * (`GAME_STALE_MS`), and the page and the room cannot disagree about which
  * version of the engram they are holding. The domain listing is the sidebar's,
  * under `DOMAINS_QUERY_KEY`. Only the inbound page has a key of the game's own,
- * because it asks for a page size (`HATCH_CAP`) no screen asks for.
+ * because it asks for a page size (`HATCH_CAP`) no screen asks for, so
+ * Fluid's invalidation table never names it; the change reactions reach it
+ * by its domain prefix instead (`inboundKey`, `gameInboundPrefix`).
  *
  * What fails decides what comes back. The detail is the room: a 404, a 403 or
  * a dropped connection there is an answer the session shows as a place of its
@@ -93,8 +95,17 @@ export const TARGET_TIMEOUT_MS = 3000;
  */
 export const GAME_STALE_MS = 30_000;
 
-/** The cache key of the inbound page the game asks for. */
-function inboundKey(domain: string, permalink: string): readonly unknown[] {
+/**
+ * The cache key of the inbound page the game asks for:
+ * `["game", "inbound", domain, permalink]`. Exported so the change
+ * reactions (`gameInboundPrefix` in `data/changes.ts`, M4 C13) make every
+ * inbound page of a changed domain stale by its first three parts, and a
+ * test pins that the two agree.
+ */
+export function inboundKey(
+  domain: string,
+  permalink: string,
+): readonly unknown[] {
   return ["game", "inbound", domain, permalink];
 }
 

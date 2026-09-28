@@ -22,9 +22,10 @@
  *    already names the room, so the lift panel needs no fallback (M3 A13).
  *
  * With the two fixtures in place the room is re-dressed exactly as
- * `withHeroes` re-dresses round a forced hero: `dressRoom` of the room with
- * the new fixtures, then `placeCurios` with the room's own draws
- * (`curioDraws`) and neighbours (`nearFor(place)`), then `placeDecals`. The
+ * `withHeroes` re-dresses round a forced hero (`redress`): `dressRoom` of
+ * the room with the new fixtures, then `placeCurios` with the room's own
+ * draws (`curioDraws`) and neighbours (`nearFor(place)`), then
+ * `placeDecals`. The
  * lights, the finish and the heroes are the room's own and never move: the
  * bridge adds fixtures, never heroes. Handed no bridge data,
  * `withBridge` gives the room back unchanged (`bridge === null`), the
@@ -41,7 +42,10 @@
  * the screen's own viewing lane (`SHEET_LANE_WIDTH` by `SHEET_LANE_DEPTH`,
  * `props.ts`), since the heroes are not re-drawn here and so must already
  * be clear of wherever the screen ends up. A room with no free edge on any
- * of the three walls gives null.
+ * of the three walls gives null. That per-edge test is `freeEdgeTest(room)`,
+ * exported beside it together with `redress`, so the darkened room's hatch
+ * (`darkened` in `diff.ts`, M4 C19) takes a free edge by the very same rule
+ * and is dressed round the same way.
  *
  * The generator side (M3 global constraints): this module may import
  * `generate.ts` (for `nearFor`), never `move.ts`, `interact.ts`,
@@ -55,9 +59,10 @@ import { dressRoom } from "./dress";
 import { footprint } from "./footprints";
 import { nearFor } from "./generate";
 import { heroReserve } from "./heroes";
+import { wallRuns } from "./layout";
 import { LIFT_WORDS, bridgeStops, engramCount } from "./lifts";
 import { SHEET_LANE_DEPTH, SHEET_LANE_WIDTH } from "./props";
-import { dressingSites, edgeKey, edgeOf, overlaps } from "./sites";
+import { dressingSites, edgeKey, edgeOf, overlaps, type Near } from "./sites";
 import type {
   Fixture,
   LiftStop,
@@ -123,16 +128,37 @@ function bridgePanel(bridge: BridgeInput): {
 }
 
 /**
- * The free wall edge the bridge's screen goes on (M3 C20), or null when
- * none of the three walls has one. See the module doc for the rule.
+ * The free-edge test `bridgeScreenEdge` applies to every wall edge (M3
+ * C20), built once for `room`: true for a wall edge with no fixture, not
+ * the entrance edge or one beside it, no wall prop and not one a hero
+ * reserves, its screen lane clear of every hero's reserved box. Exported
+ * for the darkened room's hatch (`darkened` in `diff.ts`, M4 C19), which
+ * takes the first edge in `wallSlots` order that passes it, so the two
+ * seams agree on what a free wall edge is.
  */
-export function bridgeScreenEdge(room: RoomSpec): WallSlot | null {
+export function freeEdgeTest(room: RoomSpec): (edge: WallSlot) => boolean {
   const sites = dressingSites(room);
   const walled = new Set<string>();
   for (const p of room.props)
     if (p.anchor === "wall") walled.add(edgeKey(edgeOf(p)));
   const reserved = heroReserve(room.heroes);
-  const edges = sites.runs.flat();
+  return (e) => {
+    const key = edgeKey(e);
+    if (!sites.free.has(key)) return false;
+    if (walled.has(key)) return false;
+    if (reserved.edges.has(key)) return false;
+    const box = footprint(e, SCREEN_LANE);
+    return !reserved.boxes.some((b) => overlaps(box, b));
+  };
+}
+
+/**
+ * The free wall edge the bridge's screen goes on (M3 C20), or null when
+ * none of the three walls has one. See the module doc for the rule.
+ */
+export function bridgeScreenEdge(room: RoomSpec): WallSlot | null {
+  const free = freeEdgeTest(room);
+  const edges = wallRuns(room.grid).flat();
   for (const side of SCREEN_SIDES) {
     const alongX = side === "n" || side === "s";
     const centre = alongX
@@ -143,12 +169,7 @@ export function bridgeScreenEdge(room: RoomSpec): WallSlot | null {
     let bestCoord = Infinity;
     for (const e of edges) {
       if (e.side !== side) continue;
-      const key = edgeKey(e);
-      if (!sites.free.has(key)) continue;
-      if (walled.has(key)) continue;
-      if (reserved.edges.has(key)) continue;
-      const box = footprint(e, SCREEN_LANE);
-      if (reserved.boxes.some((b) => overlaps(box, b))) continue;
+      if (!free(e)) continue;
       const coord = alongX ? e.x : e.y;
       const dist = Math.abs(coord + 0.5 - centre);
       if (dist < bestDist || (dist === bestDist && coord < bestCoord)) {
@@ -160,6 +181,23 @@ export function bridgeScreenEdge(room: RoomSpec): WallSlot | null {
     if (best !== null) return best;
   }
   return null;
+}
+
+/**
+ * `fitted` re-dressed round its fixtures (M3 C21): `dressRoom`, then
+ * `placeCurios` with the room's own draws and `near`, then `placeDecals`,
+ * exactly as `withHeroes` re-dresses round a forced hero. The lights, the
+ * finish and the heroes are kept. `withBridge` passes the place's
+ * neighbours (`nearFor`); the darkened room (M4 C19), which has no place
+ * at hand, passes `NO_NEAR`.
+ */
+export function redress(fitted: RoomSpec, near: Near): RoomSpec {
+  const dressed: RoomSpec = { ...fitted, props: dressRoom(fitted) };
+  const placed: RoomSpec = {
+    ...dressed,
+    curios: placeCurios(dressed, curioDraws(dressed), near),
+  };
+  return { ...placed, decals: placeDecals(placed) };
 }
 
 /**
@@ -197,11 +235,5 @@ export function withBridge(
       seed: seedFor(room.seed, "screen"),
     });
   }
-  const fitted: RoomSpec = { ...room, fixtures };
-  const dressed: RoomSpec = { ...fitted, props: dressRoom(fitted) };
-  const placed: RoomSpec = {
-    ...dressed,
-    curios: placeCurios(dressed, curioDraws(dressed), nearFor(place)),
-  };
-  return { ...placed, decals: placeDecals(placed) };
+  return redress({ ...room, fixtures }, nearFor(place));
 }
