@@ -77,6 +77,19 @@ export interface Voice {
   gain: number;
   /** Tremolo: rate in Hz and depth 0..1. */
   tremolo?: { rate: number; depth: number };
+  /**
+   * Pitch drift: a slow sine on the pitch, rate in Hz and depth in cents,
+   * for a drone that wavers. Every oscillator of the voice (both saws of a
+   * pulse) drifts together.
+   */
+  drift?: { rate: number; cents: number };
+  /**
+   * Pulse width modulation by a sine (pulse only): rate in Hz and depth in
+   * width, swinging the width's steps up and down by `depth`. Unlike a
+   * `width` step list it keeps moving in a looping patch. The steps plus
+   * and minus `depth` should stay inside 0.05..0.95.
+   */
+  pwm?: { rate: number; depth: number };
 }
 
 /**

@@ -30,6 +30,18 @@
  * seeded noise (`noiseBuffer`), never an unseeded random, so a render is the
  * same every time (M4 C29).
  *
+ * Two slow modulations keep a looping drone alive, since a loop holds its
+ * steps' last values: `drift`, a sine LFO into the `detune` of every
+ * oscillator of the voice (both saws of a pulse from one LFO gain, or the
+ * two halves would beat against each other), and `pwm`, a sine LFO added
+ * to the pulse's delay line, whose depth in seconds is the width depth over
+ * the voice's first pitch (a drone's pitch holds, so that is its period).
+ *
+ * The noise buffer is filled once per context and name and reused (up to
+ * `NOISE_CACHE_SIZE` names per context), so a footstep does not fill two
+ * seconds of samples on the main thread; several sources may play one
+ * buffer at once.
+ *
  * Every parameter a step list drives holds its first step's value from the
  * patch start, so nothing sounds at a node's default (440 Hz, a delay of
  * 0) before the first step, and `valueAt` reads the schedule as it plays.
@@ -53,6 +65,8 @@ import type {
   AudioNodeLike,
   AudioParamLike,
   BaseAudioContextLike,
+  DelayLike,
+  OscillatorLike,
   ScheduledSourceLike,
 } from "./context";
 import {
@@ -92,6 +106,36 @@ const DELAY_MARGIN_S = 0.01;
  * delay and level) where an input moves along a curve.
  */
 const PIECE_S = 0.02;
+
+/** How many noise buffers a context keeps, by name, before the oldest goes. */
+export const NOISE_CACHE_SIZE = 16;
+
+/** The noise buffers filled so far, per context and name. */
+const noiseCache = new WeakMap<
+  BaseAudioContextLike,
+  Map<string, AudioBufferLike>
+>();
+
+/**
+ * The noise buffer for `name` on `ctx`: the one filled before, or a new
+ * one, the oldest name dropped once the context holds `NOISE_CACHE_SIZE`.
+ */
+function cachedNoise(ctx: BaseAudioContextLike, name: string): AudioBufferLike {
+  let byName = noiseCache.get(ctx);
+  if (byName === undefined) {
+    byName = new Map();
+    noiseCache.set(ctx, byName);
+  }
+  const held = byName.get(name);
+  if (held !== undefined) return held;
+  const made = noiseBuffer(ctx, NOISE_BUFFER_S, name);
+  if (byName.size >= NOISE_CACHE_SIZE) {
+    const oldest = byName.keys().next().value;
+    if (oldest !== undefined) byName.delete(oldest);
+  }
+  byName.set(name, made);
+  return made;
+}
 
 /** The organ's partials: index is the harmonic, value its sine amplitude. */
 const ORGAN_PARTIALS = [0, 1, 0.5, 0.35, 0.25, 0, 0.12] as const;
@@ -138,9 +182,7 @@ export function playPatch(
   level.connect(dest);
   made.push(level);
 
-  let noise: AudioBufferLike | null = null;
-  const noiseOf = (): AudioBufferLike =>
-    (noise ??= noiseBuffer(ctx, NOISE_BUFFER_S, seedName));
+  const noiseOf = (): AudioBufferLike => cachedNoise(ctx, seedName);
 
   for (const voice of patch.voices) {
     const start = when + voice.at;
@@ -188,9 +230,41 @@ export function playPatch(
       input = filter;
     }
 
-    const { play: players, outs } = sourcesOf(ctx, voice, when, noiseOf, track);
+    const {
+      play: players,
+      outs,
+      oscillators,
+      delay,
+    } = sourcesOf(ctx, voice, when, noiseOf, track);
     for (const node of outs) node.connect(input);
     for (const node of players) play(node);
+    // A slow sine LFO into `targets` through one gain of `amount`.
+    const lfoInto = (
+      rate: number,
+      amount: number,
+      targets: readonly AudioParamLike[],
+    ): void => {
+      if (targets.length === 0) return;
+      const lfo = ctx.createOscillator();
+      lfo.type = "sine";
+      lfo.frequency.setValueAtTime(rate, start);
+      const depth = track(ctx.createGain());
+      depth.gain.value = amount;
+      lfo.connect(depth);
+      for (const target of targets) depth.connect(target);
+      play(lfo);
+    };
+    if (voice.drift !== undefined) {
+      lfoInto(
+        voice.drift.rate,
+        voice.drift.cents,
+        oscillators.map((o) => o.detune),
+      );
+    }
+    if (voice.pwm !== undefined && delay !== null) {
+      const hz = Math.max(MIN_HZ, voice.pitch[0]?.value ?? MIN_HZ);
+      lfoInto(voice.pwm.rate, voice.pwm.depth / hz, [delay.delayTime]);
+    }
   }
 
   let stopped = false;
@@ -227,10 +301,16 @@ export function playPatch(
   };
 }
 
-/** A voice's sources (to start and stop) and its outputs (to connect). */
+/**
+ * A voice's sources (to start and stop), its outputs (to connect), its
+ * oscillators (the drift's targets) and a pulse's delay line (the width
+ * modulation's target, null for any other wave).
+ */
 interface VoiceSources {
   play: ScheduledSourceLike[];
   outs: AudioNodeLike[];
+  oscillators: OscillatorLike[];
+  delay: DelayLike | null;
 }
 
 /**
@@ -250,7 +330,7 @@ function sourcesOf(
     const player = ctx.createBufferSource();
     player.buffer = noiseOf();
     player.loop = true;
-    return { play: [player], outs: [player] };
+    return { play: [player], outs: [player], oscillators: [], delay: null };
   }
   const pitch = voice.pitch.length > 0 ? voice.pitch : DEFAULT_PITCH;
   const osc = (): ReturnType<BaseAudioContextLike["createOscillator"]> => {
@@ -264,14 +344,14 @@ function sourcesOf(
     case "sine": {
       const node = osc();
       node.type = voice.wave === "saw" ? "sawtooth" : voice.wave;
-      return { play: [node], outs: [node] };
+      return { play: [node], outs: [node], oscillators: [node], delay: null };
     }
     case "organ": {
       const node = osc();
       const real = new Float32Array(ORGAN_PARTIALS.length);
       const imag = Float32Array.from(ORGAN_PARTIALS);
       node.setPeriodicWave(ctx.createPeriodicWave(real, imag));
-      return { play: [node], outs: [node] };
+      return { play: [node], outs: [node], oscillators: [node], delay: null };
     }
     case "pulse": {
       const width =
@@ -311,7 +391,12 @@ function sourcesOf(
       flip.connect(delay);
       direct.connect(sum);
       delay.connect(sum);
-      return { play: [direct, inverted], outs: [sum] };
+      return {
+        play: [direct, inverted],
+        outs: [sum],
+        oscillators: [direct, inverted],
+        delay,
+      };
     }
   }
 }

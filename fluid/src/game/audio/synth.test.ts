@@ -573,6 +573,91 @@ describe("playPatch", () => {
   });
 });
 
+describe("playPatch's slow modulations", () => {
+  // Mutation caught: the drift driving only one saw of a pulse (the two
+  // halves beat and the pulse falls apart), or no drift at all.
+  it("drifts every oscillator of a voice from one LFO, in cents", () => {
+    const ctx = new FakeAudioContext();
+    playPatch(
+      ctx,
+      ctx.destination,
+      single(
+        voice({
+          wave: "pulse",
+          pitch: [{ at: 0, value: 41 }],
+          width: [{ at: 0, value: 0.4 }],
+          drift: { rate: 0.07, cents: 30 },
+        }),
+        true,
+      ),
+      0,
+      "drift",
+    );
+    const lfo = ctx
+      .ofKind("oscillator")
+      .find((o) => o.frequency.events[0]?.[1] === 0.07);
+    expect(lfo).toBeDefined();
+    const depth = lfo!.connections[0] as FakeNode;
+    expect(depth.kind).toBe("gain");
+    expect(depth.params.gain?.value).toBeCloseTo(30, 9);
+    const saws = ctx.ofKind("oscillator").filter((o) => o !== lfo);
+    expect(saws).toHaveLength(2);
+    for (const saw of saws) expect(depth.connections).toContain(saw.detune);
+    // The LFO starts with the voice and, in a loop, is never stopped early.
+    expect(lfo!.started).toEqual([0]);
+    expect(lfo!.stopped).toEqual([]);
+  });
+
+  // Mutation caught: the width LFO left unconnected, or scaled by the
+  // width alone (the delay is width over pitch, in seconds).
+  it("modulates a pulse's width through its delay line", () => {
+    const ctx = new FakeAudioContext();
+    playPatch(
+      ctx,
+      ctx.destination,
+      single(
+        voice({
+          wave: "pulse",
+          pitch: [{ at: 0, value: 50 }],
+          width: [{ at: 0, value: 0.4 }],
+          pwm: { rate: 0.3, depth: 0.2 },
+        }),
+      ),
+      0,
+      "pwm",
+    );
+    const lfo = ctx
+      .ofKind("oscillator")
+      .find((o) => o.frequency.events[0]?.[1] === 0.3);
+    expect(lfo).toBeDefined();
+    const depth = lfo!.connections[0] as FakeNode;
+    expect(depth.params.gain?.value).toBeCloseTo(0.2 / 50, 9);
+    const delay = ctx.ofKind("delay")[0]!;
+    expect(depth.connections).toEqual([delay.delayTime]);
+    // It ends with the voice.
+    expect(lfo!.stopped).toEqual([0.5 + 0.2]);
+  });
+});
+
+describe("playPatch's noise", () => {
+  // Mutation caught: a fresh two-second buffer filled on every play (the
+  // cost of every footstep, Task 6 m8).
+  it("fills one buffer per context and name, and reuses it", () => {
+    const ctx = new FakeAudioContext(8000);
+    const noisy = single(voice({ wave: "noise", pitch: [] }));
+    playPatch(ctx, ctx.destination, noisy, 0, "hiss");
+    playPatch(ctx, ctx.destination, noisy, 1, "hiss");
+    expect(ctx.buffers).toHaveLength(1);
+    const [a, b] = ctx.ofKind("bufferSource");
+    expect(a!.buffer).toBe(b!.buffer);
+    playPatch(ctx, ctx.destination, noisy, 2, "other");
+    expect(ctx.buffers).toHaveLength(2);
+    const fresh = new FakeAudioContext(8000);
+    playPatch(fresh, fresh.destination, noisy, 0, "hiss");
+    expect(fresh.buffers).toHaveLength(1);
+  });
+});
+
 describe("noiseBuffer", () => {
   // Mutation caught: `Math.random` (two calls with one name would differ),
   // or a fill that ignores the name.
