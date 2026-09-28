@@ -12,22 +12,24 @@
  *    entrance's east neighbour edge `{ x: entrance.x + 1, y: entrance.y,
  *    side: "s" }` (`stencilEdge`) when that is a wall edge and no fixture
  *    edge, 1.5 m up, 0.9 by 0.3 m; the strip in front of it is a lane
- *    (`STENCIL_STRIP`), so no floor prop or hero hides it. The entrance floor stencil, `BAY m`, at
- *    `(entrance.x + 0.5, entrance.y - 1.0)` reading walking in (turn 0),
- *    1.0 by 0.3 m, or at `entrance.y - 0.5` when that box is not clear: a
- *    lane cell outside the interior band that nothing takes, so a room
- *    always has exactly one (the fallback is still checked, and the tests
- *    pin that it is always clear). Each overflow bay's `BAY mA` to `BAY mD` at
- *    the bay's centre, reading from the hall (turn 1: every bay lies east
- *    of the hall, so its top points east, away from the reader), when its box is
- *    clear. The numbers are `deckNumber` and `bayNumber` (C18). All the
+ *    (`STENCIL_STRIP`), so no floor prop or hero hides it. The entrance
+ *    floor stencil, `BAY m`, at `(entrance.x + 0.5, entrance.y - 1.0)`
+ *    reading walking in (turn 0), 1.0 by 0.3 m, or at `entrance.y - 0.5`
+ *    when that box is not clear: a lane cell outside the interior band
+ *    that nothing takes, so a room always has exactly one (the fallback is
+ *    still checked, and the tests pin that it is always clear). Each
+ *    overflow bay's `BAY mA` to `BAY mD` at the bay's centre, reading from
+ *    the hall (turn 1: every bay lies east of the hall, so its top points
+ *    east, away from the reader), when its box is clear. The numbers are `deckNumber` and `bayNumber` (C18). All the
  *    stencils of a room share one seed (they draw nothing), so the sort
- *    keeps them in place order and the bay letters run A to D.
+ *    orders them by `y`, then `x`. A bay's letter is in `stencil.letter`,
+ *    never read from the list order.
  * 2. **Chevrons** (C14), in fixture order: a strip 1.6 by 0.3 m in front
  *    of every bulkhead and blast door, sealed or not, starting
  *    `DOOR_GAP` past the door's own depth (`DOOR_DEPTH`), so the door's
- *    housings, sill and leaves never bury it, and a strip the machine's width by 0.3 m, from 0.2 to 0.5 m in
- *    front of its footprint, before every `HAZARD_MACHINES` machine; each
+ *    housings, sill and leaves never bury it, and a strip the machine's
+ *    width by 0.3 m, from 0.2 to 0.5 m in front of its footprint, before
+ *    every `HAZARD_MACHINES` machine; each
  *    only when its box is clear. The tile (variant) is drawn.
  * 3. **Arrows** (C14), 0.6 by 0.9 m, pointing the way out: in each bay one
  *    cell in from its doorway, centred on the doorway's rows, pointing west

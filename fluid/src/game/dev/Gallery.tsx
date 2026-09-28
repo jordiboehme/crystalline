@@ -23,8 +23,8 @@
  * `?hall=variants` (2.7 C24) shows `variantsHallRoom()` instead: one of
  * every machine kind and variant along the east wall and its bays, one of
  * every terminal variant on the west wall, and one of every decor kind and
- * variant on the floor, for judging a later variant's model against
- * today's (`?at=machine:<n>`, `?at=terminal:<n>` and the new
+ * variant on the floor, for judging each variant's model against its
+ * kind's variant 0 (`?at=machine:<n>`, `?at=terminal:<n>` and
  * `?at=decor:<kind>:<n>`, below).
  * `?at=prop:<kind>:<n>` (H16, see `spotView`) puts the player in front of
  * the n-th hero or prop of that kind in whichever room is shown, framed

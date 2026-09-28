@@ -203,7 +203,8 @@ function forcedHeroDraws(
  * dresses a room around the heroes it draws on its own, and places its
  * curios again (`placeCurios`) on the re-dressed room, with the room's own
  * draws and neighbours (`nearFor`, 2.6f C9), so no curio stands on a host
- * that moved or was dropped and a curio the room skips stays skipped. The
+ * that moved or was dropped and a curio the room skips stays skipped, and
+ * lays its decals again (`placeDecals`) round the new heroes and props. The
  * forced hero itself never reads the neighbours, so it lands even where
  * one draws it. The returned room keeps its own archetype throughout; only
  * the `placeHeroes` call sees the forced one. `placed` is `kind` when it

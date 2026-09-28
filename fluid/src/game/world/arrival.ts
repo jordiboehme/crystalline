@@ -25,9 +25,9 @@
  * `withArrivalBox` then drops the room's own heroes whose floor overlaps
  * the box's moat (grown by `HERO_CLEAR`), keeps the rest, and re-dresses
  * the room round the box and the kept heroes through the shared
- * forced-hero seam (`withHeroes` in `generate.ts`, C15), so props and
- * curios keep off the box's moat as they keep off any hero the generator
- * drew: the walkway round it holds nothing. The player's spawn is the
+ * forced-hero seam (`withHeroes` in `generate.ts`, C15), so props,
+ * curios and decals keep off the box's moat as they keep off any hero the
+ * generator drew: the walkway round it holds nothing. The player's spawn is the
  * box's use point, facing the way the box faces. When no candidate fits
  * there is no box: the room comes back as it was handed in, the spawn is
  * null and the player arrives at the entrance, as on any other visit.

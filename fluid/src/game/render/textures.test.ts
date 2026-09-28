@@ -13,7 +13,7 @@ import {
 describe("baseLayers", () => {
   const layers = baseLayers(32, 1);
 
-  it("makes one RGBA layer per base slot, pictogram and decal placeholders included", () => {
+  it("makes one RGBA layer per base slot, the pictogram layer and the decal atlas included", () => {
     expect(layers).toHaveLength(LAYER.decal + 1);
     for (const l of layers) expect(l.length).toBe(32 * 32 * 4);
   });

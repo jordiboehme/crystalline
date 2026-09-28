@@ -143,8 +143,8 @@ export function toLocal(f: Frame, p: V3): V3 {
  * edges, in local terms, divided by at least two samples a voxel), so a
  * large flat top counts by its area, not by its four corners. `cell`
  * defaults to 0.1 m, the voxel `occupancy` and `silhouetteDelta` compare
- * two builds of the same kind at (2.7 Task 1: a variant keeps its kind's
- * silhouette close to today's, C3).
+ * two builds of the same kind at (a variant keeps its silhouette close to
+ * its kind's variant 0, 2.7 C3).
  */
 export function occupancy(m: MeshData, f: Frame, cell = 0.1): Set<string> {
   const ps = positions(m);

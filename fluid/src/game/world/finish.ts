@@ -27,10 +27,8 @@ import { seedFor } from "../core/seed";
 import type { Finish } from "./types";
 import { ACCENT_COUNT } from "./variants";
 
-export type { Finish } from "./types";
-
 /**
- * How many wall patterns there are (2.7 C11): 0 panels (today's bevelled
+ * How many wall patterns there are (2.7 C11): 0 panels (the bevelled
  * squares), 1 ribbed and 2 plated.
  */
 export const WALL_PATTERNS = 3;

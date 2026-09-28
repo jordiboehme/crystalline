@@ -3274,7 +3274,7 @@ function twinCells({ k, s, ctx, hue, half, out, accent2 }: Recipe) {
 
 /**
  * The recipes of every machine kind, one per variant (2.7 C2): entry 0 is
- * today's model (2.7 C1), and `VARIANT_COUNTS.machine` says how many each
+ * variant 0, the kind's first model (2.7 C1), and `VARIANT_COUNTS.machine` says how many each
  * kind draws.
  */
 const RECIPES: Record<MachineKind, readonly ((r: Recipe) => void)[]> = {

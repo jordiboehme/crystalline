@@ -426,7 +426,10 @@ function swivelChair({ k, s }: Recipe): void {
   );
 }
 
-/** Terminal variant 0: today's desk, CRT and swivel chair, part for part (2.7 C1). */
+/**
+ * Terminal variant 0: the first terminal's desk, CRT and swivel chair, part
+ * for part (2.7 C1).
+ */
 function terminal0(r: Recipe): void {
   desk(r);
   keyDeck(r);

@@ -40,18 +40,20 @@
  * also carrying `variant`, one per kind, shared by every piece of that kind
  * in the room, and the grid is lit in blocks of four by four cells.
  *
- * 8. Last, the heroes and the set dressing. The heroes (`placeHeroes`,
+ * 8. The heroes and the set dressing. The heroes (`placeHeroes`,
  *    `heroes.ts`) stand after the scaffold and before the dressing, which
  *    keeps off what they reserve (`heroReserve`), skipping, by `near`
  *    (`nearFor`, 2.6f C5 to C8), what the rooms its ways lead to draw.
  *    Then `dressRoom` (`dress.ts`) reads the finished room, fixtures,
  *    furniture, scaffolding and heroes included, and adds its props. The
- *    dressing runs after everything else and only ever adds decoration, so
- *    a prop never moves a fixture, and the room states its entrance, bays
- *    and corridor so the dressing never has to work them out again.
- * 9. Last, the curios (`placeCurios`, `curios.ts`), after the dressing,
- *    since shelves and cabinets are props; they read everything and move
- *    nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the
+ *    dressing runs after steps 1 to 7 and the heroes and only ever adds
+ *    decoration, so a prop never moves a fixture, and the room states its
+ *    entrance, bays and corridor so the dressing never has to work them
+ *    out again. The curios and the decals (steps 9 and 11) read the props
+ *    afterwards.
+ * 9. The curios (`placeCurios`, `curios.ts`), after the dressing, since
+ *    shelves and cabinets are props; they read everything before them and
+ *    move nothing, skipping, by `near` (`nearFor`, 2.6f C5 to C8), what the
  *    rooms its ways lead to draw.
  * 10. The finish (`finishFor`, `finish.ts`, 2.7 C8, C11): the room's accent
  *    and the wall pattern of its hall, each bay and its corridor, by seed
@@ -65,8 +67,8 @@
  * heroes in a room the generator built and re-runs steps 8, 9 and 11
  * round them, exactly as `generateRoom` runs them round its own draws: the
  * heroes sorted by `HERO_ORDER`, the dressing, the curios with the room's
- * own draws and neighbours, then the decals. Handed the room's own heroes, it gives
- * the room back unchanged. The dev switches (`dev/demo.ts`) and the
+ * own draws and neighbours, then the decals. Handed the room's own heroes,
+ * it gives the room back unchanged. The dev switches (`dev/demo.ts`) and the
  * arrival box (`world/arrival.ts`) both go through it; the generator
  * itself never calls it.
  */

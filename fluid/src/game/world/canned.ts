@@ -1214,8 +1214,8 @@ const VARIANTS_HALL_KIND_ORDER: readonly DecorKind[] = [
 /**
  * Every decor kind and variant the variants hall stands once, in hall
  * order: kind by kind (`VARIANTS_HALL_KIND_ORDER`), variant by variant.
- * Read off `VARIANT_COUNTS.decor`, so it follows every count. The stills
- * of the model tasks and of the decals frame these pieces, and
+ * Read off `VARIANT_COUNTS.decor`, so it follows every count. The decor
+ * variants' and the decals' stills frame these pieces, and
  * `canned.test.ts` pins them against the head of `variantsHallRoom`'s own
  * `room.decor` (the council row, `VARIANTS_HALL_COUNCIL`, follows them).
  */

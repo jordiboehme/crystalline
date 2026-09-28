@@ -160,9 +160,10 @@ export type RoomBase = Omit<RoomSpec, "props" | "curios" | "finish" | "decals">;
 /**
  * A room as the site rules and the hero pass see it: the sites are worked
  * out from fixtures, decor and scaffolding alone, so this type leaves out
- * the props, the heroes, the curios, the finish and the decals. The hero pass (`heroes.ts`) reads
- * the sites before any hero stands, and the dressing reads the same sites
- * and then keeps off what the heroes reserved (`heroReserve`).
+ * the props, the heroes, the curios, the finish and the decals. The hero
+ * pass (`heroes.ts`) reads the sites before any hero stands, and the
+ * dressing reads the same sites and then keeps off what the heroes
+ * reserved (`heroReserve`).
  */
 export type SiteBase = Omit<
   RoomSpec,

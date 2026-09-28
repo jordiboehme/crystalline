@@ -143,7 +143,10 @@ function floorQuad(
   }
 }
 
-/** The uv rectangles `n` pieces of a strip show: its tile's whole shape, or a chevron repeat each. */
+/**
+ * The uv rectangles `n` pieces of a strip show: its tile's whole shape, or
+ * a chevron repeat each.
+ */
 function piecesOf(d: Decal, tile: number): { n: number; uv: UvRect } {
   if (d.kind !== "chevrons") return { n: 1, uv: tileRect(tile) };
   return {

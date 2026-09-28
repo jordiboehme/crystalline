@@ -648,8 +648,8 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
       const Z0 = y * CELL;
       flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, 0, true, floor);
       flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, H, false, ceiling);
-      // The cell's own wall pattern (2.7 C11): pattern 0 (today's panels)
-      // on a room with fittings, whichever the hall, its bay or the
+      // The cell's own wall pattern (2.7 C11): pattern 0 (the bevelled
+      // panels) on a room with fittings, whichever the hall, its bay or the
       // corridor picked otherwise.
       const patternLook =
         WALL_PATTERN_LOOK[fitted ? 0 : wallPatternOf(room, x, y)]!;
