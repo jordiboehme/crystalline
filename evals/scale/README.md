@@ -63,6 +63,11 @@ directory, which defaults to `/tmp/crystalline-scale` because a unix socket
 path holds at most 103 bytes and a state directory under a deep working copy
 overruns it. `DRAIN_LIMIT` in the environment raises the `nli` stage's
 pre-flight ceiling for a long timing run (default 1800 seconds).
+`NLI_SEED_MODELS` in the environment points at a directory already holding one
+or more NLI checkpoints in hf-hub cache shape (`models--<org>--<name>`), so a
+profile's own checkpoint is reused instead of downloaded the first time that
+profile runs; without it, only the embedding model is seeded and the NLI
+checkpoint still downloads once per profile, as it would on a real install.
 
 ## Contradiction scoring
 
@@ -83,9 +88,11 @@ small probes corpus with the related line lowered and the pair cap lifted
 (the default `--nli-lift yes`); drain time and resident size run on the full
 corpus with the product's own caps (`--nli-lift no`), because the full corpus's
 lead cosines are degenerate and a lifted cap there means weeks of CPU. A
-pre-flight stops a stage whose projected drain exceeds `DRAIN_LIMIT`. Each
-profile gets its own model cache under `<out>`, seeded with a clone of the
-embedding model.
+pre-flight stops a stage whose projected drain exceeds `DRAIN_LIMIT`, and a
+drain that does not finish anyway marks the dump `"drained": false` rather than
+reporting partial numbers silently. Each profile gets its own model cache
+under `<out>`, seeded with a clone of the embedding model (and, with
+`NLI_SEED_MODELS` set, that profile's own checkpoint too).
 
 ## Isolation
 

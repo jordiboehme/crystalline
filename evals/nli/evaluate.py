@@ -151,6 +151,27 @@ def rss(path) -> dict:
 def report(dump: dict, sidecar: list, langs=None, log=None, rss_path=None) -> dict:
     items = [i for i in planted_scores(sidecar, dump) if langs is None or i["lang"] in langs]
     out = {"profile": dump.get("profile"), "model": dump.get("model"), "planted": len(items)}
+    # Coverage, split from recall: a planted item can miss for reasons that
+    # are not the model. "uncandidated" never cleared the related-pair cosine
+    # line, or lost a slot to the pair cap before scoring ever started
+    # (`cosine` is None). "no_stored_row" cleared it but has no contradiction
+    # row: on a fully drained dump that means the pair WAS scored and correctly
+    # landed below CONTRADICTION_STORE_FLOOR (0.5) - the store never persists a
+    # low score, so a negative probe scoring low leaves no row and is expected
+    # to, not a gap. On a dump that did not finish draining the two cases are
+    # indistinguishable from here (still pending vs. scored-and-floored both
+    # look like "no row"), which `markdown()` says explicitly. Correction 24's
+    # worry is exactly this: a recall number that is actually measuring the
+    # cap needs to be told apart from one measuring the model, and this is how
+    # a report shows the difference instead of hiding it inside a lower recall
+    # number.
+    out["coverage"] = {
+        "uncandidated": {k: sum(i["kind"] == k and i["cosine"] is None for i in items) for k in ("flip", "negative")},
+        "no_stored_row": {
+            k: sum(i["kind"] == k and i["cosine"] is not None and i["score_ab"] is None for i in items)
+            for k in ("flip", "negative")
+        },
+    }
     for how in ("mean", "min"):
         sweep = []
         for t in THRESHOLDS:
@@ -197,6 +218,13 @@ def report(dump: dict, sidecar: list, langs=None, log=None, rss_path=None) -> di
 
 def markdown(r: dict) -> str:
     lines = [f"## {r['profile']} ({r['model']})", "", f"planted pairs: {r['planted']}", ""]
+    no_row_reason = (
+        "below the store floor (0.5) - expected for a negative probe, not a gap"
+        if r.get("drained", True)
+        else "still pending or below the store floor - the drain did not finish, so these are indistinguishable"
+    )
+    lines += [f"coverage (missed the cap or the related-pair line, never a candidate): {r['coverage']['uncandidated']}",
+              f"coverage (candidate, no stored row: {no_row_reason}): {r['coverage']['no_stored_row']}", ""]
     if not r.get("drained", True):
         lines += ["**PARTIAL: the backlog had not drained within DRAIN_LIMIT; every number below undercounts.**", ""]
     for how in ("mean", "min"):
@@ -254,6 +282,9 @@ def self_test() -> int:
     assert related[0.80]["recall"] == 0.5, related
     assert r["min"]["sweep"][35]["recall"] == 0.5
     assert r["mean"]["period_hint_hit_rate_versions"] is None, "no version-type item in the self-test sidecar"
+    assert r["coverage"] == {"uncandidated": {"flip": 0, "negative": 0}, "no_stored_row": {"flip": 0, "negative": 0}}, (
+        "every planted item here has both a pair cosine and a scored row"
+    )
     print("self-test passed")
     return 0
 

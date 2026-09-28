@@ -478,12 +478,13 @@ print("true" if any(a.get("kind") == "contradictions" for a in d.get("activity",
   # its speed, project the whole drain (every pending pair at the full 64 line
   # pairs, both orders, batches of 16) and stop early when it cannot finish
   # inside DRAIN_LIMIT: that projection is a result too, and a night is not.
-  local elapsed=0 pending checked="" estimate
+  local elapsed=0 pending checked="" estimate drained_ok=""
   while [ "$elapsed" -lt "$DRAIN_LIMIT" ]; do
     kill -0 "$pid" 2> /dev/null || { echo "the daemon died after ${elapsed}s" >&2; break; }
     pending="$(status_field contradictions.pending_pairs)"
     if [ "$pending" = "0" ]; then
       echo "contradiction backlog drained after about ${elapsed}s"
+      drained_ok=1
       break
     fi
     if [ -z "$checked" ] && [ -f "$daemon_log" ] && [ -n "$pending" ] && [ "$pending" != "None" ]; then
@@ -522,10 +523,11 @@ PY
     sleep "$SAMPLE_EVERY"
     elapsed=$((elapsed + SAMPLE_EVERY))
   done
-  local drained="$elapsed" fully_drained="true"
-  if [ "$elapsed" -ge "$DRAIN_LIMIT" ]; then
-    fully_drained="false"
-    echo "the contradiction backlog did not drain within ${DRAIN_LIMIT}s; the dump below is partial" >&2
+  local drained="$elapsed" fully_drained="false"
+  if [ -n "$drained_ok" ]; then
+    fully_drained="true"
+  else
+    echo "the contradiction backlog did not drain (daemon died, or ${DRAIN_LIMIT}s ran out); the dump below is partial" >&2
   fi
   run_step "ctl-status-nli-$profile" "$BIN" ctl status
   echo "sampling ${NLI_UNLOAD_WAIT}s more for the idle drop"
