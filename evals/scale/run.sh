@@ -475,9 +475,20 @@ print("true" if any(a.get("kind") == "contradictions" for a in d.get("activity",
 
   # Drained when the daemon reports zero pending after it has reported a
   # number at all (null means no pass ran yet). Once the first pass has logged
-  # its speed, project the whole drain (every pending pair at the full 64 line
-  # pairs, both orders, batches of 16) and stop early when it cannot finish
-  # inside DRAIN_LIMIT: that projection is a result too, and a night is not.
+  # its speed, project the whole drain from the average cost per pair scored
+  # so far (cumulative over every pass logged, not just the first) and stop
+  # early when it cannot finish inside DRAIN_LIMIT: that projection is a
+  # result too, and a night is not. Measured, not assumed worst-case: an
+  # earlier version of this projection assumed every pending pair needed the
+  # full 64 line pairs both orders (8 batches/pair); a probes corpus (2
+  # observation bullets per engram, so 4 line pairs and about 1 batch per
+  # pair) made that overestimate the remaining time by about 8x, which was
+  # large enough to trip DRAIN_LIMIT on a run that would actually finish
+  # comfortably. The corpus this harness generates - probes or the standard
+  # 10k one - always writes exactly two observation bullets per engram
+  # (`generate.py`'s `engram_text`), so the average from whatever has already
+  # been scored this run is a sound estimate for what is left, not a guess
+  # tuned to one corpus shape.
   local elapsed=0 pending checked="" estimate drained_ok=""
   while [ "$elapsed" -lt "$DRAIN_LIMIT" ]; do
     kill -0 "$pid" 2> /dev/null || { echo "the daemon died after ${elapsed}s" >&2; break; }
@@ -492,19 +503,19 @@ print("true" if any(a.get("kind") == "contradictions" for a in d.get("activity",
 import re, sys
 log, pending = sys.argv[1], int(sys.argv[2])
 ansi = re.compile(r"\x1b\[[0-9;]*m")
-ms = batches = 0
+ms = pairs = 0
 for raw in open(log, encoding="utf-8", errors="replace"):
     line = ansi.sub("", raw)
     if "scored related pairs for possible contradictions" not in line:
         continue
     m_ms = re.search(r"\bms=(\d+)", line)
-    m_batches = re.search(r"\bbatches=(\d+)", line)
-    if not (m_ms and m_batches):
+    m_pairs = re.search(r"\bpairs=(\d+)", line)
+    if not (m_ms and m_pairs):
         continue
     ms += int(m_ms.group(1))
-    batches += int(m_batches.group(1))
-if batches:
-    print(int(pending * 64 * 2 / 16 * ms / batches / 1000))
+    pairs += int(m_pairs.group(1))
+if pairs:
+    print(int(pending * ms / pairs / 1000))
 PY
 )"
       if [ -n "$estimate" ]; then

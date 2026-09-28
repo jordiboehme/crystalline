@@ -218,13 +218,15 @@ def report(dump: dict, sidecar: list, langs=None, log=None, rss_path=None) -> di
 
 def markdown(r: dict) -> str:
     lines = [f"## {r['profile']} ({r['model']})", "", f"planted pairs: {r['planted']}", ""]
-    no_row_reason = (
-        "below the store floor (0.5) - expected for a negative probe, not a gap"
-        if r.get("drained", True)
-        else "still pending or below the store floor - the drain did not finish, so these are indistinguishable"
-    )
+    if r.get("drained", True):
+        no_row_note = (
+            "on a negative this means the model correctly scored it below the store floor (0.5), not a gap; "
+            "on a flip it means the model missed it - a real recall loss, not a cap or threshold effect"
+        )
+    else:
+        no_row_note = "the drain did not finish, so this may still be pending rather than scored below the floor"
     lines += [f"coverage (missed the cap or the related-pair line, never a candidate): {r['coverage']['uncandidated']}",
-              f"coverage (candidate, no stored row: {no_row_reason}): {r['coverage']['no_stored_row']}", ""]
+              f"coverage (candidate, no stored row - {no_row_note}): {r['coverage']['no_stored_row']}", ""]
     if not r.get("drained", True):
         lines += ["**PARTIAL: the backlog had not drained within DRAIN_LIMIT; every number below undercounts.**", ""]
     for how in ("mean", "min"):
