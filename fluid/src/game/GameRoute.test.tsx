@@ -34,6 +34,7 @@ import {
   expect,
   it,
   vi,
+  type Mock,
   type MockInstance,
 } from "vitest";
 
@@ -46,7 +47,8 @@ import {
   meResponse,
   userFixture,
 } from "../test/harness";
-import { INVERT_KEY, type SessionOptions } from "./session";
+import { INVERT_KEY, type Session, type SessionOptions } from "./session";
+import type { LiftStop } from "./world/types";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -79,6 +81,18 @@ const made = vi.hoisted(() => ({
   options: [] as SessionOptions[],
   /** The reader's "open in Fluid" handler the route last handed its view. */
   openFluid: null as (() => void) | null,
+}));
+
+/**
+ * A seam for the one test that needs to report a lift without walking the
+ * player to one and facing it (M3 Task 12 fix round 1): when set, the
+ * session mock below hands the route this stub instead of a real session,
+ * so the test can call the route's own `onLift` and watch `ride` and
+ * `closeLift` rather than drive the real fixture-facing input path. Every
+ * other test leaves this null and gets the real session, as before.
+ */
+const sessionStub = vi.hoisted(() => ({
+  factory: null as ((opts: SessionOptions) => Session) | null,
 }));
 
 // The real view, with the reader's F handler kept, so a test can press it
@@ -114,6 +128,11 @@ vi.mock("./session", async (importOriginal) => {
     ...actual,
     createSession: (opts: Parameters<typeof actual.createSession>[0]) => {
       made.options.push(opts);
+      if (sessionStub.factory !== null) {
+        const session = sessionStub.factory(opts);
+        made.sessions.push({ disposed: false });
+        return session;
+      }
       const session = actual.createSession({
         ...opts,
         navigate: (path: string) => {
@@ -340,6 +359,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  sessionStub.factory = null;
 });
 
 /**
@@ -359,6 +379,49 @@ async function typeWord(word: string) {
 }
 
 const LEVELS = { name: "Jump to a domain" } as const;
+const LIFT = { name: "Choose a stop" } as const;
+
+/** Two stops, the second the one the lift stands at: enough to pick from. */
+function liftStops(): LiftStop[] {
+  return [
+    { label: "Alpha", to: { kind: "airlock" }, key: false, here: false },
+    { label: "Bridge", to: { kind: "airlock" }, key: false, here: true },
+  ];
+}
+
+/**
+ * A stub session for the lift-wiring test: every method not under test is a
+ * plain spy, and `ride`/`closeLift` are the two spies the test itself holds
+ * (declared before the route is rendered, so reading them back afterward
+ * never runs into the narrowing a `let` reassigned only inside this factory
+ * would). `closeLift`'s spy still calls `opts.onLift?.(null)` on its way
+ * out, exactly what the real session's `closeLift` does, so the overlay
+ * this test opened by hand also closes by hand.
+ */
+function stubSession(
+  opts: SessionOptions,
+  spies: {
+    ride: Mock<(stop: number) => void>;
+    closeLift: Mock<() => void>;
+  },
+): Session {
+  return {
+    go: vi.fn(),
+    showCanned: vi.fn(),
+    showRoom: vi.fn(),
+    closeReader: vi.fn(),
+    jump: vi.fn(),
+    closeLevels: vi.fn(),
+    ride: spies.ride,
+    closeLift: () => {
+      spies.closeLift();
+      opts.onLift?.(null);
+    },
+    dispose: vi.fn(),
+    current: null,
+    where: null,
+  };
+}
 
 describe("GameRoute", () => {
   it("mounts on the raw π prefix too, not only its encoding", async () => {
@@ -667,6 +730,55 @@ describe("GameRoute", () => {
       expect(lastRoom()).toBe("beta");
     });
     await settle(500);
+    view.unmount();
+  });
+
+  it("mounts the lift overlay from the session's onLift, rides a pick with its stops index, and closes on Esc", async () => {
+    // Mutation caught: `onLift: setLift` dropped from the session options
+    // (the overlay never appears - `findByRole` below times out), the
+    // route's `ride` callback not reaching `session.ride` (the spy sees no
+    // call, or the wrong index), and the route's `closeLift` callback not
+    // reaching `session.closeLift` (the spy sees no call, and the overlay
+    // stays up past Esc). Driven through a stub session (`stubSession`)
+    // rather than a real one facing a real lift fixture: reaching a real
+    // lift needs the player walked and turned to face it through the
+    // movement path, which `session.test.ts`'s `atDeckLift` reaches with a
+    // test-only `showRoom` override not available at this route level; the
+    // stub reports a lift the way the real session's `openLift` would,
+    // through the very `onLift` option this test is proving is wired.
+    gl.available = true;
+    serve();
+    const rideSpy = vi.fn<(stop: number) => void>();
+    const closeLiftSpy = vi.fn<() => void>();
+    sessionStub.factory = (opts) =>
+      stubSession(opts, { ride: rideSpy, closeLift: closeLiftSpy });
+    const view = renderAt("/%CF%80");
+    await waitFor(() => {
+      expect(made.options.length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("dialog", LIFT)).toBeNull();
+
+    act(() => {
+      made.options.at(-1)?.onLift?.({ stops: liftStops(), note: null });
+    });
+    const dialog = await screen.findByRole("dialog", LIFT);
+    const options = within(dialog).getAllByRole("option");
+    expect(options.map((o) => o.firstElementChild?.textContent)).toEqual([
+      "Alpha",
+      "Bridge",
+    ]);
+    expect(within(options[1]!).getByText("HERE")).toBeInTheDocument();
+
+    // A pick rides with its own index in the stops array (1: "Bridge"),
+    // not a position in whatever the overlay currently shows.
+    fireEvent.click(options[1]!);
+    expect(rideSpy).toHaveBeenCalledTimes(1);
+    expect(rideSpy).toHaveBeenCalledWith(1);
+
+    const field = within(dialog).getByRole("textbox", { name: "Stop name" });
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(closeLiftSpy).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", LIFT)).toBeNull();
     view.unmount();
   });
 
