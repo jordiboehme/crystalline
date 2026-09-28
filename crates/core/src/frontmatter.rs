@@ -1,6 +1,7 @@
 //! Frontmatter as top-level key blocks: the pure pieces the three-way merge
-//! of an engram text, verify's `E010` and doctor's repair of a repeated key
-//! share.
+//! of an engram text ([`merge_text`], used by the pull in crystalline-remote
+//! and by the co-editing session's external change), verify's `E010` and
+//! doctor's repair of a repeated key share.
 //!
 //! A block is one top-level key: its key line plus every following line that
 //! does not start a new key (indented lines, `-` items, blank and comment
@@ -300,6 +301,294 @@ pub fn line_list(lines: &[usize]) -> String {
     }
 }
 
+/// What [`merge_frontmatter`] made of three sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontmatterMerge<'a> {
+    /// The merged frontmatter, delimiters included (upstream's), and the
+    /// three bodies the caller still has to merge.
+    Clean {
+        /// Opening delimiter, merged keys, closing delimiter.
+        head: String,
+        /// The base body: the whole base when it has no frontmatter, empty
+        /// when there is no base.
+        base_body: &'a str,
+        /// The local body.
+        local_body: &'a str,
+        /// The upstream body.
+        upstream_body: &'a str,
+    },
+    /// The sides collide on this key (`None`: on the preamble).
+    Conflict {
+        /// The key both sides changed differently.
+        key: Option<String>,
+    },
+    /// The frontmatter cannot be merged by key; merge the whole text.
+    NotApplicable,
+}
+
+#[derive(Default)]
+struct Prepared {
+    preamble: String,
+    blocks: Vec<KeyBlock>,
+}
+
+enum Refusal {
+    StepAside,
+    Conflict(String),
+}
+
+/// One side ready to merge: cut, repeats with one value collapsed to the
+/// first copy, and checked that the blocks read together say what they say
+/// one by one (the guard against a wrong cut).
+fn prepare(yaml: &str) -> Result<Prepared, Refusal> {
+    let KeyBlocks { preamble, blocks } = key_blocks(yaml).ok_or(Refusal::StepAside)?;
+    if let Some(differs) = repeats(&blocks).into_iter().find(|d| !d.same_value) {
+        return Err(Refusal::Conflict(differs.key));
+    }
+    let kept: Vec<KeyBlock> = without_repeats(&blocks, Keep::First)
+        .into_iter()
+        .cloned()
+        .collect();
+    if !consistent(&preamble, &kept) {
+        return Err(Refusal::StepAside);
+    }
+    Ok(Prepared {
+        preamble,
+        blocks: kept,
+    })
+}
+
+fn consistent(preamble: &str, blocks: &[KeyBlock]) -> bool {
+    if blocks.is_empty() {
+        return true;
+    }
+    let mut joined = preamble.to_string();
+    for block in blocks {
+        joined.push_str(&block.text);
+    }
+    match serde_yaml_ng::from_str::<Value>(&joined) {
+        Ok(Value::Mapping(mapping)) => mapping
+            .into_iter()
+            .map(|(k, v)| (key_text(&k), v))
+            .eq(blocks.iter().map(|b| (b.key.clone(), b.value.clone()))),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Lf,
+    CrLf,
+}
+
+/// The one line ending a frontmatter section uses, or `None` when it mixes.
+fn ending(section: &str) -> Option<Ending> {
+    let mut seen = None;
+    for line in section.split_inclusive('\n').filter(|l| l.ends_with('\n')) {
+        let this = if line.ends_with("\r\n") {
+            Ending::CrLf
+        } else {
+            Ending::Lf
+        };
+        match seen {
+            None => seen = Some(this),
+            Some(before) if before != this => return None,
+            Some(_) => {}
+        }
+    }
+    Some(seen.unwrap_or(Ending::Lf))
+}
+
+fn head_of<'a>(source: &'a str, parts: &FrontmatterParts<'a>) -> &'a str {
+    &source[..source.len() - parts.body.len()]
+}
+
+/// The three-way rule on plain text: local unchanged or equal to upstream
+/// takes upstream, upstream unchanged takes local, anything else collides.
+fn settle(base: &str, local: &str, upstream: &str) -> Option<String> {
+    if local == upstream || local == base {
+        Some(upstream.to_string())
+    } else if upstream == base {
+        Some(local.to_string())
+    } else {
+        None
+    }
+}
+
+fn find<'s>(blocks: &'s [KeyBlock], key: &str) -> Option<&'s KeyBlock> {
+    blocks.iter().find(|b| b.key == key)
+}
+
+fn value_of(block: Option<&KeyBlock>) -> Option<&Value> {
+    block.map(|b| &b.value)
+}
+
+fn text_of(block: Option<&KeyBlock>) -> Option<&str> {
+    block.map(|b| b.text.as_str())
+}
+
+/// Upstream's key order, with each key only local has placed right after its
+/// nearest preceding local key (first when it has none).
+fn key_order(local: &[KeyBlock], upstream: &[KeyBlock]) -> Vec<String> {
+    let mut order: Vec<String> = upstream.iter().map(|b| b.key.clone()).collect();
+    let mut after: Option<usize> = None;
+    for block in local {
+        match order.iter().position(|k| *k == block.key) {
+            Some(at) => after = Some(at),
+            None => {
+                let at = after.map_or(0, |a| a + 1);
+                order.insert(at, block.key.clone());
+                after = Some(at);
+            }
+        }
+    }
+    order
+}
+
+/// The spec's per-key table: `Ok(Some(text))` writes that block, `Ok(None)`
+/// drops the key, `Err(())` is a conflict.
+fn pick(
+    base: Option<&KeyBlock>,
+    local: Option<&KeyBlock>,
+    upstream: Option<&KeyBlock>,
+    line_merge: LineMerge<'_>,
+) -> Result<Option<String>, ()> {
+    let owned = |text: Option<&str>| text.map(str::to_string);
+    if value_of(local) == value_of(upstream) {
+        // Same value: upstream's spelling, unless only local re-spelled it.
+        if text_of(upstream) == text_of(base) && text_of(local) != text_of(base) {
+            return Ok(owned(text_of(local)));
+        }
+        return Ok(owned(text_of(upstream)));
+    }
+    if value_of(local) == value_of(base) {
+        return Ok(owned(text_of(upstream)));
+    }
+    if value_of(upstream) == value_of(base) {
+        return Ok(owned(text_of(local)));
+    }
+    if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
+        && let Some(merged) = line_merge(&b.text, &l.text, &u.text)
+        && let Some(cut) = key_blocks(&merged)
+        && cut.preamble.is_empty()
+        && cut.blocks.len() == 1
+        && cut.blocks[0].key == l.key
+    {
+        return Ok(Some(merged));
+    }
+    Err(())
+}
+
+/// Merge three frontmatters key by key (see the module doc and the spec's
+/// per-key table). `base` is `None` when both sides added the file.
+pub fn merge_frontmatter<'a>(
+    base: Option<&'a str>,
+    local: &'a str,
+    upstream: &'a str,
+    line_merge: LineMerge<'_>,
+) -> FrontmatterMerge<'a> {
+    let (Some(l), Some(u)) = (split_frontmatter(local), split_frontmatter(upstream)) else {
+        return FrontmatterMerge::NotApplicable;
+    };
+    let b = base.and_then(split_frontmatter);
+    let base_body = match (base, b) {
+        (_, Some(parts)) => parts.body,
+        (Some(text), None) => text,
+        (None, None) => "",
+    };
+    let mut endings = vec![ending(head_of(local, &l)), ending(head_of(upstream, &u))];
+    if let (Some(text), Some(parts)) = (base, b) {
+        endings.push(ending(head_of(text, &parts)));
+    }
+    if endings.iter().any(Option::is_none) || endings.windows(2).any(|w| w[0] != w[1]) {
+        return FrontmatterMerge::NotApplicable;
+    }
+    let sides = (
+        b.map_or_else(|| Ok(Prepared::default()), |parts| prepare(parts.yaml)),
+        prepare(l.yaml),
+        prepare(u.yaml),
+    );
+    // A side that cannot be cut makes the whole frontmatter step aside
+    // before any side's repeat can call a conflict (the spec's order).
+    let (bs, ls, us) = match sides {
+        (Ok(bs), Ok(ls), Ok(us)) => (bs, ls, us),
+        (Err(Refusal::StepAside), _, _)
+        | (_, Err(Refusal::StepAside), _)
+        | (_, _, Err(Refusal::StepAside)) => return FrontmatterMerge::NotApplicable,
+        (Err(Refusal::Conflict(key)), _, _)
+        | (_, Err(Refusal::Conflict(key)), _)
+        | (_, _, Err(Refusal::Conflict(key))) => {
+            return FrontmatterMerge::Conflict { key: Some(key) };
+        }
+    };
+    let Some(preamble) = settle(&bs.preamble, &ls.preamble, &us.preamble) else {
+        return FrontmatterMerge::Conflict { key: None };
+    };
+    let mut head = String::from(u.open);
+    head.push_str(&preamble);
+    for key in key_order(&ls.blocks, &us.blocks) {
+        match pick(
+            find(&bs.blocks, &key),
+            find(&ls.blocks, &key),
+            find(&us.blocks, &key),
+            line_merge,
+        ) {
+            Ok(Some(text)) => head.push_str(&text),
+            Ok(None) => {}
+            Err(()) => return FrontmatterMerge::Conflict { key: Some(key) },
+        }
+    }
+    head.push_str(u.close);
+    FrontmatterMerge::Clean {
+        head,
+        base_body,
+        local_body: l.body,
+        upstream_body: u.body,
+    }
+}
+
+/// What [`merge_text`] made of three texts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergedText {
+    /// Write this.
+    Clean(String),
+    /// Leave the local text alone and record a conflict.
+    Conflict,
+}
+
+/// Three-way merge of an engram text: the frontmatter key by key, the body
+/// with `line_merge`, and the whole text with `line_merge` when the
+/// frontmatter cannot be merged by key. A clean result that no longer parses
+/// while local and upstream both did is a conflict: a merge never makes a
+/// parseable file unparseable.
+pub fn merge_text(
+    base: Option<&str>,
+    local: &str,
+    upstream: &str,
+    line_merge: LineMerge<'_>,
+) -> MergedText {
+    let merged = match merge_frontmatter(base, local, upstream, line_merge) {
+        FrontmatterMerge::Clean {
+            head,
+            base_body,
+            local_body,
+            upstream_body,
+        } => settle(base_body, local_body, upstream_body)
+            .or_else(|| line_merge(base_body, local_body, upstream_body))
+            .map(|body| head + &body),
+        FrontmatterMerge::Conflict { .. } => None,
+        FrontmatterMerge::NotApplicable => line_merge(base.unwrap_or(""), local, upstream),
+    };
+    match merged {
+        Some(text) if !breaks_parse(local, upstream, &text) => MergedText::Clean(text),
+        _ => MergedText::Conflict,
+    }
+}
+
+fn breaks_parse(local: &str, upstream: &str, merged: &str) -> bool {
+    parse_engram(local).is_ok() && parse_engram(upstream).is_ok() && parse_engram(merged).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +740,271 @@ mod tests {
         assert_eq!(line_list(&[5]), "5");
         assert_eq!(line_list(&[3, 12]), "3 and 12");
         assert_eq!(line_list(&[3, 7, 12]), "3, 7 and 12");
+    }
+
+    #[test]
+    fn collapse_refuses_when_the_collapsed_source_still_does_not_parse() {
+        let source =
+            "---\ntitle: T\ndomain_name: eng\ndomain_name: eng\n---\n\nBody \0 with a null byte.\n";
+        assert_eq!(
+            collapse_duplicate_keys(source, None),
+            Collapse::NotRepairable,
+            "the repeats agree, but the null byte in the body still breaks the parse"
+        );
+    }
+
+    #[test]
+    fn a_tab_after_a_sequence_dash_is_not_a_new_key() {
+        // Tested on the line classifier itself: the YAML parser rejects a tab
+        // after `-`, so a whole cut refuses such a block either way.
+        assert!(!starts_key("-\titem"));
+        assert!(starts_key("title: T"));
+    }
+
+    /// A line merge that only settles the trivial cases, so every test below
+    /// that expects a clean result proves the key rules did the work.
+    fn trivial(base: &str, local: &str, upstream: &str) -> Option<String> {
+        if local == upstream || local == base {
+            Some(upstream.to_string())
+        } else if upstream == base {
+            Some(local.to_string())
+        } else {
+            None
+        }
+    }
+
+    const SCOTTY: &str = "---\ntype: manifest\ntitle: Scotty\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\n---\n\n# Scotty\n\n## Scope\n\n- Engineering\n";
+
+    fn with(text: &str, after: &str, line: &str) -> String {
+        text.replacen(after, &format!("{after}{line}"), 1)
+    }
+
+    #[test]
+    fn a_key_both_sides_added_with_one_value_lands_once_in_upstreams_place() {
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(upstream.clone())
+        );
+    }
+
+    #[test]
+    fn a_key_both_sides_added_with_different_values_is_a_conflict_naming_it() {
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty-eng\n");
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
+            FrontmatterMerge::Conflict {
+                key: Some("domain_name".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_key_deleted_on_one_side_and_changed_on_the_other_is_a_conflict() {
+        let local = SCOTTY.replace("status: stable\n", "");
+        let upstream = SCOTTY.replace("status: stable", "status: archived");
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
+            FrontmatterMerge::Conflict {
+                key: Some("status".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_key_deleted_on_one_side_and_unchanged_on_the_other_is_gone() {
+        let local = SCOTTY.replace("status: stable\n", "");
+        let upstream = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let expected = with(&local, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_key_only_local_added_follows_its_local_predecessor_and_upstream_spelling_stays() {
+        let local = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        let upstream = SCOTTY.replace("status: stable", "status: 'archived'");
+        let expected = with(&upstream, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn an_upstream_respelling_of_an_equal_value_wins() {
+        let local = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let upstream = SCOTTY.replace("status: stable", "status: 'stable'");
+        let expected = with(&upstream, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_comment_only_local_added_survives_an_upstream_change() {
+        let local = with(
+            SCOTTY,
+            "permalink: manifest\n",
+            "# ask kim before renaming\n",
+        );
+        let upstream = SCOTTY.replace("status: stable", "status: archived");
+        let expected = with(
+            &upstream,
+            "permalink: manifest\n",
+            "# ask kim before renaming\n",
+        );
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_repeat_already_in_local_is_repaired_when_upstream_moves() {
+        let base = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        let local = with(&base, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(&base, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_text(Some(&base), &local, &upstream, &trivial),
+            MergedText::Clean(upstream.clone())
+        );
+    }
+
+    #[test]
+    fn a_repeat_with_different_values_in_one_side_is_a_conflict() {
+        let local = with(SCOTTY, "status: stable\n", "status: archived\n");
+        let upstream = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
+            FrontmatterMerge::Conflict {
+                key: Some("status".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_side_that_cannot_be_cut_steps_aside_before_a_repeat_conflicts() {
+        let local = SCOTTY.replace("title: Scotty", "title: \"Scotty");
+        let upstream = with(SCOTTY, "status: stable\n", "status: archived\n");
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
+            FrontmatterMerge::NotApplicable
+        );
+    }
+
+    #[test]
+    fn a_list_changed_on_both_sides_merges_through_the_line_merge() {
+        let local = SCOTTY.replace("  - manifest\n", "  - manifest\n  - c\n");
+        let upstream = SCOTTY.replace("tags:\n  - manifest\n", "tags:\n  - z\n  - manifest\n");
+        let block_merge = |b: &str, l: &str, u: &str| {
+            if b == "tags:\n  - manifest\n" {
+                Some("tags:\n  - z\n  - manifest\n  - c\n".to_string())
+            } else {
+                trivial(b, l, u)
+            }
+        };
+        let expected = SCOTTY.replace(
+            "tags:\n  - manifest\n",
+            "tags:\n  - z\n  - manifest\n  - c\n",
+        );
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &block_merge),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_block_line_merge_that_spills_into_another_key_is_a_conflict() {
+        let local = SCOTTY.replace("  - manifest\n", "  - manifest\n  - c\n");
+        let upstream = SCOTTY.replace("tags:\n  - manifest\n", "tags:\n  - z\n  - manifest\n");
+        let spilling = |b: &str, l: &str, u: &str| {
+            if b == "tags:\n  - manifest\n" {
+                Some("tags:\n  - z\nowner: kim\n".to_string())
+            } else {
+                trivial(b, l, u)
+            }
+        };
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &spilling),
+            FrontmatterMerge::Conflict {
+                key: Some("tags".into())
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_line_endings_step_aside() {
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let upstream =
+            with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
+            FrontmatterMerge::NotApplicable
+        );
+    }
+
+    #[test]
+    fn crlf_on_every_side_merges_and_keeps_crlf() {
+        let base = SCOTTY.replace('\n', "\r\n");
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        let upstream =
+            with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        assert_eq!(
+            merge_text(Some(&base), &local, &upstream, &trivial),
+            MergedText::Clean(upstream.clone())
+        );
+    }
+
+    #[test]
+    fn a_side_without_frontmatter_steps_aside() {
+        assert_eq!(
+            merge_frontmatter(Some(SCOTTY), "# plain\n", SCOTTY, &trivial),
+            FrontmatterMerge::NotApplicable
+        );
+    }
+
+    #[test]
+    fn a_base_without_frontmatter_counts_as_an_empty_one() {
+        let base = "\n# Scotty\n\n## Scope\n\n- Engineering\n";
+        let local = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge_text(Some(base), &local, SCOTTY, &trivial),
+            MergedText::Clean(local.clone())
+        );
+    }
+
+    #[test]
+    fn both_sides_added_the_file_keys_on_one_side_merge() {
+        let local = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge_text(None, &local, SCOTTY, &trivial),
+            MergedText::Clean(local.clone())
+        );
+    }
+
+    #[test]
+    fn a_clean_line_merge_that_breaks_the_parse_is_a_conflict() {
+        let breaking = |_: &str, _: &str, _: &str| Some("---\na: 1\na: 2\n---\n".to_string());
+        assert_eq!(
+            merge_text(Some("base\n"), "local\n", "upstream\n", &breaking),
+            MergedText::Conflict
+        );
+    }
+
+    #[test]
+    fn the_safety_net_stays_quiet_when_an_input_already_did_not_parse() {
+        let broken_local = "---\ntitle: \"T\n---\n\nlocal\n";
+        let merged = "---\ntitle: \"T\n---\n\nmerged\n";
+        let fixed = |_: &str, _: &str, _: &str| Some(merged.to_string());
+        assert_eq!(
+            merge_text(Some("base\n"), broken_local, "upstream\n", &fixed),
+            MergedText::Clean(merged.to_string())
+        );
     }
 }
