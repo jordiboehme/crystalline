@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { LOOKS } from "../render/looks";
 import { normals, positions } from "../render/modelChecks";
+import { HOUSING_DEPTH } from "../render/models/doors";
 import { buildPropMesh } from "../render/models/props";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "./canned";
 import {
   CRATE_FACES,
   DECAL_CAP,
   DECAL_RATES,
+  DOOR_DEPTH,
   HAZARD_MACHINES,
   STREAK_SOURCES,
   bayNumber,
@@ -15,7 +17,12 @@ import {
   placeDecals,
 } from "./decals";
 import decalsSource from "./decals.ts?raw";
-import { FOOTPRINTS, heroFootprint, propFootprint } from "./footprints";
+import {
+  FOOTPRINTS,
+  HERO_FRONT,
+  heroFootprint,
+  propFootprint,
+} from "./footprints";
 import { generateRoom, withHeroes } from "./generate";
 import { heroReserve } from "./heroes";
 import { wallRuns } from "./layout";
@@ -27,12 +34,14 @@ import {
   fitsFloor,
   inside,
   overlaps,
+  wallAnchor,
 } from "./sites";
 import type {
   Box,
   Decal,
   FloorPropKind,
   PlaceInput,
+  Prop,
   PropKind,
   Rect,
   RoomSpec,
@@ -79,6 +88,27 @@ function floorBox(d: Decal): Box {
   return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
 }
 
+/**
+ * The index of the prop a face decal lies on: the floor prop with a flat
+ * face (`CRATE_FACES`) at the decal's turn whose face point, `prop +
+ * HERO_FRONT[turn] * (depth / 2 - inset) / CELL`, is the decal's; -1 for
+ * none.
+ */
+function faceProp(room: RoomSpec, d: Decal): number {
+  const [fx, fz] = HERO_FRONT[d.turn] ?? [0, -1];
+  return room.props.findIndex((p) => {
+    if (p.anchor !== "floor" || p.turn % 4 !== d.turn) return false;
+    const face = CRATE_FACES[p.kind as FloorPropKind]?.[p.variant];
+    const size = FOOTPRINTS.prop[p.kind as FloorPropKind][p.variant];
+    if (!face || !size) return false;
+    const out = (size.depth / 2 - face.inset) / CELL;
+    return (
+      Math.abs(p.x + fx * out - d.x) < 1e-3 &&
+      Math.abs(p.y + fz * out - d.y) < 1e-3
+    );
+  });
+}
+
 /** True when a box lies wholly inside a rectangle of cells. */
 function within(r: Rect, b: Box): boolean {
   return (
@@ -93,7 +123,9 @@ describe("decal placement (2.7 Task 10)", () => {
   it("never lays a wall decal on an edge that carries text, a fixture or a reservation (2.7 C16)", () => {
     // Mutation caught: a smear on an edge with a sign plate, a streak on an
     // edge whose prop is no source, a decal on a fixture's or a wall hero's
-    // edge, or a stencil moved off its empty edge.
+    // edge, a stencil moved off its empty edge, or a smear or streak that
+    // runs past its own edge onto the next one (over a door frame or a
+    // sign plate there).
     const all = rooms(120);
     let walls = 0;
     for (const room of all) {
@@ -106,6 +138,10 @@ describe("decal placement (2.7 Task 10)", () => {
       for (const d of room.decals) {
         if (d.on !== "wall") continue;
         walls++;
+        expect(Math.abs(d.along) + d.width / 2).toBeLessThanOrEqual(
+          CELL / 2 + 1e-9,
+        );
+        expect(d.h).toBeGreaterThanOrEqual(0);
         const e = edgeKey(edgeOf(d));
         expect(sites.fixtureEdges.has(e)).toBe(false);
         expect(reserved.has(e)).toBe(false);
@@ -351,6 +387,100 @@ describe("decal placement (2.7 Task 10)", () => {
     expect(decals).toEqual(placeDecals(rest));
     expect(decals).not.toEqual(g.decals);
   });
+
+  it("lays a face decal only on a crate's flat face whose front is clear (2.7 C14, C16)", () => {
+    // Mutation caught: a face decal on a face pressed against a touching
+    // cluster neighbour, a taken box or a hero (the strip check dropped),
+    // on a crate with no flat face or a marked crate, or off its face's
+    // flat band.
+    let faces = 0;
+    for (const room of rooms(40)) {
+      const sites = dressingSites(room);
+      const heroes = room.heroes.map((h) => heroFootprint(h));
+      const boxes = room.props.map(propFootprint);
+      for (const d of room.decals) {
+        if (d.on !== "face") continue;
+        faces++;
+        const [fx, fz] = HERO_FRONT[d.turn] ?? [0, -1];
+        const i = faceProp(room, d);
+        expect(i).toBeGreaterThanOrEqual(0);
+        const prop = room.props[i]!;
+        expect(prop.kind).not.toBe("marked-crate");
+        const face = CRATE_FACES[prop.kind as FloorPropKind]![prop.variant]!;
+        const size = FOOTPRINTS.prop[prop.kind as FloorPropKind][prop.variant]!;
+        expect(d.h).toBeGreaterThanOrEqual(face.h0 - 1e-9);
+        expect(d.h + d.length).toBeLessThanOrEqual(face.h1 + 1e-9);
+        expect(d.width).toBeLessThanOrEqual(size.width - 2 * face.inset);
+        const own = boxes[i]!;
+        const strip: Box =
+          fx > 0
+            ? { ...own, x0: own.x1, x1: own.x1 + 0.05 }
+            : fx < 0
+              ? { ...own, x0: own.x0 - 0.05, x1: own.x0 }
+              : fz > 0
+                ? { ...own, z0: own.z1, z1: own.z1 + 0.05 }
+                : { ...own, z0: own.z0 - 0.05, z1: own.z0 };
+        boxes.forEach((b, j) => {
+          if (j !== i && b !== null) expect(overlaps(strip, b)).toBe(false);
+        });
+        for (const b of [...sites.taken, ...heroes])
+          expect(overlaps(strip, b)).toBe(false);
+      }
+    }
+    expect(faces).toBeGreaterThan(100);
+    // The dressing never stands a prop against a crate's face, so the
+    // blocked case is made by hand: a small crate touching the front of a
+    // crate that carries a face decal.
+    const g = generateRoom({ ...CANNED_HUB, status: "archived" });
+    const d0 = g.decals.find((d) => d.on === "face");
+    expect(d0).toBeDefined();
+    const host = g.props[faceProp(g, d0!)]!;
+    const own = propFootprint(host)!;
+    const [fx, fz] = HERO_FRONT[d0!.turn] ?? [0, -1];
+    const cx =
+      fx > 0 ? own.x1 + 0.4 : fx < 0 ? own.x0 - 0.4 : (own.x0 + own.x1) / 2;
+    const cz =
+      fz > 0 ? own.z1 + 0.4 : fz < 0 ? own.z0 - 0.4 : (own.z0 + own.z1) / 2;
+    const blocker: Prop = {
+      kind: "crate",
+      variant: 0,
+      anchor: "floor",
+      x: cx / CELL,
+      y: cz / CELL,
+      turn: 0,
+      seed: 0,
+    };
+    const pressed = placeDecals({ ...g, props: [...g.props, blocker] });
+    expect(
+      pressed.some((d) => d.on === "face" && d.x === d0!.x && d.y === d0!.y),
+    ).toBe(false);
+  }, 30_000);
+
+  it("starts every door's chevron strip past the door's own depth (2.7 C14)", () => {
+    // Mutation caught: a strip laid under the door's housings, sill or
+    // lower leaf, or a door depth that no longer matches the models.
+    expect(DOOR_DEPTH).toBe(HOUSING_DEPTH);
+    let strips = 0;
+    for (const room of rooms(5)) {
+      for (const f of room.fixtures) {
+        if (f.kind !== "door" || f.style === "sliding") continue;
+        const a = wallAnchor(f.slot);
+        const [fx, fz] = HERO_FRONT[a.turn] ?? [0, -1];
+        const d = room.decals.find(
+          (c) =>
+            c.kind === "chevrons" &&
+            c.on === "floor" &&
+            c.turn === a.turn &&
+            Math.abs((c.x - a.x) * fz - (c.y - a.y) * fx) < 1e-3,
+        );
+        expect(d).toBeDefined();
+        const out = ((d!.x - a.x) * fx + (d!.y - a.y) * fz) * CELL;
+        expect(out - d!.length / 2).toBeGreaterThan(DOOR_DEPTH);
+        strips++;
+      }
+    }
+    expect(strips).toBeGreaterThan(0);
+  }, 30_000);
 
   it("cuts a full room down to the cap from the floor stains up, never a strip, an arrow or a stencil (2.7 C17)", () => {
     // Mutation caught: no cap at all, or a cap that drops streaks, smears,

@@ -15,14 +15,16 @@
  *    `(entrance.x + 0.5, entrance.y - 1.0)` reading walking in (turn 0),
  *    1.0 by 0.3 m, or at `entrance.y - 0.5` when that box is not clear: a
  *    lane cell outside the interior band that nothing takes, so a room
- *    always has exactly one. Each overflow bay's `BAY mA` to `BAY mD` at
+ *    always has exactly one (the fallback is still checked, and the tests
+ *    pin that it is always clear). Each overflow bay's `BAY mA` to `BAY mD` at
  *    the bay's centre, reading from the hall (turn 3), when its box is
  *    clear. The numbers are `deckNumber` and `bayNumber` (C18). All the
  *    stencils of a room share one seed (they draw nothing), so the sort
  *    keeps them in place order and the bay letters run A to D.
- * 2. **Chevrons** (C14), in fixture order: a strip 1.6 by 0.3 m from 0.1
- *    to 0.4 m out in front of every bulkhead and blast door, sealed or
- *    not, and a strip the machine's width by 0.3 m, from 0.2 to 0.5 m in
+ * 2. **Chevrons** (C14), in fixture order: a strip 1.6 by 0.3 m in front
+ *    of every bulkhead and blast door, sealed or not, starting
+ *    `DOOR_GAP` past the door's own depth (`DOOR_DEPTH`), so the door's
+ *    housings, sill and leaves never bury it, and a strip the machine's width by 0.3 m, from 0.2 to 0.5 m in
  *    front of its footprint, before every `HAZARD_MACHINES` machine; each
  *    only when its box is clear. The tile (variant) is drawn.
  * 3. **Arrows** (C14), 0.6 by 0.9 m, pointing the way out: in each bay one
@@ -277,6 +279,19 @@ const RANK = {
 const STREAK_GAP = 0.02;
 /** A source whose bottom is lower than this hangs no streak, in metres. */
 const STREAK_MIN = 0.35;
+/**
+ * How far a bulkhead or blast door stands out from its wall at floor
+ * level, in metres: the housing depth of the door models
+ * (`HOUSING_DEPTH` in `render/models/doors.ts`, copied by hand since the
+ * generator side cannot import `render/`). A door takes no floor
+ * (`footprintOf` is null), so the clear check cannot see it; without
+ * this a chevron strip would lie mostly under the bulkhead's sill and
+ * side housings and the blast door's lower leaf. `decals.test.ts` pins it
+ * against the render constant.
+ */
+export const DOOR_DEPTH = 0.29;
+/** The gap between a door's front and its chevron strip, in metres. */
+const DOOR_GAP = 0.03;
 /** How deep the strip in front of a crate's face must be clear, in metres. */
 const FACE_STRIP = 0.05;
 /** A face decal is this much narrower than its face, in metres. */
@@ -432,12 +447,9 @@ export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
     length: 0.3,
     stencil: text(0, 1),
   });
-  if (!layFloor(fixed, lane(ent.y - 1.0))) {
-    // A lane cell outside the interior band, which nothing takes.
-    const r = rounded(lane(ent.y - 0.5));
-    laid.push(floorBox(r));
-    fixed.push(r);
-  }
+  // The fallback is a lane cell outside the interior band, which nothing
+  // takes; it is checked all the same, and the tests pin that it is laid.
+  if (!layFloor(fixed, lane(ent.y - 1.0))) layFloor(fixed, lane(ent.y - 0.5));
   room.bays.forEach((bay, i) => {
     layFloor(fixed, {
       ...stencil,
@@ -474,7 +486,7 @@ export function placeDecals(room: DecalBase, cap = DECAL_CAP): Decal[] {
   };
   for (const f of room.fixtures) {
     if (f.kind === "door" && f.style !== "sliding")
-      strip(f.slot, 1.6, 0.1, "door");
+      strip(f.slot, 1.6, DOOR_DEPTH + DOOR_GAP, "door");
     else if (f.kind === "machine" && HAZARD_MACHINES.includes(f.machine)) {
       const size = FOOTPRINTS.machine[f.machine];
       strip(f.slot, size.along, size.out + 0.2, "machine");
