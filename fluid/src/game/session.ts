@@ -202,9 +202,11 @@
  * `jump` on the level select's jump. `answer` from an answering console
  * (`answers`, M4 C25): once per visit, after the player has faced it
  * (`focusOf`, never while modal) for `ANSWER_WAIT_MS` without looking
- * away, placed at its wall point; every entry starts the visit over. Nothing is sent while paused (the
- * tick returns first) or after `dispose`; suspending the sound under the
- * pause is the host's, which hears of it through `onPause`.
+ * away, placed at its wall point, never while a place loads; every entry
+ * starts the visit over, and so do the pause and a hidden tab. Nothing is
+ * sent while paused (the tick returns first) or after `dispose`;
+ * suspending the sound under the pause is the host's, which hears of it
+ * through `onPause`.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
@@ -901,6 +903,12 @@ export function createSession(opts: SessionOptions): Session {
     if (e.key !== "Escape" || e.repeat || e.defaultPrevented) return;
     if (document.pointerLockElement !== canvas) pause();
   };
+  // A hidden tab stops the loop while the clock runs on: the answering
+  // console's wait starts over, as after the pause (M4 C25).
+  const onVisibility = () => {
+    if (document.visibilityState === "hidden") answering = null;
+  };
+  document.addEventListener("visibilitychange", onVisibility);
   // Only a host that shows the pause (`onPause`) gets one: the look demo
   // and the model gallery never pass it, and a pause nobody can end would
   // freeze them.
@@ -2363,6 +2371,7 @@ export function createSession(opts: SessionOptions): Session {
       // pauses nothing (F18).
       document.removeEventListener("pointerlockchange", onPauseLock);
       window.removeEventListener("keydown", onPauseKey);
+      document.removeEventListener("visibilitychange", onVisibility);
       canvas.removeEventListener("webglcontextlost", onLost);
       canvas.removeEventListener("webglcontextrestored", onRestored);
       input.dispose();

@@ -6,11 +6,11 @@
  * the signature sounds (`audio/effects.ts`, `audio/ambience.ts`,
  * `audio/signature.ts`); a click plays the patch on its bus (`busOf`: the
  * drones on `ambience`, the wheeze and the tones on `signature`, everything
- * else on `effects`) through a mixer of
- * the board's own, made and unlocked inside that first click. A looping
- * patch (a drone, the ride's hum) is a toggle: a second click stops it, and
- * `STOP ALL` stops every loop. The unmount stops everything and closes the
- * context. Mute is left out: the board is for hearing.
+ * else on `effects`) through a mixer of the board's own, made and unlocked
+ * inside that first click. A looping patch (a drone, the ride's hum) is a
+ * toggle: a second click stops it, and `STOP ALL` stops every loop. The
+ * unmount stops everything and closes the context. Mute is left out: the
+ * board is for hearing.
  *
  * Development only - the route that renders this (`/π/dev/sounds`) exists
  * only under `import.meta.env.DEV`, like the look demo and the gallery.

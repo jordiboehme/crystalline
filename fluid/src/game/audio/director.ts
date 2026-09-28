@@ -13,8 +13,9 @@
  *   (`box`, its take-off or its landing) and the five tones (`jump`, and
  *   `answer`, placed like a door; M4 C24, C25). A placed cue (a door, a
  *   fault, an answer) plays through a stereo panner at its pan into its
- *   bus, its voices scaled by its gain.
- *   At most `VOICE_CAP` patches play at once, the drone and the ride's hum
+ *   bus, its voices scaled by its gain. The tones never overlap: an
+ *   answer while they sound is dropped, a jump cuts them short. At most
+ *   `VOICE_CAP` patches play at once, the drone and the ride's hum
  *   counted; one more drops the oldest step or fault first (a 30 ms fade),
  *   and only when none is left the oldest other one-shot. The drone and the
  *   hum are never dropped, and starting either makes room the same way. A
@@ -100,6 +101,8 @@ interface ShotOptions {
   cheap?: boolean;
   /** The bus it plays on, `effects` unless given. */
   bus?: Bus;
+  /** Called once the shot has ended (or been stopped and faded). */
+  onEnd?: () => void;
 }
 
 /** The director over `mixer`. */
@@ -113,6 +116,8 @@ export function createDirector(mixer: Mixer): Director {
   let wanted: { ambience: Ambience; seed: number } | null = null;
   let drone: { ambience: Ambience; playing: PlayingPatch } | null = null;
   let hum: PlayingPatch | null = null;
+  /** The five tones while they sound (a jump's or an answer's). */
+  let tones: PlayingPatch | null = null;
   /** Whether a ride arrived and its chime waits for the room it lands in. */
   let chimeOwed = false;
   /** Whether the host suspended the sound (the pause, a hidden tab). */
@@ -145,7 +150,7 @@ export function createDirector(mixer: Mixer): Director {
   const start = (
     patch: Patch,
     bus: Bus,
-    { pan, gain = 1 }: ShotOptions = {},
+    { pan, gain = 1, onEnd: ended }: ShotOptions = {},
   ): PlayingPatch | null => {
     const ctx = mixer.ctx;
     const out = mixer.bus(bus);
@@ -168,11 +173,14 @@ export function createDirector(mixer: Mixer): Director {
           };
     if (panner !== null) panners.add(panner);
     const onEnd =
-      panner === null
+      panner === null && ended === undefined
         ? undefined
         : () => {
-            panner.disconnect();
-            panners.delete(panner);
+            if (panner !== null) {
+              panner.disconnect();
+              panners.delete(panner);
+            }
+            ended?.();
           };
     return playPatch(ctx, dest, played, ctx.currentTime, bus, onEnd);
   };
@@ -181,14 +189,41 @@ export function createDirector(mixer: Mixer): Director {
    * A one-shot on its bus (the effects unless given), under the cap;
    * dropped while not running.
    */
-  const shot = (patch: Patch, options: ShotOptions = {}) => {
+  const shot = (
+    patch: Patch,
+    options: ShotOptions = {},
+  ): PlayingPatch | null => {
     const ctx = mixer.ctx;
-    if (disposed || ctx === null || !mixer.running) return;
-    if (options.gain !== undefined && !(options.gain > 0)) return;
+    if (disposed || ctx === null || !mixer.running) return null;
+    if (options.gain !== undefined && !(options.gain > 0)) return null;
     makeRoom();
     const playing = start(patch, options.bus ?? "effects", options);
-    if (playing === null) return;
+    if (playing === null) return null;
     shots.push({ playing, cheap: options.cheap === true });
+    return playing;
+  };
+
+  /**
+   * The five tones, for a jump or an answer (M4 C24, C25). An answer while
+   * tones still sound is dropped (a console left and come straight back
+   * to, a second console in the room), so the motif never overlaps
+   * itself; a jump cuts sounding tones short (`evict`'s fade) and plays its
+   * own.
+   */
+  const playTones = (options: ShotOptions, jump: boolean) => {
+    if (tones !== null) {
+      if (!jump) return;
+      tones.stop();
+      tones = null;
+    }
+    const playing: PlayingPatch | null = shot(tonesPatch(), {
+      ...options,
+      bus: "signature",
+      onEnd: () => {
+        if (tones === playing) tones = null;
+      },
+    });
+    tones = playing;
   };
 
   /** Starts the wanted drone when there is none and a context to play it. */
@@ -267,10 +302,10 @@ export function createDirector(mixer: Mixer): Director {
         });
         return;
       case "jump":
-        shot(tonesPatch(), { bus: "signature" });
+        playTones({}, true);
         return;
       case "answer":
-        shot(tonesPatch(), { pan: c.pan, gain: c.gain, bus: "signature" });
+        playTones({ pan: c.pan, gain: c.gain }, false);
         return;
     }
   };
@@ -316,6 +351,7 @@ export function createDirector(mixer: Mixer): Director {
       shots = [];
       drone = null;
       hum = null;
+      tones = null;
       wanted = null;
       mixer.close();
     },

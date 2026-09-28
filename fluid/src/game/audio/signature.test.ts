@@ -144,6 +144,16 @@ describe("answers (M4 C25)", () => {
     expect(rate).toBeLessThan(0.027);
   });
 
+  // Mutation caught: a pick that is not the seed's (a random one, another
+  // seed path).
+  it("answers for known seeds and not for others", () => {
+    for (const seed of [42, 67, 82, 131])
+      expect(answers(terminal(seed))).toBe(true);
+    for (const seed of [0, 1, 41, 43, 100]) {
+      expect(answers(terminal(seed))).toBe(false);
+    }
+  });
+
   it("answers the same for the same fixture, and never for a door", () => {
     for (let seed = 0; seed < 500; seed++) {
       const f = terminal(seed);

@@ -5195,6 +5195,61 @@ describe("sound cues (M4 Task 7)", () => {
     expect(answered()).toHaveLength(1);
   });
 
+  it("never answers while a place loads (M4 C25)", () => {
+    // Mutation caught: the console timed while the room it stands in is
+    // being left.
+    const { room, at } = answeringBridge();
+    const { cues, sink } = recordSound();
+    const session = start({
+      client: null,
+      load: () => new Promise<LoadedStation>(() => undefined),
+      sound: sink,
+    });
+    session.showRoom(room, { pitch: 0 }, at);
+    frames(1);
+    expect(facingScope()).toBe(true);
+    until(now, 500);
+    session.go(engramAt("eng", "beta"));
+    until(now, ANSWER_WAIT_MS * 3);
+    expect(cues.filter((c) => c.kind === "answer")).toEqual([]);
+  });
+
+  it("starts the answering console's wait over after a hidden tab (M4 C25)", () => {
+    // Mutation caught: the time before the tab was hidden counted towards
+    // the wait (the console answering on the first tick back).
+    const { room, at } = answeringBridge();
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    const answered = () => cues.filter((c) => c.kind === "answer");
+    const visibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => state,
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      session.showRoom(room, { pitch: 0 }, at);
+      frames(1);
+      expect(facingScope()).toBe(true);
+      until(now, 1000);
+      // Hidden: no frames run while the clock goes on.
+      visibility("hidden");
+      now += 3000;
+      visibility("visible");
+      frames(1);
+      expect(facingScope()).toBe(true);
+      const t0 = now;
+      expect(answered()).toEqual([]);
+      until(t0, ANSWER_WAIT_MS - 100);
+      expect(answered()).toEqual([]);
+      until(t0, ANSWER_WAIT_MS);
+      expect(answered()).toHaveLength(1);
+    } finally {
+      Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
   it("sends the police box's take-off and landing, and the jump", async () => {
     // Mutation caught: the landing cue on any bridge arrival.
     const { cues, sink } = recordSound();

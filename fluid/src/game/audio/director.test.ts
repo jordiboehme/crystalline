@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CROSSFADE_S } from "./ambience";
+import type { Cue } from "./cues";
 import { RIDE_FADE_S, VOICE_CAP, createDirector } from "./director";
 import { createMixer, type Mixer } from "./mixer";
 import { midiHz } from "./patch";
@@ -111,6 +112,79 @@ describe("createDirector", () => {
     expect(panners[0]!.pan.value).toBeCloseTo(0.4, 9);
     expect(panners[0]!.connections).toEqual([bus(mixer, "signature")]);
     expect(levelsInto(ctx, panners[0]!)).toHaveLength(1);
+  });
+
+  // Mutation caught: take-off and landing swapped, the jump or the
+  // answer playing a wheeze.
+  it("plays the take-off, the landing and the tones for their cues (M4 C24)", () => {
+    const heard = (c: Cue) => {
+      const { ctx, director } = setup();
+      disposers.push(() => director.dispose());
+      director.cue(c);
+      return pitches(ctx);
+    };
+    const saw = 148.5;
+    const takeoff = heard({ kind: "box", phase: "takeoff" });
+    expect(takeoff).toContain(saw);
+    expect(takeoff).not.toContain(90);
+    const landing = heard({ kind: "box", phase: "landing" });
+    expect(landing).toContain(saw);
+    expect(landing).toContain(90);
+    for (const c of [
+      { kind: "jump" },
+      { kind: "answer", pan: 0, gain: 1 },
+    ] as const) {
+      const tones = heard(c);
+      expect(tones, c.kind).toContain(midiHz(67));
+      expect(tones, c.kind).toContain(midiHz(53 - 12));
+      expect(tones, c.kind).not.toContain(saw);
+    }
+  });
+
+  // Mutation caught: an answer played over tones still sounding (a
+  // console left and come straight back to, two consoles in one room), or
+  // the tones never forgotten once they end.
+  it("never plays an answer over tones still sounding (M4 C25)", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    const answer = (pan: number) => {
+      director.cue({ kind: "answer", pan, gain: 1 });
+    };
+    const tonesPlayed = () => ctx.ofKind("panner").length;
+    answer(0.2);
+    expect(tonesPlayed()).toBe(1);
+    // Left through a door and straight back: the same console again.
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({ kind: "room", ambience: "dim", seed: 2 });
+    answer(0.2);
+    expect(tonesPlayed()).toBe(1);
+    // A second console in the same room.
+    answer(-0.7);
+    expect(tonesPlayed()).toBe(1);
+    // Once the tones have ended, the next answer plays.
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    answer(-0.7);
+    expect(tonesPlayed()).toBe(2);
+  });
+
+  // Mutation caught: the jump's tones played over an answer's.
+  it("cuts an answer's tones short for the jump's", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "answer", pan: 0, gain: 1 });
+    const [first] = levelsInto(ctx, ctx.ofKind("panner")[0]!);
+    expect(first).toBeDefined();
+    expect(stopped(first!)).toBe(false);
+    director.cue({ kind: "jump" });
+    expect(stopped(first!)).toBe(true);
+    const jump = levelsInto(ctx, bus(mixer, "signature"));
+    expect(jump).toHaveLength(1);
+    expect(stopped(jump[0]!)).toBe(false);
+    // And an answer while the jump's tones play is dropped.
+    director.cue({ kind: "answer", pan: 0, gain: 1 });
+    expect(ctx.ofKind("panner")).toHaveLength(1);
   });
 
   // Mutation caught: a placed one-shot's panner left on the bus after the
