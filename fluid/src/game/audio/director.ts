@@ -4,12 +4,16 @@
  *
  * The session names moments (`audio/cues.ts`); the director picks their
  * patches (`audio/effects.ts`, `audio/ambience.ts`) and plays them on a bus
- * of the mixer (`audio/mixer.ts`), every effect on `effects` and the drone
- * on `ambience`:
+ * of the mixer (`audio/mixer.ts`), every effect on `effects`, the drone
+ * on `ambience` and the signature sounds (`audio/signature.ts`) on
+ * `signature`:
  *
  * - **One-shots.** A step, a door, a portal's or a hatch's travel, a
- *   fault, a terminal. A placed cue (a door, a fault) plays through a
- *   stereo panner at its pan into the bus, its voices scaled by its gain.
+ *   fault, a terminal; and on the signature bus the police box's wheeze
+ *   (`box`, its take-off or its landing) and the five tones (`jump`, and
+ *   `answer`, placed like a door; M4 C24, C25). A placed cue (a door, a
+ *   fault, an answer) plays through a stereo panner at its pan into its
+ *   bus, its voices scaled by its gain.
  *   At most `VOICE_CAP` patches play at once, the drone and the ride's hum
  *   counted; one more drops the oldest step or fault first (a 30 ms fade),
  *   and only when none is left the oldest other one-shot. The drone and the
@@ -44,8 +48,7 @@
  *
  * `suspend` and `resume` are the host's (the pause and a hidden tab);
  * `dispose` stops everything, takes the listeners down and closes the
- * mixer. The `box`, `jump` and `answer` cues are the signature sounds'
- * (M4 C24) and play nothing yet.
+ * mixer.
  */
 
 import { CROSSFADE_S, dronePatch } from "./ambience";
@@ -62,6 +65,7 @@ import {
 } from "./effects";
 import type { Bus, Mixer } from "./mixer";
 import type { Patch } from "./patch";
+import { landingPatch, takeoffPatch, tonesPatch } from "./signature";
 import { playPatch, type PlayingPatch } from "./synth";
 
 /** The most patches that play at once, the drone and the ride's hum counted. */
@@ -94,6 +98,8 @@ interface ShotOptions {
   pan?: number;
   gain?: number;
   cheap?: boolean;
+  /** The bus it plays on, `effects` unless given. */
+  bus?: Bus;
 }
 
 /** The director over `mixer`. */
@@ -171,13 +177,16 @@ export function createDirector(mixer: Mixer): Director {
     return playPatch(ctx, dest, played, ctx.currentTime, bus, onEnd);
   };
 
-  /** A one-shot on the effects bus, under the cap; dropped while not running. */
+  /**
+   * A one-shot on its bus (the effects unless given), under the cap;
+   * dropped while not running.
+   */
   const shot = (patch: Patch, options: ShotOptions = {}) => {
     const ctx = mixer.ctx;
     if (disposed || ctx === null || !mixer.running) return;
     if (options.gain !== undefined && !(options.gain > 0)) return;
     makeRoom();
-    const playing = start(patch, "effects", options);
+    const playing = start(patch, options.bus ?? "effects", options);
     if (playing === null) return;
     shots.push({ playing, cheap: options.cheap === true });
   };
@@ -253,8 +262,15 @@ export function createDirector(mixer: Mixer): Director {
         room(c.ambience, c.seed);
         return;
       case "box":
+        shot(c.phase === "takeoff" ? takeoffPatch() : landingPatch(), {
+          bus: "signature",
+        });
+        return;
       case "jump":
+        shot(tonesPatch(), { bus: "signature" });
+        return;
       case "answer":
+        shot(tonesPatch(), { pan: c.pan, gain: c.gain, bus: "signature" });
         return;
     }
   };

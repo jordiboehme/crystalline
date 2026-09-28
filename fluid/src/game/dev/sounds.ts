@@ -1,6 +1,7 @@
 /**
  * The sound board's list (`SoundBoard.tsx`): every patch the station plays
- * by a readable name, and the bus each plays on. Kept apart from the board
+ * by a readable name (the effects, the drones and the signature sounds),
+ * and the bus each plays on. Kept apart from the board
  * so its component module exports components only.
  */
 
@@ -17,6 +18,7 @@ import {
 } from "../audio/effects";
 import type { Bus } from "../audio/mixer";
 import type { Patch } from "../audio/patch";
+import { landingPatch, takeoffPatch, tonesPatch } from "../audio/signature";
 
 /** Every door sound, checked complete against the type. */
 const DOOR_SOUNDS = Object.keys({
@@ -51,9 +53,21 @@ export const SOUNDS: Record<string, () => Patch> = {
   ...Object.fromEntries(
     AMBIENCES.map((kind) => [`drone ${kind}`, () => dronePatch(kind, 1)]),
   ),
+  "wheeze takeoff": takeoffPatch,
+  "wheeze landing": landingPatch,
+  "five tones": tonesPatch,
 };
 
-/** The bus a patch plays on: a drone on the ambience, the rest on effects. */
+/** The signature sounds' patch names (M4 C24). */
+const SIGNATURES: ReadonlySet<string> = new Set(
+  [takeoffPatch(), landingPatch(), tonesPatch()].map((p) => p.name),
+);
+
+/**
+ * The bus a patch plays on: a drone on the ambience, the wheeze and the
+ * tones on the signature bus, the rest on effects.
+ */
 export function busOf(patch: Patch): Bus {
-  return patch.name.startsWith("drone") ? "ambience" : "effects";
+  if (patch.name.startsWith("drone")) return "ambience";
+  return SIGNATURES.has(patch.name) ? "signature" : "effects";
 }

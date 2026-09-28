@@ -17,6 +17,7 @@ import { ApiProblem, api } from "../api/client";
 import type { ChangeEvent, EngramChange } from "../api/events";
 import { COALESCE_MS } from "../events/ChangeStreamProvider";
 import type { Cue, SoundSink } from "./audio/cues";
+import { ANSWER_WAIT_MS, answers } from "./audio/signature";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
@@ -5078,6 +5079,84 @@ describe("sound cues (M4 Task 7)", () => {
     type("idclev");
     frames(1);
     expect(cues).toEqual([{ kind: "terminal" }]);
+  });
+
+  it("answers once per visit after the wait (M4 C25)", () => {
+    // Mutation caught: the timer not reset when the focus leaves, a cue
+    // per tick, the visit's answer not cleared on entry.
+    const built = generateRoom(CANNED_BRIDGE);
+    const index = built.fixtures.findIndex(
+      (f) => f.kind === "terminal" && f.heading === "Scope",
+    );
+    const scope = built.fixtures[index];
+    if (scope?.kind !== "terminal") throw new Error("no Scope terminal");
+    let seed = -1;
+    for (let s = 0; s < 10000 && seed < 0; s++) {
+      if (answers({ ...scope, seed: s })) seed = s;
+    }
+    expect(seed).toBeGreaterThanOrEqual(0);
+    const room: RoomSpec = {
+      ...built,
+      fixtures: built.fixtures.map((f, i) =>
+        i === index ? { ...f, seed } : f,
+      ),
+      spawn: wallFacingSpawn(scope.slot),
+    };
+    const at = engramAt(CANNED_BRIDGE.domain, CANNED_BRIDGE.permalink);
+    const { cues, sink } = recordSound();
+    const session = start({ client: null, sound: sink });
+    const answered = () => cues.filter((c) => c.kind === "answer");
+    /** Cranks until `ms` have passed since `from`. */
+    const until = (from: number, ms: number) => {
+      while (now - from < ms) frames(1);
+    };
+    const facing = () =>
+      hud.prompt.mock.calls.at(-1)?.[0] === "SPACE READ Scope";
+
+    session.showRoom(room, { pitch: 0 }, at);
+    frames(1);
+    expect(facing()).toBe(true);
+    let t0 = now;
+
+    // Faced for a while, then looked away and back: the wait starts over.
+    until(t0, 1000);
+    key("keydown", "ArrowLeft");
+    let turned = 0;
+    for (; turned < 60 && facing(); turned++) frames(1);
+    key("keyup", "ArrowLeft");
+    expect(facing()).toBe(false);
+    expect(answered()).toEqual([]);
+    // Back the same way, from the first tick it is in focus again.
+    key("keydown", "ArrowRight");
+    t0 = -1;
+    for (let i = 0; i < turned; i++) {
+      frames(1);
+      if (t0 < 0 && facing()) t0 = now;
+    }
+    key("keyup", "ArrowRight");
+    expect(facing()).toBe(true);
+    until(t0, ANSWER_WAIT_MS - 100);
+    expect(answered()).toEqual([]);
+    until(t0, ANSWER_WAIT_MS);
+    expect(answered()).toHaveLength(1);
+    const cue = answered()[0] as Extract<Cue, { kind: "answer" }>;
+    expect(Math.abs(cue.pan)).toBeLessThan(0.3);
+    expect(cue.gain).toBeGreaterThan(0.5);
+
+    // Standing on: no second.
+    until(t0, ANSWER_WAIT_MS * 3);
+    expect(answered()).toHaveLength(1);
+
+    // Entered again: one more, after the wait.
+    session.showRoom(room, { pitch: 0 }, at);
+    frames(1);
+    t0 = now;
+    until(t0, ANSWER_WAIT_MS - 100);
+    expect(answered()).toHaveLength(1);
+    until(t0, ANSWER_WAIT_MS);
+    expect(answered()).toHaveLength(2);
+    until(t0, ANSWER_WAIT_MS * 3);
+    expect(answered()).toHaveLength(2);
   });
 
   it("sends the police box's take-off and landing, and the jump", async () => {

@@ -2,9 +2,11 @@
  * SOUND BOARD: every patch the station plays, one button each, for
  * listening to them (M4 C28).
  *
- * `SOUNDS` (`dev/sounds.ts`) names every effect and every room's drone (`audio/effects.ts`,
- * `audio/ambience.ts`); a click plays the patch on its bus (`busOf`: the
- * drones on `ambience`, everything else on `effects`) through a mixer of
+ * `SOUNDS` (`dev/sounds.ts`) names every effect, every room's drone and
+ * the signature sounds (`audio/effects.ts`, `audio/ambience.ts`,
+ * `audio/signature.ts`); a click plays the patch on its bus (`busOf`: the
+ * drones on `ambience`, the wheeze and the tones on `signature`, everything
+ * else on `effects`) through a mixer of
  * the board's own, made and unlocked inside that first click. A looping
  * patch (a drone, the ride's hum) is a toggle: a second click stops it, and
  * `STOP ALL` stops every loop. The unmount stops everything and closes the

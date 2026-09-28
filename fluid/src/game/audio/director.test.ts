@@ -88,6 +88,31 @@ describe("createDirector", () => {
     expect(Math.max(...peaks)).toBeCloseTo(0.25, 9);
   });
 
+  // Mutation caught: a signature sound played on the effects bus, or not
+  // at all.
+  it("plays the box, the jump and the answer on the signature bus (M4 C24)", () => {
+    for (const c of [
+      { kind: "box", phase: "takeoff" },
+      { kind: "box", phase: "landing" },
+      { kind: "jump" },
+    ] as const) {
+      const { ctx, mixer, director } = setup();
+      disposers.push(() => director.dispose());
+      director.cue(c);
+      expect(levelsInto(ctx, bus(mixer, "signature")), c.kind).toHaveLength(1);
+      expect(levelsInto(ctx, bus(mixer, "effects")), c.kind).toHaveLength(0);
+    }
+    // The answer is placed: through a panner into the signature bus.
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "answer", pan: 0.4, gain: 0.8 });
+    const panners = ctx.ofKind("panner") as FakePanner[];
+    expect(panners).toHaveLength(1);
+    expect(panners[0]!.pan.value).toBeCloseTo(0.4, 9);
+    expect(panners[0]!.connections).toEqual([bus(mixer, "signature")]);
+    expect(levelsInto(ctx, panners[0]!)).toHaveLength(1);
+  });
+
   // Mutation caught: a placed one-shot's panner left on the bus after the
   // shot ended (disconnected only when a later one-shot prunes it).
   it("disconnects a door's panner once the door has sounded", () => {

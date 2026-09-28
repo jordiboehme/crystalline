@@ -38,9 +38,13 @@ afterEach(() => {
   contexts.length = 0;
 });
 
+/** The signature sounds (M4 C24), on their own bus. */
+const SIGNATURES = ["wheeze takeoff", "wheeze landing", "five tones"];
+
 describe("SOUNDS", () => {
   // Mutation caught: a door, a direction or a room kind left off the board
-  // (never heard before the ear check).
+  // (never heard before the ear check), a signature sound on the effects
+  // bus.
   it("lists every door both ways, every effect and every drone", () => {
     const names = Object.keys(SOUNDS);
     for (const sound of ["sliding", "bulkhead", "blast", "exit", "box"]) {
@@ -59,13 +63,18 @@ describe("SOUNDS", () => {
       "fault portal",
       "ride depart",
       "ride arrive",
+      ...SIGNATURES,
     ]) {
       expect(names).toContain(name);
     }
     for (const [name, make] of Object.entries(SOUNDS)) {
       expect(make().voices.length, name).toBeGreaterThan(0);
       expect(busOf(make()), name).toBe(
-        name.startsWith("drone") ? "ambience" : "effects",
+        name.startsWith("drone")
+          ? "ambience"
+          : SIGNATURES.includes(name)
+            ? "signature"
+            : "effects",
       );
     }
   });

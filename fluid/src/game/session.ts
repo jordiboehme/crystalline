@@ -199,7 +199,10 @@
  * load error or a new place), so the ride's hum never outlasts it. `box`
  * `takeoff` on the cut into the console room, and `landing` when the
  * console room's exit lands on a bridge with the arrival box standing.
- * `jump` on the level select's jump. Nothing is sent while paused (the
+ * `jump` on the level select's jump. `answer` from an answering console
+ * (`answers`, M4 C25): once per visit, after the player has faced it
+ * (`focusOf`, never while modal) for `ANSWER_WAIT_MS` without looking
+ * away, placed at its wall point; every entry starts the visit over. Nothing is sent while paused (the
  * tick returns first) or after `dispose`; suspending the sound under the
  * pause is the host's, which hears of it through `onPause`.
  */
@@ -212,10 +215,12 @@ import {
   ambienceOf,
   doorCues,
   faultCues,
+  placeCue,
   stepsBetween,
   type Cue,
   type SoundSink,
 } from "./audio/cues";
+import { ANSWER_WAIT_MS, answers } from "./audio/signature";
 import { createCheatReader } from "./core/cheat";
 import { createInput } from "./core/input";
 import { createLoop, type Clock } from "./core/loop";
@@ -794,6 +799,13 @@ export function createSession(opts: SessionOptions): Session {
    * from since (`steppedAway`).
    */
   let boxLatched: number | null = null;
+  /**
+   * The answering console in focus and since when (the session's clock),
+   * null while none is (M4 C25).
+   */
+  let answering: { index: number; since: number } | null = null;
+  /** The consoles that answered this visit, by fixture index. */
+  let answered = new Set<number>();
   /** Aborts the listing read for the console room's visit. */
   let listing: AbortController | null = null;
   /** Gives up on the listing after `LISTING_WAIT_MS`; null when not waiting. */
@@ -1093,6 +1105,8 @@ export function createSession(opts: SessionOptions): Session {
     latched = null;
     boxLatched = null;
     exitLatched = false;
+    answering = null;
+    answered = new Set();
     liftAt = null;
     const exit = room.fixtures.findIndex((f) => f.kind === "exit");
     upLatched = exit < 0 ? null : exit;
@@ -1946,6 +1960,37 @@ export function createSession(opts: SessionOptions): Session {
     return out;
   };
 
+  /**
+   * The answering console (M4 C25): the terminal in `focus` that `answers`
+   * and has not answered this visit is timed, the wait starting over
+   * whenever the focus leaves it; after `ANSWER_WAIT_MS` it sends `answer`,
+   * placed at its wall point, once.
+   */
+  const listenForAnswer = (focus: ReturnType<typeof focusOf>) => {
+    const fixture =
+      room === null || focus === null ? undefined : room.fixtures[focus.index];
+    if (
+      focus === null ||
+      fixture === undefined ||
+      player === null ||
+      !answers(fixture) ||
+      answered.has(focus.index)
+    ) {
+      answering = null;
+      return;
+    }
+    const t = now();
+    if (answering?.index !== focus.index) {
+      answering = { index: focus.index, since: t };
+      return;
+    }
+    if (t - answering.since < ANSWER_WAIT_MS) return;
+    answered.add(focus.index);
+    answering = null;
+    const w = wallPoint(fixture.slot);
+    cue({ kind: "answer", ...placeCue(player, w.x, w.z) });
+  };
+
   const tick = () => {
     ticks++;
     // A ride whose load settled early lands once it has lasted
@@ -2130,6 +2175,7 @@ export function createSession(opts: SessionOptions): Session {
     setPrompt(
       modal() || loading ? null : (focus?.prompt ?? boxAt?.prompt ?? null),
     );
+    listenForAnswer(loading ? null : focus);
 
     if (!loading && !modal()) {
       const travel = travelOf(room, player, doors, failed, shut);
