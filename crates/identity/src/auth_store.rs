@@ -5062,7 +5062,10 @@ mod tests {
     /// The quiet lookup answers what `session_user` answers and writes
     /// nothing. Catches a lookup that stamped `last_seen_at` (every open tab
     /// would read as a fresh sighting) or pruned (a write per check), and
-    /// one that let a disabled account or an expired session through.
+    /// one that let an expired session or a disabled account through. The
+    /// account is disabled under its session row here: `set_disabled`
+    /// deletes the sessions with it, so only a row an older build left
+    /// behind reaches the filter, and the filter is what keeps it out.
     #[tokio::test]
     async fn the_quiet_session_lookup_reads_without_writing() {
         let (_dir, store) = store().await;
@@ -5110,6 +5113,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(user.role, Role::Viewer, "the stored role, read now");
+        disable_keeping_sessions(&store, "ada").await;
+        assert!(
+            store
+                .session_user_quiet(&live.token)
+                .await
+                .unwrap()
+                .is_none(),
+            "a disabled account's surviving session row answers none"
+        );
+    }
+
+    /// Flag `name` disabled and leave its session rows alone, the state a
+    /// file written before disabling revoked sessions can hold.
+    async fn disable_keeping_sessions(store: &AuthStore, name: &str) {
+        let _guard = store.guard.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE users SET disabled = 1 WHERE name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .unwrap();
     }
 
     /// `ensure_session` issues at most one session per account: the first call

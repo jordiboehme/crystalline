@@ -64,6 +64,17 @@ async fn serve(anonymous: bool, read_only: bool) -> Fixture {
 /// [`serve`], with `eng` reviewing changes when `review` is set, so a write
 /// lands in the writer's own draft.
 async fn serve_with(anonymous: bool, read_only: bool, review: bool) -> Fixture {
+    serve_config(anonymous, read_only, review, None).await
+}
+
+/// [`serve_with`], with `trusted_header` naming the header a proxy asserts
+/// the account in when it is set.
+async fn serve_config(
+    anonymous: bool,
+    read_only: bool,
+    review: bool,
+    trusted_header: Option<&str>,
+) -> Fixture {
     scratch_home();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -71,6 +82,7 @@ async fn serve_with(anonymous: bool, read_only: bool, review: bool) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             anonymous: Some(anonymous),
+            trusted_header: trusted_header.map(str::to_string),
             ..AuthConfig::default()
         }),
         ..GlobalConfig::default()
@@ -731,6 +743,35 @@ async fn a_streams_refresh_writes_nothing_to_the_accounts_store() {
         seen,
         "the idle re-check and the refresh left last_seen_at alone"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_header_stream_outlives_its_re_checks_until_the_account_is_disabled() {
+    // The header-mode arm of the quiet re-check. Catches a re-check that
+    // looked for a session cookie in this mode, where the proxy's header is
+    // the whole credential (every stream would end after ten seconds and
+    // reconnect, over and over), and one that let a disabled account keep
+    // its stream.
+    let fx = serve_config(false, false, false, Some("x-remote-user")).await;
+    let mut resp = client()
+        .get(format!("http://{}/api/v1/events", fx.addr))
+        .header("accept", "text/event-stream")
+        .header("x-remote-user", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(PAST_TTL).await;
+    fx.engine
+        .edit_engram(&edit("eng", "alpha", "past one re-check"))
+        .await
+        .unwrap();
+    let frames = read_frames(&mut resp, 1, Duration::from_secs(3)).await;
+    assert_eq!(frames.len(), 1, "the stream is still open: {frames:?}");
+    assert_eq!(frames[0].event, "engram");
+    fx.auth.set_disabled("ada", true).await.unwrap();
+    let (seen, ended) = read_to_end(&mut resp, PAST_TTL + Duration::from_secs(2)).await;
+    assert!(ended, "the disabled account's stream ends: {seen:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
