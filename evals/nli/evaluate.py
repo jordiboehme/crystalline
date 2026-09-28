@@ -189,11 +189,16 @@ def report(dump: dict, sidecar: list, langs=None, log=None, rss_path=None) -> di
     out["speed"] = speed(log)
     out["rss"] = rss(rss_path)
     out["wall_seconds"] = dump.get("wall_seconds")
+    # Absent (an older dump) reads as fully drained, never as partial by
+    # default: a dump that stopped early always says so explicitly.
+    out["drained"] = dump.get("drained", True)
     return out
 
 
 def markdown(r: dict) -> str:
     lines = [f"## {r['profile']} ({r['model']})", "", f"planted pairs: {r['planted']}", ""]
+    if not r.get("drained", True):
+        lines += ["**PARTIAL: the backlog had not drained within DRAIN_LIMIT; every number below undercounts.**", ""]
     for how in ("mean", "min"):
         m = r[how]
         lines += [f"### {how} of both orders", "", f"line reaching 0.9 precision: {m['threshold_at_precision_0_9']}", ""]

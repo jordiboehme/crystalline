@@ -817,6 +817,7 @@ def plant_contradictions(out: Path, seed: int, count: int) -> list:
     root.mkdir(parents=True, exist_ok=True)
     (root / "MANIFEST.md").write_text(manifest_text(PROBES), encoding="utf-8")
     items = []
+    used_bullets: set[str] = set()
     for kind, table, stem in (("flip", PLANT_FLIPS, "Contradiction probe"), ("negative", PLANT_NEGATIVES, "Consistency probe")):
         for i in range(count):
             lang = plant_lang(i)
@@ -829,7 +830,21 @@ def plant_contradictions(out: Path, seed: int, count: int) -> list:
             paragraph = f"{title} records how the {en} is run. " + " ".join(
                 sentence(rng) for _ in range(2)
             )
-            shared = f"This is probe {i:04d} of the {stem.lower()} set, written for the contradiction measurement"
+            # A drawn sentence, not a templated "probe 0002"/"probe 0003" string:
+            # two of those would differ only by a number, which is exactly the
+            # shape a number-flip probe is planted to catch, and reading every
+            # pair of probes as a number-flip contradiction would drown the
+            # measurement in noise that proves nothing. Rejection-sampled
+            # against every bullet already used in this run: the vocabulary is
+            # large but finite, and a birthday-paradox collision is not rare
+            # enough to ignore at a few hundred probes (measured: two
+            # collisions in 800 draws with no resampling). Resampling keeps the
+            # sentence varied and keeps generation deterministic - the same
+            # seed retries in the same order and lands on the same result.
+            shared = sentence(rng)
+            while shared in used_bullets:
+                shared = sentence(rng)
+            used_bullets.add(shared)
             ends = []
             for side, text in zip("ab", texts):
                 side_title = f"{title} {side}"

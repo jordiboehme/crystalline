@@ -49,6 +49,7 @@ SAMPLE_EVERY=10    # seconds between resident-size samples
 NLI_PROFILE="full"
 NLI_LIFT="yes"
 NLI_UNLOAD_WAIT="${NLI_UNLOAD_WAIT:-960}"   # seconds to keep sampling after the drain, for the idle drop
+NLI_SEED_MODELS="${NLI_SEED_MODELS:-}"   # a directory already holding this profile's checkpoint, hf-hub cache shape
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -411,13 +412,28 @@ print(len(json.load(open(sys.argv[1]))))' "$CORPUS/contradictions.json")"
   rm -f "$daemon_log"
 
   # A model cache of this profile's own, seeded with a clone of the embedding
-  # model so the stage measures scoring rather than a download.
+  # model so the stage measures scoring rather than a download. Checked (and
+  # seeded) per checkpoint, not only when the whole directory is missing, so a
+  # rerun that reuses an existing $models still gets the NLI checkpoint copied
+  # in the first time it is needed. NLI_SEED_MODELS, when set, points at a
+  # directory already holding this profile's own checkpoint (the hf-hub cache
+  # shape, `models--<org>--<name>`) - without it a first run of a given
+  # profile still downloads that one checkpoint, exactly like a real install.
   local models="$OUT/models-$profile"
-  if [ ! -d "$models" ]; then
-    mkdir -p "$models"
-    for d in "$CRYSTALLINE_MODELS_DIR"/models--ibm-granite--*; do
-      [ -d "$d" ] && { cp -Rc "$d" "$models/" 2> /dev/null || cp -R "$d" "$models/"; }
-    done
+  mkdir -p "$models"
+  local granite_dir
+  for granite_dir in "$CRYSTALLINE_MODELS_DIR"/models--ibm-granite--*; do
+    [ -d "$granite_dir" ] || continue
+    [ -d "$models/$(basename "$granite_dir")" ] || {
+      cp -Rc "$granite_dir" "$models/" 2> /dev/null || cp -R "$granite_dir" "$models/"
+    }
+  done
+  if [ -n "$NLI_SEED_MODELS" ]; then
+    local hub_name="models--${repo//\//--}"
+    if [ -d "$NLI_SEED_MODELS/$hub_name" ] && [ ! -d "$models/$hub_name" ]; then
+      cp -Rc "$NLI_SEED_MODELS/$hub_name" "$models/" 2> /dev/null \
+        || cp -R "$NLI_SEED_MODELS/$hub_name" "$models/"
+    fi
   fi
 
   local rss="$OUT/nli-$profile-rss.csv" stop="$OUT/.nli-sampler-stop"
@@ -506,7 +522,11 @@ PY
     sleep "$SAMPLE_EVERY"
     elapsed=$((elapsed + SAMPLE_EVERY))
   done
-  local drained="$elapsed"
+  local drained="$elapsed" fully_drained="true"
+  if [ "$elapsed" -ge "$DRAIN_LIMIT" ]; then
+    fully_drained="false"
+    echo "the contradiction backlog did not drain within ${DRAIN_LIMIT}s; the dump below is partial" >&2
+  fi
   run_step "ctl-status-nli-$profile" "$BIN" ctl status
   echo "sampling ${NLI_UNLOAD_WAIT}s more for the idle drop"
   sleep "$NLI_UNLOAD_WAIT"
@@ -518,9 +538,9 @@ PY
 
   # Every stored row and every scored pair, with texts and cosines, read
   # straight off the index file once the daemon has let go of it.
-  python3 - "$DB" "$repo" "$profile" "$drained" "$OUT/nli-$profile.json" <<'PY'
+  python3 - "$DB" "$repo" "$profile" "$drained" "$OUT/nli-$profile.json" "$fully_drained" <<'PY'
 import json, sqlite3, sys
-db, repo, profile, drained, out = sys.argv[1:6]
+db, repo, profile, drained, out, fully_drained = sys.argv[1:7]
 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
 rows = con.execute(
     """SELECT d.name, ea.permalink, eb.permalink, c.line_a, c.line_b, c.score_ab, c.score_ba,
@@ -547,6 +567,7 @@ json.dump(
         "profile": profile,
         "model": repo,
         "wall_seconds": int(drained),
+        "drained": fully_drained == "true",
         "rows": [dict(zip(keys, r)) for r in rows],
         "pairs": [dict(zip(["domain", "a", "b", "cosine"], p)) for p in pairs],
     },
@@ -554,7 +575,8 @@ json.dump(
     ensure_ascii=False,
     indent=1,
 )
-print(f"dumped {len(rows)} rows over {len(pairs)} scored pairs to {out}")
+note = "" if fully_drained == "true" else " (PARTIAL: the backlog had not drained)"
+print(f"dumped {len(rows)} rows over {len(pairs)} scored pairs to {out}{note}")
 PY
   printf '%s,%s,%s,%s,%s\n' "$STAGE" "nli-$profile-drain" 0 "$drained" \
     "$(awk -F, 'NR > 1 && $2 != "" && $2 + 0 > m { m = $2 + 0 } END { printf "%.1f", m }' "$rss")" >> "$CSV"
