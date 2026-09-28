@@ -268,8 +268,9 @@ export function undressedRoom(place: PlaceInput): RoomSpec {
  * room, its curios replaced by `placeCurios` run again on the same room with
  * `forcedCurioDraws(kind)` in place of the room's own draws. Curios never
  * move anything else, and the decals never read them, so nothing here
- * needs re-dressing or new decals the way `roomWithForcedHero` does. `placed` is `kind` when it landed (it found a
- * host among the room's own surfaces), else null: the caller reads it to
+ * needs re-dressing or new decals the way `roomWithForcedHero` does.
+ * `placed` is `kind` when it landed (it found a host among the room's own
+ * surfaces), else null: the caller reads it to
  * decide whether to say so on the HUD.
  */
 export function roomWithForcedCurio(

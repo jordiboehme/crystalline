@@ -3130,8 +3130,8 @@ const GLASS_CASE = {
  * holding four panes of pale glass (`CASE_GLASS`) that stop short of the
  * plinth and the cap, a core glowing in a beam between two emitter dishes
  * (held on thin rods, the beam shows as bright bands in the gaps), and a
- * square cap with a port and a conduit to the wall. The ring round the cap's port carries
- * the tag's second accent.
+ * square cap with a port and a conduit to the wall. The ring round the
+ * cap's port carries the tag's second accent.
  */
 function glassCase({ k, s, hue, out, accent2 }: Recipe) {
   const G = GLASS_CASE;
@@ -3284,8 +3284,8 @@ function twinCells({ k, s, ctx, hue, half, out, accent2 }: Recipe) {
 
 /**
  * The recipes of every machine kind, one per variant (2.7 C2): entry 0 is
- * variant 0, the kind's first model (2.7 C1), and `VARIANT_COUNTS.machine` says how many each
- * kind draws.
+ * variant 0, the kind's first model (2.7 C1), and `VARIANT_COUNTS.machine`
+ * says how many each kind draws.
  */
 const RECIPES: Record<MachineKind, readonly ((r: Recipe) => void)[]> = {
   workbench: [workbench, fitterBench, weldingBench],

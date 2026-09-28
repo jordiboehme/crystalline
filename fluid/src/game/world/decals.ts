@@ -20,8 +20,9 @@
  *    still checked, and the tests pin that it is always clear). Each
  *    overflow bay's `BAY mA` to `BAY mD` at the bay's centre, reading from
  *    the hall (turn 1: every bay lies east of the hall, so its top points
- *    east, away from the reader), when its box is clear. The numbers are `deckNumber` and `bayNumber` (C18). All the
- *    stencils of a room share one seed (they draw nothing), so the sort
+ *    east, away from the reader), when its box is clear. The numbers are
+ *    `deckNumber` and `bayNumber` (C18). All the stencils of a room share
+ *    one seed (they draw nothing), so the sort
  *    orders them by `y`, then `x`. A bay's letter is in `stencil.letter`,
  *    never read from the list order.
  * 2. **Chevrons** (C14), in fixture order: a strip 1.6 by 0.3 m in front

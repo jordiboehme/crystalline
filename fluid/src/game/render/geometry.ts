@@ -47,8 +47,9 @@
  * own. Every other room's full wall quads also carry the accent stripe
  * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
  * fixture edges, the entrance edge, lintels and the edges of the wall
- * props and heroes that lie under it (`UNDER_STRIPE`, the saucer poster). The models themselves are
- * built by the recipes in `models/`, with the modelling kit of `kit.ts`,
+ * props and heroes that lie under it (`UNDER_STRIPE`, the saucer poster).
+ * The models themselves are built by the recipes in `models/`, with the
+ * modelling kit of `kit.ts`,
  * and always keep `LAYER.panel` whatever the room's wall patterns. Last
  * come the room's decals (`buildDecals` in `models/decals.ts`, 2.7 C20,
  * C21): quads on the decal atlas with `FLAG.decal`, `DECAL_LIFT` off their
@@ -181,8 +182,8 @@ export function accentTint(k: number): Rgb {
  * The accent stripe (2.7 C9): a band 0.08 m tall, from `h0` to `h1`
  * metres, one `DECAL_LIFT` proud of every full wall quad of the hall, the
  * bays and the corridor, except fixture edges, the entrance edge, lintels
- * and the edges `UNDER_STRIPE` covers. It carries the accent mark, so it takes the room's accent in
- * every look.
+ * and the edges `UNDER_STRIPE` covers. It carries the accent mark, so it
+ * takes the room's accent in every look.
  */
 export const ACCENT_STRIPE = { h0: 1.2, h1: 1.28 } as const;
 
