@@ -49,6 +49,7 @@ import {
   spawnPlayer,
 } from "../world/move";
 import { wallAnchor } from "../world/sites";
+import { VARIANT_COUNTS } from "../world/variants";
 import type {
   Box,
   Curio,
@@ -892,22 +893,48 @@ describe("every catalogued under spot seen from a standing player", () => {
     "guide",
   ] as const;
 
-  /** Every under spot the tables catalogue, as `<host> v<variant> <j>`. */
+  /**
+   * Every under spot the tables catalogue, as `<host> v<variant> <j>`. The
+   * terminal's, a machine kind's and a decor kind's `FIXTURE_SURFACES` and
+   * `DECOR_SURFACES` entries hold for every one of that kind's variants
+   * (2.7 C3 keeps the footprint the recipes stand on), so each is fanned
+   * out over `VARIANT_COUNTS` here to match the variant a generated room's
+   * fixture or decor piece actually carries.
+   */
   function catalogued(): Set<string> {
     const out = new Set<string>();
     const terminal: readonly SurfaceSpec[] = FIXTURE_SURFACES.terminal;
     for (const [j, s] of terminal.entries())
-      if (s.cls === "under") out.add(`terminal v0 ${String(j)}`);
+      if (s.cls === "under")
+        for (let v = 0; v < VARIANT_COUNTS.terminal; v++)
+          out.add(`terminal v${String(v)} ${String(j)}`);
     const machines: Partial<Record<string, readonly SurfaceSpec[]>> =
       FIXTURE_SURFACES.machine;
     for (const [kind, specs] of Object.entries(machines))
       for (const [j, s] of (specs ?? []).entries())
-        if (s.cls === "under") out.add(`machine:${kind} v0 ${String(j)}`);
+        if (s.cls === "under")
+          for (
+            let v = 0;
+            v <
+            (VARIANT_COUNTS.machine[
+              kind as keyof typeof VARIANT_COUNTS.machine
+            ] ?? 1);
+            v++
+          )
+            out.add(`machine:${kind} v${String(v)} ${String(j)}`);
     const decor: Partial<Record<string, readonly SurfaceSpec[]>> =
       DECOR_SURFACES;
     for (const [kind, specs] of Object.entries(decor))
       for (const [j, s] of (specs ?? []).entries())
-        if (s.cls === "under") out.add(`decor:${kind} v0 ${String(j)}`);
+        if (s.cls === "under")
+          for (
+            let v = 0;
+            v <
+            (VARIANT_COUNTS.decor[kind as keyof typeof VARIANT_COUNTS.decor] ??
+              1);
+            v++
+          )
+            out.add(`decor:${kind} v${String(v)} ${String(j)}`);
     const props: Partial<Record<string, readonly (readonly SurfaceSpec[])[]>> =
       PROP_SURFACES;
     for (const [kind, variants] of Object.entries(props))

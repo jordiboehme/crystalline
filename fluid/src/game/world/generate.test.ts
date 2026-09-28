@@ -24,6 +24,7 @@ import {
 import { curioDrawsOf, placeCurios } from "./curios";
 import { HALL_CAP, isFloor } from "./layout";
 import { pickByRoll, skipNear } from "./sites";
+import { VARIANT_COUNTS, machineVariant, terminalVariant } from "./variants";
 import type {
   Archetype,
   Fixture,
@@ -632,6 +633,73 @@ describe("generateRoom determinism", () => {
       if (m?.kind === "machine") seen.add(m.machine);
     }
     expect(seen.size).toBe(MACHINE_KINDS.length);
+  });
+});
+
+describe("generated variants (2.7 Task 9)", () => {
+  it("gives a tag the same machine and variant in every room (Review Focus 2)", () => {
+    // 2.7 C4. Mutation caught: a machine variant keyed by the room's seed
+    // or the fixture's seed.
+    const other: PlaceInput = {
+      ...CANNED_WORKSHOP,
+      domain: "elsewhere",
+      permalink: "deep/down/boiler",
+      status: "archived",
+      type: "runbook",
+      tags: ["reactor", "zzz-1", "zzz-2", "zzz-3"],
+    };
+    const pick = (p: PlaceInput) =>
+      generateRoom(p).fixtures.find(
+        (f) => f.kind === "machine" && f.tag === "reactor",
+      );
+    const a = pick(CANNED_BRIDGE);
+    const b = pick(other);
+    expect(a?.kind).toBe("machine");
+    expect(b?.kind).toBe("machine");
+    if (a?.kind !== "machine" || b?.kind !== "machine") return;
+    expect(a.slot).not.toEqual(b.slot);
+    expect([b.machine, b.hue, b.variant]).toEqual([
+      a.machine,
+      a.hue,
+      a.variant,
+    ]);
+  });
+
+  it("spreads the variants: every variant of every kind turns up, none much more often than the others", () => {
+    // Mutation caught: a pick stuck on variant 0, or a modulo by the wrong
+    // count (a variant that never shows).
+    const tags = Array.from({ length: 3000 }, (_, i) => `t${String(i)}`);
+    const seen = new Map<string, number>();
+    for (const tag of tags) {
+      const kind = createRng(seedFor("tag-kind", tag)).pick(MACHINE_KINDS);
+      const key = `${kind}:${String(machineVariant(tag, kind))}`;
+      seen.set(key, (seen.get(key) ?? 0) + 1);
+    }
+    for (const kind of MACHINE_KINDS) {
+      const counts = Array.from(
+        { length: VARIANT_COUNTS.machine[kind] },
+        (_, v) => seen.get(`${kind}:${String(v)}`) ?? 0,
+      );
+      expect(counts.length).toBe(3);
+      const total = counts.reduce((s, n) => s + n, 0);
+      for (const n of counts) expect(n / total).toBeGreaterThan(0.22);
+    }
+  });
+
+  it("writes one variant per decor kind in a room, and each terminal's own", () => {
+    // Mutation caught: decor variants per piece, or terminals all sharing one.
+    const room = generateRoom(CANNED_HUB);
+    const byKind = new Map<string, Set<number>>();
+    for (const d of room.decor)
+      byKind.set(
+        d.kind,
+        (byKind.get(d.kind) ?? new Set()).add(d.variant ?? -1),
+      );
+    expect(byKind.size).toBeGreaterThan(0);
+    for (const vs of byKind.values()) expect(vs.size).toBe(1);
+    for (const f of room.fixtures)
+      if (f.kind === "terminal")
+        expect(f.variant).toBe(terminalVariant(f.seed));
   });
 });
 

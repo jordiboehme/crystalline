@@ -30,8 +30,15 @@
  * machine in every room - and every list is sorted before placement, so the
  * order the API happened to return things in never moves a door.
  *
- * The hall also gets its archetype's furniture (see `decorFor`), and the
- * grid is lit in blocks of four by four cells.
+ * A terminal and a machine also carry `variant` (2.7 C4, `variants.ts`): a
+ * terminal's from its own seed, a machine's from its tag alone (`tagAccent`
+ * and `machineModelSeed` read the same tag, so a tag's machine, its variant,
+ * its model details and its second accent are all identical wherever the
+ * tag turns up).
+ *
+ * The hall also gets its archetype's furniture (see `decorFor`), each piece
+ * also carrying `variant`, one per kind, shared by every piece of that kind
+ * in the room, and the grid is lit in blocks of four by four cells.
  *
  * 8. Last, the heroes and the set dressing. The heroes (`placeHeroes`,
  *    `heroes.ts`) stand after the scaffold and before the dressing, which
@@ -77,6 +84,7 @@ import { finishFor } from "./finish";
 import { decorFootprint } from "./footprints";
 import { HERO_ORDER, heroDraws, placeHeroes } from "./heroes";
 import { nearOf, type Neighbour } from "./neighbours";
+import { decorVariant, machineVariant, terminalVariant } from "./variants";
 import {
   dressingSites,
   type CurioBase,
@@ -297,6 +305,10 @@ function round3(v: number) {
  * A piece's seed is keyed by its kind and its index among pieces of that
  * kind. That is safe here, unlike for fixtures, because how many pieces
  * there are depends only on the hall's size, never on the content.
+ *
+ * Every piece also carries `variant` (2.7 C4, `decorVariant`): the room's
+ * seed and the piece's own kind, never its index, so every piece of one
+ * kind in a room shares its variant.
  */
 function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
   const band = {
@@ -319,6 +331,7 @@ function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
       y: round3(y),
       turn,
       seed: seedFor(roomSeed, "decor", kind, n),
+      variant: decorVariant(roomSeed, kind),
     });
   };
   switch (archetype) {
@@ -618,25 +631,29 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     headingsSeen.set(s.heading, nth + 1);
     const slot = take("west");
     if (slot === null) continue;
+    const terminalSeed = seedFor(seed, "terminal", s.heading, nth);
     fixtures.push({
       kind: "terminal",
       slot,
       heading: s.heading,
       lines: s.lines,
       section: nth,
-      seed: seedFor(seed, "terminal", s.heading, nth),
+      seed: terminalSeed,
+      variant: terminalVariant(terminalSeed),
     });
   }
   for (const tag of tags) {
     const slot = take("east");
     if (slot === null) continue;
+    const machine = createRng(seedFor("tag-kind", tag)).pick(MACHINE_KINDS);
     fixtures.push({
       kind: "machine",
       slot,
-      machine: createRng(seedFor("tag-kind", tag)).pick(MACHINE_KINDS),
+      machine,
       tag,
       hue: seedFor("tag-hue", tag) % 360,
       seed: seedFor(seed, "tag", tag),
+      variant: machineVariant(tag, machine),
     });
   }
   for (const h of inbound) {

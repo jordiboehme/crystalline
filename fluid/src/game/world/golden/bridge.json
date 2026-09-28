@@ -112,7 +112,8 @@
         "Decisions, runbooks and the odd warning about the reactor."
       ],
       "section": 0,
-      "seed": 2510781472804312
+      "seed": 2510781472804312,
+      "variant": 2
     },
     {
       "kind": "terminal",
@@ -127,7 +128,8 @@
         "Cargo questions go through the portal to logistics."
       ],
       "section": 0,
-      "seed": 5259207943204841
+      "seed": 5259207943204841,
+      "variant": 0
     },
     {
       "kind": "machine",
@@ -139,7 +141,8 @@
       "machine": "containment",
       "tag": "navigation",
       "hue": 196,
-      "seed": 1206274509564404
+      "seed": 1206274509564404,
+      "variant": 0
     },
     {
       "kind": "machine",
@@ -151,7 +154,8 @@
       "machine": "fabricator",
       "tag": "reactor",
       "hue": 152,
-      "seed": 5755076367619376
+      "seed": 5755076367619376,
+      "variant": 2
     },
     {
       "kind": "hatch",

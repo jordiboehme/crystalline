@@ -169,7 +169,8 @@
         "Close the valve upstream and bleed the line."
       ],
       "section": 0,
-      "seed": 783733759090979
+      "seed": 783733759090979,
+      "variant": 0
     },
     {
       "kind": "terminal",
@@ -183,7 +184,8 @@
         "Swap the seat, torque the bonnet to spec."
       ],
       "section": 0,
-      "seed": 472843725335067
+      "seed": 472843725335067,
+      "variant": 2
     },
     {
       "kind": "terminal",
@@ -197,7 +199,8 @@
         "Open slowly and watch the gauge for a minute."
       ],
       "section": 0,
-      "seed": 3769261221743828
+      "seed": 3769261221743828,
+      "variant": 1
     },
     {
       "kind": "machine",
@@ -209,7 +212,8 @@
       "machine": "fabricator",
       "tag": "gauges",
       "hue": 10,
-      "seed": 420821534596461
+      "seed": 420821534596461,
+      "variant": 2
     },
     {
       "kind": "machine",
@@ -221,7 +225,8 @@
       "machine": "lab-bench",
       "tag": "pressure",
       "hue": 293,
-      "seed": 1423880274236610
+      "seed": 1423880274236610,
+      "variant": 0
     },
     {
       "kind": "machine",
@@ -233,7 +238,8 @@
       "machine": "lab-bench",
       "tag": "safety",
       "hue": 17,
-      "seed": 8778174873098034
+      "seed": 8778174873098034,
+      "variant": 0
     },
     {
       "kind": "machine",
@@ -245,7 +251,8 @@
       "machine": "nav-table",
       "tag": "tools",
       "hue": 320,
-      "seed": 6102725083153601
+      "seed": 6102725083153601,
+      "variant": 0
     },
     {
       "kind": "machine",
@@ -257,7 +264,8 @@
       "machine": "containment",
       "tag": "valves",
       "hue": 132,
-      "seed": 7956794569900630
+      "seed": 7956794569900630,
+      "variant": 2
     },
     {
       "kind": "hatch",
@@ -334,21 +342,24 @@
       "x": 6.5,
       "y": 6,
       "turn": 0,
-      "seed": 896310677415786
+      "seed": 896310677415786,
+      "variant": 1
     },
     {
       "kind": "pipe-run",
       "x": 6.5,
       "y": 4.75,
       "turn": 0,
-      "seed": 3215931741977255
+      "seed": 3215931741977255,
+      "variant": 1
     },
     {
       "kind": "pipe-run",
       "x": 6.5,
       "y": 7.25,
       "turn": 0,
-      "seed": 4546906418204469
+      "seed": 4546906418204469,
+      "variant": 1
     }
   ],
   "scaffold": [
