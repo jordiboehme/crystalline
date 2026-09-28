@@ -16,12 +16,14 @@
  *   lit strip in the room's accent along the lintel and an amber warning
  *   lamp at each of the frame's top corners; both glow steady, so the
  *   door reads from the lift at the far end of the hall (C19).
- * - **A pad** is a plate `PAD_PLATE` proud over its cells, with a
+ * - **A pad** is a plate `PAD_PLATE` proud over its cells under a flat
+ *   dark coat (`PAD_COAT` of the look's floor colour, painted with no
+ *   edge lines, so the pad stands apart from a gridded floor), with a
  *   hazard-striped rim `PAD_PAINT.rim` wide, a white ring `PAD_PAINT.ring`
  *   wide of radius `PAD_PAINT.radius` and a white cross of two bars round
  *   its centre, and a small lamp housing in each corner whose lens glows.
- *   A floor decal on a pad (the pad's stencil) lies on the plate
- *   (`floorTop`), not under it.
+ *   A floor decal on a pad (the pad's stencil) lies on the coat
+ *   (`floorTop`, `PAD_TOP`), not under it.
  * - **A gantry** is a box truss `2 * GANTRY_BEAM.half` square along its
  *   row's centre line from the west wall to the east, its underside at
  *   the gantry's `h`: four chords, a post and a diagonal on each side
@@ -31,14 +33,22 @@
  *   wall's plane. A catwalk `GANTRY_BEAM.catwalk` wide runs along the
  *   truss's south side at its underside's height, with a rail on each
  *   side. Truss, catwalk and rails stay inside the beam's plan box
- *   (`gantryBeams`), where no ceiling span hangs.
+ *   (`gantryBeams`), where no ceiling span hangs. Everything of a gantry
+ *   but its top rails (in the room's accent) is dark steel
+ *   (`gantrySteel`), so it stands out against the pale walls and ceiling
+ *   in every look; the legs' frames fill their leg boxes (`GANTRY_LEG`).
  *
  * Everything is built in one world-aligned kit frame (`along` +x, `inward`
  * +z) plus the legs' wall frames, so every face winds as the kit winds
  * it.
  */
 
-import { GANTRY_BEAM, gantryLegEdges, padBox } from "../../world/hangarShape";
+import {
+  GANTRY_BEAM,
+  GANTRY_LEG,
+  gantryLegEdges,
+  padBox,
+} from "../../world/hangarShape";
 import { edgeKey } from "../../world/sites";
 import type { RoomSpec, WallSlot } from "../../world/types";
 import { CELL } from "../../world/units";
@@ -64,6 +74,36 @@ import {
 
 /** How far a pad's plate stands proud of the floor, in metres. */
 export const PAD_PLATE = 0.02;
+
+/**
+ * The top of a pad's painted plate, in metres: the dark coat lies
+ * `DECAL_LIFT` over the plate's box, and the marks on it (the rim, the
+ * ring, the cross and the pad's stencil) lie `DECAL_LIFT` above this.
+ */
+export const PAD_TOP = PAD_PLATE + DECAL_LIFT;
+
+/**
+ * How dark a pad's coat is against the look's floor colour. The coat is
+ * lit as a decal (no edge lines), so the plate reads as one flat dark
+ * square on a gridded floor in every look.
+ */
+export const PAD_COAT = 0.55;
+
+/**
+ * How dark the gantries' steel is against the look's bare metal: dark
+ * enough that the truss and its legs stand out against the pale walls and
+ * ceiling, the flat palette's among them.
+ */
+export const GANTRY_SHADE = 0.4;
+
+/** The gantries' steel in `look` (`GANTRY_SHADE` of its bare metal). */
+export function gantrySteel(look: Look): Surface {
+  return {
+    layer: LAYER.metal,
+    tint: shade(look.palette.metal, GANTRY_SHADE),
+    flag: FLAG.lit,
+  };
+}
 
 /**
  * The bay door's frame, in metres: each jamb `jamb` wide inside the span,
@@ -109,14 +149,14 @@ const PAD_LAMP = { side: 0.3, h: 0.12, lens: 0.06 } as const;
 const PAD_LENS: Rgb = [0.8, 0.95, 1.0];
 
 /** The white paint's colour, the same in every look. */
-const PAINT_WHITE: Rgb = [0.9, 0.9, 0.88];
+const PAINT_WHITE: Rgb = [1, 1, 0.97];
 
 /** How many pieces the pad's ring is cut into. */
 const RING_SEGMENTS = 48;
 
 /**
  * Where the floor's top is at world `(x, z)` for what lies on it: the
- * plate's `PAD_PLATE` on a pad, 0 anywhere else. A floor decal lies
+ * painted plate's `PAD_TOP` on a pad, 0 anywhere else. A floor decal lies
  * `DECAL_LIFT` above this (`buildDecals`).
  */
 export function floorTop(room: RoomSpec, x: number, z: number): number {
@@ -125,7 +165,7 @@ export function floorTop(room: RoomSpec, x: number, z: number): number {
     const b = padBox(p);
     return x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1;
   });
-  return on ? PAD_PLATE : 0;
+  return on ? PAD_TOP : 0;
 }
 
 /**
@@ -185,11 +225,13 @@ export function buildHangar(b: Builder, room: RoomSpec, look: Look): void {
   const k = createKit(b, frameAt([0, 0, 0], 2));
   const s = surfaces(look);
   bayDoor(k, hangar.bayDoor, s);
-  for (const p of hangar.pads) pad(b, k, padBox(p), s);
-  for (const g of hangar.gantries) truss(k, room.width * CELL, g, s);
+  for (const p of hangar.pads) pad(b, k, padBox(p), s, look);
+  const steel = gantrySteel(look);
+  for (const g of hangar.gantries)
+    truss(k, room.width * CELL, g, steel, s.accent(0.9));
   gantryLegEdges(room).forEach((edge) => {
     const g = hangar.gantries.find((x) => x.y === edge.y);
-    if (g !== undefined) leg(createKit(b, frameForSlot(edge)), g.h, s);
+    if (g !== undefined) leg(createKit(b, frameForSlot(edge)), g.h, steel);
   });
 }
 
@@ -265,31 +307,39 @@ function pad(
   k: Kit,
   box: { x0: number; x1: number; z0: number; z1: number },
   s: Surfaces,
+  look: Look,
 ): void {
   const { x0, x1, z0, z1 } = box;
   const plate: Surface = {
     layer: LAYER.plated,
-    tint: shade(s.metal.tint, 0.5),
+    tint: shade(look.palette.floor, PAD_COAT),
     flag: FLAG.lit,
   };
   k.box(x0, x1, z0, z1, 0, PAD_PLATE, plate);
-  const y = PAD_PLATE + DECAL_LIFT;
+  // The paint samples one point of the decal atlas's solid tile, as a
+  // stencil's pixels do, and is lit as a decal: flat paint with no edge
+  // lines across it. First the dark coat over the whole plate.
+  const solid = tileRect(DECAL_TILES.solid[0] ?? 15);
+  const dot = [(solid.u0 + solid.u1) / 2, (solid.v0 + solid.v1) / 2] as const;
+  const coat: Surface = {
+    layer: LAYER.decal,
+    tint: shade(look.palette.floor, PAD_COAT),
+    flag: FLAG.decal,
+  };
+  paint(b, x0, x1, z0, z1, PAD_TOP, coat, dot);
+  const y = PAD_TOP + DECAL_LIFT;
   const r = PAD_PAINT.rim;
   // The rim: north and south bars full width, west and east between them.
   paint(b, x0, x1, z0, z0 + r, y, s.hazard);
   paint(b, x0, x1, z1 - r, z1, y, s.hazard);
   paint(b, x0, x0 + r, z0 + r, z1 - r, y, s.hazard);
   paint(b, x1 - r, x1, z0 + r, z1 - r, y, s.hazard);
-  // The white paint samples one point of the decal atlas's solid tile, as
-  // a stencil's pixels do, and is lit as a decal: flat paint with no edge
-  // lines across it.
+  // Then the white ring and cross on it.
   const white: Surface = {
     layer: LAYER.decal,
     tint: PAINT_WHITE,
     flag: FLAG.decal,
   };
-  const solid = tileRect(DECAL_TILES.solid[0] ?? 15);
-  const dot = [(solid.u0 + solid.u1) / 2, (solid.v0 + solid.v1) / 2] as const;
   const cx = (x0 + x1) / 2;
   const cz = (z0 + z1) / 2;
   // The ring, cut into flat pieces round the centre.
@@ -353,7 +403,8 @@ function truss(
   k: Kit,
   width: number,
   g: { y: number; h: number },
-  s: Surfaces,
+  steel: Surface,
+  rail: Surface,
 ): void {
   const zc = (g.y + 0.5) * CELL;
   const half = GANTRY_BEAM.half;
@@ -361,7 +412,6 @@ function truss(
   const zs = zc + half;
   const h0 = g.h;
   const h1 = g.h + 2 * half;
-  const steel = s.body;
   // Four chords.
   for (const [za, zb] of [
     [zn, zn + CHORD],
@@ -381,8 +431,8 @@ function truss(
       [zn, zn + WEB],
       [zs - WEB, zs],
     ] as const)
-      k.box(x, x + WEB, za, zb, h0 + CHORD, h1 - CHORD, s.metal);
-    k.box(x, x + WEB, zn + CHORD, zs - CHORD, h0, h0 + WEB, s.metal);
+      k.box(x, x + WEB, za, zb, h0 + CHORD, h1 - CHORD, steel);
+    k.box(x, x + WEB, zn + CHORD, zs - CHORD, h0, h0 + WEB, steel);
   }
   for (let i = 0; i < bays; i++) {
     const xa = i * TRUSS_BAY + WEB;
@@ -392,24 +442,24 @@ function truss(
     const angle = Math.atan2(rising ? hb - ha : ha - hb, xb - xa);
     const length = Math.hypot(xb - xa, hb - ha);
     const bar = tiltedBar((xa + xb) / 2, (ha + hb) / 2, angle, length, WEB);
-    k.extrude(bar, zn + 0.005, zn + WEB - 0.005, s.metal);
-    k.extrude(bar, zs - WEB + 0.005, zs - 0.005, s.metal);
+    k.extrude(bar, zn + 0.005, zn + WEB - 0.005, steel);
+    k.extrude(bar, zs - WEB + 0.005, zs - 0.005, steel);
   }
   // The catwalk along the truss's south side: deck, posts and rails.
   const c0 = zs;
   const c1 = zs + GANTRY_BEAM.catwalk;
   const C = CATWALK;
-  k.box(0, width, c0, c1, h0, h0 + C.deck, s.metal);
+  k.box(0, width, c0, c1, h0, h0 + C.deck, steel);
   for (const [za, zb] of [
     [c0, c0 + C.bar],
     [c1 - C.bar, c1],
   ] as const) {
     for (let i = 0; i <= bays; i++) {
       const x = Math.min(width - C.bar, Math.max(0, i * TRUSS_BAY - C.bar / 2));
-      k.box(x, x + C.bar, za, zb, h0 + C.deck, h0 + C.rail, s.metal);
+      k.box(x, x + C.bar, za, zb, h0 + C.deck, h0 + C.rail, steel);
     }
-    k.box(0, width, za, zb, h0 + C.rail - C.bar, h0 + C.rail, s.accent(0.9));
-    k.box(0, width, za, zb, h0 + C.mid, h0 + C.mid + C.bar, s.metal);
+    k.box(0, width, za, zb, h0 + C.rail - C.bar, h0 + C.rail, rail);
+    k.box(0, width, za, zb, h0 + C.mid, h0 + C.mid + C.bar, steel);
   }
 }
 
@@ -419,15 +469,17 @@ function truss(
  * posts from the floor to the truss, cross-braced in stages in the wall's
  * plane, and a cap under the truss.
  */
-function leg(k: Kit, h: number, s: Surfaces): void {
+function leg(k: Kit, h: number, steel: Surface): void {
   const out0 = 0.05;
   const out1 = out0 + LEG.post;
-  const edge = 0.5; // the leg box's half length along the wall
+  // The frame fills its leg box (`GANTRY_LEG`) along the wall and stands
+  // inside it out from the wall.
+  const edge = GANTRY_LEG.along / 2;
   const inner = edge - LEG.post;
-  k.box(-edge, -inner, out0, out1, 0, h, s.body);
-  k.box(inner, edge, out0, out1, 0, h, s.body);
+  k.box(-edge, -inner, out0, out1, 0, h, steel);
+  k.box(inner, edge, out0, out1, 0, h, steel);
   // The cap the truss rests on.
-  k.box(-edge, edge, out0, out1, h - 0.12, h, s.body);
+  k.box(-edge, edge, out0, out1, h - 0.12, h, steel);
   // Cross-bracing in stages between the posts.
   const stages = Math.max(1, Math.floor((h - 0.3) / LEG.stage));
   const step = (h - 0.3) / stages;
@@ -445,7 +497,7 @@ function leg(k: Kit, h: number, s: Surfaces): void {
         bar,
         dMid + (sign > 0 ? -0.04 : 0),
         dMid + (sign > 0 ? 0 : 0.04),
-        s.metal,
+        steel,
       );
     }
   }

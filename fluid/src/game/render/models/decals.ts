@@ -356,14 +356,15 @@ function flatPiece(
 
 /**
  * The hazard ring (M3 C24): a black band `length` wide inside the outer
- * diameter `width`, round the decal's centre, and over it, one
+ * diameter `width`, round the decal's centre, `DECAL_LIFT` above the
+ * floor's top `base` (`floorTop`), and over it, one
  * `DECAL_LIFT` higher, the chevrons' yellow stripes. The band is cut into
  * near-square pieces round the ring, each showing one repeat of the
  * chevron tile (`CHEVRON_WINDOW`), so the stripes run on round the ring;
  * the black shows through their gaps. The black samples one point of the
  * solid tile, as a stencil's pixels do.
  */
-function ring(b: Builder, d: Decal): void {
+function ring(b: Builder, d: Decal, base: number): void {
   const cx = d.x * CELL;
   const cz = d.y * CELL;
   const outer = d.width / 2;
@@ -380,7 +381,7 @@ function ring(b: Builder, d: Decal): void {
     (solid.u0 + solid.u1) / 2,
     (solid.v0 + solid.v1) / 2,
   ];
-  const base: Surface = {
+  const black: Surface = {
     layer: LAYER.decal,
     tint: DECAL_TINT.ringBase,
     flag: FLAG.decal,
@@ -394,7 +395,7 @@ function ring(b: Builder, d: Decal): void {
     const t0 = (2 * Math.PI * i) / n;
     const t1 = (2 * Math.PI * (i + 1)) / n;
     const points = [at(inner, t0), at(inner, t1), at(outer, t1), at(outer, t0)];
-    flatPiece(b, points, [dot, dot, dot, dot], DECAL_LIFT, base);
+    flatPiece(b, points, [dot, dot, dot, dot], base + DECAL_LIFT, black);
     flatPiece(
       b,
       points,
@@ -404,7 +405,7 @@ function ring(b: Builder, d: Decal): void {
         [stripes.u1, stripes.v1],
         [stripes.u0, stripes.v1],
       ],
-      2 * DECAL_LIFT,
+      base + 2 * DECAL_LIFT,
       top,
     );
   }
@@ -426,7 +427,7 @@ export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
       continue;
     }
     if (d.kind === "ring") {
-      ring(b, d);
+      ring(b, d, base);
       continue;
     }
     const tiles = DECAL_TILES[d.kind];
