@@ -424,7 +424,7 @@ function stubSession(
   };
 }
 
-describe("GameRoute", () => {
+describe("ExploreRoute", () => {
   it("mounts on the raw π prefix too, not only its encoding", async () => {
     gl.available = true;
     serve();

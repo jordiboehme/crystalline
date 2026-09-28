@@ -64,10 +64,13 @@ describe("the launch path (M4 C1)", () => {
   });
 
   it("imports nothing, so the main chunk carries no game module but this one", () => {
-    // Mutation caught: an import added to launch.ts (it would pull game
-    // code into the main chunk through ShatterGem).
+    // Mutation caught: an import added to launch.ts, a re-export
+    // (`export { x } from "./paths"`) or a dynamic `import(...)` (each would
+    // pull game code into the main chunk through ShatterGem).
     expect(LAUNCH_SOURCE.length).toBeGreaterThan(0);
     expect(LAUNCH_SOURCE).not.toMatch(/^\s*import\s/m);
+    expect(LAUNCH_SOURCE).not.toMatch(/\bfrom\s*["']/);
+    expect(LAUNCH_SOURCE).not.toMatch(/\bimport\s*\(/);
   });
 
   it("stays silent and hands nothing over without an AudioContext", () => {

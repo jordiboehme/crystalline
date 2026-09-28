@@ -98,7 +98,7 @@ const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
  * the station is an Easter egg, meant to be reached from the C64 screen
  * rather than typed in, and there is no `/game` alias into it.
  */
-const GameRoute = lazy(() => import("./game/GameRoute"));
+const ExploreRoute = lazy(() => import("./game/ExploreRoute"));
 
 /**
  * The station's look demo at `/π/dev`, and only in development.
@@ -207,7 +207,7 @@ export function AppRoutes() {
           path="/π/*"
           element={
             <Suspense fallback={null}>
-              <GameRoute />
+              <ExploreRoute />
             </Suspense>
           }
         />

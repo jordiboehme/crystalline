@@ -4,7 +4,7 @@
  *
  * Mounted in the whole app on an in-memory history, the composition
  * `renderApp` builds (`MemoryRouter` around `App`) with two probes beside it
- * that read and move the router's location, the way `GameRoute.test.tsx`
+ * that read and move the router's location, the way `ExploreRoute.test.tsx`
  * does: the header, the router and the signed-in shell are real, so the
  * triple click's first two clicks really navigate home, and a launch really
  * lands on the `/π` route. That route's module is replaced by a marker, so
@@ -43,7 +43,7 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
-vi.mock("../game/GameRoute", () => ({
+vi.mock("../game/ExploreRoute", () => ({
   default: () => <p>station marker</p>,
 }));
 
@@ -256,6 +256,20 @@ describe("the C64 screen's launch (M4 C1 to C4)", () => {
     expect(cursorLine(dialog)).toBe("");
     expect(location).toBe("/");
     expect(screen.queryByText("station marker")).toBeNull();
+  });
+
+  it("announces the typed line and the syntax error politely", async () => {
+    // Mutation caught: `aria-live` dropped from the typed line or from the
+    // `?SYNTAX  ERROR` line (a screen reader hears nothing of the typing).
+    renderAt("/");
+    const dialog = await openScreen();
+    const cursor = dialog.querySelector(".crystal-cursor");
+    expect(cursor?.parentElement).toHaveAttribute("aria-live", "polite");
+    type("X");
+    fireEvent.keyDown(focused(), { key: "Enter" });
+    const errors = syntaxErrors(dialog);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toHaveAttribute("aria-live", "polite");
   });
 
   it("caps the typed line at 40 characters", async () => {

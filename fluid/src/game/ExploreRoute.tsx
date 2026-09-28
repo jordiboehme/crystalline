@@ -115,7 +115,7 @@ function addressAt(pathname: string, search: string): StationAddress {
  * session is created once, on the address the URL names at that moment,
  * and every later address reaches it through `go`.
  */
-export default function GameRoute() {
+export default function ExploreRoute() {
   const { pathname, search } = useLocation();
   const address = addressAt(pathname, search);
   const client = useQueryClient();

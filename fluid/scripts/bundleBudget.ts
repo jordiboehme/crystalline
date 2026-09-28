@@ -13,7 +13,7 @@
  * every visitor downloads before any route runs). Then a walk from
  * `GAME_ENTRY` over both `imports` and `dynamicImports`, but a key already in
  * the main set is never entered: a lazy chunk imports its own entry chunk
- * (Vite's manifest lists `index.html` in `GameRoute`'s `imports`), and
+ * (Vite's manifest lists `index.html` in `ExploreRoute`'s `imports`), and
  * entering it from here would pull in every other lazy Fluid route through
  * the entry's own `dynamicImports`. A build without the route has no
  * `GAME_ENTRY` key at all; `gameFiles` then returns `[]` rather than
@@ -22,7 +22,32 @@
  */
 
 /** The manifest key of the game's lazy route entry (Vite keys a chunk by its source path). */
-export const GAME_ENTRY = "src/game/GameRoute.tsx";
+export const GAME_ENTRY = "src/game/ExploreRoute.tsx";
+
+/**
+ * The output name of the route's own chunk. Every file the app ships says
+ * "explore" rather than naming what the route is, and Vite would otherwise
+ * name the chunk after its module, which the main chunk's lazy import and
+ * preload map then carry in clear.
+ */
+export const EXPLORE_CHUNK = "assets/explore-[hash].js";
+
+/** Vite's own default for every other chunk. */
+const DEFAULT_CHUNK = "assets/[name]-[hash].js";
+
+/**
+ * The `chunkFileNames` rule `vite.config.ts` hands the bundler: the chunk
+ * whose facade module is `GAME_ENTRY` is `EXPLORE_CHUNK`, every other one
+ * keeps Vite's default. The manifest still keys the chunk by its source
+ * path, so the walk below is unaffected.
+ */
+export function chunkFileName(chunk: {
+  facadeModuleId: string | null;
+}): string {
+  return chunk.facadeModuleId?.endsWith(`/${GAME_ENTRY}`) === true
+    ? EXPLORE_CHUNK
+    : DEFAULT_CHUNK;
+}
 
 /** The manifest key of the app's main entry. */
 export const MAIN_ENTRY = "index.html";

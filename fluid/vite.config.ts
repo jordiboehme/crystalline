@@ -4,6 +4,8 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
+import { chunkFileName } from "./scripts/bundleBudget.ts";
+
 /**
  * The app's own version, read from package.json at config time and frozen into
  * the bundle as `import.meta.env.VITE_APP_VERSION`.
@@ -41,6 +43,12 @@ export default defineConfig({
     // `dist/.vite/manifest.json` and would otherwise be served alongside the
     // app the service crate embeds.
     manifest: process.env.FLUID_BUNDLE_REPORT === "1",
+    // The `/π` route's chunk is written as `explore-<hash>.js` rather than
+    // after its module's name (`chunkFileName` in scripts/bundleBudget.ts);
+    // every other chunk keeps Vite's default name.
+    rolldownOptions: {
+      output: { chunkFileNames: chunkFileName },
+    },
   },
   server: {
     // Same-origin in development too: the browser only ever talks to the Vite

@@ -26,7 +26,9 @@
  * consumes, so the app's own window shortcuts (`?` for help, `\` for the
  * width) never act behind the screen, and an Enter that runs a typed line
  * never also follows a focused link. Enter on an empty line, Esc, Tab and
- * any key held with Ctrl, Cmd or Alt are left alone.
+ * any key held with Ctrl, Cmd or Alt are left alone. The typed line and the
+ * `?SYNTAX  ERROR` line are polite live regions, so a screen reader hears
+ * the typing and the answer.
  *
  * A launch starts from the page the screen was opened on, not from where
  * the triple click leaves the app: its first two clicks are ordinary clicks
@@ -209,11 +211,11 @@ function C64Screen({
             {answer !== null && (
               <>
                 <p className="mt-2">{answer}</p>
-                <p>{SYNTAX_ERROR}</p>
+                <p aria-live="polite">{SYNTAX_ERROR}</p>
                 <p>READY.</p>
               </>
             )}
-            <p className={answer === null ? "mt-2" : ""}>
+            <p aria-live="polite" className={answer === null ? "mt-2" : ""}>
               {typed}
               <span aria-hidden className="crystal-cursor">
                 {"█"}

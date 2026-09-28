@@ -15,6 +15,7 @@ import {
   GAME_BUDGET_BYTES,
   MAIN_GUIDELINE_BYTES,
   ROUTE_REQUIRED,
+  chunkFileName,
   gameFiles,
   mainFile,
   measure,
@@ -32,7 +33,7 @@ const manifest: Manifest = {
     dynamicImports: [
       "src/screens/EngramPage.tsx",
       "src/screens/GraphView.tsx",
-      "src/game/GameRoute.tsx",
+      "src/game/ExploreRoute.tsx",
     ],
   },
   "_shared-b.js": { file: "assets/shared-b.js" },
@@ -48,12 +49,12 @@ const manifest: Manifest = {
   },
   "_heavy-i.js": { file: "assets/heavy-i.js" },
   "_md-d.js": { file: "assets/md-d.js" },
-  "src/game/GameRoute.tsx": {
-    file: "assets/GameRoute-e.js",
+  "src/game/ExploreRoute.tsx": {
+    file: "assets/explore-e.js",
     isDynamicEntry: true,
     imports: ["index.html", "_shared-b.js", "_md-d.js", "_game-f.js"],
     dynamicImports: ["_game-g.js"],
-    css: ["assets/GameRoute-e.css"],
+    css: ["assets/explore-e.css"],
   },
   "_game-f.js": { file: "assets/game-f.js" },
   "_game-g.js": { file: "assets/game-g.js" },
@@ -66,8 +67,8 @@ describe("the /π route's size (M4 C30)", () => {
     // followed, css left out, a chunk shared with another lazy route left
     // out, the main entry's static chunks counted.
     expect(gameFiles(manifest).sort()).toEqual([
-      "assets/GameRoute-e.css",
-      "assets/GameRoute-e.js",
+      "assets/explore-e.css",
+      "assets/explore-e.js",
       "assets/game-f.js",
       "assets/game-g.js",
       "assets/md-d.js",
@@ -173,8 +174,8 @@ describe("the /π route's size (M4 C30)", () => {
     // guard), which pushes a css file shared by two different keys twice.
     const dedupeManifest: Manifest = {
       "index.html": { file: "assets/index-a.js", isEntry: true },
-      "src/game/GameRoute.tsx": {
-        file: "assets/GameRoute-e.js",
+      "src/game/ExploreRoute.tsx": {
+        file: "assets/explore-e.js",
         isDynamicEntry: true,
         imports: ["index.html", "_a.js", "_b.js"],
       },
@@ -182,9 +183,9 @@ describe("the /π route's size (M4 C30)", () => {
       "_b.js": { file: "assets/b.js", css: ["assets/shared.css"] },
     };
     expect(gameFiles(dedupeManifest).sort()).toEqual([
-      "assets/GameRoute-e.js",
       "assets/a.js",
       "assets/b.js",
+      "assets/explore-e.js",
       "assets/shared.css",
     ]);
   });
@@ -253,6 +254,24 @@ describe("the CLI's cleanup guarantee (M4 Task 11 fix round 1)", () => {
     expect(result.failed).toBe(false);
     expect(result.annotations.some((l) => l.startsWith("::error::"))).toBe(
       false,
+    );
+  });
+});
+
+describe("the /π route's chunk name", () => {
+  it("names the route's own chunk explore and leaves every other chunk to Vite", () => {
+    // Mutation caught: the rule dropped (the route's chunk keeps its module
+    // name), or applied to every chunk (the other lazy screens lose theirs).
+    expect(
+      chunkFileName({
+        facadeModuleId: "/repo/fluid/src/game/ExploreRoute.tsx",
+      }),
+    ).toBe("assets/explore-[hash].js");
+    expect(
+      chunkFileName({ facadeModuleId: "/repo/fluid/src/screens/Profile.tsx" }),
+    ).toBe("assets/[name]-[hash].js");
+    expect(chunkFileName({ facadeModuleId: null })).toBe(
+      "assets/[name]-[hash].js",
     );
   });
 });
