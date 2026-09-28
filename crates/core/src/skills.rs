@@ -173,13 +173,17 @@ mod tests {
     fn the_skills_teach_the_file_path_identifier() {
         let capture = skill("crystalline-capture").unwrap().content;
         assert!(
-            capture.contains("with or without `.md`"),
-            "capture skill lacks the path identifier"
+            capture.contains(
+                "with or without `.md` (a path spelled like a permalink needs the `.md`)"
+            ),
+            "capture skill lacks the narrowed path identifier rule"
         );
         let desktop = skill("crystalline-intelligence").unwrap().content;
         assert!(
-            desktop.contains("with or without `.md`"),
-            "consolidated skill lacks the path identifier"
+            desktop.contains(
+                "with or without `.md` (a path spelled like a permalink needs the `.md`)"
+            ),
+            "consolidated skill lacks the narrowed path identifier rule"
         );
         let routing = skill("crystalline-routing").unwrap().content;
         assert!(
