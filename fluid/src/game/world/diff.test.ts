@@ -39,6 +39,166 @@ function centre(cx: number, cy: number) {
   return { x: (cx + 0.5) * CELL, z: (cy + 0.5) * CELL };
 }
 
+const SLOT = { x: 1, y: 0, side: "n" } as const;
+
+/**
+ * One fixture of every kind and every edit C16 counts as text on it. Keyed
+ * by the fixture union's own `kind`, so a new kind is a type error here
+ * until its text fields are listed. A kind with no text (a machine) lists
+ * no edit. Each edit changes one field on a copy of the fixture.
+ */
+const TEXT_EDITS = {
+  terminal: {
+    fixture: {
+      kind: "terminal",
+      slot: SLOT,
+      heading: "HEAD",
+      lines: ["a"],
+      section: 0,
+      seed: 1,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "terminal") f.heading = "OTHER";
+      },
+      (f) => {
+        if (f.kind === "terminal") f.lines = ["b", "c"];
+      },
+    ],
+  },
+  door: {
+    fixture: {
+      kind: "door",
+      slot: SLOT,
+      style: "sliding",
+      relType: "depends_on",
+      label: "DOOR",
+      address: { domain: "eng", permalink: "b" },
+      sealedLabel: null,
+      seed: 2,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "door") f.label = "OTHER";
+      },
+    ],
+  },
+  portal: {
+    fixture: {
+      kind: "portal",
+      slot: SLOT,
+      label: "PORTAL",
+      address: { domain: "ops", permalink: "b" },
+      crossDomain: true,
+      sealedLabel: null,
+      seed: 3,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "portal") f.label = "OTHER";
+      },
+    ],
+  },
+  hatch: {
+    fixture: {
+      kind: "hatch",
+      slot: SLOT,
+      label: "HATCH",
+      address: { domain: "eng", permalink: "c" },
+      seed: 4,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "hatch") f.label = "OTHER";
+      },
+    ],
+  },
+  machine: {
+    fixture: {
+      kind: "machine",
+      slot: SLOT,
+      machine: "workbench",
+      tag: "tag",
+      hue: 0,
+      seed: 5,
+    },
+    edits: [],
+  },
+  poster: {
+    fixture: {
+      kind: "poster",
+      slot: SLOT,
+      category: "warning",
+      lines: ["a"],
+      seed: 6,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "poster") f.lines = ["b"];
+      },
+    ],
+  },
+  placard: {
+    fixture: { kind: "placard", slot: SLOT, lines: ["a"] },
+    edits: [
+      (f) => {
+        if (f.kind === "placard") f.lines = ["b", "c"];
+      },
+    ],
+  },
+  lift: {
+    fixture: {
+      kind: "lift",
+      slot: SLOT,
+      stops: [
+        { label: "STOP", to: { kind: "airlock" }, key: false, here: false },
+      ],
+      note: null,
+      seed: 7,
+    },
+    edits: [
+      (f) => {
+        const stop = f.kind === "lift" ? f.stops[0] : undefined;
+        if (stop !== undefined) stop.label = "OTHER";
+      },
+      (f) => {
+        if (f.kind === "lift") f.note = "NOTE";
+      },
+    ],
+  },
+  screen: {
+    fixture: {
+      kind: "screen",
+      slot: SLOT,
+      lines: ["a"],
+      keys: [],
+      seed: 8,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "screen") f.lines = ["b"];
+      },
+    ],
+  },
+  exit: {
+    fixture: {
+      kind: "exit",
+      slot: SLOT,
+      label: "EXIT",
+      to: { kind: "airlock" },
+      seed: 9,
+    },
+    edits: [
+      (f) => {
+        if (f.kind === "exit") f.label = "OTHER";
+      },
+    ],
+  },
+} satisfies Record<
+  Fixture["kind"],
+  { fixture: Fixture; edits: ((f: Fixture) => void)[] }
+>;
+
 describe("the room diff (M4 C16)", () => {
   it("tells same, text and shape apart", () => {
     // Mutation caught: a label change read as a shape change (a reshape per
@@ -74,6 +234,37 @@ describe("the room diff (M4 C16)", () => {
       grown.fixtures.filter((f) => f.kind === "machine").length,
     ).toBeGreaterThan(room.fixtures.filter((f) => f.kind === "machine").length);
     expect(diffRooms(room, grown)).toBe("shape");
+  });
+
+  it("reads a text edit on every fixture kind as text (M4 C16)", () => {
+    // Mutation caught: a kind's text fields left out of the blanking (a
+    // portal, hatch or exit label, a poster, placard or screen line, a lift
+    // stop label or note), so a typo there reshapes the room.
+    const room = generateRoom(CANNED_WORKSHOP);
+    const kinds = Object.entries(TEXT_EDITS);
+    expect(kinds.length).toBeGreaterThan(0);
+    for (const [kind, { fixture, edits }] of kinds) {
+      expect(fixture.kind).toBe(kind);
+      if (kind !== "machine") expect(edits.length).toBeGreaterThan(0);
+      const base: RoomSpec = { ...room, fixtures: [...room.fixtures, fixture] };
+      edits.forEach((edit, i) => {
+        const edited = structuredClone(base);
+        const last = edited.fixtures.at(-1);
+        expect(last).toBeDefined();
+        if (last === undefined) return;
+        edit(last);
+        expect(`${kind} ${i}: ${diffRooms(base, edited)}`).toBe(
+          `${kind} ${i}: text`,
+        );
+      });
+      // Its seed is never text.
+      const reseeded = structuredClone(base);
+      const last = reseeded.fixtures.at(-1);
+      if (last !== undefined && "seed" in last) {
+        last.seed += 1;
+        expect(`${kind}: ${diffRooms(base, reseeded)}`).toBe(`${kind}: shape`);
+      }
+    }
   });
 
   it("keeps the player where they stand when the floor is free, else the nearest free cell (M4 C17)", () => {

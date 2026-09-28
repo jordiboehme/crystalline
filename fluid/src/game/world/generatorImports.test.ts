@@ -67,22 +67,89 @@ function specifiers(src: string): string[] {
   return out;
 }
 
-/** True when a generator module may not import this specifier. */
-function forbidden(spec: string): boolean {
-  const bare = spec.replace(/\.tsx?$/, "");
-  return (
-    bare === "./diff" ||
-    bare === "../data/changes" ||
-    spec.startsWith("../audio/") ||
-    bare === "../ui" ||
-    spec.startsWith("../ui/") ||
-    bare === "../render" ||
-    spec.startsWith("../render/") ||
-    bare === "../session"
-  );
+/**
+ * A relative specifier resolved against the importing file, as a path from
+ * `fluid/src/game/` with no extension and no trailing `/index`:
+ * `./diff.js` from `./generate.ts` is `world/diff`. Null for a package
+ * specifier, and for one that climbs out of the game folder (Fluid's own
+ * modules, which the guard does not police).
+ */
+function resolveFrom(importer: string, spec: string): string | null {
+  if (!spec.startsWith(".")) return null;
+  // Paths from `fluid/src/`: the globbed files live in `game/world/`, and
+  // `importer` is `./<file>`, so its own folder parts are dropped with the
+  // file name.
+  const parts: string[] = ["game", "world"];
+  const dirs = importer.split("/").slice(0, -1);
+  for (const part of [...dirs, ...spec.split("/")]) {
+    if (part === "." || part === "") continue;
+    if (part === "..") {
+      if (parts.pop() === undefined) return null;
+    } else parts.push(part);
+  }
+  if (parts[0] !== "game" || parts.length < 2) return null;
+  const path = parts
+    .slice(1)
+    .join("/")
+    .replace(/\.(?:tsx?|jsx?)$/, "");
+  return path.replace(/\/index$/, "");
+}
+
+/** The session side, as paths from `fluid/src/game/`; a folder covers what is under it. */
+const SESSION_SIDE = [
+  "world/diff",
+  "data/changes",
+  "audio",
+  "ui",
+  "render",
+  "session",
+] as const;
+
+/** True when `importer` may not import `spec` (M4 Global Constraints). */
+function forbidden(importer: string, spec: string): boolean {
+  const target = resolveFrom(importer, spec);
+  if (target === null) return false;
+  return SESSION_SIDE.some((s) => target === s || target.startsWith(`${s}/`));
 }
 
 describe("the generator side's imports", () => {
+  it("resolves a specifier against the importing file before matching", () => {
+    // Mutation caught: specifiers matched by spelling, so `./diff.js`,
+    // `../world/diff` or `../../game/session` slip past the guard.
+    const caught = [
+      "./diff",
+      "./diff.ts",
+      "./diff.js",
+      "../world/diff",
+      "../world/./diff.js",
+      "../data/changes.js",
+      "../audio/mixer",
+      "../audio",
+      "../ui",
+      "../ui/keys.js",
+      "../render/kit",
+      "../session",
+      "../../game/session.ts",
+    ];
+    const allowed = [
+      "./sites",
+      "./diffs",
+      "../core/seed",
+      "../data/changesets",
+      "../../api/events",
+      "vitest",
+    ];
+    expect(caught.length).toBeGreaterThan(0);
+    for (const spec of caught)
+      expect(`${spec}: ${forbidden("./generate.ts", spec)}`).toBe(
+        `${spec}: true`,
+      );
+    for (const spec of allowed)
+      expect(`${spec}: ${forbidden("./generate.ts", spec)}`).toBe(
+        `${spec}: false`,
+      );
+  });
+
   it("finds every generator module it guards", () => {
     // Mutation caught: a file dropped from the glob or renamed, so the guard
     // below would pass over it unread.
@@ -102,7 +169,7 @@ describe("the generator side's imports", () => {
       const specs = specifiers(src);
       expect(specs.length).toBeGreaterThan(0);
       for (const spec of specs)
-        if (forbidden(spec)) offenders.push(`${path} imports ${spec}`);
+        if (forbidden(path, spec)) offenders.push(`${path} imports ${spec}`);
     }
     expect(offenders).toEqual([]);
   });

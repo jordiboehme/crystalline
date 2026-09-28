@@ -25,11 +25,10 @@
  * `withHeroes` re-dresses round a forced hero (`redress`): `dressRoom` of
  * the room with the new fixtures, then `placeCurios` with the room's own
  * draws (`curioDraws`) and neighbours (`nearFor(place)`), then
- * `placeDecals`. The
- * lights, the finish and the heroes are the room's own and never move: the
- * bridge adds fixtures, never heroes. Handed no bridge data,
- * `withBridge` gives the room back unchanged (`bridge === null`), the
- * object itself, not a copy.
+ * `placeDecals`. The lights, the finish and the heroes are the room's own
+ * and never move: the bridge adds fixtures, never heroes. Handed no bridge
+ * data, `withBridge` gives the room back unchanged (`bridge === null`),
+ * the object itself, not a copy.
  *
  * `bridgeScreenEdge(room)` is `withBridge`'s own search, exported so a test
  * can call it on a room built by hand: the free wall edge (M3 C20) - a

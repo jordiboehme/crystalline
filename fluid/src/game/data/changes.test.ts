@@ -6,7 +6,9 @@
 
 import { describe, expect, it } from "vitest";
 
+import { engramDetailKey } from "../../api/engram";
 import type { ChangeEvent, EngramChange } from "../../api/events";
+import { graphKey, NEIGHBORHOOD_DEPTH } from "../../api/graph";
 import { keysFor } from "../../events/invalidation";
 import { CANNED_WORKSHOP } from "../world/canned";
 import { generateRoom } from "../world/generate";
@@ -20,6 +22,19 @@ import {
   type Watch,
 } from "./changes";
 import { inboundKey } from "./source";
+
+/** True when `key` is a prefix of `full`, the way TanStack matches a query key. */
+function covers(key: readonly unknown[], full: readonly unknown[]): boolean {
+  return key.length <= full.length && key.every((v, i) => v === full[i]);
+}
+
+/** True when some key of `keys` covers `full`. */
+function anyCovers(
+  keys: (readonly unknown[])[] | "everything",
+  full: readonly unknown[],
+): boolean {
+  return keys !== "everything" && keys.some((k) => covers(k, full));
+}
 
 const change = (o: Partial<EngramChange> = {}): ChangeEvent => ({
   event: "engram",
@@ -288,7 +303,10 @@ describe("what a frame concerns (M4 C14)", () => {
     expect(fluid).not.toBe("everything");
     if (fluid === "everything") return;
     expect(fluid.length).toBeGreaterThan(0);
-    expect(changeKeys(engram)).toEqual([...fluid, prefix]);
+    const keys = changeKeys(engram);
+    expect(keys).not.toBe("everything");
+    if (keys === "everything") return;
+    expect(keys.slice(0, fluid.length)).toEqual(fluid);
 
     const domain: ChangeEvent = {
       event: "domain",
@@ -303,5 +321,47 @@ describe("what a frame concerns (M4 C14)", () => {
     ]);
 
     expect(changeKeys({ event: "reset" })).toBe("everything");
+  });
+
+  it("makes the current room's own detail and graph stale when a neighbour changes (I1)", () => {
+    // Mutation caught: an engram frame reaching only the changed engram's
+    // own keys (Fluid's table), so the room beside it re-reads a fresh
+    // cache and never sees its door's target deleted, moved or retitled;
+    // or the prefixes built for every domain rather than the frame's.
+    const keys = changeKeys(
+      change({ permalink: "notes/b", path: "notes/b.md" }),
+    );
+    const own = [
+      engramDetailKey("eng", "notes/a"),
+      graphKey("eng", "notes/a", NEIGHBORHOOD_DEPTH),
+    ];
+    const far = [
+      engramDetailKey("ops", "notes/a"),
+      graphKey("ops", "notes/a", NEIGHBORHOOD_DEPTH),
+    ];
+    expect(own.length).toBeGreaterThan(0);
+    for (const key of own) expect(anyCovers(keys, key)).toBe(true);
+    for (const key of far) expect(anyCovers(keys, key)).toBe(false);
+    // Fluid's own table alone does not cover them: the rows are the game's.
+    const fluid = keysFor(change({ permalink: "notes/b", path: "notes/b.md" }));
+    for (const key of own) expect(anyCovers(fluid, key)).toBe(false);
+  });
+
+  it("makes every domain's inbound pages stale on an engram frame (I2)", () => {
+    // Mutation caught: only the frame's own domain's inbound pages made
+    // stale, so a new link from another domain never shows as a hatch
+    // until the page ages out.
+    const keys = changeKeys(
+      change({ domain: "far", permalink: "x", path: "x.md" }),
+    );
+    expect(anyCovers(keys, inboundKey("far", "x"))).toBe(true);
+    expect(anyCovers(keys, inboundKey("eng", "notes/a"))).toBe(true);
+    // A domain frame keeps to its own domain.
+    const domain = changeKeys({
+      event: "domain",
+      change: { domain: "far", actor: null },
+    });
+    expect(anyCovers(domain, inboundKey("far", "x"))).toBe(true);
+    expect(anyCovers(domain, inboundKey("eng", "notes/a"))).toBe(false);
   });
 });

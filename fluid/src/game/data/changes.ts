@@ -3,10 +3,18 @@
  * the session decides when to act, this module only answers.
  *
  * `changeKeys` is the game's invalidation: every key Fluid's own table
- * (`keysFor`) names for the frame, plus, for an `engram` or a `domain`
- * frame, the prefix of the game's inbound pages for that domain
- * (`gameInboundPrefix`), the one key of the game's own that the table
- * never names. A `reset` is "everything", as in the table.
+ * (`keysFor`) names for the frame, then the game's own rows. An `engram`
+ * frame adds the `["engram", domain]` and `["graph", domain]` prefixes of
+ * its domain, because a room's doors are built from its own engram's
+ * detail and graph: a neighbour deleted, moved or retitled must make those
+ * stale too, or the re-check reads the old cache and finds nothing
+ * changed. It also adds the whole `["game", "inbound"]` prefix
+ * (`GAME_INBOUND_KEY`), because an inbound link may come from any domain,
+ * so a link added anywhere can give any room a new hatch. A `domain` frame
+ * adds the inbound prefix of its own domain (`gameInboundPrefix`); Fluid's
+ * table already makes its `engram` and `graph` rows stale. A `reset` is
+ * "everything", as in the table. The keys are only marked stale, never
+ * refetched here, so a wide prefix costs nothing until a room reads it.
  *
  * `watchOf` says what the current place depends on and `concerns` whether a
  * frame touches it:
@@ -45,16 +53,33 @@ export function gameInboundPrefix(domain: string): readonly unknown[] {
 }
 
 /**
- * Every key a frame makes stale in the game's cache: Fluid's table
- * (`keysFor`) in its own order, then the inbound prefix of the frame's
- * domain for an `engram` or `domain` frame; `"everything"` for a `reset`.
+ * The prefix of every inbound page the game holds, in every domain:
+ * `["game", "inbound"]`. An `engram` frame makes all of it stale (M4 C13).
+ */
+export const GAME_INBOUND_KEY: readonly unknown[] = ["game", "inbound"];
+
+/**
+ * Every key a frame makes stale in the game's cache (M4 C13): Fluid's
+ * table (`keysFor`) in its own order, then the game's own rows - for an
+ * `engram` frame the `["engram", domain]` and `["graph", domain]` prefixes
+ * and `GAME_INBOUND_KEY`, for a `domain` frame the domain's inbound prefix;
+ * `"everything"` for a `reset`. See the module doc for why.
  */
 export function changeKeys(
   event: ChangeEvent,
 ): (readonly unknown[])[] | "everything" {
   const keys = keysFor(event);
-  if (keys === "everything" || event.event === "reset") return "everything";
-  return [...keys, gameInboundPrefix(event.change.domain)];
+  if (keys === "everything") return keys;
+  switch (event.event) {
+    case "engram": {
+      const domain = event.change.domain;
+      return [...keys, ["engram", domain], ["graph", domain], GAME_INBOUND_KEY];
+    }
+    case "domain":
+      return [...keys, gameInboundPrefix(event.change.domain)];
+    case "reset":
+      return "everything";
+  }
 }
 
 /**
