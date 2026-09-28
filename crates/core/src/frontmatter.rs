@@ -512,14 +512,18 @@ fn pick(
     let owned = |text: Option<&str>| text.map(str::to_string);
     if value_of(local) == value_of(upstream) {
         // Same value: the spelling of the side that re-spelled it; when both
-        // did, their line merge if it keeps the value, else local's.
+        // did, their line merge if it keeps the value, else local's. Both
+        // sides added it: upstream's, so the pull converges on the team's copy.
         if text_of(local) == text_of(upstream) || text_of(local) == text_of(base) {
             return Ok(owned(text_of(upstream)));
         }
         if text_of(upstream) == text_of(base) {
             return Ok(owned(text_of(local)));
         }
-        if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
+        let Some(b) = base else {
+            return Ok(owned(text_of(upstream)));
+        };
+        if let (Some(l), Some(u)) = (local, upstream)
             && let Some((merged, value)) = merge_block(b, l, u, line_merge)
             && value == l.value
         {
@@ -559,7 +563,7 @@ fn pick(
 ///
 /// | case | result |
 /// |---|---|
-/// | L equals U | U's text when L's text is byte-equal to U's or B's; L's text when U's text is byte-equal to B's (only local re-spelled it); when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text (also when there is no B); absent on both: the key is gone |
+/// | L equals U | U's text when L's text is byte-equal to U's or B's; L's text when U's text is byte-equal to B's (only local re-spelled it); when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text; no B (both added it): U's text; absent on both: the key is gone |
 /// | L equals B | U's text (only upstream changed or removed it) |
 /// | U equals B | L's text (only local changed, added or removed it) |
 /// | otherwise, all three present | the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key |
@@ -1400,12 +1404,12 @@ mod tests {
     }
 
     #[test]
-    fn a_key_both_added_with_one_value_in_two_spellings_keeps_local_spelling() {
+    fn a_key_both_added_with_one_value_in_two_spellings_takes_upstreams_spelling() {
         let local = with(SCOTTY, "title: Scotty\n", "domain_name: 'scotty'\n");
         let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
         assert_eq!(
             merge_text(Some(SCOTTY), &local, &upstream, &trivial),
-            MergedText::Clean(local.clone())
+            MergedText::Clean(upstream.clone())
         );
     }
 }
