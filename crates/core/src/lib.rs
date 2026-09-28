@@ -20,6 +20,7 @@ pub mod attachment;
 pub mod config;
 pub mod emit;
 pub mod engram;
+pub mod frontmatter;
 pub mod harness;
 pub mod import;
 pub mod index;
