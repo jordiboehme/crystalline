@@ -70,6 +70,11 @@ export interface Look {
   bands: number;
   /** 0 clean to 1 filthy. */
   grime: number;
+  /**
+   * How far the contact shadows under things (`shadows.ts`) darken the
+   * floor's light at their darkest, 0 to 1. Absent draws none.
+   */
+  contactShadow?: number;
   edge: {
     colour: Rgb;
     /** Added brightness of an edge line; above 1 feeds the bloom. */
@@ -223,6 +228,7 @@ export const LOOKS: Record<LookId, Look> = {
     minLight: 0.1,
     bands: 32,
     grime: 0.04,
+    contactShadow: 0.7,
     edge: {
       colour: hex(0x9ae8ff),
       strength: 2.2,

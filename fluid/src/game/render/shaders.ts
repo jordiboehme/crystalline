@@ -266,6 +266,11 @@ uniform float uEdgeWidth;
 uniform bool uEdgeEverywhere;
 uniform vec2 uEdgeFade;
 uniform float uGrimeLayer;
+// The contact shadow texture over the room (shadows.ts), its size in metres
+// and how dark it gets (0 none)
+uniform sampler2D uShadow;
+uniform vec2 uShadowSize;
+uniform float uContactShadow;
 uniform float uLdr;
 uniform float uBlink[${String(BLINK_CHANNELS)}];
 out vec4 outColour;
@@ -309,6 +314,7 @@ void main() {
   vec2 swirlUv = vUv * 0.5 + vec2(uTime * 0.07, -uTime * 0.11);
   float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
   float level = cellLevel(vWorld, vNormal);
+  float contact = textureLod(uShadow, vWorld.xz / uShadowSize, 0.0).r;
   if (vFlag == ${String(FLAG.decal)} && texel4.a < bayer4(gl_FragCoord.xy)) discard;
   vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
 
@@ -344,6 +350,7 @@ void main() {
   // The classic banded distance light: fall off, then quantise into bands.
   float dist = distance(uEye, vWorld);
   float lit = clamp(level * uLightScale * 1.25 - dist * uFalloff * (1.1 - level), uMinLight, 1.0);
+  if (vNormal.y > 0.9 && vWorld.y < 0.05) lit *= 1.0 - uContactShadow * contact;
   lit = floor(lit * uBands + 0.5) / uBands;
   // A little fixed shading by face direction, so walls read as walls.
   float facing = 0.82 + 0.18 * abs(dot(normalize(vNormal), normalize(vec3(0.35, 0.8, 0.5))));

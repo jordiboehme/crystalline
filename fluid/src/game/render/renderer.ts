@@ -91,6 +91,7 @@ import { buildHeroMesh } from "./models/heroes";
 import { buildInteriorMesh } from "./models/interior";
 import { buildPropMesh } from "./models/props";
 import { moverDraw, restDraw, type MoverDraw } from "./parts";
+import { SHADOW_TEXELS, contactShadows } from "./shadows";
 import {
   BRIGHT_FS,
   COMPOSITE_FS,
@@ -286,6 +287,8 @@ export function createRenderer(
   let movers: GpuMover[] = [];
   let textures: TextureArray | null = null;
   let light: GpuLight | null = null;
+  // The room's contact shadow texture and its size in metres.
+  let shadow: { texture: WebGLTexture; w: number; d: number } | null = null;
   let room: RoomSpec | null = null;
   let look: Look | null = null;
   let meshLook: LookId | null = null;
@@ -318,6 +321,8 @@ export function createRenderer(
     textures = null;
     if (light !== null) gl.deleteTexture(light.texture);
     light = null;
+    if (shadow !== null) gl.deleteTexture(shadow.texture);
+    shadow = null;
     room = null;
     look = null;
   };
@@ -381,6 +386,43 @@ export function createRenderer(
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.bindTexture(gl.TEXTURE_2D, null);
     return { texture, grid, texels: new Uint8Array(grid.width * grid.depth) };
+  };
+
+  /**
+   * The room's contact shadow texture (`contactShadows`): immutable R8
+   * storage, LINEAR so the patches stay soft between texels, clamped at
+   * the grid's edge.
+   */
+  const makeShadow = (
+    nextRoom: RoomSpec,
+  ): { texture: WebGLTexture; w: number; d: number } => {
+    const cs = contactShadows(nextRoom);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, cs.width, cs.depth);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      0,
+      0,
+      cs.width,
+      cs.depth,
+      gl.RED,
+      gl.UNSIGNED_BYTE,
+      cs.texels,
+    );
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return {
+      texture,
+      w: cs.width / SHADOW_TEXELS,
+      d: cs.depth / SHADOW_TEXELS,
+    };
   };
 
   const pass = (
@@ -502,6 +544,7 @@ export function createRenderer(
       }
       array.finish();
       light = makeLight(nextRoom);
+      shadow = makeShadow(nextRoom);
       room = nextRoom;
       look = nextLookApplied;
     },
@@ -552,6 +595,9 @@ export function createRenderer(
         light.texels,
       );
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      // The contact shadow on unit 2.
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, shadow?.texture ?? null);
       // The texture array on unit 0.
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, textures.texture);
@@ -594,6 +640,13 @@ export function createRenderer(
       gl.uniform1f(scene.uniform("uBands"), look.bands);
       gl.uniform1f(scene.uniform("uGrime"), look.grime);
       gl.uniform1f(scene.uniform("uGrimeLayer"), LAYER.grime);
+      gl.uniform1i(scene.uniform("uShadow"), 2);
+      gl.uniform2f(
+        scene.uniform("uShadowSize"),
+        shadow?.w ?? 1,
+        shadow?.d ?? 1,
+      );
+      gl.uniform1f(scene.uniform("uContactShadow"), look.contactShadow ?? 0);
       gl.uniform1f(scene.uniform("uTextureMix"), look.textureMix);
       gl.uniform3f(scene.uniform("uEdgeColour"), ...look.edge.colour);
       gl.uniform1f(scene.uniform("uEdgeStrength"), look.edge.strength);

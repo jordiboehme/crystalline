@@ -699,6 +699,25 @@ function toolBoard({ k, s, ctx, variant }: Parameters<PropRecipe>[0]): void {
 const CONDUIT = { depth: 0.28, runH: 2.15 };
 
 /**
+ * The wall props that stand on the floor against their wall, per variant:
+ * the body's extent along the wall (`a0` to `a1`) and its depth out from
+ * it, as the recipes above build them. The contact shadows read it.
+ */
+export const WALL_STANDING: Partial<
+  Record<WallPropKind, readonly { a0: number; a1: number; depth: number }[]>
+> = {
+  "locker-bank": [0, 1].map(() => ({
+    a0: -LOCKER.half,
+    a1: LOCKER.half,
+    depth: LOCKER.depth,
+  })),
+  "conduit-cabinet": [
+    { a0: -0.55, a1: 0.25, depth: CONDUIT.depth },
+    { a0: -0.88, a1: 0.88, depth: CONDUIT.depth },
+  ],
+};
+
+/**
  * Conduit cabinet: variant 0 one cabinet with a door seam, a handle and two
  * conduits climbing to a horizontal run across the whole reach with a
  * junction box at each end; variant 1 two narrower cabinets side by side,

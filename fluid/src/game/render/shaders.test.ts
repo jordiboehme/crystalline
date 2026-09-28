@@ -254,3 +254,15 @@ describe("the fade of look 2's seams with distance", () => {
     );
   });
 });
+
+it("darkens only the floor by the contact shadow, as far as the look says", () => {
+  // Mutation caught: the shadow on walls or on the tops of props, applied
+  // after the bands (it would add a band edge of its own), or a strength
+  // not taken from the look (looks 1 and 3 would get one).
+  expect(SCENE_FS).toContain(
+    "if (vNormal.y > 0.9 && vWorld.y < 0.05) lit *= 1.0 - uContactShadow * contact;\n  lit = floor(lit * uBands + 0.5) / uBands;",
+  );
+  expect(rendererSource).toMatch(
+    /scene\.uniform\("uContactShadow"\),\s*look\.contactShadow \?\? 0/,
+  );
+});
