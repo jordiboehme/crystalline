@@ -4,7 +4,9 @@ import { boxKey } from "../world/box";
 import { BLINK_GROUPS } from "./blink";
 import {
   CANNED_BRIDGE,
+  CANNED_DECK,
   CANNED_DOMAINS,
+  CANNED_HANGAR,
   CANNED_HUB,
   CANNED_WORKSHOP,
   galleryRoom,
@@ -12,8 +14,10 @@ import {
 } from "../world/canned";
 import { airlockRoom } from "../world/airlock";
 import { consoleRoom } from "../world/consoleRoom";
+import { generateDeck } from "../world/deck";
 import { plainFinish } from "../world/finish";
 import { generateRoom } from "../world/generate";
+import { gantryBeams, gantryLegEdges } from "../world/hangarShape";
 import { BAY, isFloor, wallRuns } from "../world/layout";
 import { HERO_FOOTING } from "../world/footprints";
 import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
@@ -814,5 +818,63 @@ describe("the construction baseboard (M3 C28)", () => {
     expect(after.size).toBeGreaterThan(0);
     expect(after.has(edgeKey(entrance))).toBe(false);
     expect(after.has(edgeKey(free))).toBe(false);
+  });
+});
+
+describe("the hangar in the room mesh (M3 C15)", () => {
+  it("runs no accent stripe across the bay door's span or a gantry leg's edge", () => {
+    // Mutation caught: the stripe's skip set not extended to the hangar
+    // (the stripe would run behind the bay door and through the legs).
+    const room = generateDeck(CANNED_HANGAR, 0);
+    const hangar = room.hangar!;
+    const skipped = new Set([
+      ...gantryLegEdges(room).map(edgeKey),
+      ...Array.from({ length: hangar.bayDoor.x1 - hangar.bayDoor.x0 }, (_, i) =>
+        edgeKey({ x: hangar.bayDoor.x0 + i, y: 0, side: "n" }),
+      ),
+    ]);
+    expect(skipped.size).toBe(14);
+    const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    expect(stripes.length).toBeGreaterThan(0);
+    for (const q of stripes) expect(skipped.has(q.edge), q.edge).toBe(false);
+    // The rest of the north wall keeps its stripe.
+    expect(
+      stripes.some((q) => q.edge === edgeKey({ x: 3, y: 0, side: "n" })),
+    ).toBe(true);
+  });
+
+  it("draws the hangar's structure into the static mesh", () => {
+    // Mutation caught: `buildRoomMesh` not building the hangar (only the
+    // shell's lamp panels would be up at the gantries' height).
+    const room = generateDeck(CANNED_HANGAR, 0);
+    const beams = gantryBeams(room);
+    const h = room.hangar!.gantries[0]!.h;
+    expect(beams.length).toBe(2);
+    const high = all(buildRoomMesh(room, LOOKS.aperture).static).filter(
+      (v) => v.pos[1] > h + 0.1 && v.pos[1] < room.ceiling - 0.1,
+    );
+    for (const bm of beams)
+      expect(
+        high.some(
+          (v) =>
+            v.pos[0] > bm.x0 &&
+            v.pos[0] < bm.x1 &&
+            v.pos[2] > bm.z0 &&
+            v.pos[2] < bm.z1,
+        ),
+      ).toBe(true);
+  });
+
+  it("builds nothing of the hangar into a plain deck", () => {
+    // Mutation caught: the hangar's structure (or its stripe skip) built
+    // for every deck. The count is the plain deck's static triangles at
+    // c0799a87, the commit before the hangar was drawn.
+    const room = generateDeck(CANNED_DECK, 1);
+    expect(room.hangar).toBeUndefined();
+    const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+    for (const v of all(mesh))
+      expect(v.pos[1]).toBeLessThanOrEqual(room.ceiling + EPS);
+    expect(room.ceiling).toBe(4);
+    expect(mesh.count / 3).toBe(2056);
   });
 });

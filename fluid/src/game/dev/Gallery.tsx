@@ -92,10 +92,10 @@
  *
  * `?hall=hangar` (M3 C13 to C17) shows the hangar `generateDeck` builds of
  * `CANNED_HANGAR`, for judging the hall, its doors on the west, east and
- * south walls, the cargo round the empty landing pads, the pad stencils
- * and the deck's lift and screen. The bay door, the pads' plates and the
- * gantries are the room's `hangar` data, which the room mesh does not draw
- * yet. The spawn is the hangar's own, in
+ * south walls, the cargo round the empty landing pads, the pad stencils,
+ * the deck's lift and screen, and the structure the room mesh draws from
+ * the room's `hangar` data: the bay door, the pads' plates and paint, and
+ * the gantries with their legs and catwalks. The spawn is the hangar's own, in
  * front of the lift; `?at=screen:0` stands in front of the screen. The
  * doors and the lift lead nowhere in the gallery.
  *

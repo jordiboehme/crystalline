@@ -4,8 +4,8 @@
  * Pure arithmetic on a `HangarSpec`, read by the site rules
  * (`dressingSites`: the pads, the legs and the bay door's apron are taken
  * boxes, the leg edges carry nothing, the span lines keep off the beams)
- * and the decals (`placeDecals` lays the pad stencils). The numbers are the
- * structure's own, so whatever draws it can read them too.
+ * and the decals (`placeDecals` lays the pad stencils). The room mesh
+ * (`render/models/hangar.ts`) draws the structure from the same numbers.
  *
  * - A pad's box is its cells in metres.
  * - Each gantry stands on a leg at each end of its beam: on the west wall
@@ -37,7 +37,8 @@ export const GANTRY_LEG = { along: 1.0, out: 0.6 } as const;
  * A gantry's beam in plan, in metres (M3 C15): the truss `half` either side
  * of its row's centre line and the catwalk `catwalk` wide along its south
  * side: the room the gantry takes overhead, which no ceiling span is hung
- * across or along (`gantryBeams`).
+ * across or along (`gantryBeams`). The room mesh draws the truss, the
+ * catwalk and its rails inside it.
  */
 export const GANTRY_BEAM = { half: 0.4, catwalk: 1.0 } as const;
 

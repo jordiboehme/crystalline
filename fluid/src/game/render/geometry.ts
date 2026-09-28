@@ -48,7 +48,11 @@
  * own. Every other room's full wall quads also carry the accent stripe
  * (`ACCENT_STRIPE`, 2.7 C9), a band in the accent mark (`accentTint`), off
  * fixture edges, the entrance edge, lintels and the edges of the wall
- * props and heroes that lie under it (`UNDER_STRIPE`, the saucer poster).
+ * props and heroes that lie under it (`UNDER_STRIPE`, the saucer poster),
+ * and in a hangar off the bay door's span and the gantry legs' edges
+ * (`hangarEdges`, M3 C15). A hangar's bay door, pads and gantries
+ * (`buildHangar` in `models/hangar.ts`) are built into the same static
+ * array after the lamps and the scaffolding.
  * The models themselves are built by the recipes in `models/`, with the
  * modelling kit of `kit.ts`,
  * and always keep `LAYER.panel` whatever the room's wall patterns. Last
@@ -82,6 +86,7 @@ import {
   type Mover,
 } from "./models";
 import { buildDecals } from "./models/decals";
+import { buildHangar, hangarEdges } from "./models/hangar";
 import { buildHeroMovers } from "./models/heroes";
 import { buildInteriorMovers } from "./models/interior";
 import { CONSOLE_SHELL } from "./models/interior/common";
@@ -585,15 +590,18 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  * stands between two floor cells. Where a doorway cell (see
  * `doorwayColumns`) meets the hall, a bay or the corridor, a lintel runs
  * from `LINTEL` to the ceiling on both faces of the edge. A full wall quad
- * on an edge that is neither a fixture's slot nor the entrance's carries
- * the accent stripe, unless the room has fittings (`interior`). Every wall,
+ * on an edge that is neither a fixture's slot nor the entrance's, nor
+ * covered by a wall prop under the stripe or by a hangar's bay door or
+ * gantry leg, carries the accent stripe, unless the room has fittings
+ * (`interior`). Every wall,
  * lintel and stripe quad reads its cell's wall pattern
  * (`wallPatternOf`, `WALL_PATTERN_LOOK`, 2.7 C11): the hall's, a bay's or
  * the corridor's, whichever rectangle the cell falls in, pattern 0 always
  * on a room with fittings. Lamps and scaffolding share the hall's ceiling
  * height, which bays and the corridor share too. Every light zone hangs a
  * lamp panel, except in the airlock (M3 C24), which is lit by the iris
- * light in its ceiling instead.
+ * light in its ceiling instead. A hangar (`room.hangar`) adds its bay door,
+ * pads and gantries (`buildHangar`, M3 C15).
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const b = createBuilder();
@@ -627,7 +635,11 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const entranceEdge = `${room.entrance.x},${room.entrance.y},s`;
   // The edges a wall prop or wall hero lying under the stripe hangs on
   // (`UNDER_STRIPE`): the stripe skips them whole.
+  // So do the bay door's span of the north wall and the gantry legs' edges
+  // in a hangar (M3 C15): the door and the legs stand over the stripe's
+  // band.
   const coveredEdges = new Set([
+    ...hangarEdges(room),
     ...room.props
       .filter((p) => UNDER_STRIPE.props.has(p.kind))
       .map((p) => edgeKey(edgeOf(p))),
@@ -723,6 +735,9 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   // Under construction: the scaffold frames the player walks around.
   const pole: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };
   for (const box of room.scaffold) scaffold(b, box, H, pole);
+
+  // A hangar's bay door, pads and gantries (M3 C15).
+  buildHangar(b, room, look);
 
   const plan = layerPlan(room);
   const ctx: ModelContext = {

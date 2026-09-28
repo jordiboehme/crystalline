@@ -16,7 +16,8 @@
  * - A **face** decal is a `k.panel` in the crate's own frame at its face
  *   (the decal's anchor lies on the face, its turn the way the face looks),
  *   `DECAL_LIFT` off it.
- * - A **floor** decal lies `DECAL_LIFT` above the floor, `width` across and
+ * - A **floor** decal lies `DECAL_LIFT` above the floor (above a pad's
+ *   plate on a hangar's pad, `floorTop`), `width` across and
  *   `length` along its turn; the tile's top (its high `v`) points along the
  *   turn, so an arrow points the way its turn says.
  * - **Chevrons** are hazard stripes at 45 degrees on any strip: the strip
@@ -62,6 +63,7 @@ import { LAYER } from "../layers";
 import type { Rgb } from "../looks";
 import { DECAL_TILES, tileRect, tileWindow } from "../textures";
 import type { KitAt } from "./common";
+import { floorTop } from "./hangar";
 import { runsOf, textRows } from "./heroes/pixels";
 import { stencilMarks, wordMarks } from "./marks";
 
@@ -115,13 +117,15 @@ interface UvRect {
 }
 
 /**
- * A quad lying `DECAL_LIFT` above the floor, centred on `(cx, cz)` in
+ * A quad lying `DECAL_LIFT` above the floor's top `base` (0 on the floor,
+ * a pad's plate in a hangar, `floorTop`), centred on `(cx, cz)` in
  * metres: `x0..x1` along `right` and `y0..y1` along `front` (its top),
  * facing up, wound counter-clockwise seen from above like the floor, with
  * `uv` from its bottom-left to its top-right corner.
  */
 function floorQuad(
   b: Builder,
+  base: number,
   cx: number,
   cz: number,
   front: readonly [number, number],
@@ -136,7 +140,7 @@ function floorQuad(
   const [rx, rz] = [-fz, fx];
   const at = (x: number, y: number): V3 => [
     cx + rx * x + fx * y,
-    DECAL_LIFT,
+    base + DECAL_LIFT,
     cz + rz * x + fz * y,
   ];
   const corners = [
@@ -276,7 +280,7 @@ function stencilRows(d: Decal): string[][] {
  * wall in its slot frame or on the floor turned by its turn, every quad
  * sampling one point in the solid tile.
  */
-function stencil(kitAt: KitAt, b: Builder, d: Decal): void {
+function stencil(kitAt: KitAt, b: Builder, d: Decal, base: number): void {
   const lines = stencilRows(d);
   if (lines.length === 0) return;
   const s = surfaceOf(d);
@@ -307,7 +311,19 @@ function stencil(kitAt: KitAt, b: Builder, d: Decal): void {
       if (kit !== null)
         kit.panel(a0, a1, DECAL_LIFT, lo, hi, s, 0, 0, point.u0, point.v0);
       else
-        floorQuad(b, d.x * CELL, d.y * CELL, front, a0, a1, lo, hi, point, s);
+        floorQuad(
+          b,
+          base,
+          d.x * CELL,
+          d.y * CELL,
+          front,
+          a0,
+          a1,
+          lo,
+          hi,
+          point,
+          s,
+        );
     }
   });
 }
@@ -403,8 +419,10 @@ function ring(b: Builder, d: Decal): void {
  */
 export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
   for (const d of room.decals) {
+    // The floor's top under a floor decal: a pad's plate in a hangar.
+    const base = d.on === "floor" ? floorTop(room, d.x * CELL, d.y * CELL) : 0;
     if (d.kind === "stencil") {
-      stencil(kitAt, b, d);
+      stencil(kitAt, b, d, base);
       continue;
     }
     if (d.kind === "ring") {
@@ -423,6 +441,7 @@ export function buildDecals(kitAt: KitAt, b: Builder, room: RoomSpec): void {
         const front = HERO_FRONT[((d.turn % 4) + 4) % 4] ?? [0, -1];
         floorQuad(
           b,
+          base,
           d.x * CELL,
           d.y * CELL,
           front,
