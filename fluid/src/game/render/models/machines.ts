@@ -3107,7 +3107,7 @@ const GLASS_CASE = {
   plinth: 0.3,
   half: 0.35,
   post: 0.06,
-  panes: [0.46, 1.54],
+  panes: [0.6, 1.4],
   cap: [1.7, 1.9],
   core: 0.2,
   coreAt: 1.0,
