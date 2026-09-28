@@ -10080,3 +10080,55 @@ parity!(
     lookup_in_domain_resolves_paths_and_hints_on_both_backends,
     lookup_in_domain_resolves_paths_and_hints
 );
+
+/// Jordi's narrowed rule (2026-09-28): an identifier spelled like a permalink
+/// is judged as a permalink or title only, and a miss names the permalink of
+/// the row whose path it spells. A lowercase path with `.md` still resolves,
+/// and a title hit on the slug is never offered as a hint (#111).
+async fn lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "notes/meeting.md",
+        &engram("Standup", "standup", "engram", "", "one\n"),
+    );
+    write(
+        root,
+        "plan.md",
+        &engram("roadmap", "plan-2026", "engram", "", "two\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    match crystalline_index::lookup_in_domain(store, "d", "notes/meeting.md")
+        .await
+        .unwrap()
+    {
+        crystalline_index::DomainLookup::Found(found) => assert_eq!(found.permalink, "standup"),
+        other => panic!("notes/meeting.md: {other:?}"),
+    }
+    // Spelled like a permalink: no path step, and the hint names the row's
+    // permalink.
+    assert_eq!(
+        crystalline_index::lookup_in_domain(store, "d", "notes/meeting")
+            .await
+            .unwrap(),
+        crystalline_index::DomainLookup::Missing {
+            suggest: vec!["standup".to_string()]
+        }
+    );
+    // `roadmap` is a TITLE, not a permalink: a title hit on the slug is no hint.
+    assert_eq!(
+        crystalline_index::lookup_in_domain(store, "d", "Roadmap.md")
+            .await
+            .unwrap(),
+        crystalline_index::DomainLookup::Missing {
+            suggest: Vec::new()
+        }
+    );
+}
+
+parity!(
+    lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink_on_both_backends,
+    lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink
+);

@@ -2613,6 +2613,103 @@ async fn a_draft_resolves_by_its_path_without_md() {
     assert!(text.contains("a page only alice has"), "{text}");
 }
 
+/// A `crystalline://` URL addresses a permalink and nothing else, on a draft
+/// as on a base row: a draft renamed in place does not answer its old address
+/// through its file's path, which is what keeps a co-editing room over a
+/// draft from finding it again under its old key (#111).
+#[tokio::test]
+async fn a_url_never_reaches_a_draft_through_its_path() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let renamed = |permalink: &str| {
+        ALICE_NEW
+            .replace("permalink: fresh", &format!("permalink: {permalink}"))
+            .replace("title: Fresh", "title: Renamed Page")
+            .replace("# Fresh", "# Renamed Page")
+    };
+    f.draft("team", "alice", "fresh.md", &renamed("renamed"))
+        .await;
+    f.draft(
+        "team",
+        "alice",
+        "notes/Fresh Idea.md",
+        &renamed("renamed-idea"),
+    )
+    .await;
+    for identifier in [
+        "crystalline://team/fresh",
+        "crystalline://team/notes/Fresh Idea",
+    ] {
+        let miss = f
+            .reads(identifier, &alice)
+            .await
+            .expect_err("a URL names a permalink, never a path");
+        assert!(miss.contains("no engram"), "{identifier}: {miss}");
+    }
+    // A bare identifier spelled like a permalink is judged as one, on a draft
+    // as on a base row: the old permalink of a draft renamed in place misses.
+    let miss = f
+        .reads("fresh", &alice)
+        .await
+        .expect_err("fresh is spelled like a permalink, and no draft holds it");
+    assert!(
+        miss.contains("no engram 'fresh' in domain 'team'"),
+        "{miss}"
+    );
+    // The bare path, which may name a path, still reaches the draft.
+    let text = f
+        .reads("notes/Fresh Idea", &alice)
+        .await
+        .expect("the bare path reaches the draft");
+    assert!(text.contains("a page only alice has"), "{text}");
+}
+
+/// A miss at a URL names the permalink, the way the resolver's own URL miss
+/// does, also where the reader's tombstone is what answers (#111).
+#[tokio::test]
+async fn a_tombstoned_url_miss_names_the_bare_permalink() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let agent = Some("claude-code/2.0-for-alice");
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            agent,
+            &alice,
+        )
+        .await
+        .unwrap();
+    let err = f
+        .engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "crystalline://team/plan".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] after the deletion #team".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            },
+            agent,
+            &alice,
+        )
+        .await
+        .expect_err("her deletion holds at the URL");
+    assert_eq!(err.to_string(), "no engram 'plan' in domain 'team'");
+}
+
 /// A draft is not a way around the domain screen. Alice's draft in a private
 /// domain reads for her and is the same nothing a stranger gets about every
 /// other engram in there - and, crucially, about the domain itself.

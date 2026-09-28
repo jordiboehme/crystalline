@@ -1972,6 +1972,68 @@ async fn the_hint_names_a_custom_permalink_found_through_the_path() {
     assert!(err.contains("Did you mean `agent-guide`?"), "{err}");
 }
 
+/// After an in-place rename the old permalink is only the file's path, and a
+/// path spelled like a permalink is judged as a permalink: a stale `alpha`
+/// misses on read, delete and move, and the miss names `beta` (#111, Jordi's
+/// narrowed rule of 2026-09-28).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_permalink_misses_after_an_in_place_rename_and_names_the_new_one() {
+    let h = Harness::new(&["eng"]).await;
+    let file = h.root.join("eng/alpha.md");
+    let text = |permalink: &str| {
+        format!(
+            "---\ntype: engram\ntitle: Renamed Page\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Renamed Page\n\n- [fact] the file stays where it was #eng\n- [fact] only the permalink moves #eng\n"
+        )
+    };
+    std::fs::write(&file, text("alpha")).unwrap();
+    h.engine.sync(None).await.unwrap();
+    std::fs::write(&file, text("beta")).unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let hint = "no engram 'alpha' in domain 'eng'. Did you mean `beta`?";
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "alpha", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains(hint), "read: {err}");
+    let err = call(
+        peer,
+        "delete_engram",
+        json!({ "identifier": "alpha", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains(hint), "delete: {err}");
+    let err = call(
+        peer,
+        "move_engram",
+        json!({ "identifier": "alpha", "domain": "eng", "destination": "moved/alpha" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains(hint), "move: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        text("beta"),
+        "nothing was deleted or moved"
+    );
+
+    // The path itself, with `.md`, still names the file.
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "alpha.md", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["permalink"], json!("beta"));
+}
+
 /// The read_engram copy teaches the file-path identifier, so an agent that
 /// copies a reference from the file tree finds out it works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

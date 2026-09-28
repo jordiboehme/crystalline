@@ -53,7 +53,7 @@ use crystalline_core::emit::{set_frontmatter_field, touch_generated};
 use crystalline_core::{CrystallineUrl, parse_engram};
 use crystalline_index::{
     AttachmentRow, BrowseLevel, DomainId, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    OutboundRef, RecentFilter, StoredEngram,
+    OutboundRef, RecentFilter, StoredEngram, may_name_a_path,
 };
 use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
@@ -67,6 +67,17 @@ use crate::engine::{
 use crate::params::MoveParams;
 use crate::review::ActorDrafts;
 use crate::share_staging::{OVERLAY_STAGING_DIR, OverlayStaging, write_staged_file};
+
+/// How a miss names the identifier it was asked for: a `crystalline://` URL
+/// by its permalink, the way the resolver's own URL miss names it
+/// (`no engram 'plan' in domain 'team'`), anything else as written. A
+/// co-editing room addresses its engram by URL, and its misses keep reading
+/// like the bare permalink they always showed.
+fn shown(identifier: &str) -> String {
+    CrystallineUrl::parse(identifier)
+        .map(|url| url.permalink)
+        .unwrap_or_else(|| identifier.to_string())
+}
 
 /// What one reader sees in one domain: the folder the team reviewed, with that
 /// reader's own drafts laid over it.
@@ -745,7 +756,7 @@ impl<'a> DomainView<'a> {
         let domain = self.domain.as_str();
         let base = self.engine.resolve_in(identifier, domain).await;
         self.shadow(identifier, base, || {
-            format!("no engram '{identifier}' in domain '{domain}'")
+            format!("no engram '{}' in domain '{domain}'", shown(identifier))
         })
         .await
     }
@@ -818,9 +829,10 @@ impl<'a> DomainView<'a> {
 
     /// One actor's own draft at an identifier, when no base row answers to it.
     ///
-    /// Matched by permalink, by title and by path with or without `.md`,
-    /// which is the same ladder the base lookup offers, over the entries this
-    /// actor holds. Tombstones are skipped: a deletion is not an engram to
+    /// Matched by permalink, by title and by path with or without `.md`
+    /// (without it only for an identifier that may name a path, see
+    /// [`may_name_a_path`]), which is the same ladder the base lookup offers,
+    /// over the entries this actor holds. Tombstones are skipped: a deletion is not an engram to
     /// find.
     pub(crate) async fn resolve_draft(
         &self,
@@ -832,11 +844,16 @@ impl<'a> DomainView<'a> {
         };
         // An absolute identifier naming another domain is not this domain's to
         // answer, exactly as `resolve_in` refuses it.
-        let wanted = match CrystallineUrl::parse(identifier) {
+        let (wanted, is_url) = match CrystallineUrl::parse(identifier) {
             Some(url) if url.domain != domain => return Ok(None),
-            Some(url) => url.permalink,
-            None => identifier.to_string(),
+            Some(url) => (url.permalink, true),
+            None => (identifier.to_string(), false),
         };
+        // The path without `.md` answers only what the base lookup's path step
+        // answers: never a URL, which addresses a permalink and nothing else,
+        // and never an identifier spelled like a permalink, so a draft renamed
+        // in place does not answer its old permalink through its file's path.
+        let by_stem = !is_url && may_name_a_path(&wanted);
         let (domain_id, source) = self.engine.domain_source(domain).await?;
         let entries = {
             let store = self.engine.store();
@@ -858,7 +875,9 @@ impl<'a> DomainView<'a> {
                 entry.path.as_str(),
             ];
             let path_stem = entry.path.strip_suffix(".md");
-            if !names.iter().any(|name| *name == wanted) && path_stem != Some(wanted.as_str()) {
+            if !names.iter().any(|name| *name == wanted)
+                && !(by_stem && path_stem == Some(wanted.as_str()))
+            {
                 continue;
             }
             return Ok(Some((
@@ -1616,7 +1635,8 @@ impl<'a> DomainView<'a> {
         let (desc, source) = self.resolve(identifier).await?;
         let content = self.text_at(&source, &desc).await?.ok_or_else(|| {
             EngineError::NotFound(format!(
-                "no engram '{identifier}' in domain '{}'",
+                "no engram '{}' in domain '{}'",
+                shown(identifier),
                 self.domain
             ))
         })?;

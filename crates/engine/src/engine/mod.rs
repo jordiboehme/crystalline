@@ -4045,9 +4045,11 @@ impl Engine {
 
     /// Resolve an identifier to a descriptor and the content source to read
     /// it through. The grammar is deliberately two-form: a bare permalink,
-    /// title or, with a domain named, the file path inside it is
-    /// domain-relative (within the passed `domain`, or across all domains
-    /// when none is passed, where a path does not resolve) and a
+    /// title or, with a domain named, the file path inside it (a path spelled
+    /// like a permalink only with its `.md`, see
+    /// [`crystalline_index::may_name_a_path`]) is domain-relative (within the
+    /// passed `domain`, or across all domains when none is passed, where a
+    /// path does not resolve) and a
     /// `crystalline://` URL is the one absolute, cross-domain form -
     /// mirroring the `[[target]]` / `[[domain:target]]` wikilink pair. A
     /// scheme-less `domain/permalink` composite is not part of the grammar,

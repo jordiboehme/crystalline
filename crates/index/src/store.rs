@@ -2772,22 +2772,38 @@ pub enum DomainLookup {
     },
 }
 
+/// Whether a domain-scoped identifier may name a file path: it ends in `.md`,
+/// or it cannot be a permalink because slugifying its stem changes it (an
+/// uppercase letter, a space, an underscore and so on). An identifier spelled
+/// like a permalink is judged as a permalink (or a title) only. Otherwise an
+/// in-place rename would leave the OLD permalink resolving through the file's
+/// path on every verb, move and delete included (Jordi, 2026-09-28).
+pub fn may_name_a_path(identifier: &str) -> bool {
+    match identifier.strip_suffix(".md") {
+        Some(_) => true,
+        None => slugify(identifier) != identifier,
+    }
+}
+
 /// The one domain-scoped lookup every identifier-taking surface shares: the
-/// permalink, then the title (both [`Store::find_engram`]), then the file
-/// path inside the domain as written or with `.md` added, compared exactly.
-/// A miss carries the permalinks the identifier's slug matches - a row's own
-/// permalink or the slug of its path - so the caller can name the one that
-/// was meant.
+/// permalink, then the title (both [`Store::find_engram`]), then, when the
+/// identifier [may name a path](may_name_a_path), the file path inside the
+/// domain as written or with `.md` added, compared exactly. A miss carries
+/// the permalinks the identifier's slug matches - a row's own permalink or
+/// the slug of its path - so the caller can name the one that was meant. For
+/// an identifier spelled like a permalink the slug is the identifier itself,
+/// so a stale permalink after an in-place rename (`alpha`, whose file
+/// `alpha.md` now holds `beta`) misses and names `beta`.
 ///
 /// The path rows come from the escaped, case-folded prefix listing and are
 /// compared byte for byte here, so a path in the wrong case never resolves: it
 /// becomes a hint instead. The listing cannot use the path index (`lower(path)
 /// LIKE`), which is accepted because it runs only after the two indexed
 /// lookups missed. An identifier whose stem is empty (`.md`) skips the path
-/// step: the backends drop an empty prefix and would list the whole domain.
-/// A free function rather than a trait method, so neither backend changes.
-/// Callers skip it for a domain the reader may not see, which keeps a hidden
-/// domain's miss free of hints.
+/// step and the hint: the backends drop an empty prefix and would list the
+/// whole domain. A free function rather than a trait method, so neither
+/// backend changes. Callers skip it for a domain the reader may not see,
+/// which keeps a hidden domain's miss free of hints.
 pub async fn lookup_in_domain(
     store: &dyn Store,
     dom: &str,
@@ -2803,18 +2819,24 @@ pub async fn lookup_in_domain(
         });
     }
     let rows = store.list_engrams(dom, Some(stem), None).await?;
-    let with_md = format!("{stem}.md");
-    if let Some(d) = rows
-        .iter()
-        .find(|r| r.path == identifier)
-        .or_else(|| rows.iter().find(|r| r.path == with_md))
-    {
-        return Ok(DomainLookup::Found(d.clone()));
+    if may_name_a_path(identifier) {
+        let with_md = format!("{stem}.md");
+        if let Some(d) = rows
+            .iter()
+            .find(|r| r.path == identifier)
+            .or_else(|| rows.iter().find(|r| r.path == with_md))
+        {
+            return Ok(DomainLookup::Found(d.clone()));
+        }
     }
     let slug = crystalline_core::path_permalink(identifier);
     let mut suggest: Vec<String> = Vec::new();
-    if !slug.is_empty() && slug != identifier {
-        if let Some(d) = store.find_engram(dom, &slug).await?
+    if !slug.is_empty() {
+        // A permalink equal to the slug. Only asked when the slug differs:
+        // otherwise the first lookup above already asked it. A title hit is
+        // no hint - a title is not what the identifier spelled.
+        if slug != identifier
+            && let Some(d) = store.find_engram(dom, &slug).await?
             && d.permalink == slug
         {
             suggest.push(d.permalink);

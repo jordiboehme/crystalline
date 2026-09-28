@@ -94,8 +94,9 @@ pub struct WriteParams {
 pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL, or, with `domain`
     /// set, the engram's file path inside the domain with or without `.md`
-    /// (`guides/Agent Workflow Guide`). Without the scheme the identifier is
-    /// domain-relative: never prefix it with a domain name.
+    /// (`guides/Agent Workflow Guide`; a path spelled like a permalink needs
+    /// the `.md`). Without the scheme the identifier is domain-relative: never
+    /// prefix it with a domain name.
     pub identifier: String,
     /// Restrict resolution to this domain.
     #[serde(default)]
@@ -120,8 +121,9 @@ pub struct ReadParams {
 pub struct EditParams {
     /// A bare permalink, title or `crystalline://` URL, or, with `domain`
     /// set, the engram's file path inside the domain with or without `.md`
-    /// (`guides/Agent Workflow Guide`). Without the scheme the identifier is
-    /// domain-relative: never prefix it with a domain name.
+    /// (`guides/Agent Workflow Guide`; a path spelled like a permalink needs
+    /// the `.md`). Without the scheme the identifier is domain-relative: never
+    /// prefix it with a domain name.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
@@ -211,8 +213,9 @@ pub struct SaveParams {
     pub domain: String,
     /// A bare permalink, title or `crystalline://` URL, or, with `domain`
     /// set, the engram's file path inside the domain with or without `.md`
-    /// (`guides/Agent Workflow Guide`). Without the scheme the identifier is
-    /// domain-relative: never prefix it with a domain name.
+    /// (`guides/Agent Workflow Guide`; a path spelled like a permalink needs
+    /// the `.md`). Without the scheme the identifier is domain-relative: never
+    /// prefix it with a domain name.
     pub identifier: String,
     /// The complete markdown text, frontmatter included, written verbatim.
     pub content: String,
@@ -229,7 +232,8 @@ pub struct RetireParams {
     /// The engram's domain.
     pub domain: String,
     /// A bare permalink, title, the engram's file path inside the domain
-    /// (with or without `.md`) or `crystalline://` URL, domain-relative.
+    /// (with or without `.md`; a path spelled like a permalink needs the
+    /// `.md`) or `crystalline://` URL, domain-relative.
     pub identifier: String,
     /// The retirement status: deprecated, superseded or archived. This guided
     /// flow accepts exactly these three; any other status goes through the
@@ -254,8 +258,8 @@ pub struct SplitParams {
     /// The source engram's domain. The new engram lands in the same domain.
     pub domain: String,
     /// The source engram: a bare permalink, title, its file path inside the
-    /// domain (with or without `.md`) or `crystalline://` URL,
-    /// domain-relative.
+    /// domain (with or without `.md`; a path spelled like a permalink needs
+    /// the `.md`) or `crystalline://` URL, domain-relative.
     pub identifier: String,
     /// The new engram's title. Slugified into its permalink, as write_engram
     /// slugifies one.
@@ -286,8 +290,9 @@ pub struct SplitParams {
 pub struct MoveParams {
     /// A bare permalink, title or `crystalline://` URL, or, with `domain`
     /// set, the engram's file path inside the domain with or without `.md`
-    /// (`guides/Agent Workflow Guide`). Without the scheme the identifier is
-    /// domain-relative: never prefix it with a domain name.
+    /// (`guides/Agent Workflow Guide`; a path spelled like a permalink needs
+    /// the `.md`). Without the scheme the identifier is domain-relative: never
+    /// prefix it with a domain name.
     pub identifier: String,
     /// The engram's current domain.
     pub domain: String,
@@ -323,8 +328,9 @@ pub struct MoveParams {
 pub struct DeleteParams {
     /// A bare permalink, title or `crystalline://` URL, or, with `domain`
     /// set, the engram's file path inside the domain with or without `.md`
-    /// (`guides/Agent Workflow Guide`). Without the scheme the identifier is
-    /// domain-relative: never prefix it with a domain name.
+    /// (`guides/Agent Workflow Guide`; a path spelled like a permalink needs
+    /// the `.md`). Without the scheme the identifier is domain-relative: never
+    /// prefix it with a domain name.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
@@ -448,7 +454,8 @@ pub struct ValidateParams {
     /// The domain whose engrams to validate against its schema engrams.
     pub domain: String,
     /// Validate only this engram: a permalink, title or, since domain is
-    /// required, the file path inside the domain with or without .md.
+    /// required, the file path inside the domain with or without .md (a path
+    /// spelled like a permalink needs the .md).
     #[serde(default)]
     pub identifier: Option<String>,
     /// Validate only engrams of this `type`.
