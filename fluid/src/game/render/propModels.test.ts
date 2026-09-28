@@ -13,10 +13,17 @@ import {
 import { turnForSide, wallAnchor } from "../world/sites";
 import type { PropKind, Side } from "../world/types";
 import { CELL } from "../world/units";
-import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
+import {
+  FLAG,
+  accentTint,
+  createBuilder,
+  type MeshData,
+  type V3,
+} from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
+  GLOWING,
   floatingGlow,
   inBox,
   looseParts,
@@ -306,6 +313,104 @@ describe("prop models", () => {
           `${kind} ${String(v)}`,
         ).toBe(PROP_BANK[kind] !== "steady");
       }
+  });
+
+  it("paints exactly the six kinds' small parts with the room's accent, and none of them glows (2.7 C9)", () => {
+    // Mutation caught: a part painted twice, the wrong part painted (a
+    // handle's upright, a drawer pull, a middle vent slit, a rib the drum
+    // rack shares), or an accent part that glows.
+    const mark = accentTint(1).join();
+    const PROP_ACCENT_PARTS: Partial<Record<PropKind, readonly number[]>> = {
+      stool: [1, 1],
+      bench: [1, 1],
+      trolley: [1, 1],
+      "tool-cart": [2, 3],
+      barrel: [2, 6],
+      "locker-bank": [3, 4],
+    };
+    for (const [kind, counts] of Object.entries(PROP_ACCENT_PARTS) as [
+      PropKind,
+      readonly number[],
+    ][]) {
+      counts.forEach((n, v) => {
+        const { parts } = buildRecorded(kind, v);
+        const painted = parts.filter((p) => p.tint?.join() === mark);
+        expect(painted.length, `${kind} variant ${String(v)}`).toBe(n);
+        for (const p of painted) expect(GLOWING).not.toContain(p.flag);
+      });
+    }
+  });
+
+  it("keeps the tool cart's drawer fronts visibly proud of its own red body, not buried inside it (2.7 C9)", () => {
+    // Mutation caught: the drawer front's depth moved back flush with, or
+    // behind, the body's own face, which would bury the accent in the same
+    // surface as the body and hide it whatever its tint (found by hand: the
+    // brief's own first depths did exactly this).
+    const mark = accentTint(1).join();
+    for (let v = 0; v < PROP_CATALOGUE["tool-cart"].variants; v++) {
+      const { parts } = buildRecorded("tool-cart", v);
+      const fronts = parts.filter((p) => p.tint?.join() === mark);
+      const body = parts.find(
+        (p) => p.method === "bevelBox" && p.tint?.join() !== mark,
+      );
+      expect(fronts.length, `tool-cart variant ${String(v)}`).toBeGreaterThan(
+        0,
+      );
+      if (!body) throw new Error("no body part");
+      const f0 = frameAt([0, 0, 0], 0);
+      const localD = (points: readonly V3[]) =>
+        Math.max(...points.map((p) => toLocal(f0, p)[1]));
+      const bodyFace = localD(body.points);
+      for (const front of fronts) {
+        expect(
+          localD(front.points),
+          `tool-cart variant ${String(v)}`,
+        ).toBeGreaterThan(bodyFace);
+      }
+    }
+  });
+
+  it("keeps the barrel's ribs visibly proud of its own wall, not buried inside it (2.7 C9)", () => {
+    // Mutation caught: a rib's inset widened back to today's (drum rack's
+    // own), which would put the rib's outer edge exactly on the barrel's
+    // own wall, buried in the same surface, invisible whatever its tint.
+    for (let v = 0; v < PROP_CATALOGUE.barrel.variants; v++) {
+      const { parts } = buildRecorded("barrel", v);
+      const bodies = parts.filter((p) => {
+        if (p.method !== "cylinder") return false;
+        const s = shape(p.points);
+        return s.hi[1] - s.lo[1] > 0.5; // the tall body, not the thin lid
+      });
+      const rings = parts.filter((p) => p.method === "ring");
+      expect(bodies.length, `barrel variant ${String(v)}`).toBeGreaterThan(0);
+      expect(rings.length, `barrel variant ${String(v)}`).toBeGreaterThan(0);
+      for (const ring of rings) {
+        const rs = shape(ring.points);
+        const centre: [number, number] = [
+          (rs.lo[0] + rs.hi[0]) / 2,
+          (rs.lo[2] + rs.hi[2]) / 2,
+        ];
+        let nearest: { dist: number; s: ReturnType<typeof shape> | null } = {
+          dist: Infinity,
+          s: null,
+        };
+        for (const b of bodies) {
+          const bs = shape(b.points);
+          const c: [number, number] = [
+            (bs.lo[0] + bs.hi[0]) / 2,
+            (bs.lo[2] + bs.hi[2]) / 2,
+          ];
+          const dist = Math.hypot(c[0] - centre[0], c[1] - centre[1]);
+          if (dist < nearest.dist) nearest = { dist, s: bs };
+        }
+        if (!nearest.s) throw new Error("no matching body");
+        const ringRadius = (rs.hi[0] - rs.lo[0]) / 2;
+        const bodyRadius = (nearest.s.hi[0] - nearest.s.lo[0]) / 2;
+        expect(ringRadius, `barrel variant ${String(v)}`).toBeGreaterThan(
+          bodyRadius,
+        );
+      }
+    }
   });
 
   it("rests every part of every rare kind on the floor, its wall or another part (2.6d C14)", () => {

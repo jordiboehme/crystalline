@@ -10,8 +10,16 @@
  * a handle, a wheel or a corner post can protrude past the body's own face
  * without ever crossing the true footprint, the same way a real object
  * rarely touches every edge of its bounding box.
+ *
+ * Four kinds carry the room's accent (`s.accent()`, 2.7 C9) on one small
+ * part, in every variant, so the room's colour repeats on its set dressing
+ * without ever taking over a whole prop: the stool's seat, the bench's
+ * seat, the trolley's top grip bar and the tool cart's drawer fronts. The
+ * barrel's two ribs carry it too, as its middle band, on every barrel of
+ * the cluster (variant 1). No other floor prop carries it.
  */
 
+import type { Surface } from "../../geometry";
 import { FOOTPRINTS, type FloorSize } from "../../../world/footprints";
 import type { RarePropKind } from "../../../world/props";
 import type { FloorPropKind } from "../../../world/types";
@@ -149,9 +157,23 @@ function crate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
 const BARREL = { ribTube: 0.015, lidLift: 0.02 };
 
 /**
+ * How far a rib's centre sits in from the barrel's own wall (`radius -
+ * inset`), for `oneBarrel`'s `inset` parameter: at `BARREL.ribTube` (its
+ * default, `drumRack`'s own) the rib's outer edge lands exactly on the
+ * wall, buried in the same surface as the cylinder's own side, so it never
+ * shows against it, dark or accented (a fact of this recipe from before
+ * 2.7, left as it is for the drum rack). `barrel` passes a smaller inset so
+ * its ribs stand a hair proud of the wall instead, where the accent reads.
+ */
+const RIB_PROUD = 0.008;
+
+/**
  * One upright barrel at `(a, d)`, its base at `base` (0 by default so
  * `barrel`'s own floor-level barrels need not pass it): a metal cylinder
- * with two ribs and a lid, `sides` facets round.
+ * with two ribs and a lid, `sides` facets round. `band` colours the two
+ * ribs (plain dark metal by default); `barrel` passes the room's accent so
+ * every barrel of the cluster carries it, `drumRack` leaves it as it was.
+ * `inset` is documented on `RIB_PROUD`.
  */
 function oneBarrel(
   k: Kit,
@@ -162,6 +184,8 @@ function oneBarrel(
   height: number,
   sides: number,
   base = 0,
+  band: Surface = s.dark,
+  inset: number = BARREL.ribTube,
 ): void {
   k.cylinder(a, d, base, base + height, radius, sides, s.metal);
   for (const h of [height * 0.3, height * 0.7]) {
@@ -169,11 +193,11 @@ function oneBarrel(
       a,
       d,
       base + h,
-      radius - BARREL.ribTube,
+      radius - inset,
       BARREL.ribTube,
       6,
       sides,
-      s.dark,
+      band,
       "up",
     );
   }
@@ -191,11 +215,25 @@ function oneBarrel(
 /**
  * Barrel: variant 0 one barrel with ribs and a lid at the anchor; variant 1
  * three smaller barrels clustered so the group fills the wider footprint.
+ * Every barrel's two ribs carry the room's accent as its middle band
+ * (2.7 C9).
  */
 function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("barrel", variant);
+  const inset = BARREL.ribTube - RIB_PROUD;
   if (variant === 0) {
-    oneBarrel(k, s, 0, 0, Math.min(hw, hd) - 0.025, 0.85, 12);
+    oneBarrel(
+      k,
+      s,
+      0,
+      0,
+      Math.min(hw, hd) - 0.025,
+      0.85,
+      12,
+      0,
+      s.accent(),
+      inset,
+    );
     return;
   }
   const r = 0.28;
@@ -204,7 +242,9 @@ function barrel({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     [hw - r - 0.02, -(hd - r - 0.15)],
     [0, hd - r - 0.02],
   ];
-  for (const [a, d] of positions) oneBarrel(k, s, a, d, r, 0.8, 10);
+  for (const [a, d] of positions) {
+    oneBarrel(k, s, a, d, r, 0.8, 10, 0, s.accent(), inset);
+  }
 }
 
 /** The trolley deck's thickness and the caster's radius. */
@@ -233,7 +273,9 @@ function trolleyDeck(
 
 /**
  * Trolley: a flat cart on four casters with a handle at the back (`-d`).
- * Variant 0 a single deck, variant 1 two decks stacked on corner posts.
+ * Variant 0 a single deck, variant 1 two decks stacked on corner posts. The
+ * handle's top grip bar carries the room's accent (2.7 C9); its two
+ * uprights stay plain metal.
  */
 function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("trolley", variant);
@@ -287,25 +329,26 @@ function trolley({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       s.dark,
     );
   }
-  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, s.dark);
+  k.cylinderAlong(-railA, railA, -hd + 0.03, handleTop, 0.015, 6, s.accent());
 }
 
 /**
  * Stool: variant 0 a round seat on a post with a foot ring, variant 1 a
- * square seat on four straight legs.
+ * square seat on four straight legs. The seat carries the room's accent in
+ * both variants (2.7 C9).
  */
 function stool({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("stool", variant);
   const r = Math.min(hw, hd) - 0.03;
   const H = 0.75;
   if (variant === 0) {
-    k.cylinder(0, 0, H - 0.04, H, r, 12, s.body);
+    k.cylinder(0, 0, H - 0.04, H, r, 12, s.accent());
     k.cylinder(0, 0, 0.04, H - 0.04, 0.035, 8, s.metal);
     k.cylinder(0, 0, 0, 0.04, r * 0.4, 8, s.dark);
     k.ring(0, 0, 0.24, r * 0.7, 0.014, 6, 12, s.dark, "up");
     return;
   }
-  k.bevelBox(-r, r, -r, r, H - 0.04, H, 0.015, s.body);
+  k.bevelBox(-r, r, -r, r, H - 0.04, H, 0.015, s.accent());
   const legA = r - 0.03;
   for (const a of [-legA, legA]) {
     for (const d of [-legA, legA]) {
@@ -486,13 +529,23 @@ function planter({ k, s, variant }: Parameters<PropRecipe>[0]): void {
 
 /**
  * Bench: a slab seat on two legs, front towards `+d`. Variant 1 adds a
- * back panel behind the seat (`-d`).
+ * back panel behind the seat (`-d`). The seat carries the room's accent in
+ * both variants (2.7 C9); the legs and the back panel stay plain.
  */
 function bench({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("bench", variant);
   const seatD0 = variant === 0 ? -hd + 0.02 : -hd * 0.35;
   const seatD1 = hd - 0.02;
-  k.bevelBox(-hw + 0.02, hw - 0.02, seatD0, seatD1, 0.42, 0.48, 0.012, s.body);
+  k.bevelBox(
+    -hw + 0.02,
+    hw - 0.02,
+    seatD0,
+    seatD1,
+    0.42,
+    0.48,
+    0.012,
+    s.accent(),
+  );
   const legA = hw - 0.08;
   for (const a of [-legA, legA]) {
     k.box(a - 0.03, a + 0.03, seatD0 + 0.04, seatD1 - 0.04, 0, 0.42, s.metal);
@@ -725,7 +778,11 @@ function ladder({ kitAt, s, variant }: Parameters<PropRecipe>[0]): void {
 /** The tool cart's drawer band height and tool props on top. */
 const CART = { drawerH: 0.1 };
 
-/** Tool cart: a red body with stacked drawers and small tools on top. */
+/**
+ * Tool cart: a red body with stacked drawers and small tools on top. Each
+ * drawer's front panel carries the room's accent (2.7 C9); its pull handle
+ * stays plain metal.
+ */
 function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const { hw, hd } = halfSize("tool-cart", variant);
   const drawers = variant === 0 ? 2 : 3;
@@ -741,7 +798,10 @@ function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     0.02,
     red,
   );
-  const front = hd - 0.03;
+  // The front panel's outer face stands a hair proud of the body's own
+  // face (at `hd - 0.02`), so its accent never sits flush with, or behind,
+  // the red body and the two do not fight for the same surface.
+  const front = hd - 0.018;
   const gap = 0.01;
   const bh = (top - 0.14 - gap * (drawers + 1)) / drawers;
   for (let i = 0; i < drawers; i++) {
@@ -753,7 +813,7 @@ function toolCart({ k, s, variant }: Parameters<PropRecipe>[0]): void {
       front + 0.004,
       h0,
       h0 + bh,
-      s.dark,
+      s.accent(),
     );
     k.box(
       -0.05,

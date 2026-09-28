@@ -9,6 +9,10 @@
  * facing `+d`, so it works purely in the kit's local `(a, d, h)` terms and
  * never sees the room; the prop test builds every kind, variant and turn
  * against those bounds.
+ *
+ * The locker bank carries the room's accent (`s.accent()`, 2.7 C9) on the
+ * topmost vent slit of every door, its trim strip, in every variant. No
+ * other wall prop carries it.
  */
 
 import { FLAG, type Surface } from "../../geometry";
@@ -35,7 +39,9 @@ const LOCKER = { half: 0.85, depth: 0.26, h1: 2.0 };
 
 /**
  * Locker bank: a cabinet of narrow doors, each with a vent slit and a
- * handle. Variant 0 has three doors, variant 1 four narrower ones.
+ * handle. Variant 0 has three doors, variant 1 four narrower ones. Every
+ * door's topmost slit carries the room's accent, standing in for the trim
+ * strip along its top (2.7 C9); its lower two slits stay plain dark metal.
  */
 function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const L = LOCKER;
@@ -57,7 +63,7 @@ function lockerBank({ k, s, variant }: Parameters<PropRecipe>[0]): void {
         L.depth,
         h0,
         h0 + 0.02,
-        s.dark,
+        j === 0 ? s.accent() : s.dark,
       );
     }
     k.box(
