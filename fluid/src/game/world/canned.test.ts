@@ -16,6 +16,7 @@ import {
   heroBlocker,
   heroFootprint,
   HERO_FOOTING,
+  pipeRunBox,
   propFootprint,
 } from "./footprints";
 import {
@@ -810,6 +811,34 @@ describe("the variants hall (2.7 C24)", () => {
         expect(overlaps(b, t)).toBe(false);
       boxes.forEach((c, j) => {
         if (i !== j) expect(overlaps(b, c)).toBe(false);
+      });
+    });
+  });
+
+  it("turns both pipe runs along the hall, so they neither cross nor leave it (2.7 C24)", () => {
+    // Mutation caught: the pipe runs left at turn 0, where a run lies
+    // across the hall and pokes out past its west wall.
+    const runs = room.decor.filter((d) => d.kind === "pipe-run");
+    expect(runs.length).toBe(VARIANT_COUNTS.decor["pipe-run"]);
+    const boxes = runs.map((d) => {
+      expect(d.turn).toBe(1);
+      const box = pipeRunBox(d, room.hall);
+      if (box === null) throw new Error("a pipe run with no box");
+      return box;
+    });
+    const hall: Box = {
+      x0: room.hall.x0 * CELL,
+      x1: room.hall.x1 * CELL,
+      z0: room.hall.y0 * CELL,
+      z1: room.hall.y1 * CELL,
+    };
+    boxes.forEach((b, i) => {
+      expect(b.x0).toBeGreaterThanOrEqual(hall.x0);
+      expect(b.x1).toBeLessThanOrEqual(hall.x1);
+      expect(b.z0).toBeGreaterThanOrEqual(hall.z0);
+      expect(b.z1).toBeLessThanOrEqual(hall.z1);
+      boxes.forEach((c, k) => {
+        if (i !== k) expect(overlaps(b, c)).toBe(false);
       });
     });
   });

@@ -61,6 +61,31 @@ describe("baseLayers", () => {
     expect(at(third, mid)).toBeLessThan(at(third, y) - 20);
   });
 
+  it("darkens the ribbed layer's four edges, so every wrap reads as a seam (2.7 C11)", () => {
+    // Mutation caught: the ribbed layer's edge darkening dropped (its
+    // wraps, every 0.5 m along and 2 m up, would show no seam).
+    const ribbed = baseLayers(LAYER_SIZE, 1)[LAYER.ribbed];
+    expect(ribbed).toBeDefined();
+    const at = (x: number, y: number) => ribbed![(y * LAYER_SIZE + x) * 4] ?? 0;
+    const mean = (vs: number[]) => vs.reduce((s, v) => s + v, 0) / vs.length;
+    const n = LAYER_SIZE;
+    // The top and bottom rows against a row a quarter up, texel by texel
+    // across (the ribs run up, so a column's shade is the same up it).
+    const across = Array.from({ length: n }, (_, x) => x);
+    for (const edge of [0, n - 1])
+      expect(mean(across.map((x) => at(x, edge)))).toBeLessThan(
+        mean(across.map((x) => at(x, n / 4))) - 30,
+      );
+    // The left and right columns sit in a trough between ribs; the next
+    // trough (a sixth across) is the same shade without the darkening.
+    const up = Array.from({ length: n / 2 }, (_, i) => i + n / 8);
+    const trough = n / 6;
+    for (const edge of [0, n - 1])
+      expect(mean(up.map((y) => at(edge, y)))).toBeLessThan(
+        mean(up.map((y) => at(Math.round(trough), y))) - 30,
+      );
+  });
+
   it("rivets the plated layer's edges and leaves its middle plain (2.7 C11)", () => {
     // Mutation caught: no rivets, rivets in the middle, or a copy of the
     // panel layer.
