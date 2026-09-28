@@ -19,6 +19,9 @@
  *   and an unsealed portal needs nothing at all: walking into it is the
  *   action, so neither is offered for Space.
  * - A sealed door or portal is offered only to say why it is sealed.
+ * - A lift is offered for Space (`SPACE LIFT`, M3 C26), which opens its
+ *   list of stops; a station screen is only looked at, and an exit opens
+ *   on approach like a sliding door (M3 C28), so neither is offered.
  *
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
@@ -100,10 +103,11 @@ const OPEN_ENOUGH = 0.9;
  *   door, after where the door is heading;
  * - `SPACE CRAWL <label>` at a hatch;
  * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing;
- * - `SEALED <label>` at a way in `failed`.
+ * - `SEALED <label>` at a way in `failed`;
+ * - `SPACE LIFT` at a lift.
  */
 export type Interactable = {
-  kind: "terminal" | "door" | "hatch" | "portal";
+  kind: "terminal" | "door" | "hatch" | "portal" | "lift";
   index: number;
   prompt: string;
 };
@@ -218,9 +222,10 @@ export function approaches(slot: WallSlot, player: Player): boolean {
 
 /**
  * What the HUD offers for a fixture, or null when Space does nothing there and
- * nothing needs saying: an unsealed sliding door opens on approach and an
- * unsealed portal on contact, and machines, posters and the placard are
- * only looked at.
+ * nothing needs saying: an unsealed sliding door and an exit open on
+ * approach and an unsealed portal on contact, and machines, posters, the
+ * placard and screens are only looked at. A lift is always offered: Space
+ * opens its stops.
  */
 function offer(
   fixture: Fixture,
@@ -258,9 +263,13 @@ function offer(
       }
       return null;
     }
+    case "lift":
+      return { kind: "lift", index, prompt: "SPACE LIFT" };
+    case "exit":
     case "machine":
     case "poster":
     case "placard":
+    case "screen":
       return null;
   }
 }

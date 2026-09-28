@@ -72,10 +72,11 @@
  *    their seeds (`seedFor(room.seed, "hero", <anchor ints>, <token>)`, H18;
  *    ties by the anchor's y, then x):
  *    - `wall` and `backed`: every free wall edge of the hall that is not
- *      beside a door, hatch or portal on its run (H5) and not a placed
- *      hero's edge, token `wall-<side>`, anchored at `wallAnchor`; a backed
- *      kind never takes a run's first or last edge (H24), and the core wall
- *      takes an edge and the next one of its run, anchored between them;
+ *      beside a door, hatch, portal, lift or exit on its run (H5) and not
+ *      a placed hero's edge, token `wall-<side>`, anchored at `wallAnchor`;
+ *      a backed kind never takes a run's first or last edge (H24), and the
+ *      core wall takes an edge and the next one of its run, anchored
+ *      between them;
  *    - `band`: every half-cell point of the interior band, token `band`,
  *      its box inside the band, turned by its second draw;
  *    - `corner`: as in step 3, token `corner`;
@@ -1060,12 +1061,18 @@ export function placeHeroes(
     .map((d) => pipeRunBox(d, hall))
     .filter((b) => b !== null);
 
-  // The run neighbours of every way's edge (H5), which no hero takes.
+  // The run neighbours of every way's edge (H5), which no hero takes: a
+  // door, hatch or portal, and a lift or exit (M3 C26, C28).
   const beside = new Set<string>();
   const ways = new Set(
     room.fixtures
       .filter(
-        (f) => f.kind === "door" || f.kind === "hatch" || f.kind === "portal",
+        (f) =>
+          f.kind === "door" ||
+          f.kind === "hatch" ||
+          f.kind === "portal" ||
+          f.kind === "lift" ||
+          f.kind === "exit",
       )
       .map((f) => edgeKey(f.slot)),
   );

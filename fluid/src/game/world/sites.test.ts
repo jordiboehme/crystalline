@@ -44,7 +44,15 @@ import {
   type RoomBase,
 } from "./sites";
 import sitesSource from "./sites.ts?raw";
-import type { Box, PlaceInput, PlaceReference, WallSlot } from "./types";
+import { arrivalPoint, targetsOf } from "./reachChecks";
+import type {
+  Box,
+  Fixture,
+  PlaceInput,
+  PlaceReference,
+  RoomSpec,
+  WallSlot,
+} from "./types";
 import { CELL } from "./units";
 
 /** A place with nothing in it, to be filled by `over`. */
@@ -368,6 +376,72 @@ describe("lanes", () => {
         z1: (Math.max(...rows) + 1) * CELL,
       });
     }
+  });
+});
+
+/**
+ * The first three free wall edges of `room` (`dressingSites(room).free`),
+ * as slots, carrying a lift, a screen and an exit in that order: the three
+ * fixtures the station adds to rooms (M3 C7, C20, C28).
+ */
+function withStationFixtures(room: RoomSpec): RoomSpec {
+  const [a, b, c] = [...dressingSites(room).free].map((k): WallSlot => {
+    const [x, y, side] = k.split(",");
+    return { x: Number(x), y: Number(y), side: side as WallSlot["side"] };
+  });
+  if (a === undefined || b === undefined || c === undefined)
+    throw new Error("fewer than three free edges");
+  const fixtures: Fixture[] = [
+    { kind: "lift", slot: a, stops: [], note: null, seed: 1 },
+    { kind: "screen", slot: b, lines: ["S"], keys: [], seed: 2 },
+    {
+      kind: "exit",
+      slot: c,
+      label: "DECK 1",
+      to: { kind: "bridge", domain: room.domain },
+      seed: 3,
+    },
+  ];
+  return { ...room, fixtures: [...room.fixtures, ...fixtures] };
+}
+
+describe("the station's fixtures (M3 C7, C20, C28)", () => {
+  const room = withStationFixtures(empty);
+  const slotOf = (kind: Fixture["kind"]) => {
+    const f = room.fixtures.find((x) => x.kind === kind);
+    if (f === undefined) throw new Error(kind);
+    return f.slot;
+  };
+
+  it("gives a lift and an exit a way lane and a screen a sheet lane", () => {
+    // Mutation caught: a case missing from the lanes switch.
+    const lanes = dressingSites(room).lanes;
+    const way = { along: LANE_WIDTH, out: LANE_DEPTH };
+    const sheet = { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH };
+    expect(lanes).toContainEqual(footprint(slotOf("lift"), way));
+    expect(lanes).toContainEqual(footprint(slotOf("exit"), way));
+    expect(lanes).toContainEqual(footprint(slotOf("screen"), sheet));
+    expect(lanes).toHaveLength(dressingSites(empty).lanes.length + 3);
+  });
+
+  it("stands the three flush on the wall: no taken footprint of their own", () => {
+    // Mutation caught: a lift, screen or exit given a floor footprint,
+    // which would keep props off the floor in front of a flush fixture.
+    for (const kind of ["lift", "screen", "exit"] as const) {
+      const f = room.fixtures.find((x) => x.kind === kind);
+      expect(f, kind).toBeDefined();
+      if (f !== undefined) expect(footprintOf(f), kind).toBeNull();
+    }
+  });
+
+  it("gives a lift and an exit an arrival point in the reach checks' targets", () => {
+    // Mutation caught: the lift or the exit left out of `targetsOf`, so no
+    // flood-fill test checks the player can still reach it.
+    const labels = targetsOf(room).map((t) => t.label);
+    expect(labels).toContain(`lift ${edgeKey(slotOf("lift"))}`);
+    expect(labels).toContain(`exit ${edgeKey(slotOf("exit"))}`);
+    const exit = targetsOf(room).find((t) => t.label.startsWith("exit "));
+    expect(exit).toMatchObject(arrivalPoint(slotOf("exit")));
   });
 });
 

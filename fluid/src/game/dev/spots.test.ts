@@ -138,9 +138,17 @@ describe("spotSpawn", () => {
   });
 
   it("accepts exactly the fixture kinds", () => {
+    // The gallery room carries every engram room's kind; the station's
+    // lift, screen and exit are judged in `liftsHallRoom` instead.
+    const station = ["exit", "lift", "screen"];
     const room = galleryRoom();
     const kinds = new Set(room.fixtures.map((f) => f.kind));
-    expect(Object.keys(SPOT_KINDS).sort()).toEqual([...kinds].sort());
+    expect(
+      Object.keys(SPOT_KINDS)
+        .filter((k) => !station.includes(k))
+        .sort(),
+    ).toEqual([...kinds].sort());
+    expect(Object.keys(SPOT_KINDS)).toEqual(expect.arrayContaining(station));
   });
 });
 

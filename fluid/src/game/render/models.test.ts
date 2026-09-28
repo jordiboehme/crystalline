@@ -256,6 +256,9 @@ const KEY_OF: Record<Fixture["kind"], string> = {
   machine: `tag:${INDEX}`,
   poster: `poster:${INDEX}`,
   placard: "placard",
+  lift: `lift:${INDEX}`,
+  screen: `screen:${INDEX}`,
+  exit: `exit:${INDEX}`,
 };
 
 const DECOR_KINDS: readonly DecorKind[] = [

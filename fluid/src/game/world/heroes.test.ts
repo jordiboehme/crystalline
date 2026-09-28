@@ -91,12 +91,14 @@ import { WALL_PROP_DEPTH } from "./props";
 import type {
   Archetype,
   Box,
+  Fixture,
   Hero,
   HeroKind,
   PlaceInput,
   Prop,
   RoomSpec,
   Side,
+  WallSlot,
 } from "./types";
 import { CELL } from "./units";
 
@@ -1455,6 +1457,59 @@ describe("the hero pass", () => {
               expect(ends.has(k), `${h.kind} ${k}`).toBe(false);
           }
     }
+  }, 30_000);
+
+  it("keeps heroes off the run neighbours of a lift's and an exit's edge (M3 C26, C28)", () => {
+    // Mutation caught: the lift or the exit left out of the pass's `ways`
+    // set. A hero that stood on edge `e` is handed the same draws in the
+    // same room with a lift (then an exit) on `e`'s run neighbour; the way
+    // lane alone (1.6 m across a 2 m cell) does not reach `e`, so only the
+    // ways set keeps the hero off it.
+    const stationFixtures = (slot: WallSlot, domain: string): Fixture[] => [
+      { kind: "lift", slot, stops: [], note: null, seed: 1 },
+      {
+        kind: "exit",
+        slot,
+        label: "DECK 1",
+        to: { kind: "bridge", domain },
+        seed: 2,
+      },
+    ];
+    let checked = 0;
+    for (const { base } of EVERY_BASE) {
+      const sites = sitesOf(base);
+      let here = 0;
+      for (const r of reseeded(base, 200)) {
+        if (here >= 3) break;
+        const draws = heroDraws(r);
+        const hero = place(base, r, draws).find(
+          (h) => heroEdges(h).length === 1,
+        );
+        if (hero === undefined) continue;
+        const e = heroEdges(hero)[0];
+        if (e === undefined) continue;
+        const run = sites.runs.find((x) =>
+          x.some((y) => edgeKey(y) === edgeKey(e)),
+        );
+        const i = run?.findIndex((y) => edgeKey(y) === edgeKey(e)) ?? -1;
+        const n = [run?.[i - 1], run?.[i + 1]].find(
+          (y) => y !== undefined && sites.free.has(edgeKey(y)),
+        );
+        if (n === undefined) continue;
+        here++;
+        for (const fixture of stationFixtures(n, base.domain)) {
+          const room = { ...r, fixtures: [...r.fixtures, fixture] };
+          const edges = placeHeroes(room, draws, dressingSites(room)).flatMap(
+            (h) => heroEdges(h).map(edgeKey),
+          );
+          expect(edges, `${fixture.kind} ${edgeKey(n)}`).not.toContain(
+            edgeKey(e),
+          );
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(10);
   }, 30_000);
 
   it("keeps a cabinet's use point on the floor and clear of every blocker", () => {

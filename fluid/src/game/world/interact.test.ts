@@ -158,6 +158,43 @@ describe("focusOf", () => {
   });
 });
 
+describe("focusOf at the station's fixtures (M3 C26, C28)", () => {
+  const slot = bridge.fixtures[scopeIndex]!.slot;
+  /** The bridge with `fixture` alone on the scope terminal's wall edge. */
+  const alone = (fixture: Fixture): RoomSpec => ({
+    ...bridge,
+    fixtures: [fixture],
+  });
+  const lift = alone({ kind: "lift", slot, stops: [], note: null, seed: 1 });
+  const screen = alone({
+    kind: "screen",
+    slot,
+    lines: ["S"],
+    keys: [],
+    seed: 2,
+  });
+  const exit = alone({
+    kind: "exit",
+    slot,
+    label: "DECK 1",
+    to: { kind: "deck", domain: "d", folder: "", section: null },
+    seed: 3,
+  });
+
+  it("offers the lift within reach, and nothing at a screen or an exit", () => {
+    // Mutation caught: the lift's case returning null, the exit offered as
+    // a door.
+    expect(focusOf(lift, inFront(lift, 0, 1.2))).toEqual({
+      kind: "lift",
+      index: 0,
+      prompt: "SPACE LIFT",
+    });
+    expect(focusOf(lift, inFront(lift, 0, REACH + 0.3))).toBeNull();
+    expect(focusOf(screen, inFront(screen, 0, 1.2))).toBeNull();
+    expect(focusOf(exit, inFront(exit, 0, 1.2))).toBeNull();
+  });
+});
+
 describe("stepDoors", () => {
   it("opens a sliding door on approach and closes it on leaving", () => {
     const near = inFront(bridge, slidingIndex, APPROACH - 0.5);

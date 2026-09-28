@@ -65,7 +65,8 @@ export { DISC_SEALED_GAIN } from "./portal";
  * lid (`lid:<index>`) and every portal its disc (`disc:<index>`). `index`
  * is the fixture's position in `room.fixtures`, which names its text
  * layer key (`terminal:<index>`, `tag:<index>` and so on) and its movers.
- * Every other kind returns no movers.
+ * Every other kind returns no movers. The station's lift, screen and exit
+ * build nothing yet: their models are still to come.
  */
 export function buildFixture(
   kitAt: KitAt,
@@ -91,6 +92,10 @@ export function buildFixture(
       return [];
     case "placard":
       buildPlacard(kitAt, fixture, ctx);
+      return [];
+    case "lift":
+    case "screen":
+    case "exit":
       return [];
   }
 }

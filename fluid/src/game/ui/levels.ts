@@ -15,6 +15,7 @@
 
 import type { DomainSummary } from "../../api/domains";
 import { domainSpellings } from "../../domainNames";
+import { byLabel } from "../world/lifts";
 
 /** The title line: the word that opens the select. */
 export const LEVELS_TITLE = "IDCLEV";
@@ -104,17 +105,15 @@ export function hereKey(
   return spellings.get(current) ?? null;
 }
 
-/** The items sorted by lowercased label, then by code point (C12). */
+/**
+ * The items sorted by lowercased label, then by code point (C12): `byLabel`,
+ * the comparator the airlock's lift sorts its domains with too (M3 C24).
+ */
 export function sortLevels<T>(
   items: readonly T[],
   label: (item: T) => string = String,
 ): T[] {
-  const order = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
-  return [...items].sort((x, y) => {
-    const a = label(x);
-    const b = label(y);
-    return order(a.toLowerCase(), b.toLowerCase()) || order(a, b);
-  });
+  return [...items].sort((x, y) => byLabel(label(x), label(y)));
 }
 
 /**

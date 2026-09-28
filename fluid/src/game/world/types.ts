@@ -212,6 +212,19 @@ export type MachineKind =
  *   points here, which is why it always has an address.
  * - A `machine` is a tag, a `poster` the observations of one category, and
  *   the `placard` at the entrance the frontmatter.
+ * - A `lift` (M3 C7, C26) is lift doors with a call panel: `stops` are the
+ *   places it rides to, in the order its panel and overlay list them
+ *   (`world/lifts.ts`), and `note` a status line only (`NO DECKS`,
+ *   `?DECK LIST ERROR`, `?DOMAIN LIST ERROR`) or null. The overflow line
+ *   `+N MORE` is never stored: the text layer works it out from
+ *   `stops.length` against `LIFT_LINES`.
+ * - A `screen` (M3 C8, C20, C24) is a wall screen of plain lines: a deck's
+ *   name and count, the bridge's domain, the airlock's directory. `keys`
+ *   are the indices of the lines drawn with the key pictogram (a private
+ *   domain).
+ * - An `exit` (M3 C28) is the sliding door on an engram room's entrance
+ *   edge that leads up to its deck: `label` its `DECK <n> <FOLDER>` and
+ *   `to` the station address it opens onto.
  */
 export type Fixture =
   | {
@@ -268,7 +281,44 @@ export type Fixture =
       lines: string[];
       seed: number;
     }
-  | { kind: "placard"; slot: WallSlot; lines: string[] };
+  | { kind: "placard"; slot: WallSlot; lines: string[] }
+  | {
+      kind: "lift";
+      slot: WallSlot;
+      stops: LiftStop[];
+      /** A status line, or null; never the `+N MORE` overflow line. */
+      note: string | null;
+      seed: number;
+    }
+  | {
+      kind: "screen";
+      slot: WallSlot;
+      lines: string[];
+      /** The indices of the lines drawn with the key pictogram. */
+      keys: number[];
+      seed: number;
+    }
+  | {
+      kind: "exit";
+      slot: WallSlot;
+      label: string;
+      to: StationAddress;
+      seed: number;
+    };
+
+/**
+ * One stop a lift rides to (M3 C7, C24): the `label` its panel and overlay
+ * show, the station address `to` it rides to, `key` when the stop is a
+ * private domain (drawn with the key pictogram), and `here` when it is the
+ * place the lift stands in (the current section of a deck, the domain the
+ * player came from in the airlock), which the overlay marks.
+ */
+export interface LiftStop {
+  label: string;
+  to: StationAddress;
+  key: boolean;
+  here: boolean;
+}
 
 /**
  * The free-standing furniture of each archetype: the command console and

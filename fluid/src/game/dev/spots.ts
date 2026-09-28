@@ -87,6 +87,9 @@ export const SPOT_KINDS = {
   machine: true,
   poster: true,
   placard: true,
+  lift: true,
+  screen: true,
+  exit: true,
 } as const satisfies Record<Fixture["kind"], true>;
 
 const FIXTURE_SPOT = new RegExp(

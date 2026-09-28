@@ -321,8 +321,9 @@ export function footprint(
 /**
  * The floor a fixture takes, sized by its kind from `FOOTPRINTS`: a
  * terminal's desk, or a machine by its `MachineKind`. Doors, portals,
- * hatches, posters and the placard are flush with their wall and give null:
- * walking up to a door or hatch is how it gets used, so it must not block.
+ * hatches, posters, the placard and the station's lifts, screens and exits
+ * are flush with their wall and give null: walking up to a door, hatch or
+ * lift is how it gets used, so it must not block.
  */
 export function footprintOf(fixture: Fixture): Box | null {
   switch (fixture.kind) {
@@ -335,6 +336,9 @@ export function footprintOf(fixture: Fixture): Box | null {
     case "hatch":
     case "poster":
     case "placard":
+    case "lift":
+    case "screen":
+    case "exit":
       return null;
   }
 }

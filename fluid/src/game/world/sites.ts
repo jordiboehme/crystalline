@@ -26,13 +26,14 @@
  *   wall or ceiling run may cover either; free is exactly wall edges minus
  *   `noRun`, so the two never drift apart (ruling 6).
  * - **Lanes** (ruling 10), which floor props never enter:
- *   - for every door, hatch and portal, sealed or not:
+ *   - for every door, hatch, portal, lift and exit, sealed or not:
  *     `footprint(slot, { along: LANE_WIDTH, out: LANE_DEPTH })` (4 m deep);
  *   - for every terminal and machine:
  *     `footprint(slot, { along: LANE_WIDTH, out: USE_LANE_DEPTH })`
  *     (2.5 m deep, E6): a fixture is used from within `REACH` of its wall
  *     point, so the shallower lane still holds its whole use range;
- *   - for every poster and the placard, a viewing lane:
+ *   - for every poster, the placard and every station screen, a viewing
+ *     lane:
  *     `footprint(slot, { along: SHEET_LANE_WIDTH, out: SHEET_LANE_DEPTH })`
  *     (1.2 m by 1.5 m), so no floor prop stands in front of the sheet;
  *   - the wall stencil's edge (`stencilEdge`, 2.7 C19), when it is a wall
@@ -517,6 +518,8 @@ export function dressingSites(room: SiteBase): DressingSites {
       case "door":
       case "hatch":
       case "portal":
+      case "lift":
+      case "exit":
         lanes.push(footprint(f.slot, way));
         break;
       case "terminal":
@@ -525,6 +528,7 @@ export function dressingSites(room: SiteBase): DressingSites {
         break;
       case "poster":
       case "placard":
+      case "screen":
         lanes.push(footprint(f.slot, sheet));
         break;
     }

@@ -6,7 +6,7 @@
  * `reach` and `reachedTargets` flood a 0.2 m grid from the spawn, so a test
  * can compare what a room reaches with its props and heroes against what it
  * reaches without them. `arrivalPoint` and `targetsOf` name where the player
- * stands to use each door, hatch, portal, terminal and machine.
+ * stands to use each door, hatch, portal, lift, exit, terminal and machine.
  * `DEGENERATE_PLACES` and `OVER_CAP` are the odd places (an empty one, a
  * hall full of fixtures, a narrow deep hall, a hall at the large threshold
  * and the fullest room) that `dress.test.ts` and `heroes.test.ts` both hold
@@ -34,7 +34,7 @@ export function distanceTo(x: number, z: number, b: Box) {
   return Math.hypot(x - nx, z - nz);
 }
 
-/** The point in front of a door, hatch or portal the player arrives at. */
+/** The point in front of a door, hatch, portal, lift or exit the player arrives at. */
 export function arrivalPoint(slot: WallSlot) {
   const w = wallPoint(slot);
   return {
@@ -118,14 +118,21 @@ export function reach(room: RoomSpec, blockers: readonly Box[]) {
 
 /**
  * Where the player stands to use each way and wall fixture: a door's,
- * hatch's or portal's arrival point, and a terminal's or machine's use
- * point, a player's radius and 0.1 m in front of its footprint.
+ * hatch's, portal's, lift's or exit's arrival point, and a terminal's or
+ * machine's use point, a player's radius and 0.1 m in front of its
+ * footprint.
  */
 export function targetsOf(room: RoomSpec) {
   const out: { label: string; x: number; z: number }[] = [];
   for (const f of room.fixtures) {
     const label = `${f.kind} ${edgeKey(f.slot)}`;
-    if (f.kind === "door" || f.kind === "hatch" || f.kind === "portal") {
+    if (
+      f.kind === "door" ||
+      f.kind === "hatch" ||
+      f.kind === "portal" ||
+      f.kind === "lift" ||
+      f.kind === "exit"
+    ) {
       out.push({ label, ...arrivalPoint(f.slot) });
     } else if (f.kind === "terminal" || f.kind === "machine") {
       const size =

@@ -127,7 +127,21 @@ const FIXTURE_KINDS = Object.keys({
   portal: true,
   poster: true,
   terminal: true,
+  lift: true,
+  screen: true,
+  exit: true,
 } satisfies Record<Fixture["kind"], true>) as Fixture["kind"][];
+
+/**
+ * The fixture kinds an engram room carries: every kind but the station's
+ * lift, screen and exit (M3 C7, C20, C28), which the gallery room does not
+ * hold. They are judged in their own canned hall (`liftsHallRoom`), whose
+ * test pins that the two rooms together carry every kind.
+ */
+const STATION_KINDS: readonly Fixture["kind"][] = ["lift", "screen", "exit"];
+const ENGRAM_ROOM_KINDS = FIXTURE_KINDS.filter(
+  (k) => !STATION_KINDS.includes(k),
+);
 
 const MACHINES = Object.keys({
   workbench: true,
@@ -170,9 +184,12 @@ describe("galleryRoom", () => {
     expect(room.dropped).toBe(0);
   });
 
-  it("carries one of every fixture kind", () => {
+  it("carries one of every engram room's fixture kind", () => {
+    // The lift, the screen and the exit are judged in `liftsHallRoom`,
+    // whose test pins that the two rooms together carry every kind.
     const kinds = new Set(room.fixtures.map((f) => f.kind));
-    expect([...kinds].sort()).toEqual([...FIXTURE_KINDS].sort());
+    expect(ENGRAM_ROOM_KINDS).toHaveLength(7);
+    expect([...kinds].sort()).toEqual([...ENGRAM_ROOM_KINDS].sort());
   });
 
   it("carries every door style open, and both sealed ways", () => {
