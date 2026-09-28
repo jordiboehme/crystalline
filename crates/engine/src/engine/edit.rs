@@ -632,16 +632,6 @@ impl Engine {
         Ok((text, None))
     }
 
-    /// Assign or clear one lifecycle frontmatter field, the `set_frontmatter`
-    /// operation. Restricted to [`SETTABLE_FRONTMATTER_KEYS`]: identity,
-    /// provenance and index keys are owned by the tools that maintain them, so
-    /// rewriting one here is refused rather than silently corrupting the
-    /// engram's address or its write history.
-    ///
-    /// An absent or empty value clears the field, except on `status`, which is
-    /// required, and on `verified`, which stamps a verification instead. That
-    /// verification carries `model` - the reported one - only where the actor
-    /// it names is not a person; see the arm.
     /// Refuses a `set_frontmatter` the single-line writers would get wrong.
     ///
     /// Those writers replace or remove the key's own line and nothing under
@@ -692,6 +682,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Assign or clear one lifecycle frontmatter field, the `set_frontmatter`
+    /// operation. Restricted to [`SETTABLE_FRONTMATTER_KEYS`]: identity,
+    /// provenance and index keys are owned by the tools that maintain them, so
+    /// rewriting one here is refused rather than silently corrupting the
+    /// engram's address or its write history.
+    ///
+    /// An absent or empty value clears the field, except on `status`, which is
+    /// required, and on `verified`, which stamps a verification instead. That
+    /// verification carries `model` - the reported one - only where the actor
+    /// it names is not a person; see the arm.
     #[allow(clippy::too_many_arguments)]
     fn apply_set_frontmatter(
         source: &str,
