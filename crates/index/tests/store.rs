@@ -10028,66 +10028,25 @@ parity!(
     a_draft_reaches_no_base_answer_through_its_children
 );
 
-/// The shared domain-scoped lookup: path as written, path plus `.md`, the
-/// slug hint from a permalink or from a path, and no path step for an empty
-/// stem (#111).
-async fn lookup_in_domain_resolves_paths_and_hints(store: &dyn Store) {
+/// The shared domain-scoped lookup resolves by permalink and by title only.
+/// A file path never resolves, with or without `.md` and in any case: the
+/// miss names the permalink the identifier's slug is. Only a permalink is
+/// offered - a title hit on the slug is no hint - and an identifier whose
+/// slug is empty or is the identifier itself gets none (#111).
+async fn lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
         root,
         "guides/Agent Workflow Guide.md",
-        &engram("Workflow", "agent-guide", "engram", "", "one\ntwo\nthree\n"),
+        &engram(
+            "Workflow",
+            "guides/agent-workflow-guide",
+            "engram",
+            "",
+            "one\ntwo\nthree\n",
+        ),
     );
-    write(root, "a.md", &engram("A", "a", "engram", "", "body\n"));
-    sync_domain(store, "d", root).await.unwrap();
-
-    for identifier in [
-        "guides/Agent Workflow Guide",
-        "guides/Agent Workflow Guide.md",
-    ] {
-        match crystalline_index::lookup_in_domain(store, "d", identifier)
-            .await
-            .unwrap()
-        {
-            crystalline_index::DomainLookup::Found(found) => {
-                assert_eq!(found.permalink, "agent-guide", "{identifier}")
-            }
-            other => panic!("{identifier}: {other:?}"),
-        }
-    }
-    // Only the case differs: no resolution, and the hint comes from the path's slug.
-    assert_eq!(
-        crystalline_index::lookup_in_domain(store, "d", "guides/agent workflow guide")
-            .await
-            .unwrap(),
-        crystalline_index::DomainLookup::Missing {
-            suggest: vec!["agent-guide".to_string()]
-        }
-    );
-    // `.md` alone has an empty stem: no path step, no hint.
-    assert_eq!(
-        crystalline_index::lookup_in_domain(store, "d", ".md")
-            .await
-            .unwrap(),
-        crystalline_index::DomainLookup::Missing {
-            suggest: Vec::new()
-        }
-    );
-}
-
-parity!(
-    lookup_in_domain_resolves_paths_and_hints_on_both_backends,
-    lookup_in_domain_resolves_paths_and_hints
-);
-
-/// Jordi's narrowed rule (2026-09-28): an identifier spelled like a permalink
-/// is judged as a permalink or title only, and a miss names the permalink of
-/// the row whose path it spells. A lowercase path with `.md` still resolves,
-/// and a title hit on the slug is never offered as a hint (#111).
-async fn lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink(store: &dyn Store) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
     write(
         root,
         "notes/meeting.md",
@@ -10100,35 +10059,48 @@ async fn lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink(st
     );
     sync_domain(store, "d", root).await.unwrap();
 
-    match crystalline_index::lookup_in_domain(store, "d", "notes/meeting.md")
-        .await
-        .unwrap()
-    {
-        crystalline_index::DomainLookup::Found(found) => assert_eq!(found.permalink, "standup"),
-        other => panic!("notes/meeting.md: {other:?}"),
+    let lookup = |identifier: &'static str| async move {
+        crystalline_index::lookup_in_domain(store, "d", identifier)
+            .await
+            .unwrap()
+    };
+    for identifier in ["guides/agent-workflow-guide", "WORKFLOW", "standup"] {
+        assert!(
+            matches!(
+                lookup(identifier).await,
+                crystalline_index::DomainLookup::Found(_)
+            ),
+            "{identifier}"
+        );
     }
-    // Spelled like a permalink: no path step, and the hint names the row's
-    // permalink.
-    assert_eq!(
-        crystalline_index::lookup_in_domain(store, "d", "notes/meeting")
-            .await
-            .unwrap(),
-        crystalline_index::DomainLookup::Missing {
-            suggest: vec!["standup".to_string()]
-        }
-    );
+    let missing = |suggest: Option<&str>| crystalline_index::DomainLookup::Missing {
+        suggest: suggest.map(str::to_string),
+    };
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+        "guides/agent workflow guide",
+        "guides/agent-workflow-guide.md",
+    ] {
+        assert_eq!(
+            lookup(identifier).await,
+            missing(Some("guides/agent-workflow-guide")),
+            "{identifier}"
+        );
+    }
+    // The file's path is no identifier and names no permalink: `standup` is
+    // not what `notes/meeting` slugifies to.
+    for identifier in ["notes/meeting", "notes/meeting.md"] {
+        assert_eq!(lookup(identifier).await, missing(None), "{identifier}");
+    }
     // `roadmap` is a TITLE, not a permalink: a title hit on the slug is no hint.
-    assert_eq!(
-        crystalline_index::lookup_in_domain(store, "d", "Roadmap.md")
-            .await
-            .unwrap(),
-        crystalline_index::DomainLookup::Missing {
-            suggest: Vec::new()
-        }
-    );
+    assert_eq!(lookup("Roadmap.md").await, missing(None));
+    // `.md` alone slugifies to nothing, and `nope` to itself.
+    assert_eq!(lookup(".md").await, missing(None));
+    assert_eq!(lookup("nope").await, missing(None));
 }
 
 parity!(
-    lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink_on_both_backends,
-    lookup_in_domain_judges_a_permalink_shaped_identifier_as_a_permalink
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug_on_both_backends,
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug
 );

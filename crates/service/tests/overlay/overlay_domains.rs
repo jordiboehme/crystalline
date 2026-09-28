@@ -2598,25 +2598,36 @@ async fn screened_fixture() -> Fixture {
     f
 }
 
-/// A draft at a path no base row holds resolves by that path without `.md`,
-/// the same way a base row does (#111).
+/// A draft at a path no base row holds does not answer to that path without
+/// `.md`, the same way a base row does not: a domain-scoped identifier is a
+/// permalink or a title (#111).
 #[tokio::test]
-async fn a_draft_resolves_by_its_path_without_md() {
+async fn a_draft_does_not_resolve_by_its_path_without_md() {
     let f = review_fixture().await;
     let alice = account("alice");
     f.draft("team", "alice", "notes/Fresh Idea.md", ALICE_NEW)
         .await;
-    let text = f
+    let miss = f
         .reads("notes/Fresh Idea", &alice)
         .await
-        .expect("alice reads her draft by its path");
+        .expect_err("a path without .md is no identifier");
+    assert!(
+        miss.starts_with("no engram 'notes/Fresh Idea' in domain 'team'"),
+        "{miss}"
+    );
+    // Her draft still answers to its permalink.
+    let text = f
+        .reads("fresh", &alice)
+        .await
+        .expect("alice reads her draft by its permalink");
     assert!(text.contains("a page only alice has"), "{text}");
 }
 
 /// A `crystalline://` URL addresses a permalink and nothing else, on a draft
 /// as on a base row: a draft renamed in place does not answer its old address
 /// through its file's path, which is what keeps a co-editing room over a
-/// draft from finding it again under its old key (#111).
+/// draft from finding it again under its old key. A bare identifier does not
+/// reach it through the path either (#111).
 #[tokio::test]
 async fn a_url_never_reaches_a_draft_through_its_path() {
     let f = review_fixture().await;
@@ -2646,21 +2657,24 @@ async fn a_url_never_reaches_a_draft_through_its_path() {
             .expect_err("a URL names a permalink, never a path");
         assert!(miss.contains("no engram"), "{identifier}: {miss}");
     }
-    // A bare identifier spelled like a permalink is judged as one, on a draft
-    // as on a base row: the old permalink of a draft renamed in place misses.
-    let miss = f
-        .reads("fresh", &alice)
-        .await
-        .expect_err("fresh is spelled like a permalink, and no draft holds it");
-    assert!(
-        miss.contains("no engram 'fresh' in domain 'team'"),
-        "{miss}"
-    );
-    // The bare path, which may name a path, still reaches the draft.
+    // A bare identifier is a permalink or a title, on a draft as on a base
+    // row: the old permalink of a draft renamed in place misses, and so does
+    // the bare path without `.md`.
+    for identifier in ["fresh", "notes/Fresh Idea"] {
+        let miss = f
+            .reads(identifier, &alice)
+            .await
+            .expect_err("no draft holds this permalink or title");
+        assert!(
+            miss.contains(&format!("no engram '{identifier}' in domain 'team'")),
+            "{identifier}: {miss}"
+        );
+    }
+    // The drafts answer to their permalinks.
     let text = f
-        .reads("notes/Fresh Idea", &alice)
+        .reads("renamed-idea", &alice)
         .await
-        .expect("the bare path reaches the draft");
+        .expect("the permalink reaches the draft");
     assert!(text.contains("a page only alice has"), "{text}");
 }
 

@@ -1852,42 +1852,48 @@ async fn a_domain_prefixed_identifier_never_resolves_and_the_error_teaches_the_f
     assert_eq!(read["title"], json!("Guide"));
 }
 
-/// A reference copied from the file tree - the folder plus the file name,
-/// with or without `.md` - resolves like the permalink does (#111).
+/// A domain-scoped identifier resolves by permalink and title only. A
+/// reference copied from the file tree - the folder plus the file name, with
+/// or without `.md`, in any case - is no identifier: it misses on reads, write
+/// verbs and validate_engrams alike, and the miss names the permalink its
+/// slug is, so the next call succeeds (#111).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_identifier_that_is_the_file_path_resolves_with_or_without_md() {
+async fn a_file_path_never_resolves_and_the_miss_names_the_permalink() {
     let h = Harness::new(&["eng"]).await;
     std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    let file = h.root.join("eng/guides/Agent Workflow Guide.md");
     std::fs::write(
-        h.root.join("eng/guides/Agent Workflow Guide.md"),
-        "---\ntype: guide\ntitle: Agent Workflow Guide\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Agent Workflow Guide\n\n- [convention] agents read before they write #eng\n- [fact] the guide lives under guides #eng\n",
+        &file,
+        "---\ntype: guide\ntitle: Workflow\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] the guide lives under guides #eng\n",
     )
     .unwrap();
     h.engine.sync(None).await.unwrap();
+    let before = std::fs::read_to_string(&file).unwrap();
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
     for identifier in [
         "guides/Agent Workflow Guide",
         "guides/Agent Workflow Guide.md",
+        "guides/agent workflow guide",
     ] {
-        let read = call(
+        let err = call(
             peer,
             "read_engram",
             json!({ "identifier": identifier, "domain": "eng" }),
         )
         .await
-        .unwrap_or_else(|e| panic!("{identifier}: {e}"));
-        assert_eq!(read["title"], json!("Agent Workflow Guide"), "{identifier}");
-        assert_eq!(
-            read["permalink"],
-            json!("guides/agent-workflow-guide"),
-            "{identifier}"
+        .expect_err(identifier);
+        assert!(
+            err.contains(&format!(
+                "no engram '{identifier}' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
+            )),
+            "{identifier}: {err}"
         );
     }
 
-    // A write verb resolves through the same lookup.
-    call(
+    // A write verb misses the same way and leaves the file alone.
+    let err = call(
         peer,
         "edit_engram",
         json!({
@@ -1896,45 +1902,53 @@ async fn an_identifier_that_is_the_file_path_resolves_with_or_without_md() {
         }),
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(
+        err.contains("Did you mean `guides/agent-workflow-guide`?"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
 
     // So does validate_engrams' identifier.
-    call(
-        peer,
-        "validate_engrams",
-        json!({ "domain": "eng", "identifier": "guides/Agent Workflow Guide" }),
-    )
-    .await
-    .unwrap();
-}
-
-/// A path that differs from the file only in case - what a case-insensitive
-/// disk lets a person type - does not resolve silently: it misses and names
-/// the permalink.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_path_in_the_wrong_case_misses_and_names_the_permalink() {
-    let h = Harness::new(&["eng"]).await;
-    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
-    std::fs::write(
-        h.root.join("eng/guides/Agent Workflow Guide.md"),
-        "---\ntype: guide\ntitle: Workflow\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] only the case of the path differs #eng\n",
-    )
-    .unwrap();
-    h.engine.sync(None).await.unwrap();
-    let (client, _server) = h.connect().await;
-    let peer = client.peer();
-
     let err = call(
         peer,
-        "read_engram",
-        json!({ "identifier": "guides/agent workflow guide", "domain": "eng" }),
+        "validate_engrams",
+        json!({ "domain": "eng", "identifier": "guides/Agent Workflow Guide.md" }),
     )
     .await
     .unwrap_err();
     assert!(
-        err.contains(
-            "no engram 'guides/agent workflow guide' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
-        ),
+        err.contains("Did you mean `guides/agent-workflow-guide`?"),
+        "{err}"
+    );
+
+    // The permalink the hint names resolves, and so does the title.
+    for identifier in ["guides/agent-workflow-guide", "workflow"] {
+        let read = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{identifier}: {e}"));
+        assert_eq!(
+            read["permalink"],
+            json!("guides/agent-workflow-guide"),
+            "{identifier}"
+        );
+    }
+
+    // The MANIFEST's filename is no identifier either, and the miss names
+    // its permalink, as the routing skill says.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "MANIFEST.md", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("no engram 'MANIFEST.md' in domain 'eng'. Did you mean `manifest`?"),
         "{err}"
     );
 
@@ -1946,13 +1960,15 @@ async fn a_path_in_the_wrong_case_misses_and_names_the_permalink() {
     )
     .await
     .unwrap_err();
+    assert!(err.contains("no engram 'nope' in domain 'eng'"), "{err}");
     assert!(!err.contains("Did you mean"), "{err}");
 }
 
-/// A custom permalink is found through its file path's slug, and the hint
-/// names the permalink the engram really answers to.
+/// The hint only names a permalink the identifier's slug is. An engram with
+/// a custom permalink is not found through its file path at all: the miss
+/// stays plain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_hint_names_a_custom_permalink_found_through_the_path() {
+async fn a_custom_permalink_is_not_hinted_from_its_file_path() {
     let h = Harness::new(&["eng"]).await;
     std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
     std::fs::write(
@@ -1965,19 +1981,22 @@ async fn the_hint_names_a_custom_permalink_found_through_the_path() {
     let err = call(
         client.peer(),
         "read_engram",
-        json!({ "identifier": "guides/agent workflow guide", "domain": "eng" }),
+        json!({ "identifier": "guides/Agent Workflow Guide", "domain": "eng" }),
     )
     .await
     .unwrap_err();
-    assert!(err.contains("Did you mean `agent-guide`?"), "{err}");
+    assert!(
+        err.contains("no engram 'guides/Agent Workflow Guide' in domain 'eng'"),
+        "{err}"
+    );
+    assert!(!err.contains("Did you mean"), "{err}");
 }
 
 /// After an in-place rename the old permalink is only the file's path, and a
-/// path spelled like a permalink is judged as a permalink: a stale `alpha`
-/// misses on read, delete and move, and the miss names `beta` (#111, Jordi's
-/// narrowed rule of 2026-09-28).
+/// path is no identifier: a stale `alpha` misses on read, delete and move,
+/// with or without `.md`, and nothing is deleted or moved (#111).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_old_permalink_misses_after_an_in_place_rename_and_names_the_new_one() {
+async fn an_old_permalink_misses_after_an_in_place_rename() {
     let h = Harness::new(&["eng"]).await;
     let file = h.root.join("eng/alpha.md");
     let text = |permalink: &str| {
@@ -1992,52 +2011,52 @@ async fn an_old_permalink_misses_after_an_in_place_rename_and_names_the_new_one(
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
-    let hint = "no engram 'alpha' in domain 'eng'. Did you mean `beta`?";
-    let err = call(
-        peer,
-        "read_engram",
-        json!({ "identifier": "alpha", "domain": "eng" }),
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains(hint), "read: {err}");
-    let err = call(
-        peer,
-        "delete_engram",
-        json!({ "identifier": "alpha", "domain": "eng" }),
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains(hint), "delete: {err}");
-    let err = call(
-        peer,
-        "move_engram",
-        json!({ "identifier": "alpha", "domain": "eng", "destination": "moved/alpha" }),
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains(hint), "move: {err}");
+    for identifier in ["alpha", "alpha.md"] {
+        let miss = format!("no engram '{identifier}' in domain 'eng'");
+        let err = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "read {identifier}: {err}");
+        let err = call(
+            peer,
+            "delete_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "delete {identifier}: {err}");
+        let err = call(
+            peer,
+            "move_engram",
+            json!({ "identifier": identifier, "domain": "eng", "destination": "moved/alpha" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "move {identifier}: {err}");
+    }
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         text("beta"),
         "nothing was deleted or moved"
     );
-
-    // The path itself, with `.md`, still names the file.
     let read = call(
         peer,
         "read_engram",
-        json!({ "identifier": "alpha.md", "domain": "eng" }),
+        json!({ "identifier": "beta", "domain": "eng" }),
     )
     .await
     .unwrap();
-    assert_eq!(read["permalink"], json!("beta"));
+    assert_eq!(read["path"], json!("alpha.md"));
 }
 
-/// The read_engram copy teaches the file-path identifier, so an agent that
-/// copies a reference from the file tree finds out it works.
+/// The read_engram copy says a miss names the permalink it probably meant,
+/// and no longer offers the file path as an identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_descriptions_teach_path_identifiers() {
+async fn tool_descriptions_teach_the_miss_hint() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
@@ -2048,8 +2067,12 @@ async fn tool_descriptions_teach_path_identifiers() {
         .expect("read_engram tool present");
     let description = read.description.as_deref().unwrap_or("");
     assert!(
-        description.contains("file path inside the domain"),
-        "read_engram teaches the file-path identifier: {description}"
+        description.contains("a miss names the permalink it probably meant"),
+        "read_engram teaches the miss hint: {description}"
+    );
+    assert!(
+        !description.contains("file path inside the domain"),
+        "read_engram no longer offers the file path: {description}"
     );
 }
 

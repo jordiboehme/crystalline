@@ -1177,9 +1177,10 @@ async fn virtual_path_identifier(store: Arc<Mutex<dyn Store>>) {
         })
         .await
         .unwrap();
-    // The stored path column is `guides/agent-workflow-guide.md`: the `.md` form
-    // is the path, and it resolves on a domain that has no files at all.
-    let read = engine
+    // The stored path column is `guides/agent-workflow-guide.md`. A path is no
+    // identifier, on a domain without files as on one with them: the miss
+    // names the permalink its slug is.
+    let err = engine
         .read_engram(
             &ReadParams {
                 identifier: "guides/agent-workflow-guide.md".to_string(),
@@ -1189,12 +1190,15 @@ async fn virtual_path_identifier(store: Arc<Mutex<dyn Store>>) {
             &Scope::Unrestricted,
         )
         .await
-        .unwrap();
-    assert_eq!(read["permalink"], "guides/agent-workflow-guide");
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "no engram 'guides/agent-workflow-guide.md' in domain 'notes'. Did you mean `guides/agent-workflow-guide`?"
+    );
 }
 
 both_backends!(
-    a_virtual_engram_resolves_by_its_stored_path,
+    a_virtual_engram_misses_by_its_stored_path_and_names_the_permalink,
     virtual_path_identifier
 );
 

@@ -45,7 +45,7 @@ pub use store::{
     MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
     RecentFilter, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo, StoredEngram,
     TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status, lookup_in_domain,
-    may_name_a_path, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
+    merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.

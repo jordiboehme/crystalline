@@ -444,11 +444,10 @@ enum Command {
     },
     /// Read an engram's markdown and metadata.
     Read {
-        /// A bare permalink, title or crystalline:// URL, or, with the domain
-        /// given, the engram's file path inside it with or without .md
-        /// (guides/Agent Workflow Guide; a path spelled like a permalink needs
-        /// the .md). Without the scheme the identifier is domain-relative:
-        /// never prefix it with a domain name.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// Restrict resolution to this domain.
         #[arg(long)]
@@ -459,11 +458,10 @@ enum Command {
     },
     /// Edit an engram in place.
     Edit {
-        /// A bare permalink, title or crystalline:// URL, or, with the domain
-        /// given, the engram's file path inside it with or without .md
-        /// (guides/Agent Workflow Guide; a path spelled like a permalink needs
-        /// the .md). Without the scheme the identifier is domain-relative:
-        /// never prefix it with a domain name.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain.
         domain: String,
@@ -511,11 +509,10 @@ enum Command {
     /// relation and crystalline:// URL that pointed at its old address is
     /// rewritten to the new one.
     Move {
-        /// A bare permalink, title or crystalline:// URL, or, with the domain
-        /// given, the engram's file path inside it with or without .md
-        /// (guides/Agent Workflow Guide; a path spelled like a permalink needs
-        /// the .md). Without the scheme the identifier is domain-relative:
-        /// never prefix it with a domain name.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's current domain.
         domain: String,
@@ -543,11 +540,10 @@ enum Command {
     /// one fact in an engram stops holding while the rest still does: split
     /// first, then retire what remains.
     Split {
-        /// A bare permalink, title or crystalline:// URL, or, with the domain
-        /// given, the engram's file path inside it with or without .md
-        /// (guides/Agent Workflow Guide; a path spelled like a permalink needs
-        /// the .md). Without the scheme the identifier is domain-relative:
-        /// never prefix it with a domain name.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain. The new engram lands in the same domain.
         domain: String,
@@ -575,11 +571,10 @@ enum Command {
     },
     /// Delete an engram.
     Delete {
-        /// A bare permalink, title or crystalline:// URL, or, with the domain
-        /// given, the engram's file path inside it with or without .md
-        /// (guides/Agent Workflow Guide; a path spelled like a permalink needs
-        /// the .md). Without the scheme the identifier is domain-relative:
-        /// never prefix it with a domain name.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain.
         domain: String,

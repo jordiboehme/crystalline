@@ -24,7 +24,11 @@ impl Engine {
             match lookup_in_domain(&*store, &p.domain, id).await? {
                 DomainLookup::Found(d) => vec![d],
                 DomainLookup::Missing { suggest } => {
-                    return Err(EngineError::NotFound(domain_miss(id, &p.domain, &suggest)));
+                    return Err(EngineError::NotFound(domain_miss(
+                        id,
+                        &p.domain,
+                        suggest.as_deref(),
+                    )));
                 }
             }
         } else {

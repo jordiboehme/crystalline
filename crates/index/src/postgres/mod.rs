@@ -864,12 +864,10 @@ pub(super) fn like_escape(s: &str) -> String {
 /// where `lower()` is context-sensitive (an ICU provider), a prefix ending in a
 /// capital sigma folds to a FINAL sigma while the same letter mid-path folds to
 /// a medial one, so a row that matched before the fold can stop matching. It is
-/// reachable through one caller: `lookup_in_domain` hands over a bare stem (an
-/// identifier with its `.md` off). Every other caller-supplied folder prefix is
-/// slash-terminated, and the other prefix-passing `list_engrams` callers pass
-/// exact `.md` paths. For `lookup_in_domain` the narrowing can cost a path match or a hint on an
-/// ICU-collated database, never a wrong resolution, because the exact
-/// comparison happens afterwards on the bytes.
+/// unreachable through the service today - every caller-supplied folder prefix
+/// is slash-terminated, and the prefix-passing `list_engrams` callers pass
+/// exact `.md` paths - but a future caller that hands a bare word must know the
+/// fold is not purely a widening.
 pub(super) fn path_prefix_like(n: usize, negated: bool) -> String {
     let not = if negated { " NOT" } else { "" };
     format!("lower(e.path){not} LIKE lower(${n}) ESCAPE '\\'")

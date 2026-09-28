@@ -44,12 +44,9 @@ use crate::domain_view::DomainView;
 use crate::engine::{Engine, EngineError, EngramText};
 
 /// The address a room reads and saves its engram at: the `crystalline://`
-/// URL, because that form resolves a permalink and nothing else. A bare
-/// permalink would also resolve as a file path inside the domain, and after
-/// an in-place rename the OLD permalink is still the file's path, so a room
-/// keyed by it would find the renamed engram again: a second room over one
-/// file on join, and an edit conflict where the rename is a deletion to this
-/// room.
+/// URL, the one absolute form, which names the room's domain and permalink
+/// together, so the address a room reads and saves at is its own key. A miss
+/// at it names the bare permalink, as before the room used the URL.
 fn room_address(domain: &str, permalink: &str) -> String {
     format!("{}{domain}/{permalink}", crystalline_core::address::SCHEME)
 }

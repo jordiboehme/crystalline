@@ -53,7 +53,7 @@ use crystalline_core::emit::{set_frontmatter_field, touch_generated};
 use crystalline_core::{CrystallineUrl, parse_engram};
 use crystalline_index::{
     AttachmentRow, BrowseLevel, DomainId, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    OutboundRef, RecentFilter, StoredEngram, may_name_a_path,
+    OutboundRef, RecentFilter, StoredEngram,
 };
 use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
@@ -938,11 +938,9 @@ impl<'a> DomainView<'a> {
 
     /// One actor's own draft at an identifier, when no base row answers to it.
     ///
-    /// Matched by permalink, by title and by path with or without `.md`
-    /// (without it only for an identifier that may name a path, see
-    /// [`may_name_a_path`]), which is the same ladder the base lookup offers,
-    /// over the entries this actor holds. Tombstones are skipped: a deletion is not an engram to
-    /// find.
+    /// Matched by permalink, by title and by path, which is the same ladder
+    /// the base lookup offers, over the entries this actor holds. Tombstones
+    /// are skipped: a deletion is not an engram to find.
     pub(crate) async fn resolve_draft(
         &self,
         identifier: &str,
@@ -953,16 +951,11 @@ impl<'a> DomainView<'a> {
         };
         // An absolute identifier naming another domain is not this domain's to
         // answer, exactly as `resolve_in` refuses it.
-        let (wanted, is_url) = match CrystallineUrl::parse(identifier) {
+        let wanted = match CrystallineUrl::parse(identifier) {
             Some(url) if url.domain != domain => return Ok(None),
-            Some(url) => (url.permalink, true),
-            None => (identifier.to_string(), false),
+            Some(url) => url.permalink,
+            None => identifier.to_string(),
         };
-        // The path without `.md` answers only what the base lookup's path step
-        // answers: never a URL, which addresses a permalink and nothing else,
-        // and never an identifier spelled like a permalink, so a draft renamed
-        // in place does not answer its old permalink through its file's path.
-        let by_stem = !is_url && may_name_a_path(&wanted);
         let (domain_id, source) = self.engine.domain_source(domain).await?;
         let entries = {
             let store = self.engine.store();
@@ -983,10 +976,7 @@ impl<'a> DomainView<'a> {
                 record.title.as_str(),
                 entry.path.as_str(),
             ];
-            let path_stem = entry.path.strip_suffix(".md");
-            if !names.iter().any(|name| *name == wanted)
-                && !(by_stem && path_stem == Some(wanted.as_str()))
-            {
+            if !names.iter().any(|name| *name == wanted) {
                 continue;
             }
             return Ok(Some((
