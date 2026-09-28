@@ -14,6 +14,8 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import type { ChangeEvent, EngramChange } from "../api/events";
+import { COALESCE_MS } from "../events/ChangeStreamProvider";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { CHEAT_GAP_TICKS } from "./core/cheat";
@@ -21,7 +23,12 @@ import { RELOCK_DELAY_MS } from "./core/input";
 import { TICK_MS, type Clock } from "./core/loop";
 import { prefetchPlace } from "./data/source";
 import type { LoadedStation } from "./data/station";
-import { addressOfGameLocation, domainOf, stationOfPlace } from "./paths";
+import {
+  addressOfGameLocation,
+  domainOf,
+  gameRouteOf,
+  stationOfPlace,
+} from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
 import type { Camera, Renderer } from "./render/renderer";
 import {
@@ -29,6 +36,8 @@ import {
   LIFT_RIDE_MS,
   LISTING_WAIT_MS,
   NOTICE_MS,
+  RECONFIGURING,
+  RESHAPE_MIN_MS,
   UP_LATCH_CLEAR,
   createSession,
   type HudSink,
@@ -54,15 +63,48 @@ import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import { LIFT_WORDS } from "./world/lifts";
 import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
-import { MAX_PITCH, PLAYER_RADIUS } from "./world/move";
+import { MAX_PITCH, PLAYER_RADIUS, blockersFor } from "./world/move";
+import { DIP_SWAP_MS, FLICKER_MS, diffRooms, settleSpot } from "./world/diff";
 import { withPadHeroes } from "./world/hangar";
 import { roomFor } from "./world/station";
-import type { Fixture, Hero, RoomSpec, StationAddress } from "./world/types";
+import type {
+  Fixture,
+  Hero,
+  PlaceInput,
+  RoomSpec,
+  StationAddress,
+} from "./world/types";
 import { CELL } from "./world/units";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
+});
+
+/**
+ * The kind of fixture a room `roomFor` builds puts the player in front of,
+ * or null for the room's own spawn: a seam for the live-change tests,
+ * which need a terminal or a door in reach without walking there.
+ */
+const facing = vi.hoisted(() => ({
+  kind: null as "terminal" | "door" | null,
+}));
+
+vi.mock("./world/station", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./world/station")>();
+  const { wallFacingSpawn } = await import("./world/interact");
+  return {
+    ...actual,
+    roomFor: (...args: Parameters<typeof actual.roomFor>) => {
+      const built = actual.roomFor(...args);
+      const fixture = built.room.fixtures.find((f) => f.kind === facing.kind);
+      if (fixture === undefined) return built;
+      return {
+        ...built,
+        room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
+      };
+    },
+  };
 });
 
 vi.mock("./data/source", async (importOriginal) => {
@@ -302,6 +344,7 @@ beforeEach(() => {
   });
   openFluid = vi.fn();
   sessions = [];
+  facing.kind = null;
   now = 0;
   pending = null;
   window.history.replaceState(null, "", "/");
@@ -3599,5 +3642,678 @@ describe("the pause (M4 C6 to C9)", () => {
     unlock();
     expect(session.lockEndedAt).toBeGreaterThanOrEqual(before);
     expect(session.lockEndedAt).toBeLessThanOrEqual(performance.now());
+  });
+});
+
+describe("live changes (M4 C13 to C19)", () => {
+  /** The engram room the live-change tests stand in. */
+  const ROOM_AT = engramAt("station", "hall");
+
+  /** The canned bridge's place moved to `station/hall`, with changes. */
+  const placeOf = (o: Partial<PlaceInput> = {}): PlaceInput => ({
+    ...CANNED_BRIDGE,
+    domain: "station",
+    permalink: "hall",
+    ...o,
+  });
+
+  /** The place with one routing line changed: a text change. */
+  const retexted = (word = "new") =>
+    placeOf({
+      content: CANNED_BRIDGE.content.replace(
+        "Engineering questions go to the reactor deck.",
+        `Engineering questions go to the ${word} reactor deck.`,
+      ),
+    });
+
+  /** The place with one more relation: a new door, a shape change. */
+  const redoored = (n = 1) =>
+    placeOf({
+      relations: [
+        ...CANNED_BRIDGE.relations,
+        ...Array.from({ length: n }, (_, i) => ({
+          relType: "relates_to",
+          target: { domain: null, target: `annex-${String(i)}` },
+          resolved: true,
+          address: { domain: "station", permalink: `annex-${String(i)}` },
+          targetTitle: `Annex ${String(i)}`,
+          targetSalience: 3,
+        })),
+      ],
+    });
+
+  const engramOf = (
+    place: PlaceInput,
+  ): Extract<LoadedStation, { kind: "engram" }> => ({
+    kind: "engram",
+    place,
+    folder: "",
+  });
+
+  /** What the loader answers for an engram, by permalink. */
+  let answers: Map<string, LoadedStation>;
+  /** Every address the loader was asked for, with the clock at the time. */
+  let asked: { address: StationAddress; at: number }[];
+  /** A load held open for an engram, by permalink: answered once. */
+  let holds: Map<string, Promise<LoadedStation>>;
+
+  const liveLoad: PlaceLoader = (a, signal) => {
+    asked.push({ address: a, at: now });
+    if (a.kind !== "engram") return stationLoad(a, signal);
+    const held = holds.get(a.permalink);
+    if (held !== undefined) {
+      holds.delete(a.permalink);
+      return held;
+    }
+    const answer = answers.get(a.permalink);
+    return Promise.resolve(answer ?? { kind: "missing" });
+  };
+
+  /** How many times the loader was asked for `permalink`. */
+  const loadsOf = (permalink: string) =>
+    asked.filter(
+      (c) => c.address.kind === "engram" && c.address.permalink === permalink,
+    ).length;
+
+  /** An engram frame of `station/hall`, with changes. */
+  const frameOf = (o: Partial<EngramChange> = {}): ChangeEvent => ({
+    event: "engram",
+    change: {
+      domain: "station",
+      permalink: "hall",
+      path: "hall.md",
+      kind: "modified",
+      from: null,
+      checksum: "1",
+      actor: null,
+      draftOf: null,
+      ...o,
+    },
+  });
+
+  /** Lets every settled promise run its callbacks, with no timer. */
+  async function micro() {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  /**
+   * Runs `ms` of the station: the loop's clock and the timers step
+   * together, a tick at a time, and every settled load lands.
+   */
+  async function run(ms: number) {
+    const until = now + ms;
+    while (now < until) {
+      vi.advanceTimersByTime(TICK_MS);
+      await micro();
+      frames(1);
+    }
+  }
+
+  /** The room `roomFor` builds from `place`, as the session would. */
+  const built = (place: PlaceInput) =>
+    roomFor(engramOf(place), null, null).room;
+
+  /** Starts a session standing in `station/hall`, its first answer `place`. */
+  async function standIn(
+    place: PlaceInput = placeOf(),
+    extra: Parameters<typeof start>[0] = {},
+  ): Promise<Session> {
+    answers.set("hall", engramOf(place));
+    const session = start({ load: liveLoad, ...extra });
+    session.go(ROOM_AT);
+    await micro();
+    frames(1);
+    expect(session.current).toEqual(ROOM_AT);
+    return session;
+  }
+
+  /** Every level array drawn, copied as it was drawn. */
+  let drawn: {
+    at: number;
+    levels: Float32Array;
+    camera: Camera;
+    doors: Map<string, number>;
+  }[];
+  /** The clock at every `setRoom`, with the room. */
+  let rooms: { at: number; room: RoomSpec }[];
+  /** The clock at every notice, with its text. */
+  let notices: { at: number; text: string | null }[];
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    answers = new Map();
+    holds = new Map();
+    asked = [];
+    drawn = [];
+    rooms = [];
+    notices = [];
+    renderer.draw.mockImplementation((camera, levels, _t, doors) => {
+      drawn.push({
+        at: now,
+        levels: Float32Array.from(levels),
+        camera,
+        doors: new Map(doors),
+      });
+    });
+    renderer.setRoom.mockImplementation((room) => {
+      rooms.push({ at: now, room });
+    });
+    hud.notice.mockImplementation((text) => {
+      notices.push({ at: now, text });
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The room the renderer was last handed. */
+  const shown = (): RoomSpec => {
+    const room = rooms.at(-1)?.room;
+    if (room === undefined) throw new Error("no room");
+    return room;
+  };
+
+  describe("holds a re-check while busy and applies the latest once (Review Focus 3)", () => {
+    // Mutation caught: no pending flag (the change lost), no coalescing,
+    // no reshape throttle.
+    it("while a door's load is in flight", async () => {
+      const session = await standIn();
+      const other = deferred<LoadedStation>();
+      holds.set("beta", other.promise);
+      asked = [];
+      session.go(engramAt("station", "beta"));
+      answers.set("hall", engramOf(retexted()));
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      other.resolve({ kind: "offline" });
+      await run(500);
+      expect(loadsOf("hall")).toBe(1);
+      expect(shown()).toEqual(built(retexted()));
+    });
+
+    it("while the reader is open", async () => {
+      facing.kind = "terminal";
+      const session = await standIn();
+      key("keydown", "Space");
+      frames(1);
+      key("keyup", "Space");
+      expect(hud.reader.mock.calls.at(-1)?.[0]).not.toBeNull();
+      asked = [];
+      answers.set("hall", engramOf(retexted()));
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      session.closeReader();
+      await run(500);
+      expect(loadsOf("hall")).toBe(1);
+      expect(shown()).toEqual(built(retexted()));
+    });
+
+    it("while paused, and a re-check already in flight when the pause starts lands on resume", async () => {
+      const onPause = vi.fn<(paused: boolean) => void>();
+      const session = await standIn(placeOf(), { onPause });
+      asked = [];
+      answers.set("hall", engramOf(retexted()));
+      session.pause();
+      session.changed(frameOf());
+      await run(1000);
+      expect(loadsOf("hall")).toBe(0);
+      const before = rooms.length;
+      session.resume();
+      await run(500);
+      expect(loadsOf("hall")).toBe(1);
+      expect(rooms.length).toBe(before + 1);
+      expect(shown()).toEqual(built(retexted()));
+
+      // A re-check whose answer lands under the pause changes nothing
+      // there: the room under the pause screen stays the one it names,
+      // and the latest answer is entered on resume.
+      const slow = deferred<LoadedStation>();
+      holds.set("hall", slow.promise);
+      asked = [];
+      session.changed(frameOf());
+      await run(300);
+      expect(loadsOf("hall")).toBe(1);
+      session.pause();
+      slow.resolve(engramOf(retexted("third")));
+      const count = rooms.length;
+      await run(1000);
+      expect(rooms.length).toBe(count);
+      answers.set("hall", engramOf(retexted("fourth")));
+      session.resume();
+      await run(500);
+      expect(shown()).toEqual(built(retexted("fourth")));
+    });
+
+    it("during a lift ride's hold", async () => {
+      const deckRoom = generateDeck(CANNED_DECK, 0);
+      const lift = deckRoom.fixtures.find((f) => f.kind === "lift");
+      if (lift?.kind !== "lift") throw new Error("no lift");
+      const stop = lift.stops.findIndex((s) => s.to.kind === "bridge");
+      expect(stop).toBeGreaterThanOrEqual(0);
+      const onLift = vi.fn();
+      const session = start({ load: liveLoad, onLift });
+      const at: StationAddress = {
+        kind: "deck",
+        domain: CANNED_DECK.domain,
+        folder: CANNED_DECK.folder,
+        section: 0,
+      };
+      session.showRoom(
+        { ...deckRoom, spawn: wallFacingSpawn(lift.slot) },
+        undefined,
+        at,
+      );
+      frames(1);
+      key("keydown", "Space");
+      frames(1);
+      key("keyup", "Space");
+      expect(onLift.mock.calls.at(-1)?.[0]).not.toBeNull();
+      session.ride(stop);
+      await micro();
+      asked = [];
+      session.changed({
+        event: "domain",
+        change: { domain: CANNED_DECK.domain, actor: null },
+      });
+      // The ride's load has settled; its landing is held for the ride.
+      await run(LIFT_RIDE_MS - 2 * TICK_MS);
+      expect(session.current?.kind).toBe("deck");
+      expect(asked).toHaveLength(0);
+      await run(500);
+      expect(session.current?.kind).toBe("bridge");
+      expect(asked).toHaveLength(1);
+    });
+
+    it("gives 20 frames within 2 s one re-check per coalesce window, at most one reshape per 3 s, and enters the last answer", async () => {
+      const session = await standIn();
+      // Twenty frames of a save that changed nothing: one re-check per
+      // window, never one per frame.
+      asked = [];
+      for (let i = 0; i < 20; i++) {
+        session.changed(frameOf());
+        await run(100);
+      }
+      await run(1000);
+      expect(asked.length).toBeGreaterThan(1);
+      expect(asked.length).toBeLessThanOrEqual(
+        Math.ceil(2000 / COALESCE_MS) + 1,
+      );
+      // Twenty frames of changes that each reshape the room.
+      asked = [];
+      for (let i = 0; i < 20; i++) {
+        answers.set("hall", engramOf(redoored(1 + (i % 3))));
+        session.changed(frameOf());
+        await run(100);
+      }
+      const last = redoored(1 + (19 % 3));
+      answers.set("hall", engramOf(last));
+      await run(8000);
+      // One re-check per window at most while the frames come, and the
+      // ones they left owed after them.
+      const starts = asked.map((c) => c.at);
+      expect(starts.length).toBeGreaterThan(1);
+      expect(starts.length).toBeLessThanOrEqual(Math.ceil(2000 / COALESCE_MS));
+      const dips = notices.filter((n) => n.text === RECONFIGURING);
+      expect(dips.length).toBeGreaterThanOrEqual(1);
+      for (let i = 1; i < dips.length; i++) {
+        expect(dips[i]!.at - dips[i - 1]!.at).toBeGreaterThanOrEqual(
+          RESHAPE_MIN_MS,
+        );
+      }
+      expect(shown()).toEqual(built(last));
+    });
+  });
+
+  it("follows a move, a delete and a re-add (Review Focus 3)", async () => {
+    // Mutation caught: the move not followed, the URL not replaced,
+    // darkening that also changes the URL.
+    const session = await standIn();
+    expect(navigate).toHaveBeenCalledTimes(1);
+    asked = [];
+    const moved = placeOf({ permalink: "annex/hall" });
+    answers.set("annex/hall", engramOf(moved));
+    session.changed(
+      frameOf({
+        kind: "moved",
+        permalink: "annex/hall",
+        path: "annex/hall.md",
+        from: { path: "hall.md", permalink: "hall" },
+      }),
+    );
+    await run(2000);
+    expect(loadsOf("annex/hall")).toBe(1);
+    expect(notices.some((n) => n.text === RECONFIGURING)).toBe(true);
+    expect(session.current).toEqual(engramAt("station", "annex/hall"));
+    expect(navigate).toHaveBeenCalledTimes(2);
+    expect(navigate).toHaveBeenLastCalledWith(
+      gameRouteOf(engramAt("station", "annex/hall")),
+    );
+    const url = window.location.pathname + window.location.search;
+
+    // Deleted: the room goes dark in place, the URL stays.
+    const lit = shown();
+    answers.delete("annex/hall");
+    session.changed(
+      frameOf({
+        kind: "deleted",
+        permalink: "annex/hall",
+        path: "annex/hall.md",
+      }),
+    );
+    await run(2000);
+    const dark = shown();
+    expect(dark.lights.map((z) => z.level)).toEqual(
+      lit.lights.map((z) => Math.round(z.level / 4)),
+    );
+    const levels = drawn.at(-1)?.levels;
+    if (levels === undefined) throw new Error("nothing drawn");
+    dark.lights.forEach((z, i) => {
+      expect(levels[i]).toBeLessThanOrEqual(z.level);
+    });
+    expect(
+      dark.fixtures.some(
+        (f) => f.kind === "hatch" && f.label === LIFT_WORDS.bridge,
+      ),
+    ).toBe(true);
+    expect(hud.notice).toHaveBeenLastCalledWith(NOT_FOUND);
+    expect(window.location.pathname + window.location.search).toBe(url);
+    expect(navigate).toHaveBeenCalledTimes(2);
+    expect(session.current).toEqual(engramAt("station", "annex/hall"));
+
+    // A second delete while dark changes nothing.
+    const darkCount = rooms.length;
+    session.changed(
+      frameOf({
+        kind: "deleted",
+        permalink: "annex/hall",
+        path: "annex/hall.md",
+      }),
+    );
+    await run(1000);
+    expect(rooms.length).toBe(darkCount);
+
+    // Added again: the room comes back through a dip.
+    notices = [];
+    answers.set("annex/hall", engramOf(moved));
+    session.changed(
+      frameOf({
+        kind: "added",
+        permalink: "annex/hall",
+        path: "annex/hall.md",
+      }),
+    );
+    await run(RESHAPE_MIN_MS + 2000);
+    expect(notices.some((n) => n.text === RECONFIGURING)).toBe(true);
+    expect(shown()).toEqual(built(moved));
+  });
+
+  it("flickers on a text change and keeps everything", async () => {
+    // Mutation caught: a text change reshaping, the doors reset.
+    facing.kind = "door";
+    const session = await standIn();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    await run(300);
+    // A turn away from the entrance's heading, so an entry that put the
+    // player back at the spawn would show.
+    key("keydown", "ArrowLeft");
+    frames(3);
+    key("keyup", "ArrowLeft");
+    await run(1000);
+    const doorsBefore = new Map(lastDoors());
+    expect([...doorsBefore.values()].some((v) => v > 0)).toBe(true);
+    const cam = lastCamera();
+    expect(diffRooms(shown(), built(retexted()))).toBe("text");
+    notices = [];
+    const drawnBefore = drawn.length;
+    const base = Math.max(
+      ...drawn.slice(-20).map((d) => d.levels.reduce((a, b) => a + b, 0)),
+    );
+    answers.set("hall", engramOf(retexted()));
+    session.changed(frameOf());
+    await run(COALESCE_MS + FLICKER_MS + 200);
+    expect(notices.some((n) => n.text === RECONFIGURING)).toBe(false);
+    expect(shown()).toEqual(built(retexted()));
+    expect(lastCamera().eye).toEqual(cam.eye);
+    expect(lastCamera().yaw).toBe(cam.yaw);
+    // Every frame from the change on draws the doors as they stood.
+    for (const d of drawn.slice(drawnBefore))
+      expect(d.doors).toEqual(doorsBefore);
+    const low = drawn
+      .slice(drawnBefore)
+      .filter((d) => d.levels.reduce((a, b) => a + b, 0) < 0.8 * base);
+    expect(low.length).toBeGreaterThan(0);
+    const first = low[0]!.at;
+    expect(low.every((d) => d.at - first < FLICKER_MS)).toBe(true);
+    expect(session.current).toEqual(ROOM_AT);
+  });
+
+  it("keeps the latches on a text change: a player left in a doorway is not carried through", async () => {
+    // Mutation caught: the keep path resetting the way latch (the player
+    // standing in the doorway of a travel that failed is sent again).
+    facing.kind = "door";
+    const session = await standIn();
+    const door = shown().fixtures.find((f) => f.kind === "door");
+    if (door?.kind !== "door" || door.address === null)
+      throw new Error("no door with an address");
+    const to = door.address.permalink;
+    holds.set(to, Promise.resolve({ kind: "offline" }));
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    await run(500);
+    key("keydown", "KeyW");
+    for (let i = 0; i < 120 && loadsOf(to) === 0; i++) await run(TICK_MS);
+    key("keyup", "KeyW");
+    expect(loadsOf(to)).toBe(1);
+    await run(500);
+    expect(hud.notice).toHaveBeenCalledWith("SIGNAL LOST");
+    expect(session.current).toEqual(ROOM_AT);
+    answers.set("hall", engramOf(retexted()));
+    session.changed(frameOf());
+    await run(1500);
+    expect(shown()).toEqual(built(retexted()));
+    expect(loadsOf(to)).toBe(1);
+  });
+
+  describe("reshapes behind the dip and keeps the player on free floor", () => {
+    // Mutation caught: the room swapped at 0 ms, the entrance spawn used.
+    const next = () => built(redoored());
+
+    /** A spot on free floor in both `a` and `b`, away from `a`'s spawn. */
+    function freeInBoth(a: RoomSpec, b: RoomSpec): { x: number; z: number } {
+      const clear = (r: RoomSpec, x: number, z: number) =>
+        settleSpot(r, x, z).x === x && settleSpot(r, x, z).z === z;
+      for (let cy = 0; cy < a.grid.length; cy++) {
+        for (let cx = 0; cx < (a.grid[cy]?.length ?? 0); cx++) {
+          const x = (cx + 0.3) * CELL;
+          const z = (cy + 0.7) * CELL;
+          if (cx === a.spawn.x && cy === a.spawn.y) continue;
+          if (clear(a, x, z) && clear(b, x, z)) return { x, z };
+        }
+      }
+      throw new Error("no free spot");
+    }
+
+    /** A spot on free floor in `a` that a blocker of `b` covers. */
+    function blockedInB(a: RoomSpec, b: RoomSpec): { x: number; z: number } {
+      for (const box of blockersFor(b)) {
+        const x = (box.x0 + box.x1) / 2;
+        const z = (box.z0 + box.z1) / 2;
+        const s = settleSpot(a, x, z);
+        if (s.x === x && s.z === z) return { x, z };
+      }
+      throw new Error("no spot blocked in the new room only");
+    }
+
+    function standAt(spot: { x: number; z: number }): Session {
+      answers.set("hall", engramOf(placeOf()));
+      const session = start({ load: liveLoad });
+      const a = built(placeOf());
+      session.showRoom(
+        {
+          ...a,
+          spawn: { x: spot.x / CELL - 0.5, y: spot.z / CELL - 0.5, yaw: 0.5 },
+        },
+        undefined,
+        ROOM_AT,
+      );
+      frames(2);
+      return session;
+    }
+
+    it("keeps the player's x and z on free floor, and swaps at 500 ms", async () => {
+      const a = built(placeOf());
+      const b = next();
+      expect(diffRooms(a, b)).toBe("shape");
+      const spot = freeInBoth(a, b);
+      const session = standAt(spot);
+      const pitch = lastCamera().pitch;
+      answers.set("hall", engramOf(redoored()));
+      rooms = [];
+      session.changed(frameOf());
+      await run(2000);
+      const dip = notices.find((n) => n.text === RECONFIGURING);
+      if (dip === undefined) throw new Error("no dip notice");
+      expect(rooms).toHaveLength(1);
+      expect(rooms[0]!.room).toEqual(b);
+      expect(rooms[0]!.at - dip.at).toBeGreaterThanOrEqual(DIP_SWAP_MS);
+      expect(rooms[0]!.at - dip.at).toBeLessThan(DIP_SWAP_MS + 2 * TICK_MS);
+      const [x, z] = eyeAt();
+      expect(x).toBeCloseTo(spot.x, 6);
+      expect(z).toBeCloseTo(spot.z, 6);
+      expect(lastCamera().yaw).toBeCloseTo(0.5, 6);
+      expect(lastCamera().pitch).toBe(pitch);
+      // The lights fell to a tenth in the dip's dark stretch.
+      const inDip = drawn.filter(
+        (d) => d.at > dip.at + 420 && d.at < dip.at + 580,
+      );
+      expect(inDip.length).toBeGreaterThan(0);
+      const lit = drawn.at(-1)!.levels.reduce((p, q) => p + q, 0);
+      for (const d of inDip)
+        expect(d.levels.reduce((p, q) => p + q, 0)).toBeLessThan(0.2 * lit);
+      expect(session.current).toEqual(ROOM_AT);
+    });
+
+    it("moves the player to the nearest free cell when their spot is blocked", async () => {
+      const a = built(placeOf());
+      const b = next();
+      const spot = blockedInB(a, b);
+      const session = standAt(spot);
+      answers.set("hall", engramOf(redoored()));
+      session.changed(frameOf());
+      await run(2000);
+      expect(shown()).toEqual(b);
+      const want = settleSpot(b, spot.x, spot.z);
+      expect(want).not.toEqual(spot);
+      // The first frame drawn in the new room stands at the spot; the
+      // walk's own collision may nudge it afterwards.
+      const swappedAt = rooms.at(-1)?.at ?? Infinity;
+      const first = drawn.find((d) => d.at >= swappedAt);
+      if (first === undefined) throw new Error("nothing drawn after the swap");
+      expect(first.camera.eye[0]).toBeCloseTo(want.x, 6);
+      expect(first.camera.eye[2]).toBeCloseTo(want.z, 6);
+      expect(session.current).toEqual(ROOM_AT);
+    });
+  });
+
+  it("closes a lift overlay opened during the dip when the room is swapped", async () => {
+    // Mutation caught: the swap leaving the old room's stops open over the
+    // new room, where a pick rides nowhere.
+    const deckRoom = generateDeck(CANNED_DECK, 0);
+    const lift = deckRoom.fixtures.find((f) => f.kind === "lift");
+    if (lift?.kind !== "lift") throw new Error("no lift");
+    const onLift = vi.fn();
+    const session = start({ load: liveLoad, onLift });
+    session.showRoom(
+      { ...deckRoom, spawn: wallFacingSpawn(lift.slot) },
+      undefined,
+      {
+        kind: "deck",
+        domain: CANNED_DECK.domain,
+        folder: CANNED_DECK.folder,
+        section: 0,
+      },
+    );
+    frames(1);
+    session.changed({
+      event: "domain",
+      change: { domain: CANNED_DECK.domain, actor: null },
+    });
+    await run(COALESCE_MS + 2 * TICK_MS);
+    const dip = notices.find((n) => n.text === RECONFIGURING);
+    if (dip === undefined) throw new Error("no dip");
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(onLift.mock.calls.at(-1)?.[0]).not.toBeNull();
+    expect(now - dip.at).toBeLessThan(DIP_SWAP_MS);
+    await run(DIP_SWAP_MS);
+    expect(rooms.at(-1)?.at).toBeGreaterThanOrEqual(dip.at + DIP_SWAP_MS);
+    expect(onLift).toHaveBeenLastCalledWith(null);
+  });
+
+  it("ignores frames that do not concern the room, and every frame inside the console room", async () => {
+    // Mutation caught: `concerns` bypassed.
+    const session = await standIn();
+    asked = [];
+    session.changed(frameOf({ domain: "far", permalink: "x", path: "x.md" }));
+    await run(1000);
+    expect(asked).toHaveLength(0);
+    // The control: a frame of the room's own domain is read.
+    session.changed(frameOf());
+    await run(1000);
+    expect(asked).toHaveLength(1);
+
+    const inside = startWithConsole([row(HALL), row("ops")], liveLoad);
+    standAtBox(inside);
+    walkIn();
+    frames(1);
+    expect(isConsole(lastRoom())).toBe(true);
+    asked = [];
+    inside.changed(frameOf({ domain: HALL, permalink: "x", path: "x.md" }));
+    inside.changed({ event: "domain", change: { domain: HALL, actor: null } });
+    inside.changed({ event: "reset" });
+    await run(1000);
+    expect(asked).toHaveLength(0);
+  });
+
+  it("re-reads the airlock as it was entered, so a frame changes nothing there", async () => {
+    // Mutation caught: the re-check built with no arrival (the stop the
+    // player came from loses its mark: a shape change on every frame).
+    // The precondition: the stop the player came from is marked, so a
+    // build with no arrival differs from the room entered.
+    const airlock: Extract<LoadedStation, { kind: "airlock" }> = {
+      kind: "airlock",
+      input: { domains: CANNED_DOMAINS, here: null },
+    };
+    const from: StationAddress = { kind: "bridge", domain: "orbit" };
+    expect(
+      diffRooms(
+        roomFor(airlock, { from }, null).room,
+        roomFor(airlock, null, null).room,
+      ),
+    ).not.toBe("same");
+    const session = start({ load: liveLoad });
+    session.go(from);
+    await micro();
+    frames(1);
+    session.go({ kind: "airlock" }, { via: "lift", from: session.current! });
+    await micro();
+    frames(1);
+    expect(session.current).toEqual({ kind: "airlock" });
+    const count = rooms.length;
+    notices = [];
+    session.changed({
+      event: "domain",
+      change: { domain: "ops", actor: null },
+    });
+    await run(2000);
+    expect(rooms.length).toBe(count);
+    expect(notices.some((n) => n.text === RECONFIGURING)).toBe(false);
   });
 });

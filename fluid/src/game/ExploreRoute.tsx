@@ -78,12 +78,27 @@
  * into the station again. Before the first room lands the session is at
  * no place yet, and the way out leads to the page of the address the URL
  * last sent it to; the unmount that follows disposes the session.
+ *
+ * The route listens to the change stream itself (M4 C13): `Layout`, whose
+ * provider invalidates for every other screen, is not mounted here. The
+ * mount marks the whole cache stale once before the first `go`, since the
+ * stream restarted on the way in and frames in that gap are lost. Every
+ * frame then marks the keys `changeKeys` names stale (Fluid's own table
+ * and the game's rows), refetching nothing, and hands the frame to the
+ * session (`changed`), which decides whether the room reacts. The
+ * subscription passes Fluid's identity (the cached `/auth/me`), so a frame
+ * streamed as another account never reaches the station. A live change
+ * that follows a moved engram replaces the URL through the same
+ * `navigate` as a landing.
  */
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
+import { ME_QUERY_KEY } from "../auth/keys";
+import { subscribeToChanges } from "../events/ChangeStreamProvider";
+import { changeKeys } from "./data/changes";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
 import { hasWebGL2 } from "./gl/context";
@@ -203,10 +218,34 @@ export default function ExploreRoute() {
     sessionRef.current = session;
     // Nothing of the route's own holds the station busy yet.
     session.setBusy(false);
+    // Frames lost while the stream restarted for this route (M4 C13):
+    // everything is marked stale, so the first room is read fresh.
+    void client.invalidateQueries({ refetchType: "none" });
+    const unsubscribe = subscribeToChanges(
+      (event) => {
+        const keys = changeKeys(event);
+        if (keys === "everything") {
+          void client.invalidateQueries({ refetchType: "none" });
+        } else {
+          for (const queryKey of keys)
+            void client.invalidateQueries({ queryKey, refetchType: "none" });
+        }
+        session.changed(event);
+      },
+      {
+        identity: {
+          held: () => client.getQueryData(ME_QUERY_KEY),
+          recheck: () => {
+            void client.invalidateQueries({ queryKey: ME_QUERY_KEY });
+          },
+        },
+      },
+    );
     const first = addressRef.current;
     requestedRef.current = first;
     session.go(first);
     return () => {
+      unsubscribe();
       sessionRef.current = null;
       requestedRef.current = null;
       session.dispose();

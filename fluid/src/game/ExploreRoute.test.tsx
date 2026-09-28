@@ -39,8 +39,13 @@ import {
   type MockInstance,
 } from "vitest";
 
+import { QueryClient } from "@tanstack/react-query";
+
 import App from "../App";
 import { ApiProblem, api } from "../api/client";
+import { engramDetailKey } from "../api/engram";
+import type { ChangeEvent } from "../api/events";
+import { ME_QUERY_KEY } from "../auth/keys";
 import {
   answersFor,
   type Answer,
@@ -183,6 +188,37 @@ vi.mock("./session", async (importOriginal) => {
         dispose();
       };
       return session;
+    },
+  };
+});
+
+/**
+ * The change stream as the route subscribes to it: every listener with its
+ * options, and how many unsubscribed.
+ */
+const stream = vi.hoisted(() => ({
+  subs: [] as {
+    listener: (event: import("../api/events").ChangeEvent) => void;
+    options:
+      import("../events/ChangeStreamProvider").StreamSubscription | undefined;
+    unsubscribed: boolean;
+  }[],
+}));
+
+vi.mock("../events/ChangeStreamProvider", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../events/ChangeStreamProvider")>();
+  return {
+    ...actual,
+    subscribeToChanges: (
+      listener: (typeof stream.subs)[number]["listener"],
+      options?: (typeof stream.subs)[number]["options"],
+    ) => {
+      const sub = { listener, options, unsubscribed: false };
+      stream.subs.push(sub);
+      return () => {
+        sub.unsubscribed = true;
+      };
     },
   };
 });
@@ -378,6 +414,7 @@ beforeEach(() => {
   navigationType = "";
   facing.kind = null;
   made.pauses.length = 0;
+  stream.subs.length = 0;
   made.renderers.length = 0;
   made.navigations.length = 0;
   made.sessions.length = 0;
@@ -465,6 +502,7 @@ function stubSession(
     pause: vi.fn(),
     resume: vi.fn(),
     setBusy: vi.fn(),
+    changed: vi.fn(),
     current: null,
     where: null,
     paused: false,
@@ -1170,6 +1208,92 @@ describe("ExploreRoute", () => {
       expect(location).toBe("/d/eng/e/beta");
     });
     view.unmount();
+  });
+
+  it("invalidates with Fluid's table and passes its identity (M4 C13)", async () => {
+    // Mutation caught: no identity passed, the game inbound prefix not
+    // invalidated, the mount's reset after the first go or refetching.
+    gl.available = true;
+    serve();
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    const go = vi.fn();
+    const changed = vi.fn();
+    let options: SessionOptions | null = null;
+    sessionStub.factory = (opts) => {
+      options = opts;
+      return {
+        ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+        go,
+        changed,
+      };
+    };
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(go).toHaveBeenCalledTimes(1);
+    });
+    const client = (options as SessionOptions | null)?.client;
+    if (client === null || client === undefined) throw new Error("no client");
+    // The mount's one reset, before the first go, marking only.
+    const resets = invalidate.mock.calls
+      .map((args, i) => ({
+        args,
+        order: invalidate.mock.invocationCallOrder[i]!,
+      }))
+      .filter(({ args }) => args[0]?.queryKey === undefined);
+    expect(resets).toHaveLength(1);
+    expect(resets[0]!.args[0]).toEqual({ refetchType: "none" });
+    expect(resets[0]!.order).toBeLessThan(go.mock.invocationCallOrder[0]!);
+
+    expect(stream.subs).toHaveLength(1);
+    const sub = stream.subs[0]!;
+    await waitFor(() => {
+      expect(client.getQueryData(ME_QUERY_KEY)).toBeDefined();
+    });
+    expect(sub.options?.identity?.held()).toBe(
+      client.getQueryData(ME_QUERY_KEY),
+    );
+
+    invalidate.mockClear();
+    const frame: ChangeEvent = {
+      event: "engram",
+      change: {
+        domain: "eng",
+        permalink: "alpha",
+        path: "alpha.md",
+        kind: "modified",
+        from: null,
+        checksum: "2",
+        actor: null,
+        draftOf: null,
+      },
+    };
+    act(() => {
+      sub.listener(frame);
+    });
+    const keys = invalidate.mock.calls.map(([filters]) => filters);
+    expect(keys).toContainEqual({
+      queryKey: engramDetailKey("eng", "alpha"),
+      refetchType: "none",
+    });
+    expect(keys).toContainEqual({
+      queryKey: ["game", "inbound"],
+      refetchType: "none",
+    });
+    for (const filters of keys) expect(filters?.refetchType).toBe("none");
+    expect(changed).toHaveBeenCalledWith(frame);
+    const lastInvalidation = Math.max(...invalidate.mock.invocationCallOrder);
+    expect(changed.mock.invocationCallOrder[0]!).toBeGreaterThan(
+      lastInvalidation,
+    );
+
+    // The identity's re-check asks the probe again.
+    invalidate.mockClear();
+    sub.options?.identity?.recheck();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ME_QUERY_KEY });
+
+    expect(sub.unsubscribed).toBe(false);
+    view.unmount();
+    expect(sub.unsubscribed).toBe(true);
   });
 
   it.each(["/%CF%80/dev", "/%CF%80/dev/gallery"])(

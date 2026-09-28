@@ -136,13 +136,53 @@
  * `setBusy` holds the station modal the same way for a screen of the
  * host's (the connecting screen), without a pause. Going down pauses
  * nothing: both listeners are removed before the input releases the lock.
+ *
+ * Live changes (M4 C14 to C19) come in through `changed`, which the host
+ * calls for every frame of the change stream after it made the frame's
+ * keys stale. A `moved` frame of the current engram sets the address the
+ * room follows to (`movedTo`, C18). A frame that concerns the place
+ * (`concerns` on `watchOf`: an engram room watches its domain and the
+ * domains its ways lead to, a bridge or a deck its domain, the airlock
+ * the listing, the console room nothing) opens a `COALESCE_MS` window;
+ * frames inside it join it, and at its end one re-check runs. A re-check
+ * waits, owed (`pendingCheck`, the latest wins), while a load or a lift
+ * ride is in flight, an overlay is open, the station is paused or busy,
+ * a flicker or a dip is running, or another re-check is loading, and
+ * runs once that ends. It loads the current address again (or the one a
+ * move sent it to) through the session's loader, builds the room with
+ * the arrival and the landing the room was entered with, and diffs it
+ * with the room shown (`diffRooms`, C16): `same` does nothing; `text`
+ * re-enters the room keeping the player, the doors, the malfunctions and
+ * the latches, and flickers the lights for `FLICKER_MS`; `shape` shows
+ * `STATION RECONFIGURING`, dips the lights for `DIP_MS` and enters the
+ * rebuilt room at `DIP_SWAP_MS`, the player where they stood or on the
+ * nearest free floor (`settleSpot`), their view kept, the doors shut and
+ * the malfunctions cleared. A shape change within `RESHAPE_MIN_MS` of the
+ * last is held until that has passed. A move replaces the URL once its
+ * room is entered. A room whose engram went (a 404) or is refused (a 403)
+ * goes dark in place (`darkened`, C19): the player kept, the lights at a
+ * quarter and failing, a hatch to the bridge, the notice standing, the
+ * URL kept; a second such answer changes nothing, and a later one that
+ * loads the room brings it back through a dip. The airlock is never
+ * darkened. An `offline` answer flashes `SIGNAL LOST` and keeps the room.
+ * A new place drops the re-check in flight and a running dip.
+ *
+ * Nothing changes under the pause: a re-check owed waits for `resume`, an
+ * answer that lands while paused is dropped and the re-check owed again,
+ * and a flicker or a dip holds still with the shader's clock and goes on
+ * after it. So the room the pause screen names is the one the player sees
+ * on continuing; a load of the player's own that lands under the pause
+ * enters its room, and the host renames the screen through `navigate`.
  */
 
 import type { QueryClient } from "@tanstack/react-query";
 
+import type { ChangeEvent } from "../api/events";
+import { COALESCE_MS } from "../events/ChangeStreamProvider";
 import { createCheatReader } from "./core/cheat";
 import { createInput } from "./core/input";
 import { createLoop, type Clock } from "./core/loop";
+import { concerns, movedTo, watchOf } from "./data/changes";
 import { prefetchPlace } from "./data/source";
 import { loadStation, type LoadedStation } from "./data/station";
 import { backbufferSize } from "./device";
@@ -172,6 +212,15 @@ import {
   type DomainRow,
 } from "./world/box";
 import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
+import {
+  DIP_MS,
+  DIP_SWAP_MS,
+  FLICKER_MS,
+  darkened,
+  diffRooms,
+  dipFactor,
+  settleSpot,
+} from "./world/diff";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
@@ -436,6 +485,12 @@ export interface Session {
   pause(): void;
   resume(): void;
   setBusy(busy: boolean): void;
+  /**
+   * One frame of the change stream, after the host made its keys stale:
+   * follows a move of the current engram and re-checks the room when the
+   * frame concerns it (M4 C14, C15, C18). See the module doc.
+   */
+  changed(event: ChangeEvent): void;
   readonly current: StationAddress | null;
   readonly where: string | null;
   readonly paused: boolean;
@@ -480,6 +535,15 @@ export const UP_LATCH_CLEAR = 2.0;
  * leave the station on it.
  */
 export const PAUSE_ESC_GUARD_MS = 250;
+
+/**
+ * How long after one reshape the next may run, in milliseconds (M4 C15):
+ * a shape change that comes sooner is held until then.
+ */
+export const RESHAPE_MIN_MS = 3000;
+
+/** The notice over a power dip (M4 C17). */
+export const RECONFIGURING = "STATION RECONFIGURING";
 
 /** No fixture held shut. */
 const NONE_SHUT: ReadonlySet<number> = new Set();
@@ -687,6 +751,43 @@ export function createSession(opts: SessionOptions): Session {
   /** Counts the cuts in, so a listing that answers late is dropped. */
   let visit = 0;
 
+  // Live changes (M4 C14 to C19): see the module doc.
+  /** A re-check is owed: asked for while one could not run. */
+  let pendingCheck = false;
+  /** Whether a re-check's load is in flight. */
+  let checking = false;
+  /** Aborts the re-check in flight; `leave` and `dispose` abort it. */
+  let checkAbort: AbortController | null = null;
+  /** The coalescing window a concerning frame opened; null when none. */
+  let checkTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Waits out `RESHAPE_MIN_MS` for a held shape change; null when none. */
+  let reshapeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the last reshape entered its room, on the session's clock. */
+  let lastReshape = -Infinity;
+  /**
+   * The flicker or the dip running, from `at` on the station's clock
+   * (`stationTime`); `next` is the dip's swap, run at `DIP_SWAP_MS`.
+   */
+  let dip: {
+    kind: "flicker" | "dip";
+    at: number;
+    next: (() => void) | null;
+  } | null = null;
+  /** The light levels scaled by the dip, reused from frame to frame. */
+  let dipLevels = new Float32Array(0);
+  /** Whether the room shown is the darkened one (C19). */
+  let dark = false;
+  /** Where a `moved` frame sent the current engram, until it is entered. */
+  let target: StationAddress | null = null;
+  /**
+   * The arrival and the landing the room was entered with (F35): a
+   * re-check builds with both, so it builds the room it is comparing
+   * with (the airlock's stop the player came from, a bridge's arrival
+   * box).
+   */
+  let entryArrival: Arrival | null = null;
+  let entryLanding: "box" | null = null;
+
   let generation = 0;
   let controller: AbortController | null = null;
   let loading = false;
@@ -709,6 +810,11 @@ export function createSession(opts: SessionOptions): Session {
   let started = now();
   /** When the pause began, on the session's clock; null while running. */
   let pausedAt: number | null = null;
+  /**
+   * The station's own clock: the session's with every pause cut out, the
+   * clock the shader and a dip run on, so both hold still while paused.
+   */
+  const stationTime = () => now() - started;
   /** The last `renderer.setRoom` call's time, in ms; null before the first. */
   let lastBuildMs: number | null = null;
 
@@ -868,7 +974,9 @@ export function createSession(opts: SessionOptions): Session {
    * `spawn`, when given, places the player there (in metres) in place of
    * `arrivalSpawn` (the arrival box's step out). Every entry ends a visit
    * of the console room: `inside` is cleared and its listing read aborted
-   * (the cut in sets both again once it has entered).
+   * (the cut in sets both again once it has entered). `landing` is the
+   * landing the room was entered with (`land`'s), kept with `arrival` for
+   * the re-check (F35); every entry leaves the dark room behind.
    *
    * The renderer is asked first. When it refuses the room, nothing of the
    * session has changed yet: the player stays in the room they were in,
@@ -884,6 +992,7 @@ export function createSession(opts: SessionOptions): Session {
     arrival: Arrival | null,
     keep: boolean,
     spawn?: { x: number; z: number; yaw: number },
+    landing: "box" | null = null,
   ): boolean => {
     if (!present(built, lookId)) {
       fail(LOAD_ERROR);
@@ -895,6 +1004,9 @@ export function createSession(opts: SessionOptions): Session {
     blockers = blockersFor(room);
     lights = createLights(room.lights);
     current = address;
+    entryArrival = arrival;
+    entryLanding = landing;
+    dark = false;
     if (!keep || player === null) {
       const at = spawn ?? arrivalSpawn(room, arrival);
       player = { ...at, vx: 0, vz: 0, pitch: 0, bob: 0 };
@@ -941,10 +1053,14 @@ export function createSession(opts: SessionOptions): Session {
     if (ride !== null && now() < ride.start + LIFT_RIDE_MS) {
       ride.held = () => {
         land(arrival, loaded, label, landing);
+        retryCheck();
       };
       return;
     }
     land(arrival, loaded, label, landing);
+    // A re-check held for the load runs now, on the room it left the
+    // player in.
+    retryCheck();
   };
 
   /**
@@ -1012,6 +1128,7 @@ export function createSession(opts: SessionOptions): Session {
         arrival,
         false,
         built.spawn ?? undefined,
+        landing,
       )
     ) {
       return;
@@ -1023,7 +1140,16 @@ export function createSession(opts: SessionOptions): Session {
     if (arrival?.via === "lift") startOpen("lift");
     else if (arrival?.via === "door" && arrival.from.kind === "deck")
       startOpen("exit");
-    const path = gameRouteOf(built.address);
+    showAddress(built.address);
+  };
+
+  /**
+   * Replaces the URL with `address`'s game route unless the location's
+   * pathname and search already spell it (M3 C5): after a landing, and
+   * after a re-check that followed a move (C18).
+   */
+  const showAddress = (address: StationAddress) => {
+    const path = gameRouteOf(address);
     // `path` is built with `encodeURIComponent` (M3 C2), which leaves a
     // character like `'` unescaped, while a browser's own query
     // serialiser writes it `%27` - `window.location.search` is always
@@ -1031,8 +1157,8 @@ export function createSession(opts: SessionOptions): Session {
     // comparing puts both sides through the same normalisation, so a
     // folder name that needs it does not replace the URL on every
     // landing.
-    const target = new URL(path, window.location.origin);
-    const normalized = target.pathname + target.search;
+    const url = new URL(path, window.location.origin);
+    const normalized = url.pathname + url.search;
     const { pathname, search } = window.location;
     if (pathname + search !== normalized) opts.navigate(path);
   };
@@ -1059,7 +1185,8 @@ export function createSession(opts: SessionOptions): Session {
    * Leaves whatever the session was doing for a new place: closes the CRT
    * reader, the level select, the lift overlay and the pause, drops the load in
    * flight (a new generation, the old one aborted) and a ride's held
-   * landing with it, and takes the connector down if it was up.
+   * landing with it, drops a re-check in flight and a dip, and takes the
+   * connector down if it was up.
    */
   const leave = (): number => {
     closeReader();
@@ -1071,12 +1198,28 @@ export function createSession(opts: SessionOptions): Session {
     const gen = ++generation;
     controller?.abort();
     controller = null;
+    // A new place drops the re-check in flight, the dip with its swap and
+    // a move not yet followed; a re-check owed stays owed, for the room
+    // the new place lands in.
+    checkAbort?.abort();
+    checkAbort = null;
+    checking = false;
+    dip = null;
+    target = null;
     if (loading) {
       loading = false;
       hud.connector(false, loadingLabel, lookId);
     }
     return gen;
   };
+
+  /**
+   * The loader a journey and a re-check load with: `SessionOptions.load`,
+   * else `loadStation` through the client, else none.
+   */
+  const loaderOf = (): PlaceLoader | null =>
+    opts.load ??
+    (client === null ? null : (a, signal) => loadStation(client, a, signal));
 
   /**
    * Loads `address` and enters it once it lands (`settle`): the journey
@@ -1091,9 +1234,7 @@ export function createSession(opts: SessionOptions): Session {
   ) => {
     if (disposed) return;
     const gen = leave();
-    const loader: PlaceLoader | null =
-      opts.load ??
-      (client === null ? null : (a, signal) => loadStation(client, a, signal));
+    const loader = loaderOf();
     if (loader === null) {
       fail(FAILED.offline);
       return;
@@ -1116,6 +1257,7 @@ export function createSession(opts: SessionOptions): Session {
         ride = null;
         hud.connector(false, shown, lookId);
         if (!isAbort(error)) fail(LOAD_ERROR);
+        retryCheck();
       },
     );
   };
@@ -1401,6 +1543,206 @@ export function createSession(opts: SessionOptions): Session {
     if (loading) ride = { start, held: null };
   };
 
+  /**
+   * Whether a re-check must wait (M4 C15): a load or a lift ride in
+   * flight, an overlay, the pause or a busy host (`modal`), or a flicker
+   * or a dip still running.
+   */
+  const checkBlocked = () =>
+    loading || ride !== null || modal() || dip !== null;
+
+  /**
+   * Asks for a re-check: runs it now when nothing holds it, else owes it
+   * (`pendingCheck`, the latest wins) to whatever holds it.
+   */
+  const requestCheck = () => {
+    if (disposed) return;
+    if (checking || reshapeTimer !== null || checkBlocked()) {
+      pendingCheck = true;
+      return;
+    }
+    pendingCheck = false;
+    recheck();
+  };
+
+  /** Runs the re-check owed, if any, once what held it has ended. */
+  const retryCheck = () => {
+    if (pendingCheck) requestCheck();
+  };
+
+  /** The latches an entry resets, for the keep paths to put back. */
+  const latches = () => ({ latched, boxLatched, exitLatched, upLatched });
+  const restoreLatches = (saved: ReturnType<typeof latches>) => {
+    ({ latched, boxLatched, exitLatched, upLatched } = saved);
+  };
+
+  /**
+   * Re-enters the room shown, rebuilt, keeping the player, the doors, the
+   * malfunctions and the latches (a text change, the dark room): the
+   * player may stand in an open doorway or a box's, and must not be
+   * carried through it by the entry.
+   */
+  const reenterKept = (
+    next: PlaceInput | null,
+    built: RoomSpec,
+    address: StationAddress | null,
+  ): boolean => {
+    const saved = latches();
+    if (
+      !enter(next, built, address, entryArrival, true, undefined, entryLanding)
+    )
+      return false;
+    restoreLatches(saved);
+    return true;
+  };
+
+  /**
+   * The re-check (M4 C15): loads the current address again, or the one a
+   * move sent it to, and settles the answer (`applyCheck`) unless a new
+   * place was taken meanwhile. One runs at a time; a re-check owed runs
+   * after it.
+   */
+  const recheck = () => {
+    const address = target ?? current;
+    const loader = loaderOf();
+    if (address === null || room === null || inside !== null || loader === null)
+      return;
+    const gen = generation;
+    const abort = new AbortController();
+    checkAbort = abort;
+    checking = true;
+    const settled = (): boolean => {
+      if (disposed || gen !== generation || checkAbort !== abort) return false;
+      checkAbort = null;
+      checking = false;
+      return true;
+    };
+    loader(address, abort.signal).then(
+      (loaded) => {
+        if (!settled()) return;
+        applyCheck(address, loaded);
+        retryCheck();
+      },
+      () => {
+        // A failure the server did not explain is not worth a notice for a
+        // room the player did not ask for; the next frame tries again.
+        if (settled()) retryCheck();
+      },
+    );
+  };
+
+  /**
+   * Settles a re-check's answer (M4 C15 to C19). While something holds
+   * the station (the pause, an overlay) nothing changes under it: the
+   * answer is dropped and the re-check owed, to run again once that ends.
+   */
+  const applyCheck = (address: StationAddress, loaded: LoadedStation) => {
+    if (room === null || inside !== null) return;
+    if (checkBlocked()) {
+      pendingCheck = true;
+      return;
+    }
+    if (isFailure(loaded)) {
+      if (loaded.kind === "offline") {
+        flash(FAILED.offline, NOTICE_MS);
+        return;
+      }
+      // Gone or refused: the room goes dark in place, once (C19). The
+      // airlock is never darkened; its load degrades instead.
+      if (dark || address.kind === "airlock") return;
+      const domain = domainOf(address) ?? room.domain;
+      if (!reenterKept(place, darkened(room, domain), current)) return;
+      dark = true;
+      placeNotice = FAILED[loaded.kind];
+      showStanding();
+      return;
+    }
+    const built = roomFor(loaded, entryArrival, entryLanding);
+    switch (diffRooms(room, built.room)) {
+      case "same":
+        return;
+      case "text":
+        if (!reenterKept(built.place, built.room, built.address)) return;
+        dip = { kind: "flicker", at: stationTime(), next: null };
+        followMove(built.address);
+        return;
+      case "shape":
+        break;
+    }
+    const wait = lastReshape + RESHAPE_MIN_MS - now();
+    if (wait > 0) {
+      pendingCheck = true;
+      reshapeTimer ??= setTimeout(() => {
+        reshapeTimer = null;
+        retryCheck();
+      }, wait);
+      return;
+    }
+    flash(RECONFIGURING, DIP_MS);
+    dip = {
+      kind: "dip",
+      at: stationTime(),
+      next: () => {
+        swapIn(built);
+      },
+    };
+  };
+
+  /**
+   * The dip's swap (C17): enters the rebuilt room with the player where
+   * they stand, or on the nearest free floor (`settleSpot`), their view
+   * kept; the doors start shut and the malfunctions are cleared, since
+   * the fixtures' indices changed. A lift overlay opened during the dip
+   * closes: its stops belong to the room replaced, as with a `go`.
+   */
+  const swapIn = (built: ReturnType<typeof roomFor>) => {
+    const was = player;
+    if (was === null) return;
+    closeLift();
+    const spot = settleSpot(built.room, was.x, was.z);
+    if (
+      !enter(
+        built.place,
+        built.room,
+        built.address,
+        entryArrival,
+        false,
+        { x: spot.x, z: spot.z, yaw: was.yaw },
+        entryLanding,
+      )
+    )
+      return;
+    if (player !== null) {
+      player = { ...player, pitch: was.pitch };
+      previous = player;
+    }
+    lastReshape = now();
+    followMove(built.address);
+  };
+
+  /**
+   * After a re-check entered a room: a move followed (C18) is done, and
+   * the URL names the new address.
+   */
+  const followMove = (address: StationAddress) => {
+    if (target === null) return;
+    target = null;
+    showAddress(address);
+  };
+
+  /** See `Session.changed`. */
+  const changed = (event: ChangeEvent) => {
+    if (disposed) return;
+    const moved = inside === null ? movedTo(event, target ?? current) : null;
+    if (moved !== null) target = moved;
+    if (!concerns(event, watchOf(current, room, inside !== null))) return;
+    // A window, not a debounce: frames that come inside it join it.
+    checkTimer ??= setTimeout(() => {
+      checkTimer = null;
+      requestCheck();
+    }, COALESCE_MS);
+  };
+
   // Sizes the backbuffer to the canvas's CSS size times the pixel ratio and
   // says whether it changed, so a resize that changes nothing rebuilds no
   // render targets.
@@ -1535,6 +1877,23 @@ export function createSession(opts: SessionOptions): Session {
         opts.openFluid(fluidRouteOfStation(current));
       }
       if (matched) openLevels();
+    }
+    // The dip's swap at `DIP_SWAP_MS`, and the end of a flicker or a dip,
+    // on the station's clock (C17); a re-check held for it runs then.
+    if (dip !== null) {
+      const elapsed = stationTime() - dip.at;
+      const swap = dip.next;
+      if (swap !== null && elapsed >= DIP_SWAP_MS) {
+        dip.next = null;
+        swap();
+        // The rest of this tick read the room left: the new one starts on
+        // the next.
+        return;
+      }
+      if (elapsed >= (dip.kind === "dip" ? DIP_MS : FLICKER_MS)) {
+        dip = null;
+        retryCheck();
+      }
     }
     if (room === null || player === null) return;
 
@@ -1672,6 +2031,19 @@ export function createSession(opts: SessionOptions): Session {
     blink.tick();
   };
 
+  /**
+   * The light levels to draw: `levels` as they are, or scaled by the
+   * flicker's or the dip's factor into one array reused frame to frame.
+   */
+  const levelsNow = (levels: Float32Array): Float32Array => {
+    if (dip === null) return levels;
+    const factor = dipFactor(dip.kind, stationTime() - dip.at);
+    if (dipLevels.length !== levels.length)
+      dipLevels = new Float32Array(levels.length);
+    for (let i = 0; i < levels.length; i++) dipLevels[i] = levels[i]! * factor;
+    return dipLevels;
+  };
+
   const loop = createLoop(
     {
       tick,
@@ -1706,7 +2078,7 @@ export function createSession(opts: SessionOptions): Session {
             yaw: lerp(previous.yaw, player.yaw),
             pitch: lerp(previous.pitch, player.pitch),
           },
-          lights.levels,
+          levelsNow(lights.levels),
           (t - started) / 1000,
           doorOpen,
           faultNow,
@@ -1737,20 +2109,33 @@ export function createSession(opts: SessionOptions): Session {
   if (boot()) loop.start();
   showStatus();
 
+  // The host's closers run a re-check held for the overlay; `leave` calls
+  // the inner ones, before it drops the load, so it never starts one.
   return {
     go,
     showCanned,
     showRoom,
-    closeReader,
+    closeReader() {
+      closeReader();
+      retryCheck();
+    },
     jump(domain) {
       go(bridgeAddress(domain), null, domain);
     },
-    closeLevels,
+    closeLevels() {
+      closeLevels();
+      retryCheck();
+    },
     ride: rideLift,
-    closeLift,
+    closeLift() {
+      closeLift();
+      retryCheck();
+    },
     pause,
     resume() {
-      if (closePause()) input.requestLock();
+      if (!closePause()) return;
+      input.requestLock();
+      retryCheck();
     },
     setBusy(next) {
       if (disposed || busy === next) return;
@@ -1758,7 +2143,9 @@ export function createSession(opts: SessionOptions): Session {
       // A key the host's screen took is not replayed as a command.
       input.clear();
       cheat?.reset();
+      if (!next) retryCheck();
     },
+    changed,
     dispose() {
       if (disposed) return;
       // The host's overlays go down with the session, so a host that
@@ -1778,6 +2165,13 @@ export function createSession(opts: SessionOptions): Session {
       listingTimer = null;
       if (noticeTimer !== null) clearTimeout(noticeTimer);
       noticeTimer = null;
+      checkAbort?.abort();
+      checkAbort = null;
+      if (checkTimer !== null) clearTimeout(checkTimer);
+      checkTimer = null;
+      if (reshapeTimer !== null) clearTimeout(reshapeTimer);
+      reshapeTimer = null;
+      dip = null;
       loop.stop();
       observer?.disconnect();
       ratioQuery?.removeEventListener("change", onRatioChange);

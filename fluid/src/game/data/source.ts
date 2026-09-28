@@ -90,8 +90,12 @@ export const TARGET_TIMEOUT_MS = 3000;
  * refetched on every read, so the prefetch fired when the player walks up to
  * a door would buy nothing once it had landed: stepping through would ask the
  * server again. Thirty seconds covers the walk from a door to the next room
- * and back. A room is built once per entry and live changes are milestone 4,
- * so a room that is a little behind the server is expected until then.
+ * and back. Within it, invalidation decides freshness: the station route
+ * marks the keys a change frame names stale (M4 C13, `changeKeys`), so a
+ * payload the server has changed is read again on the next room entry or
+ * re-check however young its cached copy is. An engram frame marks every
+ * detail and graph of its domain stale, so the next entry of a room there
+ * refetches.
  */
 export const GAME_STALE_MS = 30_000;
 
