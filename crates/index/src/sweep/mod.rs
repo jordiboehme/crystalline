@@ -556,11 +556,12 @@ const SCOPE_SEPARATOR: &str = ", ";
 /// engram, as `V103` does over the three [`RECIPROCAL_PAIRS`]: those findings
 /// share the one answer, so acknowledging the second replaces the first and
 /// leaves the other marked stale wearing its note. An engram that twins two
-/// others carries two `V301` findings, and one whose lines two other engrams
-/// contradict carries two `V302` findings; neither is an answer about the
-/// engram, so those acknowledgments are stored per pair (a twin pair, or a
-/// pair of observation lines) and a pair with no entry of its own is a plain
-/// finding rather than a stale one - nobody has answered it yet.
+/// others carries two `V301` findings, and one whose lines read as
+/// contradicting two others' carries two `V302` findings; neither is an
+/// answer about the engram, so those acknowledgments are stored per pair (a
+/// twin pair, or a pair of observation lines) and a pair with no entry of its
+/// own is a plain finding rather than a stale one - nobody has answered it
+/// yet.
 ///
 /// Read by the sweep here and by the engine's `evolve_ack` write path, which
 /// keys its entries the same way. One predicate, so the two cannot drift.
@@ -1076,6 +1077,10 @@ pub struct SweepInput {
     /// counts below are unknown rather than zero. A truncation line of its
     /// own: an unknown count never reads as a clean domain.
     pub contradictions_uncounted: bool,
+    /// The configured model could not be loaded and the daemon waits for the
+    /// setting to be set again, so the lines above name that and point at
+    /// `status` and `doctor` rather than promise a pass that will not run.
+    pub contradiction_model_unavailable: bool,
     /// Related pairs the daemon has not scored yet; a non-zero count is a
     /// truncation line, so a quiet `V302` never reads as a clean domain.
     pub contradictions_pending: usize,
@@ -1120,6 +1125,7 @@ impl SweepInput {
             contradictions: Vec::new(),
             contradiction_model: String::new(),
             contradictions_uncounted: false,
+            contradiction_model_unavailable: false,
             contradictions_pending: 0,
             contradiction_candidates_capped: false,
             contradiction_unembedded: 0,
@@ -1216,8 +1222,9 @@ pub struct Counterpart {
     pub title: String,
     /// The one-based line of its observation.
     pub line: usize,
-    /// The aggregated contradiction probability.
-    pub probability: f32,
+    /// The aggregated contradiction probability, rounded to two decimals:
+    /// the same number the finding's text quotes.
+    pub probability: f64,
 }
 
 impl Finding {
@@ -1372,12 +1379,13 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
 /// deterministic order keep that order when every key ties.
 ///
 /// **That stability is load-bearing, not a convenience.** Two `V301` findings
-/// on one engram tie on every key here, and so do two `V302` findings - same anchor, so the same priority -
-/// and the engine's `evolve_ack` write path acknowledges "the first finding
-/// still standing" for a rule on an engram. A switch to `sort_unstable_by`
-/// would make which twin pair an acknowledgment lands on depend on the sort's
-/// internals, so keep the stable sort and let `find_twins`' deterministic
-/// emission order settle the ties.
+/// on one engram tie on every key here, and so do two `V302` findings - same
+/// anchor, so the same priority - and the engine's `evolve_ack` write path
+/// acknowledges "the first finding still standing" for a rule on an engram. A
+/// switch to `sort_unstable_by` would make which pair an acknowledgment lands
+/// on depend on the sort's internals, so keep the stable sort and let each
+/// detector's deterministic emission order (`find_twins`' for `V301`, highest
+/// score first for `V302`) settle the ties.
 pub fn rank(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.priority
@@ -1414,6 +1422,54 @@ pub fn detect(input: &SweepInput) -> SweepReport {
     report
 }
 
+/// The entry among `entries` that silences `finding`: one for its rule whose
+/// scope is absent or equals the finding's. The generous match wins over a
+/// stale one, so an engram carrying both a scope-less entry and an outdated
+/// scoped one is acknowledged. One predicate for [`apply_acknowledgments`]
+/// and for [`FindingCap`], so the cap and the suppression cannot disagree
+/// about which findings are silenced.
+fn matching_ack<'a>(entries: &'a [AckEntry], finding: &Finding) -> Option<&'a AckEntry> {
+    entries
+        .iter()
+        .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
+        .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope))
+}
+
+/// The per-domain cap of a pair rule (`V301`, `V302`), applied with the
+/// acknowledgments in view. A finding its anchor already acknowledges is
+/// emitted without taking a slot - [`apply_acknowledgments`] then counts and
+/// suppresses it - so once the highest pairs are acknowledged the next ones
+/// still surface. Capping before acknowledgments were known would hide every
+/// later pair behind ten silenced ones for ever.
+struct FindingCap {
+    /// Slots left for findings nobody has acknowledged.
+    left: usize,
+    /// An unacknowledged finding was dropped, which is a truncation line.
+    cut: bool,
+}
+
+impl FindingCap {
+    fn new(cap: usize) -> FindingCap {
+        FindingCap {
+            left: cap,
+            cut: false,
+        }
+    }
+
+    /// Emit `finding` about `anchor` unless the cap is spent and nothing on
+    /// `anchor` acknowledges it.
+    fn push(&mut self, report: &mut SweepReport, anchor: &EngramFacts, finding: Finding) {
+        if matching_ack(&anchor.acks, &finding).is_some() {
+            report.findings.push(finding);
+        } else if self.left > 0 {
+            self.left -= 1;
+            report.findings.push(finding);
+        } else {
+            self.cut = true;
+        }
+    }
+}
+
 /// Drop the findings an acknowledgment silences, count them, and mark the ones
 /// whose acknowledgment no longer matches.
 ///
@@ -1428,11 +1484,10 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///   different thing to read than a fresh finding. One entry is what a rule
 ///   acknowledged per engram always has, since the write path replaces it;
 /// - nothing matches and the rule is pair-scoped ([`is_pair_scoped`], which is
-///   `V301` and `V302`): **returned plain**. A twin or line-pair acknowledgment
-///   answers one pair, so a
-///   pair with no entry of its own is unanswered rather than stale, and lending
-///   it another pair's note would tell a reader they have seen evidence they
-///   have not;
+///   `V301` and `V302`): **returned plain**. A twin or line-pair
+///   acknowledgment answers one pair, so a pair with no entry of its own is
+///   unanswered rather than stale, and lending it another pair's note would
+///   tell a reader they have seen evidence they have not;
 /// - nothing matches and the engram carries several entries for the rule, which
 ///   only a hand-edited file can hold for a rule acknowledged per engram:
 ///   **returned plain**, since which of them went stale is unknowable;
@@ -1457,13 +1512,7 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
         let Some(entries) = acks.get(finding.permalink.as_str()) else {
             return true;
         };
-        // The generous match wins over a stale one: an engram carrying both a
-        // scope-less entry and an outdated scoped one is acknowledged.
-        let matching = entries
-            .iter()
-            .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
-            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
-        if let Some(ack) = matching {
+        if let Some(ack) = matching_ack(entries, finding) {
             counts.add(finding.family);
             finding.acknowledged = true;
             finding.ack_note = ack.note.clone();
@@ -2613,7 +2662,10 @@ fn detect_twins(
         ));
         return;
     }
-    let mut emitted = 0usize;
+    // Capped after the acknowledgments are known, as `V302` is: an
+    // acknowledged pair takes no slot, so ten acknowledged twins never hide
+    // the eleventh.
+    let mut cap = FindingCap::new(input.options.max_twin_findings);
     for pair in &found.pairs {
         // Two rows standing at one path are one engram's versions, not two
         // engrams: a draft and the row it is a draft of say close to the same
@@ -2629,18 +2681,13 @@ fn detect_twins(
         {
             continue;
         }
-        if emitted == input.options.max_twin_findings {
-            report.truncations.push(format!(
-                "V301 findings capped at {}",
-                input.options.max_twin_findings
-            ));
-            break;
-        }
         let Some(lead) = leader(live, &[pair.a, pair.b]) else {
             continue;
         };
         let other = if lead == pair.a { pair.b } else { pair.a };
-        report.findings.push(
+        cap.push(
+            report,
+            live[lead],
             Finding::about("V301", live[lead])
                 .with(
                     Class::Judgment,
@@ -2657,7 +2704,12 @@ fn detect_twins(
                 // nothing about the next.
                 .scoped(vec![live[pair.a].address(), live[pair.b].address()]),
         );
-        emitted += 1;
+    }
+    if cap.cut {
+        report.truncations.push(format!(
+            "V301 findings capped at {}",
+            input.options.max_twin_findings
+        ));
     }
 }
 

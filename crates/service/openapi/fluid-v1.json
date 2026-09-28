@@ -8893,7 +8893,7 @@
               "string",
               "null"
             ],
-            "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V301` and `V302` send one: they are the two rules that fire more\nthan once on an engram (an engram can be the semantic twin of several\nothers, and several of its lines can read as contradicting another's),\nso they are the ones where naming the rule does not name the finding.\nOn `POST`\nthe server checks the scope is really firing and refuses with a 422 if\nit is not, which is what a queue read too long ago looks like; on\n`DELETE` it takes back that pair's entry and leaves the engram's other\npairs silenced. Every other rule ignores it, and omitting it on `V301`\nor `V302` means the whole rule: the server's own pick on `POST`, every pair at\nonce on `DELETE`.",
+            "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V301` and `V302` send one: they are the two rules that fire more\nthan once on an engram (an engram can be the semantic twin of several\nothers, and several of its lines can read as contradicting another's),\nso they are the ones where naming the rule does not name the finding.\nOn `POST` the server checks the scope is really firing and refuses with\na 422 if it is not, which is what a queue read too long ago looks like;\non `DELETE` it takes back that pair's entry and leaves the engram's\nother pairs silenced. Every other rule ignores it, and omitting it on\n`V301` or `V302` means the whole rule: the server's own pick on `POST`,\nevery pair at once on `DELETE`.",
             "example": "notes/backoff-lesson, notes/retry-queue-gotcha"
           }
         }

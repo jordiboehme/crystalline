@@ -254,12 +254,13 @@ impl Engine {
                 }
                 // A V302 row names its counterpart flat, so a renderer links
                 // the other engram and shows the probability without parsing
-                // the evidence. Rounded to two decimals, as the text says it.
+                // the evidence. Already rounded to the two decimals the text
+                // quotes, so the two never disagree.
                 if let Some(c) = &f.counterpart {
                     row["counterpart"] = Value::String(c.permalink.clone());
                     row["counterpart_title"] = Value::String(c.title.clone());
                     row["counterpart_line"] = json!(c.line);
-                    row["probability"] = json!((f64::from(c.probability) * 100.0).round() / 100.0);
+                    row["probability"] = json!(c.probability);
                 }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
@@ -487,8 +488,8 @@ impl Engine {
     /// **The unacknowledged finding wins when the rule fires more than once
     /// here**, which only the pair-scoped rules do
     /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
-    /// carries two `V301` findings, one whose lines two others contradict
-    /// carries two `V302` findings, and neither one is "the" finding. Taking
+    /// carries two `V301` findings, one whose lines read as contradicting two
+    /// others' carries two `V302` findings, and neither one is "the" finding. Taking
     /// the first row every time made the second acknowledgment re-record the
     /// pair the first already covered, so the other pair could never be
     /// acknowledged at all. With every pair acknowledged the first row wins
@@ -1018,6 +1019,7 @@ impl Engine {
             contradictions: meaning.rows,
             contradiction_model: meaning.model.map(|m| m.id.to_string()).unwrap_or_default(),
             contradictions_uncounted: meaning.uncounted,
+            contradiction_model_unavailable: meaning.model_unavailable,
             contradictions_pending: meaning.pending,
             contradiction_candidates_capped: meaning.capped,
             contradiction_unembedded: meaning.unembedded,

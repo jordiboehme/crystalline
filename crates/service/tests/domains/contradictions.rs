@@ -1550,6 +1550,68 @@ fn offline_once(stub: Arc<StubScorer>) -> ScorerLoader {
 const NOT_COUNTED: &str =
     "notes - V302: related pairs not counted yet (the daemon counts them after embedding)";
 
+/// What the V302 lines say instead of promising a pass while the model's
+/// failed load blocks the daemon.
+const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)";
+
+/// While a failed load blocks the pass, an edit leaves the domain uncounted
+/// for good, so the line names the failure and where to read it rather than
+/// a pass that will not come.
+#[tokio::test]
+async fn a_blocked_model_never_promises_a_pass() {
+    let loader: ScorerLoader =
+        Arc::new(|_model: &'static NliModel| ready(Err(IndexError::Nli("offline".to_string()))));
+    let (_tmp, engine) = engine_with(loader).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    engine.edit_engram(&append_to_twenty()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        v302_truncations(&sweep(&engine).await),
+        vec![format!(
+            "notes - V302: related pairs not counted: {UNAVAILABLE}"
+        )]
+    );
+}
+
+/// A walk that skips a settled domain keeps the domain's record, so a sweep
+/// after two walks with nothing changed still reads as counted.
+#[tokio::test]
+async fn a_settled_domain_stays_counted_across_a_skipping_walk() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    let (parsed, walked) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_walks(),
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Scored {
+            pairs: 0,
+            line_pairs: 0,
+            remaining: 0
+        }
+    );
+    assert_eq!(engine.contradiction_walks(), walked + 1, "a walk ran");
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        parsed,
+        "and skipped the settled domain without parsing it"
+    );
+    let value = sweep(&engine).await;
+    assert!(v302_truncations(&value).is_empty(), "{value}");
+    assert_eq!(v302(&value).len(), 1, "{value}");
+}
+
 #[tokio::test]
 async fn evolve_raises_v302_from_stored_rows_and_never_scores_inline() {
     let s = stub();
@@ -1575,11 +1637,10 @@ async fn evolve_raises_v302_from_stored_rows_and_never_scores_inline() {
     assert!(v302(&before).is_empty());
     assert_eq!(
         v302_truncations(&before),
-        vec![
-            "notes - V302: 1 related pairs not scored yet (the daemon scores them after embedding)"
-                .to_string()
-        ],
-        "{before}"
+        vec![format!(
+            "notes - V302: 1 related pairs not scored: {UNAVAILABLE}"
+        )],
+        "a blocked model promises no pass: {before}"
     );
     assert_eq!(s.forwards(), 0, "a sweep never scores");
 

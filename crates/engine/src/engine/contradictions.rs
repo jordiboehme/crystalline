@@ -74,6 +74,10 @@ pub(crate) struct SweepContradictions {
     /// No walk has counted the domain as it stands now, so the counts below
     /// are unknown rather than zero.
     pub(crate) uncounted: bool,
+    /// The configured model's last load failed and nothing has lifted it,
+    /// so the daemon neither counts nor scores until the setting is set
+    /// again or it restarts: the truncation lines must not promise a pass.
+    pub(crate) model_unavailable: bool,
     /// Related pairs with no scored row at their current checksums.
     pub(crate) pending: usize,
     /// The related pairs reached the per-domain cap.
@@ -671,15 +675,13 @@ impl Engine {
             // It only decides whether a later embedding can add a pair
             // without moving a stamp, which is when the count joins the
             // settled record.
-            let waiting = facts.iter().any(|f| {
-                f.lead_vector.is_none() && eligible(&f.status) && !f.observations.is_empty()
-            });
             let unembedded = facts
                 .iter()
                 .filter(|f| {
                     f.lead_vector.is_none() && eligible(&f.status) && !f.observations.is_empty()
                 })
                 .count();
+            let waiting = unembedded > 0;
             let settle = SettledDomain {
                 digest,
                 coverage: waiting.then_some(coverage),
@@ -890,6 +892,8 @@ impl Engine {
             }
             None => out.uncounted = true,
         }
+        // Read, never lifted: `load_blocked` is the walk's to clear.
+        out.model_unavailable = state.load_failed == Some(model.repo);
         Ok(out)
     }
 

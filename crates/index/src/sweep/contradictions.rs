@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use super::{Class, Counterpart, EngramFacts, Finding, SweepInput, SweepReport, leader};
+use super::{
+    Class, Counterpart, EngramFacts, Finding, FindingCap, SweepInput, SweepReport, leader,
+};
 use crate::nli::candidates::{eligible, max_related_pairs, observation_hash, windows_overlap};
 use crate::store::ContradictionRow;
 
@@ -13,6 +15,10 @@ const FIX: &str = "read both then supersede or close a window or acknowledge V30
 
 /// What a row's fix says first when either line names a period.
 const PERIOD: &str = "One of these lines names a period; if both held at different times, close the older engram's validity window.";
+
+/// Why nothing is counted or scored while the model cannot be loaded, and
+/// where to read more.
+const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)";
 
 /// One stored row that still stands.
 struct Live<'a> {
@@ -83,13 +89,10 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
                 .cmp(&(y.row.a.0, y.row.b.0, y.line_a, y.line_b))
         })
     });
-    let cap = input.options.max_contradiction_findings;
-    if live.len() > cap {
-        report
-            .truncations
-            .push(format!("V302 findings capped at {cap}"));
-        live.truncate(cap);
-    }
+    // Capped after the acknowledgments are known, never before: a pair the
+    // anchor already acknowledged takes no slot, so ten acknowledged pairs
+    // never hide the eleventh.
+    let mut cap = FindingCap::new(input.options.max_contradiction_findings);
     for l in live {
         // The engram V301 would pick for the pair, so the two rules agree on
         // where a pair lives.
@@ -107,24 +110,28 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
         } else {
             ((l.b, &l.row.hash_b), (l.a, &l.row.hash_a))
         };
+        // Rounded once, so the text and the probability column say the
+        // same number.
+        let probability = (f64::from(l.score) * 100.0).round() / 100.0;
         let fix = if l.row.period {
             format!("{PERIOD} {FIX}")
         } else {
             FIX.to_string()
         };
-        report.findings.push(
+        cap.push(
+            report,
+            anchor,
             Finding::about("V302", anchor)
                 .with(
                     Class::Judgment,
                     format!(
-                        "\"{anchor_text}\" ({}) against \"{other_text}\" ({}) read as a contradiction at probability {:.2}",
-                        anchor.title, other.title, l.score
+                        "\"{anchor_text}\" ({}) against \"{other_text}\" ({}) read as a contradiction at probability {probability:.2}",
+                        anchor.title, other.title
                     ),
                     format!(
-                        "{} line {anchor_line}; {} line {other_line}; probability {:.2}; model {}",
+                        "{} line {anchor_line}; {} line {other_line}; probability {probability:.2}; model {}",
                         anchor.address(),
                         other.address(),
-                        l.score,
                         input.contradiction_model
                     ),
                     fix,
@@ -140,9 +147,15 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
                     permalink: other.permalink.clone(),
                     title: other.title.clone(),
                     line: other_line,
-                    probability: l.score,
+                    probability,
                 }),
         );
+    }
+    if cap.cut {
+        report.truncations.push(format!(
+            "V302 findings capped at {}",
+            input.options.max_contradiction_findings
+        ));
     }
 }
 
@@ -157,17 +170,29 @@ fn notes(input: &SweepInput, report: &mut SweepReport) {
             input.options.max_twin_vectors
         ));
     }
+    // With the model unavailable the daemon runs no pass until the setting
+    // is set again, so neither line may promise one.
+    let unavailable = input.contradiction_model_unavailable;
     if input.contradictions_uncounted {
-        report.truncations.push(
+        report.truncations.push(if unavailable {
+            format!("V302: related pairs not counted: {UNAVAILABLE}")
+        } else {
             "V302: related pairs not counted yet (the daemon counts them after embedding)"
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     if input.contradictions_pending > 0 {
-        report.truncations.push(format!(
-            "V302: {} related pairs not scored yet (the daemon scores them after embedding)",
-            input.contradictions_pending
-        ));
+        report.truncations.push(if unavailable {
+            format!(
+                "V302: {} related pairs not scored: {UNAVAILABLE}",
+                input.contradictions_pending
+            )
+        } else {
+            format!(
+                "V302: {} related pairs not scored yet (the daemon scores them after embedding)",
+                input.contradictions_pending
+            )
+        });
     }
     if input.contradiction_unembedded > 0 {
         report.truncations.push(format!(

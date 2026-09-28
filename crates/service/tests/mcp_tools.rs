@@ -732,11 +732,11 @@ async fn tool_descriptions_teach_salience() {
 
 /// How often an acknowledgment stacks is a rule-by-rule fact, and `edit_engram`
 /// is where an agent learns it. The stacking clause has to name `V301` and
-/// `V302`: they are the only rules whose entries are kept per pair. Stated generally it is false
-/// of `V103`, which fires once per reciprocal pair and so can raise several
-/// findings on one engram whose acknowledgments replace one another - an agent
-/// reading the general form would expect a second note to sit beside the first
-/// and find it had overwritten it.
+/// `V302`: they are the only rules whose entries are kept per pair. Stated
+/// generally it is false of `V103`, which fires once per reciprocal pair and so
+/// can raise several findings on one engram whose acknowledgments replace one
+/// another - an agent reading the general form would expect a second note to
+/// sit beside the first and find it had overwritten it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
     let h = Harness::new(&["eng"]).await;

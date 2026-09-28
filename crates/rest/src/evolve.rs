@@ -348,13 +348,12 @@ pub struct AckBody {
     /// than once on an engram (an engram can be the semantic twin of several
     /// others, and several of its lines can read as contradicting another's),
     /// so they are the ones where naming the rule does not name the finding.
-    /// On `POST`
-    /// the server checks the scope is really firing and refuses with a 422 if
-    /// it is not, which is what a queue read too long ago looks like; on
-    /// `DELETE` it takes back that pair's entry and leaves the engram's other
-    /// pairs silenced. Every other rule ignores it, and omitting it on `V301`
-    /// or `V302` means the whole rule: the server's own pick on `POST`, every pair at
-    /// once on `DELETE`.
+    /// On `POST` the server checks the scope is really firing and refuses with
+    /// a 422 if it is not, which is what a queue read too long ago looks like;
+    /// on `DELETE` it takes back that pair's entry and leaves the engram's
+    /// other pairs silenced. Every other rule ignores it, and omitting it on
+    /// `V301` or `V302` means the whole rule: the server's own pick on `POST`,
+    /// every pair at once on `DELETE`.
     #[serde(default)]
     #[schema(example = "notes/backoff-lesson, notes/retry-queue-gotcha")]
     scope: Option<String>,

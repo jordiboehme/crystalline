@@ -3232,3 +3232,150 @@ fn a_draft_is_never_read_as_the_engram_its_row_names() {
     ));
     assert!(!fired(&r).contains(&"V302"));
 }
+
+// ---------------------------------------------------------------------------
+// The pair caps count only what nobody acknowledged
+// ---------------------------------------------------------------------------
+
+/// Acknowledge every `rule` finding `report` shows, on its anchor in `facts`,
+/// for the scope it fired on.
+fn acknowledge_shown(facts: &mut [EngramFacts], report: &SweepReport, rule: &str) -> usize {
+    let mut n = 0;
+    for f in report.findings.iter().filter(|f| f.rule == rule) {
+        let anchor = facts
+            .iter_mut()
+            .find(|e| e.permalink == f.permalink)
+            .expect("the anchor is in scope");
+        anchor.acks.push(AckEntry {
+            rule: rule.to_string(),
+            scope: Some(f.scope.clone()),
+            note: Some("read".to_string()),
+        });
+        n += 1;
+    }
+    n
+}
+
+/// Eleven twin pairs, the ten closest acknowledged: the eleventh surfaces, the
+/// ten are counted, and nothing reads as capped. Capping before the
+/// acknowledgments were known would hide it for ever.
+#[test]
+fn v301_an_acknowledged_pair_takes_no_slot_so_the_eleventh_surfaces() {
+    let dims = 11;
+    let mut facts = Vec::new();
+    for k in 0..11usize {
+        let mut base = vec![0.0f32; dims];
+        base[k] = 1.0;
+        let mut near = base.clone();
+        near[(k + 1) % dims] = 0.01 * (k as f32 + 1.0);
+        let mut a = fact(2 * k as i64 + 1, &format!("p{k:02}-a"));
+        a.lead_vector = Some(unit(&base));
+        let mut b = fact(2 * k as i64 + 2, &format!("p{k:02}-b"));
+        b.lead_vector = Some(unit(&near));
+        facts.push(a);
+        facts.push(b);
+    }
+    let first = detect(&input(facts.clone()));
+    assert!(
+        first
+            .truncations
+            .contains(&"V301 findings capped at 10".to_string())
+    );
+    assert_eq!(acknowledge_shown(&mut facts, &first, "V301"), 10);
+    assert!(
+        !first.findings.iter().any(|f| f.permalink == "p10-a"),
+        "the loosest pair was the one cut"
+    );
+
+    let next = detect(&input(facts));
+    let left: Vec<&Finding> = next.findings.iter().filter(|f| f.rule == "V301").collect();
+    assert_eq!(left.len(), 1, "{:?}", fired(&next));
+    assert_eq!(left[0].permalink, "p10-a");
+    assert_eq!(next.acknowledged.meaning, 10);
+    assert!(
+        !next.truncations.iter().any(|t| t.starts_with("V301")),
+        "{:?}",
+        next.truncations
+    );
+}
+
+/// The same for `V302`: eleven stored rows, the ten highest acknowledged, and
+/// the eleventh surfaces - "a new disagreement still surfaces" holds past the
+/// cap.
+#[test]
+fn v302_an_acknowledged_pair_takes_no_slot_so_the_eleventh_surfaces() {
+    let mut facts = Vec::new();
+    let mut rows = Vec::new();
+    for k in 0..11i64 {
+        facts.push(observed(2 * k + 1, &format!("p{k:02}-a"), &[(3, "x")]));
+        facts.push(observed(2 * k + 2, &format!("p{k:02}-b"), &[(3, "y")]));
+        let p = 0.99 - 0.01 * k as f32;
+        rows.push(stored(2 * k + 1, 2 * k + 2, 3, "x", 3, "y", p, p));
+    }
+    let first = detect(&meaning_input(facts.clone(), rows.clone()));
+    assert!(
+        first
+            .truncations
+            .contains(&"V302 findings capped at 10".to_string())
+    );
+    assert_eq!(acknowledge_shown(&mut facts, &first, "V302"), 10);
+
+    let next = detect(&meaning_input(facts, rows));
+    let left: Vec<&Finding> = next.findings.iter().filter(|f| f.rule == "V302").collect();
+    assert_eq!(left.len(), 1, "{:?}", fired(&next));
+    assert_eq!(left[0].permalink, "p10-a");
+    assert_eq!(next.acknowledged.meaning, 10);
+    assert!(
+        !next.truncations.iter().any(|t| t.starts_with("V302")),
+        "{:?}",
+        next.truncations
+    );
+}
+
+/// The text and the probability column come from one rounded value.
+#[test]
+fn v302_rounds_the_probability_once() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let f = only(
+        &detect(&meaning_input(
+            vec![a, b],
+            vec![stored(1, 2, 5, "x", 5, "y", 0.905, 0.905)],
+        )),
+        "V302",
+    );
+    let p = f
+        .counterpart
+        .as_ref()
+        .expect("the other engram")
+        .probability;
+    assert!(
+        f.finding.ends_with(&format!("probability {p:.2}")),
+        "{} against {p}",
+        f.finding
+    );
+    assert_eq!(p, (p * 100.0).round() / 100.0, "already two decimals");
+}
+
+/// With the model unavailable the daemon runs no pass, so neither the
+/// pending line nor the not-counted line may promise one.
+#[test]
+fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
+    let mut sweep = meaning_input(vec![observed(1, "one", &[(5, "x")])], Vec::new());
+    sweep.contradiction_model_unavailable = true;
+    sweep.contradictions_pending = 2;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: 2 related pairs not scored: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)"
+        ]
+    );
+    sweep.contradictions_pending = 0;
+    sweep.contradictions_uncounted = true;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)"
+        ]
+    );
+}
