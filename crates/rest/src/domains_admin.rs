@@ -2819,7 +2819,8 @@ pub struct RenameBody {
 /// The response is the engine's own report, unchanged: `{ domain, previous,
 /// local_only, manifest_written, manifest_draft, rewritten, left_behind,
 /// aliases, shadows, moved }`, plus a `note` when the new name was another
-/// domain's canonical name or alias.
+/// domain's canonical name or alias, or when the MANIFEST's frontmatter
+/// could not take the new `domain_name` and was left as it was.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/rename",
