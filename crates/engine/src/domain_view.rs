@@ -138,10 +138,12 @@ pub struct DomainView<'a> {
 pub(crate) enum Occupant {
     /// Nothing, or a path this writer's own tombstone deletes.
     Free,
-    /// An engram answering to this permalink.
-    Engram(String),
-    /// A file or row that does not parse as an engram.
-    Unreadable,
+    /// An engram answering to `permalink`, in the file or row at `at`: the
+    /// name as it stands on disk, which a case-folding filesystem can spell
+    /// differently from the path that was asked for.
+    Engram { permalink: String, at: String },
+    /// A file or row at `at` that does not parse as an engram.
+    Unreadable { at: String },
 }
 
 impl<'a> DomainView<'a> {
@@ -597,20 +599,27 @@ impl<'a> DomainView<'a> {
             };
             match held {
                 Some(entry) if entry.tombstone => return Ok(Occupant::Free),
-                Some(entry) => return Ok(Occupant::Engram(entry.permalink)),
+                Some(entry) => {
+                    return Ok(Occupant::Engram {
+                        permalink: entry.permalink,
+                        at: path.to_string(),
+                    });
+                }
                 None => {}
             }
         }
-        let text = match source {
+        let (text, at) = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, path);
                 match std::fs::read_to_string(&abs) {
-                    Ok(text) => text,
+                    Ok(text) => (text, on_disk_name(root, path)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(Occupant::Free);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        return Ok(Occupant::Unreadable);
+                        return Ok(Occupant::Unreadable {
+                            at: on_disk_name(root, path),
+                        });
                     }
                     Err(source) => {
                         return Err(EngineError::Io {
@@ -624,16 +633,17 @@ impl<'a> DomainView<'a> {
                 let store = self.engine.store();
                 let store = store.lock().await;
                 match store.engram_content(domain_id, path).await? {
-                    Some(text) => text,
+                    Some(text) => (text, path.to_string()),
                     None => return Ok(Occupant::Free),
                 }
             }
         };
         Ok(match parse_engram(&text) {
-            Ok(engram) => Occupant::Engram(
-                EngramRecord::from_engram(&engram, path, virtual_stamp(&text)).permalink,
-            ),
-            Err(_) => Occupant::Unreadable,
+            Ok(engram) => Occupant::Engram {
+                permalink: EngramRecord::from_engram(&engram, path, virtual_stamp(&text)).permalink,
+                at,
+            },
+            Err(_) => Occupant::Unreadable { at },
         })
     }
 
@@ -2378,4 +2388,37 @@ impl<'a> DomainView<'a> {
         }
         Ok(())
     }
+}
+
+/// `path` as the files that answer to it are named on disk: each segment
+/// looked up in its folder's listing, an exact match first, else the one
+/// entry whose name folds onto it ([`crystalline_core::fold_path_case`]).
+/// `path` itself when a segment has no match or more than one fold match.
+fn on_disk_name(root: &Path, path: &str) -> String {
+    let mut dir = root.to_path_buf();
+    let mut named: Vec<String> = Vec::new();
+    for segment in path.split('/') {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return path.to_string();
+        };
+        let names: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let found = if names.iter().any(|name| name == segment) {
+            segment.to_string()
+        } else {
+            let folded = crystalline_core::fold_path_case(segment);
+            let mut matches = names
+                .iter()
+                .filter(|name| crystalline_core::fold_path_case(name) == folded);
+            match (matches.next(), matches.next()) {
+                (Some(one), None) => one.clone(),
+                _ => return path.to_string(),
+            }
+        };
+        dir.push(&found);
+        named.push(found);
+    }
+    named.join("/")
 }

@@ -243,22 +243,28 @@ impl Engine {
         }
         match view.occupant_at(domain_id, source, &path).await? {
             Occupant::Free => {}
-            Occupant::Engram(held) if held == permalink => {
+            Occupant::Engram {
+                permalink: held,
+                at,
+            } if held == permalink => {
                 if !overwrite {
                     return Err(EngineError::Conflict(collision_message(
-                        permalink, domain, &path,
+                        permalink, domain, &at,
                     )));
                 }
             }
-            Occupant::Engram(other) => {
+            Occupant::Engram {
+                permalink: other,
+                at,
+            } => {
                 return Err(EngineError::Conflict(format!(
-                    "'{path}' in domain '{domain}' already holds the engram '{other}'. Pick another title or folder, or change '{other}' with edit_engram"
+                    "'{at}' in domain '{domain}' already holds the engram '{other}'. Pick another title or folder, or change '{other}' with edit_engram"
                 )));
             }
-            Occupant::Unreadable if overwrite => {}
-            Occupant::Unreadable => {
+            Occupant::Unreadable { .. } if overwrite => {}
+            Occupant::Unreadable { at } => {
                 return Err(EngineError::Conflict(format!(
-                    "'{path}' in domain '{domain}' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
+                    "'{at}' in domain '{domain}' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
                 )));
             }
         }
@@ -795,7 +801,13 @@ impl Engine {
         let overlay = view.actor();
         let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
         let source = self.content_source(&p.domain).ok()?;
-        let (domain_id, _) = self.domain_source(&p.domain).await.ok()?;
+        // The read-only id lookup, never an upserting one: a preview writes
+        // nothing, and a domain with no row has no document anybody can have
+        // open (the pattern `granted_read` uses).
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(&p.domain).await.ok()??
+        };
         // A replacement preview, so the landing an overwrite would take. A
         // landing that cannot be worked out answers `None` here: the write
         // raises the real refusal a moment later, after its own join screen.
@@ -2186,5 +2198,163 @@ mod landing_race_tests {
             "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'archive/code-review-standards.md' in folder 'archive', not in folder 'conventions'. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram"
         );
         assert!(!root.join(slug).exists(), "nothing written");
+    }
+}
+
+#[cfg(test)]
+mod on_disk_name_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+
+    const MANIFEST: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions\n";
+
+    fn engram(title: &str, permalink: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule.\n"
+        )
+    }
+
+    /// Whether `dir`'s filesystem folds letter case (the macOS and Windows
+    /// default), the way `rename.rs`'s case tests ask it.
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("Probe");
+        std::fs::create_dir(&probe).unwrap();
+        let folds = dir.join("probe").exists();
+        std::fs::remove_dir(&probe).unwrap();
+        folds
+    }
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let abs = root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, text).unwrap();
+    }
+
+    /// A file domain `kb` over `root` holding `files`, synced; `late` lands
+    /// after the sync, so the index does not know it.
+    async fn engine_over(
+        root: &Path,
+        files: &[(&str, &str)],
+        late: &[(&str, &str)],
+    ) -> Arc<Engine> {
+        put(root, "MANIFEST.md", MANIFEST);
+        for (rel, text) in files {
+            put(root, rel, text);
+        }
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("kb".to_string(), DomainEntry::file(root.to_path_buf()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+        for (rel, text) in late {
+            put(root, rel, text);
+        }
+        engine
+    }
+
+    fn create(title: &str, folder: &str) -> WriteParams {
+        WriteParams {
+            domain: "kb".to_string(),
+            title: title.to_string(),
+            content: "Mine.".to_string(),
+            folder: Some(folder.to_string()),
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn m2_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        let held = engram("Custom Gamma", "custom-gamma");
+        let engine = engine_over(&root, &[("Notes/Gamma.md", &held)], &[]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        // Review Focus 3: the folder is named as it is on disk too.
+        assert_eq!(
+            err,
+            "'Notes/Gamma.md' in domain 'kb' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram"
+        );
+        assert!(!err.contains("already exists in domain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn m3_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        let engine = engine_over(&root, &[], &[]).await;
+        // Not valid UTF-8, so the read itself fails: a file with no
+        // frontmatter would still parse as an engram.
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/Gamma.md"), [0xff, 0xfe, 0x00]).unwrap();
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "'notes/Gamma.md' in domain 'kb' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
+        );
+        assert!(!err.contains("already exists in domain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_collision_message_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        // Landed after the sync, so only the file answers for the permalink.
+        let late = engram("Gamma", "notes/gamma");
+        let engine = engine_over(&root, &[], &[("notes/Gamma.md", &late)]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "permalink 'notes/gamma' already exists in domain 'kb' (at notes/Gamma.md); pass overwrite=true to replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_name_is_named_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kb");
+        let held = engram("Custom Gamma", "custom-gamma");
+        let engine = engine_over(&root, &[("notes/gamma.md", &held)], &[]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "'notes/gamma.md' in domain 'kb' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram"
+        );
     }
 }

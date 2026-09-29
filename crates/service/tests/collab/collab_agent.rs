@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
-use crystalline_index::TursoStore;
+use crystalline_index::{Store, TursoStore};
 use crystalline_service::Engine;
 use crystalline_service::collab::session::{
     AgentPeer, CollabSessions, Frame, Joined, MAX_PARTICIPANTS,
@@ -34,6 +34,70 @@ use yrs::sync::{Awareness, AwarenessUpdate, Message, MessageReader, SyncMessage}
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres virtual-domain leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A recycled pid must never adopt a schema a panicking run left behind.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ctv_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
+}
+
+/// Run a body against Turso (always) and Postgres (when configured), each with a
+/// fresh, isolated store handed to the engine as a trait object.
+macro_rules! both_backends {
+    ($name:ident, $body:path) => {
+        #[tokio::test]
+        async fn $name() {
+            {
+                let store = TursoStore::open_in_memory().await.unwrap();
+                let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+                $body(store).await;
+            }
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(url) = pg_url() {
+                    let schema = unique_schema();
+                    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .expect("open the postgres test schema");
+                    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
+                    $body(store).await;
+                    // Drop the schema through a fresh connection (the boxed store
+                    // no longer exposes the inherent drop_schema).
+                    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .unwrap();
+                    cleanup.drop_schema().await.unwrap();
+                }
+            }
+        }
+    };
+}
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
@@ -2247,3 +2311,56 @@ async fn a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache() {
     );
     drop(scratch);
 }
+
+/// Item 4: the preview reads the domain's id and never registers it. A domain
+/// the index has never seen has no document anybody can have open, so the
+/// answer is `None`, and asking left no row behind.
+async fn a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cold = tmp.path().join("cold");
+    std::fs::create_dir_all(&cold).unwrap();
+    std::fs::write(
+        cold.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: cold\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# cold\n\n## Scope\n\n- Everything about cold\n\n## When to Use\n\n- Route here for cold questions\n",
+    )
+    .unwrap();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("cold".to_string(), DomainEntry::file(cold));
+    // No sync: the domain is registered and the index has never seen it.
+    let engine = Arc::new(
+        Engine::new(store.clone(), cfg, None, None).with_state_dir(tmp.path().join("state")),
+    );
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let capture = WriteParams {
+        domain: "cold".to_string(),
+        title: "Gamma".to_string(),
+        content: "x".to_string(),
+        folder: None,
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite: true,
+        share_link: None,
+        model: None,
+    };
+    let target = engine
+        .live_write_target(
+            &capture,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await;
+    assert!(target.is_none(), "no row, so no open document");
+    let row = { store.lock().await.domain_id("cold").await.unwrap() };
+    assert_eq!(row, None, "a preview registers nothing");
+}
+both_backends!(
+    a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing,
+    a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing_body
+);
