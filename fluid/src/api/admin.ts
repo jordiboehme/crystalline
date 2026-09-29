@@ -733,9 +733,12 @@ export interface SyncStatus {
   /** Every layer exists, but they are not grouped on the forge yet. */
   stackLinkPending: boolean;
   /**
-   * Merged share branches kept on the forge because an open pull request is
-   * still based on them, each with the sentence to show and the forge's
-   * reason. Empty when nothing is kept, or from an older server.
+   * Share branches kept on the forge instead of deleted: a merged, declined
+   * or withdrawn share's branch that an open pull request is based on or
+   * comes from, one whose pull request cannot move because its target is
+   * gone, one GitHub refused to delete, or one a waiting move still needs.
+   * Each carries the sentence to show, the forge's reason and what kept it.
+   * Empty when nothing is kept, or from an older server.
    */
   keptBranches: KeptBranch[];
   /**

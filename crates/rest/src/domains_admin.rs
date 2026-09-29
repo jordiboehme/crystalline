@@ -3103,6 +3103,9 @@ mod tests {
             example["reason"],
             entry.kept.as_ref().unwrap().reason.as_str()
         );
+        assert_eq!(example["branch"], entry.branch.as_str());
+        assert_eq!(example["number"], entry.number);
+        assert_eq!(example["onto"], entry.onto.as_str());
         assert_eq!(example["why"], "merged");
         assert_eq!(example["kind"], "base");
         assert_eq!(example["blocked_by"], 12);
