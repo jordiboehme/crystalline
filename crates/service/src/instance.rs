@@ -493,32 +493,108 @@ pub enum AttachPolicy {
 /// displaces; everything else, including versions that fail to parse,
 /// attaches, so an odd lock record can never trigger a shutdown.
 pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
-    match (version_triple(daemon_version), version_triple(own_version)) {
+    match (
+        Precedence::parse(daemon_version),
+        Precedence::parse(own_version),
+    ) {
         (Some(daemon), Some(own)) if daemon < own => AttachPolicy::Displace,
         _ => AttachPolicy::Attach,
     }
 }
 
 /// Whether `candidate` is a strictly newer release than `baseline`. Same
-/// triple parsing as [`attach_policy`]; an unparseable version on either side
+/// precedence as [`attach_policy`]; an unparseable version on either side
 /// is never newer, so an odd record can only ever read as a conflict, never as
 /// an upgrade skew.
 pub(crate) fn strictly_newer(candidate: &str, baseline: &str) -> bool {
-    match (version_triple(candidate), version_triple(baseline)) {
+    match (Precedence::parse(candidate), Precedence::parse(baseline)) {
         (Some(candidate), Some(baseline)) => candidate > baseline,
         _ => false,
     }
 }
 
-/// Parse a version string's numeric `major.minor.patch` triple, ignoring any
-/// pre-release or build suffix.
-fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version.split(['-', '+']).next().unwrap_or(version);
-    let mut parts = core.split('.');
-    let major = parts.next()?.trim().parse().ok()?;
-    let minor = parts.next()?.trim().parse().ok()?;
-    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((major, minor, patch))
+/// A version's place in semantic-versioning precedence: the numeric
+/// `major.minor.patch` triple first, then the pre-release identifiers, with
+/// build metadata ignored.
+///
+/// The pre-release part matters for the dev channel: two dev builds share a
+/// triple (`0.21.0-dev.4817` and `0.21.0-dev.4820`), and comparing the triple
+/// alone would read them as equal, so the newer one would attach to the older
+/// daemon instead of taking over after an upgrade. A release outranks every
+/// pre-release of its own triple, as semantic versioning orders them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Precedence {
+    triple: (u64, u64, u64),
+    /// Empty for a release. Compared identifier by identifier.
+    pre: Vec<PreIdent>,
+}
+
+/// One dot-separated pre-release identifier. A numeric one sorts below an
+/// alphanumeric one, numerics compare as numbers and the rest in ASCII order;
+/// the derived order gets all three from the variant order and the payloads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreIdent {
+    Numeric(u64),
+    Alpha(String),
+}
+
+impl Precedence {
+    /// Parse a version string. Tolerates a two-part `major.minor`; `None`
+    /// when the triple does not parse or a pre-release identifier is empty.
+    fn parse(version: &str) -> Option<Self> {
+        let version = version.trim();
+        let without_build = version.split('+').next().unwrap_or(version);
+        let (core, pre) = match without_build.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (without_build, None),
+        };
+        let mut parts = core.split('.');
+        let major = parts.next()?.trim().parse().ok()?;
+        let minor = parts.next()?.trim().parse().ok()?;
+        let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
+        let pre = match pre {
+            None => Vec::new(),
+            Some(pre) => pre
+                .split('.')
+                .map(|ident| {
+                    if ident.is_empty() {
+                        None
+                    } else if ident.bytes().all(|b| b.is_ascii_digit()) {
+                        ident.parse().ok().map(PreIdent::Numeric)
+                    } else {
+                        Some(PreIdent::Alpha(ident.to_string()))
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+        Some(Self {
+            triple: (major, minor, patch),
+            pre,
+        })
+    }
+}
+
+impl Ord for Precedence {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.triple.cmp(&other.triple).then_with(|| {
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                // Slice order goes identifier by identifier, and a shorter
+                // list that is a prefix of the longer one sorts first, which
+                // is the semantic-versioning rule for pre-release fields.
+                (false, false) => self.pre.cmp(&other.pre),
+            }
+        })
+    }
+}
+
+impl PartialOrd for Precedence {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// How long each stage of a displacement waits for the old daemon to leave.
@@ -2236,13 +2312,71 @@ mod tests {
         );
     }
 
+    fn triple(version: &str) -> Option<(u64, u64, u64)> {
+        Precedence::parse(version).map(|p| p.triple)
+    }
+
     #[test]
     fn version_triples_ignore_suffixes_and_tolerate_two_parts() {
-        assert_eq!(version_triple("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(version_triple("1.2.3-rc.1"), Some((1, 2, 3)));
-        assert_eq!(version_triple("1.2.3+build7"), Some((1, 2, 3)));
-        assert_eq!(version_triple("1.2"), Some((1, 2, 0)));
-        assert_eq!(version_triple("nope"), None);
+        assert_eq!(triple("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(triple("1.2.3-rc.1"), Some((1, 2, 3)));
+        assert_eq!(triple("1.2.3+build7"), Some((1, 2, 3)));
+        assert_eq!(triple("1.2"), Some((1, 2, 0)));
+        assert_eq!(triple("nope"), None);
+    }
+
+    #[test]
+    fn a_newer_dev_build_displaces_an_older_one_of_the_same_triple() {
+        assert_eq!(
+            attach_policy("0.21.0-dev.4817", "0.21.0-dev.4820"),
+            AttachPolicy::Displace,
+            "a brew upgrade of the dev channel must take the daemon over"
+        );
+        assert_eq!(
+            attach_policy("0.21.0-dev.9", "0.21.0-dev.10"),
+            AttachPolicy::Displace,
+            "numeric identifiers compare as numbers, not as text"
+        );
+        assert_eq!(
+            attach_policy("0.21.0-dev.4820", "0.21.0-dev.4817"),
+            AttachPolicy::Attach,
+            "an older dev client attaches to a newer dev daemon"
+        );
+        assert_eq!(
+            attach_policy("0.21.0-dev.4820", "0.21.0-dev.4820"),
+            AttachPolicy::Attach
+        );
+    }
+
+    #[test]
+    fn pre_release_precedence_follows_semantic_versioning() {
+        assert_eq!(
+            attach_policy("0.20.0", "0.21.0-dev.1"),
+            AttachPolicy::Displace,
+            "a dev build of the next minor displaces the last release"
+        );
+        assert_eq!(
+            attach_policy("0.21.0-dev.4817", "0.21.0"),
+            AttachPolicy::Displace,
+            "a release outranks every pre-release of its own triple"
+        );
+        assert_eq!(
+            attach_policy("0.21.0", "0.21.0-dev.4817"),
+            AttachPolicy::Attach
+        );
+        assert!(strictly_newer("1.0.0-alpha.1", "1.0.0-alpha"));
+        assert!(strictly_newer("1.0.0-alpha.beta", "1.0.0-alpha.1"));
+        assert!(strictly_newer("1.0.0-beta", "1.0.0-alpha.beta"));
+        assert!(strictly_newer("1.0.0-beta.11", "1.0.0-beta.2"));
+        assert!(strictly_newer("1.0.0-rc.1", "1.0.0-beta.11"));
+        assert!(
+            !strictly_newer("1.0.0+build.2", "1.0.0+build.1"),
+            "build metadata carries no precedence"
+        );
+        assert!(
+            !strictly_newer("0.21.0-dev..1", "0.20.0"),
+            "an empty pre-release identifier is unparseable, never newer"
+        );
     }
 
     /// The displacement mechanics against a scripted daemon: a mini ctl

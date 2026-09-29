@@ -1,0 +1,328 @@
+name: Dev channel
+
+# The Homebrew dev channel: every commit on main that CI passed becomes a
+# GitHub pre-release and the formula `crystalline-dev` in
+# jordiboehme/homebrew-tap, installed with
+# `brew install jordiboehme/tap/crystalline-dev`.
+#
+# The stable channel is untouched by this: a `v*` tag runs release.yml, which
+# publishes the latest release and Formula/crystalline.rb exactly as before.
+# Dev tags are `dev-<version>`, which the `v*` trigger never matches, dev
+# releases are never marked latest, and this workflow never writes the stable
+# formula. The two formulae conflict because both install the same
+# `crystalline` binary.
+#
+# The version is <X>.<Y+1>.0-dev.<N> (scripts/dev-version.sh): the next minor
+# after the workspace version, and the commit count of the built commit.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Builds and publishes main's current commit. Refused on any other branch,
+  # where the commit count would not be main's.
+  workflow_dispatch: {}
+
+# A newer merge supersedes an older build still in flight: only the newest
+# commit is worth installing.
+#
+# The group is decided when a run starts, before any job `if` runs, and
+# workflow_run fires for every CI conclusion. So a run that will not ship (a
+# red or cancelled CI run, a pull request, a dispatch off main, or a CI run
+# for a commit that is no longer main's tip) gets a group of its own; in the
+# shared group it would cancel a newer build and then skip itself, and
+# nothing would ship. The condition is the `version` job's guard.
+#
+# The tip check matters because CI runs on main can finish out of order
+# (ci.yml has no concurrency group and a docs-only fast path) and an old CI
+# run can be re-run. For workflow_run, github.sha is main's tip when this run
+# started, so `head_sha == github.sha` means CI tested the tip. It also keeps
+# `uses: ./.github/workflows/build.yml`, which resolves at github.sha, on the
+# same commit as the source the build checks out.
+concurrency:
+  group: >-
+    ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+    (github.event_name == 'workflow_run' &&
+    github.event.workflow_run.conclusion == 'success' &&
+    github.event.workflow_run.event == 'push' &&
+    github.event.workflow_run.head_repository.full_name == github.repository &&
+    github.event.workflow_run.head_sha == github.sha))
+    && 'dev-channel' || format('dev-channel-skip-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: compute the dev version
+    runs-on: ubuntu-latest
+    # Only a green CI run of a push to main in this repository, for the commit
+    # that is still main's tip, ships. The branches filter above matches a
+    # head branch by name, so a pull request from a fork's own `main` would
+    # pass it; the event and repository checks keep those out. The tip check
+    # is explained at `concurrency` above.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_sha == github.sha)
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      build: ${{ steps.plan.outputs.build }}
+      formula: ${{ steps.plan.outputs.formula }}
+    steps:
+      # Before anything is signed or published: without the tap token the run
+      # would build, notarize and publish a release and then fail to point the
+      # formula at it.
+      - name: The tap token is configured
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::the TAP_GITHUB_TOKEN secret is empty or not visible to this workflow, so the crystalline-dev formula could not be updated. Set it as a repository secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The commit CI tested, which the guard above makes main's tip.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The commit count is the version's last field, so the full history.
+          fetch-depth: 0
+
+      - name: Compute the version
+        id: version
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          version="$(bash scripts/dev-version.sh "$sha")"
+          echo "dev version $version from $sha"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # What this run does, from the published dev releases and the tap's
+      # current formula (scripts/dev-plan.sh has the rules): build and publish
+      # only a version newer than every published one, and update the formula
+      # whenever it is behind a published or about-to-be-published version.
+      # A re-run of a run whose tap push failed therefore skips the build and
+      # finishes the formula.
+      - name: Plan the run
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "${{ github.repository }}" --limit 200 \
+            --json tagName,isPrerelease,isDraft > "$RUNNER_TEMP/releases.json"
+
+          formula="$RUNNER_TEMP/crystalline-dev.rb"
+          : > "$formula"
+          if ! GH_TOKEN="$TAP_GITHUB_TOKEN" gh api \
+              -H "Accept: application/vnd.github.raw" \
+              repos/jordiboehme/homebrew-tap/contents/Formula/crystalline-dev.rb \
+              > "$formula" 2> "$RUNNER_TEMP/formula.err"; then
+            if grep -q "HTTP 404" "$RUNNER_TEMP/formula.err"; then
+              echo "the tap has no crystalline-dev formula yet"
+              : > "$formula"
+            else
+              cat "$RUNNER_TEMP/formula.err"
+              echo "::error::could not read Formula/crystalline-dev.rb from the tap"
+              exit 1
+            fi
+          fi
+
+          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: dev
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ needs.version.outputs.sha }}
+    secrets: inherit
+
+  publish:
+    name: publish the dev pre-release
+    needs: [version, build]
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ needs.version.outputs.sha }}
+      TAG: dev-${{ needs.version.outputs.version }}
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: crystalline-*
+          path: downloads
+
+      - name: Collect archives and generate checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find downloads -type f -name '*.tar.gz' -exec cp {} release/ \;
+          cd release
+          count="$(find . -name '*.tar.gz' | wc -l)"
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected the four Homebrew archives, found $count"
+            ls -la
+            exit 1
+          fi
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # gh uploads the assets to a draft and publishes it last, so a run
+      # cancelled in between leaves a draft of this tag behind. A draft does
+      # not count as published (scripts/dev-plan.sh), and deleting it here
+      # means it never blocks its version: the next run creates the release
+      # afresh. Drafts are looked up through the API, because the by-tag
+      # lookups do not return drafts.
+      - name: Delete a leftover draft of this tag
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${{ github.repository }}/releases" \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")"
+          for id in $ids; do
+            echo "deleting the leftover draft $id of $TAG"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+          done
+
+      # The notes list the commits since the previous dev pre-release. Without
+      # --notes-start-tag GitHub would compare against the latest release,
+      # which is the last stable tag. The first dev release has no previous
+      # one and compares against that stable tag, which is right for it.
+      - name: Create the pre-release
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --repo "${{ github.repository }}" --limit 200 \
+            --json tagName,isPrerelease,isDraft,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith("dev-")))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+          start=()
+          if [ -n "$previous" ]; then
+            echo "notes since $previous"
+            start=(--notes-start-tag "$previous")
+          fi
+          gh release create "$TAG" release/* \
+            --repo "${{ github.repository }}" \
+            --target "$SHA" \
+            --title "crystalline $VERSION (dev)" \
+            --prerelease \
+            --latest=false \
+            --generate-notes \
+            "${start[@]}"
+
+  # Runs after a fresh publish, and also on its own when the release already
+  # exists but the formula is behind it (a re-run after a failed tap push).
+  # `!cancelled()` lets it run when build and publish were skipped on
+  # purpose; the publish result check keeps it from running after a failed or
+  # cancelled publish.
+  homebrew:
+    name: update the crystalline-dev formula
+    needs: [version, publish]
+    if: >-
+      !cancelled() &&
+      needs.version.result == 'success' &&
+      needs.version.outputs.formula == 'true' &&
+      (needs.publish.result == 'success' ||
+       (needs.publish.result == 'skipped' && needs.version.outputs.build != 'true'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: dev-${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+
+      - name: Download the release checksums
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern SHA256SUMS --dir "$RUNNER_TEMP/release"
+
+      # Only Formula/crystalline-dev.rb is written; Formula/crystalline.rb is
+      # release.yml's alone. The stable homebrew job may push to the tap at the
+      # same moment, so a rejected push rebases onto it and tries again.
+      - name: Render and push the formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tap="$RUNNER_TEMP/homebrew-tap"
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/jordiboehme/homebrew-tap.git" "$tap"
+          mkdir -p "$tap/Formula"
+          bash scripts/render-dev-formula.sh "$VERSION" "$RUNNER_TEMP/release/SHA256SUMS" \
+            > "$tap/Formula/crystalline-dev.rb"
+          ruby -c "$tap/Formula/crystalline-dev.rb"
+
+          cd "$tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/crystalline-dev.rb
+          if git diff --cached --quiet; then
+            echo "Formula/crystalline-dev.rb already says $VERSION"
+            exit 0
+          fi
+          git commit -m "Update crystalline-dev to ${VERSION}"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt), rebasing onto the tap and trying again"
+            sleep $((attempt * 5))
+            git pull --rebase
+          done
+          echo "::error::could not push Formula/crystalline-dev.rb to the tap"
+          exit 1
+
+  # Keeps the newest 10 dev pre-releases and deletes the rest with their tags.
+  # The filter is positive on purpose: only a pre-release whose tag starts with
+  # `dev-` is ever a candidate, so a stable `v*` release can never be touched,
+  # whatever state its flags are in.
+  prune:
+    name: prune old dev pre-releases
+    needs: homebrew
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP: 10
+    steps:
+      - name: Delete all but the newest dev pre-releases
+        run: |
+          set -euo pipefail
+          old="$(gh release list --repo "${{ github.repository }}" --limit 200 \
+            --json tagName,isPrerelease,isDraft,createdAt \
+            --jq "[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith(\"dev-\")))] | sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName")"
+          if [ -z "$old" ]; then
+            echo "nothing to prune"
+            exit 0
+          fi
+          while IFS= read -r tag; do
+            case "$tag" in
+              dev-*) ;;
+              *)
+                echo "::error::refusing to delete $tag, which is not a dev tag"
+                exit 1
+                ;;
+            esac
+            echo "deleting $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes
+          done <<< "$old"

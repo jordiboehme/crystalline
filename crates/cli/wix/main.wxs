@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <!--
-  WiX v3 source consumed by `cargo wix` in .github/workflows/release.yml.
+  WiX v3 source consumed by `cargo wix` in .github/workflows/build.yml.
   For a local build (Windows only, WiX v3 on PATH or %WIX% set), run the
   exact cargo-wix invocation from that workflow's "Build .msi package" step
   after a release build of the crystalline package.
