@@ -11147,6 +11147,62 @@ async fn a_kept_entry_never_follows_a_withdrawn_target_it_was_bound_for() {
     );
 }
 
+/// The declined twin of the test above: a declined target is deleted once
+/// nothing waits for it, and the merged entry bound for it keeps pointing at
+/// it, since a declined share's commits are nowhere else either.
+#[tokio::test]
+async fn a_kept_entry_never_follows_a_declined_target_it_was_bound_for() {
+    let mock = MockProvider::new();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    mock.open_pull_request(
+        70,
+        "crystalline/share-2",
+        Some("team/knowledge"),
+        "release-1.2",
+    );
+    let mut state = load_state(&sub.state_dir);
+    state
+        .retire_queue
+        .push(merged_share_two(second, &first.branch));
+    state.save(&sub.state_dir).unwrap();
+
+    decline_and_share_again(&mock, &sub, first.number).await;
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(
+        merged.onto, first.branch,
+        "a declined share's onto is never passed on"
+    );
+    assert_eq!(kept_as(merged), Some((KeptKind::Head, Some(70))));
+
+    // Later a pull request is opened on share-2, and #70 closes. The move to
+    // the gone share-1 fails; nothing is ever sent to main.
+    mock.open_pull_request(
+        80,
+        "suggest-80",
+        Some("team/knowledge"),
+        "crystalline/share-2",
+    );
+    mock.fail_update_proposal(80);
+    mock.set_proposal_state(70, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    sync(&mock, &sub).await;
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&"update_proposal_base:80:main".to_string()),
+        "{calls:?}"
+    );
+    call_at(&calls, &format!("update_proposal_base:80:{}", first.branch));
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(merged.onto, first.branch);
+    assert_eq!(kept_as(merged), Some((KeptKind::TargetGone, Some(80))));
+}
+
 /// A declined entry bound for a merged layer takes the layer's `onto` when the
 /// layer's branch goes, and its own `base` notice stays: it is about a pull
 /// request on the declined branch, not about the old target.
