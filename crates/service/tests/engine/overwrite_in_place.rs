@@ -666,3 +666,85 @@ async fn a_joined_landing_refusal_never_names_a_file_only_the_owners_draft_holds
         "{err}"
     );
 }
+
+// --- a plain create across folders (#112, amended 2026-09-28) ---------------
+
+const CREATE_ACROSS: &str = "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'archive/code-review-standards.md' in folder 'archive', not in folder 'conventions'. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram";
+
+#[tokio::test]
+async fn a_create_whose_permalink_lives_in_another_folder_is_refused_without_the_offer() {
+    let moved = "archive/code-review-standards.md";
+    let old = engram("Code Review Standards", PERMALINK, "The old rule.");
+    for review in [false, true] {
+        let (tmp, engine, _scratch) = fixture(review, &[(moved, old.clone())]).await;
+        let scope = if review { ada() } else { Scope::Unrestricted };
+        let err = engine
+            .write_engram_as(
+                &capture(
+                    "Code Review Standards",
+                    Some("conventions"),
+                    "The new rule.",
+                    false,
+                ),
+                None,
+                &scope,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, CREATE_ACROSS, "review={review}");
+        assert!(
+            !err.contains("already exists in domain") && !err.contains("overwrite=true"),
+            "no collision marker and no overwrite offer: {err}"
+        );
+        let notes = tmp.path().join("notes");
+        assert!(!notes.join(SLUG).exists());
+        assert_eq!(std::fs::read_to_string(notes.join(moved)).unwrap(), old);
+    }
+}
+
+#[tokio::test]
+async fn a_create_whose_permalink_lives_in_the_same_folder_keeps_the_collision() {
+    let (_tmp, engine, _scratch) = fixture(
+        false,
+        &[(
+            OWNER,
+            engram("Code Review Standards", PERMALINK, "The old rule."),
+        )],
+    )
+    .await;
+    let err = engine
+        .write_engram(&capture(
+            "Code Review Standards",
+            Some("conventions"),
+            "The new rule.",
+            false,
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "permalink 'conventions/code-review-standards' already exists in domain 'notes' (at conventions/Code Review Standards.md); pass overwrite=true to replace"
+    );
+}
+
+#[tokio::test]
+async fn a_create_whose_title_namesake_lives_elsewhere_keeps_the_collision() {
+    // `archive/g.md` is titled Gamma but answers to `g`: a namesake, not the
+    // owner of `gamma`, so nothing says `gamma` belongs to it.
+    let (_tmp, engine, _scratch) = fixture(
+        false,
+        &[("archive/g.md", engram("Gamma", "g", "A namesake."))],
+    )
+    .await;
+    let err = engine
+        .write_engram(&capture("Gamma", None, "The real gamma.", false))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "permalink 'gamma' already exists in domain 'notes' (at archive/g.md); pass overwrite=true to replace"
+    );
+}

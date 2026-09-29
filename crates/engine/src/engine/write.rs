@@ -126,7 +126,9 @@ impl Engine {
     /// `rel`, from this writer's own point of view: the writer's own shadowed
     /// view in review mode (a name another actor is drafting under is free,
     /// and a path this writer has tombstoned is free again), the plain index
-    /// otherwise. `None` means free; `Some(path)` names where it is taken.
+    /// otherwise. `None` means free; `Some((path, permalink))` names where it
+    /// is taken and what the engram there answers to, which is not always
+    /// `permalink`: `find_engram` also answers a title namesake.
     ///
     /// Shared by [`Engine::write_engram_present`]'s two collision checks - the
     /// early, unlocked one that answers before `build_markdown` can raise a
@@ -139,21 +141,21 @@ impl Engine {
         rel: &str,
         permalink: &str,
         overlay_draft: Option<(&str, DomainId)>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, String)>> {
         let store = self.store.lock().await;
         Ok(match overlay_draft {
             Some((actor, domain_id)) => match store.overlay_entry(domain_id, actor, rel).await? {
                 Some(entry) if entry.tombstone => None,
-                Some(entry) => Some(entry.path),
+                Some(entry) => Some((entry.path, entry.permalink)),
                 None => store
                     .find_engram(domain, permalink)
                     .await?
-                    .map(|existing| existing.path),
+                    .map(|existing| (existing.path, existing.permalink)),
             },
             None => store
                 .find_engram(domain, permalink)
                 .await?
-                .map(|existing| existing.path),
+                .map(|existing| (existing.path, existing.permalink)),
         })
     }
 
@@ -393,13 +395,11 @@ impl Engine {
         // or taken between the two still gets the correct, authoritative
         // answer there.
         if !p.overwrite
-            && let Some(at) = self
+            && let Some((at, held)) = self
                 .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
                 .await?
         {
-            return Err(EngineError::Conflict(collision_message(
-                &permalink, &p.domain, &at,
-            )));
+            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
         }
         let path = landing?;
 
@@ -562,13 +562,11 @@ impl Engine {
         // write below - `overlay_draft` was resolved once, above, and is
         // reused rather than re-paired.
         if !p.overwrite
-            && let Some(at) = self
+            && let Some((at, held)) = self
                 .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
                 .await?
         {
-            return Err(EngineError::Conflict(collision_message(
-                &permalink, &p.domain, &at,
-            )));
+            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
         }
         // The landing, settled again under the lock: an overwrite whose owner
         // moved, or a path another writer filled, since the unlocked look
@@ -1792,16 +1790,54 @@ fn folder_place(folder: &str) -> String {
 /// whenever the title holds no `/`. Compared by slug, so `Conventions` and
 /// `conventions` address one folder.
 fn refuse_other_folder(domain: &str, permalink: &str, held: &str, rel: &str) -> Result<()> {
+    other_folder(
+        domain,
+        permalink,
+        held,
+        rel,
+        "An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram",
+    )
+}
+
+/// The one reading of "the engram at `held` lives in another folder than the
+/// slug path `rel` addresses", with `advice` for what the caller can do.
+fn other_folder(domain: &str, permalink: &str, held: &str, rel: &str, advice: &str) -> Result<()> {
     let asked = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
     let lives = held.rsplit_once('/').map_or("", |(dir, _)| dir);
     if slugify(asked) == slugify(lives) {
         return Ok(());
     }
     Err(EngineError::Conflict(format!(
-        "permalink '{permalink}' in domain '{domain}' belongs to '{held}' in {}, not in {}. An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram",
+        "permalink '{permalink}' in domain '{domain}' belongs to '{held}' in {}, not in {}. {advice}",
         folder_place(lives),
         folder_place(asked)
     )))
+}
+
+/// What a create hears when its permalink is already taken at `at` by an
+/// engram answering to `held`.
+///
+/// An engram that owns this exact permalink in another folder is not a
+/// collision an overwrite could settle (an overwrite would be refused with
+/// M1 as well), so it is refused at once, without the collision marker, and
+/// no client offers "overwrite or cancel?" for it (amended 2026-09-28). The
+/// same folder, or a title namesake that only `find_engram`'s title match
+/// found, keeps the one collision message. `at` is a base row or the
+/// writer's own draft at `rel`, never another actor's draft, so the folder
+/// named is one this writer may already read.
+fn create_taken(permalink: &str, domain: &str, at: &str, held: &str, rel: &str) -> EngineError {
+    if held == permalink
+        && let Err(refused) = other_folder(
+            domain,
+            permalink,
+            at,
+            rel,
+            "A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram",
+        )
+    {
+        return refused;
+    }
+    EngineError::Conflict(collision_message(permalink, domain, at))
 }
 
 /// Puts a path back the way a failed write found it: the bytes that were

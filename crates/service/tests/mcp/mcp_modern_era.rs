@@ -5006,3 +5006,93 @@ async fn a_link_that_opens_nothing_is_said_out_loud_rather_than_read_past() {
         "and is NOT quietly answered the page the domain holds: {answer}"
     );
 }
+
+// --- a create across folders is refused, never offered (#112) ---------------
+//
+// A plain create whose permalink an engram in ANOTHER folder answers to has no
+// overwrite behind it: an overwrite replaces an engram where it lives and
+// would be refused too. So the engine says so at once, without the collision
+// marker, and an eliciting peer is never asked "overwrite or cancel?".
+
+const ACROSS_REFUSAL: &str = "permalink 'taken' in domain 'eng' belongs to 'archive/taken.md' in folder 'archive', not in the domain root. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram";
+
+/// A harness whose `taken` engram lives in `archive/`, moved there with its
+/// permalink kept.
+async fn taken_elsewhere() -> (Harness, std::path::PathBuf) {
+    let h = Harness::new().await;
+    let path = h.root.join("eng/archive/taken.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!("---\ntype: engram\ntitle: Taken\npermalink: taken\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Taken\n\n{FIRST_BODY}\n"),
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    (h, path)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_across_folders_on_an_eliciting_peer_is_refused_without_a_round() {
+    let (h, path) = taken_elsewhere().await;
+    let before = std::fs::read(&path).unwrap();
+    let mut wire = h.stdio().await;
+    let refused = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    assert_ne!(
+        refused["result"]["resultType"],
+        json!("input_required"),
+        "no question is put: {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(message, ACROSS_REFUSAL, "{refused}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the owner is untouched"
+    );
+    assert!(
+        !h.root.join("eng/taken.md").exists(),
+        "and nothing landed at the root"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_across_folders_without_elicitation_gets_the_refusal_not_the_hint() {
+    let (h, path) = taken_elsewhere().await;
+    let before = std::fs::read(&path).unwrap();
+    let mut wire = h.stdio().await;
+    let refused = wire
+        .open(modern(
+            1,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(message, ACROSS_REFUSAL, "{refused}");
+    assert!(!message.contains("pass overwrite=true"), "{message}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!h.root.join("eng/taken.md").exists());
+
+    // And the tool says so before anybody calls it.
+    let listed = wire.call(modern(2, "tools/list", json!({}))).await;
+    let description = listed["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .find(|tool| tool["name"] == json!("write_engram"))
+        .and_then(|tool| tool["description"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        description.contains(
+            "a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it"
+        ),
+        "{description}"
+    );
+}
