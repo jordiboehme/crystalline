@@ -21,7 +21,8 @@ use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
-    FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+    BranchKept, FeedbackItem, FeedbackKind, KeptKind, OriginState, Proposal, ProposalStatus,
+    ProposedChange, ProposedFile, QueuedBranch, RetireWhy,
 };
 use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
@@ -409,6 +410,61 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
             .unwrap()
             .contains("shared knowledge about turbines")
     );
+}
+
+/// Connecting a repository as `brand` heals `[[brand:Alpha]]` in another
+/// domain at once: the link waited pending while nothing answered to the
+/// prefix, and the connect binds the rows spelled with the new name.
+#[tokio::test]
+async fn origin_add_heals_a_pending_link_that_names_the_new_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "brand alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("src.md"),
+        engram("Src", "src", "See [[brand:Alpha]]."),
+    )
+    .unwrap();
+    eng.domain_add_local(Some("home"), Some(home.to_str().unwrap()))
+        .await
+        .unwrap();
+    let src_resolved = || async {
+        let read = eng
+            .read_engram(
+                &ReadParams {
+                    identifier: "src".to_string(),
+                    domain: Some("home".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        read["links"][0]["resolved"].as_bool().unwrap()
+    };
+    assert!(!src_resolved().await, "`brand` names no domain yet");
+
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(tmp.path().join("brand").to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(src_resolved().await, "healed by the connect");
 }
 
 #[tokio::test]
@@ -1520,10 +1576,65 @@ async fn origin_status_reports_behind_and_connection() {
     assert_eq!(domains2[0]["behind"], true);
 }
 
+/// A kept entry reaches the status JSON with why its share was retired, what
+/// kept it and a null reason when the forge gave none.
+#[tokio::test]
+async fn origin_status_names_why_and_what_kept_a_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &c1);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.retire_queue.push(QueuedBranch {
+        number: 3,
+        branch: "crystalline/share-1".to_string(),
+        onto: "main".to_string(),
+        why: RetireWhy::Withdrawn,
+        kept: Some(BranchKept {
+            blocked_by: Some(70),
+            reason: String::new(),
+            kind: KeptKind::Head,
+        }),
+    });
+    state.save(&state_dir).unwrap();
+
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["kept_branches"],
+        serde_json::json!([{
+            "branch": "crystalline/share-1",
+            "number": 3,
+            "onto": "main",
+            "why": "withdrawn",
+            "kind": "head",
+            "blocked_by": 70,
+            "reason": null,
+            "message": "Branch crystalline/share-1 is kept: pull request #70 comes from it.",
+        }])
+    );
+}
+
 /// The keys one domain entry carries when nobody asked for detail. Pinned as a
 /// list rather than spot-checked so an accidental `detail: null` - a key that
 /// costs every reader something and says nothing - fails here.
-const STATUS_KEYS_WITHOUT_DETAIL: [&str; 19] = [
+const STATUS_KEYS_WITHOUT_DETAIL: [&str; 20] = [
     "base_commit",
     "behind",
     "branch",
@@ -1531,6 +1642,7 @@ const STATUS_KEYS_WITHOUT_DETAIL: [&str; 19] = [
     "declined_proposals",
     "direct_shares",
     "domain",
+    "kept_branches",
     "last_checked",
     "local_changes",
     "merged_unconsumed",
@@ -5237,6 +5349,65 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
     // and touches nothing at all.
     let quiet = eng.converge_overlays("no-such-domain").await.unwrap();
     assert_eq!(quiet, crystalline_service::ConvergenceReport::default());
+}
+
+/// A convergence pass that stops on an error still announces the drafts it
+/// already ended: the batch guard is pushed each drop right after it lands, so
+/// a later entry failing does not swallow the event for an earlier one. The
+/// second draft's base copy is a directory, which no read turns into bytes.
+#[tokio::test]
+async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", DRAFT_PLAN.as_bytes().to_vec()),
+        ],
+    )
+    .await;
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    draft(&eng, "owner", "notes/zz.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH);
+    let base = base_copy_of(&tmp.path().join("origins"), "notes/plan.md")
+        .expect("the first pull wrote the base snapshot");
+    std::fs::create_dir_all(base.join("notes/zz.md")).unwrap();
+
+    let mut rx = eng.changes().subscribe();
+    eng.converge_overlays("team")
+        .await
+        .expect_err("the second draft's base copy cannot be read");
+    let mut dropped = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        if let crystalline_service::changes::Change::Engram(change) = envelope.change {
+            dropped.push((change.path, change.draft_of));
+        }
+    }
+    assert_eq!(
+        dropped,
+        vec![("notes/plan.md".to_string(), Some("owner".to_string()))],
+        "the draft the pass ended before it stopped is announced"
+    );
+}
+
+/// The `base` folder under `origins` that holds a snapshot copy of `rel`.
+fn base_copy_of(origins: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let mut dirs = vec![origins.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let base = dir.join("base");
+        if base.join(rel).is_file() {
+            return Some(base);
+        }
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    None
 }
 
 /// A conflict the pull left in the reviewed folder is still settled against the

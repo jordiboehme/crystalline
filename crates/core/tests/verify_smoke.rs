@@ -997,3 +997,49 @@ fn cross_domain_links_resolve_against_the_manifest_domain_name() {
         "link references domain `a-knowledge`, which is outside the scan set"
     );
 }
+
+#[test]
+fn a_bare_link_to_another_domains_title_names_the_prefixed_link() {
+    let dir = tempdir().unwrap();
+    let manifest = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n";
+    let ops = dir.path().join("ops");
+    let docs = dir.path().join("docs");
+    write(&ops, "MANIFEST.md", manifest);
+    write(&docs, "MANIFEST.md", manifest);
+    write(
+        &ops,
+        "runbook.md",
+        "---\ntype: engram\ntitle: Incident Runbook\npermalink: runbook\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Incident Runbook\n\nSteps for the on-call engineer when the pager goes off at night.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &docs,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[Incident Runbook]] and [[Nowhere At All]] for the details here.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+
+    let report =
+        verify::verify_paths([ops.as_path(), docs.as_path()], &VerifyOptions::default()).unwrap();
+    let mut l001: Vec<&str> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L001")
+        .map(|i| i.message.as_str())
+        .collect();
+    l001.sort_unstable();
+    assert_eq!(
+        l001,
+        vec![
+            "broken wikilink to `Incident Runbook` (found in `ops`, link it as `[[ops:Incident Runbook]]`)",
+            "broken wikilink to `Nowhere At All`",
+        ],
+        "{:#?}",
+        report.issues
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.rule == "L001")
+            .all(|i| i.severity == Severity::Warning)
+    );
+}

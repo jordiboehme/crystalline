@@ -158,6 +158,10 @@ impl Engine {
             );
         }
         self.refresh_names().await;
+        // A reference elsewhere may already name this domain, and it waited
+        // pending while nothing answered to the prefix. Its own domain's next
+        // sync is not coming on its own, so it is bound here.
+        self.resolve_references_into(&domain_name).await;
         if !self.request_embed()
             && let Err(e) = self.embed_pending().await
         {
@@ -248,6 +252,9 @@ impl Engine {
         // declare a name, and a virtual domain's declared name is only read
         // by a refresh.
         self.refresh_names().await;
+        // As for a file domain: a reference elsewhere that already named this
+        // one binds now rather than on its own domain's next sync.
+        self.resolve_references_into(name).await;
 
         let mut result = json!({
             "domain": name,
@@ -307,9 +314,8 @@ impl Engine {
             None,
             &scope,
             move |current| {
-                Ok(set_frontmatter_field(
+                Ok(crystalline_core::manifest::set_declared_name(
                     current,
-                    DOMAIN_NAME_KEY,
                     &local_owned,
                 ))
             },
@@ -942,11 +948,22 @@ impl Engine {
             .flatten()
             .map(|per_actor| per_actor.values().sum())
             .unwrap_or(0);
+        // Who could read the domain a moment before it goes, read while the
+        // privacy records still name it (ruled 2026-09-27): the removal's
+        // event carries this snapshot, never a registry the removal is about
+        // to empty.
+        let audience = self.domain_audience(name).await;
+        // From here every event under this name carries that snapshot: the
+        // last room saves just below, the ring's earlier entries for it, and
+        // the domain event itself, since a path under the name leaks it as
+        // surely as the domain event does.
+        let _captured = self.capture_audience(name, audience.clone());
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,
         };
         let mut report = self.domain_remove(name).await?;
+        self.announce_domain(name, None, Some(audience));
         self.forget_domain_records(name).await;
         // Every draft in this domain has just ended, whichever way each one
         // ended, so every link on one and every session inside one ends with

@@ -34,7 +34,7 @@ pub use search::{
     semantic_hydrate_sql, semantic_phase1_sql,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -50,8 +50,9 @@ use crate::store::{
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
     Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
     SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
-    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
+    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
+    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
     spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
@@ -1260,6 +1261,76 @@ impl Store for TursoStore {
                     .await?;
             }
             Ok(reset)
+        })
+        .await
+    }
+
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
+        in_transaction(self, async {
+            let mut bound = 0;
+            for table in ["relation", "link"] {
+                bound += self
+                    .conn
+                    .execute(
+                        &resolve_spelled_references_sql(table, &list),
+                        params.clone(),
+                    )
+                    .await?;
+            }
+            Ok(bound)
+        })
+        .await
+    }
+
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>> {
+        if spellings.is_empty() || targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let spelled = placeholders(2, spellings.len());
+        let first = 2 + spellings.len();
+        let targeted = (first..first + targets.len())
+            .map(|i| format!("lower(?{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params: Vec<Value> = vec![Value::Integer(domain.0)];
+        params.extend(spellings.iter().map(|s| Value::Text(s.clone())));
+        params.extend(targets.iter().map(|t| Value::Text(t.clone())));
+        in_transaction(self, async {
+            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+            for table in ["relation", "link"] {
+                let rows = query_all(
+                    &self.conn,
+                    &count_references_to_sql(table, "?1", &spelled, &targeted),
+                    params.clone(),
+                )
+                .await?;
+                for row in rows {
+                    if let (Some(id), Some(n)) = (cell_i64(&row, 0), cell_i64(&row, 1)) {
+                        *counts.entry(id).or_default() += n as u64;
+                    }
+                }
+                self.conn
+                    .execute(
+                        &resolve_references_to_sql(table, "?1", &spelled, &targeted),
+                        params.clone(),
+                    )
+                    .await?;
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(id, n)| (DomainId(id), n))
+                .collect())
         })
         .await
     }

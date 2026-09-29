@@ -85,6 +85,10 @@ impl Engine {
         // this edit at all and must not gate it.
         let join = join.filter(|_| view.joined().is_some());
         let actor = self.actor_for(client, overlay);
+        if join.is_none() {
+            self.refuse_granted_name(&p.domain, &p.identifier, scope)
+                .await?;
+        }
         let (desc, source) = match view.resolve(&p.identifier).await {
             Ok(resolved) => resolved,
             // A name this caller's own view cannot resolve, when they hold a
@@ -406,7 +410,7 @@ impl Engine {
 
         // Answered by whichever arm below runs, so the tail's `SourceEdited`
         // reports the count whichever kind of source this write landed on.
-        let normalized = match source {
+        let (normalized, checksum, before, after) = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
@@ -449,7 +453,12 @@ impl Engine {
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await
                     .map_err(SourceEditFailure::after)?;
-                count
+                (
+                    count,
+                    sha256_hex(edited.as_bytes()),
+                    engram_names(&current, &desc.permalink),
+                    engram_names(&edited, &desc.permalink),
+                )
             }
             ContentSource::Virtual => {
                 let current = {
@@ -504,9 +513,40 @@ impl Engine {
                 )
                 .await
                 .map_err(SourceEditFailure::before)?;
-                count
+                (
+                    count,
+                    sha256_hex(edited.as_bytes()),
+                    engram_names(&current, &desc.permalink),
+                    engram_names(&edited, &desc.permalink),
+                )
             }
         };
+
+        // Announced here rather than in `edit_engram_as`, so every edit that
+        // reaches a file or a row passes this line: a retirement, a split's
+        // tail, a successor's back-link, evolve's rewrites, the name report's
+        // fixes, the keyed MANIFEST policy edit, the MANIFEST `domain_name`
+        // write-back and a domain rename's MANIFEST and relink steps all
+        // funnel through `apply_source_edit`. The live arm and the draft arm
+        // returned above; the room's save and `DomainView::put` announce
+        // those.
+        self.announce(Change::Engram(EngramChanged {
+            domain: desc.domain.clone(),
+            permalink: desc.permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(checksum),
+            actor: Some(actor.to_string()),
+            draft_of: None,
+            audience: None,
+        }));
+        // An edit that moved the permalink or changed the title may be what a
+        // link in another domain has been waiting for.
+        if after != before {
+            self.bind_references_to(&desc.domain, &after.0, &after.1)
+                .await;
+        }
 
         // An edit may have rewritten this domain's MANIFEST, its routing and
         // its declared name. The store locks above are all released.
@@ -612,6 +652,56 @@ impl Engine {
         Ok((text, None))
     }
 
+    /// Refuses a `set_frontmatter` the single-line writers would get wrong.
+    ///
+    /// Those writers replace or remove the key's own line and nothing under
+    /// it, so on a value that spans lines - a block list, a block scalar, a
+    /// flow collection, an indented continuation - a set leaves the old lines
+    /// joined to the new value and a removal folds them into the key above.
+    /// Either writes a false value without a word. A new value holding a line
+    /// break is refused for the same reason: it cannot be one line.
+    ///
+    /// `verified` and `evolve_ack` are not guarded: both are block-valued by
+    /// design, written by block-aware emitters, and their values are folded to
+    /// one line before they are written. Setting `stale_after` is not guarded
+    /// either, since its writer takes an indented bound along; clearing it is,
+    /// under both spellings.
+    fn guard_one_line_scalar(
+        source: &str,
+        key: &str,
+        value: Option<&str>,
+        permalink: &str,
+    ) -> Result<()> {
+        let checked: &[&str] = match (key, value) {
+            ("stale_after", Some(_)) => &[],
+            ("stale_after", None) => &["stale_after", "review_after"],
+            (
+                "status" | "valid_from" | "valid_to" | "source_date" | "resource"
+                | "source_version" | "salience",
+                _,
+            ) => std::slice::from_ref(&key),
+            _ => return Ok(()),
+        };
+        if value.is_some_and(|v| v.contains(['\n', '\r'])) {
+            return Err(EngineError::Invalid(format!(
+                "{key} takes a one-line value and this one holds a line break. \
+                 To write a value over several lines, edit the frontmatter text \
+                 with find_replace instead"
+            )));
+        }
+        if let Some(held) = checked
+            .iter()
+            .find(|k| crystalline_core::emit::frontmatter_value_spans_lines(source, k))
+        {
+            return Err(EngineError::Invalid(format!(
+                "{held} in '{permalink}' holds a list or a value over several \
+                 lines, and set_frontmatter only replaces a one-line value. \
+                 Edit the frontmatter text with find_replace instead"
+            )));
+        }
+        Ok(())
+    }
+
     /// Assign or clear one lifecycle frontmatter field, the `set_frontmatter`
     /// operation. Restricted to [`SETTABLE_FRONTMATTER_KEYS`]: identity,
     /// provenance and index keys are owned by the tools that maintain them, so
@@ -643,6 +733,7 @@ impl Engine {
                 ))
             })?;
         let value = p.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        Self::guard_one_line_scalar(source, key, value, permalink)?;
 
         match key {
             "status" => {
@@ -694,6 +785,12 @@ impl Engine {
                     set_frontmatter_field(source, key, &date.format("%Y-%m-%d").to_string())
                 })
             }
+            "resource" | "source_version" => Ok(match value {
+                // Plain text, written through the YAML emitter so a URL with
+                // `: ` or `#` stays one quoted scalar.
+                Some(v) => set_frontmatter_field(source, key, v),
+                None => remove_frontmatter_field(source, key),
+            }),
             "salience" => {
                 let Some(raw) = value else {
                     return Ok(remove_frontmatter_field(source, "salience"));
@@ -826,5 +923,162 @@ impl Engine {
             out = remove_frontmatter_field(&out, field);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod settable_keys_tests {
+    use super::*;
+
+    const SOURCE: &str = "---\ntype: engram\ntitle: T\npermalink: t\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nbody\n";
+
+    /// A value each key's arm accepts.
+    fn value_for(key: &str) -> Option<String> {
+        Some(match key {
+            "status" => "stable".to_string(),
+            "valid_from" | "valid_to" | "stale_after" | "source_date" => "2026-02-01".to_string(),
+            "salience" => "5".to_string(),
+            _ => "x".to_string(),
+        })
+    }
+
+    fn set(key: &str) -> Result<String> {
+        let p = EditParams {
+            identifier: "t".to_string(),
+            domain: "d".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(key.to_string()),
+            value: value_for(key),
+            ..EditParams::default()
+        };
+        Engine::apply_set_frontmatter(SOURCE, &p, "t", "tester", None, None)
+    }
+
+    #[test]
+    fn every_listed_key_has_an_arm_and_an_unlisted_key_is_refused() {
+        // `evolve_ack` needs a draft the sweep computed, so its arm answers
+        // with its own value message here; what matters is that no listed key
+        // falls through to the refusal.
+        for key in SETTABLE_FRONTMATTER_KEYS {
+            if let Err(e) = set(key) {
+                assert!(
+                    !e.to_string().contains("cannot set"),
+                    "{key} is listed but has no arm: {e}"
+                );
+            }
+        }
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"resource"));
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"source_version"));
+        for key in [
+            "title",
+            "permalink",
+            "type",
+            "tags",
+            "recorded_at",
+            "generated",
+            "not_a_key",
+        ] {
+            let e = set(key).expect_err(key).to_string();
+            assert!(e.contains(&format!("cannot set '{key}'")), "{key}: {e}");
+        }
+    }
+
+    /// `set_frontmatter` on `source` with `key` and `value`.
+    fn set_on(source: &str, key: &str, value: Option<&str>) -> Result<String> {
+        let p = EditParams {
+            identifier: "t".to_string(),
+            domain: "d".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(key.to_string()),
+            value: value.map(str::to_string),
+            ..EditParams::default()
+        };
+        Engine::apply_set_frontmatter(source, &p, "t", "tester", None, None)
+    }
+
+    /// An engram written by hand with its locations as a block list, which
+    /// parses as no `resource` at all - so `V111` sends an agent here.
+    const LISTED: &str = "---\ntype: engram\ntitle: T\npermalink: t\ntags:\n  - t\nstatus: stable\nresource:\n  - https://a.example\n  - https://b.example\nrecorded_at: 2026-01-01\n---\n\nbody\n";
+
+    fn assert_refused_toward_find_replace(result: Result<String>, what: &str) {
+        let e = result.expect_err(what).to_string();
+        assert!(e.contains("find_replace"), "{what}: {e}");
+    }
+
+    #[test]
+    fn setting_a_list_valued_key_is_refused_toward_find_replace() {
+        // The single-line setter would replace only `resource:` and leave the
+        // two items under the new value, which then reads as one false
+        // citation joining all three.
+        assert_refused_toward_find_replace(
+            set_on(LISTED, "resource", Some("https://c.example")),
+            "set on a list",
+        );
+    }
+
+    #[test]
+    fn removing_a_list_valued_key_is_refused_toward_find_replace() {
+        // Removing only the key line would fold the items into the key above.
+        assert_refused_toward_find_replace(set_on(LISTED, "resource", None), "remove a list");
+    }
+
+    #[test]
+    fn a_block_scalar_or_a_flow_list_is_refused_too() {
+        for shape in [
+            "resource: >-\n  https://a.example\n",
+            "resource: [https://a.example, https://b.example]\n",
+        ] {
+            let source = format!(
+                "---\ntype: engram\ntitle: T\nstatus: stable\n{shape}recorded_at: 2026-01-01\n---\n\nbody\n"
+            );
+            assert_refused_toward_find_replace(
+                set_on(&source, "resource", Some("https://c.example")),
+                shape,
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_holding_a_newline_is_refused() {
+        for key in ["resource", "source_version", "status"] {
+            assert_refused_toward_find_replace(
+                set_on(SOURCE, key, Some("https://a.example\nhttps://b.example")),
+                key,
+            );
+        }
+    }
+
+    #[test]
+    fn a_hand_written_bound_on_its_own_line_is_set_but_not_removed() {
+        // Setting `stale_after` goes through the block-aware writer, which
+        // takes the indented date along; clearing it would not, so it is
+        // refused - under the legacy `review_after` spelling too.
+        for spelling in ["stale_after", "review_after"] {
+            let source = SOURCE.replace(
+                "status: stable\n",
+                &format!("status: stable\n{spelling}:\n  2026-08-01\n"),
+            );
+            let set = set_on(&source, "stale_after", Some("2026-12-01")).unwrap();
+            assert!(!set.contains("2026-08-01"), "{set}");
+            assert_refused_toward_find_replace(set_on(&source, "stale_after", None), spelling);
+        }
+    }
+
+    #[test]
+    fn a_one_line_value_is_still_replaced_and_removed() {
+        // The control: the guard is about shape, not about the key.
+        let one = SOURCE.replace(
+            "status: stable\n",
+            "status: stable\nresource: https://a.example\n",
+        );
+        let set = set_on(&one, "resource", Some("https://c.example")).unwrap();
+        let parsed = crystalline_core::parse_engram(&set).unwrap();
+        assert_eq!(
+            parsed.frontmatter.resource.as_deref(),
+            Some("https://c.example")
+        );
+        let removed = set_on(&one, "resource", None).unwrap();
+        assert!(!removed.contains("resource"), "{removed}");
+        crystalline_core::parse_engram(&removed).unwrap();
     }
 }

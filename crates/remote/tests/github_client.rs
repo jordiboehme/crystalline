@@ -1200,10 +1200,10 @@ async fn list_open_proposals_pages_until_a_short_page() {
             let page: usize = q.get("page").unwrap().parse().unwrap();
             let rows: Vec<serde_json::Value> = if page == 1 {
                 (1..=100)
-                    .map(|n| serde_json::json!({"number": n, "head": {"ref": format!("b{n}"), "sha": format!("s{n}")}}))
+                    .map(|n| serde_json::json!({"number": n, "head": {"ref": format!("b{n}"), "sha": format!("s{n}")}, "base": {"ref": "main"}}))
                     .collect()
             } else {
-                vec![serde_json::json!({"number": 101, "head": {"ref": "b101", "sha": "s101"}})]
+                vec![serde_json::json!({"number": 101, "head": {"ref": "b101", "sha": "s101"}, "base": {"ref": "main"}})]
             };
             Json(serde_json::Value::Array(rows))
         }),
@@ -1215,7 +1215,44 @@ async fn list_open_proposals_pages_until_a_short_page() {
     assert_eq!(open[0].number, 1);
     assert_eq!(open[0].branch, "b1");
     assert_eq!(open[0].head_sha, "s1");
+    assert_eq!(open[0].base, "main");
     assert_eq!(open[100].number, 101);
+}
+
+#[tokio::test]
+async fn an_open_pull_request_without_a_base_is_not_listed_as_based_nowhere() {
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls",
+        get(|| async {
+            Json(serde_json::json!([{"number": 1, "head": {"ref": "b1", "sha": "s1"}}]))
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    assert!(
+        provider.list_open_proposals(&origin()).await.is_err(),
+        "a row with no base must fail the listing, never default to an empty base"
+    );
+}
+
+#[tokio::test]
+async fn list_open_proposals_reads_the_head_repository_when_there_is_one() {
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls",
+        get(|| async {
+            Json(serde_json::json!([
+                {"number": 1, "head": {"ref": "b1", "sha": "s1", "repo": {"full_name": "acme/brand-knowledge"}}, "base": {"ref": "main"}},
+                {"number": 2, "head": {"ref": "b2", "sha": "s2", "repo": null}, "base": {"ref": "main"}},
+                {"number": 3, "head": {"ref": "b3", "sha": "s3"}, "base": {"ref": "main"}},
+            ]))
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    let open = provider.list_open_proposals(&origin()).await.unwrap();
+    assert_eq!(open[0].head_repo.as_deref(), Some("acme/brand-knowledge"));
+    assert_eq!(open[1].head_repo, None, "a deleted fork");
+    assert_eq!(open[2].head_repo, None, "no repo key at all");
 }
 
 // --- stacks ------------------------------------------------------------------

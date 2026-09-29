@@ -13,7 +13,7 @@ import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
@@ -26,6 +26,7 @@ import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
 import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
+import { FakeEventSource } from "../events/testSupport";
 import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
 import {
   answersFor,
@@ -328,6 +329,12 @@ beforeEach(() => {
   // The join lives in session storage, and a leftover one would put the next
   // test's editor inside somebody else's draft.
   sessionStorage.clear();
+});
+
+afterEach(() => {
+  // The change-stream case stubs the global `EventSource`; every other case
+  // runs with the shell's stream inert, as jsdom has none.
+  vi.unstubAllGlobals();
 });
 
 describe("the engram editor", () => {
@@ -653,6 +660,71 @@ describe("the engram editor", () => {
     expect(putBody(0)).toEqual({ content: linked });
   });
 
+  it("draws a wikilink spelled with a domain's canonical name or an alias as resolved", async () => {
+    // Registered here as `moonbase`, called `moon` by its MANIFEST and `lunar`
+    // before a rename: the chips place both spellings through the same table
+    // the reading page uses.
+    const linked = CONTENT.replace(
+      "A rule.",
+      "A rule about [[moon:Crater Base]] and [[lunar:Crater Base]].",
+    );
+    const listing = domainsResponse();
+    const graph = graphResponse();
+    serveEditor({
+      "/domains": () => ({
+        ...listing,
+        domains: [
+          ...listing.domains,
+          {
+            name: "moonbase",
+            kind: "file",
+            canonical_name: "moon",
+            aliases: ["lunar"],
+            shadowed: false,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: linked,
+          links: [
+            {
+              line: 9,
+              resolved: true,
+              target: { domain: "moon", target: "Crater Base" },
+            },
+            {
+              line: 9,
+              resolved: true,
+              target: { domain: "lunar", target: "Crater Base" },
+            },
+          ],
+        }),
+      "/graph": () => ({
+        ...graph,
+        nodes: [
+          ...graph.nodes,
+          {
+            id: 3,
+            domain: "moonbase",
+            permalink: "crater-base",
+            title: "Crater Base",
+            status: "stable",
+            type: "engram",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      const resolved = [
+        ...editor.querySelectorAll(".cm-wikilink-resolved"),
+      ].map((chip) => chip.textContent);
+      expect(resolved).toEqual(["Crater Base", "Crater Base"]);
+    });
+  });
+
   it("keeps the findings under the buffer at full width, form and all", async () => {
     // The frame's own preference, read by the screen through the context the
     // frame provides. The column beside the buffer goes, and what goes with
@@ -894,6 +966,83 @@ describe("the engram editor", () => {
     await waitFor(() => {
       expect(trees().length).toBeGreaterThan(before);
     });
+  });
+
+  it("leaves the open engram's detail to its room when the change stream names it, and still moves the tree on", async () => {
+    // Catches the stream refetching the detail under a live document: the
+    // room owns the text, and a second answer would race it. The tree
+    // refetch is the witness that the frame was read and the window flushed.
+    vi.stubGlobal("EventSource", FakeEventSource);
+    FakeEventSource.instances = [];
+    serveEditor({
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "engram",
+            status: "stable",
+            path: "alpha.md",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await screen.findByRole("link", { name: "Alpha" });
+    const details = () =>
+      apiMock.mock.calls.filter(
+        ([path, init]) =>
+          path.split("?")[0] === "/domains/eng/engrams/alpha" &&
+          (init?.method ?? "GET") === "GET",
+      ).length;
+    const detailsBefore = details();
+    const treesBefore = trees().length;
+    expect(detailsBefore).toBe(1);
+    expect(FakeEventSource.instances, "one stream").toHaveLength(1);
+    const source = FakeEventSource.instances[0];
+    if (!source) throw new Error("no stream was opened");
+    // The session cookie has to ride along, or the stream answers 401.
+    expect(source.url).toBe("/api/v1/events");
+    expect(source.withCredentials).toBe(true);
+
+    const frame = (permalink: string) => ({
+      domain: "eng",
+      permalink,
+      path: `${permalink}.md`,
+      kind: "modified",
+      checksum: "9f",
+      actor: "ada",
+      draft_of: null,
+    });
+    // A real `EventSource` fires `open` before any message, and the
+    // leading tab asks who the stream is for before it passes one on.
+    act(() => {
+      source.open();
+    });
+    await settled();
+    act(() => {
+      source.emit("engram", frame("alpha"), "1:1");
+    });
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(treesBefore);
+    });
+    await settled();
+    expect(details(), "the open engram's detail is left alone").toBe(
+      detailsBefore,
+    );
+
+    const treesAfterAlpha = trees().length;
+    act(() => {
+      source.emit("engram", frame("beta"), "1:2");
+    });
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(treesAfterAlpha);
+    });
+    expect(details()).toBe(detailsBefore);
   });
 
   it("carries its actions in the trail's own row, where reading mode has them", async () => {

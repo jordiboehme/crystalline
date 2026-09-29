@@ -447,6 +447,49 @@ impl DomainAccess {
         Ok(self.resolve(&principal).await?.hidden)
     }
 
+    /// The accounts that may read `domain` right now, or `None` when the
+    /// domain is not private and so every scope that reaches the instance
+    /// reads it.
+    ///
+    /// The other direction of [`DomainAccess::hidden_domains`]: from one
+    /// domain to the accounts, where that method goes from one scope to the
+    /// domains. The engine asks it in the instant before a change takes the
+    /// domain's name out of these records (a removal, the old name of a
+    /// rename), so the change can carry who could read the domain a moment
+    /// before it, rather than leaving a listener to ask a registry the change
+    /// is emptying. Each account is decided by [`decide`], the rule every
+    /// other answer here uses: the owner, every member at any level and every
+    /// instance admin; a disabled account reads nothing, as
+    /// [`DomainAccess::principal`] rules. Names are the store's own folded
+    /// spelling. The machine owner is never named: it reads every domain.
+    pub async fn readers_of(&self, domain: &str) -> Result<Option<HashSet<String>>> {
+        let Some(acl) = self.auth.domain_visibility(domain).await? else {
+            return Ok(None);
+        };
+        let members: HashMap<String, MemberLevel> = self
+            .auth
+            .domain_members(domain)
+            .await?
+            .into_iter()
+            .map(|member| (member.principal, member.level))
+            .collect();
+        let mut readers = HashSet::new();
+        for user in self.auth.list_users().await? {
+            if user.disabled {
+                continue;
+            }
+            let level = members.get(&user.name).copied();
+            let principal = Principal::Account {
+                name: user.name.clone(),
+                role: user.role,
+            };
+            if decide(&principal, Some(&acl), level) >= DomainRight::Read {
+                readers.insert(user.name);
+            }
+        }
+        Ok(Some(readers))
+    }
+
     /// Retire the visibility and membership records of a domain that no longer
     /// exists.
     ///
@@ -617,6 +660,37 @@ mod tests {
             account: account.into(),
             admin,
         }
+    }
+
+    /// The readers of a private domain are its owner, its members and the
+    /// instance admins, and nobody else; a shared domain has no list at all.
+    /// Catches a reader list that drops the owner or the admins (who read by
+    /// role, not by membership) or keeps a disabled member.
+    #[tokio::test]
+    async fn the_readers_of_a_private_domain_are_owner_members_and_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.add_user("gone", "gone", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        auth.set_domain_visibility("lab", true, "keeper")
+            .await
+            .unwrap();
+        for member in ["mem", "gone"] {
+            auth.upsert_domain_member("lab", member, MemberLevel::Viewer, "keeper")
+                .await
+                .unwrap();
+        }
+        auth.set_disabled("gone", true).await.unwrap();
+        let access = DomainAccess::new(auth);
+        assert_eq!(access.readers_of("shared").await.unwrap(), None);
+        let readers = access.readers_of("lab").await.unwrap().unwrap();
+        let expected: HashSet<String> = ["keeper", "boss", "mem"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(readers, expected);
     }
 
     /// A renamed domain keeps who may do what: the rights answered for the

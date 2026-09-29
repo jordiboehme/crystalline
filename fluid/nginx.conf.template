@@ -134,6 +134,14 @@ server {
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
 
+        # The change stream, GET /api/v1/events, is a server-sent event
+        # stream the web UI keeps open per tab. The daemon sends
+        # X-Accel-Buffering: no on it, which switches buffering off for that
+        # response on its own; this line is the belt to that brace, for a
+        # config that strips upstream headers. The daemon writes a comment on
+        # it every 15 s, well inside the 120 s read timeout.
+        proxy_buffering off;
+
         # No URI part after the upstream, and that is load bearing. With none,
         # nginx passes the request URI exactly as the client sent it. Add a
         # trailing slash or any path and nginx switches rules: it then sends

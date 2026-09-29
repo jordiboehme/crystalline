@@ -6,9 +6,9 @@
 //! library, so it stays an implementation detail hidden from users and from
 //! the rest of the workspace.
 //!
-//! Merge is plain-text three-way (base, local, upstream) in v1; a
-//! frontmatter-aware merge that reconciles YAML keys structurally rather than
-//! by line is future work.
+//! Merge is three-way (base, local, upstream): the frontmatter key by key
+//! through [`crystalline_core::frontmatter::merge_text`], the body and any
+//! frontmatter that cannot be cut into keys line by line.
 //!
 //! This crate depends on `crystalline-core` only among workspace crates: it
 //! reads and writes plain files (the working tree, the base snapshot, origin

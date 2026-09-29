@@ -809,7 +809,24 @@ fn single_domain(
                            all exist but are not grouped on the forge yet. \
                            All four are always present, quiet rather than \
                            absent off the stacked path, so one reader handles \
-                           either path.\n\nOn a domain that reviews changes \
+                           either path.\n\n`kept_branches` lists share \
+                           branches Crystalline keeps upstream instead of \
+                           deleting them: a merged, declined or withdrawn \
+                           share's branch that an open pull request is based \
+                           on or comes from, one whose pull request cannot \
+                           move because the target branch no longer exists, \
+                           one GitHub refused to delete and a declined or \
+                           withdrawn share's branch that a waiting move \
+                           still needs. Each entry carries `branch`, \
+                           `number`, `onto`, `why` (`merged`, `declined` or \
+                           `withdrawn`), `kind` (`base`, `head`, \
+                           `target_gone`, `delete_refused` or `awaited`), \
+                           `blocked_by` (the pull request in the way, null \
+                           when the open pull requests could not be listed \
+                           or the delete was refused), `reason` (the forge's \
+                           answer, null when there is none) and `message`, \
+                           the sentence to show. Always present, empty when \
+                           nothing is kept.\n\nOn a domain that reviews changes \
                            three more keys say where the drafts stand. \
                            `my_drafts` counts this account's own draft \
                            changes, `drafts` counts every actor's, and \
@@ -838,6 +855,16 @@ fn single_domain(
                 "stack_wedged": [],
                 "repair_pending": false,
                 "stack_link_pending": false,
+                "kept_branches": [{
+                    "branch": "crystalline/share-7",
+                    "number": 7,
+                    "onto": "main",
+                    "why": "merged",
+                    "kind": "base",
+                    "blocked_by": 12,
+                    "reason": "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.",
+                    "message": "Branch crystalline/share-7 is kept: pull request #12 is based on it and could not be moved to main. The next sync tries again."
+                }],
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),
@@ -1726,8 +1753,11 @@ pub struct WithdrawBody {
     summary = "Withdraw one of a team domain's open proposals.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Closes the proposal's pull request, deletes \
-                   its branch best-effort and records it as withdrawn. With \
+                   `personal`). Closes the proposal's pull request, retires \
+                   its branch and records it as withdrawn. The branch is \
+                   deleted unless an open pull request is based on it or \
+                   comes from it; then it is kept and the sync status \
+                   names it under `kept_branches`. With \
                    `revert` true the shared files are restored from the \
                    origin as well, and files a reviewer amended on the \
                    proposal branch are left alone and reported under \
@@ -2819,7 +2849,8 @@ pub struct RenameBody {
 /// The response is the engine's own report, unchanged: `{ domain, previous,
 /// local_only, manifest_written, manifest_draft, rewritten, left_behind,
 /// aliases, shadows, moved }`, plus a `note` when the new name was another
-/// domain's canonical name or alias.
+/// domain's canonical name or alias, or when the MANIFEST's frontmatter
+/// could not take the new `domain_name` and was left as it was.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/rename",
@@ -3042,6 +3073,43 @@ pub async fn github_domain_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example's kept entry is a real one: its message is the sentence
+    /// `kept_message` words for the same entry, so the document can never
+    /// show a sentence no surface prints.
+    #[test]
+    fn the_status_example_uses_the_real_kept_sentence() {
+        use crystalline_remote::state::{BranchKept, KeptKind, QueuedBranch, RetireWhy};
+        let doc = serde_json::to_value(crate::openapi_document()).unwrap();
+        let example = &doc["paths"]["/api/v1/domains/{domain}/sync"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["example"]["kept_branches"][0];
+        let entry = QueuedBranch {
+            number: 7,
+            branch: "crystalline/share-7".to_string(),
+            onto: "main".to_string(),
+            why: RetireWhy::Merged,
+            kept: Some(BranchKept {
+                blocked_by: Some(12),
+                reason: "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.".to_string(),
+                kind: KeptKind::Base,
+            }),
+        };
+        assert_eq!(
+            example["message"].as_str(),
+            entry.kept_message().as_deref(),
+            "{example}"
+        );
+        assert_eq!(
+            example["reason"],
+            entry.kept.as_ref().unwrap().reason.as_str()
+        );
+        assert_eq!(example["branch"], entry.branch.as_str());
+        assert_eq!(example["number"], entry.number);
+        assert_eq!(example["onto"], entry.onto.as_str());
+        assert_eq!(example["why"], "merged");
+        assert_eq!(example["kind"], "base");
+        assert_eq!(example["blocked_by"], 12);
+    }
 
     /// Each branch names a remedy that works in the state it leaves, and
     /// only that one: pasting the rolled-back branch's owner route straight

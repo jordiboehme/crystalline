@@ -525,6 +525,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
         &[],
         auth.clone(),
         None,
+        None,
     )
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

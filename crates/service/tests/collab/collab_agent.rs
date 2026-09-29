@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
-use crystalline_index::TursoStore;
+use crystalline_index::{Store, TursoStore};
 use crystalline_service::Engine;
 use crystalline_service::collab::session::{
     AgentPeer, CollabSessions, Frame, Joined, MAX_PARTICIPANTS,
@@ -34,6 +34,70 @@ use yrs::sync::{Awareness, AwarenessUpdate, Message, MessageReader, SyncMessage}
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres virtual-domain leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A recycled pid must never adopt a schema a panicking run left behind.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ctv_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
+}
+
+/// Run a body against Turso (always) and Postgres (when configured), each with a
+/// fresh, isolated store handed to the engine as a trait object.
+macro_rules! both_backends {
+    ($name:ident, $body:path) => {
+        #[tokio::test]
+        async fn $name() {
+            {
+                let store = TursoStore::open_in_memory().await.unwrap();
+                let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+                $body(store).await;
+            }
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(url) = pg_url() {
+                    let schema = unique_schema();
+                    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .expect("open the postgres test schema");
+                    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
+                    $body(store).await;
+                    // Drop the schema through a fresh connection (the boxed store
+                    // no longer exposes the inherent drop_schema).
+                    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .unwrap();
+                    cleanup.drop_schema().await.unwrap();
+                }
+            }
+        }
+    };
+}
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
@@ -308,6 +372,36 @@ async fn an_agent_edit_composes_with_a_typed_line_and_lands_live() {
         on_disk.contains("a person typed this") && on_disk.contains("and the agent added that"),
         "and then the file carries both: {on_disk:?}"
     );
+}
+
+/// An edit that composed into an open room announces nothing: nothing
+/// landed. The room's save a moment later is what announces, once.
+#[tokio::test]
+async fn an_agent_edit_into_an_open_room_announces_nothing_until_the_room_saves() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "a person typed this").await;
+    let mut rx = engine.changes().subscribe();
+    let receipt = engine
+        .edit_engram_as(
+            &append_edit("and the agent added that", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["landed"].as_str(), Some("live"));
+    assert!(rx.try_recv().is_err(), "nothing landed, nothing announced");
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let saved = rx.try_recv().expect("the room's save announced");
+    assert_eq!(saved.change.name(), "engram");
+    assert!(rx.try_recv().is_err(), "once");
 }
 
 /// A guarded split of a page somebody is typing in is guarded against the
@@ -1697,6 +1791,59 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
     assert_eq!(on_disk, ALPHA, "the reviewed file stands: {on_disk:?}");
 }
 
+/// Issue 112, spec item 7: the question an overwrite puts and the write it
+/// asks about resolve ONE landing. Bob works inside ada's draft of a page
+/// whose file name is not its title's slug, and ada has that page open. The
+/// preview has to screen the file the write lands in, not the slug path the
+/// title spells: screening `beta.md` would refuse the join, answer `None`,
+/// and the write would then compose into ada's open page without asking.
+#[tokio::test]
+async fn a_joined_overwrite_of_a_title_named_page_asks_about_the_room_the_write_lands_in() {
+    let (tmp, engine, _scratch) = engine_fixture(true).await;
+    std::fs::write(
+        tmp.path().join("eng/Beta Notes.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nA rule about beta.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let hers = sessions.join("eng", "beta", Some("ada")).await.unwrap();
+    let doc = sync_client(&hers).await;
+    append_line(&hers, &doc, "ada typed this").await;
+
+    let bob = crystalline_service::Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    };
+    let join = crystalline_service::Join {
+        account: "bob".to_string(),
+        holder: crystalline_service::Holder::Process(1),
+        domain: "eng".to_string(),
+        path: "Beta Notes.md".to_string(),
+        owner: "ada".to_string(),
+        expires_at: None,
+    };
+    let capture = wholesale_capture("Beta", REPLACEMENT, true);
+    let target = engine
+        .live_write_target(&capture, &bob, Some(&join), None)
+        .await
+        .expect("the preview finds ada's open page, so the question is put");
+    assert_eq!(target.permalink, "beta");
+
+    let receipt = engine
+        .write_engram_present(&capture, None, &bob, Some(&join), None)
+        .await
+        .expect("the capture lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    assert_eq!(receipt["path"].as_str(), Some("Beta Notes.md"), "{receipt}");
+    assert_eq!(
+        receipt["joined"].as_str(),
+        Some("landed in ada's draft"),
+        "{receipt}"
+    );
+}
+
 /// **Ruling from review.** The refusal a client that cannot be asked gets is
 /// the same one at the legacy era, which is what nearly every client in the
 /// field still speaks: the gate is era AND capability, so a handshake at
@@ -2164,3 +2311,56 @@ async fn a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache() {
     );
     drop(scratch);
 }
+
+/// Item 4: the preview reads the domain's id and never registers it. A domain
+/// the index has never seen has no document anybody can have open, so the
+/// answer is `None`, and asking left no row behind.
+async fn a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cold = tmp.path().join("cold");
+    std::fs::create_dir_all(&cold).unwrap();
+    std::fs::write(
+        cold.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: cold\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# cold\n\n## Scope\n\n- Everything about cold\n\n## When to Use\n\n- Route here for cold questions\n",
+    )
+    .unwrap();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("cold".to_string(), DomainEntry::file(cold));
+    // No sync: the domain is registered and the index has never seen it.
+    let engine = Arc::new(
+        Engine::new(store.clone(), cfg, None, None).with_state_dir(tmp.path().join("state")),
+    );
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let capture = WriteParams {
+        domain: "cold".to_string(),
+        title: "Gamma".to_string(),
+        content: "x".to_string(),
+        folder: None,
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite: true,
+        share_link: None,
+        model: None,
+    };
+    let target = engine
+        .live_write_target(
+            &capture,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await;
+    assert!(target.is_none(), "no row, so no open document");
+    let row = { store.lock().await.domain_id("cold").await.unwrap() };
+    assert_eq!(row, None, "a preview registers nothing");
+}
+both_backends!(
+    a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing,
+    a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_nothing_body
+);

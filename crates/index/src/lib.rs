@@ -38,14 +38,14 @@ pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_te
 pub use factory::{open_store, store_location};
 pub use store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
     MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
     RecentFilter, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo, StoredEngram,
-    TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status, merge_vocabularies,
-    parse_metadata_filters, retired_factor, salience_prior,
+    TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status, lookup_in_domain,
+    merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.
@@ -62,8 +62,9 @@ pub use store::{
 /// own argument type is crate-private.
 #[doc(hidden)]
 pub use store::{
-    link_frontier_sql, referencing_domains_sql, relation_frontier_sql,
-    reset_spelled_references_sql, resolve_pending_sql, spelled_references_sql,
+    count_references_to_sql, link_frontier_sql, referencing_domains_sql, relation_frontier_sql,
+    reset_spelled_references_sql, resolve_pending_sql, resolve_references_to_sql,
+    resolve_spelled_references_sql, spelled_references_sql,
 };
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
@@ -71,9 +72,9 @@ pub use sweep::{
     SweepReport, UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
-    DomainScan, NoReindexHooks, ReindexHooks, SyncReport, apply_scan, apply_scan_with_slab,
-    refresh_tag_aliases, reindex_domains, resolve_forward_refs, scan_domain, scan_paths,
-    sync_domain, sync_domain_with,
+    DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReindexHooks, SyncReport, apply_scan,
+    apply_scan_with_slab, refresh_tag_aliases, reindex_domains, resolve_forward_refs, scan_domain,
+    scan_paths, sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
 pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};

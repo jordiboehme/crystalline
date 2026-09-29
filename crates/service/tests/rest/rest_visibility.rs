@@ -684,6 +684,43 @@ async fn the_evolve_queue_names_no_hidden_domain() {
     assert_eq!(named.status(), 404);
     let ghost = out.get("/api/v1/evolve?domains=ghost").await;
     assert_eq!(ghost.status(), 404);
+
+    // A rule that reads the graph around a visible engram must not reach into
+    // a hidden domain either. An ingestion record in `lab` that fed `open/alpha`
+    // makes V111 fire on alpha, which carries no resource, and its evidence
+    // names the record by domain and permalink.
+    let intake = boss
+        .post_json(
+            "/api/v1/domains/lab/engrams",
+            json!({
+                "title": "Intake",
+                "type": "ingestion",
+                "content": "# Intake\n\n- produced [[open:Alpha]]\n",
+            }),
+        )
+        .await;
+    assert_eq!(intake.status(), 201, "{:?}", intake.text().await);
+
+    let v111_on_alpha = |queue: &serde_json::Value| {
+        queue["queue"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|f| f["rule"] == "V111" && f["domain"] == "open" && f["permalink"] == "alpha")
+        })
+    };
+    let swept = boss.get_json("/api/v1/evolve?rules=V111&limit=100").await;
+    assert!(
+        v111_on_alpha(&swept),
+        "the probe fires for a caller who sees the record: {swept}"
+    );
+
+    let scoped = out.get_json("/api/v1/evolve?rules=V111&limit=100").await;
+    assert!(
+        !v111_on_alpha(&scoped),
+        "a record in a hidden domain feeds nothing this caller is told about: {scoped}"
+    );
+    let scoped = out.get_json("/api/v1/evolve?limit=100").await.to_string();
+    assert!(!scoped.contains("lab"), "{scoped}");
+    assert!(!scoped.contains("intake"), "{scoped}");
 }
 
 /// **Privatizing a domain that is already private changes nothing.**

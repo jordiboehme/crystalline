@@ -50,6 +50,26 @@ const SHARING_DIRECT: &str = "direct";
 /// the enum kind the other two registry entries use.
 pub const DOMAIN_NAME_KEY: &str = "domain_name";
 
+/// Declare `name` as the domain's canonical name in MANIFEST `source`: an
+/// existing [`DOMAIN_NAME_KEY`] key, however it is spelled, is rewritten in
+/// place, a missing one goes right after `title`, where a person adding it
+/// by hand usually puts it. Two writers that pick the same place leave a
+/// merge nothing to reconcile. A frontmatter that cannot be cut into key
+/// blocks (flow style) is left as it is; see
+/// [`crate::emit::set_frontmatter_field_after`].
+pub fn set_declared_name(source: &str, name: &str) -> String {
+    crate::emit::set_frontmatter_field_after(source, DOMAIN_NAME_KEY, name, "title")
+}
+
+/// Whether [`set_declared_name`] can write a name into MANIFEST `source`:
+/// true when it has no frontmatter (a block is created) or one that cuts
+/// into key blocks, false for flow style and anything else it leaves as it
+/// is.
+pub fn can_declare_name(source: &str) -> bool {
+    crate::frontmatter::split_frontmatter(source)
+        .is_none_or(|parts| crate::frontmatter::key_blocks(parts.yaml).is_some())
+}
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -76,7 +96,7 @@ recorded_at: {today}\n\
 - Note the folder layout new engrams should reuse\n"
     );
     if validate_domain_name(name).is_ok() {
-        crate::emit::set_frontmatter_field(&text, DOMAIN_NAME_KEY, name)
+        set_declared_name(&text, name)
     } else {
         text
     }

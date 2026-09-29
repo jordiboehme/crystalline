@@ -42,6 +42,26 @@ async fn engine_fixture() -> (
     Arc<Engine>,
     crate::support::ScratchStateDir,
 ) {
+    fixture_with(false).await
+}
+
+/// [`engine_fixture`] with a state directory, which a rename and a removal
+/// need for their journals.
+async fn engine_fixture_with_state() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    fixture_with(true).await
+}
+
+async fn fixture_with(
+    state: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
     let scratch = crate::support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -70,12 +90,11 @@ async fn engine_fixture() -> (
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
-    let engine = Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ));
+    let mut engine = Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path));
+    if state {
+        engine = engine.with_state_dir(root.join("state"));
+    }
+    let engine = Arc::new(engine);
     engine.sync(None).await.unwrap();
     (tmp, engine, scratch)
 }
@@ -204,6 +223,45 @@ async fn a_pause_lands_the_save_with_the_separator_reapplied() {
             .contains(&"eng".to_string()),
         "a landed co-editing save marks its domain pending"
     );
+}
+
+/// The room's save is a feed point: one `modified` per landed save, and
+/// nothing for a tick that had nothing to save.
+#[tokio::test]
+async fn a_room_save_announces_once() {
+    let (_tmp, engine, _scratch) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let mut rx = engine.changes().subscribe();
+    append_line(&joined, &doc, "typed in the room").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    let saved = next_control(&mut joined.rx).await;
+    assert!(matches!(saved, Control::Saved { .. }));
+    let first = rx.try_recv().expect("the save announced");
+    match &first.change {
+        crystalline_service::changes::Change::Engram(change) => {
+            assert_eq!(change.permalink, "alpha");
+            assert_eq!(
+                change.kind,
+                crystalline_service::changes::ChangeKind::Modified
+            );
+            assert_eq!(
+                change.actor, None,
+                "a room saves as the machine owner, who has no label"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "once");
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    assert!(rx.try_recv().is_err(), "a quiet tick announces nothing");
 }
 
 #[tokio::test]
@@ -1154,4 +1212,86 @@ async fn a_converged_room_settles_and_still_merges_an_external_edit_cleanly() {
         "the canonical spelling this fix introduced survives the merge: {on_disk}"
     );
     assert!(on_disk.contains("a further thought"), "{on_disk}");
+}
+
+/// A captured audience with a room open: a rename and a removal each close the rooms of
+/// the domain first, and the save a closing room lands goes out under the old
+/// name. It must carry the audience captured before the room closed, never
+/// the ordinary check, which after the records move would no longer hide the
+/// name. Catches a capture taken after `close_editors` or `dispose_domain`.
+#[tokio::test]
+async fn a_room_saved_by_a_rename_or_a_removal_carries_the_captured_audience() {
+    use crystalline_service::changes::{Change, DomainAudience};
+    use crystalline_service::rest::{AuthStore, MemberLevel, Role};
+    use std::collections::HashSet;
+
+    let (tmp, engine, _scratch) = engine_fixture_with_state().await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for (name, role) in [("keeper", Role::Editor), ("mem", Role::Viewer)] {
+        auth.add_user(name, name, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    for domain in ["eng", "oak"] {
+        auth.set_domain_visibility(domain, true, "keeper")
+            .await
+            .unwrap();
+    }
+    auth.upsert_domain_member("eng", "mem", MemberLevel::Viewer, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let readers = |names: &[&str]| {
+        DomainAudience::Accounts(names.iter().map(|n| n.to_string()).collect::<HashSet<_>>())
+    };
+    let room_save = |heard: &[Change], domain: &str, path: &str| {
+        heard
+            .iter()
+            .find(|c| matches!(c, Change::Engram(e) if e.domain == domain && e.path == path))
+            .cloned()
+            .unwrap_or_else(|| panic!("no room save for {domain}/{path}: {heard:?}"))
+    };
+
+    // A rename closes the room over eng's alpha with a typed line unsaved.
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed before the rename").await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .rename_domain(
+            "eng",
+            "elm",
+            true,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let mut heard = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        heard.push(envelope.change);
+    }
+    let saved = room_save(&heard, "eng", "alpha.md");
+    assert_eq!(saved.audience(), Some(&readers(&["keeper", "mem"])));
+    drop(joined);
+
+    // A removal closes the room over oak's note the same way.
+    let joined = sessions.join("oak", "oak-note", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed before the removal").await;
+    engine
+        .unregister_domain("oak", &crystalline_service::Scope::Unrestricted, false, &[])
+        .await
+        .unwrap();
+    let mut heard = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        heard.push(envelope.change);
+    }
+    let saved = room_save(&heard, "oak", "oak-note.md");
+    assert_eq!(saved.audience(), Some(&readers(&["keeper"])));
 }

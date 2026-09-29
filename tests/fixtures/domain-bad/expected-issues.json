@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "count": 57,
+  "count": 58,
   "issues": [
     {
       "path": "domain-bad/CHECKLIST.md",
@@ -86,6 +86,11 @@
       "path": "domain-bad/dup-title-b.md",
       "rule": "L003",
       "severity": "warning"
+    },
+    {
+      "path": "domain-bad/duplicate-key.md",
+      "rule": "E010",
+      "severity": "error"
     },
     {
       "path": "domain-bad/frontmatter-invalid.md",

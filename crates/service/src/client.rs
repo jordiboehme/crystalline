@@ -649,7 +649,7 @@ async fn build_embedded(
     tokio::spawn(async move {
         let _ = bg.sync(None).await;
         // As at the daemon's startup, once the first sync has returned.
-        bg.adopt_domain_names_after("the initial sync").await;
+        bg.settle_after_initial_sync().await;
         if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
             // Schedule on the worker spawned just above rather than embedding

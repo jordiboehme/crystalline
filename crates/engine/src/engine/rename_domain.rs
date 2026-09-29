@@ -71,8 +71,11 @@ impl Engine {
     /// The report: `{ domain, previous, local_only, manifest_written,
     /// manifest_draft, rewritten: [{domain, engrams, references}],
     /// left_behind: [{domain, path, references}], aliases, shadows, moved }`,
-    /// plus a `note` when something is shadowed. A local rename answers the
-    /// same shape, with nothing written and nothing rewritten.
+    /// plus a `note` when something is shadowed or when the MANIFEST's
+    /// frontmatter cannot take the new name key by key (flow style), which
+    /// leaves the MANIFEST as it is and reports `manifest_written: false`. A
+    /// local rename answers the same shape, with nothing written and nothing
+    /// rewritten.
     pub async fn rename_domain(
         &self,
         domain: &str,
@@ -228,8 +231,22 @@ impl Engine {
                     )));
                 }
                 let _origins = self.lock_both_origins(old, new).await;
+                // A resumed journal may already have carried the old name's
+                // privacy records over, so who could read it is no longer
+                // known: its events fail closed, to the machine owner only.
+                // Taken before `close_editors`, whose room saves land under
+                // the old name.
+                let _captured =
+                    self.capture_audience(old, DomainAudience::Accounts(HashSet::new()));
                 self.close_editors(old).await;
-                let mut report = self.finish_rename(journal, &state_dir, true).await?;
+                let mut report = self
+                    .finish_rename(
+                        journal,
+                        &state_dir,
+                        true,
+                        DomainAudience::Accounts(HashSet::new()),
+                    )
+                    .await?;
                 if let Value::Object(map) = &mut report {
                     map.entry("shadows").or_insert_with(|| json!([]));
                 }
@@ -271,15 +288,30 @@ impl Engine {
                 )
             }));
         }
-        let manifest_draft = if local_only {
+        let reviewing_draft = if local_only {
             false
         } else {
             self.refuse_unwritable_manifest(old, new).await?
         };
+        // Judged on the text the MANIFEST step would edit: in a reviewing
+        // domain the caller's draft when there is one. A kept MANIFEST is not
+        // drafted.
+        let manifest_kept = !local_only && !self.manifest_takes_name(old, new, scope).await?;
+        let manifest_draft = reviewing_draft && !manifest_kept;
         self.refuse_shared_index(old).await?;
         self.refuse_leftovers(new, &state_dir, scope).await?;
         // What the journal belongs to, read before anything is paused.
         let owner = self.rename_owner(&state_dir).await?;
+        // Who could read the old name, read while the privacy records still
+        // carry it and before anything is paused (ruled 2026-09-27): the
+        // rename's event for the old name carries this snapshot, never the
+        // registry after the rename re-keyed it.
+        let old_audience = self.domain_audience(old).await;
+        // Every event under the old name from here on (the MANIFEST and
+        // relink edits inside it, the room saves `close_editors` lands) and
+        // every one the ring holds for it carries the snapshot: a path under
+        // the old name leaks the name as surely as the domain event does.
+        let _captured = self.capture_audience(old, old_audience.clone());
 
         // An origin pull or share of this domain finishes first, and none
         // starts until the rename is done, under either name: the lock is
@@ -367,7 +399,7 @@ impl Engine {
             relink_spellings,
             // What the MANIFEST says once the rename is done: the new name,
             // unless the write is a draft the folder does not carry yet.
-            canonical: if local_only || manifest_draft {
+            canonical: if local_only || manifest_draft || manifest_kept {
                 canonical
             } else {
                 Some(new.to_string())
@@ -375,6 +407,7 @@ impl Engine {
             caller: rename_caller(scope),
             writable,
             manifest_draft,
+            manifest_kept,
             relinked: None,
             owner: Some(owner),
             done: Vec::new(),
@@ -383,18 +416,23 @@ impl Engine {
             self.rename_pause.resume(&[old, new]);
             return Err(io_error(e));
         }
-        let mut report = self.finish_rename(journal, &state_dir, true).await?;
+        let mut report = self
+            .finish_rename(journal, &state_dir, true, old_audience)
+            .await?;
         if let Value::Object(map) = &mut report {
             if !shadows.is_empty() {
-                map.insert(
-                    "note".to_string(),
-                    json!(format!(
-                        "'{new}' was the name {} answered to; it now reaches this domain. \
-                         Rename {} or change its domain_name to line them up.",
-                        quoted_list(&shadows),
-                        if shadows.len() == 1 { "it" } else { "them" }
-                    )),
+                let shadow_note = format!(
+                    "'{new}' was the name {} answered to; it now reaches this domain. \
+                     Rename {} or change its domain_name to line them up.",
+                    quoted_list(&shadows),
+                    if shadows.len() == 1 { "it" } else { "them" }
                 );
+                // After the MANIFEST note finish_rename may have put there.
+                let note = match map.get("note").and_then(Value::as_str) {
+                    Some(first) => format!("{first} {shadow_note}"),
+                    None => shadow_note,
+                };
+                map.insert("note".to_string(), json!(note));
             }
             map.insert("shadows".to_string(), json!(shadows));
         }
@@ -508,7 +546,12 @@ impl Engine {
         // No sync here: every opener runs its own first sync after this,
         // and the daemon calls this before its socket binds, where a scan of
         // the whole domain would hold every client back.
-        self.finish_rename(journal, &state_dir, false)
+        // Finished at a start, after the records may already have moved: who
+        // could read the old name is no longer known, so its events fail
+        // closed, to the machine owner only.
+        let nobody = DomainAudience::Accounts(HashSet::new());
+        let _captured = self.capture_audience(&journal.old, nobody.clone());
+        self.finish_rename(journal, &state_dir, false, nobody)
             .await
             .map(Some)
     }
@@ -752,12 +795,16 @@ impl Engine {
     /// Run every step of `journal` it does not list as done, re-key what
     /// memory holds, write the configuration, publish the names, drop the
     /// journal, lift the pause and, when `sync_after`, sync the domain under
-    /// its new name.
+    /// its new name. Announces both names: the old one under `old_audience`,
+    /// captured before the first step (or nobody, for a journal resumed
+    /// after the records may have moved), the new one under the ordinary
+    /// per-session check, since its records were re-keyed, not destroyed.
     async fn finish_rename(
         &self,
         mut journal: RenameJournal,
         state_dir: &Path,
         sync_after: bool,
+        old_audience: DomainAudience,
     ) -> Result<Value> {
         let (old, new) = (journal.old.clone(), journal.new.clone());
         let mut moved: Vec<&'static str> = Vec::new();
@@ -822,6 +869,15 @@ impl Engine {
         // spellings as aliases; references the index row step unbound (the
         // new name was another domain's spelling) bind again. Before the
         // journal goes: a crash here is finished by redoing just this.
+        //
+        // The new name is held under the old name's audience until the old
+        // name's frame is out. A push that rebinds links announces every
+        // registered domain, the new name among them, with no audience of
+        // its own; a session whose cache predates the rename does not list
+        // the new name as hidden, so without the hold an outsider could hear
+        // a private domain's new name before the old frame marks its cache
+        // stale.
+        let new_held = self.capture_audience(&new, old_audience.clone());
         self.mark_names_stale();
         self.refresh_names().await;
         self.resolve_pending_everywhere().await;
@@ -839,6 +895,15 @@ impl Engine {
             locks.remove(&old);
         }
         self.rename_pause.resume(&[&old, &new]);
+        // The old name's pages refetch into their not-found face and the
+        // switcher picks up the new name; the old name's frame is filtered
+        // against the snapshot, the new one's against each session's own
+        // check, since its records were re-keyed rather than destroyed.
+        self.announce_domain(&old, None, Some(old_audience));
+        // Released before the new name's own frame, which keeps the ordinary
+        // per-session check: the old frame has marked every cache stale.
+        drop(new_held);
+        self.announce_domain(&new, None, None);
 
         let entry = self.domain_entry(&new)?;
         if sync_after && let Err(e) = self.sync(Some(&new)).await {
@@ -849,17 +914,30 @@ impl Engine {
             );
         }
         let relinked = journal.relinked.clone().unwrap_or_default();
-        Ok(json!({
+        let mut report = json!({
             "domain": new,
             "previous": old,
             "local_only": journal.local_only,
-            "manifest_written": journal.done.contains(&RenameStep::Manifest),
+            "manifest_written": journal.done.contains(&RenameStep::Manifest)
+                && !journal.manifest_kept,
             "manifest_draft": journal.manifest_draft,
             "rewritten": relinked.rewritten,
             "left_behind": relinked.left_behind,
             "aliases": entry.aliases,
             "moved": moved,
-        }))
+        });
+        if journal.manifest_kept {
+            let place = if entry.is_overlay() {
+                format!("set it to '{new}' by hand in your draft of the MANIFEST.")
+            } else {
+                format!("set it to '{new}' by hand.")
+            };
+            report["note"] = json!(format!(
+                "The MANIFEST's frontmatter is in a form Crystalline cannot change key by key \
+                 (such as {{title: ...}}), so its domain_name was left as it is; {place}"
+            ));
+        }
+        Ok(report)
     }
 
     /// Pause `old` and `new` and wait for the writes already running in
@@ -899,6 +977,11 @@ impl Engine {
     /// Setting the key to the value it already has changes nothing, so the
     /// step is safe to run twice.
     async fn rename_manifest(&self, journal: &RenameJournal) -> Result<()> {
+        if journal.manifest_kept {
+            // Even an unchanged text gets a `generated` stamp on the edit
+            // path, which a flow-style frontmatter cannot take.
+            return Ok(());
+        }
         let scope = caller_scope(journal.caller.as_ref());
         let virtual_domain = {
             let view = DomainView::for_write(self, &journal.old, &scope).await?;
@@ -914,7 +997,7 @@ impl Engine {
                 &actor,
                 None,
                 &scope,
-                move |current| Ok(set_frontmatter_field(current, DOMAIN_NAME_KEY, &new)),
+                move |current| Ok(crystalline_core::manifest::set_declared_name(current, &new)),
             )
             .await?;
             matches!(source, ContentSource::Virtual) && overlay.is_none()
@@ -1083,13 +1166,7 @@ impl Engine {
     /// case. A file domain is asked by writing and removing a file beside
     /// its MANIFEST, since permission bits do not say who may write.
     async fn refuse_unwritable_manifest(&self, old: &str, new: &str) -> Result<bool> {
-        let refusal = |why: String| {
-            EngineError::Invalid(format!(
-                "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
-                 {new} --local` or pick This machine only in Rename domain on the domain page, which \
-                 leaves the MANIFEST and the links as they are"
-            ))
-        };
+        let refusal = |why: String| manifest_refusal(old, new, why);
         if self.reviews_changes(old) {
             return Ok(true);
         }
@@ -1104,11 +1181,7 @@ impl Engine {
         };
         if let ContentSource::File { root } = &source {
             let abs = join_rel(root, &desc.path);
-            let name = abs
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let probe = abs.with_file_name(format!("{name}.tmp.{}.probe", std::process::id()));
+            let probe = crystalline_core::path::hidden_temp_path(&abs, "probe");
             match std::fs::write(&probe, b"") {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&probe);
@@ -1122,6 +1195,39 @@ impl Engine {
             }
         }
         Ok(false)
+    }
+
+    /// Whether the MANIFEST the MANIFEST step will edit can take a new name
+    /// key by key: the caller's draft of it in a reviewing domain when there is
+    /// one, else the base, read through the same view `rename_manifest` edits.
+    /// False for a frontmatter in flow style or one that cannot be cut into
+    /// keys, which the step then leaves as it is.
+    async fn manifest_takes_name(
+        &self,
+        old: &str,
+        new: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<bool> {
+        let view = DomainView::for_write(self, old, scope).await?;
+        // No MANIFEST at all, in a file or a reviewing domain alike, is the
+        // refusal a file domain gets, naming `--local`.
+        let (desc, source) = match view.resolve("manifest").await {
+            Ok(found) => found,
+            Err(EngineError::NotFound(_)) => {
+                return Err(manifest_refusal(
+                    old,
+                    new,
+                    format!("domain '{old}' has no MANIFEST to write the new name into"),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(match view.text_at(&source, &desc).await? {
+            Some(text) => crystalline_core::manifest::can_declare_name(&text),
+            // A draft that deletes the MANIFEST: nothing to judge here, and
+            // the step answers for what it finds.
+            None => true,
+        })
     }
 
     /// Every registered domain `scope` may see and write, sorted.
@@ -1641,6 +1747,16 @@ fn quoted_list(names: &[String]) -> String {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// The refusal of a full rename whose MANIFEST cannot be written, naming
+/// the way out: a rename on this machine only.
+fn manifest_refusal(old: &str, new: &str, why: String) -> EngineError {
+    EngineError::Invalid(format!(
+        "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
+         {new} --local` or pick This machine only in Rename domain on the domain page, which \
+         leaves the MANIFEST and the links as they are"
+    ))
 }
 
 #[cfg(test)]

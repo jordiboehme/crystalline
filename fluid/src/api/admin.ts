@@ -450,6 +450,12 @@ export interface RenameReport {
   manifestWritten: boolean;
   /** Whether the MANIFEST write is a draft still waiting to be shared. */
   manifestDraft: boolean;
+  /**
+   * What the engine says a person still has to do, shown as given: a MANIFEST
+   * it could not change key by key, or a name another domain answered to.
+   * Null when there is nothing to say.
+   */
+  note: string | null;
   rewritten: RenameRewritten[];
   leftBehind: RenameLeftBehind[];
   /** Every former name this domain now answers to as well as its new one. */
@@ -514,6 +520,7 @@ export async function renameDomain(
     localOnly: report?.local_only === true,
     manifestWritten: report?.manifest_written === true,
     manifestDraft: report?.manifest_draft === true,
+    note: asString(report?.note),
     rewritten: asArray(report?.rewritten)
       .map(readRenameRewritten)
       .filter((row): row is RenameRewritten => row !== null),
@@ -726,6 +733,15 @@ export interface SyncStatus {
   /** Every layer exists, but they are not grouped on the forge yet. */
   stackLinkPending: boolean;
   /**
+   * Share branches kept on the forge instead of deleted: a merged, declined
+   * or withdrawn share's branch that an open pull request is based on or
+   * comes from, one whose pull request cannot move because its target is
+   * gone, one GitHub refused to delete, or one a waiting move still needs.
+   * Each carries the sentence to show, the forge's reason and what kept it.
+   * Empty when nothing is kept, or from an older server.
+   */
+  keptBranches: KeptBranch[];
+  /**
    * Whose credential a write to this origin goes out on: `instance` for the
    * one machine credential, `personal` for the acting person's own. Null when
    * the report did not say.
@@ -753,6 +769,15 @@ export interface SyncStatus {
 // the owner's slot. A reader with nothing behind it is a claim to keep true
 // for nothing, so the key is ignored until a surface asks for it - at which
 // point it is five lines beside `shareIdentity`. The CLI renders it today.
+
+/** One kept share branch, as the sync route reports it. */
+export interface KeptBranch {
+  branch: string;
+  message: string;
+  reason: string | null;
+  /** What kept it (`base`, `head`, `target_gone`, `delete_refused`, `awaited`), or null from an older daemon. */
+  kind: string | null;
+}
 
 /** The cache key of one domain's sync status. */
 export function syncStatusKey(domain: string): readonly unknown[] {
@@ -997,6 +1022,9 @@ function readSyncStatus(payload: unknown): SyncStatus {
     stackWedged: asNumbers(record?.stack_wedged),
     repairPending: record?.repair_pending === true,
     stackLinkPending: record?.stack_link_pending === true,
+    keptBranches: asArray(record?.kept_branches)
+      .map(readKeptBranch)
+      .filter((kept): kept is KeptBranch => kept !== null),
     // Off the connection block, where the route puts it, and tolerant: a mode
     // that is not a word is "this report does not say", which every reader
     // treats as the default mode rather than as personal.
@@ -1004,6 +1032,25 @@ function readSyncStatus(payload: unknown): SyncStatus {
     // Read off the report the way the engine writes it, and anything that is
     // not the one word is the policy every domain had before there were two.
     sharing: asString(record?.sharing) === "direct" ? "direct" : "proposal",
+  };
+}
+
+/**
+ * One kept branch, or nothing when it has no name to key a row by or no
+ * sentence to show.
+ */
+function readKeptBranch(value: unknown): KeptBranch | null {
+  const record = asObject(value);
+  const branch = asString(record?.branch);
+  const message = asString(record?.message);
+  if (branch === null || message === null) {
+    return null;
+  }
+  return {
+    branch,
+    message,
+    reason: asString(record?.reason),
+    kind: asString(record?.kind),
   };
 }
 

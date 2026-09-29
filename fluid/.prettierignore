@@ -14,3 +14,8 @@ e2e/fixtures
 # the next format check fail on a file nobody wrote.
 test-results
 playwright-report
+
+# The station game's golden rooms: the generator's own JSON.stringify output,
+# pinned byte for byte by the tests. Prettier would pull short arrays onto one
+# line and a golden would stop being what the generator writes.
+src/game/world/golden/

@@ -550,9 +550,10 @@ pub async fn run_serve(
                 tracing::warn!("initial sync failed: {err}");
             }
             // Once the first sync has returned: the one-time catch-up for a
-            // configuration from before 0.20.0, and any domain_name a
-            // MANIFEST gained while the daemon was down.
-            e.adopt_domain_names_after("the initial sync").await;
+            // configuration from before 0.20.0, any domain_name a MANIFEST
+            // gained while the daemon was down, and one resolve pass over
+            // every domain for what an index upgrade left pending.
+            e.settle_after_initial_sync().await;
             // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on
@@ -661,6 +662,10 @@ pub async fn run_serve(
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
+        // A second receiver of the same signal for the event streams, which
+        // end on it so the drain `run_http` waits for is never held open by
+        // a browser; see `rest::RestState::with_shutdown`.
+        let streams_rx = shared.watch();
         let token = setup_token.clone();
         tokio::spawn(async move {
             // Three failure classes, three sentences, because the remedy
@@ -673,7 +678,7 @@ pub async fn run_serve(
             // actually applies: a `--http` address beats both `service.http`
             // spellings, so telling a flag user to edit the config would be
             // advice that does nothing.
-            let router = match http_service(allowed_hosts, e, sessions, token).await {
+            let router = match http_service(allowed_hosts, e, sessions, token, streams_rx).await {
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
@@ -1200,11 +1205,39 @@ async fn http_service(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<axum::Router> {
-    let auth = Arc::new(
-        crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
-    );
-    http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)
+    http_service_at(
+        &crystalline_core::config::web_auth_db_path()?,
+        allowed_hosts,
+        engine,
+        http_sessions,
+        setup_token,
+        shutdown,
+    )
+    .await
+}
+
+/// [`http_service`] over the accounts database at `auth_db`, so a test can
+/// build the router `run_serve` serves, shutdown wiring included, without
+/// this machine's own accounts file.
+async fn http_service_at(
+    auth_db: &std::path::Path,
+    allowed_hosts: Vec<String>,
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<axum::Router> {
+    let auth = Arc::new(crate::rest::AuthStore::open(auth_db).await?);
+    http_router_with_shutdown(
+        engine,
+        http_sessions,
+        &allowed_hosts,
+        auth,
+        setup_token,
+        shutdown,
+    )
 }
 
 /// Serve the built router on a bound listener until shutdown.
@@ -1622,6 +1655,47 @@ pub fn http_router(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
+    http_router_inner(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        setup_token,
+        None,
+    )
+}
+
+/// [`http_router`] for the daemon itself: the same router, with the
+/// shutdown watch every event stream selects on. See
+/// `rest::RestState::with_shutdown`.
+pub fn http_router_with_shutdown(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<axum::Router> {
+    http_router_inner(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        setup_token,
+        Some(shutdown),
+    )
+}
+
+/// The body both router builders above share; `shutdown` is `None` for a
+/// router with no daemon behind it.
+fn http_router_inner(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> anyhow::Result<axum::Router> {
     #[cfg(feature = "fluid-ui")]
     {
         http_router_with_assets::<crate::ui::FluidAssets>(
@@ -1630,6 +1704,7 @@ pub fn http_router(
             allowed_hosts,
             auth,
             setup_token,
+            shutdown,
         )
     }
     #[cfg(not(feature = "fluid-ui"))]
@@ -1647,6 +1722,7 @@ pub fn http_router(
             api,
             setup_token,
             mcp_auth,
+            shutdown,
         )?;
         Ok(router.fallback_service(service))
     }
@@ -1663,6 +1739,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<axum::Router> {
     // One snapshot for all three keys: they are read once when the HTTP surface
     // starts, like `service.read_only`, and `ui_enabled`
@@ -1682,6 +1759,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         api,
         setup_token,
         mcp_auth,
+        shutdown,
     )?;
     if !ui {
         return Ok(router.fallback_service(service));
@@ -1768,9 +1846,16 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// route; `None` closes the token path, which is what a loopback bind wants.
 /// `mcp_auth` is the store the identity gate resolves agent tokens through,
 /// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
+/// `shutdown` is the daemon's shutdown watch, which every event stream ends
+/// on; `None` for a router with no daemon behind it.
 ///
 /// Also where the engine is handed its private-domain resolver, since this is
 /// the one place an accounts store and the engine meet on every HTTP path.
+///
+/// Eight parameters, each a separate startup setting both router builders
+/// resolve and hand down; a struct for this one private seam would only
+/// rename them.
+#[allow(clippy::too_many_arguments)]
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1779,6 +1864,7 @@ fn http_base(
     api: bool,
     setup_token: Option<String>,
     mcp_auth: Option<Arc<crate::rest::AuthStore>>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -1872,11 +1958,16 @@ fn http_base(
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
     // that daemon is deliberately not offering.
+    // With the API off the shutdown watch is simply dropped: no event stream
+    // is served to end on it.
     let rest = if api {
-        Some(crate::rest::router(
-            crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
-                .with_setup_token(setup_token),
-        ))
+        let state = crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
+            .with_setup_token(setup_token);
+        let state = match shutdown {
+            Some(rx) => state.with_shutdown(rx),
+            None => state,
+        };
+        Some(crate::rest::router(state))
     } else {
         None
     };
@@ -2944,6 +3035,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The router `run_serve` builds ends an open event stream when the
+    /// daemon's shutdown watch flips. Catches `http_service`
+    /// building the router without the watch, where a stream would hold
+    /// the drain until its browser hung up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_served_router_ends_an_event_stream_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let config = crystalline_core::config::GlobalConfig {
+            auth: Some(crystalline_core::config::AuthConfig {
+                anonymous: Some(true),
+                ..crystalline_core::config::AuthConfig::default()
+            }),
+            ..crystalline_core::config::GlobalConfig::default()
+        };
+        let engine = Arc::new(Engine::new(
+            Arc::new(TokioMutex::new(store)),
+            config,
+            None,
+            None,
+        ));
+        let (flip, rx) = watch::channel(false);
+        let router = http_service_at(
+            &dir.path().join("web-auth.db"),
+            Vec::new(),
+            engine,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            rx,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut resp = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/api/v1/events"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Not unwrapped: a router that dropped the watch has no receiver
+        // left, and the stream that never ends is the failure to see.
+        let _ = flip.send(true);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(_)) = resp.chunk().await {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the body closes on shutdown");
+    }
 
     /// Five requests while the first run is held: one run at a time, and
     /// exactly one follow-up for the four that came in during it. The caller

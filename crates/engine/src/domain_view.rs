@@ -58,6 +58,7 @@ use crystalline_index::{
 use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
 
+use crate::changes::{Change, ChangeKind, EngramChanged};
 use crate::engine::{
     ContentSource, Engine, EngineError, EngramText, OVERLAY_NEEDS_IDENTITY, Result, asset_claim,
     folder_slash_lower, is_within_domain, join_rel, note_unmirrored, overlay_descriptor,
@@ -66,6 +67,17 @@ use crate::engine::{
 use crate::params::MoveParams;
 use crate::review::ActorDrafts;
 use crate::share_staging::{OVERLAY_STAGING_DIR, OverlayStaging, write_staged_file};
+
+/// How a miss names the identifier it was asked for: a `crystalline://` URL
+/// by its permalink, the way the resolver's own URL miss names it
+/// (`no engram 'plan' in domain 'team'`), anything else as written. A
+/// co-editing room addresses its engram by URL, and its misses keep reading
+/// like the bare permalink they always showed.
+pub(crate) fn shown(identifier: &str) -> String {
+    CrystallineUrl::parse(identifier)
+        .map(|url| url.permalink)
+        .unwrap_or_else(|| identifier.to_string())
+}
 
 /// What one reader sees in one domain: the folder the team reviewed, with that
 /// reader's own drafts laid over it.
@@ -103,11 +115,72 @@ pub struct DomainView<'a> {
     /// rather than from an inference, and the receipt, which tells the caller
     /// whose draft their work landed in.
     joined: Option<String>,
+    /// Who is writing through the join, when this is one: the label the
+    /// change bus names on the owner's page, since `actor` names the owner
+    /// and the owner is not who made the change. `None` on every other view,
+    /// where the writer is the actor.
+    writer: Option<String>,
+    /// When a pass drops many drafts through this view, the changes its drops
+    /// made, collected instead of announced so the pass announces them once
+    /// and a large one collapses (see [`DomainView::collect_drops`]). `None`,
+    /// the ordinary case, announces each drop as it happens.
+    collected: std::sync::Mutex<Option<Vec<EngramChanged>>>,
     /// The count of this write in its domain, held for as long as the view
     /// lives, so a rename of the domain waits for the write to finish rather
     /// than moving the domain's stores out from under it. `None` on every
     /// read view.
     _writing: Option<crate::rename::WriteTicket<'a>>,
+}
+
+/// Where an occupant stands: the path that was asked for, and for a file
+/// domain the root to look its on-disk spelling up under. The lookup lists
+/// directories, so it runs only when a refusal prints the name
+/// ([`Spot::name`]), never on the plain read of an overwrite or a preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Spot {
+    path: String,
+    root: Option<std::path::PathBuf>,
+}
+
+impl Spot {
+    /// A draft or a row, found by exact path: its name is the path.
+    fn exact(path: &str) -> Self {
+        Spot {
+            path: path.to_string(),
+            root: None,
+        }
+    }
+
+    /// A file under `root`, which a case-folding filesystem can spell
+    /// differently from `path`.
+    fn on_disk(root: &Path, path: &str) -> Self {
+        Spot {
+            path: path.to_string(),
+            root: Some(root.to_path_buf()),
+        }
+    }
+
+    /// The name to print: as the disk spells it for a file, else the path.
+    pub(crate) fn name(&self) -> String {
+        match &self.root {
+            Some(root) => on_disk_name(root, &self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// What stands at one path for a writer, told apart the way a capture needs
+/// it before it writes anything (see [`DomainView::occupant_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Occupant {
+    /// Nothing, or a path this writer's own tombstone deletes.
+    Free,
+    /// An engram answering to `permalink`, in the file or row at `at`: the
+    /// name as it stands on disk, which a case-folding filesystem can spell
+    /// differently from the path that was asked for.
+    Engram { permalink: String, at: Spot },
+    /// A file or row at `at` that does not parse as an engram.
+    Unreadable { at: Spot },
 }
 
 impl<'a> DomainView<'a> {
@@ -127,6 +200,8 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: None,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -160,6 +235,8 @@ impl<'a> DomainView<'a> {
             base: Some(base),
             actor,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -189,6 +266,8 @@ impl<'a> DomainView<'a> {
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: Some(actor.to_string()),
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: None,
         })
     }
@@ -259,6 +338,8 @@ impl<'a> DomainView<'a> {
             base: engine.content_source(name).ok(),
             actor,
             joined: None,
+            writer: None,
+            collected: std::sync::Mutex::new(None),
             _writing: Some(ticket),
         };
         if !engine.reviews_changes(name) {
@@ -313,6 +394,7 @@ impl<'a> DomainView<'a> {
         engine.refuse_hidden_domain(name, scope).await?;
         let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
         view.joined = Some(join.owner.clone());
+        view.writer = crate::scope::overlay_actor(scope);
         view._writing = Some(ticket);
         Ok(view)
     }
@@ -497,6 +579,111 @@ impl<'a> DomainView<'a> {
         Ok(())
     }
 
+    /// The path of the engram that answers to exactly `permalink` in this
+    /// view, never a title namesake: the writer's own draft first, then the
+    /// base row unless the writer's own tombstone deletes its path. The same
+    /// reading of "holds" [`DomainView::refuse_address_held_elsewhere`] uses,
+    /// asked as "where" rather than "somewhere else". The two lookups are
+    /// twins on purpose (that one also filters out the path being written and
+    /// a move's vacated source); a change to what "holds" means changes both.
+    pub(crate) async fn permalink_holder(
+        &self,
+        domain_id: DomainId,
+        permalink: &str,
+    ) -> Result<Option<String>> {
+        let store = self.engine.store();
+        let store = store.lock().await;
+        // `find_engram` answers a title as well as a permalink; only an exact
+        // permalink is an owner.
+        let base = store
+            .find_engram(self.domain.as_str(), permalink)
+            .await?
+            .filter(|found| found.permalink == permalink)
+            .map(|found| found.path);
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(base);
+        };
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| !entry.tombstone && entry.permalink == permalink)
+        {
+            return Ok(Some(entry.path.clone()));
+        }
+        Ok(base.filter(|path| {
+            !entries
+                .iter()
+                .any(|entry| entry.tombstone && entry.path == *path)
+        }))
+    }
+
+    /// What stands at `path` for this view's writer: their own draft row (a
+    /// tombstone is nothing), else the file on disk for a file domain, else
+    /// the base row for a virtual one. The file is read through the
+    /// filesystem, so a case-folding filesystem answers for the file a write
+    /// there would really replace.
+    pub(crate) async fn occupant_at(
+        &self,
+        domain_id: DomainId,
+        source: &ContentSource,
+        path: &str,
+    ) -> Result<Occupant> {
+        if let Some(actor) = self.actor.as_deref() {
+            let held = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store.overlay_entry(domain_id, actor, path).await?
+            };
+            match held {
+                Some(entry) if entry.tombstone => return Ok(Occupant::Free),
+                Some(entry) => {
+                    return Ok(Occupant::Engram {
+                        permalink: entry.permalink,
+                        at: Spot::exact(path),
+                    });
+                }
+                None => {}
+            }
+        }
+        let (text, at) = match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => (text, Spot::on_disk(root, path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Occupant::Free);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        return Ok(Occupant::Unreadable {
+                            at: Spot::on_disk(root, path),
+                        });
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
+            ContentSource::Virtual => {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                match store.engram_content(domain_id, path).await? {
+                    Some(text) => (text, Spot::exact(path)),
+                    None => return Ok(Occupant::Free),
+                }
+            }
+        };
+        Ok(match parse_engram(&text) {
+            Ok(engram) => Occupant::Engram {
+                permalink: EngramRecord::from_engram(&engram, path, virtual_stamp(&text)).permalink,
+                at,
+            },
+            Err(_) => Occupant::Unreadable { at },
+        })
+    }
+
     /// The row and the mirror of a draft, once the address has been settled.
     pub(crate) async fn put(
         &self,
@@ -510,6 +697,21 @@ impl<'a> DomainView<'a> {
         self.engine
             .commit_overlay_row(domain_id, actor, &record)
             .await?;
+        // A draft moved: the owner's own sessions refetch, nobody else hears
+        // it (`draft_of` is what the route filters on). `modified` whether
+        // the draft is new or not: the counts a listing draws are the base's.
+        // The label is whoever wrote, a joined writer included.
+        self.engine.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: record.permalink.clone(),
+            path: path.to_string(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(record.stamp.sha256.clone()),
+            actor: Some(self.writer_label(actor)),
+            draft_of: Some(actor.to_string()),
+            audience: None,
+        }));
         let warning = match crate::overlay_journal::journal_write(
             &state_dir,
             domain,
@@ -564,7 +766,8 @@ impl<'a> DomainView<'a> {
     /// is gone is what makes ending its grants the truth.
     pub(crate) async fn drop(&self, domain_id: DomainId, path: &str) -> Result<()> {
         let actor = self.writing_actor()?.to_string();
-        self.clear_row(domain_id, path).await?;
+        let change = self.clear_row(domain_id, path).await?;
+        self.announce_drop(change);
         self.engine
             .end_draft_grants(self.domain.as_str(), &actor, path)
             .await;
@@ -587,7 +790,47 @@ impl<'a> DomainView<'a> {
     /// caller that took a row away and ended nothing would leave a link
     /// standing on a draft that is not there.
     pub(crate) async fn drop_mid_move(&self, domain_id: DomainId, path: &str) -> Result<()> {
-        self.clear_row(domain_id, path).await
+        let change = self.clear_row(domain_id, path).await?;
+        self.engine.announce(Change::Engram(change));
+        Ok(())
+    }
+
+    /// From now on, collect what [`DomainView::drop`] removes instead of
+    /// announcing each one, for a pass that drops many drafts (leaving review
+    /// mode, a convergence): the pass takes the batch with
+    /// [`DomainView::take_drops`] and announces it once through
+    /// [`Engine::announce_draft_drops`], so a large pass collapses rather
+    /// than evicting the ring.
+    pub(crate) fn collect_drops(&self) {
+        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
+        collected.get_or_insert_with(Vec::new);
+    }
+
+    /// The drops collected since [`DomainView::collect_drops`], and back to
+    /// announcing each one.
+    pub(crate) fn take_drops(&self) -> Vec<EngramChanged> {
+        self.collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+
+    fn announce_drop(&self, change: EngramChanged) {
+        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
+        match collected.as_mut() {
+            Some(batch) => batch.push(change),
+            None => {
+                drop(collected);
+                self.engine.announce(Change::Engram(change));
+            }
+        }
+    }
+
+    /// The label a change through this view is announced under: the joined
+    /// writer when there is one, the actor otherwise.
+    fn writer_label(&self, actor: &str) -> String {
+        self.writer.clone().unwrap_or_else(|| actor.to_string())
     }
 
     /// The removal itself: the mirror, the row and this actor's edges onto it.
@@ -596,7 +839,9 @@ impl<'a> DomainView<'a> {
     /// from, so "an overlay row goes away" is one piece of code with two
     /// callers rather than a rule each verb remembers. Whether the draft it
     /// held is OVER is the callers' question, not this one's.
-    async fn clear_row(&self, domain_id: DomainId, path: &str) -> Result<()> {
+    ///
+    /// Answers the change it made, for the caller to announce or batch.
+    async fn clear_row(&self, domain_id: DomainId, path: &str) -> Result<EngramChanged> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
         let state_dir = self.engine.journal_state_dir()?;
@@ -610,6 +855,18 @@ impl<'a> DomainView<'a> {
         let store = store.lock().await;
         store.begin().await?;
         let done = async {
+            // The address the owner's page is keyed on, read before the row
+            // goes: the draft's own permalink, or for a tombstone (whose
+            // permalink column holds its path) the base row's it stood over.
+            let permalink = match store.overlay_entry(domain_id, actor, path).await? {
+                Some(entry) if !entry.tombstone => Some(entry.permalink),
+                _ => store
+                    .list_engrams(domain, Some(path), None)
+                    .await?
+                    .into_iter()
+                    .find(|row| row.path == path)
+                    .map(|row| row.permalink),
+            };
             store.clear_overlay_entry(domain_id, actor, path).await?;
             // In the same transaction, because a row that is gone and an edge
             // that still names it are one fact told two ways: this author's
@@ -618,13 +875,23 @@ impl<'a> DomainView<'a> {
             // where none does. The fold, the discard and a settled convergence
             // all end a draft through here, so all three get it.
             store.reresolve_actor_references(domain_id, actor).await?;
-            Ok::<(), EngineError>(())
+            Ok::<Option<String>, EngineError>(permalink)
         }
         .await;
         match done {
-            Ok(()) => {
+            Ok(permalink) => {
                 store.commit().await?;
-                Ok(())
+                Ok(EngramChanged {
+                    domain: domain.to_string(),
+                    permalink: permalink.unwrap_or_else(|| crystalline_core::path_permalink(path)),
+                    path: path.to_string(),
+                    kind: ChangeKind::Deleted,
+                    from: None,
+                    checksum: None,
+                    actor: Some(self.writer_label(actor)),
+                    draft_of: Some(actor.to_string()),
+                    audience: None,
+                })
             }
             Err(e) => {
                 let _ = store.rollback().await;
@@ -645,7 +912,7 @@ impl<'a> DomainView<'a> {
         let domain = self.domain.as_str();
         let base = self.engine.resolve_in(identifier, domain).await;
         self.shadow(identifier, base, || {
-            format!("no engram '{identifier}' in domain '{domain}'")
+            format!("no engram '{}' in domain '{domain}'", shown(identifier))
         })
         .await
     }
@@ -729,12 +996,8 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(None);
         };
-        // An absolute identifier naming another domain is not this domain's to
-        // answer, exactly as `resolve_in` refuses it.
-        let wanted = match CrystallineUrl::parse(identifier) {
-            Some(url) if url.domain != domain => return Ok(None),
-            Some(url) => url.permalink,
-            None => identifier.to_string(),
+        let Some(wanted) = self.own_name(identifier) else {
+            return Ok(None);
         };
         let (domain_id, source) = self.engine.domain_source(domain).await?;
         let entries = {
@@ -742,38 +1005,55 @@ impl<'a> DomainView<'a> {
             let store = store.lock().await;
             store.overlay_entries(domain_id, actor).await?
         };
-        for entry in entries {
-            if entry.tombstone {
-                continue;
-            }
-            let Ok(engram) = parse_engram(&entry.content) else {
-                continue;
-            };
-            let record =
-                EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
-            let names = [
-                entry.permalink.as_str(),
-                record.title.as_str(),
-                entry.path.as_str(),
-            ];
-            if !names.iter().any(|name| *name == wanted) {
-                continue;
-            }
-            return Ok(Some((
-                EngramDescriptor {
-                    id: entry.id,
-                    domain_id,
-                    domain: domain.to_string(),
-                    path: entry.path,
-                    permalink: entry.permalink,
-                    title: record.title,
-                    engram_type: record.engram_type,
-                    status: record.status,
-                },
-                source,
-            )));
+        let Some((entry, record)) = own_entry_named(entries, &wanted) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            EngramDescriptor {
+                id: entry.id,
+                domain_id,
+                domain: domain.to_string(),
+                path: entry.path,
+                permalink: entry.permalink,
+                title: record.title,
+                engram_type: record.engram_type,
+                status: record.status,
+            },
+            source,
+        )))
+    }
+
+    /// Whether this actor's own drafts answer `identifier`, matched exactly as
+    /// [`DomainView::resolve_draft`] matches it, without registering anything:
+    /// the read-only question a granted read asks before it widens.
+    pub(crate) async fn holds_own_draft_named(
+        &self,
+        domain_id: DomainId,
+        identifier: &str,
+    ) -> Result<bool> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(false);
+        };
+        let Some(wanted) = self.own_name(identifier) else {
+            return Ok(false);
+        };
+        let entries = {
+            let store = self.engine.store();
+            let store = store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        Ok(own_entry_named(entries, &wanted).is_some())
+    }
+
+    /// The name an identifier asks this domain for, or `None` when it is an
+    /// absolute address naming another domain, which is not this domain's to
+    /// answer, exactly as `resolve_in` refuses it.
+    fn own_name(&self, identifier: &str) -> Option<String> {
+        match CrystallineUrl::parse(identifier) {
+            Some(url) if url.domain != self.domain => None,
+            Some(url) => Some(url.permalink),
+            None => Some(identifier.to_string()),
         }
-        Ok(None)
     }
 
     /// The seeds of a graph traversal, in one reader's own view of the domain.
@@ -1514,7 +1794,8 @@ impl<'a> DomainView<'a> {
         let (desc, source) = self.resolve(identifier).await?;
         let content = self.text_at(&source, &desc).await?.ok_or_else(|| {
             EngineError::NotFound(format!(
-                "no engram '{identifier}' in domain '{}'",
+                "no engram '{}' in domain '{}'",
+                shown(identifier),
                 self.domain
             ))
         })?;
@@ -2156,5 +2437,112 @@ impl<'a> DomainView<'a> {
             write_staged_file(staging.root(), &entry.path, &bytes)?;
         }
         Ok(())
+    }
+}
+
+/// `path` as the files that answer to it are named on disk: each segment
+/// looked up in its folder's listing, an exact match first, else the one
+/// entry whose name folds onto it ([`crystalline_core::fold_path_case`]).
+/// `path` itself when a segment has no match or more than one fold match.
+fn on_disk_name(root: &Path, path: &str) -> String {
+    let mut dir = root.to_path_buf();
+    let mut named: Vec<String> = Vec::new();
+    for segment in path.split('/') {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return path.to_string();
+        };
+        let names: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let found = name_among(&names, segment);
+        dir.push(&found);
+        named.push(found);
+    }
+    named.join("/")
+}
+
+/// The entry of `names` that `segment` stands for: an exact match first,
+/// else the one entry that folds onto it, else `segment` itself (no match,
+/// or several fold matches that cannot be told apart).
+fn name_among(names: &[String], segment: &str) -> String {
+    if names.iter().any(|name| name == segment) {
+        return segment.to_string();
+    }
+    let folded = crystalline_core::fold_path_case(segment);
+    let mut matches = names
+        .iter()
+        .filter(|name| crystalline_core::fold_path_case(name) == folded);
+    match (matches.next(), matches.next()) {
+        (Some(one), None) => one.clone(),
+        _ => segment.to_string(),
+    }
+}
+
+/// The first live entry in `entries` that answers `wanted`: by permalink, by
+/// title or by path, all exact, which is the same ladder the base lookup
+/// offers. Tombstones are skipped: a deletion is not an engram to find. The
+/// one match [`DomainView::resolve_draft`] and
+/// [`DomainView::holds_own_draft_named`] share, so the two cannot drift.
+fn own_entry_named(
+    entries: Vec<StoredEngram>,
+    wanted: &str,
+) -> Option<(StoredEngram, EngramRecord)> {
+    entries.into_iter().find_map(|entry| {
+        if entry.tombstone {
+            return None;
+        }
+        let engram = parse_engram(&entry.content).ok()?;
+        let record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
+        let answers = [
+            entry.permalink.as_str(),
+            record.title.as_str(),
+            entry.path.as_str(),
+        ]
+        .contains(&wanted);
+        answers.then_some((entry, record))
+    })
+}
+
+#[cfg(test)]
+mod on_disk_choice_tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn an_exact_match_wins_over_a_fold_match() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "gamma.md"]), "gamma.md"),
+            "gamma.md"
+        );
+    }
+
+    #[test]
+    fn one_fold_match_is_used() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "other.md"]), "gamma.md"),
+            "Gamma.md"
+        );
+    }
+
+    #[test]
+    fn several_fold_matches_fall_back_to_the_given_name() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "GAMMA.md"]), "gamma.md"),
+            "gamma.md"
+        );
+    }
+
+    #[test]
+    fn no_match_falls_back_to_the_given_name() {
+        assert_eq!(name_among(&names(&["other.md"]), "gamma.md"), "gamma.md");
+    }
+
+    #[test]
+    fn a_draft_or_row_spot_names_the_path_it_was_asked_for() {
+        assert_eq!(Spot::exact("notes/gamma.md").name(), "notes/gamma.md");
     }
 }

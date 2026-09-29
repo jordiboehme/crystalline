@@ -240,7 +240,7 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("md.tmp.{}", std::process::id()));
+    let tmp = crystalline_core::path::hidden_temp_path(path, "tmp");
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }

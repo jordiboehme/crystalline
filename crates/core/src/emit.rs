@@ -294,6 +294,89 @@ pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
     set_frontmatter_line(source, &[key], format_scalar_line(key, value))
 }
 
+/// Set a scalar frontmatter field like [`set_frontmatter_field`], except that
+/// keys are found by their parsed key (so `"domain_name":` and
+/// `domain_name :` are the key too) and a key the frontmatter does not hold
+/// yet goes right after the `after` key instead of at the end: after its
+/// continuation lines and any blank lines that follow them, whether they sit
+/// inside a block scalar or after a one-line value. An existing key is
+/// rewritten in place, every copy of it, its old continuation lines
+/// dropped; one that already holds `value` leaves the source byte for byte.
+/// The key goes at the end when `after` is not there, and a new block is
+/// created when the source has none. A frontmatter that cannot be cut into
+/// key blocks (flow style such as `{title: KB}`, among others) is returned
+/// unchanged: a line written into it could leave it unparsable. New lines
+/// use the frontmatter's own line ending.
+pub fn set_frontmatter_field_after(source: &str, key: &str, value: &str, after: &str) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return set_frontmatter_field(source, key, value);
+    }
+    let raw = &source[fm_span.clone()];
+    let Some(cut) = crate::frontmatter::key_blocks(raw) else {
+        return source.to_string();
+    };
+    let named = |k: &str| Value::String(k.to_string());
+    let copies: Vec<&crate::frontmatter::KeyBlock> = cut
+        .blocks
+        .iter()
+        .filter(|b| b.parsed_key == named(key))
+        .collect();
+    if !copies.is_empty() && copies.iter().all(|b| b.value == named(value)) {
+        return source.to_string();
+    }
+    // A block's `line` counts from the opening delimiter as line 1, so its
+    // index among the frontmatter's own lines is two less.
+    let own: Vec<usize> = copies.iter().map(|b| b.line - 2).collect();
+    let anchor = cut
+        .blocks
+        .iter()
+        .find(|b| b.parsed_key == named(after))
+        .map(|b| b.line - 2);
+    let ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let new_line = format_scalar_line(key, value);
+    let mut new_raw = String::with_capacity(raw.len() + new_line.len() + ending.len());
+    let mut in_anchor = false;
+    let mut inserted = !own.is_empty();
+    let mut replacing = false;
+    for (index, line) in raw.split_inclusive('\n').enumerate() {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if replacing && is_value_continuation(content) {
+            continue;
+        }
+        replacing = false;
+        if own.contains(&index) {
+            new_raw.push_str(&new_line);
+            if line.ends_with('\n') {
+                new_raw.push_str(ending);
+            }
+            replacing = true;
+            continue;
+        }
+        // A blank line inside the anchor's block (a `|` scalar) does not end
+        // it; the new line goes after the whole block.
+        if in_anchor && !inserted && !is_value_continuation(content) && !content.trim().is_empty() {
+            new_raw.push_str(&new_line);
+            new_raw.push_str(ending);
+            inserted = true;
+        }
+        if anchor == Some(index) {
+            in_anchor = true;
+        }
+        new_raw.push_str(line);
+    }
+    if !inserted {
+        new_raw.push_str(&new_line);
+        new_raw.push_str(ending);
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
 /// Replace the first frontmatter line that sets any of `keys` with `new_line`,
 /// appending it when none of them is present. Creates a frontmatter block when
 /// the source has none. The keys are tried in order, so a caller can name a
@@ -613,6 +696,31 @@ pub fn touch_generated(
 pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
     let line = format!("stale_after: {}", date.format("%Y-%m-%d"));
     set_frontmatter_block_line(source, &["stale_after", "review_after"], line)
+}
+
+/// True when the frontmatter sets `key` to something other than a one-line
+/// scalar: a block sequence or mapping, a block scalar (`|` or `>`), a flow
+/// collection (`[...]` or `{...}`), or any value continued on an indented line
+/// below the key. False when the key or the frontmatter block is absent.
+///
+/// [`set_frontmatter_field`] and [`remove_frontmatter_field`] touch only the
+/// key's own line, so a caller asks this first: on such a value they would
+/// leave the continuation lines behind, where they either join the new value
+/// or fold into the key above.
+pub fn frontmatter_value_spans_lines(source: &str, key: &str) -> bool {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return false;
+    }
+    let mut lines = source[fm_span].lines();
+    let Some(line) = lines.by_ref().find(|l| line_sets_key(l, key)) else {
+        return false;
+    };
+    let inline = line[key.len() + 1..].trim_start();
+    if inline.starts_with(['|', '>', '[', '{']) {
+        return true;
+    }
+    lines.next().is_some_and(is_value_continuation)
 }
 
 fn format_scalar_line(key: &str, value: &str) -> String {
@@ -1009,6 +1117,106 @@ pub fn prepend_body(source: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_field_goes_right_after_the_named_key_and_its_continuation_lines() {
+        let source =
+            "---\ntype: manifest\ntitle: >\n  Long\n  name\npermalink: manifest\n---\n\n# KB\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\ntype: manifest\ntitle: >\n  Long\n  name\ndomain_name: kb\npermalink: manifest\n---\n\n# KB\n"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_block_scalar_title_does_not_end_the_title() {
+        let source = "---\ntype: manifest\ntitle: |\n  Long\n\n  name\npermalink: manifest\n---\n";
+        let named = set_frontmatter_field_after(source, "domain_name", "kb", "title");
+        assert_eq!(
+            named,
+            "---\ntype: manifest\ntitle: |\n  Long\n\n  name\ndomain_name: kb\npermalink: manifest\n---\n"
+        );
+        assert!(crate::parse::parse_engram(&named).is_ok(), "{named}");
+    }
+
+    #[test]
+    fn a_present_field_is_rewritten_in_place_and_a_missing_anchor_appends() {
+        let present = "---\ndomain_name: old\ntitle: KB\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(present, "domain_name", "kb", "title"),
+            "---\ndomain_name: kb\ntitle: KB\n---\n"
+        );
+        let no_title = "---\ntype: manifest\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(no_title, "domain_name", "kb", "title"),
+            "---\ntype: manifest\ndomain_name: kb\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_frontmatter_gets_a_crlf_line() {
+        let source = "---\r\ntitle: KB\r\nstatus: stable\r\n---\r\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\r\ntitle: KB\r\ndomain_name: kb\r\nstatus: stable\r\n---\r\n"
+        );
+    }
+
+    #[test]
+    fn a_present_field_is_found_by_its_parsed_key_whatever_its_spelling() {
+        for spelled in [
+            "\"domain_name\": old",
+            "'domain_name': old",
+            "domain_name : old",
+        ] {
+            let source =
+                format!("---\ntype: manifest\ntitle: KB\n{spelled}\nstatus: stable\n---\n");
+            let named = set_frontmatter_field_after(&source, "domain_name", "kb", "title");
+            assert_eq!(
+                named, "---\ntype: manifest\ntitle: KB\ndomain_name: kb\nstatus: stable\n---\n",
+                "{spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_field_with_the_value_already_is_left_byte_for_byte() {
+        let source = "---\ntitle: KB\n\"domain_name\": kb # canonical\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            source
+        );
+    }
+
+    #[test]
+    fn a_present_field_loses_its_old_continuation_lines() {
+        let source = "---\ntitle: KB\ndomain_name: >\n  old\nstatus: stable\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\ntitle: KB\ndomain_name: kb\nstatus: stable\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_quoted_anchor_is_found_by_its_parsed_key() {
+        let source = "---\ntype: manifest\n\"title\": KB\nstatus: stable\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\ntype: manifest\n\"title\": KB\ndomain_name: kb\nstatus: stable\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_flow_style_frontmatter_is_left_as_it_is() {
+        for source in [
+            "---\n{title: KB}\n---\n\n# KB\n",
+            "---\n{title: KB, domain_name: old}\n---\n",
+        ] {
+            let named = set_frontmatter_field_after(source, "domain_name", "kb", "title");
+            assert_eq!(named, source);
+            assert!(crate::parse::parse_engram(&named).is_ok(), "{named}");
+        }
+    }
 
     /// A document whose body lines are numbered in the assertions below, with
     /// the frontmatter taking lines 1 through 5 so a range that reached into it

@@ -191,6 +191,17 @@ impl Engine {
             crystalline_index::refresh_tag_aliases(&*store, desc.domain_id).await?;
         }
         drop(store);
+        self.announce(Change::Engram(EngramChanged {
+            domain: desc.domain.clone(),
+            permalink: desc.permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Deleted,
+            from: None,
+            checksum: None,
+            actor: change_label(scope),
+            draft_of: None,
+            audience: None,
+        }));
 
         // Deleting a MANIFEST empties a virtual domain's routing bullets and
         // takes back the name either kind declared, so refresh once the store

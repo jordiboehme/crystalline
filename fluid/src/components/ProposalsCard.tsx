@@ -57,7 +57,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { useState } from "react";
 
-import type { SyncProposal } from "../api/admin";
+import type { KeptBranch, SyncProposal } from "../api/admin";
 import { fetchSyncStatus, syncStatusKey } from "../api/admin";
 import { isWebAddress } from "../format";
 import { ShareDialog } from "./ShareDialog";
@@ -148,6 +148,7 @@ export function ProposalsCard({
           linkPending={linkPending}
         />
       )}
+      <KeptBranchNotices kept={answered.keptBranches} />
       {proposals.length === 0 ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">
           {direct
@@ -314,6 +315,39 @@ function ChainNotices({
           Stack link pending - the next share or status check finishes it.
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * Merged share branches kept on the forge because a pull request is still
+ * based on them. Shown whatever the domain's sharing policy is now: a branch
+ * kept before a switch to direct sharing is still there.
+ */
+function KeptBranchNotices({
+  kept,
+}: {
+  kept: KeptBranch[];
+}): ReactElement | null {
+  if (kept.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      {kept.map((branch) => (
+        <div
+          key={branch.branch}
+          className="rounded bg-amber-50 px-3 py-2 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+        >
+          <p>{branch.message}</p>
+          {/* A refused delete's sentence already holds the forge's reason. */}
+          {branch.reason !== null && branch.kind !== "delete_refused" && (
+            <p className="text-caption break-words opacity-80">
+              {branch.reason}
+            </p>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

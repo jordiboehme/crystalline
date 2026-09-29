@@ -1071,6 +1071,58 @@ async fn a_join_naming_an_ungranted_owner_refuses() {
         .expect("a join is what was missing");
 }
 
+/// The room socket's refusal for a held, unjoined grant names the draft by
+/// its permalink, never by its file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_join_refusal_names_the_permalink_on_the_room_socket() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let token = fx.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = fx
+        .request(&bob, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+    let err = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap_err();
+    // The body is a problem document; the sentence is its `detail`.
+    let body: serde_json::Value = serde_json::from_str(&refusal_detail(&err)).unwrap();
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("'fresh' is alice's draft, shared with you to read"),
+        "{detail}"
+    );
+
+    // Asked by the draft's title, the refusal still names its permalink.
+    let err = connect(
+        fx.addr,
+        "/api/v1/collab/team/Fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap_err();
+    let body: serde_json::Value = serde_json::from_str(&refusal_detail(&err)).unwrap();
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("'fresh' is alice's draft, shared with you to read"),
+        "{detail}"
+    );
+}
+
 /// Taking the link back puts the grantee outside the room on the next saver
 /// tick - and leaves the owner in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1439,9 +1491,9 @@ async fn a_rooms_save_at_another_path_is_refused_and_the_room_stays_open() {
         panic!("a save at another path is refused: {refused:?}")
     };
     assert!(
-        detail.contains("alice") && detail.contains("fresh.md") && detail.contains("plan.md"),
-        "the refusal names the draft this room is and the path the write would have gone to: \
-         {detail}"
+        detail.contains("alice's draft of 'Plan'") && detail.contains("'plan.md'"),
+        "the refusal names the draft this room is, by the draft's permalink, which his \
+         retarget set to 'Plan', and the path the write would have gone to: {detail}"
     );
 
     assert!(

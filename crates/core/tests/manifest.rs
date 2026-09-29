@@ -865,6 +865,43 @@ fn domain_name_at_reads_the_root_and_falls_back_to_none() {
 }
 
 #[test]
+fn the_declared_name_goes_right_after_the_title() {
+    let source =
+        "---\ntype: manifest\ntitle: KB\npermalink: manifest\nstatus: stable\n---\n\n# KB\n";
+    let named = crystalline_core::manifest::set_declared_name(source, "kb");
+    assert_eq!(
+        named,
+        "---\ntype: manifest\ntitle: KB\ndomain_name: kb\npermalink: manifest\nstatus: stable\n---\n\n# KB\n"
+    );
+    assert_eq!(domain_name_of_source(&named).as_deref(), Some("kb"));
+}
+
+#[test]
+fn a_name_can_be_declared_unless_the_frontmatter_cannot_be_cut_into_keys() {
+    use crystalline_core::manifest::can_declare_name;
+    assert!(can_declare_name("---\ntitle: KB\n---\n"));
+    assert!(can_declare_name(
+        "---\ntitle: KB\n\"domain_name\": kb\n---\n"
+    ));
+    assert!(
+        can_declare_name("# KB\n"),
+        "no frontmatter: a block is created"
+    );
+    assert!(!can_declare_name(
+        "---\n{title: KB, domain_name: kb}\n---\n"
+    ));
+}
+
+#[test]
+fn the_template_declares_the_name_right_after_the_title() {
+    let source = manifest_template("eng", "2026-09-28");
+    assert!(
+        source.contains("title: eng\ndomain_name: eng\npermalink: manifest\n"),
+        "{source}"
+    );
+}
+
+#[test]
 fn the_template_declares_a_valid_name_so_it_reads_back_as_the_same_string() {
     for name in ["eng", "1.0", "true", "123", "a.b"] {
         let source = manifest_template(name, "2026-09-25");

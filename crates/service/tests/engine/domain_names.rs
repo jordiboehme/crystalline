@@ -819,7 +819,10 @@ async fn nameless_add_writes_the_basename_default_back_into_a_bare_manifest() {
     assert_eq!(report["domain"], "my-notes");
     assert_eq!(report["name_origin"], "derived");
     let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
-    assert!(manifest.contains("domain_name: my-notes"), "{manifest}");
+    assert!(
+        manifest.contains("title: My Notes\ndomain_name: my-notes\npermalink: manifest\n"),
+        "the name lands right after the title: {manifest}"
+    );
 }
 
 /// A brand-new folder with no MANIFEST at all gets one scaffolded that
@@ -1627,4 +1630,138 @@ async fn an_ignored_alias_is_warned_about_once() {
         .filter(|l| l.contains("alias 'ops' of domain 'eng-knowledge' is ignored"))
         .count();
     assert_eq!(warned, 1, "{:?}", logs.lines());
+}
+
+/// Where the one outbound reference of `domain`/`permalink` lands, as
+/// `(domain, permalink)`, read from the index's graph.
+async fn bound_to(store: &SharedStore, domain: &str, permalink: &str) -> Option<(String, String)> {
+    let store = store.lock().await;
+    let source = store.lookup_id(domain, permalink).await.unwrap().unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    slice
+        .nodes
+        .into_iter()
+        .find(|n| n.id != source)
+        .map(|n| (n.domain, n.permalink))
+}
+
+/// `[[ops:Runbook]]` written where `ops` is not registered stays unresolved,
+/// even though home holds a Runbook. Registering `ops` through the engine heals
+/// it at once: the link in home binds to the ops Runbook without waiting for
+/// home's next sync or write.
+#[tokio::test]
+async fn registering_the_domain_a_prefix_names_heals_the_link_at_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = memory_store().await;
+    let home = file_domain(
+        tmp.path(),
+        "home",
+        "home",
+        &[
+            ("runbook.md", engram("Runbook", "runbook", "home runbook")),
+            ("src.md", engram("Src", "src", "See [[ops:Runbook]].")),
+        ],
+    );
+    let engine = engine(store.clone(), tmp.path(), vec![("home", home)]);
+    engine.sync(None).await.unwrap();
+    assert!(
+        !link_resolved(&engine, "home", "src").await,
+        "`ops` names no domain, and home's own Runbook does not answer"
+    );
+
+    let ops = tmp.path().join("ops");
+    std::fs::create_dir_all(&ops).unwrap();
+    std::fs::write(
+        ops.join("runbook.md"),
+        engram("Runbook", "runbook", "ops runbook"),
+    )
+    .unwrap();
+    engine
+        .domain_add_local(Some("ops"), Some(ops.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    assert!(link_resolved(&engine, "home", "src").await);
+    assert_eq!(
+        bound_to(&store, "home", "src").await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+}
+
+/// The same for a virtual domain: registering `ops` with its scaffolded
+/// MANIFEST engram heals `[[ops:manifest]]` in home at once, though home holds
+/// a MANIFEST of its own under that permalink.
+#[tokio::test]
+async fn registering_a_virtual_domain_a_prefix_names_heals_the_link_at_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = memory_store().await;
+    let home = file_domain(
+        tmp.path(),
+        "home",
+        "home",
+        &[("src.md", engram("Src", "src", "See [[ops:manifest]]."))],
+    );
+    let engine = engine(store.clone(), tmp.path(), vec![("home", home)]);
+    engine.sync(None).await.unwrap();
+    assert!(!link_resolved(&engine, "home", "src").await);
+
+    engine.domain_add_virtual("ops").await.unwrap();
+
+    assert!(link_resolved(&engine, "home", "src").await);
+    assert_eq!(
+        bound_to(&store, "home", "src").await,
+        Some(("ops".to_string(), "manifest".to_string()))
+    );
+}
+
+/// What an index upgrade unbinds is bound again by the engine's startup pass,
+/// in a virtual domain too, which never syncs from disk. The upgrade is stood in
+/// for by the reset that unbinds every reference spelled `typo`: the same rows,
+/// left pending the same way.
+#[tokio::test]
+async fn the_startup_pass_binds_what_an_upgrade_left_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = memory_store().await;
+    let engine = engine(
+        store.clone(),
+        tmp.path(),
+        vec![("scratch", DomainEntry::virtual_domain())],
+    );
+    engine.domain_add_virtual("scratch").await.unwrap();
+    for (title, body) in [
+        ("Foo", "the bare target"),
+        ("typo:Foo", "the whole bracket text"),
+        ("Src", "See [[typo:Foo]]."),
+    ] {
+        engine
+            .write_engram(&WriteParams {
+                domain: "scratch".to_string(),
+                title: title.to_string(),
+                content: body.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec![],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+    }
+    let raw = Some(("scratch".to_string(), "typo-foo".to_string()));
+    assert_eq!(bound_to(&store, "scratch", "src").await, raw);
+
+    let unbound = store
+        .lock()
+        .await
+        .reset_references_to_spellings(&["typo".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(unbound, 1);
+    assert_eq!(bound_to(&store, "scratch", "src").await, None);
+
+    engine.settle_after_initial_sync().await;
+    assert_eq!(bound_to(&store, "scratch", "src").await, raw);
 }

@@ -9,15 +9,20 @@
 //! no async work and knows nothing about paths, domains or GitHub. A later
 //! task calls it once per upstream-changed path and acts on the result.
 //!
-//! Merge is plain-text three-way in v1: engram files (including their YAML
-//! frontmatter) are merged line by line with [`diffy::merge`]. A
-//! frontmatter-aware merge that reconciles YAML keys structurally rather
-//! than by line is future work.
+//! Engram files are merged in two layers: the YAML frontmatter key by key
+//! (a key both sides set to the same value lands once, a change on one side
+//! wins, changes on both sides conflict unless their lines merge into one
+//! clean block), the body line by line with [`diffy::merge`]. A file whose
+//! frontmatter cannot be cut into keys is merged line by line as a whole.
+//! A merge result that no longer parses where both inputs did is a conflict.
+//! The rules live in [`crystalline_core::frontmatter`].
 //!
 //! The one rule this module exists to uphold: conflict markers must never
 //! be produced as output. When a text merge cannot be reconciled cleanly,
 //! diffy's conflict-marked text is discarded and the local file is left
 //! untouched; the caller is only told which [`ConflictKind`] occurred.
+
+use crystalline_core::frontmatter::{MergedText, merge_text};
 
 /// How a conflict came about, recorded with the conflict for status
 /// displays.
@@ -73,12 +78,12 @@ pub enum FileMerge {
 /// 5. Base present, local present, upstream absent -> locally edited while
 ///    upstream deleted: [`ConflictKind::EditDelete`].
 /// 6. Base absent, local present, upstream present, and they differ -> both
-///    sides added the file: attempt a text merge against an empty
-///    ancestor; a clean result is applied, otherwise
-///    [`ConflictKind::AddAdd`].
+///    sides added the file: attempt a merge (frontmatter by key, body by
+///    line, see the module doc) against an empty ancestor; a clean result
+///    is applied, otherwise [`ConflictKind::AddAdd`].
 /// 7. Base present, local present, upstream present, and all three differ ->
-///    attempt a text merge; a clean result is applied, otherwise
-///    [`ConflictKind::EditEdit`].
+///    attempt a merge (frontmatter by key, body by line, see the module
+///    doc); a clean result is applied, otherwise [`ConflictKind::EditEdit`].
 ///
 /// A text merge needs every participating side to be valid UTF-8. If any
 /// side that must participate is not, the merge is not attempted and the
@@ -112,10 +117,10 @@ pub fn merge_file(base: Option<&[u8]>, local: Option<&[u8]>, upstream: Option<&[
         (Some(_), None, Some(_)) => FileMerge::Conflict(ConflictKind::DeleteEdit),
         (Some(_), Some(_), None) => FileMerge::Conflict(ConflictKind::EditDelete),
         (None, Some(local_bytes), Some(upstream_bytes)) => {
-            attempt_text_merge(&[], local_bytes, upstream_bytes, ConflictKind::AddAdd)
+            attempt_text_merge(None, local_bytes, upstream_bytes, ConflictKind::AddAdd)
         }
         (Some(base_bytes), Some(local_bytes), Some(upstream_bytes)) => attempt_text_merge(
-            base_bytes,
+            Some(base_bytes),
             local_bytes,
             upstream_bytes,
             ConflictKind::EditEdit,
@@ -123,29 +128,40 @@ pub fn merge_file(base: Option<&[u8]>, local: Option<&[u8]>, upstream: Option<&[
     }
 }
 
-/// Attempts a text merge of `local` and `upstream` against `ancestor`,
-/// falling back to `kind` as a conflict whenever any side is not valid
-/// UTF-8 or `diffy::merge` cannot reconcile the two versions cleanly.
+/// Attempts a merge of `local` and `upstream` against `ancestor` (`None`
+/// when both sides added the file), falling back to `kind` as a conflict
+/// whenever any side is not valid UTF-8 or the merge cannot reconcile the
+/// two versions cleanly.
 ///
-/// `diffy::merge` returns conflict-marked text in its `Err` case; that text
-/// is deliberately discarded rather than surfaced, since conflict markers
-/// must never reach an engram file.
+/// The frontmatter is merged key by key and the rest line by line
+/// ([`crystalline_core::frontmatter::merge_text`]); a result that would no
+/// longer parse where both inputs did is a conflict too. diffy's
+/// conflict-marked text is never kept: conflict markers must never reach an
+/// engram file.
 fn attempt_text_merge(
-    ancestor: &[u8],
+    ancestor: Option<&[u8]>,
     local: &[u8],
     upstream: &[u8],
     kind: ConflictKind,
 ) -> FileMerge {
-    let ancestor = std::str::from_utf8(ancestor);
-    let local = std::str::from_utf8(local);
-    let upstream = std::str::from_utf8(upstream);
-    match (ancestor, local, upstream) {
-        (Ok(ancestor), Ok(local), Ok(upstream)) => match diffy::merge(ancestor, local, upstream) {
-            Ok(merged) => FileMerge::Apply(merged.into_bytes()),
-            Err(_conflict_marked_text) => FileMerge::Conflict(kind),
-        },
-        _ => FileMerge::Conflict(kind),
+    let (Ok(local), Ok(upstream)) = (std::str::from_utf8(local), std::str::from_utf8(upstream))
+    else {
+        return FileMerge::Conflict(kind);
+    };
+    let ancestor = match ancestor.map(std::str::from_utf8) {
+        None => None,
+        Some(Ok(text)) => Some(text),
+        Some(Err(_)) => return FileMerge::Conflict(kind),
+    };
+    match merge_text(ancestor, local, upstream, &line_merge) {
+        MergedText::Clean(merged) => FileMerge::Apply(merged.into_bytes()),
+        MergedText::Conflict => FileMerge::Conflict(kind),
     }
+}
+
+/// diffy's three-way line merge, its conflict-marked `Err` discarded.
+fn line_merge(base: &str, local: &str, upstream: &str) -> Option<String> {
+    diffy::merge(base, local, upstream).ok()
 }
 
 #[cfg(test)]
@@ -215,13 +231,14 @@ mod tests {
 
     #[test]
     fn add_add_divergent_content_conflicts_add_add() {
-        // diffy's three-way merge always conflicts when the ancestor is
-        // empty and the two sides diverge at all, even for a strict
-        // prefix extension of one side by the other (verified against
-        // diffy 0.5.0 directly: prefix-extension, shared-prefix-diverge,
-        // disjoint-single-line and prepend-vs-append all return `Err`).
-        // There is no case in which an empty-ancestor divergence merges
-        // cleanly, so add/add divergence always conflicts.
+        // For a file without frontmatter, diffy's three-way merge always
+        // conflicts when the ancestor is empty and the two sides diverge at
+        // all, even for a strict prefix extension of one side by the other
+        // (verified against diffy 0.5.0 directly: prefix-extension,
+        // shared-prefix-diverge, disjoint-single-line and prepend-vs-append
+        // all return `Err`). There is no case in which such a file's
+        // empty-ancestor divergence merges cleanly, so its add/add
+        // divergence always conflicts.
         let local: &[u8] = b"line1\n";
         let upstream: &[u8] = b"line1\nline2\n";
         let result = merge_file(None, Some(local), Some(upstream));
@@ -366,5 +383,139 @@ mod tests {
         let local: &[u8] = b"new local-only file\n";
         let result = merge_file(None, Some(local), None);
         assert_eq!(result, FileMerge::Converged);
+    }
+
+    const SCOTTY: &str = "---\ntype: manifest\ntitle: Scotty\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\n---\n\n# Scotty\n\n## Scope\n\n- Engineering\n";
+
+    fn with(text: &str, after: &str, line: &str) -> String {
+        text.replacen(after, &format!("{after}{line}"), 1)
+    }
+
+    fn merge(base: Option<&str>, local: &str, upstream: &str) -> FileMerge {
+        merge_file(
+            base.map(str::as_bytes),
+            Some(local.as_bytes()),
+            Some(upstream.as_bytes()),
+        )
+    }
+
+    #[test]
+    fn a_key_both_sides_added_with_one_value_applies_upstream() {
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Apply(upstream.into_bytes())
+        );
+    }
+
+    #[test]
+    fn a_key_both_sides_added_with_different_values_conflicts_edit_edit() {
+        let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty-eng\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn salience_added_on_both_sides_with_different_values_conflicts() {
+        let local = with(SCOTTY, "status: stable\n", "salience: 7\n");
+        let upstream = with(SCOTTY, "type: manifest\n", "salience: 5\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn sharing_added_on_both_sides_with_one_value_applies_upstream() {
+        let local = with(SCOTTY, "status: stable\n", "sharing: direct\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "sharing: direct\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Apply(upstream.into_bytes())
+        );
+    }
+
+    #[test]
+    fn a_local_repeat_is_repaired_by_the_next_pull_that_touches_the_file() {
+        let base = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        let local = with(&base, "status: stable\n", "domain_name: scotty\n");
+        let upstream = with(&base, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge(Some(&base), &local, &upstream),
+            FileMerge::Apply(upstream.into_bytes())
+        );
+    }
+
+    #[test]
+    fn a_key_deleted_locally_and_changed_upstream_conflicts() {
+        let local = SCOTTY.replace("status: stable\n", "");
+        let upstream = SCOTTY.replace("status: stable", "status: archived");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn a_local_only_key_keeps_its_place_and_upstream_quoting_stays() {
+        let local = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        let upstream = SCOTTY.replace("status: stable", "status: 'archived'");
+        let expected = with(&upstream, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Apply(expected.into_bytes())
+        );
+    }
+
+    #[test]
+    fn a_tags_list_extended_on_both_sides_merges_cleanly() {
+        let local = SCOTTY.replace("  - manifest\n", "  - manifest\n  - c\n");
+        let upstream = SCOTTY.replace("tags:\n  - manifest\n", "tags:\n  - z\n  - manifest\n");
+        let expected = SCOTTY.replace(
+            "tags:\n  - manifest\n",
+            "tags:\n  - z\n  - manifest\n  - c\n",
+        );
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Apply(expected.into_bytes())
+        );
+    }
+
+    #[test]
+    fn an_unparseable_local_frontmatter_falls_back_to_todays_text_merge() {
+        let local = SCOTTY.replace("title: Scotty", "title: \"Scotty");
+        let upstream = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let expected = with(&local, "- Engineering\n", "- Warp\n");
+        assert_eq!(
+            merge(Some(SCOTTY), &local, &upstream),
+            FileMerge::Apply(expected.into_bytes())
+        );
+    }
+
+    #[test]
+    fn a_text_merge_that_would_break_the_frontmatter_conflicts_instead() {
+        // The alias keeps the key merge out (a block cannot parse alone), so
+        // the whole text is line-merged: two insertions of `c` one line apart
+        // merge "cleanly" into a repeated key. The safety net stops it.
+        let base = "---\na: &x 1\nb: *x\n---\n\nBody.\n";
+        let local = "---\na: &x 1\nc: 1\nb: *x\n---\n\nBody.\n";
+        let upstream = "---\na: &x 1\nb: *x\nc: 2\n---\n\nBody.\n";
+        assert_eq!(
+            merge(Some(base), local, upstream),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn both_sides_added_a_file_with_one_extra_key_locally_applies_the_union() {
+        let local = with(SCOTTY, "permalink: manifest\n", "owner: kim\n");
+        assert_eq!(
+            merge(None, &local, SCOTTY),
+            FileMerge::Apply(local.into_bytes())
+        );
     }
 }

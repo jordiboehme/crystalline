@@ -1,7 +1,9 @@
-//! The external-change merge: line-based three-way in LF space, applied into
+//! The external-change merge: three-way in LF space (frontmatter key by key,
+//! body line by line, see `crystalline_core::frontmatter`), applied into
 //! the live document as a minimal edit script. Conflict markers are never
 //! output - diffy's marked text is discarded and the room resolves instead.
 
+use crystalline_core::frontmatter::{MergedText, merge_text};
 use similar::{ChangeTag, TextDiff};
 use yrs::{Text, TextRef, TransactionMut};
 
@@ -16,7 +18,9 @@ pub enum MergeOutcome {
 }
 
 /// base and theirs arrive in FILE space, mine in session space; everything is
-/// merged in LF space. diffy's Err carries conflict-marked text - discarded.
+/// merged in LF space (frontmatter key by key, body line by line, see
+/// `crystalline_core::frontmatter`). diffy's Err carries conflict-marked
+/// text - discarded.
 pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> MergeOutcome {
     if !collab_eligible(theirs_file) {
         // Merging would force a silent line-ending rewrite on save; the room
@@ -25,12 +29,19 @@ pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> Merg
     }
     let base = session_text(base_file);
     let theirs = session_text(theirs_file);
-    match diffy::merge(&base, mine_session, &theirs) {
-        Ok(merged) => MergeOutcome::Clean(merged),
-        // The marked text is discarded, never surfaced: conflict markers must
-        // never reach an engram file or the live document.
-        Err(_marked) => MergeOutcome::Conflict,
+    // Frontmatter by key, body by line, and never a result that stops
+    // parsing where both sides parsed. diffy's marked text is discarded
+    // inside `line_merge`: conflict markers must never reach an engram file
+    // or the live document.
+    match merge_text(Some(&base), mine_session, &theirs, &line_merge) {
+        MergedText::Clean(merged) => MergeOutcome::Clean(merged),
+        MergedText::Conflict => MergeOutcome::Conflict,
     }
+}
+
+/// diffy's three-way line merge, its conflict-marked `Err` discarded.
+fn line_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    diffy::merge(base, mine, theirs).ok()
 }
 
 /// Morph the live Y.Text into `target` with a minimal line-based edit script,
@@ -139,5 +150,93 @@ mod tests {
             apply_target(&text, &mut txn, &current, "b\n");
         }
         assert_eq!(text.get_string(&doc.transact()), "b\n");
+    }
+
+    const SCOTTY: &str = "---\ntype: manifest\ntitle: Scotty\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\n---\n\n# Scotty\n\n## Scope\n\n- Engineering\n";
+
+    fn with(text: &str, after: &str, line: &str) -> String {
+        text.replacen(after, &format!("{after}{line}"), 1)
+    }
+
+    #[test]
+    fn a_key_both_sides_added_with_one_value_lands_once() {
+        let mine = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let theirs = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
+        let MergeOutcome::Clean(merged) = three_way(SCOTTY, &mine, &theirs) else {
+            panic!("one value lands once");
+        };
+        assert_eq!(merged, theirs);
+    }
+
+    #[test]
+    fn a_crlf_file_merges_by_key_in_session_space() {
+        let base = SCOTTY.replace('\n', "\r\n");
+        let theirs = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        let mine = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
+        let MergeOutcome::Clean(merged) = three_way(&base, &mine, &theirs) else {
+            panic!("session space is LF on every side");
+        };
+        assert_eq!(merged, session_text(&theirs));
+    }
+
+    #[test]
+    fn a_merge_that_would_break_the_frontmatter_is_a_conflict() {
+        let base = "---\na: &x 1\nb: *x\n---\n\nBody.\n";
+        let mine = "---\na: &x 1\nc: 1\nb: *x\n---\n\nBody.\n";
+        let theirs = "---\na: &x 1\nb: *x\nc: 2\n---\n\nBody.\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn a_comment_typed_on_a_key_line_upstream_changed_is_a_conflict() {
+        let mine = SCOTTY.replace("status: stable", "status: stable # reviewed by kim");
+        let theirs = SCOTTY.replace("status: stable", "status: archived");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn a_comment_typed_under_a_key_upstream_changed_is_a_conflict() {
+        let mine = with(SCOTTY, "title: Scotty\n", "# the ship's engineer\n");
+        let theirs = SCOTTY.replace("title: Scotty", "title: Montgomery Scott");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn an_outside_comment_on_a_key_line_typed_over_is_a_conflict() {
+        let mine = SCOTTY.replace("status: stable", "status: archived");
+        let theirs = SCOTTY.replace("status: stable", "status: stable # reviewed by kim");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn an_outside_comment_under_a_key_typed_over_is_a_conflict() {
+        let mine = SCOTTY.replace("title: Scotty", "title: Montgomery Scott");
+        let theirs = with(SCOTTY, "title: Scotty\n", "# the ship's engineer\n");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn a_half_typed_frontmatter_keeps_todays_merge() {
+        let mine = SCOTTY.replace("title: Scotty", "title: \"Scotty");
+        let theirs = with(SCOTTY, "- Engineering\n", "- Warp\n");
+        let MergeOutcome::Clean(merged) = three_way(SCOTTY, &mine, &theirs) else {
+            panic!("the person's unfinished quote is not the merge's business");
+        };
+        assert_eq!(merged, with(&mine, "- Engineering\n", "- Warp\n"));
     }
 }

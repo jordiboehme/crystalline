@@ -12,6 +12,7 @@ mod support;
 
 mod activity;
 mod attachments;
+mod change_bus;
 mod domain_names;
 mod embed_tick;
 mod engine_writes;
@@ -22,6 +23,7 @@ mod model_upgrade;
 mod move_permalink;
 mod name_report;
 mod orphaned_rows;
+mod overwrite_in_place;
 mod similar;
 #[cfg(unix)]
 mod sync_denied;

@@ -101,6 +101,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain spellings",
         sql: SCHEMA_V15,
     },
+    Migration {
+        version: 16,
+        label: "unbind references an unknown prefix bound at home",
+        sql: SCHEMA_V16,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -476,6 +481,39 @@ CREATE INDEX IF NOT EXISTS idx_relation_to_domain ON relation(to_domain) WHERE t
 CREATE INDEX IF NOT EXISTS idx_link_to_domain ON link(to_domain) WHERE to_domain IS NOT NULL;
 "#;
 
+// A reference with a domain prefix resolves only in the domain the prefix
+// spells. Before this, a prefix that spelled no domain fell back to the
+// source's own domain and bound the bare target there, so `[[ops:Runbook]]`
+// written where `ops` is not registered landed on a home Runbook. The resolve
+// pass no longer does that, but the rows it bound that way stay bound until
+// their engram is reindexed, so this unbinds them once.
+//
+// Only the rows the current rule would not bind: a prefix no spelling holds,
+// and a bound engram that is not the whole bracket text at home, the one
+// reading such a prefix still gets. A row bound to that engram keeps it. A row
+// written before `to_raw` existed compares against NULL and is unbound, which
+// is what the current rule gives it too. The startup sync binds a file
+// domain's rows again, and the engine's pass after it binds virtual domains
+// and drafts, so every unbound row the whole text now reaches is bound. A row whose
+// engram matches the whole text by title while another matches it by
+// permalink keeps the title match (contrived, left as is).
+// Idempotent, so a replay after a missed ledger stamp finds nothing the
+// first run left behind. The Turso v17 twin.
+const SCHEMA_V16: &str = r#"
+UPDATE relation SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = relation.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = relation.to_id
+                  AND e.domain_id = relation.domain_id
+                  AND (e.permalink = relation.to_raw OR lower(e.title) = lower(relation.to_raw)));
+UPDATE link SET to_id = NULL
+WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM domain_spelling s WHERE s.spelling = link.to_domain)
+  AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.id = link.to_id
+                  AND e.domain_id = link.domain_id
+                  AND (e.permalink = link.to_raw OR lower(e.title) = lower(link.to_raw)));
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -574,6 +612,143 @@ async fn current_version(conn: &mut PgConnection) -> Result<i64> {
 mod tests {
     use super::*;
     use sqlx::Connection;
+
+    /// v16 against an index the old resolve pass wrote, the Turso v17 twin's
+    /// fixture row for row: a prefix that spelled no domain had bound the bare
+    /// target at home. The migration unbinds exactly those rows (and a row
+    /// bound to the whole text in another domain), keeps a row bound to the
+    /// whole bracket text at home, a row whose prefix names a domain and a bare
+    /// row, the resolve pass that follows binds the way the current rule does,
+    /// and a replay changes nothing.
+    ///
+    /// Gated on `CRYSTALLINE_TEST_POSTGRES_URL` like the v11 test beside it,
+    /// and talking to sqlx directly for the same reason.
+    #[tokio::test]
+    async fn v16_unbinds_what_an_unknown_prefix_bound_at_home() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig16_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let (v16, before) = MIGRATIONS.split_last().unwrap();
+        assert_eq!(v16.version, 16, "the last migration is v16");
+        for m in before {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO domain(id, name, path) OVERRIDING SYSTEM VALUE \
+                 VALUES (1,'home','/tmp/h'), (2,'eng','/tmp/e'); \
+             INSERT INTO domain_spelling(spelling, domain_id) VALUES ('home',1), ('eng',2) \
+                 ON CONFLICT DO NOTHING; \
+             INSERT INTO engram(id, domain_id, path, permalink, title) OVERRIDING SYSTEM VALUE \
+                 VALUES (1,1,'foo.md','foo','Foo'), \
+                        (2,1,'typo-foo.md','typo-foo','typo:Foo'), \
+                        (3,1,'src.md','src','Src'), \
+                        (4,2,'runbook.md','runbook','Runbook'), \
+                        (5,1,'runbook.md','runbook','Runbook'), \
+                        (6,2,'typo-foo.md','typo-foo','typo:Foo'); \
+             INSERT INTO link(id, engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) \
+                 OVERRIDING SYSTEM VALUE \
+                 VALUES (1,3,1,1,'Foo','typo','typo:Foo',1), \
+                        (2,3,1,2,'Foo','typo','typo:Foo',2), \
+                        (3,3,1,3,'Runbook','eng','eng:Runbook',4), \
+                        (4,3,1,4,'Foo',NULL,'Foo',1), \
+                        (5,3,1,5,'Runbook','ops',NULL,5), \
+                        (6,3,1,7,'Foo','typo','typo:Foo',6); \
+             INSERT INTO relation(id, engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) \
+                 OVERRIDING SYSTEM VALUE \
+                 VALUES (1,3,1,6,'relates_to','Runbook','ops','ops:Runbook',5);",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(v16.sql).execute(&mut conn).await.unwrap();
+        async fn bound(conn: &mut PgConnection, table: &str, id: i64) -> i64 {
+            let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT COALESCE(to_id, 0) FROM {table} WHERE id={id}"
+            )))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+            row.0
+        }
+        assert_eq!(
+            bound(&mut conn, "link", 1).await,
+            0,
+            "the bare target at home is unbound"
+        );
+        assert_eq!(
+            bound(&mut conn, "link", 2).await,
+            2,
+            "the whole text at home stays bound"
+        );
+        assert_eq!(
+            bound(&mut conn, "link", 3).await,
+            4,
+            "a known prefix keeps its binding"
+        );
+        assert_eq!(
+            bound(&mut conn, "link", 4).await,
+            1,
+            "a bare reference keeps its binding"
+        );
+        assert_eq!(
+            bound(&mut conn, "link", 5).await,
+            0,
+            "a row with no raw text is unbound"
+        );
+        assert_eq!(
+            bound(&mut conn, "link", 6).await,
+            0,
+            "the whole text matched in another domain is not the whole text at home"
+        );
+        assert_eq!(
+            bound(&mut conn, "relation", 1).await,
+            0,
+            "relations are unbound too"
+        );
+
+        for table in ["relation", "link"] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(crate::store::resolve_pending_sql(
+                table, "1",
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            bound(&mut conn, "link", 1).await,
+            2,
+            "rebound to the whole text at home"
+        );
+        assert_eq!(bound(&mut conn, "link", 5).await, 0);
+        assert_eq!(bound(&mut conn, "link", 6).await, 2);
+        assert_eq!(bound(&mut conn, "relation", 1).await, 0);
+
+        sqlx::raw_sql(v16.sql).execute(&mut conn).await.unwrap();
+        assert_eq!(
+            bound(&mut conn, "link", 1).await,
+            2,
+            "a replay changes nothing"
+        );
+        assert_eq!(bound(&mut conn, "link", 3).await, 4);
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
 
     /// The v11 column against a database written before it, which is the case
     /// an upgrade actually meets: a schema raised to v10, domain rows already

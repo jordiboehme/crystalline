@@ -83,6 +83,55 @@ const Profile = lazy(() => import("./screens/Profile"));
 const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
 
 /**
+ * The station itself, every place in it under one splat, `/π/*`, lazy like
+ * the screens above so the app shell never pays for it.
+ *
+ * It ships in every build: the C64 screen behind the header's gem is its
+ * way in (`LOAD"GAME",8,1`). It sits inside `RequireAuth`, since every room
+ * is built from what the account reads, and outside `Layout`: the station
+ * is full screen, with no frame around it. The route reads the location
+ * itself (`addressOfGameLocation` in `game/paths.ts`): `/π` is the airlock,
+ * `/π/d/<domain>` a domain's bridge, the same with `?path=<folder>` a deck
+ * and `/π/d/<domain>/e/<permalink>` an engram's room, each Fluid's own
+ * address under the `π` prefix, and any other path under it the airlock.
+ * That prefix is the Unicode character itself, deliberately hard to type:
+ * the station is an Easter egg, meant to be reached from the C64 screen
+ * rather than typed in, and there is no `/game` alias into it.
+ */
+const ExploreRoute = lazy(() => import("./game/ExploreRoute"));
+
+/**
+ * The station's look demo at `/π/dev`, and only in development.
+ *
+ * `import.meta.env.DEV` is a constant the build replaces, so in a production
+ * build this is `null`, the import below is dead code, and neither the
+ * chunk nor the route exists. Its route sits beside the station's, inside
+ * `RequireAuth` and outside `Layout`, and outranks the station's splat by
+ * being more specific.
+ */
+const LookDemo = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/LookDemo"))
+  : null;
+
+/**
+ * The model gallery at `/π/dev/gallery`: one room with every model the
+ * station draws, for judging them. A development tool, like the look demo,
+ * and gated the same way for good: the station ships, its dev seams never
+ * do.
+ */
+const Gallery = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/Gallery"))
+  : null;
+
+/**
+ * The sound board at `/π/dev/sounds`: every patch the station plays, one
+ * button each (M4 C28). A development tool, gated the same way for good.
+ */
+const SoundBoard = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/SoundBoard"))
+  : null;
+
+/**
  * The MANIFEST's old address. The document is read on the domain page now,
  * so a link that still points here lands there rather than on the not-found
  * screen; the editor keeps its own segment beneath it.
@@ -130,6 +179,59 @@ export function AppRoutes() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route element={<RequireAuth />}>
+        {/*
+          The look demo, full screen and so outside `Layout`. In a
+          production build `LookDemo` is null and the route does not exist.
+          The dev routes are declared above the station's splat, which they
+          outrank anyway by being more specific.
+        */}
+        {LookDemo === null ? null : (
+          <Route
+            path="/π/dev"
+            element={
+              <Suspense fallback={null}>
+                <LookDemo />
+              </Suspense>
+            }
+          />
+        )}
+        {/*
+          The gallery, gated and placed the same way.
+        */}
+        {Gallery === null ? null : (
+          <Route
+            path="/π/dev/gallery"
+            element={
+              <Suspense fallback={null}>
+                <Gallery />
+              </Suspense>
+            }
+          />
+        )}
+        {/*
+          The sound board, gated and placed the same way.
+        */}
+        {SoundBoard === null ? null : (
+          <Route
+            path="/π/dev/sounds"
+            element={
+              <Suspense fallback={null}>
+                <SoundBoard />
+              </Suspense>
+            }
+          />
+        )}
+        {/*
+          The station itself, in every build: full screen, outside `Layout`.
+        */}
+        <Route
+          path="/π/*"
+          element={
+            <Suspense fallback={null}>
+              <ExploreRoute />
+            </Suspense>
+          }
+        />
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="/d/:domain" element={<DomainHome />} />

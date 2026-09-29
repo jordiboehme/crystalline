@@ -1,0 +1,555 @@
+import { afterEach, describe, expect, it } from "vitest";
+
+import { CROSSFADE_S } from "./ambience";
+import type { Cue } from "./cues";
+import {
+  DIAL_FADE_S,
+  RIDE_FADE_S,
+  VOICE_CAP,
+  createDirector,
+} from "./director";
+import { createMixer, type Mixer } from "./mixer";
+import { DTMF } from "./modem";
+import { midiHz } from "./patch";
+import {
+  FakeAudioContext,
+  type FakeGain,
+  type FakeNode,
+  type FakePanner,
+} from "./testContext";
+
+/** A running context and a mixer borrowing it. */
+function setup(state: AudioContextState = "running") {
+  const ctx = new FakeAudioContext();
+  ctx.state = state;
+  const mixer = createMixer({ borrow: () => ctx });
+  const director = createDirector(mixer);
+  return { ctx, mixer, director };
+}
+
+/** The bus gain of `name`, as the fake made it. */
+function bus(mixer: Mixer, name: Parameters<Mixer["bus"]>[0]): FakeNode {
+  const node = mixer.bus(name);
+  if (node === null) throw new Error(`no ${name} bus`);
+  return node as FakeNode;
+}
+
+/** The patch levels feeding `node` directly: one per patch played into it. */
+function levelsInto(ctx: FakeAudioContext, node: FakeNode): FakeGain[] {
+  return ctx.ofKind("gain").filter((g) => g.connections.includes(node));
+}
+
+/** Whether a patch level was stopped (its stop cancels and ramps it). */
+const stopped = (level: FakeGain) =>
+  level.gain.events.some(([m]) => m === "cancelScheduledValues");
+
+/** The ramp to silence a stop scheduled on a level, as [value, time]. */
+function fadeOf(level: FakeGain): [number, number] | undefined {
+  const ramp = level.gain.events.find(
+    ([m, v]) => m === "linearRampToValueAtTime" && v === 0,
+  );
+  return ramp === undefined ? undefined : [ramp[1], ramp[2]];
+}
+
+/** Every oscillator frequency the context was told to start at. */
+const pitches = (ctx: FakeAudioContext) =>
+  ctx.ofKind("oscillator").map((o) => o.frequency.events[0]?.[1]);
+
+/** Lets queued microtasks run. */
+const microtasks = () => new Promise<void>((r) => queueMicrotask(r));
+
+let disposers: (() => void)[] = [];
+afterEach(() => {
+  for (const d of disposers) d();
+  disposers = [];
+  window.localStorage.clear();
+});
+
+describe("createDirector's dial on a settling context (F29)", () => {
+  // Mutation caught: a dial that waits for the context to run played all
+  // the same after it was hung up, or after a later dial replaced it.
+  it("plays when the resume settles, and not once hung up or replaced", async () => {
+    const { ctx, director } = setup("suspended");
+    disposers.push(() => director.dispose());
+    ctx.deferred = true;
+    director.resume();
+    const tones = () => pitches(ctx).filter((p) => p === DTMF["5"]![0]);
+    director.dial("555-0142");
+    expect(tones()).toHaveLength(0);
+    ctx.settle();
+    await microtasks();
+    expect(tones().length).toBeGreaterThan(0);
+    const played = tones().length;
+
+    ctx.state = "suspended";
+    const hangUp = director.dial("555-0142");
+    hangUp();
+    ctx.settle();
+    ctx.state = "running";
+    await microtasks();
+    expect(tones()).toHaveLength(played);
+
+    ctx.state = "suspended";
+    director.dial("555-0142");
+    ctx.state = "running";
+    director.dial("777-0000");
+    await microtasks();
+    ctx.settle();
+    await microtasks();
+    expect(tones()).toHaveLength(played);
+  });
+});
+
+describe("createDirector", () => {
+  // Mutation caught: the pan dropped (no panner, or one left at 0), a door
+  // played on the wrong bus, or the distance gain ignored.
+  it("plays a door on the effects bus through a panner at its pan", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({
+      kind: "door",
+      sound: "sliding",
+      open: true,
+      pan: -0.6,
+      gain: 0.5,
+    });
+    const panners = ctx.ofKind("panner") as FakePanner[];
+    expect(panners).toHaveLength(1);
+    const panner = panners[0]!;
+    expect(panner.pan.value).toBeCloseTo(-0.6, 9);
+    expect(panner.connections).toEqual([bus(mixer, "effects")]);
+    expect(levelsInto(ctx, panner)).toHaveLength(1);
+    // The hiss's envelope peaks at its gain (0.5) times the cue's (0.5).
+    const peaks = ctx
+      .ofKind("gain")
+      .flatMap((g) =>
+        g.gain.events
+          .filter(([m]) => m === "linearRampToValueAtTime")
+          .map(([, v]) => v),
+      );
+    expect(Math.max(...peaks)).toBeCloseTo(0.25, 9);
+  });
+
+  // Mutation caught: a signature sound played on the effects bus, or not
+  // at all.
+  it("plays the box, the jump and the answer on the signature bus (M4 C24)", () => {
+    for (const c of [
+      { kind: "box", phase: "takeoff" },
+      { kind: "box", phase: "landing" },
+      { kind: "jump" },
+    ] as const) {
+      const { ctx, mixer, director } = setup();
+      disposers.push(() => director.dispose());
+      director.cue(c);
+      expect(levelsInto(ctx, bus(mixer, "signature")), c.kind).toHaveLength(1);
+      expect(levelsInto(ctx, bus(mixer, "effects")), c.kind).toHaveLength(0);
+    }
+    // The answer is placed: through a panner into the signature bus.
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "answer", pan: 0.4, gain: 0.8 });
+    const panners = ctx.ofKind("panner") as FakePanner[];
+    expect(panners).toHaveLength(1);
+    expect(panners[0]!.pan.value).toBeCloseTo(0.4, 9);
+    expect(panners[0]!.connections).toEqual([bus(mixer, "signature")]);
+    expect(levelsInto(ctx, panners[0]!)).toHaveLength(1);
+  });
+
+  // Mutation caught: take-off and landing swapped, the jump or the
+  // answer playing a wheeze.
+  it("plays the take-off, the landing and the tones for their cues (M4 C24)", () => {
+    const heard = (c: Cue) => {
+      const { ctx, director } = setup();
+      disposers.push(() => director.dispose());
+      director.cue(c);
+      return pitches(ctx);
+    };
+    const saw = 148.5;
+    const takeoff = heard({ kind: "box", phase: "takeoff" });
+    expect(takeoff).toContain(saw);
+    expect(takeoff).not.toContain(90);
+    const landing = heard({ kind: "box", phase: "landing" });
+    expect(landing).toContain(saw);
+    expect(landing).toContain(90);
+    for (const c of [
+      { kind: "jump" },
+      { kind: "answer", pan: 0, gain: 1 },
+    ] as const) {
+      const tones = heard(c);
+      expect(tones, c.kind).toContain(midiHz(67));
+      expect(tones, c.kind).toContain(midiHz(53 - 12));
+      expect(tones, c.kind).not.toContain(saw);
+    }
+  });
+
+  // Mutation caught: an answer played over tones still sounding (a
+  // console left and come straight back to, two consoles in one room), or
+  // the tones never forgotten once they end.
+  it("never plays an answer over tones still sounding (M4 C25)", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    const answer = (pan: number) => {
+      director.cue({ kind: "answer", pan, gain: 1 });
+    };
+    const tonesPlayed = () => ctx.ofKind("panner").length;
+    answer(0.2);
+    expect(tonesPlayed()).toBe(1);
+    // Left through a door and straight back: the same console again.
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({ kind: "room", ambience: "dim", seed: 2 });
+    answer(0.2);
+    expect(tonesPlayed()).toBe(1);
+    // A second console in the same room.
+    answer(-0.7);
+    expect(tonesPlayed()).toBe(1);
+    // Once the tones have ended, the next answer plays.
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    answer(-0.7);
+    expect(tonesPlayed()).toBe(2);
+  });
+
+  // Mutation caught: the modem on another bus than its own, the dial's
+  // stop cutting the handshake without its fade, or a stop that does
+  // nothing.
+  it("dials on the modem bus and fades the handshake out on its stop (M4 C26)", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    const stop = director.dial("555-0142");
+    const modem = levelsInto(ctx, bus(mixer, "modem"));
+    expect(modem).toHaveLength(1);
+    expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(0);
+    // The first key dialled: 5, its row and its column.
+    expect(pitches(ctx).slice(0, 2)).toEqual([...DTMF["5"]!]);
+    ctx.currentTime = 1.5;
+    stop();
+    expect(fadeOf(modem[0]!)).toEqual([0, 1.5 + DIAL_FADE_S]);
+    expect(DIAL_FADE_S).toBe(0.04);
+  });
+
+  // Mutation caught: the hang-up and the reconnect swapped, or either on
+  // another bus than the modem's.
+  it("hangs up on a carrier down and shakes hands again on an up (M4 C27)", () => {
+    const heard = (up: boolean) => {
+      const { ctx, mixer, director } = setup();
+      disposers.push(() => director.dispose());
+      director.carrier(up);
+      expect(levelsInto(ctx, bus(mixer, "modem")), String(up)).toHaveLength(1);
+      expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(0);
+      return pitches(ctx);
+    };
+    expect(heard(true)).toContain(2100);
+    const down = heard(false);
+    expect(down).not.toContain(2100);
+    expect(down).toContain(90);
+  });
+
+  it("cuts an answer's tones short for the jump's", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "answer", pan: 0, gain: 1 });
+    const [first] = levelsInto(ctx, ctx.ofKind("panner")[0]!);
+    expect(first).toBeDefined();
+    expect(stopped(first!)).toBe(false);
+    director.cue({ kind: "jump" });
+    expect(stopped(first!)).toBe(true);
+    const jump = levelsInto(ctx, bus(mixer, "signature"));
+    expect(jump).toHaveLength(1);
+    expect(stopped(jump[0]!)).toBe(false);
+    // And an answer while the jump's tones play is dropped.
+    director.cue({ kind: "answer", pan: 0, gain: 1 });
+    expect(ctx.ofKind("panner")).toHaveLength(1);
+  });
+
+  // Mutation caught: a placed one-shot's panner left on the bus after the
+  // shot ended (disconnected only when a later one-shot prunes it).
+  it("disconnects a door's panner once the door has sounded", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({
+      kind: "door",
+      sound: "bulkhead",
+      open: false,
+      pan: 0.3,
+      gain: 1,
+    });
+    const panner = ctx.ofKind("panner")[0]!;
+    expect(panner.connections).toHaveLength(1);
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    expect(panner.connections).toHaveLength(0);
+    expect(panner.disconnects).toBe(1);
+  });
+
+  // Mutation caught: a shot's end, arriving after `dispose` took its
+  // panner down, running its callback all the same (a second disconnect,
+  // an end callback on a disposed director).
+  it("does nothing on a shot's end that arrives after dispose", () => {
+    const { ctx, director } = setup();
+    director.cue({
+      kind: "door",
+      sound: "bulkhead",
+      open: false,
+      pan: 0.3,
+      gain: 1,
+    });
+    const panner = ctx.ofKind("panner")[0]!;
+    director.dispose();
+    expect(panner.disconnects).toBe(1);
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    expect(panner.disconnects).toBe(1);
+  });
+
+  // Mutation caught: a noise buffer filled per patch name (fifteen two
+  // second buffers kept for the context's life, where two do).
+  it("fills one noise buffer per bus, whatever the patches", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "step", foot: 0, run: true, n: 1 });
+    director.cue({ kind: "step", foot: 0, run: false, n: 2 });
+    for (const sound of ["sliding", "exit", "blast"] as const) {
+      director.cue({ kind: "door", sound, open: true, pan: 0, gain: 1 });
+    }
+    director.cue({ kind: "travel", via: "portal" });
+    director.cue({ kind: "room", ambience: "airlock", seed: 1 });
+    director.cue({ kind: "room", ambience: "derelict", seed: 1 });
+    expect(ctx.buffers).toHaveLength(2);
+  });
+
+  // Mutation caught: the drone restarted on every room of the same kind.
+  it("keeps one drone through rooms of the same ambience", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({ kind: "room", ambience: "clean", seed: 2 });
+    const drones = levelsInto(ctx, bus(mixer, "ambience"));
+    expect(drones).toHaveLength(1);
+    expect(stopped(drones[0]!)).toBe(false);
+  });
+
+  // Mutation caught: no cross-fade (the old drone cut in a click), or the
+  // new drone never started.
+  it("cross-fades to another ambience over CROSSFADE_S", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    ctx.currentTime = 5;
+    director.cue({ kind: "room", ambience: "hangar", seed: 1 });
+    const [old, fresh] = levelsInto(ctx, bus(mixer, "ambience"));
+    expect(fadeOf(old!)).toEqual([0, 5 + CROSSFADE_S]);
+    expect(fresh).toBeDefined();
+    expect(stopped(fresh!)).toBe(false);
+    // The new drone's voices fade in over the same time.
+    expect(pitches(ctx)).toContain(33);
+  });
+
+  // Mutation caught: the cap not enforced, the drone or a door evicted
+  // before the steps.
+  it("holds at most VOICE_CAP live patches, dropping steps first", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({
+      kind: "door",
+      sound: "bulkhead",
+      open: true,
+      pan: 0,
+      gain: 1,
+    });
+    for (let n = 0; n < 30; n++) {
+      director.cue({ kind: "step", foot: (n % 2) as 0 | 1, run: false, n });
+    }
+    const drone = levelsInto(ctx, bus(mixer, "ambience"));
+    const door = levelsInto(ctx, ctx.ofKind("panner")[0]!);
+    const steps = levelsInto(ctx, bus(mixer, "effects"));
+    expect(steps).toHaveLength(30);
+    const live = [...drone, ...door, ...steps].filter((l) => !stopped(l));
+    expect(live.length).toBeLessThanOrEqual(VOICE_CAP);
+    expect(stopped(drone[0]!)).toBe(false);
+    expect(stopped(door[0]!)).toBe(false);
+    // The oldest steps went, the newest play on.
+    expect(stopped(steps[0]!)).toBe(true);
+    expect(stopped(steps.at(-1)!)).toBe(false);
+
+    // The ride's hum and a new room's drone make room too: the count
+    // stays at the cap with both of them live.
+    const liveNow = () =>
+      [
+        ...levelsInto(ctx, bus(mixer, "ambience")),
+        ...door,
+        ...levelsInto(ctx, bus(mixer, "effects")),
+      ].filter((l) => !stopped(l)).length;
+    director.cue({ kind: "ride", phase: "depart" });
+    expect(liveNow()).toBeLessThanOrEqual(VOICE_CAP);
+    director.cue({ kind: "room", ambience: "hangar", seed: 1 });
+    const drones = levelsInto(ctx, bus(mixer, "ambience"));
+    const effects = levelsInto(ctx, bus(mixer, "effects"));
+    const hum = effects.at(-1)!;
+    const all = [...drones, ...door, ...effects].filter((l) => !stopped(l));
+    expect(all.length).toBeLessThanOrEqual(VOICE_CAP);
+    expect(stopped(hum)).toBe(false);
+    expect(stopped(drones.at(-1)!)).toBe(false);
+  });
+
+  // Mutation caught: a drone started over a full cap (a room entered while
+  // 24 one-shots play, or the first click on a reload) going past it.
+  it("makes room for a drone that starts over a full cap", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    for (let n = 0; n < 30; n++) {
+      director.cue({ kind: "step", foot: 0, run: false, n });
+    }
+    director.cue({ kind: "room", ambience: "dim", seed: 1 });
+    const live = [
+      ...levelsInto(ctx, bus(mixer, "ambience")),
+      ...levelsInto(ctx, bus(mixer, "effects")),
+    ].filter((l) => !stopped(l));
+    expect(live.length).toBeLessThanOrEqual(VOICE_CAP);
+    expect(stopped(levelsInto(ctx, bus(mixer, "ambience"))[0]!)).toBe(false);
+  });
+
+  // Mutation caught: the ride's hum never stopped, or stopped with a
+  // click, or the chime missing on a landing.
+  it("holds the ride's hum until it arrives, then chimes as the room lands", async () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "ride", phase: "depart" });
+    const effects = bus(mixer, "effects");
+    const before = levelsInto(ctx, effects);
+    // The doors' hiss and the hum.
+    expect(before).toHaveLength(2);
+    const hum = before[1]!;
+    expect(stopped(hum)).toBe(false);
+    ctx.currentTime = 2;
+    director.cue({ kind: "ride", phase: "arrive" });
+    expect(fadeOf(hum)).toEqual([0, 2 + RIDE_FADE_S]);
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    expect(pitches(ctx)).toContain(midiHz(84));
+    await microtasks();
+  });
+
+  // Mutation caught: a chime on a ride that ended without a room (a
+  // failed stop, a load error), or a hum left humming after it.
+  it("stops the hum without a chime when no room follows the ride", async () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "ride", phase: "depart" });
+    director.cue({ kind: "ride", phase: "arrive" });
+    await microtasks();
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    expect(pitches(ctx)).not.toContain(midiHz(84));
+    const hum = levelsInto(ctx, bus(mixer, "effects"))[1]!;
+    expect(stopped(hum)).toBe(true);
+  });
+
+  // Mutation caught: no unlock on a gesture while the context is not
+  // running (Safari's refused resume after a hidden tab, F29), or one on
+  // every gesture.
+  it("unlocks again on a click or key while the context is not running", () => {
+    const { ctx, director } = setup("suspended");
+    disposers.push(() => director.dispose());
+    window.dispatchEvent(new MouseEvent("click"));
+    expect(ctx.calls).toEqual(["resume"]);
+    expect(ctx.state).toBe("running");
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyW" }));
+    expect(ctx.calls).toEqual(["resume"]);
+    ctx.state = "interrupted";
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyW" }));
+    expect(ctx.calls).toEqual(["resume", "resume"]);
+  });
+
+  // Mutation caught: a room entered before the context existed left
+  // silent after the first click made one.
+  it("starts the room's drone once a click makes the context", () => {
+    const ctx = new FakeAudioContext();
+    const mixer = createMixer({ make: () => ctx });
+    const director = createDirector(mixer);
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "room", ambience: "dim", seed: 4 });
+    director.cue({ kind: "step", foot: 0, run: false, n: 0 });
+    expect(ctx.nodes).toHaveLength(0);
+    window.dispatchEvent(new MouseEvent("click"));
+    expect(levelsInto(ctx, bus(mixer, "ambience"))).toHaveLength(1);
+    expect(pitches(ctx)).toContain(46);
+  });
+
+  // Mutation caught: one-shots queued on a frozen clock while the context
+  // is suspended (they would all fire at once on the resume).
+  it("drops one-shots while the context is not running, not the drone", () => {
+    const { ctx, mixer, director } = setup("suspended");
+    disposers.push(() => director.dispose());
+    director.cue({ kind: "step", foot: 0, run: false, n: 0 });
+    director.cue({ kind: "terminal" });
+    expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(0);
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    expect(levelsInto(ctx, bus(mixer, "ambience"))).toHaveLength(1);
+  });
+
+  // Mutation caught: mute silencing the cues rather than the master (the
+  // drone missing when sound comes back mid-room).
+  it("mutes the master only, the cues play on into it", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    expect(director.toggleMute()).toBe(true);
+    expect(mixer.muted).toBe(true);
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({ kind: "terminal" });
+    expect(levelsInto(ctx, bus(mixer, "ambience"))).toHaveLength(1);
+    expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(1);
+    expect(director.toggleMute()).toBe(false);
+  });
+
+  // Mutation caught: a drone or a hum left playing after the route went,
+  // the mixer left open, or cues still played after.
+  it("stops everything and closes the mixer on dispose", () => {
+    const { ctx, mixer, director } = setup();
+    director.cue({ kind: "room", ambience: "clean", seed: 1 });
+    director.cue({ kind: "ride", phase: "depart" });
+    director.cue({ kind: "step", foot: 0, run: false, n: 0 });
+    const levels = [
+      ...levelsInto(ctx, bus(mixer, "ambience")),
+      ...levelsInto(ctx, bus(mixer, "effects")),
+    ];
+    expect(levels).toHaveLength(4);
+    director.dispose();
+    for (const level of levels) expect(stopped(level)).toBe(true);
+    expect(mixer.ctx).toBeNull();
+    expect(ctx.calls).toContain("suspend");
+    const made = ctx.nodes.length;
+    director.cue({ kind: "terminal" });
+    window.dispatchEvent(new MouseEvent("click"));
+    expect(ctx.nodes).toHaveLength(made);
+    expect(ctx.calls).not.toContain("resume");
+  });
+
+  // Mutation caught: a click on the pause screen (or while the tab is
+  // hidden) unlocking a context the host suspended on purpose.
+  it("leaves a suspended context quiet through gestures until resumed", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.suspend();
+    window.dispatchEvent(new MouseEvent("click"));
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "Enter" }));
+    expect(ctx.calls).toEqual(["suspend"]);
+    director.resume();
+    expect(ctx.calls).toEqual(["suspend", "resume"]);
+    // A resume the browser refused: the next gesture unlocks.
+    ctx.state = "suspended";
+    window.dispatchEvent(new MouseEvent("click"));
+    expect(ctx.calls).toEqual(["suspend", "resume", "resume"]);
+  });
+
+  // Mutation caught: suspend and resume not passed to the mixer.
+  it("suspends and resumes the context", () => {
+    const { ctx, director } = setup();
+    disposers.push(() => director.dispose());
+    director.suspend();
+    expect(ctx.state).toBe("suspended");
+    director.resume();
+    expect(ctx.state).toBe("running");
+  });
+});
