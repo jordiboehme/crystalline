@@ -7400,6 +7400,8 @@ export interface operations {
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              *
+             *     `kept_branches` lists merged share branches that were kept because an open pull request is still based on them and could not be moved to the branch the share merged into. Each entry carries `branch`, `number`, `onto`, `blocked_by` (null when the open pull requests could not be listed), `reason` and `message`, the sentence to show. Always present, empty when nothing is kept.
+             *
              *     On a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.
              */
             200: {
@@ -7420,6 +7422,7 @@ export interface operations {
                      *       },
                      *       "declined_proposals": [],
                      *       "domain": "eng",
+                     *       "kept_branches": [],
                      *       "last_checked": "2026-08-10T08:00:00Z",
                      *       "local_changes": 2,
                      *       "merged_unconsumed": [],

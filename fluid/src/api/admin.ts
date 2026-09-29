@@ -726,6 +726,12 @@ export interface SyncStatus {
   /** Every layer exists, but they are not grouped on the forge yet. */
   stackLinkPending: boolean;
   /**
+   * Merged share branches kept on the forge because an open pull request is
+   * still based on them, each with the sentence to show and the forge's
+   * reason. Empty when nothing is kept, or from an older server.
+   */
+  keptBranches: KeptBranch[];
+  /**
    * Whose credential a write to this origin goes out on: `instance` for the
    * one machine credential, `personal` for the acting person's own. Null when
    * the report did not say.
@@ -753,6 +759,13 @@ export interface SyncStatus {
 // the owner's slot. A reader with nothing behind it is a claim to keep true
 // for nothing, so the key is ignored until a surface asks for it - at which
 // point it is five lines beside `shareIdentity`. The CLI renders it today.
+
+/** One kept merged-share branch, as the sync route reports it. */
+export interface KeptBranch {
+  branch: string;
+  message: string;
+  reason: string | null;
+}
 
 /** The cache key of one domain's sync status. */
 export function syncStatusKey(domain: string): readonly unknown[] {
@@ -997,6 +1010,9 @@ function readSyncStatus(payload: unknown): SyncStatus {
     stackWedged: asNumbers(record?.stack_wedged),
     repairPending: record?.repair_pending === true,
     stackLinkPending: record?.stack_link_pending === true,
+    keptBranches: asArray(record?.kept_branches)
+      .map(readKeptBranch)
+      .filter((kept): kept is KeptBranch => kept !== null),
     // Off the connection block, where the route puts it, and tolerant: a mode
     // that is not a word is "this report does not say", which every reader
     // treats as the default mode rather than as personal.
@@ -1005,6 +1021,20 @@ function readSyncStatus(payload: unknown): SyncStatus {
     // not the one word is the policy every domain had before there were two.
     sharing: asString(record?.sharing) === "direct" ? "direct" : "proposal",
   };
+}
+
+/**
+ * One kept branch, or nothing when it has no name to key a row by or no
+ * sentence to show.
+ */
+function readKeptBranch(value: unknown): KeptBranch | null {
+  const record = asObject(value);
+  const branch = asString(record?.branch);
+  const message = asString(record?.message);
+  if (branch === null || message === null) {
+    return null;
+  }
+  return { branch, message, reason: asString(record?.reason) };
 }
 
 /** Where this team domain stands. 404 for a domain with no origin. */

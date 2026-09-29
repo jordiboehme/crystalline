@@ -465,6 +465,9 @@ describe("the admin client layer", () => {
       stackWedged: [],
       repairPending: false,
       stackLinkPending: false,
+      // Nothing is kept on the forge, which is also what an older server that
+      // never sent the key is read as.
+      keptBranches: [],
       // A report that does not name the policy is a report from before there
       // were two of them, which is the one every domain shared under.
       sharing: "proposal",
@@ -528,6 +531,50 @@ describe("the admin client layer", () => {
     expect(status.stackWedged).toEqual([3]);
     expect(status.repairPending).toBe(true);
     expect(status.stackLinkPending).toBe(true);
+  });
+
+  it("reads the kept share branches, with and without a reason", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      kept_branches: [
+        {
+          branch: "crystalline/share-1",
+          number: 3,
+          onto: "main",
+          blocked_by: 7,
+          reason: "GitHub returned an unexpected answer (status 422): nope",
+          message: "Branch crystalline/share-1 is kept.",
+        },
+        // No sentence to show, so nothing to draw: dropped.
+        { branch: "crystalline/share-2", reason: "gone" },
+        // No branch to key a row by: dropped.
+        { message: "Branch ? is kept." },
+        {
+          branch: "crystalline/share-4",
+          blocked_by: null,
+          reason: null,
+          message: "Branch crystalline/share-4 is kept.",
+        },
+      ],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    // The per-domain report, never the all-domains summary: the summary
+    // passes on only the keys it lists, and kept branches are not among them.
+    expect(apiMock).toHaveBeenCalledWith("/domains/eng/sync");
+    expect(status.keptBranches).toEqual([
+      {
+        branch: "crystalline/share-1",
+        message: "Branch crystalline/share-1 is kept.",
+        reason: "GitHub returned an unexpected answer (status 422): nope",
+      },
+      {
+        branch: "crystalline/share-4",
+        message: "Branch crystalline/share-4 is kept.",
+        reason: null,
+      },
+    ]);
   });
 
   it("reads a chain whose linking call has not landed as pending, not as stack null", async () => {
