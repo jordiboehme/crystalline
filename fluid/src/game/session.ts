@@ -885,6 +885,8 @@ export function createSession(opts: SessionOptions): Session {
   /** The last `renderer.setRoom` call's time, in ms; null before the first. */
   let lastBuildMs: number | null = null;
 
+  // Made before `onClaimedKey` is added: the input drops a keydown that is
+  // already cancelled (`input.ts`), and the claimed keys are the game's own.
   const input = createInput(canvas);
   const onClick = () => {
     if (!modal()) input.requestLock();

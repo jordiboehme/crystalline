@@ -117,7 +117,9 @@
  * own director. The same one subscription hears the carrier (C27): a drop
  * hangs up (`director.carrier`) and flashes `NO CARRIER`, the return after
  * it plays a short handshake, and `carrierGate` lets a pair sound at most
- * once per `CARRIER_QUIET_MS`.
+ * once per `CARRIER_QUIET_MS`. A change heard while the connecting screen
+ * shows is held, never played over the dial-in: once the screen is done,
+ * the state the carrier is in then is said once (a drop, or nothing).
  */
 
 import { useQueryClient } from "@tanstack/react-query";
@@ -244,6 +246,10 @@ export default function ExploreRoute() {
   const [dialIn, setDialIn] = useState<DialIn | null>(null);
   const dialInRef = useRef<DialIn | null>(null);
   const hangUpRef = useRef<(() => void) | null>(null);
+  // A carrier change heard while the connecting screen shows, held until it
+  // is done (the latest one), and what says a change once it is.
+  const heldCarrierRef = useRef<boolean | null>(null);
+  const sayCarrierRef = useRef<((up: boolean) => void) | null>(null);
   // The pause, with what the screen shows taken from the session as it
   // paused: the room's label and when the lock ended. Null while running.
   const [pause, setPause] = useState<{
@@ -327,12 +333,18 @@ export default function ExploreRoute() {
     }
     // The carrier's sounds and notice, at most once a minute (M4 C27).
     let carrier = CARRIER_START;
-    const onCarrier = (up: boolean) => {
+    const sayCarrier = (up: boolean) => {
       const gate = carrierGate(carrier, up, performance.now());
       carrier = gate.state;
       if (!gate.play) return;
       director.carrier(up);
       if (!up) session.flash(NO_CARRIER);
+    };
+    sayCarrierRef.current = sayCarrier;
+    // Not over the dial-in: the state it is in is said once it is done.
+    const onCarrier = (up: boolean) => {
+      if (dialInRef.current !== null) heldCarrierRef.current = up;
+      else sayCarrier(up);
     };
     // Frames lost while the stream restarted for this route (M4 C13):
     // everything is marked stale, so the first room is read fresh.
@@ -364,6 +376,7 @@ export default function ExploreRoute() {
     return () => {
       unsubscribe();
       hangUpRef.current = null;
+      sayCarrierRef.current = null;
       sessionRef.current = null;
       requestedRef.current = null;
       session.dispose();
@@ -389,6 +402,9 @@ export default function ExploreRoute() {
     dialInRef.current = null;
     sessionRef.current?.setBusy(false);
     setDialIn(null);
+    const held = heldCarrierRef.current;
+    heldCarrierRef.current = null;
+    if (held !== null) sayCarrierRef.current?.(held);
   }, []);
   const closeReader = useCallback(() => {
     sessionRef.current?.closeReader();

@@ -58,6 +58,36 @@ describe("Connecting", () => {
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 
+  // Mutation caught: every key taken, browser shortcuts included (F5 or
+  // Cmd+R in the first seconds would only skip the screen).
+  it("lets browser shortcuts through: neither cancelled nor a skip", () => {
+    const onDone = vi.fn();
+    render(<Connecting number="555-0142" name="ENG" onDone={onDone} />);
+    const shortcuts: KeyboardEventInit[] = [
+      { key: "r", code: "KeyR", metaKey: true },
+      { key: "l", code: "KeyL", ctrlKey: true },
+      { key: "ArrowLeft", code: "ArrowLeft", altKey: true },
+      { key: "F5", code: "F5" },
+      { key: "F12", code: "F12" },
+      { key: "F1", code: "F1" },
+    ];
+    for (const init of shortcuts) {
+      const event = new KeyboardEvent("keydown", {
+        ...init,
+        bubbles: true,
+        cancelable: true,
+      });
+      act(() => {
+        document.body.dispatchEvent(event);
+      });
+      expect(event.defaultPrevented, init.code).toBe(false);
+      expect(onDone, init.code).not.toHaveBeenCalled();
+    }
+    // Shift is no shortcut: it skips.
+    fireEvent.keyDown(document.body, { key: "Shift", code: "ShiftLeft" });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
   it("skips on a click", () => {
     const onDone = vi.fn();
     render(<Connecting number="555-0142" name="ENG" onDone={onDone} />);

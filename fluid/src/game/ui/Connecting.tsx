@@ -6,7 +6,9 @@
  * modem's answer and the name of the place dialled into, while the
  * director plays the dial-in (`audio/modem.ts`). It is done (`onDone`)
  * after `HANDSHAKE_MS`, or at once on any key or click; the host then cuts
- * the sound and hands the station its keys back.
+ * the sound and hands the station its keys back. A browser's shortcut (a
+ * key held with Ctrl, Cmd or Alt, or F1 to F12) is left to the browser:
+ * it neither skips the screen nor is cancelled.
  *
  * Its listeners are on `window` in the capture phase, so they run before
  * the session's own Esc listener whatever order they were added in (C9):
@@ -25,6 +27,22 @@ export const CONNECTING_LABEL = "Connecting";
 
 /** How fast the lines are typed out, in characters a second. */
 export const TYPE_CPS = 30;
+
+/** A function key: F1 to F12 (a reload, the developer tools, full screen). */
+const FUNCTION_KEY = /^F([1-9]|1[0-2])$/;
+
+/**
+ * A browser's key, left alone: one held with Ctrl, Cmd or Alt, or a
+ * function key. It neither skips the screen nor is cancelled.
+ */
+function isShortcut(event: KeyboardEvent): boolean {
+  return (
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    FUNCTION_KEY.test(event.code)
+  );
+}
 
 /** The props of `Connecting`. */
 export interface ConnectingProps {
@@ -54,6 +72,7 @@ export function Connecting({ number, name, onDone }: ConnectingProps) {
       doneRef.current();
     };
     const onKey = (event: KeyboardEvent) => {
+      if (isShortcut(event)) return;
       event.preventDefault();
       finish();
     };

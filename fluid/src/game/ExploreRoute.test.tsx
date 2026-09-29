@@ -1664,6 +1664,54 @@ describe("ExploreRoute", () => {
     // Mutation caught: the gate bypassed (every drop in a flapping minute
     // would hang up and flash), the notice or the hang-up missing, or the
     // carrier heard on a second subscription.
+    // Mutation caught: a carrier change played over the dial-in (the
+    // hang-up on the modem bus under the handshake, the notice under the
+    // screen), or the state held back and never said once the dial ends.
+    it("holds a carrier change until the dial-in ends, then says the state it is in (M4 C26, C27)", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      serve();
+      const flash = vi.fn<(text: string) => void>();
+      sessionStub.factory = (opts) => ({
+        ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+        flash,
+      });
+      const dialledWith = async (changes: boolean[]) => {
+        const view = renderAt("/%CF%80");
+        const dialog = await screen.findByRole("dialog", CONNECTING);
+        const onCarrier = stream.subs.at(-1)?.options?.onCarrier;
+        if (onCarrier === undefined) throw new Error("no carrier callback");
+        const carrier = vi.spyOn(sound.directors.at(-1)!, "carrier");
+        act(() => {
+          for (const up of changes) onCarrier(up);
+        });
+        const during = { carrier: carrier.mock.calls.length, flash: 0 };
+        during.flash = flash.mock.calls.length;
+        fireEvent.click(dialog);
+        return { view, carrier, during };
+      };
+
+      // Down, up and down again under the screen: nothing while it shows,
+      // then the one drop it ended in.
+      const down = await dialledWith([false, true, false]);
+      expect(down.during).toEqual({ carrier: 0, flash: 0 });
+      expect(down.carrier.mock.calls).toEqual([[false]]);
+      expect(flash.mock.calls).toEqual([["NO CARRIER"]]);
+      down.view.unmount();
+
+      // Down and back up under the screen: it ended up, nothing to say.
+      window.sessionStorage.clear();
+      ctx.state = "running";
+      flash.mockClear();
+      const up = await dialledWith([false, true]);
+      expect(up.during).toEqual({ carrier: 0, flash: 0 });
+      expect(up.carrier).not.toHaveBeenCalled();
+      expect(flash).not.toHaveBeenCalled();
+      up.view.unmount();
+    });
+
     it("says NO CARRIER at most once a minute when the stream drops (M4 C27)", async () => {
       gl.available = true;
       serve();

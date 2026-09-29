@@ -1729,15 +1729,18 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("waits longer before each fresh start while the cookie never holds, up to the cap", async () => {
+  it("waits longer before each fresh start while the cookie never holds, up to the cap, and starts over once a label holds", async () => {
     // Catches the fresh start's backoff counted on the counter every open
-    // clears: a cookie that never holds would start over about once a
-    // second forever. Every source opens as soon as it is made and every
-    // answer is in at once, so the gap before a fresh start is its delay.
+    // clears (a cookie that never holds would start over about once a
+    // second forever), and a label that does not clear it (after one
+    // flapping spell every later one would wait 30 s from its first
+    // start). Every source opens as soon as it is made and every answer is
+    // in at once, so the gap before a fresh start is its delay.
     let asked = 0;
+    let holding = false;
     const flipping: SessionProbe = () => {
       asked += 1;
-      return Promise.resolve(me(asked % 2 === 0 ? "bob" : "ada"));
+      return Promise.resolve(me(!holding && asked % 2 === 0 ? "bob" : "ada"));
     };
     const made: number[] = [];
     const streamFactory = (url: string): EventSource => {
@@ -1763,6 +1766,30 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     expect(gaps.slice(0, 7)).toEqual([
       1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
     ]);
+
+    // The cookie holds: a label.
+    holding = true;
+    await advance(60_000);
+    const labelled = made.length;
+    await advance(60_000);
+    expect(made, "labelled: no more sources").toHaveLength(labelled);
+
+    // It flaps again: MAX_REOPENS reopens, then a fresh start after the
+    // first step of the backoff again.
+    holding = false;
+    const last = FakeEventSource.instances.at(-1)!;
+    act(() => {
+      last.fail(0);
+    });
+    await settle();
+    act(() => {
+      last.open();
+    });
+    await settle();
+    await advance(60_000);
+    const fresh = labelled + MAX_REOPENS;
+    expect(made.length).toBeGreaterThan(fresh);
+    expect(made[fresh]! - made[fresh - 1]!).toBe(1_000);
     leave();
   });
 

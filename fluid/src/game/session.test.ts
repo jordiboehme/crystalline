@@ -1282,6 +1282,21 @@ describe("the classic controls", () => {
     return event.defaultPrevented;
   }
 
+  // Mutation caught: the session's own `onClaimedKey` added before the
+  // input's listener, which then finds every claimed key cancelled and
+  // drops it (M4 C26's guard in `input.ts`): no turning on the arrows, no
+  // Space, in play.
+  it("still hands the game the keys its own handler cancels", () => {
+    const session = onBridge();
+    const yaw = lastCamera().yaw;
+    expect(prevented("keydown", "ArrowLeft")).toBe(true);
+    frames(10);
+    prevented("keyup", "ArrowLeft");
+    frames(1);
+    expect(lastCamera().yaw).not.toBeCloseTo(yaw, 3);
+    session.dispose();
+  });
+
   it("keeps the browser from scrolling or going back on the game's keys", () => {
     const session = onBridge();
     expect(prevented("keydown", "Space")).toBe(true);
