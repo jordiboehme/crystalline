@@ -237,6 +237,10 @@ pub struct StrayCopy {
     pub original: String,
     /// The permalink both files answer to.
     pub permalink: String,
+    /// Whether both titles slugify to the copy's file name, as they do when
+    /// 0.20.0's overwrite wrote it. Otherwise the two files only share a
+    /// permalink by accident, and `--fix` never touches them.
+    pub from_overwrite: bool,
     /// Whether the two hold the same text apart from `generated`.
     pub same_text: bool,
     /// Whether the copy was written after the original: its stamp is later,
@@ -1822,15 +1826,15 @@ async fn check_domain_checks(
     // included: a fix is an ordinary local change the next share carries.
     let mut stray_files: HashSet<String> = HashSet::new();
     for pair in stray_pairs(&path) {
-        stray_files.insert(pair.stray.rel.clone());
-        stray_files.insert(pair.original.rel.clone());
-        d.stray_copies.push(settle_stray(
-            &path,
-            &pair,
-            entry.is_overlay(),
-            read_only,
-            fix,
-        ));
+        let report = settle_stray(&path, &pair, entry.is_overlay(), read_only, fix);
+        // Only a pair still on disk is its own finding. After a fix the
+        // engram's file may not be indexed yet (the copy was the indexed
+        // one), and then `unindexed` says so and sends the person to sync.
+        if !report.fixed {
+            stray_files.insert(pair.stray.rel.clone());
+            stray_files.insert(pair.original.rel.clone());
+        }
+        d.stray_copies.push(report);
     }
     let blocked: HashSet<String> = d
         .duplicate_keys
@@ -1992,14 +1996,19 @@ fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Resu
 struct StrayFile {
     rel: String,
     source: String,
-    /// The file's modification time, read together with `source`.
+    /// The file's modification time, when it was the same right before and
+    /// right after `source` was read.
     modified: Option<std::time::SystemTime>,
+    /// The title in the file's frontmatter.
+    title: String,
 }
 
 /// A stray copy and the engram's own file, answering to one permalink.
 #[derive(Debug, Clone)]
 struct StrayPair {
     permalink: String,
+    /// Whether both titles slugify to the copy's file name.
+    from_overwrite: bool,
     stray: StrayFile,
     original: StrayFile,
 }
@@ -2014,10 +2023,15 @@ fn stray_pairs(root: &Path) -> Vec<StrayPair> {
     let mut by_key: BTreeMap<(String, String), Vec<StrayFile>> = BTreeMap::new();
     for rel in markdown_rel_paths(root) {
         let file = root.join(&rel);
+        // The time is read before and after the text. A write in between
+        // would pair one text with the other's time, so then the time counts
+        // as unknown, and an unknown time never lets the fix run.
+        let mtime = || std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        let before = mtime();
         let Ok(source) = std::fs::read_to_string(&file) else {
             continue;
         };
-        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        let modified = before.filter(|&before| mtime() == Some(before));
         let Ok(engram) = crystalline_core::parse_engram(&source) else {
             continue;
         };
@@ -2039,6 +2053,7 @@ fn stray_pairs(root: &Path) -> Vec<StrayPair> {
                 rel,
                 source,
                 modified,
+                title: engram.frontmatter.title.clone(),
             });
     }
     let mut pairs = Vec::new();
@@ -2054,8 +2069,15 @@ fn stray_pairs(root: &Path) -> Vec<StrayPair> {
             (false, true) => (b.clone(), a.clone()),
             _ => continue,
         };
+        // 0.20.0 wrote the copy at the slug of the title and found the
+        // original through that same title, so both titles lead to the
+        // copy's file name. Two files that only share a permalink do not.
+        let from_overwrite = [&stray, &original]
+            .iter()
+            .all(|file| crystalline_core::slugify(&file.title) == last);
         pairs.push(StrayPair {
             permalink,
+            from_overwrite,
             stray,
             original,
         });
@@ -2129,12 +2151,17 @@ fn settle_stray(
         path: pair.stray.rel.clone(),
         original: pair.original.rel.clone(),
         permalink: pair.permalink.clone(),
+        from_overwrite: pair.from_overwrite,
         same_text,
         newer,
         fixable: false,
         fixed: false,
         note: None,
     };
+    // Not a copy from 0.20.0: reported, never adopted or deleted.
+    if !pair.from_overwrite {
+        return report;
+    }
     if reviewing {
         report.note = Some(REVIEWED_NOTE.to_string());
         return report;
@@ -2159,7 +2186,14 @@ fn settle_stray(
     // file, a write by title lands on it, and that text must not be lost.
     // After an adopt the next run then finds the pair again and compares.
     if std::fs::read_to_string(&stray_abs).ok().as_deref() != Some(pair.stray.source.as_str()) {
-        report.note = Some(CHANGED_NOTE.to_string());
+        report.note = Some(if same_text {
+            CHANGED_NOTE.to_string()
+        } else {
+            format!(
+                "{} now has the text of the copy. The copy changed while doctor ran, so --fix kept it: run doctor again",
+                pair.original.rel
+            )
+        });
         return report;
     }
     match std::fs::remove_file(&stray_abs) {
@@ -3172,6 +3206,12 @@ pub fn render_human(report: &DoctorReport) -> String {
                     out,
                     "  fixed {}: took the newer text from {} and deleted the copy",
                     s.original, s.path
+                )
+            } else if !s.from_overwrite {
+                writeln!(
+                    out,
+                    "  [problem] {} and {} both use the permalink {}, so only one of them can be indexed. They are not a copy left by 0.20.0, so --fix leaves them: give one of them its own permalink",
+                    s.path, s.original, s.permalink
                 )
             } else if let Some(note) = &s.note {
                 writeln!(out, "  [problem] {head} {note}")
@@ -5230,12 +5270,31 @@ mod tests {
             std::fs::write(root.join(S_PATH), &edited).unwrap();
             let s = settle_stray(&root, &pairs[0], false, false, true);
             assert!(!s.fixed, "{original_body}: {s:?}");
-            assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE), "{original_body}");
             assert_eq!(
                 std::fs::read_to_string(root.join(S_PATH)).unwrap(),
                 edited,
                 "{original_body}: the new text survives"
             );
+            if s.same_text {
+                assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE));
+                assert_eq!(
+                    std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                    review_standards(original_body, OLDER),
+                    "the identical delete writes nothing"
+                );
+            } else {
+                // The adopt already wrote the original: the note says so.
+                assert_eq!(
+                    s.note.as_deref(),
+                    Some(
+                        "conventions/Code Review Standards.md now has the text of the copy. The copy changed while doctor ran, so --fix kept it: run doctor again"
+                    )
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                    review_standards("The rule.", NEWER)
+                );
+            }
         }
     }
 
@@ -5269,5 +5328,161 @@ mod tests {
             out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. conventions/Code Review Standards.md changed after it: compare the two, keep the right text in conventions/Code Review Standards.md and delete the copy"),
             "{out}"
         );
+    }
+
+    /// An engram in `notes` with its own title and permalink.
+    fn note(title: &str, permalink: &str, body: &str, generated_at: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ngenerated:\n  by: human:ada\n  at: {generated_at}\n---\n\n# {title}\n\n{body}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_two_files_that_only_share_a_permalink() {
+        // Copied by hand and retitled, the permalink left as it was; an agent
+        // then edited notes/meeting, so meeting.md is stamped and modified
+        // last. Not an overwrite from 0.20.0: reported, never touched.
+        let meeting = note("Meeting", "notes/meeting", "The agenda.", NEWER);
+        let september = note(
+            "Meeting 2026-09",
+            "notes/meeting",
+            "The September notes.",
+            OLDER,
+        );
+        let (dir, d) = stray_doctor(
+            &[
+                ("notes/meeting.md", meeting.clone()),
+                ("notes/Meeting 2026-09.md", september.clone()),
+            ],
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert!(!s.from_overwrite && !s.fixable && !s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/meeting.md")).unwrap(),
+            meeting
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/Meeting 2026-09.md")).unwrap(),
+            september
+        );
+        let report = DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains("  [problem] notes/meeting.md and notes/Meeting 2026-09.md both use the permalink notes/meeting, so only one of them can be indexed. They are not a copy left by 0.20.0, so --fix leaves them: give one of them its own permalink"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_of_an_indexed_copy_sends_the_engram_to_sync() {
+        // The copy was the indexed file: after the fix its row is an orphan
+        // (removed in the same run) and the engram's own file is not indexed
+        // yet, which doctor must say instead of "ok".
+        let newer = review_standards("The new rule.", NEWER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), review_standards("The old rule.", OLDER)),
+            Some(S_PATH),
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kb").join(O_PATH)).unwrap(),
+            newer
+        );
+        assert_eq!(d.unindexed, vec![O_PATH.to_string()]);
+        assert_eq!(
+            (d.orphans.clone(), d.orphans_removed),
+            (vec![S_PATH.to_string()], 1)
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        assert!(
+            render_human(&report).contains(
+                "  [problem] 1 file(s) not indexed yet, run: crystalline sync --domain kb"
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn one_permalink_in_two_folders_is_not_a_stray_copy() {
+        let (_dir, d) = stray_doctor(
+            &[
+                (
+                    "drafts/code-review-standards.md",
+                    review_standards("New.", NEWER),
+                ),
+                (
+                    "conventions/Code Review Standards.md",
+                    review_standards("Old.", OLDER),
+                ),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+    }
+
+    #[tokio::test]
+    async fn three_files_with_one_permalink_are_only_reported() {
+        let files = vec![
+            (S_PATH, review_standards("The new rule.", NEWER)),
+            (O_PATH, review_standards("The old rule.", OLDER)),
+            ("conventions/Review.md", review_standards("A third.", OLDER)),
+        ];
+        let (dir, d) = stray_doctor(&files, None, |_| {}, true, false).await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        for (rel, text) in &files {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(rel)).unwrap(),
+                text,
+                "{rel}"
+            );
+        }
+        assert_eq!(
+            d.unindexed.len(),
+            2,
+            "sync indexes one of the three: {:?}",
+            d.unindexed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_without_a_permalink_key_is_found() {
+        // The index gives a file without the key the slug of its path.
+        let copy = review_standards("The new rule.", NEWER)
+            .replace("permalink: conventions/code-review-standards\n", "");
+        let (_dir, d) = stray_doctor(
+            &pair(copy, review_standards("The old rule.", OLDER)),
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert_eq!((s.path.as_str(), s.original.as_str()), (S_PATH, O_PATH));
+        assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
     }
 }
