@@ -191,6 +191,26 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_typed_on_a_key_line_upstream_changed_is_a_conflict() {
+        let mine = SCOTTY.replace("status: stable", "status: stable # reviewed by kim");
+        let theirs = SCOTTY.replace("status: stable", "status: archived");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn a_comment_typed_under_a_key_upstream_changed_is_a_conflict() {
+        let mine = with(SCOTTY, "title: Scotty\n", "# the ship's engineer\n");
+        let theirs = SCOTTY.replace("title: Scotty", "title: Montgomery Scott");
+        assert!(matches!(
+            three_way(SCOTTY, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
     fn a_half_typed_frontmatter_keeps_todays_merge() {
         let mine = SCOTTY.replace("title: Scotty", "title: \"Scotty");
         let theirs = with(SCOTTY, "- Engineering\n", "- Warp\n");

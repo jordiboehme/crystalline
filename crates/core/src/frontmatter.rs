@@ -511,9 +511,10 @@ fn pick(
 ) -> Result<Option<String>, ()> {
     let owned = |text: Option<&str>| text.map(str::to_string);
     if value_of(local) == value_of(upstream) {
-        // Same value: the spelling of the side that re-spelled it; when both
-        // did, their line merge if it keeps the value, else local's. Both
-        // sides added it: upstream's, so the pull converges on the team's copy.
+        // Same value: the spelling of the side that re-spelled it. Both
+        // sides added it: upstream's, so the pull converges on the team's
+        // copy. Both re-spelled it: their line merge if it keeps the value,
+        // else local's.
         if text_of(local) == text_of(upstream) || text_of(local) == text_of(base) {
             return Ok(owned(text_of(upstream)));
         }
@@ -532,7 +533,19 @@ fn pick(
         return Ok(owned(text_of(local)));
     }
     if value_of(local) == value_of(base) {
-        return Ok(owned(text_of(upstream)));
+        if text_of(local) == text_of(base) {
+            return Ok(owned(text_of(upstream)));
+        }
+        // Local only re-spelled it (a comment, say) and upstream changed
+        // the value: their line merge when it carries upstream's value,
+        // else a conflict, so the local text is never dropped silently.
+        if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
+            && let Some((merged, value)) = merge_block(b, l, u, line_merge)
+            && value == u.value
+        {
+            return Ok(Some(merged));
+        }
+        return Err(());
     }
     if value_of(upstream) == value_of(base) {
         return Ok(owned(text_of(local)));
@@ -563,8 +576,8 @@ fn pick(
 ///
 /// | case | result |
 /// |---|---|
-/// | L equals U | U's text when L's text is byte-equal to U's or B's; L's text when U's text is byte-equal to B's (only local re-spelled it); when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text; no B (both added it): U's text; absent on both: the key is gone |
-/// | L equals B | U's text (only upstream changed or removed it) |
+/// | L equals U | U's text when L's text is byte-equal to U's or B's (absent on both: the key is gone); L's text when U's text is byte-equal to B's (only local re-spelled it); no B (both added it): U's text; when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text |
+/// | L equals B | U's text when L's text is byte-equal to B's (only upstream changed or removed it); when local re-spelled it (a comment, say) and U is present, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with U's value; else conflict, so a local comment is never dropped silently |
 /// | U equals B | L's text (only local changed, added or removed it) |
 /// | otherwise, all three present | the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key |
 /// | otherwise | conflict |
@@ -1374,6 +1387,62 @@ mod tests {
         assert_eq!(
             merge_text(Some(SCOTTY), &local, &upstream, &trivial),
             MergedText::Clean(local.clone())
+        );
+    }
+
+    #[test]
+    fn a_local_comment_on_the_key_line_is_a_conflict_when_upstream_changes_the_value() {
+        let local = SCOTTY.replace("status: stable", "status: stable # reviewed by kim");
+        let upstream = SCOTTY.replace("status: stable", "status: archived");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Conflict
+        );
+    }
+
+    #[test]
+    fn a_local_comment_under_the_key_is_a_conflict_when_upstream_changes_the_value() {
+        let local = with(SCOTTY, "title: Scotty\n", "# the ship's engineer\n");
+        let upstream = SCOTTY.replace("title: Scotty", "title: Montgomery Scott");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Conflict
+        );
+    }
+
+    #[test]
+    fn a_local_comment_is_kept_when_the_line_merge_carries_upstreams_value() {
+        let local = SCOTTY.replace("tags:\n", "tags:\n  # keep\n");
+        let upstream = SCOTTY.replace("  - manifest\n", "  - manifest\n  - warp\n");
+        let merge = tags_merged_as("tags:\n  # keep\n  - manifest\n  - warp\n");
+        let expected = SCOTTY.replace(
+            "tags:\n  - manifest\n",
+            "tags:\n  # keep\n  - manifest\n  - warp\n",
+        );
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &merge),
+            MergedText::Clean(expected)
+        );
+    }
+
+    #[test]
+    fn a_line_merge_that_loses_upstreams_value_under_a_local_comment_is_a_conflict() {
+        let local = SCOTTY.replace("tags:\n", "tags:\n  # keep\n");
+        let upstream = SCOTTY.replace("  - manifest\n", "  - manifest\n  - warp\n");
+        let merge = tags_merged_as("tags:\n  # keep\n  - manifest\n");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &merge),
+            MergedText::Conflict
+        );
+    }
+
+    #[test]
+    fn a_local_comment_on_a_key_upstream_removed_is_a_conflict() {
+        let local = SCOTTY.replace("status: stable", "status: stable # reviewed by kim");
+        let upstream = SCOTTY.replace("status: stable\n", "");
+        assert_eq!(
+            merge_text(Some(SCOTTY), &local, &upstream, &trivial),
+            MergedText::Conflict
         );
     }
 
