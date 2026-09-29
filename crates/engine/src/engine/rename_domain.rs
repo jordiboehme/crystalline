@@ -288,13 +288,16 @@ impl Engine {
                 )
             }));
         }
-        let manifest_draft = if local_only {
+        let reviewing_draft = if local_only {
             false
         } else {
             self.refuse_unwritable_manifest(old, new).await?
         };
-        let manifest_kept =
-            !local_only && !manifest_draft && !self.manifest_takes_name(old).await?;
+        // Judged on the text the MANIFEST step would edit: in a reviewing
+        // domain the caller's draft when there is one. A kept MANIFEST is not
+        // drafted.
+        let manifest_kept = !local_only && !self.manifest_takes_name(old, scope).await?;
+        let manifest_draft = reviewing_draft && !manifest_kept;
         self.refuse_shared_index(old).await?;
         self.refuse_leftovers(new, &state_dir, scope).await?;
         // What the journal belongs to, read before anything is paused.
@@ -912,10 +915,14 @@ impl Engine {
             "moved": moved,
         });
         if journal.manifest_kept {
+            let place = if entry.is_overlay() {
+                format!("set it to '{new}' by hand in your draft of the MANIFEST.")
+            } else {
+                format!("set it to '{new}' by hand.")
+            };
             report["note"] = json!(format!(
                 "The MANIFEST's frontmatter is in a form Crystalline cannot change key by key \
-                 (such as {{title: ...}}), so its domain_name was left as it is; set it to \
-                 '{new}' by hand."
+                 (such as {{title: ...}}), so its domain_name was left as it is; {place}"
             ));
         }
         Ok(report)
@@ -1184,13 +1191,20 @@ impl Engine {
         Ok(false)
     }
 
-    /// Whether `old`'s MANIFEST can take a new name key by key; false for a
-    /// frontmatter in flow style or one that cannot be cut into keys, which
-    /// the MANIFEST step then leaves as it is.
-    async fn manifest_takes_name(&self, old: &str) -> Result<bool> {
-        let (desc, source) = self.resolve_in("manifest", old).await?;
-        let text = self.load_content(&source, &desc).await?;
-        Ok(crystalline_core::manifest::can_declare_name(&text))
+    /// Whether the MANIFEST the MANIFEST step will edit can take a new name
+    /// key by key: the caller's draft of it in a reviewing domain when there is
+    /// one, else the base, read through the same view `rename_manifest` edits.
+    /// False for a frontmatter in flow style or one that cannot be cut into
+    /// keys, which the step then leaves as it is.
+    async fn manifest_takes_name(&self, old: &str, scope: &crate::scope::Scope) -> Result<bool> {
+        let view = DomainView::for_write(self, old, scope).await?;
+        let (desc, source) = view.resolve("manifest").await?;
+        Ok(match view.text_at(&source, &desc).await? {
+            Some(text) => crystalline_core::manifest::can_declare_name(&text),
+            // A draft that deletes the MANIFEST: nothing to judge here, and
+            // the step answers for what it finds.
+            None => true,
+        })
     }
 
     /// Every registered domain `scope` may see and write, sorted.
