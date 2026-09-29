@@ -102,3 +102,8 @@ tar = { workspace = true }
 # process (the fs4 lock a rival daemon would hold) so the spawned `mcp` child
 # fails to acquire it and serves the stub.
 fs4 = { workspace = true }
+
+# The job test in tests/daemon/service_windows.rs puts its own process in a
+# job that forbids breakaway, to see the daemon's refusal path end to end.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }

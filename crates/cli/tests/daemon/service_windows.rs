@@ -7,7 +7,7 @@
 //! coverage rides the windows-latest CI leg without touching local runs.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -127,6 +127,47 @@ fn wait_for_record(env: &Env) -> Value {
     }
 }
 
+/// Run a one-shot command in this env, returning (success, stdout).
+fn run(env: &Env, args: &[&str]) -> (bool, String) {
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.args(args).stdin(Stdio::null()).output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Poll `ctl status --json` for up to 60s and return the daemon's report.
+fn wait_for_ctl_status(env: &Env) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (ok, out) = run(env, &["ctl", "status", "--json"]);
+        if ok && let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "no daemon answered within 60s");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Stop the daemon a bridge started and wait until its record is gone. The
+/// daemon is detached, so no `Reap` guard owns it and `Env::drop` cannot
+/// remove a directory it still holds.
+fn shutdown_daemon(env: &Env) {
+    let _ = run(env, &["ctl", "shutdown"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while env.info_path().exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Two spellings of one directory compare equal: canonicalized, so an 8.3
+/// short temp path and a long one meet.
+fn same_dir(a: &str, b: &Path) -> bool {
+    dunce::canonicalize(a).ok() == dunce::canonicalize(b).ok()
+}
+
 /// A `crystalline mcp` child driven with newline-delimited JSON-RPC over its
 /// stdio, mirroring service.rs's `Mcp` helper (same initialize params, the same
 /// id counter and json! request shapes). It attaches over the named pipe with
@@ -151,8 +192,25 @@ impl Bridge {
     fn attach(env: &Env) -> Bridge {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
-        cmd.arg("mcp")
-            .stdin(Stdio::piped())
+        cmd.arg("mcp");
+        Bridge::start(cmd)
+    }
+
+    /// As [`Bridge::attach`], started in `dir` and with an optional `--db`
+    /// passed exactly as written (a relative one stays relative).
+    fn attach_in(env: &Env, dir: &Path, db: Option<&str>) -> Bridge {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.current_dir(dir);
+        if let Some(db) = db {
+            cmd.arg("--db").arg(db);
+        }
+        cmd.arg("mcp");
+        Bridge::start(cmd)
+    }
+
+    fn start(mut cmd: Command) -> Bridge {
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = cmd.spawn().unwrap();
@@ -398,5 +456,112 @@ fn doctor_fix_dislodges_an_unresponsive_holder() {
     assert!(
         !env.info_path().exists(),
         "the dislodged holder's stale record was cleaned up"
+    );
+}
+
+/// Issue #115, the real regression test: a daemon a client started keeps no
+/// hold on the client's directory. Windows locks a running process's working
+/// directory, so before 0.21.1 this rename failed with a sharing violation
+/// for as long as the daemon ran.
+///
+/// The runner itself may run this test inside a job object, so `in_job` is
+/// only checked to be a bool, and the breakaway permission to be known
+/// whenever there is a job. A runner process has no package identity.
+#[test]
+fn an_autostarted_daemon_leaves_its_clients_directory_free() {
+    let env = Env::new("win-cwd");
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let bridge = Bridge::attach_in(&env, &work, None);
+    let status = wait_for_ctl_status(&env);
+    let runs_in = &status["runs_in"];
+    assert!(
+        same_dir(
+            runs_in["working_dir"].as_str().unwrap_or(""),
+            &env.state_dir()
+        ),
+        "the daemon works in the state directory: {status}"
+    );
+    assert!(runs_in["in_job"].is_boolean(), "{status}");
+    if runs_in["in_job"] == json!(true) {
+        assert!(runs_in["job_allows_breakaway"].is_boolean(), "{status}");
+    }
+    assert!(runs_in["package"].is_null(), "{status}");
+
+    // The client pins its own working directory: end it first.
+    drop(bridge);
+    let renamed = std::fs::rename(&work, env.dir.join("work-moved"));
+    shutdown_daemon(&env);
+    renamed.expect("the daemon holds no handle on the client's directory");
+}
+
+/// A relative `--db` still names the file in the client's directory.
+#[test]
+fn a_relative_db_still_reaches_the_file_the_client_meant_on_windows() {
+    let env = Env::new("win-reldb");
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let bridge = Bridge::attach_in(&env, &work, Some("rel.db"));
+    let status = wait_for_ctl_status(&env);
+    let in_work = work.join("rel.db").is_file();
+    let in_state = env.state_dir().join("rel.db").exists();
+    drop(bridge);
+    shutdown_daemon(&env);
+    assert!(in_work, "the index opened where the client was: {status}");
+    assert!(
+        !in_state,
+        "and not in the daemon's own working directory: {status}"
+    );
+}
+
+/// The refusal path end to end: this test process joins a fresh job with no
+/// limit flags, so no breakaway. The client it starts is in that job, its
+/// breakaway spawn is refused and the daemon starts inside the job, knows it
+/// and says so. nextest runs every test in its own process, so the job ends
+/// with this test (under plain `cargo test` the other tests of this binary
+/// would share it; none of them asserts on jobs). Nested jobs need Windows 8
+/// or later, which every runner is.
+#[test]
+fn a_daemon_that_cannot_leave_the_job_says_so() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let env = Env::new("win-job");
+    // SAFETY: both arguments may be null (no security attributes, no name),
+    // which makes a private job with default limits; the result is checked.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(
+        !job.is_null(),
+        "CreateJobObjectW: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `job` is the valid handle just created and `GetCurrentProcess`
+    // returns this process's pseudo handle, which never needs closing.
+    let joined = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+    assert!(
+        joined != 0,
+        "AssignProcessToJobObject: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let bridge = Bridge::attach(&env);
+    let status = wait_for_ctl_status(&env);
+    let log = std::fs::read_to_string(env.state_dir().join("daemon.log")).unwrap_or_default();
+    drop(bridge);
+    shutdown_daemon(&env);
+    // The job handle goes last; the job has no kill-on-close limit.
+    // SAFETY: `job` is a valid handle owned by this test and closed once.
+    unsafe { CloseHandle(job) };
+
+    let runs_in = &status["runs_in"];
+    assert_eq!(runs_in["in_job"], json!(true), "{status}");
+    assert_eq!(runs_in["job_allows_breakaway"], json!(false), "{status}");
+    assert_eq!(runs_in["breakaway_refused"], json!(true), "{status}");
+    assert!(
+        log.contains("could not leave the job of the program that started it"),
+        "the daemon's startup warning is in daemon.log: {log}"
     );
 }
