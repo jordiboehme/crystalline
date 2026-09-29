@@ -132,6 +132,43 @@ pub struct DomainView<'a> {
     _writing: Option<crate::rename::WriteTicket<'a>>,
 }
 
+/// Where an occupant stands: the path that was asked for, and for a file
+/// domain the root to look its on-disk spelling up under. The lookup lists
+/// directories, so it runs only when a refusal prints the name
+/// ([`Spot::name`]), never on the plain read of an overwrite or a preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Spot {
+    path: String,
+    root: Option<std::path::PathBuf>,
+}
+
+impl Spot {
+    /// A draft or a row, found by exact path: its name is the path.
+    fn exact(path: &str) -> Self {
+        Spot {
+            path: path.to_string(),
+            root: None,
+        }
+    }
+
+    /// A file under `root`, which a case-folding filesystem can spell
+    /// differently from `path`.
+    fn on_disk(root: &Path, path: &str) -> Self {
+        Spot {
+            path: path.to_string(),
+            root: Some(root.to_path_buf()),
+        }
+    }
+
+    /// The name to print: as the disk spells it for a file, else the path.
+    pub(crate) fn name(&self) -> String {
+        match &self.root {
+            Some(root) => on_disk_name(root, &self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
 /// What stands at one path for a writer, told apart the way a capture needs
 /// it before it writes anything (see [`DomainView::occupant_at`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,9 +178,9 @@ pub(crate) enum Occupant {
     /// An engram answering to `permalink`, in the file or row at `at`: the
     /// name as it stands on disk, which a case-folding filesystem can spell
     /// differently from the path that was asked for.
-    Engram { permalink: String, at: String },
+    Engram { permalink: String, at: Spot },
     /// A file or row at `at` that does not parse as an engram.
-    Unreadable { at: String },
+    Unreadable { at: Spot },
 }
 
 impl<'a> DomainView<'a> {
@@ -602,7 +639,7 @@ impl<'a> DomainView<'a> {
                 Some(entry) => {
                     return Ok(Occupant::Engram {
                         permalink: entry.permalink,
-                        at: path.to_string(),
+                        at: Spot::exact(path),
                     });
                 }
                 None => {}
@@ -612,13 +649,13 @@ impl<'a> DomainView<'a> {
             ContentSource::File { root } => {
                 let abs = join_rel(root, path);
                 match std::fs::read_to_string(&abs) {
-                    Ok(text) => (text, on_disk_name(root, path)),
+                    Ok(text) => (text, Spot::on_disk(root, path)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(Occupant::Free);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         return Ok(Occupant::Unreadable {
-                            at: on_disk_name(root, path),
+                            at: Spot::on_disk(root, path),
                         });
                     }
                     Err(source) => {
@@ -633,7 +670,7 @@ impl<'a> DomainView<'a> {
                 let store = self.engine.store();
                 let store = store.lock().await;
                 match store.engram_content(domain_id, path).await? {
-                    Some(text) => (text, path.to_string()),
+                    Some(text) => (text, Spot::exact(path)),
                     None => return Ok(Occupant::Free),
                 }
             }
@@ -2405,20 +2442,69 @@ fn on_disk_name(root: &Path, path: &str) -> String {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        let found = if names.iter().any(|name| name == segment) {
-            segment.to_string()
-        } else {
-            let folded = crystalline_core::fold_path_case(segment);
-            let mut matches = names
-                .iter()
-                .filter(|name| crystalline_core::fold_path_case(name) == folded);
-            match (matches.next(), matches.next()) {
-                (Some(one), None) => one.clone(),
-                _ => return path.to_string(),
-            }
-        };
+        let found = name_among(&names, segment);
         dir.push(&found);
         named.push(found);
     }
     named.join("/")
+}
+
+/// The entry of `names` that `segment` stands for: an exact match first,
+/// else the one entry that folds onto it, else `segment` itself (no match,
+/// or several fold matches that cannot be told apart).
+fn name_among(names: &[String], segment: &str) -> String {
+    if names.iter().any(|name| name == segment) {
+        return segment.to_string();
+    }
+    let folded = crystalline_core::fold_path_case(segment);
+    let mut matches = names
+        .iter()
+        .filter(|name| crystalline_core::fold_path_case(name) == folded);
+    match (matches.next(), matches.next()) {
+        (Some(one), None) => one.clone(),
+        _ => segment.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod on_disk_choice_tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn an_exact_match_wins_over_a_fold_match() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "gamma.md"]), "gamma.md"),
+            "gamma.md"
+        );
+    }
+
+    #[test]
+    fn one_fold_match_is_used() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "other.md"]), "gamma.md"),
+            "Gamma.md"
+        );
+    }
+
+    #[test]
+    fn several_fold_matches_fall_back_to_the_given_name() {
+        assert_eq!(
+            name_among(&names(&["Gamma.md", "GAMMA.md"]), "gamma.md"),
+            "gamma.md"
+        );
+    }
+
+    #[test]
+    fn no_match_falls_back_to_the_given_name() {
+        assert_eq!(name_among(&names(&["other.md"]), "gamma.md"), "gamma.md");
+    }
+
+    #[test]
+    fn a_draft_or_row_spot_names_the_path_it_was_asked_for() {
+        assert_eq!(Spot::exact("notes/gamma.md").name(), "notes/gamma.md");
+    }
 }

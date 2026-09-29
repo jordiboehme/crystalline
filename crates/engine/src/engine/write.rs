@@ -249,7 +249,9 @@ impl Engine {
             } if held == permalink => {
                 if !overwrite {
                     return Err(EngineError::Conflict(collision_message(
-                        permalink, domain, &at,
+                        permalink,
+                        domain,
+                        &at.name(),
                     )));
                 }
             }
@@ -257,12 +259,14 @@ impl Engine {
                 permalink: other,
                 at,
             } => {
+                let at = at.name();
                 return Err(EngineError::Conflict(format!(
                     "'{at}' in domain '{domain}' already holds the engram '{other}'. Pick another title or folder, or change '{other}' with edit_engram"
                 )));
             }
             Occupant::Unreadable { .. } if overwrite => {}
             Occupant::Unreadable { at } => {
+                let at = at.name();
                 return Err(EngineError::Conflict(format!(
                     "'{at}' in domain '{domain}' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
                 )));
@@ -803,7 +807,9 @@ impl Engine {
         let source = self.content_source(&p.domain).ok()?;
         // The read-only id lookup, never an upserting one: a preview writes
         // nothing, and a domain with no row has no document anybody can have
-        // open (the pattern `granted_read` uses).
+        // open (the pattern `granted_read` uses). The rename-in-flight
+        // refusal `domain_source` gave is covered: `localized_for` above
+        // waits for renames before this point.
         let domain_id = {
             let store = self.store.lock().await;
             store.domain_id(&p.domain).await.ok()??
@@ -2338,6 +2344,29 @@ mod on_disk_name_tests {
         assert_eq!(
             err,
             "permalink 'notes/gamma' already exists in domain 'kb' (at notes/Gamma.md); pass overwrite=true to replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_virtual_domain_names_the_path_it_was_asked_for() {
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("kb".to_string(), DomainEntry::virtual_domain());
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap();
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "permalink 'notes/gamma' already exists in domain 'kb' (at notes/gamma.md); pass overwrite=true to replace"
         );
     }
 
