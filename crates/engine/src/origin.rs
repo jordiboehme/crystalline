@@ -189,9 +189,9 @@ pub(crate) fn proposal_transitions_json(
 /// no proposal record to read its own history off, and the file list belongs
 /// to the commit rather than to a status glance.
 ///
-/// `kept_branches` names merged share branches kept because an open pull
-/// request is still based on them, each with the sentence to show; always
-/// present, empty when nothing is kept.
+/// `kept_branches` names share branches Crystalline keeps upstream (merged,
+/// declined or withdrawn shares), each with why it was retired, what kept it
+/// and the sentence to show; always present, empty when nothing is kept.
 ///
 /// `detail` is the one key here that is opt-in: `local_changes` stays the bare
 /// count it has always been, and only a caller that asked for the file list
@@ -448,9 +448,9 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
 /// the status overview stays a glance rather than a second copy of
 /// `origin_status`.
 ///
-/// `kept_branches` names merged share branches kept because an open pull
-/// request is still based on them, each with the sentence to show; always
-/// present, empty when nothing is kept.
+/// `kept_branches` names share branches Crystalline keeps upstream (merged,
+/// declined or withdrawn shares), each with why it was retired, what kept it
+/// and the sentence to show; always present, empty when nothing is kept.
 pub(crate) fn origin_poll_status_json(
     domain: &str,
     report: &OriginStatusReport,
@@ -477,9 +477,10 @@ pub(crate) fn origin_poll_status_json(
     })
 }
 
-/// The kept merged-share branches as every surface shows them: the entry,
-/// the forge's reason and the one sentence
-/// [`MergedBranch::kept_message`](crystalline_remote::state::MergedBranch::kept_message)
+/// The kept share branches as every surface shows them: the entry, why its
+/// share was retired, what kept it, the forge's reason (null when there is
+/// none) and the one sentence
+/// [`QueuedBranch::kept_message`](crystalline_remote::state::QueuedBranch::kept_message)
 /// words. An empty list when nothing is kept.
 fn kept_branches_json(report: &OriginStatusReport) -> Vec<Value> {
     report
@@ -490,8 +491,14 @@ fn kept_branches_json(report: &OriginStatusReport) -> Vec<Value> {
                 "branch": entry.branch,
                 "number": entry.number,
                 "onto": entry.onto,
+                "why": entry.why,
+                "kind": entry.kept_kind(),
                 "blocked_by": entry.kept.as_ref().and_then(|k| k.blocked_by),
-                "reason": entry.kept.as_ref().map(|k| k.reason.clone()),
+                "reason": entry
+                    .kept
+                    .as_ref()
+                    .map(|k| k.reason.clone())
+                    .filter(|reason| !reason.is_empty()),
                 "message": entry.kept_message(),
             })
         })
@@ -1994,21 +2001,25 @@ mod tests {
 
     #[test]
     fn a_kept_branch_travels_with_its_message_in_both_shapes() {
-        use crystalline_remote::state::{BranchKept, MergedBranch};
+        use crystalline_remote::state::{BranchKept, KeptKind, QueuedBranch, RetireWhy};
         let mut report = poll_status_fixture();
-        report.kept_branches = vec![MergedBranch {
+        report.kept_branches = vec![QueuedBranch {
             number: 3,
             branch: "crystalline/share-1".to_string(),
             onto: "main".to_string(),
+            why: RetireWhy::Merged,
             kept: Some(BranchKept {
                 blocked_by: Some(7),
                 reason: "GitHub returned an unexpected answer (status 422): nope".to_string(),
+                kind: KeptKind::Base,
             }),
         }];
         let expected = json!([{
             "branch": "crystalline/share-1",
             "number": 3,
             "onto": "main",
+            "why": "merged",
+            "kind": "base",
             "blocked_by": 7,
             "reason": "GitHub returned an unexpected answer (status 422): nope",
             "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",

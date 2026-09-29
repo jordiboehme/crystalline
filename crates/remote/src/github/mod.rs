@@ -665,6 +665,7 @@ impl Provider for GitHubProvider {
                     branch: item.head.reference,
                     head_sha: item.head.sha,
                     base: item.base.reference,
+                    head_repo: item.head.repo.map(|repo| repo.full_name),
                 });
             }
             if count < COMPARE_PER_PAGE {

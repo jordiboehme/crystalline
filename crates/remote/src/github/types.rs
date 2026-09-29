@@ -229,6 +229,15 @@ pub(super) struct HeadRef {
     #[serde(rename = "ref")]
     pub(super) reference: String,
     pub(super) sha: String,
+    /// The head's repository. Null for a deleted fork, and read as absent
+    /// when the key is missing.
+    #[serde(default)]
+    pub(super) repo: Option<HeadRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HeadRepo {
+    pub(super) full_name: String,
 }
 
 /// `POST .../stacks` and `POST .../stacks/{number}/add` request body: the

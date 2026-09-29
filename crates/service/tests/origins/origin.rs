@@ -21,7 +21,8 @@ use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
-    FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+    BranchKept, FeedbackItem, FeedbackKind, KeptKind, OriginState, Proposal, ProposalStatus,
+    ProposedChange, ProposedFile, QueuedBranch, RetireWhy,
 };
 use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
@@ -1573,6 +1574,61 @@ async fn origin_status_reports_behind_and_connection() {
         .unwrap();
     let domains2 = status2["domains"].as_array().unwrap();
     assert_eq!(domains2[0]["behind"], true);
+}
+
+/// A kept entry reaches the status JSON with why its share was retired, what
+/// kept it and a null reason when the forge gave none.
+#[tokio::test]
+async fn origin_status_names_why_and_what_kept_a_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &c1);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.retire_queue.push(QueuedBranch {
+        number: 3,
+        branch: "crystalline/share-1".to_string(),
+        onto: "main".to_string(),
+        why: RetireWhy::Withdrawn,
+        kept: Some(BranchKept {
+            blocked_by: Some(70),
+            reason: String::new(),
+            kind: KeptKind::Head,
+        }),
+    });
+    state.save(&state_dir).unwrap();
+
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["kept_branches"],
+        serde_json::json!([{
+            "branch": "crystalline/share-1",
+            "number": 3,
+            "onto": "main",
+            "why": "withdrawn",
+            "kind": "head",
+            "blocked_by": 70,
+            "reason": null,
+            "message": "Branch crystalline/share-1 is kept: pull request #70 comes from it.",
+        }])
+    );
 }
 
 /// The keys one domain entry carries when nobody asked for detail. Pinned as a

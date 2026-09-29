@@ -51,12 +51,12 @@ use crate::changes::{LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_lo
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
 use crate::provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalRequest, ProposalState, Provider,
-    TreeWrite, UpstreamChange,
+    ChangeKind, CompareResult, HeadProbe, OpenProposalRef, OriginSpec, ProposalRequest,
+    ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 use crate::state::{
-    self, BaseStamp, BranchKept, Conflict, DirectShare, MergedBranch, OriginState, Proposal,
-    ProposalStatus, ProposedChange, ProposedFile,
+    self, BaseStamp, BranchKept, Conflict, DirectShare, KeptKind, OriginState, Proposal,
+    ProposalStatus, ProposedChange, ProposedFile, QueuedBranch, RetireWhy,
 };
 
 /// Above this many changed files (after subpath filtering) a compare is
@@ -176,10 +176,9 @@ pub struct OriginStatusReport {
     /// Direct commits this machine put on the connected branch, newest first,
     /// from [`crate::state::OriginState::direct_shares`].
     pub direct_shares: Vec<DirectShare>,
-    /// Merged shares whose branch was kept because an open pull request is
-    /// still based on it and could not be moved, or the open pull requests
-    /// could not be listed. Empty when nothing is kept.
-    pub kept_branches: Vec<MergedBranch>,
+    /// Share branches Crystalline keeps upstream (merged, declined or
+    /// withdrawn shares), each with what kept it. Empty when nothing is kept.
+    pub kept_branches: Vec<QueuedBranch>,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -555,7 +554,7 @@ fn manifest_candidates(
 ///
 /// A consumed merge's branch is queued in the same save, and deleted once
 /// every open pull request based on it was moved to the branch the share
-/// merged into ([`retire_merged_branches`]). This is [`pull_with`] running
+/// merged into ([`retire_branches`]). This is [`pull_with`] running
 /// that cleanup.
 pub async fn pull(
     provider: &dyn Provider,
@@ -566,7 +565,7 @@ pub async fn pull(
     pull_with(provider, spec, domain_root, state_dir, BranchCleanup::Run).await
 }
 
-/// Whether a pull runs the merged-branch cleanup ([`retire_merged_branches`])
+/// Whether a pull runs the branch cleanup ([`retire_branches`])
 /// or leaves the queue for a later pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchCleanup {
@@ -577,7 +576,7 @@ pub enum BranchCleanup {
     Defer,
 }
 
-/// [`pull`], with the merged-branch cleanup run or deferred as `cleanup`
+/// [`pull`], with the branch cleanup run or deferred as `cleanup`
 /// says. Everything else is the same pull.
 pub async fn pull_with(
     provider: &dyn Provider,
@@ -780,7 +779,7 @@ pub async fn pull_with(
 
     // Branch cleanup, after the state is durable.
     if cleanup == BranchCleanup::Run {
-        retire_merged_branches(provider, spec, &mut state, state_dir).await;
+        retire_branches(provider, spec, &mut state, state_dir).await;
     }
 
     Ok(PullReport {
@@ -795,7 +794,7 @@ pub async fn pull_with(
 }
 
 /// Moves every Merged record out of the chain and into history, queues its
-/// branch in [`OriginState::merged_branches`] for [`retire_merged_branches`]
+/// branch in [`OriginState::retire_queue`] for [`retire_branches`]
 /// to delete once the caller's state is durable, and returns the records.
 ///
 /// The one rule beyond the move: when the last open layer leaves this way, the
@@ -813,15 +812,10 @@ fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
         return merged;
     }
     // Where each one went, read off the chain before it leaves: the branch is
-    // queued for [`retire_merged_branches`] in the same save as the move.
+    // queued for [`retire_branches`] in the same save as the move.
     for prop in &merged {
         let onto = merged_into(state, prop.number);
-        state.merged_branches.push(MergedBranch {
-            number: prop.number,
-            branch: prop.branch.clone(),
-            onto,
-            kept: None,
-        });
+        queue_retired(state, prop, RetireWhy::Merged, onto);
     }
     state
         .proposals
@@ -841,7 +835,8 @@ fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
 
 /// The branch a merged layer merged into: the nearest layer below it that is
 /// still open, else the branch the domain tracks. The walk [`repair_chain`]
-/// makes to pick a survivor's new base.
+/// makes to pick a survivor's new base. The same walk names where a declined
+/// layer's pull requests belong, read before the record leaves the chain.
 fn merged_into(state: &OriginState, number: u64) -> String {
     state
         .proposals
@@ -857,89 +852,301 @@ fn merged_into(state: &OriginState, number: u64) -> String {
         .unwrap_or_else(|| state.branch.clone())
 }
 
-/// Deletes the branch of every queued merged share once no open pull request
-/// is based on it (issue 113).
+/// Queues `prop`'s branch for [`retire_branches`], once: a branch already in
+/// the queue (a withdraw tried again after its revert failed) keeps the entry
+/// it has.
+fn queue_retired(state: &mut OriginState, prop: &Proposal, why: RetireWhy, onto: String) {
+    if state
+        .retire_queue
+        .iter()
+        .any(|entry| entry.branch == prop.branch)
+    {
+        return;
+    }
+    state.retire_queue.push(QueuedBranch {
+        number: prop.number,
+        branch: prop.branch.clone(),
+        onto,
+        why,
+        kept: None,
+    });
+}
+
+/// Where a withdrawn layer's pull requests belong: the nearest open layer
+/// below it, read before any call, else the branch the domain tracks.
+fn withdrawn_onto(state: &OriginState, below: &[Proposal]) -> String {
+    below
+        .last()
+        .map(|layer| layer.branch.clone())
+        .unwrap_or_else(|| state.branch.clone())
+}
+
+/// What the pass did with one queued branch.
+enum Retired {
+    /// The branch is gone upstream: deleted now, or found gone by a probe.
+    Gone,
+    /// It stays queued; `kept` says why when there is anything to say.
+    Stays,
+}
+
+/// Deletes every queued share branch nothing uses any more (issues 113 and
+/// 114).
 ///
 /// Deleting a branch closes every open pull request based on it, and the forge
-/// will not reopen one. So each one - a layer of ours the forge did not move,
-/// or one somebody pushed by hand onto the share branch - is moved to the
-/// branch the share merged into first, title and body untouched. A branch with
-/// a pull request that could not be moved stays, with the reason recorded for
-/// the status, and the next pull tries again. One listing per pass, and none
-/// when nothing is queued. Never fails the pull: the queue is already durable.
+/// will not reopen one. So a merged share's pull requests are moved to the
+/// branch it merged into first, title and body untouched, and a declined or
+/// withdrawn share's are never moved: that would change what they propose, so
+/// their branch waits until they are closed or moved by hand. A branch another
+/// open pull request of this repository comes from waits too. One listing per
+/// pass, and none when nothing is queued. Never fails the pull: the queue is
+/// already durable.
 ///
-/// A deleted branch can be another entry's `onto`: a middle layer kept on the
-/// bottom layer's branch, then the bottom merges. Every such entry, kept or
-/// still to come, then takes the deleted entry's own `onto`, so it is never
-/// bound for a branch that is gone. Its `kept` is cleared, since the reason
-/// was about the old target: the entry reads as queued until the next pass
-/// tries the new one.
-async fn retire_merged_branches(
+/// Entries are worked dependents first: an entry bound for another queued
+/// entry's branch goes before it, so the listing already shows every pull
+/// request the dependent moved onto that branch. A branch that is really gone
+/// (deleted now, or found gone by a probe) passes its own `onto` to every
+/// entry bound for it; a branch that is still there never does.
+async fn retire_branches(
     provider: &dyn Provider,
     spec: &OriginSpec,
     state: &mut OriginState,
     state_dir: &Path,
 ) {
-    if state.merged_branches.is_empty() {
+    if state.retire_queue.is_empty() {
         return;
     }
     let mut open = match provider.list_open_proposals(spec).await {
         Ok(open) => open,
         Err(e) => {
+            // Nothing is moved, probed or deleted without a listing. A notice
+            // that is about the branch itself stays as it is.
             let reason = e.to_string();
-            for entry in &mut state.merged_branches {
-                entry.kept = Some(BranchKept {
-                    blocked_by: None,
-                    reason: reason.clone(),
-                });
+            for entry in &mut state.retire_queue {
+                if !matches!(
+                    entry.kept_kind(),
+                    Some(KeptKind::TargetGone | KeptKind::DeleteRefused)
+                ) {
+                    entry.kept = Some(BranchKept {
+                        blocked_by: None,
+                        reason: reason.clone(),
+                        kind: KeptKind::Base,
+                    });
+                }
             }
             save_cleanup(state, state_dir);
             return;
         }
     };
-    let mut kept: Vec<MergedBranch> = Vec::new();
-    let mut queue: std::collections::VecDeque<MergedBranch> =
-        std::mem::take(&mut state.merged_branches).into();
-    while let Some(mut entry) = queue.pop_front() {
-        let mut blocker: Option<BranchKept> = None;
-        for pr in open.iter_mut().filter(|pr| pr.base == entry.branch) {
-            match provider
-                .update_proposal(spec, pr.number, None, None, Some(&entry.onto))
-                .await
-            {
-                // Followed in the list too, so a later entry in this same pass
-                // that deletes `onto` sees the pull request standing on it.
-                Ok(()) => pr.base = entry.onto.clone(),
-                Err(e) => {
-                    blocker.get_or_insert(BranchKept {
-                        blocked_by: Some(pr.number),
-                        reason: e.to_string(),
-                    });
-                }
+    let mut pending = dependents_first(std::mem::take(&mut state.retire_queue));
+    let mut worked: Vec<QueuedBranch> = Vec::new();
+    while !pending.is_empty() {
+        let mut entry = pending.remove(0);
+        match retire_one(provider, spec, &mut open, &mut entry, &worked, &pending).await {
+            Retired::Gone => follow_retired(&entry, worked.iter_mut().chain(pending.iter_mut())),
+            Retired::Stays => worked.push(entry),
+        }
+    }
+    state.retire_queue = worked;
+    save_cleanup(state, state_dir);
+}
+
+/// The queue in working order: an entry is taken only once no other entry
+/// still to be worked is bound for its branch. `onto` always points down the
+/// chain, so there is always one to take; ties keep queue order.
+fn dependents_first(mut queue: Vec<QueuedBranch>) -> Vec<QueuedBranch> {
+    let mut ordered = Vec::with_capacity(queue.len());
+    while !queue.is_empty() {
+        let next = queue
+            .iter()
+            .position(|entry| !queue.iter().any(|other| other.onto == entry.branch))
+            .unwrap_or(0);
+        ordered.push(queue.remove(next));
+    }
+    ordered
+}
+
+/// One queued branch through the rules, in the spec's order. `worked` and
+/// `pending` are the other entries, for the awaited check.
+async fn retire_one(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    open: &mut [OpenProposalRef],
+    entry: &mut QueuedBranch,
+    worked: &[QueuedBranch],
+    pending: &[QueuedBranch],
+) -> Retired {
+    // A delete GitHub refused for good is never sent again: a later pass only
+    // asks whether the branch is gone by now.
+    if entry.kept_kind() == Some(KeptKind::DeleteRefused) {
+        return match provider.branch_ref(spec, &entry.branch).await {
+            Ok(None) => Retired::Gone,
+            _ => Retired::Stays,
+        };
+    }
+    // The share's own pull request never keeps its branch: the listing can
+    // still show it open right after `withdraw` closed it.
+    let own = entry.number;
+    let head = open
+        .iter()
+        .filter(|pr| pr.number != own && pr.branch == entry.branch)
+        .filter(|pr| {
+            pr.head_repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(&spec.repo))
+        })
+        .map(|pr| pr.number)
+        .min();
+    if let Some(number) = head {
+        entry.kept = Some(BranchKept {
+            blocked_by: Some(number),
+            reason: String::new(),
+            kind: KeptKind::Head,
+        });
+        return Retired::Stays;
+    }
+    let based = open
+        .iter()
+        .filter(|pr| pr.number != own && pr.base == entry.branch)
+        .map(|pr| pr.number)
+        .min();
+    match entry.why {
+        RetireWhy::Declined | RetireWhy::Withdrawn => {
+            if let Some(number) = based {
+                entry.kept = Some(BranchKept {
+                    blocked_by: Some(number),
+                    reason: String::new(),
+                    kind: KeptKind::Base,
+                });
+                return Retired::Stays;
+            }
+            // A merged entry's pull request still has to move onto this
+            // branch: deleting it now would send that move somewhere that
+            // lacks this share's commits. Whatever kept the merged entry
+            // (a head too), a pull request still based on its branch has not
+            // moved yet.
+            let waiting = worked
+                .iter()
+                .chain(pending.iter())
+                .filter(|other| other.why == RetireWhy::Merged && other.onto == entry.branch)
+                .flat_map(|other| {
+                    open.iter()
+                        .filter(move |pr| pr.number != other.number && pr.base == other.branch)
+                })
+                .map(|pr| pr.number)
+                .min();
+            if let Some(number) = waiting {
+                entry.kept = Some(BranchKept {
+                    blocked_by: Some(number),
+                    reason: String::new(),
+                    kind: KeptKind::Awaited,
+                });
+                return Retired::Stays;
             }
         }
-        match blocker {
-            None => {
-                // Best effort, as before: a branch already gone is fine.
-                let _ = provider.delete_branch(spec, &entry.branch).await;
-                // Applied at every delete, so a chain of them resolves
-                // transitively: this entry's own `onto` was already rewritten
-                // by any earlier delete in the pass.
-                for other in kept.iter_mut().chain(queue.iter_mut()) {
-                    if other.onto == entry.branch {
-                        other.onto = entry.onto.clone();
-                        other.kept = None;
-                    }
-                }
+        RetireWhy::Merged if entry.kept_kind() == Some(KeptKind::TargetGone) => {
+            // Its target is gone: never retried, only watched until the last
+            // pull request based on it is closed or moved by hand.
+            if let (Some(number), Some(kept)) = (based, entry.kept.as_mut()) {
+                kept.blocked_by = Some(number);
+                return Retired::Stays;
             }
-            Some(why) => {
-                entry.kept = Some(why);
-                kept.push(entry);
+        }
+        RetireWhy::Merged => {
+            if let Some(kept) = retarget(provider, spec, open, entry).await {
+                entry.kept = Some(kept);
+                return Retired::Stays;
             }
         }
     }
-    state.merged_branches = kept;
-    save_cleanup(state, state_dir);
+    delete_or_probe(provider, spec, entry).await
+}
+
+/// Moves every open pull request based on a merged entry's branch to its
+/// `onto`, following each move in `open`. `None` when nothing is left on the
+/// branch; otherwise why it stays. On the first failed move the target is
+/// probed: a target that is gone stops every further move for this entry.
+async fn retarget(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    open: &mut [OpenProposalRef],
+    entry: &QueuedBranch,
+) -> Option<BranchKept> {
+    let mut blocker: Option<BranchKept> = None;
+    for pr in open
+        .iter_mut()
+        .filter(|pr| pr.number != entry.number && pr.base == entry.branch)
+    {
+        match provider
+            .update_proposal(spec, pr.number, None, None, Some(&entry.onto))
+            .await
+        {
+            // Followed in the list too, so a later entry in this same pass
+            // that deletes `onto` sees the pull request standing on it.
+            Ok(()) => pr.base = entry.onto.clone(),
+            Err(e) if blocker.is_none() => {
+                let gone = matches!(provider.branch_ref(spec, &entry.onto).await, Ok(None));
+                blocker = Some(BranchKept {
+                    blocked_by: Some(pr.number),
+                    reason: e.to_string(),
+                    kind: if gone {
+                        KeptKind::TargetGone
+                    } else {
+                        KeptKind::Base
+                    },
+                });
+                if gone {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    blocker
+}
+
+/// Deletes an entry's branch. A failed delete is probed: a branch that is gone
+/// is gone, a temporary failure is retried quietly on the next sync, and a
+/// permanent one is named and never sent again.
+async fn delete_or_probe(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    entry: &mut QueuedBranch,
+) -> Retired {
+    let Err(e) = provider.delete_branch(spec, &entry.branch).await else {
+        return Retired::Gone;
+    };
+    match provider.branch_ref(spec, &entry.branch).await {
+        Ok(None) => Retired::Gone,
+        Ok(Some(_)) if !e.is_temporary() => {
+            entry.kept = Some(BranchKept {
+                blocked_by: None,
+                reason: e.to_string(),
+                kind: KeptKind::DeleteRefused,
+            });
+            Retired::Stays
+        }
+        _ => {
+            entry.kept = None;
+            Retired::Stays
+        }
+    }
+}
+
+/// A branch that is really gone passes its own `onto` to every entry bound for
+/// it. A notice about the old target (`base`, `target_gone`) goes with it; one
+/// about the entry's own branch (`head`, `delete_refused`, `awaited`) stays.
+fn follow_retired<'a>(gone: &QueuedBranch, rest: impl Iterator<Item = &'a mut QueuedBranch>) {
+    for other in rest {
+        if other.onto == gone.branch {
+            other.onto = gone.onto.clone();
+            if matches!(
+                other.kept_kind(),
+                Some(KeptKind::Base | KeptKind::TargetGone)
+            ) {
+                other.kept = None;
+            }
+        }
+    }
 }
 
 /// Saves what a cleanup pass changed. A failure is logged, not raised: the
@@ -947,9 +1154,7 @@ async fn retire_merged_branches(
 /// the pass.
 fn save_cleanup(state: &OriginState, state_dir: &Path) {
     if let Err(e) = state.save(state_dir) {
-        tracing::debug!(
-            "recording the merged-branch cleanup failed; the next pull repeats it: {e}"
-        );
+        tracing::debug!("recording the branch cleanup failed; the next pull repeats it: {e}");
     }
 }
 
@@ -1270,7 +1475,7 @@ pub async fn status(
         stack_link_pending: state.stack_link_pending,
         direct_shares: state.direct_shares.clone(),
         kept_branches: state
-            .merged_branches
+            .retire_queue
             .iter()
             .filter(|b| b.kept.is_some())
             .cloned()
@@ -2059,8 +2264,8 @@ pub async fn propose(
     }
 
     // 3. A declined proposal is superseded by this share: record to history
-    //    (keeping Declined), branch best-effort deleted, exactly like the
-    //    merged path's cleanup.
+    //    (keeping Declined) and queue its branch for the same cleanup a
+    //    merged one gets.
     settle_declined(provider, spec, &mut state, state_dir).await?;
 
     // 4a. On a stackable chain a share never rewrites what is already open:
@@ -2309,7 +2514,7 @@ pub enum PlannedAction {
 /// no provider write and moves no share record. It DOES perform the pull's
 /// writes to the working tree - freshness is part of previewing honestly, and
 /// a plan computed against a stale base would name changes a real share would
-/// never make. Its pull defers the merged-branch cleanup too: a merge it
+/// never make. Its pull defers the branch cleanup too: a merge it
 /// consumes is queued, and the share or the next sync moves the pull requests
 /// off that branch and deletes it.
 ///
@@ -2561,8 +2766,10 @@ pub async fn propose_preview(
     })
 }
 
-/// Settle every declined record into history and delete its branch best
-/// effort: a declined proposal is superseded by whatever share comes next.
+/// Settle every declined record into history and queue its branch: a declined
+/// proposal is superseded by whatever share comes next. The branch goes once no
+/// open pull request uses it ([`retire_branches`], run here when anything was
+/// declined).
 async fn settle_declined(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -2579,13 +2786,16 @@ async fn settle_declined(
         return Ok(());
     }
     for prop in &declined {
+        // Where its pull requests belong, read before the record leaves.
+        let onto = merged_into(state, prop.number);
+        queue_retired(state, prop, RetireWhy::Declined, onto);
+    }
+    for prop in &declined {
         state.proposals.retain(|p| p.number != prop.number);
         state.push_history(prop.clone());
     }
     state.save(state_dir)?;
-    for prop in &declined {
-        let _ = provider.delete_branch(spec, &prop.branch).await;
-    }
+    retire_branches(provider, spec, state, state_dir).await;
     Ok(())
 }
 
@@ -4462,7 +4672,8 @@ async fn finish_pending_repair(
 /// [`crate::state::OriginState::repair_pending`] set from before the dissolve
 /// until after the recreate, so a process that dies mid-repair is finished by
 /// the next withdraw or share rather than leaving a wedged chain. The
-/// withdrawn layer's own branch is deleted LAST, once the repair is durable.
+/// withdrawn layer's own branch is queued once the repair is durable and
+/// deleted by the cleanup at the end, once no open pull request uses it.
 ///
 /// Only the close is atomic: a failure later, inside the revert loop, leaves
 /// the pull request closed on the forge while the record is still locally
@@ -4606,6 +4817,13 @@ pub async fn withdraw(
         report.repaired |= outcome.repaired;
         report.restacked = outcome.restacked.or(report.restacked);
 
+        // Queued the moment the repair is durable and before the revert, so a
+        // revert that fails cannot lose the branch; the pass at the end deletes
+        // it once nothing uses it, or the next pull does.
+        let onto = withdrawn_onto(&state, &below);
+        queue_retired(&mut state, &proposal, RetireWhy::Withdrawn, onto);
+        state.save(state_dir)?;
+
         if revert {
             revert_layer_files(
                 provider,
@@ -4620,21 +4838,20 @@ pub async fn withdraw(
             .await?;
         }
 
-        // The branch goes last, once the repaired chain is durable: a survivor
-        // replayed onto a branch that is already gone would have nothing to
-        // sit on if this ran earlier and the repair then failed.
-        let _ = provider.delete_branch(spec, &proposal.branch).await;
+        retire_branches(provider, spec, &mut state, state_dir).await;
         return Ok(report);
     }
 
     // Close first: a failure here aborts with nothing else changed. A
-    // Declined proposal is already closed on the forge, so only the branch
-    // cleanup applies to it.
+    // Declined proposal is already closed on the forge.
     if proposal.status == ProposalStatus::Open {
         provider.close_proposal(spec, proposal.number).await?;
         report.closed = true;
     }
-    let _ = provider.delete_branch(spec, &proposal.branch).await;
+    // Queued before the revert, so a revert that fails cannot lose it.
+    let onto = withdrawn_onto(&state, &below);
+    queue_retired(&mut state, &proposal, RetireWhy::Withdrawn, onto);
+    state.save(state_dir)?;
 
     if revert {
         revert_layer_files(
@@ -4656,6 +4873,7 @@ pub async fn withdraw(
     state.push_history(record);
     state.save(state_dir)?;
 
+    retire_branches(provider, spec, &mut state, state_dir).await;
     Ok(report)
 }
 
@@ -5060,7 +5278,7 @@ async fn settle_up_to_date(
     // Branch cleanup once the state is durable, exactly as the moved-trunk
     // arm does it.
     if cleanup == BranchCleanup::Run {
-        retire_merged_branches(provider, spec, &mut state, state_dir).await;
+        retire_branches(provider, spec, &mut state, state_dir).await;
     }
     Ok(PullReport {
         up_to_date: true,
@@ -5168,7 +5386,7 @@ async fn rebaseline(
 
     // Branch cleanup once the state is durable.
     if cleanup == BranchCleanup::Run {
-        retire_merged_branches(provider, spec, &mut state, state_dir).await;
+        retire_branches(provider, spec, &mut state, state_dir).await;
     }
 
     Ok(PullReport {

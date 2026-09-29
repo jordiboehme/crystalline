@@ -1082,7 +1082,7 @@ impl Provider for MockProvider {
 
     async fn list_open_proposals(
         &self,
-        _origin: &OriginSpec,
+        origin: &OriginSpec,
     ) -> Result<Vec<OpenProposalRef>, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push("list_open_proposals".to_string());
@@ -1109,6 +1109,7 @@ impl Provider for MockProvider {
                     .get(number)
                     .cloned()
                     .unwrap_or_default(),
+                head_repo: Some(origin.repo.clone()),
             });
         }
         // `proposal_states` is a HashMap, so sort before returning: tests

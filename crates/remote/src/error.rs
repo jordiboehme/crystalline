@@ -246,6 +246,40 @@ pub enum RemoteError {
     },
 }
 
+impl RemoteError {
+    /// Whether a later try may succeed with nobody acting: the network, a
+    /// rate limit, a server fault or a sign-in a reconnect restores. A branch
+    /// cleanup retries a temporary failure quietly on the next sync and stops
+    /// deleting after a permanent one (a branch rule, a missing right).
+    pub fn is_temporary(&self) -> bool {
+        match self {
+            RemoteError::Offline
+            | RemoteError::RateLimited { .. }
+            | RemoteError::AuthExpired
+            | RemoteError::NotConnected
+            | RemoteError::AuthPending => true,
+            RemoteError::Api { status, .. } => *status >= 500 || *status == 429,
+            RemoteError::NotEnabled
+            | RemoteError::SsoAuthorizationRequired { .. }
+            | RemoteError::OauthAppRestricted { .. }
+            | RemoteError::RepoNotFound { .. }
+            | RemoteError::NotADomain { .. }
+            | RemoteError::ConflictsPending { .. }
+            | RemoteError::ProposalNotFound { .. }
+            | RemoteError::NoWithdrawTarget { .. }
+            | RemoteError::ConflictNotFound { .. }
+            | RemoteError::BaseUnavailable
+            | RemoteError::StacksUnsupported
+            | RemoteError::Refused(_)
+            | RemoteError::NotFastForward { .. }
+            | RemoteError::BranchProtected { .. }
+            | RemoteError::Io(_)
+            | RemoteError::State(_)
+            | RemoteError::Credential { .. } => false,
+        }
+    }
+}
+
 /// The sentence a caller is given when a branch rule refused a direct
 /// commit: what the forge said, and the two ways out (share as a proposal,
 /// or have the rule relaxed).
@@ -805,6 +839,51 @@ mod tests {
         for msg in samples {
             assert!(!msg.contains(em_dash), "{msg}");
             assert!(!msg.contains(en_dash), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_delete_error_is_temporary_only_when_a_later_try_can_succeed() {
+        let api = |status| RemoteError::Api {
+            status,
+            message: "x".to_string(),
+        };
+        for temporary in [
+            RemoteError::Offline,
+            RemoteError::RateLimited { reset: None },
+            RemoteError::AuthExpired,
+            RemoteError::NotConnected,
+            RemoteError::AuthPending,
+            api(500),
+            api(502),
+            api(503),
+            api(429),
+        ] {
+            assert!(temporary.is_temporary(), "{temporary:?}");
+        }
+        for permanent in [
+            api(403),
+            api(404),
+            api(409),
+            api(422),
+            RemoteError::RepoNotFound {
+                repo: "team/knowledge".to_string(),
+            },
+            RemoteError::BranchProtected {
+                branch: "crystalline/share-1".to_string(),
+                message: "rule".to_string(),
+            },
+            RemoteError::SsoAuthorizationRequired {
+                org: "team".to_string(),
+                url: "https://github.com/orgs/team/sso".to_string(),
+            },
+            RemoteError::OauthAppRestricted {
+                org: "team".to_string(),
+            },
+            RemoteError::Refused("no".to_string()),
+            RemoteError::NotEnabled,
+        ] {
+            assert!(!permanent.is_temporary(), "{permanent:?}");
         }
     }
 }

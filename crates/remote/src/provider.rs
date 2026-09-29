@@ -168,6 +168,12 @@ pub struct OpenProposalRef {
     /// cleanup reads to find every pull request standing on a branch it is
     /// about to delete.
     pub base: String,
+    /// The repository the proposal's head branch lives in, as `owner/name`,
+    /// or `None` when the forge names none (a deleted fork). A branch cleanup
+    /// only counts a head from the origin's own repository: a fork's branch
+    /// of the same name is not touched by deleting ours.
+    #[serde(default)]
+    pub head_repo: Option<String>,
 }
 
 /// Forge-neutral access to the operations Crystalline needs to collaborate
@@ -246,7 +252,8 @@ pub trait Provider: Send + Sync {
         commit: &str,
     ) -> Result<(), RemoteError>;
 
-    /// Deletes a branch.
+    /// Deletes a branch. An error does not say the branch is still there; a
+    /// caller that needs to know probes with `branch_ref`.
     async fn delete_branch(&self, origin: &OriginSpec, name: &str) -> Result<(), RemoteError>;
 
     /// The commit an arbitrary branch points at, or `None` when the branch

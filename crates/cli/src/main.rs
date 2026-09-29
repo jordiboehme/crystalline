@@ -2898,9 +2898,10 @@ fn direct_share_lines(d: &serde_json::Value) -> Vec<String> {
     lines
 }
 
-/// The merged-share branches kept upstream because a pull request still
-/// stands on them, each as its sentence with the forge's reason under it.
-/// Nothing at all when none is kept, and an older daemon sends no key.
+/// The share branches kept upstream, each as its sentence with the forge's
+/// reason under it, except for a refused delete, whose sentence already holds
+/// the reason. Nothing at all when none is kept, and an older daemon sends no
+/// key (nor any `kind`, so its reason line shows as before).
 fn kept_branch_lines(d: &serde_json::Value) -> Vec<String> {
     let Some(kept) = d["kept_branches"].as_array() else {
         return Vec::new();
@@ -2911,7 +2912,8 @@ fn kept_branch_lines(d: &serde_json::Value) -> Vec<String> {
             continue;
         };
         lines.push(format!("  {message}"));
-        if let Some(reason) = entry["reason"].as_str() {
+        let refused = entry["kind"].as_str() == Some("delete_refused");
+        if !refused && let Some(reason) = entry["reason"].as_str() {
             lines.push(format!("    {reason}"));
         }
     }
@@ -4777,6 +4779,25 @@ mod tests {
         );
         assert!(kept_branch_lines(&json!({ "kept_branches": [] })).is_empty());
         assert!(kept_branch_lines(&json!({ "domain": "kb" })).is_empty());
+    }
+
+    /// A refused delete names its reason inside the sentence, so no second
+    /// line repeats it.
+    #[test]
+    fn a_refused_delete_prints_no_reason_line() {
+        assert_eq!(
+            kept_branch_lines(&json!({
+                "kept_branches": [{
+                    "branch": "crystalline/share-1",
+                    "kind": "delete_refused",
+                    "message": "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+                    "reason": "GitHub returned an unexpected answer (status 422): Reference update failed",
+                }],
+            })),
+            vec![
+                "  Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.".to_string(),
+            ]
+        );
     }
 
     /// A mixed set names every kind in it, in the order a share reports them.
