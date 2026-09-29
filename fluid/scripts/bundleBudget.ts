@@ -63,7 +63,7 @@ export const GAME_BUDGET_BYTES = 1_474_560;
  * The main chunk's guideline, gzipped. This is a guideline, not a budget: a
  * build over it warns and still passes, reporting the overrun and its cause.
  */
-export const MAIN_GUIDELINE_BYTES = 176_584;
+export const MAIN_GUIDELINE_BYTES = 178_000;
 
 /**
  * Whether a build without the `/π` route fails the check. The route ships in

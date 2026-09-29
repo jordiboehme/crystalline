@@ -92,6 +92,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 // than when the daemon is old.
                 "started_by": intent.map(|i| i.started_by.as_str()).unwrap_or("unknown"),
                 "allowed_hosts": intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
+                // Where this daemon runs, read now: its working directory and,
+                // on Windows, its job and package identity. `crystalline
+                // status` prints it as one line, `doctor` in full.
+                "runs_in": crate::runs_in::RunsIn::here(),
             });
             match shared.engine.status_report().await {
                 Ok(report) => {

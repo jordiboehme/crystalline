@@ -257,7 +257,9 @@ impl Shared {
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
 /// migration in a shared database. `exit_when_idle` bounds the daemon's life to
 /// [`IDLE_EXIT_GRACE`] past its last socket session, the Claude Desktop
-/// extension's shape; see `spawn_daemon`.
+/// extension's shape; see `spawn_daemon`. `breakaway_refused` says the
+/// spawner could not start this daemon outside its own job; see
+/// [`crate::runs_in`].
 // The daemon's startup switches are flat on purpose, one clap flag each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
@@ -270,6 +272,7 @@ pub async fn run_serve(
     read_only: bool,
     take_over: bool,
     exit_when_idle: bool,
+    breakaway_refused: bool,
 ) -> anyhow::Result<()> {
     // RUST_LOG filters the daemon's log (the tracing `EnvFilter` syntax),
     // `info` when it is unset or does not parse.
@@ -336,6 +339,13 @@ pub async fn run_serve(
         },
         allowed_hosts: allowed_hosts.clone(),
     });
+    // Where this daemon runs, as far as its own command line knows it; the
+    // rest is read from the OS when the report is built. Recorded before the
+    // lock for the same reason as the intent: `publish` reads it.
+    crate::runs_in::record_start(breakaway_refused, exit_when_idle);
+    if breakaway_refused {
+        tracing::warn!("{}", crate::runs_in::BREAKAWAY_REFUSED_WARNING);
+    }
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
     // entry is silently overridden while the variable is set.

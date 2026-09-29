@@ -320,6 +320,20 @@ pub struct ServiceDoctor {
     /// identified: the reason, for a message that tells a person where to
     /// look. Nothing is ever signalled in this state, `--fix` included.
     pub holder_unknown: Option<String>,
+    /// Where the running daemon runs, as its record says: working directory
+    /// and, on Windows, job and package identity. `None` when no live daemon
+    /// recorded one (none running, or one older than 0.21.1), or `--fix`
+    /// dislodged it.
+    pub runs_in: Option<crystalline_service::runs_in::RunsIn>,
+}
+
+impl ServiceDoctor {
+    /// `--fix` dislodged the wedged daemon. Its record's facts describe a
+    /// process that is gone, so they are dropped with it.
+    fn mark_dislodged(&mut self) {
+        self.daemon_dislodged = true;
+        self.runs_in = None;
+    }
 }
 
 /// One team domain's origin diagnostics: whether its local origin state is
@@ -2361,6 +2375,14 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         }
         _ => None,
     };
+    // Read from the record, not asked over the socket: a daemon's working
+    // directory, job and package identity do not change while it runs, and a
+    // wedged daemon still has a record to read.
+    let runs_in = if alive {
+        info.as_ref().and_then(|i| i.runs_in.clone())
+    } else {
+        None
+    };
 
     let mut s = ServiceDoctor {
         lock_present,
@@ -2373,6 +2395,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         daemon_unresponsive,
         daemon_dislodged: false,
         holder_unknown,
+        runs_in,
     };
 
     if fix {
@@ -2382,7 +2405,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         // connecting client performs, refusals included.
         if s.daemon_unresponsive {
             match instance::dislodge_unresponsive().await {
-                Ok(instance::DislodgeOutcome::Dislodged { .. }) => s.daemon_dislodged = true,
+                Ok(instance::DislodgeOutcome::Dislodged { .. }) => s.mark_dislodged(),
                 // The holder recovered between the diagnosis and the fix;
                 // nothing to dislodge and nothing to report as unresolved.
                 Ok(instance::DislodgeOutcome::NotNeeded) => s.daemon_unresponsive = false,
@@ -3325,8 +3348,29 @@ pub fn render_human(report: &DoctorReport) -> String {
     if let Some(detail) = &s.holder_unknown {
         let _ = writeln!(out, "  [problem] {detail}");
     }
-    if !s.lock_stale && !s.socket_orphaned && !s.daemon_unresponsive && s.holder_unknown.is_none() {
+    // Where the daemon runs (#115). Its warnings never count as problems,
+    // but a section that has one does not say "ok" either.
+    let warnings = s
+        .runs_in
+        .as_ref()
+        .map(|runs_in| runs_in.warnings())
+        .unwrap_or_default();
+    if !s.lock_stale
+        && !s.socket_orphaned
+        && !s.daemon_unresponsive
+        && s.holder_unknown.is_none()
+        && warnings.is_empty()
+    {
         let _ = writeln!(out, "  ok");
+    }
+    // Facts first, then what they may cause.
+    if let Some(runs_in) = &s.runs_in {
+        for line in runs_in.details() {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    for warning in &warnings {
+        let _ = writeln!(out, "  [warning] {warning}");
     }
     if let Ok(log_path) = config::daemon_log_path() {
         let _ = writeln!(out, "  daemon log: {}", log_path.display());
@@ -4204,6 +4248,109 @@ mod tests {
             !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 220 MB [stale]"),
             "the model in use is not marked stale: {out}"
         );
+    }
+
+    /// Where the daemon runs, in full, and the warning when it cannot leave
+    /// its job. A warning only: nothing on
+    /// this side can fix a job that forbids breakaway, so it never counts
+    /// toward the exit code. The Claude Desktop extension's daemon is inside
+    /// on purpose and gets the facts without the warning.
+    #[test]
+    fn doctor_shows_where_the_daemon_runs_and_warns_about_a_job_it_cannot_leave() {
+        use crystalline_service::runs_in::RunsIn;
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.service.runs_in = Some(RunsIn {
+            working_dir: Some(r"C:\Users\a\AppData\Roaming\crystalline".to_string()),
+            in_job: Some(true),
+            job_allows_breakaway: Some(false),
+            package: None,
+            breakaway_refused: true,
+            exits_when_idle: false,
+        });
+
+        let out = render_human(&report);
+        assert!(
+            out.contains(r"daemon working directory: C:\Users\a\AppData\Roaming\crystalline"),
+            "{out}"
+        );
+        assert!(
+            out.contains("daemon job: yes, breakaway not allowed, refused at start"),
+            "{out}"
+        );
+        assert!(out.contains("daemon package identity: none"), "{out}");
+        assert!(
+            out.contains("[warning] the daemon runs inside a job it cannot leave"),
+            "{out}"
+        );
+        assert!(
+            !service_section(&out).contains("  ok\n"),
+            "a section with a warning does not say ok: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "a warning, never a problem: doctor still exits 0"
+        );
+
+        report.service.runs_in.as_mut().unwrap().exits_when_idle = true;
+        let extension = render_human(&report);
+        assert!(
+            !extension.contains("[warning] the daemon runs inside"),
+            "{extension}"
+        );
+        assert!(extension.contains("on purpose"), "{extension}");
+        assert!(
+            service_section(&extension).contains("  ok\n"),
+            "facts alone leave the section ok: {extension}"
+        );
+
+        report.service.runs_in = None;
+        let none = render_human(&report);
+        assert!(
+            !none.contains("daemon working directory"),
+            "no record, no lines: {none}"
+        );
+    }
+
+    /// The `service:` section of a human report: its header and every
+    /// indented line after it.
+    fn service_section(out: &str) -> String {
+        let mut section = String::new();
+        let mut inside = false;
+        for line in out.lines() {
+            if line == "service:" {
+                inside = true;
+            } else if inside && !line.starts_with("  ") {
+                break;
+            }
+            if inside {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        section
+    }
+
+    /// `--fix` dislodged a wedged daemon: the facts of its record describe a
+    /// process that is gone, so doctor does not print them or warn about it.
+    #[test]
+    fn a_dislodged_daemon_leaves_no_facts_behind() {
+        use crystalline_service::runs_in::RunsIn;
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.service.daemon_unresponsive = true;
+        report.service.runs_in = Some(RunsIn {
+            working_dir: Some(r"C:\Users\a\AppData\Roaming\crystalline".to_string()),
+            in_job: Some(true),
+            job_allows_breakaway: Some(false),
+            ..RunsIn::default()
+        });
+
+        report.service.mark_dislodged();
+        assert!(report.service.daemon_dislodged);
+        let out = render_human(&report);
+        assert!(out.contains("dislodged an unresponsive daemon"), "{out}");
+        assert!(!out.contains("daemon working directory"), "{out}");
+        assert!(!out.contains("[warning]"), "{out}");
     }
 
     /// The pre-existing shape, with none of the new keys, still renders: the

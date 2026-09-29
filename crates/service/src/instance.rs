@@ -90,6 +90,12 @@ pub struct LockInfo {
     /// starting daemon wait for it, and nothing ever signals it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standalone: Option<String>,
+    /// Where the owning daemon runs (working directory, and on Windows its job
+    /// and package identity), taken when it published this record: none of it
+    /// changes during a daemon's life. `None` on a record from a daemon older
+    /// than 0.21.1 and on one from a holder that never served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_in: Option<crate::runs_in::RunsIn>,
 }
 
 pub use crate::serving::{
@@ -244,6 +250,9 @@ impl Ownership {
             http: intent.map(|i| i.http.clone()).unwrap_or_default(),
             allowed_hosts: intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
             standalone: None,
+            // Only a process that went through `run_serve` has start facts;
+            // `hold-lock` records none, as it records no intent.
+            runs_in: intent.map(|_| crate::runs_in::RunsIn::here()),
         };
         self.write_record(&info)
     }
@@ -263,6 +272,7 @@ impl Ownership {
             http: HttpBinding::default(),
             allowed_hosts: Vec::new(),
             standalone: Some(command.to_string()),
+            runs_in: None,
         };
         self.write_record(&info)
     }
@@ -1541,6 +1551,13 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// coherent opt-out is `service.http=false`, which turns the endpoint off for
 /// every daemon however it started; the spawned process inherits this one's
 /// environment, so `CRYSTALLINE_SERVICE_HTTP` reaches it too.
+///
+/// The daemon works in the state directory on every platform and channel,
+/// never in the directory of whoever started it (#115: Windows locks a
+/// running process's working directory, and a client started inside another
+/// program's folder made the daemon hold that folder). `--db`, `--config` and
+/// a relative `CRYSTALLINE_CONFIG` are made absolute first, so they still name
+/// the files the client meant.
 fn spawn_daemon(
     db: Option<&Path>,
     config_path: Option<&Path>,
@@ -1548,8 +1565,34 @@ fn spawn_daemon(
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let extension = crate::stub::is_mcpb_channel();
+    // The daemon works in the state directory (below), so every path it is
+    // handed has to name the same file from there as it does here.
+    let db = db.map(absolute_for_daemon);
+    let config_path = config_path.map(absolute_for_daemon);
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(daemon_args(db, config_path, read_only, extension));
+    cmd.args(daemon_args(
+        db.as_deref(),
+        config_path.as_deref(),
+        read_only,
+        extension,
+    ));
+    if let Some(value) = std::env::var_os(crate::overlay::CONFIG_PATH_ENV)
+        && let Some(absolute) = config_env_for_daemon(&value)
+    {
+        cmd.env(crate::overlay::CONFIG_PATH_ENV, absolute);
+    }
+    // Never the client's directory: a running process's working directory is
+    // locked on Windows, and the client may have been started inside another
+    // program's folder (#115). The state directory is the one folder the
+    // daemon holds anyway.
+    match daemon_working_dir(config::state_dir().map_err(anyhow::Error::from)) {
+        Ok(dir) => {
+            cmd.current_dir(dir);
+        }
+        Err(e) => tracing::warn!(
+            "the daemon keeps this process's working directory: the state directory could not be prepared ({e})"
+        ),
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(daemon_log_sink().unwrap_or_else(std::process::Stdio::null));
@@ -1580,14 +1623,25 @@ fn spawn_daemon(
         // extension, also a breakaway from the parent's job object so it
         // outlives a harness that kills its job on exit; a job that forbids
         // breakaway fails the spawn outright, so retry inside the job:
-        // starting at all beats outliving the parent. The extension's daemon
-        // stays inside the job on purpose (see above).
+        // starting at all beats outliving the parent. A refusal is said out
+        // loud and handed to the daemon, which reports it. The extension's
+        // daemon stays inside the job on purpose (see above).
         if !extension {
             cmd.creation_flags(
                 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
             );
-            if cmd.spawn().is_ok() {
-                return Ok(());
+            match cmd.spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) if breakaway_refusal(&e) => {
+                    tracing::warn!(
+                        "Windows refused the breakaway ({e}); {}",
+                        crate::runs_in::BREAKAWAY_REFUSED_WARNING
+                    );
+                    cmd.arg(crate::runs_in::BREAKAWAY_REFUSED_FLAG);
+                }
+                Err(e) => {
+                    tracing::debug!("the breakaway spawn failed ({e}); retrying inside the job")
+                }
             }
         }
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
@@ -1633,6 +1687,52 @@ fn daemon_args(
         args.push(cfg.into());
     }
     args
+}
+
+/// A path the spawned daemon will open, made absolute against this process's
+/// working directory: the daemon works in the state directory, where a
+/// relative path would name another file. Only an empty path makes
+/// `std::path::absolute` fail, and that one is passed on as given.
+fn absolute_for_daemon(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The value `CRYSTALLINE_CONFIG` has to carry into the daemon: its absolute
+/// form when the inherited value is relative once tilde-expanded (the
+/// overlay expands it the same way), `None` when it already names the same
+/// file from any directory or is empty (which the overlay reads as unset).
+fn config_env_for_daemon(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    // Tilde expansion needs text; a value that is not UTF-8 is kept as it is,
+    // so the daemon never gets a different file name.
+    let expanded = match value.to_str() {
+        Some(text) => config::expand_tilde(text),
+        None => PathBuf::from(value),
+    };
+    if expanded.is_absolute() {
+        return None;
+    }
+    Some(absolute_for_daemon(&expanded))
+}
+
+/// The directory the spawned daemon works in: the state directory, created
+/// first. Never the exe's directory as a fallback: on the Claude Desktop
+/// extension that is Desktop's own extension folder, the one thing the
+/// daemon must not hold.
+fn daemon_working_dir(state_dir: anyhow::Result<PathBuf>) -> anyhow::Result<PathBuf> {
+    let dir = state_dir?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Whether a failed spawn with `CREATE_BREAKAWAY_FROM_JOB` is Windows
+/// refusing the breakaway: the job does not allow it and the call fails with
+/// `ERROR_ACCESS_DENIED`.
+#[cfg(any(windows, test))]
+fn breakaway_refusal(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(5)
 }
 
 /// The exit code a `crystalline serve` uses when it could not take the index
@@ -2064,6 +2164,75 @@ mod tests {
         );
     }
 
+    /// The daemon works in the state directory, so a path it is handed must
+    /// mean the same file from there as it did in the client: relative ones
+    /// are resolved against the client's directory before the spawn.
+    #[test]
+    fn paths_handed_to_the_daemon_are_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_for_daemon(Path::new("rel/index.db")),
+            cwd.join("rel/index.db")
+        );
+        let already = cwd.join("config.yaml");
+        assert_eq!(absolute_for_daemon(&already), already);
+    }
+
+    /// `CRYSTALLINE_CONFIG` picks the config file like `--config` does, so a
+    /// relative value is resolved the same way. Empty means unset and a `~`
+    /// path is absolute once expanded, so both are left alone.
+    #[test]
+    fn a_relative_config_variable_is_made_absolute_for_the_daemon() {
+        use std::ffi::OsStr;
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            config_env_for_daemon(OsStr::new("conf/config.yaml")),
+            Some(cwd.join("conf/config.yaml"))
+        );
+        assert_eq!(config_env_for_daemon(OsStr::new("")), None);
+        assert_eq!(config_env_for_daemon(cwd.join("c.yaml").as_os_str()), None);
+        assert_eq!(config_env_for_daemon(OsStr::new("~/c.yaml")), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"conf/\xffconfig.yaml");
+            assert_eq!(
+                config_env_for_daemon(raw),
+                Some(cwd.join(raw)),
+                "a value that is not UTF-8 keeps its bytes"
+            );
+        }
+    }
+
+    /// The working directory is created before the spawn: a missing one would
+    /// fail both spawns on Windows and read as a refused breakaway. One that
+    /// cannot be had is an error, and the spawn then keeps its own directory.
+    #[test]
+    fn daemon_working_dir_creates_the_state_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state").join("crystalline");
+        assert_eq!(daemon_working_dir(Ok(state.clone())).unwrap(), state);
+        assert!(state.is_dir(), "created on the way");
+
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(
+            daemon_working_dir(Ok(file.join("below"))).is_err(),
+            "a path below a file cannot be a directory"
+        );
+        assert!(daemon_working_dir(Err(anyhow::anyhow!("no home"))).is_err());
+    }
+
+    /// Only an access error is Windows refusing the breakaway (libuv reads it
+    /// the same way). Anything else is some other failure and is not reported
+    /// as a refusal.
+    #[test]
+    fn only_an_access_error_is_a_refused_breakaway() {
+        assert!(breakaway_refusal(&io::Error::from_raw_os_error(5)));
+        assert!(!breakaway_refusal(&io::Error::from_raw_os_error(2)));
+        assert!(!breakaway_refusal(&io::Error::other("no")));
+    }
+
     // --- the words a locked index is refused in -----------------------------
 
     /// The raw backend error is the tail of the sentence, never its head, and
@@ -2192,6 +2361,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -2792,6 +2962,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2844,6 +3015,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2916,6 +3088,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -3262,6 +3435,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -3401,6 +3575,7 @@ mod tests {
             http,
             allowed_hosts: vec![],
             standalone: None,
+            runs_in: None,
         }
     }
 
