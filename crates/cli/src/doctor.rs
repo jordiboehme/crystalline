@@ -5050,10 +5050,12 @@ mod tests {
 
     #[tokio::test]
     async fn fix_moves_the_newer_text_into_the_original_and_deletes_the_copy() {
+        // The original is the indexed file, so nothing is left for a sync;
+        // the other way round is `fix_of_an_indexed_copy_sends_the_engram_to_sync`.
         let newer = review_standards("The new rule.", NEWER);
         let (dir, d) = stray_doctor(
             &pair(newer.clone(), review_standards("The old rule.", OLDER)),
-            None,
+            Some(O_PATH),
             |_| {},
             true,
             false,
