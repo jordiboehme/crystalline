@@ -121,6 +121,38 @@ async function openScreen(): Promise<HTMLElement> {
   return screen.findByRole("dialog", { name: "About Crystalline" });
 }
 
+/**
+ * Opens the screen as `openScreen` does, and types `keys` the moment the
+ * screen is in the document: in the microtask after the commit that shows
+ * it, before any task React runs after that commit. A loaded machine lets
+ * `findByRole` resolve there too, and so can a person typing at once.
+ */
+async function openScreenTypingAtOnce(
+  keys: KeyboardEventInit[],
+): Promise<HTMLElement> {
+  const shown = new MutationObserver(() => {
+    if (!document.querySelector('[aria-label="About Crystalline"]')) return;
+    shown.disconnect();
+    act(() => {
+      for (const init of keys) {
+        document.body.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            ...init,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+    });
+  });
+  shown.observe(document.body, { childList: true, subtree: true });
+  try {
+    return await openScreen();
+  } finally {
+    shown.disconnect();
+  }
+}
+
 /** The screen's cursor line, the typed text without the cursor block. */
 function cursorLine(dialog: HTMLElement): string {
   const cursor = dialog.querySelector(".crystal-cursor");
@@ -258,18 +290,33 @@ describe("the C64 screen's launch (M4 C1 to C4)", () => {
     expect(screen.queryByText("station marker")).toBeNull();
   });
 
-  it("announces the typed line and the syntax error politely", async () => {
+  it("announces the typed line and every syntax error politely", async () => {
     // Mutation caught: `aria-live` dropped from the typed line or from the
-    // `?SYNTAX  ERROR` line (a screen reader hears nothing of the typing).
+    // `?SYNTAX  ERROR` line's region (a screen reader hears nothing of the
+    // typing); the region mounted together with its first answer (many
+    // screen readers skip it); the answer's line kept for a repeated typo
+    // (the same text in the same node is never announced again).
     renderAt("/");
     const dialog = await openScreen();
     const cursor = dialog.querySelector(".crystal-cursor");
     expect(cursor?.parentElement).toHaveAttribute("aria-live", "polite");
+    const regions = [...dialog.querySelectorAll('[aria-live="polite"]')];
+    const region = regions.find((node) => node !== cursor?.parentElement);
+    expect(region).toBeDefined();
+    expect(region?.textContent).toBe("");
+
     type("X");
     fireEvent.keyDown(focused(), { key: "Enter" });
-    const errors = syntaxErrors(dialog);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toHaveAttribute("aria-live", "polite");
+    const first = syntaxErrors(dialog);
+    expect(first).toHaveLength(1);
+    expect(first[0]!.parentElement).toBe(region);
+
+    type("X");
+    fireEvent.keyDown(focused(), { key: "Enter" });
+    const second = syntaxErrors(dialog);
+    expect(second).toHaveLength(1);
+    expect(second[0]!.parentElement).toBe(region);
+    expect(second[0]).not.toBe(first[0]);
   });
 
   it("caps the typed line at 40 characters", async () => {
@@ -311,6 +358,27 @@ describe("the C64 screen's launch (M4 C1 to C4)", () => {
     expect(fireEvent.keyDown(source, { key: "Enter" })).toBe(false);
     await screen.findByText("station marker");
     expect(location).toBe("/%CF%80/d/eng/e/notes/deep/gamma");
+  });
+
+  it("listens from the commit that shows it, not a task later", async () => {
+    // Mutation caught: the key listener added in a passive effect, which
+    // React runs in a task after the commit that shows the screen: a key
+    // in between is lost, or reaches the app's own `?` shortcut behind
+    // the screen. This was the flake of the test above: under load its
+    // first key came in that gap.
+    renderAt("/");
+    const dialog = await openScreenTypingAtOnce([
+      { key: "?", shiftKey: true },
+      { key: "\\" },
+    ]);
+    expect(cursorLine(dialog)).toBe("?\\");
+    await act(async () => {
+      await import("./HelpOverlayBody");
+    });
+    expect(
+      screen.queryByRole("dialog", { name: /keyboard shortcuts/i }),
+    ).toBeNull();
+    expect(dialog).toHaveFocus();
   });
 
   it("primes sound inside the launching gesture", async () => {
@@ -356,6 +424,53 @@ describe("the C64 screen's launch (M4 C1 to C4)", () => {
         { inside: true, location: "/" },
         { inside: true, location: "/" },
       ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("primes no sound in this tab for a click the browser takes", async () => {
+    // Mutation caught: the link's click priming whatever the click (a
+    // Cmd or Ctrl click opens a new tab, and this tab keeps a running
+    // context no launch here ever borrows). A middle click fires
+    // `auxclick` in a browser, not `click`; the `button: 1` click here is
+    // synthetic and pins the button check all the same.
+    const made: number[] = [];
+    class StubContext {
+      state = "suspended";
+      constructor() {
+        made.push(made.length);
+      }
+      resume() {
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
+    }
+    vi.stubGlobal("AudioContext", StubContext);
+    try {
+      renderAt("/d/eng/e/notes/deep/gamma");
+      const dialog = await openScreen();
+      const game = within(dialog).getByRole("link", {
+        name: 'LOAD"GAME",8,1',
+      });
+      const taken: MouseEventInit[] = [
+        { metaKey: true },
+        { ctrlKey: true },
+        { shiftKey: true },
+        { altKey: true },
+        { button: 1 },
+      ];
+      for (const init of taken) {
+        fireEvent.click(game, init);
+        expect(made, JSON.stringify(init)).toEqual([]);
+        expect(location).toBe("/");
+      }
+      // A plain click still primes, and launches.
+      fireEvent.click(game);
+      await screen.findByText("station marker");
+      expect(made).toEqual([0]);
     } finally {
       vi.unstubAllGlobals();
     }

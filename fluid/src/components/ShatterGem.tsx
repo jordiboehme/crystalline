@@ -26,9 +26,10 @@
  * consumes, so the app's own window shortcuts (`?` for help, `\` for the
  * width) never act behind the screen, and an Enter that runs a typed line
  * never also follows a focused link. Enter on an empty line, Esc, Tab and
- * any key held with Ctrl, Cmd or Alt are left alone. The typed line and the
- * `?SYNTAX  ERROR` line are polite live regions, so a screen reader hears
- * the typing and the answer.
+ * any key held with Ctrl, Cmd or Alt are left alone. The typed line is a
+ * polite live region, and so is the `?SYNTAX  ERROR` line's place: mounted
+ * empty with the screen, it is handed a new line on every error, so a
+ * screen reader hears the first answer and each one after it.
  *
  * A launch starts from the page the screen was opened on, not from where
  * the triple click leaves the app: its first two clicks are ordinary clicks
@@ -44,7 +45,7 @@
  */
 
 import type { PointerEvent, MouseEvent, ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router";
 
@@ -89,11 +90,27 @@ function LoadLine({ href, label }: { href: string; label: string }) {
   );
 }
 
-/** The LOAD line that launches the station, a router link primed on click. */
+/**
+ * The LOAD line that launches the station, a router link primed on click.
+ * A click the router leaves to the browser (another button, or one held
+ * with Cmd, Ctrl, Shift or Alt: a new tab or window, a download) launches
+ * nothing here, so it primes no sound in this tab.
+ */
 function GameLine({ to }: { to: string }) {
+  const onClick = (event: MouseEvent) => {
+    if (
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    )
+      return;
+    primeAudio();
+  };
   return (
     <p>
-      <Link to={to} onClick={primeAudio} className={LOAD_CLASSES}>
+      <Link to={to} onClick={onClick} className={LOAD_CLASSES}>
         {LAUNCH_COMMAND}
       </Link>
     </p>
@@ -113,22 +130,26 @@ function C64Screen({
   const screenRef = useRef<HTMLDivElement>(null);
   const [typed, setTyped] = useState("");
   const [answer, setAnswer] = useState<string | null>(null);
+  const [errors, setErrors] = useState(0);
   const from = origin ?? here;
   const target = gamePathOf(from.pathname, from.search);
 
   // The listener reads the latest line and callbacks through a ref, so it
   // is registered once for the screen's life and a keystroke never
-  // re-registers it or moves the focus.
+  // re-registers it or moves the focus. The ref, the focus and the
+  // listener are all set in the commit that shows the screen (layout
+  // effects): a passive effect runs a task later, and a key typed in
+  // between would be lost or reach the app's own shortcuts.
   const latest = useRef({ typed, onClose, navigate, target });
-  useEffect(() => {
+  useLayoutEffect(() => {
     latest.current = { typed, onClose, navigate, target };
   });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     screenRef.current?.focus();
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const consume = (event: KeyboardEvent) => {
       event.preventDefault();
       event.stopPropagation();
@@ -153,6 +174,7 @@ function C64Screen({
           return;
         }
         setAnswer(now.typed);
+        setErrors((count) => count + 1);
         setTyped("");
         now.typed = "";
         return;
@@ -208,13 +230,11 @@ function C64Screen({
             <LoadLine href={REPO_URL} label="SOURCE" />
             <LoadLine href={SUPPORT_URL} label="COFFEE" />
             <GameLine to={target} />
-            {answer !== null && (
-              <>
-                <p className="mt-2">{answer}</p>
-                <p aria-live="polite">{SYNTAX_ERROR}</p>
-                <p>READY.</p>
-              </>
-            )}
+            {answer !== null && <p className="mt-2">{answer}</p>}
+            <div aria-live="polite">
+              {answer !== null && <p key={errors}>{SYNTAX_ERROR}</p>}
+            </div>
+            {answer !== null && <p>READY.</p>}
             <p aria-live="polite" className={answer === null ? "mt-2" : ""}>
               {typed}
               <span aria-hidden className="crystal-cursor">
