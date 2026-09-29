@@ -920,7 +920,7 @@ impl Engine {
         // What each domain saw rewritten, announced once per domain after every
         // store lock is released, through the collapse rule a sync goes
         // through: a tag across a hundred engrams is one `domain` event.
-        let mut changed: IndexMap<String, Vec<PathChange>> = IndexMap::new();
+        let mut pending = PendingAnnouncements::new(self);
         let retagged = |desc: &EngramDescriptor, edited: &str| PathChange {
             kind: crystalline_index::PathChangeKind::Modified,
             path: desc.path.clone(),
@@ -944,10 +944,7 @@ impl Engine {
                     self.reindex_file(&*store, desc.domain_id, &root, &desc.path)
                         .await?;
                     rewritten += 1;
-                    changed
-                        .entry(desc.domain.clone())
-                        .or_default()
-                        .push(retagged(desc, &edited));
+                    pending.push_path(&desc.domain, retagged(desc, &edited));
                 }
                 ContentSource::Virtual => {
                     let current = {
@@ -971,10 +968,7 @@ impl Engine {
                     )
                     .await?;
                     rewritten += 1;
-                    changed
-                        .entry(desc.domain.clone())
-                        .or_default()
-                        .push(retagged(desc, &edited));
+                    pending.push_path(&desc.domain, retagged(desc, &edited));
                 }
             }
         }
@@ -1014,10 +1008,7 @@ impl Engine {
                                 self.reindex_file(&*store, *domain_id, &root, "MANIFEST.md")
                                     .await?;
                                 alias_recorded.push(name.clone());
-                                changed
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push(manifest_change(&edited));
+                                pending.push_path(name, manifest_change(&edited));
                             }
                             AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
                             AliasRecord::Conflict => alias_conflict.push(name.clone()),
@@ -1048,10 +1039,7 @@ impl Engine {
                                 .await?;
                                 virtual_manifest_changed = true;
                                 alias_recorded.push(name.clone());
-                                changed
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push(manifest_change(&edited));
+                                pending.push_path(name, manifest_change(&edited));
                             }
                             AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
                             AliasRecord::Conflict => alias_conflict.push(name.clone()),
@@ -1073,10 +1061,9 @@ impl Engine {
             }
         }
 
-        // Retag carries no scope and stamps nobody.
-        for (name, changes) in changed {
-            self.announce_paths(&name, changes, None);
-        }
+        // Retag carries no scope and stamps nobody. Announced here, or on any
+        // early exit above, for every row that landed.
+        drop(pending);
         Ok(response)
     }
 

@@ -67,9 +67,26 @@ impl Engine {
         self.names_stale.store(false, AtomicOrdering::SeqCst);
         let table = self.rebuild_names().await;
         let pairs = table.spellings();
-        let store = self.store.lock().await;
-        if let Err(e) = self.push_spellings(&*store, &pairs).await {
-            tracing::warn!("recording the domain name spellings in the index failed: {e}");
+        let pushed = {
+            let store = self.store.lock().await;
+            self.push_spellings(&*store, &pairs).await
+        };
+        match pushed {
+            // The push reset and rebound references in every domain and names
+            // none, so every registered domain is announced whole, the rule
+            // `resolve_references_into` uses: a spelling change is rare, and a
+            // `domain` event only refetches what a page shows.
+            Ok(true) => {
+                let mut names: Vec<String> = self.registered_domain_names().into_iter().collect();
+                names.sort();
+                for name in names {
+                    self.announce_domain(&name, None, None);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("recording the domain name spellings in the index failed: {e}");
+            }
         }
     }
 
@@ -434,12 +451,12 @@ impl Engine {
     /// ever; on any index it may be another row's own name, which the replace
     /// re-claims for that row last, so the pair could never land. When the
     /// replace does run it gets the whole list, and the index's own rules
-    /// decide.
+    /// decide. Answers whether it changed anything.
     async fn push_spellings(
         &self,
         store: &dyn Store,
         pairs: &[(String, String)],
-    ) -> crystalline_index::Result<()> {
+    ) -> crystalline_index::Result<bool> {
         let mut ids: HashMap<&str, DomainId> = HashMap::new();
         for (_, local) in pairs {
             if ids.contains_key(local.as_str()) {
@@ -456,7 +473,7 @@ impl Engine {
             })
             .collect();
         if list.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let scope: HashSet<DomainId> = ids.values().copied().collect();
         let current = store.domain_spellings().await?;
@@ -477,21 +494,22 @@ impl Engine {
             .map(|(spelling, id)| (spelling.as_str(), *id))
             .collect();
         if wanted == held {
-            return Ok(());
+            return Ok(false);
         }
 
         #[cfg(any(test, feature = "testing"))]
         self.spelling_replaces.fetch_add(1, AtomicOrdering::Relaxed);
         let changed = store.replace_domain_spellings(&list).await?;
         if changed.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         tracing::debug!(spellings = ?changed, "domain name spellings changed meaning");
         store.reset_references_to_spellings(&changed).await?;
 
         // The reset unbound references in every domain that spelled one of
         // the changed names, whoever registers it, so every row gets a pass.
-        resolve_pending_in_every_domain(store).await
+        resolve_pending_in_every_domain(store).await?;
+        Ok(true)
     }
 
     /// Bind every pending reference in every domain the index knows, for a

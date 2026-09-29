@@ -8,13 +8,77 @@ use std::sync::Arc;
 
 use crate::support;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ReviewMode};
-use crystalline_index::TursoStore;
+use crystalline_index::{Store, TursoStore};
 use crystalline_service::changes::{
     Change, ChangeKind, DomainAudience, DomainChanged, EngramChanged, Envelope,
 };
 use crystalline_service::params::*;
 use crystalline_service::{Engine, Scope};
 use tokio::sync::{Mutex, broadcast};
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres virtual-domain leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A recycled pid must never adopt a schema a panicking run left behind.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ctv_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
+}
+
+/// Run a body against Turso (always) and Postgres (when configured), each with a
+/// fresh, isolated store handed to the engine as a trait object.
+macro_rules! both_backends {
+    ($name:ident, $body:path) => {
+        #[tokio::test]
+        async fn $name() {
+            {
+                let store = TursoStore::open_in_memory().await.unwrap();
+                let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+                $body(store).await;
+            }
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(url) = pg_url() {
+                    let schema = unique_schema();
+                    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .expect("open the postgres test schema");
+                    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
+                    $body(store).await;
+                    // Drop the schema through a fresh connection (the boxed store
+                    // no longer exposes the inherent drop_schema).
+                    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .unwrap();
+                    cleanup.drop_schema().await.unwrap();
+                }
+            }
+        }
+    };
+}
 
 fn engram(title: &str, permalink: &str, body: &str) -> String {
     format!(
@@ -37,6 +101,17 @@ fn seed(root: &Path, rel: &str, contents: &str) {
 /// Two file domains, `notes` (alpha, beta) and `oak` (empty), synced; `review`
 /// puts `notes` in review mode so a write lands in the actor's own draft.
 async fn engine_fixture(
+    review: bool,
+) -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    engine_fixture_on(store, review).await
+}
+
+/// [`engine_fixture`] over a store the caller picked, so a body runs on both
+/// backends.
+async fn engine_fixture_on(
+    store: Arc<Mutex<dyn Store>>,
     review: bool,
 ) -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
     let scratch = support::ScratchStateDir::acquire();
@@ -66,10 +141,8 @@ async fn engine_fixture(
         .insert("oak".to_string(), DomainEntry::file(oak));
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
-    let store = TursoStore::open_in_memory().await.unwrap();
     let engine = Arc::new(
-        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-            .with_state_dir(root.join("state")),
+        Engine::new(store, cfg, None, Some(config_path)).with_state_dir(root.join("state")),
     );
     engine.sync(None).await.unwrap();
     (tmp, engine, scratch)
@@ -1170,3 +1243,91 @@ async fn a_joined_edit_names_the_writer_and_stays_the_owners_draft() {
     assert_eq!(change.actor.as_deref(), Some("bob"));
     assert_eq!(change.draft_of.as_deref(), Some("ada"));
 }
+
+/// Item 12: a MANIFEST that starts declaring a name rebinds a link in
+/// another domain, and that domain hears it without a refetch.
+async fn a_domain_name_change_announces_the_linking_domain_body(store: Arc<Mutex<dyn Store>>) {
+    let (tmp, engine, _scratch) = engine_fixture_on(store, false).await;
+    seed(
+        &tmp.path().join("notes"),
+        "guide.md",
+        &engram("Guide", "guide", "See [[platform:runbook]] first."),
+    );
+    seed(
+        &tmp.path().join("oak"),
+        "runbook.md",
+        &engram("Runbook", "runbook", "Restart it."),
+    );
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    seed(
+        &tmp.path().join("oak"),
+        "MANIFEST.md",
+        &manifest("oak").replacen(
+            "status: stable\n",
+            "status: stable\ndomain_name: platform\n",
+            1,
+        ),
+    );
+    engine
+        .sync_paths("oak", vec!["MANIFEST.md".to_string()])
+        .await
+        .unwrap();
+    engine.refresh_names().await;
+    let heard = drain(&mut rx);
+    assert!(
+        heard.iter().any(
+            |c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "notes")
+        ),
+        "{heard:?}"
+    );
+}
+both_backends!(
+    a_domain_name_change_announces_the_linking_domain,
+    a_domain_name_change_announces_the_linking_domain_body
+);
+
+/// Item 12: a retag that writes two engrams and then fails on the MANIFEST's
+/// alias still announces the two it wrote.
+#[cfg(unix)]
+async fn a_retag_that_fails_halfway_announces_what_it_wrote_body(store: Arc<Mutex<dyn Store>>) {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, engine, _scratch) = engine_fixture_on(store, false).await;
+    let notes = tmp.path().join("notes");
+    let tagged = |title: &str, permalink: &str| {
+        engram(title, permalink, "A rule.").replacen("  - t\n", "  - moving\n", 1)
+    };
+    seed(&notes, "topic/gamma.md", &tagged("Gamma", "topic/gamma"));
+    seed(&notes, "topic/delta.md", &tagged("Delta", "topic/delta"));
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    // The engrams sit in a folder that stays writable; the MANIFEST's alias
+    // write needs a temp file beside it, in the root, which no longer takes one.
+    let mode =
+        |bits| std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(bits)).unwrap();
+    mode(0o555);
+    let result = engine
+        .retag("moving", "manifest", Some("notes"), true, false, true)
+        .await;
+    mode(0o755);
+    let Err(_) = result else {
+        eprintln!(
+            "skipped: the MANIFEST could be written through a read-only folder (running as root?)"
+        );
+        return;
+    };
+    let mut heard: Vec<String> = drain(&mut rx)
+        .iter()
+        .map(|change| engram_of(change).path.clone())
+        .collect();
+    heard.sort();
+    assert_eq!(
+        heard,
+        vec!["topic/delta.md".to_string(), "topic/gamma.md".to_string()]
+    );
+}
+#[cfg(unix)]
+both_backends!(
+    a_retag_that_fails_halfway_announces_what_it_wrote,
+    a_retag_that_fails_halfway_announces_what_it_wrote_body
+);

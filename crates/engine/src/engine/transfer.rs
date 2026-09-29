@@ -249,7 +249,7 @@ impl Engine {
         // Delta 6: every entry gets a row, whatever became of it.
         let mut entries: Vec<Value> = Vec::new();
         let mut changed_paths: Vec<String> = Vec::new();
-        let mut virtual_changes: Vec<PathChange> = Vec::new();
+        let mut pending = PendingAnnouncements::new(self);
 
         // Delta 1: the files arrive in memory, already unpacked by the caller,
         // so there is no folder to walk and no source directory to validate.
@@ -412,18 +412,21 @@ impl Engine {
                         self.index_markdown(&*store, domain_id, path, text, stamp, None, true)
                             .await
                             .map(|_| {
-                                virtual_changes.push(PathChange {
-                                    kind: if exists {
-                                        crystalline_index::PathChangeKind::Modified
-                                    } else {
-                                        crystalline_index::PathChangeKind::Added
+                                pending.push_path(
+                                    domain,
+                                    PathChange {
+                                        kind: if exists {
+                                            crystalline_index::PathChangeKind::Modified
+                                        } else {
+                                            crystalline_index::PathChangeKind::Added
+                                        },
+                                        path: path.clone(),
+                                        from: None,
+                                        from_permalink: None,
+                                        permalink: Some(record.permalink.clone()),
+                                        checksum: Some(sha256_hex(text.as_bytes())),
                                     },
-                                    path: path.clone(),
-                                    from: None,
-                                    from_permalink: None,
-                                    permalink: Some(record.permalink.clone()),
-                                    checksum: Some(sha256_hex(text.as_bytes())),
-                                });
+                                );
                             })
                     }
                 };
@@ -470,7 +473,7 @@ impl Engine {
             self.sync_paths(domain, changed_paths).await?;
         }
         // A virtual domain's rows skipped the sync, so they announce here.
-        self.announce_paths(domain, virtual_changes, None);
+        drop(pending);
 
         Ok(json!({
             "domain": domain,

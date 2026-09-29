@@ -3366,8 +3366,8 @@ impl Engine {
         let addresses = pulled_addresses(&state_dir, &touched)?;
 
         let mut cleared = 0u64;
-        // The drafts this pass ended, announced once at the end, collapsed.
-        let mut dropped = Vec::new();
+        // The drafts this pass ended, announced when it ends or stops, collapsed.
+        let mut pending = PendingAnnouncements::new(self);
         for ActorHolding {
             actor,
             entries,
@@ -3388,6 +3388,7 @@ impl Engine {
                     Settle::Leave => {}
                     Settle::Clear => {
                         view.drop(domain_id, &entry.path).await?;
+                        pending.push_drops_from(domain, &view);
                         record.settle(actor, &entry.path);
                         cleared += 1;
                     }
@@ -3422,7 +3423,7 @@ impl Engine {
                     }
                 }
             }
-            dropped.extend(view.take_drops());
+            pending.push_drops_from(domain, &view);
             // And their files, in the same pass and into the same record: a
             // conflict is one actor's conflict at one path, whatever kind of
             // thing stands there.
@@ -3467,7 +3468,7 @@ impl Engine {
                 store.reresolve_actor_references(domain_id, actor).await?;
             }
         }
-        self.announce_draft_drops(domain, dropped);
+        drop(pending);
         record.cleared = cleared;
         let report = ConvergenceReport {
             cleared,
@@ -3856,6 +3857,64 @@ impl Engine {
         match &self.config_path {
             Some(p) => Some(p.clone()),
             None => crystalline_core::config::global_config_path().ok(),
+        }
+    }
+}
+
+/// What a batch owes the change bus for rows it has already committed, said
+/// when the guard drops: on the normal exit and on every early `?` alike, so a
+/// batch that fails halfway still tells open pages about what landed. A row is
+/// pushed only after its own store commit, which keeps the announce-after-
+/// commit rule, and [`Engine::announce`] never awaits, so dropping is safe
+/// anywhere. Never create one while holding the store guard across a push.
+pub(crate) struct PendingAnnouncements<'a> {
+    engine: &'a Engine,
+    paths: BTreeMap<String, Vec<PathChange>>,
+    drops: BTreeMap<String, Vec<EngramChanged>>,
+}
+
+impl<'a> PendingAnnouncements<'a> {
+    pub(crate) fn new(engine: &'a Engine) -> Self {
+        PendingAnnouncements {
+            engine,
+            paths: BTreeMap::new(),
+            drops: BTreeMap::new(),
+        }
+    }
+
+    /// A committed change to one path in `domain`, for [`Engine::announce_paths`].
+    pub(crate) fn push_path(&mut self, domain: &str, change: PathChange) {
+        self.paths
+            .entry(domain.to_string())
+            .or_default()
+            .push(change);
+    }
+
+    /// A committed draft drop in `domain`, for [`Engine::announce_draft_drops`].
+    pub(crate) fn push_drop(&mut self, domain: &str, change: EngramChanged) {
+        self.drops
+            .entry(domain.to_string())
+            .or_default()
+            .push(change);
+    }
+
+    /// Move what `view` has collected so far into the guard and keep it
+    /// collecting, so a drop that lands before a later `?` is still owed.
+    pub(crate) fn push_drops_from(&mut self, domain: &str, view: &DomainView) {
+        for change in view.take_drops() {
+            self.push_drop(domain, change);
+        }
+        view.collect_drops();
+    }
+}
+
+impl Drop for PendingAnnouncements<'_> {
+    fn drop(&mut self) {
+        for (domain, changes) in std::mem::take(&mut self.paths) {
+            self.engine.announce_paths(&domain, changes, None);
+        }
+        for (domain, batch) in std::mem::take(&mut self.drops) {
+            self.engine.announce_draft_drops(&domain, batch);
         }
     }
 }
@@ -8829,6 +8888,33 @@ mod announce_tests {
             permalink: None,
             checksum: None,
         }
+    }
+
+    /// A batch that returns early still announces the rows it committed.
+    #[tokio::test]
+    async fn pending_announcements_are_made_on_an_early_return() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let mut rx = engine.changes().subscribe();
+        fn batch(engine: &Engine) -> Result<()> {
+            let mut pending = PendingAnnouncements::new(engine);
+            pending.push_path("eng", change(PathChangeKind::Modified, "a.md"));
+            pending.push_path("eng", change(PathChangeKind::Modified, "b.md"));
+            Err(EngineError::Internal("the third row failed".to_string()))
+        }
+        assert!(batch(&engine).is_err());
+        let heard: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|envelope| match envelope.change {
+                Change::Engram(change) => change.path,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(heard, vec!["a.md".to_string(), "b.md".to_string()]);
     }
 
     /// A generated listing never rides the bus, even when a report names
