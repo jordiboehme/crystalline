@@ -8,6 +8,7 @@
 //! a note otherwise), through one store shared by `Arc` so a second engine
 //! over the same store stands for a restarted daemon.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use crystalline_core::config::{DomainEntry, GlobalConfig, NameOrigin};
 use crystalline_core::provision::receipt::{self, DomainSources, ProvisionReceipt};
 use crystalline_index::{Store, TursoStore};
+use crystalline_service::changes::{Change, DomainAudience, Envelope};
 use crystalline_service::engine::{Engine, EngineError, RenameStep};
 use crystalline_service::overlay::EnvOverlay;
 use crystalline_service::params::*;
@@ -2370,4 +2372,96 @@ async fn a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_
 both_backends!(
     a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note,
     a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_body
+);
+
+// --- item 14: a resumed rename's audience --------------------------------------
+
+/// Every `domain` frame heard, as `(domain, audience)`.
+fn domain_frames(
+    rx: &mut tokio::sync::broadcast::Receiver<Envelope>,
+) -> Vec<(String, Option<DomainAudience>)> {
+    let mut frames = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        if let Change::Domain(domain) = envelope.change {
+            frames.push((domain.domain, domain.audience));
+        }
+    }
+    frames
+}
+
+fn nobody() -> Option<DomainAudience> {
+    Some(DomainAudience::Accounts(HashSet::new()))
+}
+
+/// A rename stopped after its index row, before the privacy records moved,
+/// so a resume that read the audience afresh would find ada among the old
+/// name's readers.
+async fn stopped_rename(m: &Machine) {
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the failpoint stops the rename");
+    assert!(m.journal().is_file(), "the journal stays");
+}
+
+fn assert_owner_only(m: &Machine, frames: &[(String, Option<DomainAudience>)]) {
+    let old: Vec<_> = frames.iter().filter(|(d, _)| *d == m.eng).collect();
+    assert!(!old.is_empty(), "the old name is announced: {frames:?}");
+    assert!(
+        old.iter().all(|(_, audience)| *audience == nobody()),
+        "to the machine owner only: {frames:?}"
+    );
+    assert!(
+        frames.contains(&(m.platform.clone(), None)),
+        "the new name keeps the ordinary check: {frames:?}"
+    );
+}
+
+async fn a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    stopped_rename(&m).await;
+    let restarted = m.engine(true).await;
+    let mut rx = restarted.changes().subscribe();
+    restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("a journal was left to finish");
+    assert_owner_only(&m, &domain_frames(&mut rx));
+}
+both_backends!(
+    a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only,
+    a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only_body
+);
+
+async fn a_rename_sent_again_announces_the_old_name_to_the_owner_only_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    stopped_rename(&m).await;
+    let again = m.engine(true).await;
+    let mut rx = again.changes().subscribe();
+    again
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("the same rename sent again finishes the journal");
+    assert_owner_only(&m, &domain_frames(&mut rx));
+}
+both_backends!(
+    a_rename_sent_again_announces_the_old_name_to_the_owner_only,
+    a_rename_sent_again_announces_the_old_name_to_the_owner_only_body
 );
