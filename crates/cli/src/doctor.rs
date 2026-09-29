@@ -239,7 +239,8 @@ pub struct StrayCopy {
     pub permalink: String,
     /// Whether the two hold the same text apart from `generated`.
     pub same_text: bool,
-    /// Whether the copy was written after the original.
+    /// Whether the copy was written after the original: its stamp is later,
+    /// and the original's file was not modified after the copy's.
     pub newer: bool,
     /// Whether `--fix` would settle it (delete an identical copy, or move the
     /// newer text into the original and delete the copy).
@@ -1991,6 +1992,8 @@ fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Resu
 struct StrayFile {
     rel: String,
     source: String,
+    /// The file's modification time, read together with `source`.
+    modified: Option<std::time::SystemTime>,
 }
 
 /// A stray copy and the engram's own file, answering to one permalink.
@@ -2010,9 +2013,11 @@ struct StrayPair {
 fn stray_pairs(root: &Path) -> Vec<StrayPair> {
     let mut by_key: BTreeMap<(String, String), Vec<StrayFile>> = BTreeMap::new();
     for rel in markdown_rel_paths(root) {
-        let Ok(source) = std::fs::read_to_string(root.join(&rel)) else {
+        let file = root.join(&rel);
+        let Ok(source) = std::fs::read_to_string(&file) else {
             continue;
         };
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
         let Ok(engram) = crystalline_core::parse_engram(&source) else {
             continue;
         };
@@ -2030,7 +2035,11 @@ fn stray_pairs(root: &Path) -> Vec<StrayPair> {
         by_key
             .entry((folder, permalink))
             .or_default()
-            .push(StrayFile { rel, source });
+            .push(StrayFile {
+                rel,
+                source,
+                modified,
+            });
     }
     let mut pairs = Vec::new();
     for ((_, permalink), files) in by_key {
@@ -2070,8 +2079,8 @@ fn same_apart_from_generated(a: &str, b: &str) -> bool {
 
 /// When a file was written: its `generated.at`, else its `recorded_at`, else
 /// the file's modification time.
-fn written_at(file: &Path, source: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let engram = crystalline_core::parse_engram(source).ok();
+fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
+    let engram = crystalline_core::parse_engram(&file.source).ok();
     let frontmatter = engram.as_ref().map(|e| &e.frontmatter);
     if let Some(at) = frontmatter
         .and_then(|f| f.generated.as_ref())
@@ -2082,10 +2091,7 @@ fn written_at(file: &Path, source: &str) -> Option<chrono::DateTime<chrono::Utc>
     if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
         return day.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
     }
-    std::fs::metadata(file)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(chrono::DateTime::<chrono::Utc>::from)
+    file.modified.map(chrono::DateTime::<chrono::Utc>::from)
 }
 
 /// What doctor reports about one stray pair, and what `--fix` did about it,
@@ -2102,13 +2108,23 @@ fn settle_stray(
     let stray_abs = root.join(&pair.stray.rel);
     let original_abs = root.join(&pair.original.rel);
     let same_text = same_apart_from_generated(&pair.stray.source, &pair.original.source);
-    let newer = match (
-        written_at(&stray_abs, &pair.stray.source),
-        written_at(&original_abs, &pair.original.source),
-    ) {
+    // Each side is stamped on its own, so a file with `generated.at` can meet
+    // one with only `recorded_at`, read as that day's midnight UTC: an exact
+    // time against a date, which can call either side newer within that day.
+    let stamped_newer = match (written_at(&pair.stray), written_at(&pair.original)) {
         (Some(stray), Some(original)) => stray > original,
         _ => false,
     };
+    // A hand edit of the original in an editor leaves its `generated.at` as
+    // it was, so the stamps alone would let the copy's older text overwrite
+    // it. The original's file must also not have been modified after the
+    // copy's. A pull that rewrote the times makes this too careful, never
+    // careless: doctor then only reports and the person decides.
+    let original_touched_after = match (pair.original.modified, pair.stray.modified) {
+        (Some(original), Some(stray)) => original > stray,
+        _ => true,
+    };
+    let newer = stamped_newer && !original_touched_after;
     let mut report = StrayCopy {
         path: pair.stray.rel.clone(),
         original: pair.original.rel.clone(),
@@ -4789,9 +4805,23 @@ mod tests {
         std::fs::write(abs, text).unwrap();
     }
 
+    /// Set a file's modification time to `secs` after a fixed instant, so
+    /// the tests never depend on how fast they write.
+    fn set_mtime(root: &Path, rel: &str, secs: u64) {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000 + secs);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(rel))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
     /// A file domain `kb` holding `files`, indexed with `first` alone when it
     /// is named (so that file is the indexed one) and the rest written after,
-    /// then checked by doctor with `fix` and `read_only`.
+    /// then checked by doctor with `fix` and `read_only`. The files' times
+    /// follow their order, the first one modified last: [`pair`] lists the
+    /// copy first, as 0.20.0 wrote it after the original.
     async fn stray_doctor(
         files: &[(&str, String)],
         first: Option<&str>,
@@ -4812,6 +4842,9 @@ mod tests {
         }
         if first.is_none() {
             sync_domain(&store, "kb", &root).await.unwrap();
+        }
+        for (i, (rel, _)) in files.iter().enumerate() {
+            set_mtime(&root, rel, 60 * (files.len() - i) as u64);
         }
         let mut entry = DomainEntry::file(root);
         edit(&mut entry);
@@ -5098,6 +5131,8 @@ mod tests {
         let original = review_standards("The old rule.", OLDER);
         put(&root, O_PATH, &original);
         put(&root, S_PATH, &review_standards("The new rule.", NEWER));
+        set_mtime(&root, O_PATH, 60);
+        set_mtime(&root, S_PATH, 120);
         let pairs = stray_pairs(&root);
         assert_eq!(pairs.len(), 1);
         // Somebody writes the original between doctor's read and its fix.
@@ -5186,6 +5221,8 @@ mod tests {
             let root = dir.path().join("kb");
             put(&root, O_PATH, &review_standards(original_body, OLDER));
             put(&root, S_PATH, &review_standards("The rule.", NEWER));
+            set_mtime(&root, O_PATH, 60);
+            set_mtime(&root, S_PATH, 120);
             let pairs = stray_pairs(&root);
             assert_eq!(pairs.len(), 1);
             // Somebody writes the copy between doctor's read and its delete.
@@ -5200,5 +5237,37 @@ mod tests {
                 "{original_body}: the new text survives"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_when_the_original_was_edited_by_hand_after_it() {
+        // An editor leaves `generated.at` as it was, so by the stamps alone
+        // the copy is newer; the original's file time says it changed after.
+        let copy = review_standards("The new rule.", NEWER);
+        let original = review_standards("The old rule, edited by hand.", OLDER);
+        let (dir, d) = stray_doctor(
+            &[(O_PATH, original.clone()), (S_PATH, copy.clone())],
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.newer && !s.fixable && !s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_to_string(root.join(S_PATH)).unwrap(), copy);
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. conventions/Code Review Standards.md changed after it: compare the two, keep the right text in conventions/Code Review Standards.md and delete the copy"),
+            "{out}"
+        );
     }
 }
