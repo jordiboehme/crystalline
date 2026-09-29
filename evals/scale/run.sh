@@ -251,7 +251,7 @@ stage_base() {
   for d in $DOMAINS; do
     verify_args+=("$CORPUS/$d")
   done
-  run_step "verify-all" "$BIN" verify "${verify_args[@]}"
+  run_step "verify-all" "$BIN" verify ${verify_args[@]+"${verify_args[@]}"}
   search_battery "search" "text hybrid semantic"
   run_step "evolve" "$BIN" evolve --limit 10 --config "$CFG" --db "$DB"
   run_step "evolve-temporal" \
@@ -452,7 +452,12 @@ print(len(json.load(open(sys.argv[1]))))' "$CORPUS/contradictions.json")"
     sleep 2
     waited=$((waited + 2))
   done
-  [ -n "$pid" ] || { echo "the daemon never answered ctl status; see $daemon_log" >&2; return 1; }
+  if [ -z "$pid" ]; then
+    echo "the daemon never answered ctl status; see $daemon_log" >&2
+    kill "$job" 2> /dev/null || true
+    wait "$job" 2> /dev/null || true
+    return 1
+  fi
 
   (
     local_elapsed=0
@@ -541,8 +546,12 @@ PY
     echo "the contradiction backlog did not drain (daemon died, or ${DRAIN_LIMIT}s ran out); the dump below is partial" >&2
   fi
   run_step "ctl-status-nli-$profile" "$BIN" ctl status
-  echo "sampling ${NLI_UNLOAD_WAIT}s more for the idle drop"
-  sleep "$NLI_UNLOAD_WAIT"
+  if kill -0 "$pid" 2> /dev/null; then
+    echo "sampling ${NLI_UNLOAD_WAIT}s more for the idle drop"
+    sleep "$NLI_UNLOAD_WAIT"
+  else
+    echo "the daemon is already gone; skipping the ${NLI_UNLOAD_WAIT}s idle-drop sample"
+  fi
   touch "$stop"
   wait "$sampler" 2> /dev/null || true
   run_step "ctl-shutdown-nli-$profile" "$BIN" ctl shutdown

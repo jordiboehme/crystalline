@@ -495,6 +495,13 @@ def plant_lang(index: int) -> str:
     return "en" if index % 2 == 0 else "de"
 
 
+# A generous bound on rejection-sampling a unique second bullet: comfortably
+# above what any real --contradictions count needs (2 collisions in 800 draws
+# with no resampling at all), so it only ever fires if the vocabulary is
+# genuinely exhausted or something else is wrong, not on ordinary bad luck.
+MAX_BULLET_ATTEMPTS = 10000
+
+
 CATEGORY_TEMPLATES = {
     "fact": "The {thing} holds {measure} under {condition}",
     "decision": "We settled on the {process} for every {thing} change",
@@ -842,8 +849,16 @@ def plant_contradictions(out: Path, seed: int, count: int) -> list:
             # sentence varied and keeps generation deterministic - the same
             # seed retries in the same order and lands on the same result.
             shared = sentence(rng)
+            attempts = 1
             while shared in used_bullets:
+                if attempts >= MAX_BULLET_ATTEMPTS:
+                    raise SystemExit(
+                        f"plant_contradictions: could not draw a unique second bullet for "
+                        f"{stem} {i:04d} after {attempts} attempts; the sentence vocabulary is "
+                        f"exhausted at --contradictions {count} (try a smaller count)"
+                    )
                 shared = sentence(rng)
+                attempts += 1
             used_bullets.add(shared)
             ends = []
             for side, text in zip("ab", texts):
