@@ -69,6 +69,14 @@ describe("PauseScreen", () => {
     expect(screen.getByText("BREAK IN ALPHA NOTE")).toBeInTheDocument();
     expect(screen.getByText("READY.")).toBeInTheDocument();
     expect(screen.getByText(PAUSE_LEGEND)).toBeInTheDocument();
+    // Mutation caught: the legend drawn with plain spaces, which a narrow
+    // screen breaks inside an item ("I" on one line, "INVERT" on the
+    // next). Only the gaps between items may break.
+    const legend = screen.getByText(PAUSE_LEGEND).textContent ?? "";
+    const items = legend.split(" · ");
+    expect(items.length).toBeGreaterThan(5);
+    expect(items).toContain("I\u00a0INVERT");
+    for (const item of items) expect(item).not.toContain(" ");
     const cont = screen.getByRole("button", { name: CONT_LABEL });
     expect(cont).toBeEnabled();
     expect(cont).toHaveFocus();

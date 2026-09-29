@@ -17,3 +17,18 @@ export const GAME_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT
  * sound off and on.
  */
 export const PAUSE_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND`;
+
+/** Between two items of a legend, where a line may break. */
+export const LEGEND_GAP = " · ";
+
+/**
+ * A legend a line breaks only between its items: the spaces inside an
+ * item (`I INVERT`) become non-breaking, so a narrow screen never puts a
+ * key on one line and its word on the next.
+ */
+export function unbrokenLegend(legend: string): string {
+  return legend
+    .split(LEGEND_GAP)
+    .map((item) => item.replaceAll(" ", "\u00a0"))
+    .join(LEGEND_GAP);
+}

@@ -27,7 +27,7 @@ import { useEffect, useRef, useState } from "react";
 import { RELOCK_DELAY_MS } from "../core/input";
 import { PAUSE_ESC_GUARD_MS } from "../session";
 import { C64_BLUE, C64_LIGHT_BLUE } from "./DeviceRefusal";
-import { PAUSE_LEGEND } from "./keys";
+import { PAUSE_LEGEND, unbrokenLegend } from "./keys";
 
 /** The pause screen's accessible name. */
 export const PAUSE_LABEL = "Paused";
@@ -158,7 +158,9 @@ export function PauseScreen({
             {RUN_STOP_LABEL}
           </button>
         </p>
-        <p className="mt-6 text-xs normal-case tracking-wide">{PAUSE_LEGEND}</p>
+        <p className="mt-6 text-xs normal-case tracking-wide">
+          {unbrokenLegend(PAUSE_LEGEND)}
+        </p>
       </div>
     </div>
   );
