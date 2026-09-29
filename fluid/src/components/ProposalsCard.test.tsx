@@ -91,6 +91,8 @@ function keptBranch() {
     branch: "crystalline/share-1",
     number: 3,
     onto: "main",
+    why: "merged",
+    kind: "base",
     blocked_by: 7,
     reason: "GitHub returned an unexpected answer (status 422): nope",
     message:
@@ -552,6 +554,42 @@ describe("the proposals card", () => {
         "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
       ),
     ).toBeVisible();
+  });
+
+  it("shows no reason line under a refused delete, whose sentence holds it", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          kept_branches: [
+            {
+              branch: "crystalline/share-1",
+              number: 3,
+              onto: "main",
+              why: "merged",
+              kind: "delete_refused",
+              blocked_by: null,
+              reason:
+                "GitHub returned an unexpected answer (status 422): Reference update failed",
+              message:
+                "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    expect(
+      within(card).getByText(
+        "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(card).queryByText(
+        "GitHub returned an unexpected answer (status 422): Reference update failed",
+      ),
+    ).toBeNull();
   });
 
   it("warns before withdrawing a layer that is carrying others", async () => {

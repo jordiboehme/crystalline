@@ -767,11 +767,13 @@ export interface SyncStatus {
 // for nothing, so the key is ignored until a surface asks for it - at which
 // point it is five lines beside `shareIdentity`. The CLI renders it today.
 
-/** One kept merged-share branch, as the sync route reports it. */
+/** One kept share branch, as the sync route reports it. */
 export interface KeptBranch {
   branch: string;
   message: string;
   reason: string | null;
+  /** What kept it (`base`, `head`, `target_gone`, `delete_refused`, `awaited`), or null from an older daemon. */
+  kind: string | null;
 }
 
 /** The cache key of one domain's sync status. */
@@ -1041,7 +1043,12 @@ function readKeptBranch(value: unknown): KeptBranch | null {
   if (branch === null || message === null) {
     return null;
   }
-  return { branch, message, reason: asString(record?.reason) };
+  return {
+    branch,
+    message,
+    reason: asString(record?.reason),
+    kind: asString(record?.kind),
+  };
 }
 
 /** Where this team domain stands. 404 for a domain with no origin. */

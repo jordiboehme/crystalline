@@ -543,6 +543,8 @@ describe("the admin client layer", () => {
           branch: "crystalline/share-1",
           number: 3,
           onto: "main",
+          why: "merged",
+          kind: "base",
           blocked_by: 7,
           reason: "GitHub returned an unexpected answer (status 422): nope",
           message: "Branch crystalline/share-1 is kept.",
@@ -569,11 +571,13 @@ describe("the admin client layer", () => {
         branch: "crystalline/share-1",
         message: "Branch crystalline/share-1 is kept.",
         reason: "GitHub returned an unexpected answer (status 422): nope",
+        kind: "base",
       },
       {
         branch: "crystalline/share-4",
         message: "Branch crystalline/share-4 is kept.",
         reason: null,
+        kind: null,
       },
     ]);
   });

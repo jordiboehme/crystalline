@@ -809,14 +809,23 @@ fn single_domain(
                            all exist but are not grouped on the forge yet. \
                            All four are always present, quiet rather than \
                            absent off the stacked path, so one reader handles \
-                           either path.\n\n`kept_branches` lists merged \
-                           share branches that were kept because an open pull \
-                           request is still based on them and could not be \
-                           moved to the branch the share merged into. Each \
-                           entry carries `branch`, `number`, `onto`, \
-                           `blocked_by` (null when the open pull requests \
-                           could not be listed), `reason` and `message`, the \
-                           sentence to show. Always present, empty when \
+                           either path.\n\n`kept_branches` lists share \
+                           branches Crystalline keeps upstream instead of \
+                           deleting them: a merged, declined or withdrawn \
+                           share's branch that an open pull request is based \
+                           on or comes from, one whose pull request cannot \
+                           move because the target branch no longer exists, \
+                           one GitHub refused to delete and a declined or \
+                           withdrawn share's branch that a waiting move \
+                           still needs. Each entry carries `branch`, \
+                           `number`, `onto`, `why` (`merged`, `declined` or \
+                           `withdrawn`), `kind` (`base`, `head`, \
+                           `target_gone`, `delete_refused` or `awaited`), \
+                           `blocked_by` (the pull request in the way, null \
+                           when the open pull requests could not be listed \
+                           or the delete was refused), `reason` (the forge's \
+                           answer, null when there is none) and `message`, \
+                           the sentence to show. Always present, empty when \
                            nothing is kept.\n\nOn a domain that reviews changes \
                            three more keys say where the drafts stand. \
                            `my_drafts` counts this account's own draft \
@@ -846,7 +855,16 @@ fn single_domain(
                 "stack_wedged": [],
                 "repair_pending": false,
                 "stack_link_pending": false,
-                "kept_branches": [],
+                "kept_branches": [{
+                    "branch": "crystalline/share-7",
+                    "number": 7,
+                    "onto": "main",
+                    "why": "merged",
+                    "kind": "base",
+                    "blocked_by": 12,
+                    "reason": "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.",
+                    "message": "Branch crystalline/share-7 is kept: pull request #12 is based on it and could not be moved to main. The next sync tries again."
+                }],
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),
@@ -3052,6 +3070,40 @@ pub async fn github_domain_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example's kept entry is a real one: its message is the sentence
+    /// `kept_message` words for the same entry, so the document can never
+    /// show a sentence no surface prints.
+    #[test]
+    fn the_status_example_uses_the_real_kept_sentence() {
+        use crystalline_remote::state::{BranchKept, KeptKind, QueuedBranch, RetireWhy};
+        let doc = serde_json::to_value(crate::openapi_document()).unwrap();
+        let example = &doc["paths"]["/api/v1/domains/{domain}/sync"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["example"]["kept_branches"][0];
+        let entry = QueuedBranch {
+            number: 7,
+            branch: "crystalline/share-7".to_string(),
+            onto: "main".to_string(),
+            why: RetireWhy::Merged,
+            kept: Some(BranchKept {
+                blocked_by: Some(12),
+                reason: "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.".to_string(),
+                kind: KeptKind::Base,
+            }),
+        };
+        assert_eq!(
+            example["message"].as_str(),
+            entry.kept_message().as_deref(),
+            "{example}"
+        );
+        assert_eq!(
+            example["reason"],
+            entry.kept.as_ref().unwrap().reason.as_str()
+        );
+        assert_eq!(example["why"], "merged");
+        assert_eq!(example["kind"], "base");
+        assert_eq!(example["blocked_by"], 12);
+    }
 
     /// Each branch names a remedy that works in the state it leaves, and
     /// only that one: pasting the rolled-back branch's owner route straight

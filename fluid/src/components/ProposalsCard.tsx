@@ -340,7 +340,8 @@ function KeptBranchNotices({
           className="rounded bg-amber-50 px-3 py-2 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
         >
           <p>{branch.message}</p>
-          {branch.reason !== null && (
+          {/* A refused delete's sentence already holds the forge's reason. */}
+          {branch.reason !== null && branch.kind !== "delete_refused" && (
             <p className="text-caption break-words opacity-80">
               {branch.reason}
             </p>
