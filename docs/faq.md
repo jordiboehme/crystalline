@@ -28,7 +28,7 @@ Only when told to. It does not exit when the last agent disconnects or on idle: 
 
 ## How do I stop it manually?
 
-`crystalline ctl shutdown` from any terminal asks the running daemon to stop cleanly over the local socket. If a crash ever leaves a stale lock or socket file behind, `crystalline doctor --fix` cleans them up. A daemon that is still alive but has stopped answering is replaced automatically by the next client that connects, and `crystalline doctor --fix` forces the same replacement on the spot.
+`crystalline ctl shutdown` from any terminal asks the running daemon to stop cleanly over the local socket. If a crash ever leaves a stale lock or socket file behind, `crystalline doctor --fix` cleans them up. A daemon that is still alive but has stopped answering is replaced automatically by the next client that connects, and `crystalline doctor --fix` forces the same replacement on the spot. `crystalline doctor` also shows where the daemon runs: its working directory and, on Windows, whether it runs inside the job of the program that started it or with that program's package identity. It warns when that could keep the program's files in use.
 
 ## Is the HTTP endpoint authenticated?
 

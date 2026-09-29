@@ -550,6 +550,7 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
     let bridge = Bridge::attach(&env);
     let status = wait_for_ctl_status(&env);
     let log = std::fs::read_to_string(env.state_dir().join("daemon.log")).unwrap_or_default();
+    let (_, doctor) = run(&env, &["doctor"]);
     drop(bridge);
     shutdown_daemon(&env);
     // The job handle goes last; the job has no kill-on-close limit.
@@ -563,5 +564,9 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
     assert!(
         log.contains("could not leave the job of the program that started it"),
         "the daemon's startup warning is in daemon.log: {log}"
+    );
+    assert!(
+        doctor.contains("[warning] the daemon runs inside the job of the program that started it"),
+        "doctor warns: {doctor}"
     );
 }

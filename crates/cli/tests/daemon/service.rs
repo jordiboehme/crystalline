@@ -4799,6 +4799,24 @@ fn an_autostarted_daemon_works_in_the_state_directory() {
         "service.json carries the same facts: {record}"
     );
 
+    let (ok, human) = env.run(&["status"]);
+    assert!(ok, "{human}");
+    let line = human
+        .lines()
+        .find(|l| l.starts_with("Runs in: "))
+        .unwrap_or_else(|| panic!("status names where the daemon runs: {human}"));
+    assert!(line.ends_with("crystalline"), "the state directory: {line}");
+
+    let (_, doctor) = env.run(&["doctor"]);
+    assert!(
+        doctor.contains("daemon working directory: "),
+        "doctor names it in full: {doctor}"
+    );
+    assert!(
+        !doctor.contains("daemon job:"),
+        "and has no Windows lines off Windows: {doctor}"
+    );
+
     // The client pins its own working directory: end it first.
     drop(client);
     std::fs::rename(&work, env.dir.join("work-moved"))
