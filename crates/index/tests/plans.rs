@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, twenty-two entries, each named by the function that issues it, so a
+//! One place, twenty-six entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -568,6 +568,65 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             turso_must_seek: &["idx_link_to_domain"],
             postgres_must_seek: &["idx_link_to_domain"],
+        },
+        HotStatement {
+            // The bind after a base write: only the pending rows elsewhere
+            // spelled with the written domain's names and naming its engram.
+            issued_by: "Store::resolve_references_to (relation)",
+            turso: || {
+                crystalline_index::resolve_references_to_sql("relation", "?1", "?2", "lower(?3)")
+            },
+            postgres: || {
+                crystalline_index::resolve_references_to_sql("relation", "$1", "$2", "lower($3)")
+            },
+            literals: &["1", "'d'", "'runbook'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::resolve_references_to (link)",
+            turso: || crystalline_index::resolve_references_to_sql("link", "?1", "?2", "lower(?3)"),
+            postgres: || {
+                crystalline_index::resolve_references_to_sql("link", "$1", "$2", "lower($3)")
+            },
+            literals: &["1", "'d'", "'runbook'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            // The count that goes with it, over the same rows.
+            issued_by: "Store::resolve_references_to (relation count)",
+            turso: || {
+                crystalline_index::count_references_to_sql("relation", "?1", "?2", "lower(?3)")
+            },
+            postgres: || {
+                crystalline_index::count_references_to_sql("relation", "$1", "$2", "lower($3)")
+            },
+            literals: &["1", "'d'", "'runbook'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::resolve_references_to (link count)",
+            turso: || crystalline_index::count_references_to_sql("link", "?1", "?2", "lower(?3)"),
+            postgres: || {
+                crystalline_index::count_references_to_sql("link", "$1", "$2", "lower($3)")
+            },
+            literals: &["1", "'d'", "'runbook'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         // The contradiction scorer wave (plans/2026-09-14-contradiction-scorer-plan.md)
         // adds two per-domain reads, and both belong here the day they land:

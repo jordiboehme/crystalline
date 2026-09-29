@@ -1378,6 +1378,8 @@ both_backends!(
 );
 
 /// A draft is one actor's: another domain's links never bind to it.
+/// The store, not the call site, keeps a draft from being bound to: the
+/// bind reads the base candidates alone (`ReferenceCandidates::Base`).
 async fn a_draft_write_binds_nothing_elsewhere_body(store: Arc<Mutex<dyn Store>>) {
     let (tmp, engine, _scratch) = engine_fixture_on(store, true).await;
     seed(
