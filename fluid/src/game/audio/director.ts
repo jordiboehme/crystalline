@@ -42,7 +42,10 @@
  *   M4 C26) on the `modem` bus and answers its stop, which fades it out
  *   over `DIAL_FADE_S`; `carrier` plays the hang-up on a drop and a short
  *   handshake on a return (C27), also on the `modem` bus. Both are
- *   one-shots under the cap, and a new dial cuts one still sounding.
+ *   one-shots under the cap, and a new dial cuts one still sounding. A
+ *   dial asked for while the context is still settling a resume waits
+ *   for it to run (StrictMode's second mount, F29) rather than being
+ *   dropped like another one-shot.
  * - **Mute** is the master's alone (`toggleMute`, the mixer's): the cues
  *   play on into a silent master, so sound coming back mid-room brings the
  *   drone back at once.
@@ -341,16 +344,34 @@ export function createDirector(mixer: Mixer): Director {
   window.addEventListener("click", onGesture, true);
   window.addEventListener("keydown", onGesture, true);
 
+  /** How many dials were asked for: a later one replaces a waiting one. */
+  let calls = 0;
   const dial = (number: string): (() => void) => {
     dialing?.stop(DIAL_FADE_S);
-    const playing: PlayingPatch | null = shot(handshakePatch(number), {
-      bus: "modem",
-      onEnd: () => {
-        if (dialing === playing) dialing = null;
-      },
-    });
-    dialing = playing;
+    dialing = null;
+    const call = ++calls;
+    let hungUp = false;
+    let playing: PlayingPatch | null = null;
+    const play = () => {
+      if (hungUp || disposed || call !== calls) return;
+      const shotPlaying: PlayingPatch | null = shot(handshakePatch(number), {
+        bus: "modem",
+        onEnd: () => {
+          if (dialing === shotPlaying) dialing = null;
+        },
+      });
+      playing = shotPlaying;
+      dialing = shotPlaying;
+    };
+    // A context still settling a resume (StrictMode's second mount, whose
+    // context the first mount's cleanup suspended, F29): the dial waits
+    // for it to run instead of being dropped as a one-shot.
+    const ctx = mixer.ctx;
+    if (!mixer.running && !quiet && ctx !== null && ctx.state === "suspended")
+      void ctx.resume().then(play, () => undefined);
+    else play();
     return () => {
+      hungUp = true;
       playing?.stop(DIAL_FADE_S);
     };
   };

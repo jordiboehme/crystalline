@@ -54,7 +54,7 @@ import {
   userFixture,
 } from "../test/harness";
 import type { Director } from "./audio/director";
-import { CONNECTED_KEY, dialNumber } from "./audio/modem";
+import { CONNECTED_KEY, DTMF, dialNumber } from "./audio/modem";
 import { FakeAudioContext } from "./audio/testContext";
 import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
@@ -1812,6 +1812,46 @@ describe("ExploreRoute", () => {
       expect(ctx.calls).not.toContain("close");
       expect(ctx.state).toBe("suspended");
       expect(takePrimedAudio()).toBe(ctx);
+    });
+
+    it("plays the second mount's dial once its context runs again, under StrictMode (F29)", async () => {
+      // Mutation caught: the dial played as a plain one-shot, which the
+      // director drops while the context is not running: the first
+      // mount's cleanup suspended it, the second mount's resume is still
+      // settling, and the dial-in goes silent in development.
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      // As the browser traced it: the cleanup's suspend lands at once, the
+      // second mount's resume settles later.
+      const suspend = ctx.suspend.bind(ctx);
+      ctx.suspend = () => {
+        ctx.deferred = false;
+        const done = suspend();
+        ctx.deferred = true;
+        return done;
+      };
+      const tones = new Set(Object.values(DTMF).flat());
+      const dialTones = () =>
+        ctx
+          .ofKind("oscillator")
+          .filter((o) => tones.has(o.frequency.events[0]?.[1] ?? -1)).length;
+      serve();
+      const view = renderAt("/%CF%80/d/eng/e/alpha", true);
+      await waitFor(() => {
+        expect(sound.dials).toHaveLength(2);
+      });
+      const first = dialTones();
+      expect(first).toBeGreaterThan(0);
+      expect(ctx.state).toBe("suspended");
+      await act(async () => {
+        ctx.settle();
+        await Promise.resolve();
+      });
+      expect(ctx.state).toBe("running");
+      expect(dialTones()).toBe(2 * first);
+      view.unmount();
     });
   });
 });

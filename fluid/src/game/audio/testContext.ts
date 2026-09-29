@@ -274,10 +274,12 @@ export class FakeAudioContext implements AudioContextLike {
   readonly calls: ("resume" | "suspend" | "close")[] = [];
   /**
    * When true, `resume` and `suspend` leave `state` as it is until
-   * `settle()`, as a real context does while its promise is pending.
+   * `settle()`, as a real context does while its promise is pending; their
+   * promises resolve at that `settle()` too.
    */
   deferred = false;
   private pending: AudioContextState | null = null;
+  private waiting: (() => void)[] = [];
 
   constructor(sampleRate = 48000) {
     this.sampleRate = sampleRate;
@@ -345,8 +347,7 @@ export class FakeAudioContext implements AudioContextLike {
     if (this.state === "closed") {
       return Promise.reject(new Error("InvalidStateError: closed"));
     }
-    this.change("running");
-    return Promise.resolve();
+    return this.change("running");
   }
 
   suspend(): Promise<void> {
@@ -354,8 +355,7 @@ export class FakeAudioContext implements AudioContextLike {
     if (this.state === "closed") {
       return Promise.reject(new Error("InvalidStateError: closed"));
     }
-    this.change("suspended");
-    return Promise.resolve();
+    return this.change("suspended");
   }
 
   /** Applies the state the last deferred `resume` or `suspend` asked for. */
@@ -364,11 +364,18 @@ export class FakeAudioContext implements AudioContextLike {
       this.state = this.pending;
     }
     this.pending = null;
+    const waiting = this.waiting;
+    this.waiting = [];
+    for (const resolve of waiting) resolve();
   }
 
-  private change(next: AudioContextState): void {
-    if (this.deferred) this.pending = next;
-    else this.state = next;
+  private change(next: AudioContextState): Promise<void> {
+    if (!this.deferred) {
+      this.state = next;
+      return Promise.resolve();
+    }
+    this.pending = next;
+    return new Promise((resolve) => this.waiting.push(resolve));
   }
 
   close(): Promise<void> {

@@ -65,6 +65,41 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
+describe("createDirector's dial on a settling context (F29)", () => {
+  // Mutation caught: a dial that waits for the context to run played all
+  // the same after it was hung up, or after a later dial replaced it.
+  it("plays when the resume settles, and not once hung up or replaced", async () => {
+    const { ctx, director } = setup("suspended");
+    disposers.push(() => director.dispose());
+    ctx.deferred = true;
+    director.resume();
+    const tones = () => pitches(ctx).filter((p) => p === DTMF["5"]![0]);
+    director.dial("555-0142");
+    expect(tones()).toHaveLength(0);
+    ctx.settle();
+    await microtasks();
+    expect(tones().length).toBeGreaterThan(0);
+    const played = tones().length;
+
+    ctx.state = "suspended";
+    const hangUp = director.dial("555-0142");
+    hangUp();
+    ctx.settle();
+    ctx.state = "running";
+    await microtasks();
+    expect(tones()).toHaveLength(played);
+
+    ctx.state = "suspended";
+    director.dial("555-0142");
+    ctx.state = "running";
+    director.dial("777-0000");
+    await microtasks();
+    ctx.settle();
+    await microtasks();
+    expect(tones()).toHaveLength(played);
+  });
+});
+
 describe("createDirector", () => {
   // Mutation caught: the pan dropped (no panner, or one left at 0), a door
   // played on the wrong bus, or the distance gain ignored.
