@@ -66,8 +66,11 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
             let only_repeats = !repeated.is_empty()
                 && keep_first_copies(&file.source).is_some_and(|text| parse_engram(&text).is_ok());
             if only_repeats {
+                // doctor --fix repairs a file only when every repeat in it
+                // agrees, so only then does the hint send a person there.
+                let doctor_fixes = repeated.iter().all(|r| r.same_value);
                 for repeat in &repeated {
-                    emit_repeated_key(file, repeat, sink);
+                    emit_repeated_key(file, repeat, doctor_fixes, sink);
                 }
             } else {
                 sink.emit(
@@ -204,8 +207,15 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
 }
 
 /// `E010`: one frontmatter key held more than once, pointing at the second
-/// copy's line.
-fn emit_repeated_key(file: &ScannedFile, repeat: &DuplicateKey, sink: &mut Sink) {
+/// copy's line. `doctor_fixes` says whether `crystalline doctor --fix` would
+/// repair the file (every repeat in it agrees); the hint names it only then,
+/// in the words doctor itself uses.
+fn emit_repeated_key(
+    file: &ScannedFile,
+    repeat: &DuplicateKey,
+    doctor_fixes: bool,
+    sink: &mut Sink,
+) {
     let count = repeat.lines.len();
     let times = if count == 2 {
         "twice".to_string()
@@ -213,14 +223,20 @@ fn emit_repeated_key(file: &ScannedFile, repeat: &DuplicateKey, sink: &mut Sink)
         format!("{count} times")
     };
     let (values, fix) = if repeat.same_value {
+        let which = if count == 2 { "one" } else { "all but one" };
+        let doctor = if doctor_fixes {
+            ", or run `crystalline doctor --fix`"
+        } else {
+            ""
+        };
         (
             "the same value",
-            "delete one of the lines, or run `crystalline doctor --fix`",
+            format!("delete {which} of the lines{doctor}"),
         )
     } else {
         (
             "different values",
-            "keep one line with the right value and delete the rest",
+            "keep one line with the right value and delete the rest".to_string(),
         )
     };
     sink.emit(
@@ -233,7 +249,7 @@ fn emit_repeated_key(file: &ScannedFile, repeat: &DuplicateKey, sink: &mut Sink)
             repeat.key,
             line_list(&repeat.lines)
         ),
-        Some(fix.into()),
+        Some(fix),
     );
 }
 
@@ -409,6 +425,43 @@ mod tests {
         assert_eq!(
             e010[0].fix.as_deref(),
             Some("keep one line with the right value and delete the rest")
+        );
+    }
+
+    #[test]
+    fn a_repeat_with_one_value_beside_one_with_two_does_not_offer_doctor() {
+        let source = "---\ntype: engram\ntags: [a]\ntitle: Alpha\ntags: [b]\nstatus: stable\nstatus: stable\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        let fixes: Vec<(&str, Option<&str>)> = issues
+            .iter()
+            .filter(|i| i.rule == "E010")
+            .map(|i| (i.message.as_str(), i.fix.as_deref()))
+            .collect();
+        assert_eq!(
+            fixes,
+            [
+                (
+                    "frontmatter key `tags` appears twice (lines 3 and 5) with different values",
+                    Some("keep one line with the right value and delete the rest")
+                ),
+                (
+                    "frontmatter key `status` appears twice (lines 6 and 7) with the same value",
+                    Some("delete one of the lines")
+                ),
+            ],
+            "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn a_key_held_three_times_with_one_value_asks_to_delete_all_but_one() {
+        let source = "---\ntype: engram\ntitle: Alpha\nstatus: stable\nstatus: stable\nstatus: stable\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        let e010: Vec<&Issue> = issues.iter().filter(|i| i.rule == "E010").collect();
+        assert_eq!(e010.len(), 1, "{issues:#?}");
+        assert_eq!(
+            e010[0].fix.as_deref(),
+            Some("delete all but one of the lines, or run `crystalline doctor --fix`")
         );
     }
 
