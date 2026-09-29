@@ -2898,6 +2898,26 @@ fn direct_share_lines(d: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// The merged-share branches kept upstream because a pull request still
+/// stands on them, each as its sentence with the forge's reason under it.
+/// Nothing at all when none is kept, and an older daemon sends no key.
+fn kept_branch_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(kept) = d["kept_branches"].as_array() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for entry in kept {
+        let Some(message) = entry["message"].as_str() else {
+            continue;
+        };
+        lines.push(format!("  {message}"));
+        if let Some(reason) = entry["reason"].as_str() {
+            lines.push(format!("    {reason}"));
+        }
+    }
+    lines
+}
+
 /// What a reviewing domain is holding that no share would pick up: this
 /// session's own drafts, and - for whoever holds the domain - who else is
 /// drafting in it.
@@ -3127,6 +3147,9 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
         }
         if d["repair_pending"].as_bool().unwrap_or(false) {
             println!("  repair pending - the next share or withdraw finishes it");
+        }
+        for line in kept_branch_lines(d) {
+            println!("{line}");
         }
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(
@@ -4733,6 +4756,27 @@ mod tests {
             direct_share_lines(&json!({ "domain": "kb" })).is_empty(),
             "and neither does an older daemon"
         );
+    }
+
+    /// A kept branch prints its sentence and the forge's reason under it, and
+    /// nothing prints when nothing is kept or the daemon is older.
+    #[test]
+    fn the_kept_branch_lines_name_the_branch_and_the_reason() {
+        assert_eq!(
+            kept_branch_lines(&json!({
+                "kept_branches": [{
+                    "branch": "crystalline/share-1",
+                    "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+                    "reason": "GitHub returned an unexpected answer (status 422): nope",
+                }],
+            })),
+            vec![
+                "  Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.".to_string(),
+                "    GitHub returned an unexpected answer (status 422): nope".to_string(),
+            ]
+        );
+        assert!(kept_branch_lines(&json!({ "kept_branches": [] })).is_empty());
+        assert!(kept_branch_lines(&json!({ "domain": "kb" })).is_empty());
     }
 
     /// A mixed set names every kind in it, in the order a share reports them.

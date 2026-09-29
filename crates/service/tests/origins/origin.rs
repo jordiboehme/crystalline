@@ -1578,7 +1578,7 @@ async fn origin_status_reports_behind_and_connection() {
 /// The keys one domain entry carries when nobody asked for detail. Pinned as a
 /// list rather than spot-checked so an accidental `detail: null` - a key that
 /// costs every reader something and says nothing - fails here.
-const STATUS_KEYS_WITHOUT_DETAIL: [&str; 19] = [
+const STATUS_KEYS_WITHOUT_DETAIL: [&str; 20] = [
     "base_commit",
     "behind",
     "branch",
@@ -1586,6 +1586,7 @@ const STATUS_KEYS_WITHOUT_DETAIL: [&str; 19] = [
     "declined_proposals",
     "direct_shares",
     "domain",
+    "kept_branches",
     "last_checked",
     "local_changes",
     "merged_unconsumed",

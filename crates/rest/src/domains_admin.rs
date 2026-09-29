@@ -809,7 +809,15 @@ fn single_domain(
                            all exist but are not grouped on the forge yet. \
                            All four are always present, quiet rather than \
                            absent off the stacked path, so one reader handles \
-                           either path.\n\nOn a domain that reviews changes \
+                           either path.\n\n`kept_branches` lists merged \
+                           share branches that were kept because an open pull \
+                           request is still based on them and could not be \
+                           moved to the branch the share merged into. Each \
+                           entry carries `branch`, `number`, `onto`, \
+                           `blocked_by` (null when the open pull requests \
+                           could not be listed), `reason` and `message`, the \
+                           sentence to show. Always present, empty when \
+                           nothing is kept.\n\nOn a domain that reviews changes \
                            three more keys say where the drafts stand. \
                            `my_drafts` counts this account's own draft \
                            changes, `drafts` counts every actor's, and \
@@ -838,6 +846,7 @@ fn single_domain(
                 "stack_wedged": [],
                 "repair_pending": false,
                 "stack_link_pending": false,
+                "kept_branches": [],
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),

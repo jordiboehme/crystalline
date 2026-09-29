@@ -6512,3 +6512,33 @@ async fn tool_descriptions_teach_that_an_overwrite_keeps_the_file() {
     );
     assert!(text.contains("move_engram it first"), "{text}");
 }
+
+/// Issue 113: origin_status says what a kept branch is, so an agent relays it
+/// instead of skipping an unknown key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_kept_branches() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    // origin_status is one of the six collaboration tools withheld from
+    // tools/list while github.enabled is off (as in
+    // tool_descriptions_teach_review_mode).
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "origin_status")
+        .expect("origin_status tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(text.contains("kept_branches"), "{text}");
+}
