@@ -346,6 +346,11 @@ enum Command {
         /// never outlives Claude Desktop.
         #[arg(long, hide = true)]
         exit_when_idle: bool,
+        /// Set by the daemon spawn path, never by a person: Windows refused to
+        /// let this daemon leave the job of the program that started it, so it
+        /// runs inside that job. Reported by `crystalline doctor`.
+        #[arg(long, hide = true)]
+        breakaway_refused: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -1790,6 +1795,7 @@ fn main() -> anyhow::Result<()> {
             daemon,
             autostarted,
             exit_when_idle,
+            breakaway_refused,
             read_only,
             take_over,
             config,
@@ -1816,6 +1822,7 @@ fn main() -> anyhow::Result<()> {
                     read_only,
                     take_over,
                     exit_when_idle,
+                    breakaway_refused,
                 )
             }) {
                 Ok(()) => Ok(()),

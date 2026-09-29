@@ -90,6 +90,12 @@ pub struct LockInfo {
     /// starting daemon wait for it, and nothing ever signals it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standalone: Option<String>,
+    /// Where the owning daemon runs (working directory, and on Windows its job
+    /// and package identity), taken when it published this record: none of it
+    /// changes during a daemon's life. `None` on a record from a daemon older
+    /// than 0.21.1 and on one from a holder that never served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_in: Option<crate::runs_in::RunsIn>,
 }
 
 pub use crate::serving::{
@@ -244,6 +250,9 @@ impl Ownership {
             http: intent.map(|i| i.http.clone()).unwrap_or_default(),
             allowed_hosts: intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
             standalone: None,
+            // Only a process that went through `run_serve` has start facts;
+            // `hold-lock` records none, as it records no intent.
+            runs_in: intent.map(|_| crate::runs_in::RunsIn::here()),
         };
         self.write_record(&info)
     }
@@ -263,6 +272,7 @@ impl Ownership {
             http: HttpBinding::default(),
             allowed_hosts: Vec::new(),
             standalone: Some(command.to_string()),
+            runs_in: None,
         };
         self.write_record(&info)
     }
@@ -2192,6 +2202,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -2792,6 +2803,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2844,6 +2856,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -2916,6 +2929,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -3262,6 +3276,7 @@ mod tests {
             http: HttpBinding::Unrecorded,
             allowed_hosts: Vec::new(),
             standalone: None,
+            runs_in: None,
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -3401,6 +3416,7 @@ mod tests {
             http,
             allowed_hosts: vec![],
             standalone: None,
+            runs_in: None,
         }
     }
 

@@ -4683,6 +4683,50 @@ fn an_autostarted_daemon_reports_itself_as_autostarted() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// A daemon told on its command line that its spawner's breakaway was
+/// refused says so twice: in its report, and as a warning in its log. On
+/// Windows the spawner adds the flag; here it is given by hand, which checks
+/// the plumbing on every platform.
+#[test]
+fn a_daemon_told_its_breakaway_was_refused_says_so() {
+    let env = Env::new("refused");
+    env.setup_domain("eng");
+
+    let stderr_path = env.dir.join("serve.stderr");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut daemon = cmd
+        .args(["serve", "--daemon", "--breakaway-refused"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+
+    let status = status_json(&env);
+    assert_eq!(
+        status["runs_in"]["breakaway_refused"],
+        json!(true),
+        "{status}"
+    );
+    let record = env.lock_record().unwrap();
+    assert_eq!(
+        record["runs_in"]["breakaway_refused"],
+        json!(true),
+        "service.json carries it too: {record}"
+    );
+    let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        log.contains("could not leave the job of the program that started it"),
+        "the warning reaches the daemon's log: {log}"
+    );
+
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    let _ = daemon.wait();
+}
+
 /// The daemon route for the rows of a domain nobody registers any more: they
 /// are reported, and `--fix` collects them, through the daemon that owns the
 /// index. Nothing is stopped to do it - which is the whole difference between
