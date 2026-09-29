@@ -159,6 +159,9 @@ pub struct DomainDoctor {
     /// Files whose frontmatter holds a key more than once (`verify` rule
     /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
     pub duplicate_keys: Vec<DuplicateKeyFile>,
+    /// Second copies 0.20.0's overwrite left beside an engram. Both files
+    /// leave `unindexed`, since neither is merely unsynced.
+    pub stray_copies: Vec<StrayCopy>,
     /// MANIFEST policy keys - `generated_indexes`, `sharing` - whose declared
     /// value is not one the domain recognizes, each with the value it is read
     /// as. Empty when every declared policy parses and for a domain with no
@@ -220,6 +223,32 @@ pub struct DuplicateKeyFile {
     /// Why `--fix` leaves (or left) the file as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_fixed: Option<String>,
+}
+
+/// A second file 0.20.0's `write_engram(overwrite: true)` left beside the
+/// engram it meant to replace: the new text, at the slug path of the title,
+/// while the engram lived in a file with another name. Both answer to one
+/// permalink, so only one of them can be indexed.
+#[derive(Debug, Clone, Serialize)]
+pub struct StrayCopy {
+    /// The copy, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The engram's own file, which the overwrite meant to replace.
+    pub original: String,
+    /// The permalink both files answer to.
+    pub permalink: String,
+    /// Whether the two hold the same text apart from `generated`.
+    pub same_text: bool,
+    /// Whether the copy was written after the original.
+    pub newer: bool,
+    /// Whether `--fix` would settle it (delete an identical copy, or move the
+    /// newer text into the original and delete the copy).
+    pub fixable: bool,
+    /// Whether `--fix` settled it in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// What `--fix` says about a reviewing domain's file it will not rewrite.
@@ -880,6 +909,7 @@ impl DoctorReport {
             n += d.unsyncable.len();
             n += d.encoding_issues.len();
             n += d.duplicate_keys.iter().filter(|f| !f.fixed).count();
+            n += d.stray_copies.iter().filter(|s| !s.fixed).count();
         }
         if self.service.lock_stale && !self.service.lock_removed {
             n += 1;
@@ -1786,6 +1816,21 @@ async fn check_domain_checks(
         }
         d.duplicate_keys.push(report);
     }
+
+    // (m) 0.20.0's stray second copies. In every domain, team domains
+    // included: a fix is an ordinary local change the next share carries.
+    let mut stray_files: HashSet<String> = HashSet::new();
+    for pair in stray_pairs(&path) {
+        stray_files.insert(pair.stray.rel.clone());
+        stray_files.insert(pair.original.rel.clone());
+        d.stray_copies.push(settle_stray(
+            &path,
+            &pair,
+            entry.is_overlay(),
+            read_only,
+            fix,
+        ));
+    }
     let blocked: HashSet<String> = d
         .duplicate_keys
         .iter()
@@ -1842,6 +1887,10 @@ async fn check_domain_checks(
         // indexed at all until its frontmatter is fixed - split it out.
         let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
         unindexed.retain(|p| {
+            // Both files of a stray pair are their own finding, above.
+            if stray_files.contains(p) {
+                return false;
+            }
             // A repeated frontmatter key is its own finding, above.
             if blocked.contains(p) {
                 return false;
@@ -1935,6 +1984,174 @@ fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Resu
                 .to_string(),
         ),
     }
+}
+
+/// One file of a stray pair: where it is and what it holds.
+#[derive(Debug, Clone)]
+struct StrayFile {
+    rel: String,
+    source: String,
+}
+
+/// A stray copy and the engram's own file, answering to one permalink.
+#[derive(Debug, Clone)]
+struct StrayPair {
+    permalink: String,
+    stray: StrayFile,
+    original: StrayFile,
+}
+
+/// Every pair of parsed markdown files in one folder that answer to one
+/// permalink, where exactly one of the two is named after the permalink's
+/// last segment: that one is the copy 0.20.0's overwrite wrote at the slug
+/// path of the title, the other the engram's own file. Only the file name is
+/// compared, since the overwrite kept the folder as the disk spells it and
+/// the permalink slugifies it. Neither side's index state is assumed.
+fn stray_pairs(root: &Path) -> Vec<StrayPair> {
+    let mut by_key: BTreeMap<(String, String), Vec<StrayFile>> = BTreeMap::new();
+    for rel in markdown_rel_paths(root) {
+        let Ok(source) = std::fs::read_to_string(root.join(&rel)) else {
+            continue;
+        };
+        let Ok(engram) = crystalline_core::parse_engram(&source) else {
+            continue;
+        };
+        // The permalink the index gives the file.
+        let permalink = engram
+            .frontmatter
+            .permalink
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| crystalline_core::slugify(&rel));
+        let folder = rel
+            .rsplit_once('/')
+            .map(|(folder, _)| folder.to_string())
+            .unwrap_or_default();
+        by_key
+            .entry((folder, permalink))
+            .or_default()
+            .push(StrayFile { rel, source });
+    }
+    let mut pairs = Vec::new();
+    for ((_, permalink), files) in by_key {
+        let [a, b] = files.as_slice() else {
+            continue;
+        };
+        let last = permalink.rsplit('/').next().unwrap_or(&permalink);
+        let stray_name = format!("{last}.md");
+        let named = |file: &StrayFile| file.rel.rsplit('/').next() == Some(stray_name.as_str());
+        let (stray, original) = match (named(a), named(b)) {
+            (true, false) => (a.clone(), b.clone()),
+            (false, true) => (b.clone(), a.clone()),
+            _ => continue,
+        };
+        pairs.push(StrayPair {
+            permalink,
+            stray,
+            original,
+        });
+    }
+    pairs
+}
+
+/// Whether two engrams hold the same text apart from `generated`: the
+/// frontmatter compared as parsed, the body byte for byte.
+fn same_apart_from_generated(a: &str, b: &str) -> bool {
+    let (Ok(mut a), Ok(mut b)) = (
+        crystalline_core::parse_engram(a),
+        crystalline_core::parse_engram(b),
+    ) else {
+        return false;
+    };
+    a.frontmatter.generated = None;
+    b.frontmatter.generated = None;
+    a.frontmatter == b.frontmatter && a.body == b.body
+}
+
+/// When a file was written: its `generated.at`, else its `recorded_at`, else
+/// the file's modification time.
+fn written_at(file: &Path, source: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let engram = crystalline_core::parse_engram(source).ok();
+    let frontmatter = engram.as_ref().map(|e| &e.frontmatter);
+    if let Some(at) = frontmatter
+        .and_then(|f| f.generated.as_ref())
+        .and_then(|g| g.at)
+    {
+        return Some(at.with_timezone(&chrono::Utc));
+    }
+    if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
+        return day.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+    }
+    std::fs::metadata(file)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+}
+
+/// What doctor reports about one stray pair, and what `--fix` did about it,
+/// in the order the spec rules: a reviewing domain and a read-only instance
+/// are left, an identical copy is deleted, a newer copy's text moves into the
+/// original and the copy goes, and a copy the original changed after is left.
+fn settle_stray(
+    root: &Path,
+    pair: &StrayPair,
+    reviewing: bool,
+    read_only: bool,
+    fix: bool,
+) -> StrayCopy {
+    let stray_abs = root.join(&pair.stray.rel);
+    let original_abs = root.join(&pair.original.rel);
+    let same_text = same_apart_from_generated(&pair.stray.source, &pair.original.source);
+    let newer = match (
+        written_at(&stray_abs, &pair.stray.source),
+        written_at(&original_abs, &pair.original.source),
+    ) {
+        (Some(stray), Some(original)) => stray > original,
+        _ => false,
+    };
+    let mut report = StrayCopy {
+        path: pair.stray.rel.clone(),
+        original: pair.original.rel.clone(),
+        permalink: pair.permalink.clone(),
+        same_text,
+        newer,
+        fixable: false,
+        fixed: false,
+        note: None,
+    };
+    if reviewing {
+        report.note = Some(REVIEWED_NOTE.to_string());
+        return report;
+    }
+    if read_only {
+        report.note = Some(READ_ONLY_NOTE.to_string());
+        return report;
+    }
+    report.fixable = same_text || newer;
+    if !fix || !report.fixable {
+        return report;
+    }
+    if !same_text {
+        // The adopt: the copy's bytes over the original, through the hidden
+        // temp and the re-read that drops the fix when the original changed.
+        if let Err(note) = write_fix(&original_abs, &pair.original.source, &pair.stray.source) {
+            report.note = Some(note);
+            return report;
+        }
+    }
+    // The copy is read again right before it goes: while it is the indexed
+    // file, a write by title lands on it, and that text must not be lost.
+    // After an adopt the next run then finds the pair again and compares.
+    if std::fs::read_to_string(&stray_abs).ok().as_deref() != Some(pair.stray.source.as_str()) {
+        report.note = Some(CHANGED_NOTE.to_string());
+        return report;
+    }
+    match std::fs::remove_file(&stray_abs) {
+        Ok(()) => report.fixed = true,
+        // After an adopt the next run finds an identical pair and deletes it.
+        Err(e) => report.note = Some(format!("Deleting the copy failed: {e}")),
+    }
+    report
 }
 
 /// Every `.md` file under `root`, relative and forward-slashed, skipping
@@ -2923,6 +3140,44 @@ pub fn render_human(report: &DoctorReport) -> String {
                 };
             }
         }
+        for s in &d.stray_copies {
+            let head = format!(
+                "{} is a second copy of {}, left by an overwrite in 0.20.0.",
+                s.path, s.original
+            );
+            let _ = if s.fixed && s.same_text {
+                writeln!(
+                    out,
+                    "  fixed {}: deleted, it had the same text as {}",
+                    s.path, s.original
+                )
+            } else if s.fixed {
+                writeln!(
+                    out,
+                    "  fixed {}: took the newer text from {} and deleted the copy",
+                    s.original, s.path
+                )
+            } else if let Some(note) = &s.note {
+                writeln!(out, "  [problem] {head} {note}")
+            } else if s.same_text {
+                writeln!(
+                    out,
+                    "  [problem] {head} It has the same text, rerun with --fix to delete it"
+                )
+            } else if s.newer {
+                writeln!(
+                    out,
+                    "  [problem] {head} It has the newer text, rerun with --fix to move it into {} and delete the copy",
+                    s.original
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [problem] {head} {} changed after it: compare the two, keep the right text in {} and delete the copy",
+                    s.original, s.original
+                )
+            };
+        }
         // "ok" is a claim about everything, so a domain whose index checks
         // never ran does not get to make it.
         if d.manifest_present
@@ -2932,6 +3187,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
             && d.duplicate_keys.iter().all(|f| f.fixed)
+            && d.stray_copies.iter().all(|s| s.fixed)
             && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");
@@ -4511,5 +4767,438 @@ mod tests {
             "changed by someone else"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // --- 0.20.0's stray second copies ----------------------------------------
+
+    const O_PATH: &str = "conventions/Code Review Standards.md";
+    const S_PATH: &str = "conventions/code-review-standards.md";
+
+    /// The engram 0.20.0's overwrite meant to replace, and the copies of it.
+    fn review_standards(body: &str, generated_at: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: Code Review Standards\npermalink: conventions/code-review-standards\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ngenerated:\n  by: human:ada\n  at: {generated_at}\n---\n\n# Code Review Standards\n\n{body}\n"
+        )
+    }
+
+    const MANIFEST_KB: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n";
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let abs = root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, text).unwrap();
+    }
+
+    /// A file domain `kb` holding `files`, indexed with `first` alone when it
+    /// is named (so that file is the indexed one) and the rest written after,
+    /// then checked by doctor with `fix` and `read_only`.
+    async fn stray_doctor(
+        files: &[(&str, String)],
+        first: Option<&str>,
+        edit: impl FnOnce(&mut DomainEntry),
+        fix: bool,
+        read_only: bool,
+    ) -> (tempfile::TempDir, DomainDoctor) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        put(&root, "MANIFEST.md", MANIFEST_KB);
+        for (rel, text) in files.iter().filter(|(rel, _)| Some(*rel) == first) {
+            put(&root, rel, text);
+        }
+        let store = TursoStore::open_in_memory().await.unwrap();
+        sync_domain(&store, "kb", &root).await.unwrap();
+        for (rel, text) in files.iter().filter(|(rel, _)| Some(*rel) != first) {
+            put(&root, rel, text);
+        }
+        if first.is_none() {
+            sync_domain(&store, "kb", &root).await.unwrap();
+        }
+        let mut entry = DomainEntry::file(root);
+        edit(&mut entry);
+        let store_ref: &dyn Store = &store;
+        let d = check_domain_checks("kb", &entry, Some(store_ref), None, fix, read_only)
+            .await
+            .unwrap();
+        (dir, d)
+    }
+
+    fn pair(s: String, o: String) -> Vec<(&'static str, String)> {
+        vec![(S_PATH, s), (O_PATH, o)]
+    }
+
+    const OLDER: &str = "2026-09-01T10:00:00+00:00";
+    const NEWER: &str = "2026-09-20T10:00:00+00:00";
+
+    #[tokio::test]
+    async fn a_stray_copy_is_found_and_split_out_of_unindexed() {
+        let (_dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert_eq!(
+            (s.path.as_str(), s.original.as_str(), s.permalink.as_str()),
+            (S_PATH, O_PATH, "conventions/code-review-standards")
+        );
+        assert!(s.newer && !s.same_text && s.fixable && !s.fixed, "{s:?}");
+        assert!(
+            !d.unindexed.iter().any(|p| p == S_PATH || p == O_PATH),
+            "{:?}",
+            d.unindexed
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. It has the newer text, rerun with --fix to move it into conventions/Code Review Standards.md and delete the copy"),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["domains"][0]["stray_copies"].is_array(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_in_a_capitalized_folder_is_found() {
+        let text = |body: &str, at: &str| {
+            review_standards(body, at).replace(
+                "permalink: conventions/code-review-standards",
+                "permalink: team-notes/code-review-standards",
+            )
+        };
+        let (_dir, d) = stray_doctor(
+            &[
+                (
+                    "Team Notes/code-review-standards.md",
+                    text("The new rule.", NEWER),
+                ),
+                (
+                    "Team Notes/Code Review Standards.md",
+                    text("The old rule.", OLDER),
+                ),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        assert_eq!(
+            d.stray_copies[0].path,
+            "Team Notes/code-review-standards.md"
+        );
+        assert_eq!(
+            d.stray_copies[0].original,
+            "Team Notes/Code Review Standards.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_permalink_without_the_permalink_file_name_is_not_a_stray_copy() {
+        let (_dir, d) = stray_doctor(
+            &[
+                ("conventions/Review.md", review_standards("One.", NEWER)),
+                ("conventions/Standards.md", review_standards("Two.", OLDER)),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_is_found_when_it_is_the_indexed_one() {
+        let (_dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            Some(S_PATH),
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        assert_eq!(d.stray_copies[0].path, S_PATH);
+        assert!(
+            !d.unindexed.iter().any(|p| p == O_PATH),
+            "{:?}",
+            d.unindexed
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_deletes_an_identical_stray_copy() {
+        // Equal apart from `generated`.
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The rule.", NEWER),
+                review_standards("The rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(s.same_text && s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert!(!root.join(S_PATH).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            review_standards("The rule.", OLDER),
+            "the original is untouched"
+        );
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  fixed conventions/code-review-standards.md: deleted, it had the same text as conventions/Code Review Standards.md"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_moves_the_newer_text_into_the_original_and_deletes_the_copy() {
+        let newer = review_standards("The new rule.", NEWER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), review_standards("The old rule.", OLDER)),
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        assert!(!root.join(S_PATH).exists(), "the copy is gone");
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            newer,
+            "the file name stays, and so does the permalink"
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        assert!(
+            render_human(&report).contains("  fixed conventions/Code Review Standards.md: took the newer text from conventions/code-review-standards.md and deleted the copy"),
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_when_the_original_is_newer() {
+        // The original changed after the copy; and, Review Focus 5, a pair
+        // written at the same instant with different text is not "newer".
+        for (s_at, o_at) in [(OLDER, NEWER), (NEWER, NEWER)] {
+            let original = review_standards("The old rule, edited.", o_at);
+            let (dir, d) = stray_doctor(
+                &pair(review_standards("The new rule.", s_at), original.clone()),
+                None,
+                |_| {},
+                true,
+                false,
+            )
+            .await;
+            let s = &d.stray_copies[0];
+            assert!(!s.newer && !s.fixable && !s.fixed, "{s_at} {o_at}: {s:?}");
+            let root = dir.path().join("kb");
+            assert!(root.join(S_PATH).exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                original
+            );
+            let out = render_human(&DoctorReport {
+                domains: vec![d.clone()],
+                ..DoctorReport::default()
+            });
+            assert!(
+                out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. conventions/Code Review Standards.md changed after it: compare the two, keep the right text in conventions/Code Review Standards.md and delete the copy"),
+                "{out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_in_a_reviewing_domain() {
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |entry| entry.review = Some(crystalline_core::config::ReviewMode::Overlay),
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.fixed && !s.fixable, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(REVIEWED_NOTE));
+        assert!(dir.path().join("kb").join(S_PATH).exists());
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. This domain reviews changes, so --fix leaves it: fix it in the repository"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_on_a_read_only_instance() {
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            true,
+            true,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.fixed, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(READ_ONLY_NOTE));
+        assert!(dir.path().join("kb").join(S_PATH).exists());
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. This instance is read-only, so --fix leaves it"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_drops_the_adopt_when_the_original_changes_during_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        let original = review_standards("The old rule.", OLDER);
+        put(&root, O_PATH, &original);
+        put(&root, S_PATH, &review_standards("The new rule.", NEWER));
+        let pairs = stray_pairs(&root);
+        assert_eq!(pairs.len(), 1);
+        // Somebody writes the original between doctor's read and its fix.
+        let edited = review_standards("Edited meanwhile.", OLDER);
+        std::fs::write(root.join(O_PATH), &edited).unwrap();
+        let s = settle_stray(&root, &pairs[0], false, false, true);
+        assert!(!s.fixed, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE));
+        assert_eq!(std::fs::read_to_string(root.join(O_PATH)).unwrap(), edited);
+        assert!(root.join(S_PATH).exists(), "nothing deleted");
+        let out = render_human(&DoctorReport {
+            domains: vec![DomainDoctor {
+                path_exists: true,
+                manifest_present: true,
+                stray_copies: vec![s],
+                ..DomainDoctor::default()
+            }],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. {CHANGED_NOTE}"
+            )),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_runs_in_a_team_domain_and_leaves_local_changes() {
+        use crystalline_remote::changes::{LocalChange, detect_local_changes};
+        use crystalline_remote::state::BaseStamp;
+        let newer = review_standards("The new rule.", NEWER);
+        let older = review_standards("The old rule.", OLDER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), older.clone()),
+            None,
+            |entry| {
+                entry.origin = Some(OriginConfig {
+                    repo: "acme/kb".to_string(),
+                    path: None,
+                    branch: None,
+                    poll_secs: None,
+                })
+            },
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        let stamp = |text: &str| BaseStamp {
+            sha256: crate::receipt::sha256_hex(text.as_bytes()),
+            size: text.len() as u64,
+        };
+        let base: BTreeMap<String, BaseStamp> = [
+            ("MANIFEST.md".to_string(), stamp(MANIFEST_KB)),
+            (O_PATH.to_string(), stamp(&older)),
+            (S_PATH.to_string(), stamp(&newer)),
+        ]
+        .into_iter()
+        .collect();
+        let mut changes: Vec<String> = detect_local_changes(&root, &base)
+            .unwrap()
+            .changes
+            .iter()
+            .map(|change| match change {
+                LocalChange::Modified { path, .. } => format!("modified {path}"),
+                LocalChange::Deleted { path } => format!("deleted {path}"),
+                LocalChange::Added { path, .. } => format!("added {path}"),
+            })
+            .collect();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![format!("deleted {S_PATH}"), format!("modified {O_PATH}")],
+            "ordinary local changes for the next share"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_that_changes_during_the_run() {
+        // Both fixes: the identical delete and the adopt, where the copy is
+        // the file a write by title lands on while it is the indexed one.
+        for original_body in ["The rule.", "The old rule."] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("kb");
+            put(&root, O_PATH, &review_standards(original_body, OLDER));
+            put(&root, S_PATH, &review_standards("The rule.", NEWER));
+            let pairs = stray_pairs(&root);
+            assert_eq!(pairs.len(), 1);
+            // Somebody writes the copy between doctor's read and its delete.
+            let edited = review_standards("Written meanwhile.", NEWER);
+            std::fs::write(root.join(S_PATH), &edited).unwrap();
+            let s = settle_stray(&root, &pairs[0], false, false, true);
+            assert!(!s.fixed, "{original_body}: {s:?}");
+            assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE), "{original_body}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(S_PATH)).unwrap(),
+                edited,
+                "{original_body}: the new text survives"
+            );
+        }
     }
 }
