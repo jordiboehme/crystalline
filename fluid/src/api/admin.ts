@@ -450,6 +450,12 @@ export interface RenameReport {
   manifestWritten: boolean;
   /** Whether the MANIFEST write is a draft still waiting to be shared. */
   manifestDraft: boolean;
+  /**
+   * What the engine says a person still has to do, shown as given: a MANIFEST
+   * it could not change key by key, or a name another domain answered to.
+   * Null when there is nothing to say.
+   */
+  note: string | null;
   rewritten: RenameRewritten[];
   leftBehind: RenameLeftBehind[];
   /** Every former name this domain now answers to as well as its new one. */
@@ -514,6 +520,7 @@ export async function renameDomain(
     localOnly: report?.local_only === true,
     manifestWritten: report?.manifest_written === true,
     manifestDraft: report?.manifest_draft === true,
+    note: asString(report?.note),
     rewritten: asArray(report?.rewritten)
       .map(readRenameRewritten)
       .filter((row): row is RenameRewritten => row !== null),

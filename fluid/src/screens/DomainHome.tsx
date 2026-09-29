@@ -587,6 +587,7 @@ function DomainPage({
           {renamed.manifestDraft && (
             <p>The MANIFEST change waits for review.</p>
           )}
+          {renamed.note !== null && <p>{renamed.note}</p>}
           {renamed.rewritten.map((row) => (
             <p key={row.domain}>
               {`${row.domain}: ${plural(row.engrams, "engram", "engrams")} rewritten, ${plural(row.references, "reference", "references")}.`}

@@ -34,6 +34,7 @@ import {
   readMyGithubIdentity,
   readStackPlacement,
   refusalSentence,
+  renameDomain,
   resolveConflict,
   shareDomain,
   sharePlanKey,
@@ -1431,6 +1432,27 @@ describe("the admin client layer", () => {
         headers: { "Content-Type": "application/zip" },
       },
     );
+  });
+
+  it("reads a rename's note, and null when there is none", async () => {
+    const note =
+      "The MANIFEST's frontmatter is in a form Crystalline cannot change key by key (such as {title: ...}), so its domain_name was left as it is; set it to 'platform' by hand.";
+    apiMock.mockResolvedValueOnce({
+      domain: "platform",
+      previous: "eng",
+      local_only: false,
+      manifest_written: false,
+      manifest_draft: false,
+      note,
+      rewritten: [],
+      left_behind: [],
+      aliases: ["eng"],
+      shadows: [],
+    });
+    expect((await renameDomain("eng", "platform", false)).note).toBe(note);
+
+    apiMock.mockResolvedValueOnce({ domain: "platform", previous: "eng" });
+    expect((await renameDomain("eng", "platform", false)).note).toBeNull();
   });
 });
 describe("local changes", () => {
