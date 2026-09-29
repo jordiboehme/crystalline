@@ -6805,8 +6805,10 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         // one - a link outlives the draft it was for, and a join into a draft
         // that is gone is a join to nothing.
         ("engine.rs", "open_share_link"),
-        // The read a grant widens, at the one path the grant names.
-        ("engine.rs", "granted_read"),
+        // The read a grant widens, at the one draft the grant names, and the
+        // join refusal an unjoined edit or save of that same name gets. The
+        // owner is the grant row's.
+        ("engine.rs", "granted_answer"),
         // Which granted draft a name opens, for the two surfaces that have a
         // name rather than a path: the teaching refusal for a write that named
         // a draft the caller's own view cannot resolve, and the collab upgrade

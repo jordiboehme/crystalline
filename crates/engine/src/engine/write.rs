@@ -915,6 +915,10 @@ impl Engine {
         // this write at all and must not gate it.
         let join = join.filter(|_| view.joined().is_some());
         refuse_not_an_engram(&p.content)?;
+        if join.is_none() {
+            self.refuse_granted_name(&p.domain, &p.identifier, scope)
+                .await?;
+        }
         let (desc, source) = match view.resolve(&p.identifier).await {
             Ok(resolved) => resolved,
             // A name this caller's own view cannot resolve, when they are
@@ -1418,6 +1422,36 @@ impl Engine {
             .map(|(owner, _, permalink)| granted_needs_join(&owner, &permalink)))
     }
 
+    /// The join sentence for an unjoined edit or save whose name a read would
+    /// answer with a granted draft ([`Engine::granted_answer`]).
+    ///
+    /// Asked BEFORE the ordinary resolution, because the read asks the grant
+    /// first too: without it a title that reads as somebody's shared draft
+    /// would be written into the caller's own draft of the team's page with
+    /// that title, a write somewhere other than the page they were just shown.
+    /// Nothing is asked for a caller with no account, and nothing is written.
+    pub(super) async fn refuse_granted_name(
+        &self,
+        domain: &str,
+        identifier: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if crate::scope::overlay_actor(scope).is_none() {
+            return Ok(());
+        }
+        let hidden = self.hidden_for(scope).await?;
+        match self
+            .granted_answer(domain, identifier, scope, &hidden)
+            .await?
+        {
+            Some((owner, draft)) => Err(EngineError::Refused(granted_needs_join(
+                &owner,
+                &draft.permalink,
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Present a share-link and open a join on the draft it names.
     ///
     /// **The agent's door into somebody else's draft, and it is the same door
@@ -1603,9 +1637,13 @@ impl Engine {
             .overlay_grants_held(&account, domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
-        let bare = CrystallineUrl::parse(identifier)
-            .map(|url| url.permalink)
-            .unwrap_or_else(|| identifier.to_string());
+        // An absolute address naming another domain is not this domain's to
+        // answer, exactly as the resolver refuses it.
+        let bare = match CrystallineUrl::parse(identifier) {
+            Some(url) if url.domain != domain => return Ok(None),
+            Some(url) => url.permalink,
+            None => identifier.to_string(),
+        };
         let mut answers: Vec<(GrantMatch, String, String, String)> = Vec::new();
         for (path, held_owner) in held {
             if held_owner == account || owner.is_some_and(|want| want != held_owner) {

@@ -249,7 +249,7 @@ async fn whose_document(
             granted: None,
         });
     };
-    let Some((owner, path, _)) = state
+    let Some((owner, path, draft_permalink)) = state
         .engine
         .granted_draft_named(domain, permalink, Some(owner), &scope)
         .await?
@@ -274,7 +274,8 @@ async fn whose_document(
     {
         return Err(
             crate::engine::EngineError::Refused(crate::engine::granted_needs_join(
-                &owner, permalink,
+                &owner,
+                &draft_permalink,
             ))
             .into(),
         );

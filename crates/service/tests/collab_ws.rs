@@ -1105,6 +1105,22 @@ async fn the_join_refusal_names_the_permalink_on_the_room_socket() {
         detail.starts_with("'fresh' is alice's draft, shared with you to read"),
         "{detail}"
     );
+
+    // Asked by the draft's title, the refusal still names its permalink.
+    let err = connect(
+        fx.addr,
+        "/api/v1/collab/team/Fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap_err();
+    let body: serde_json::Value = serde_json::from_str(&refusal_detail(&err)).unwrap();
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with("'fresh' is alice's draft, shared with you to read"),
+        "{detail}"
+    );
 }
 
 /// Taking the link back puts the grantee outside the room on the next saver
@@ -1476,9 +1492,8 @@ async fn a_rooms_save_at_another_path_is_refused_and_the_room_stays_open() {
     };
     assert!(
         detail.contains("alice's draft of 'Plan'") && detail.contains("'plan.md'"),
-        "the refusal names the draft this room is, by the permalink the room is keyed by \
-         (which his retarget moved to 'Plan'), and the path the write would have gone to: \
-         {detail}"
+        "the refusal names the draft this room is, by the draft's permalink, which his \
+         retarget set to 'Plan', and the path the write would have gone to: {detail}"
     );
 
     assert!(

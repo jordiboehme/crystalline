@@ -996,12 +996,8 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(None);
         };
-        // An absolute identifier naming another domain is not this domain's to
-        // answer, exactly as `resolve_in` refuses it.
-        let wanted = match CrystallineUrl::parse(identifier) {
-            Some(url) if url.domain != domain => return Ok(None),
-            Some(url) => url.permalink,
-            None => identifier.to_string(),
+        let Some(wanted) = self.own_name(identifier) else {
+            return Ok(None);
         };
         let (domain_id, source) = self.engine.domain_source(domain).await?;
         let entries = {
@@ -1009,38 +1005,55 @@ impl<'a> DomainView<'a> {
             let store = store.lock().await;
             store.overlay_entries(domain_id, actor).await?
         };
-        for entry in entries {
-            if entry.tombstone {
-                continue;
-            }
-            let Ok(engram) = parse_engram(&entry.content) else {
-                continue;
-            };
-            let record =
-                EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
-            let names = [
-                entry.permalink.as_str(),
-                record.title.as_str(),
-                entry.path.as_str(),
-            ];
-            if !names.iter().any(|name| *name == wanted) {
-                continue;
-            }
-            return Ok(Some((
-                EngramDescriptor {
-                    id: entry.id,
-                    domain_id,
-                    domain: domain.to_string(),
-                    path: entry.path,
-                    permalink: entry.permalink,
-                    title: record.title,
-                    engram_type: record.engram_type,
-                    status: record.status,
-                },
-                source,
-            )));
+        let Some((entry, record)) = own_entry_named(entries, &wanted) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            EngramDescriptor {
+                id: entry.id,
+                domain_id,
+                domain: domain.to_string(),
+                path: entry.path,
+                permalink: entry.permalink,
+                title: record.title,
+                engram_type: record.engram_type,
+                status: record.status,
+            },
+            source,
+        )))
+    }
+
+    /// Whether this actor's own drafts answer `identifier`, matched exactly as
+    /// [`DomainView::resolve_draft`] matches it, without registering anything:
+    /// the read-only question a granted read asks before it widens.
+    pub(crate) async fn holds_own_draft_named(
+        &self,
+        domain_id: DomainId,
+        identifier: &str,
+    ) -> Result<bool> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(false);
+        };
+        let Some(wanted) = self.own_name(identifier) else {
+            return Ok(false);
+        };
+        let entries = {
+            let store = self.engine.store();
+            let store = store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        Ok(own_entry_named(entries, &wanted).is_some())
+    }
+
+    /// The name an identifier asks this domain for, or `None` when it is an
+    /// absolute address naming another domain, which is not this domain's to
+    /// answer, exactly as `resolve_in` refuses it.
+    fn own_name(&self, identifier: &str) -> Option<String> {
+        match CrystallineUrl::parse(identifier) {
+            Some(url) if url.domain != self.domain => None,
+            Some(url) => Some(url.permalink),
+            None => Some(identifier.to_string()),
         }
-        Ok(None)
     }
 
     /// The seeds of a graph traversal, in one reader's own view of the domain.
@@ -2464,6 +2477,31 @@ fn name_among(names: &[String], segment: &str) -> String {
         (Some(one), None) => one.clone(),
         _ => segment.to_string(),
     }
+}
+
+/// The first live entry in `entries` that answers `wanted`: by permalink, by
+/// title or by path, all exact, which is the same ladder the base lookup
+/// offers. Tombstones are skipped: a deletion is not an engram to find. The
+/// one match [`DomainView::resolve_draft`] and
+/// [`DomainView::holds_own_draft_named`] share, so the two cannot drift.
+fn own_entry_named(
+    entries: Vec<StoredEngram>,
+    wanted: &str,
+) -> Option<(StoredEngram, EngramRecord)> {
+    entries.into_iter().find_map(|entry| {
+        if entry.tombstone {
+            return None;
+        }
+        let engram = parse_engram(&entry.content).ok()?;
+        let record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
+        let answers = [
+            entry.permalink.as_str(),
+            record.title.as_str(),
+            entry.path.as_str(),
+        ]
+        .contains(&wanted);
+        answers.then_some((entry, record))
+    })
 }
 
 #[cfg(test)]

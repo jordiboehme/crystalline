@@ -64,8 +64,9 @@ impl Engine {
     /// its permalink and to its title, the title compared case-insensitively
     /// like the resolver's title step, and never to its file path. A
     /// permalink match beats a title match; among equals the path that sorts
-    /// first byte-wise wins. A title the reader's own drafts answer stays
-    /// theirs.
+    /// first byte-wise wins. A title match yields to whatever in the reader's
+    /// own view has that name as its permalink, and to their own drafts, the
+    /// resolver's order ([`Engine::granted_answer`]).
     ///
     /// **And nowhere else.** The widening is this function and this function
     /// only: search, listing, the reference candidate set and every other read
@@ -109,12 +110,9 @@ impl Engine {
         scope: &crate::scope::Scope,
         hidden: &HashSet<String>,
     ) -> Result<Option<Value>> {
-        let Some(account) = crate::scope::overlay_actor(scope) else {
+        if crate::scope::overlay_actor(scope).is_none() {
             return Ok(None);
-        };
-        let Some(access) = self.domain_access.get() else {
-            return Ok(None);
-        };
+        }
         // Which domain the identifier is asking about. An absolute address
         // names its own; otherwise the caller's `domain` does, and a read with
         // neither is not a read this can answer - a grant names one domain,
@@ -125,6 +123,49 @@ impl Engine {
                 Some(named) => named.to_string(),
                 None => return Ok(None),
             },
+        };
+        match self
+            .granted_answer(&domain, &p.identifier, scope, hidden)
+            .await?
+        {
+            Some((owner, draft)) => Ok(Some(granted_draft_json(&domain, &owner, &draft)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The granted draft, and whose, that a read of `identifier` in `domain`
+    /// answers with, or `None` for the ordinary answer.
+    ///
+    /// **One rule for reads and edits**: [`Engine::granted_read`] answers
+    /// with it, and an unjoined edit or save of the same name is refused with
+    /// the join sentence when it answers, so an agent is never shown a draft
+    /// under a name its next write would put somewhere else.
+    ///
+    /// Matched the way the resolver matches, in the resolver's order: a grant
+    /// whose permalink is the name wins; a grant whose title is the name
+    /// applies only when nothing in the reader's own view has that name as
+    /// its permalink (the team's page, unless they deleted it, or a draft of
+    /// their own) and none of their own drafts answers it the way
+    /// [`DomainView::resolve_draft`] would. A base page that shares only the
+    /// TITLE never beats the grant. An absolute address naming another domain
+    /// matches nothing here.
+    pub(super) async fn granted_answer(
+        &self,
+        domain: &str,
+        identifier: &str,
+        scope: &crate::scope::Scope,
+        hidden: &HashSet<String>,
+    ) -> Result<Option<(String, GrantedDraft)>> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(None);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        let bare = match CrystallineUrl::parse(identifier) {
+            Some(url) if url.domain != domain => return Ok(None),
+            Some(url) => url.permalink,
+            None => identifier.to_string(),
         };
         // **The registered-set screen, the same one every other read makes.**
         // A grant is the author's word about one draft and never about a
@@ -138,28 +179,16 @@ impl Engine {
         // rather than raised: the ordinary read path below is what answers a
         // caller who named a domain they may not see, and it already answers
         // it without saying the domain exists.
-        if self.domain_entry_scoped(&domain, hidden).is_err() {
+        if self.domain_entry_scoped(domain, hidden).is_err() {
             return Ok(None);
         }
         let held = access
-            .overlay_grants_held(&account, &domain)
+            .overlay_grants_held(&account, domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         if held.is_empty() {
             return Ok(None);
         }
-        let bare = CrystallineUrl::parse(&p.identifier)
-            .map(|url| url.permalink)
-            .unwrap_or_else(|| p.identifier.clone());
-        // This reader's own view of the domain, for the one question below
-        // that is about THEM rather than about the grant. The read-only id
-        // lookup, never an upserting one: asking about a domain this index has
-        // never seen must not register it.
-        let own = DomainView::for_read(self, &domain, hidden, scope)?;
-        let domain_id = {
-            let store = self.store.lock().await;
-            store.domain_id(&domain).await?
-        };
         // Every live grant that answers the name, and how.
         let mut answers: Vec<(GrantMatch, String, String, GrantedDraft)> = Vec::new();
         for (path, owner) in held {
@@ -168,16 +197,31 @@ impl Engine {
             }
             // The freshness check every other grant surface makes: a link
             // whose draft has gone opens nothing, so it widens nothing.
-            let Some(draft) = self.overlay_draft_at(&domain, &owner, &path).await? else {
+            let Some(draft) = self.overlay_draft_at(domain, &owner, &path).await? else {
                 continue;
             };
             if let Some(how) = grant_match(&draft, &bare) {
                 answers.push((how, path, owner, draft));
             }
         }
+        if answers.is_empty() {
+            return Ok(None);
+        }
         // A permalink match first; among equals the path that sorts first
         // byte-wise, the tie-break `find_engram` uses.
         answers.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        // This reader's own view of the domain, for the questions below that
+        // are about THEM rather than about the grant. The read-only id
+        // lookup, never an upserting one: asking about a domain this index has
+        // never seen must not register it.
+        let own = DomainView::for_read(self, domain, hidden, scope)?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        // Whether the reader's own view answers the name ahead of a title
+        // match, asked once and only when a title match needs it.
+        let mut view_answers: Option<bool> = None;
         for (how, path, owner, draft) in answers {
             // **The reader's own row at that path wins.** A link handed to
             // somebody is not a reason to hide their own unfolded work from
@@ -192,27 +236,23 @@ impl Engine {
             {
                 continue;
             }
-            // A title the reader's own drafts answer is theirs: their own
-            // work first, then what a grant widens. Read without registering
-            // anything, like the id lookup above.
             if how == GrantMatch::Title
-                && let (Some(domain_id), Some(actor)) = (domain_id, own.actor())
+                && let Some(domain_id) = domain_id
             {
-                let entries = {
-                    let store = self.store.lock().await;
-                    store.overlay_entries(domain_id, actor).await?
+                let answered = match view_answers {
+                    Some(answered) => answered,
+                    None => {
+                        let answered = own.permalink_holder(domain_id, &bare).await?.is_some()
+                            || own.holds_own_draft_named(domain_id, &bare).await?;
+                        view_answers = Some(answered);
+                        answered
+                    }
                 };
-                let wanted = bare.to_lowercase();
-                let theirs = entries
-                    .iter()
-                    .filter(|entry| !entry.tombstone)
-                    .filter_map(|entry| parse_engram(&entry.content).ok())
-                    .any(|engram| engram.frontmatter.title.to_lowercase() == wanted);
-                if theirs {
+                if answered {
                     continue;
                 }
             }
-            return Ok(Some(granted_draft_json(&domain, &owner, &draft)?));
+            return Ok(Some((owner, draft)));
         }
         Ok(None)
     }
