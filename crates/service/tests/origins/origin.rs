@@ -5351,6 +5351,65 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
     assert_eq!(quiet, crystalline_service::ConvergenceReport::default());
 }
 
+/// A convergence pass that stops on an error still announces the drafts it
+/// already ended: the batch guard is pushed each drop right after it lands, so
+/// a later entry failing does not swallow the event for an earlier one. The
+/// second draft's base copy is a directory, which no read turns into bytes.
+#[tokio::test]
+async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", DRAFT_PLAN.as_bytes().to_vec()),
+        ],
+    )
+    .await;
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    draft(&eng, "owner", "notes/zz.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH);
+    let base = base_copy_of(&tmp.path().join("origins"), "notes/plan.md")
+        .expect("the first pull wrote the base snapshot");
+    std::fs::create_dir_all(base.join("notes/zz.md")).unwrap();
+
+    let mut rx = eng.changes().subscribe();
+    eng.converge_overlays("team")
+        .await
+        .expect_err("the second draft's base copy cannot be read");
+    let mut dropped = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        if let crystalline_service::changes::Change::Engram(change) = envelope.change {
+            dropped.push((change.path, change.draft_of));
+        }
+    }
+    assert_eq!(
+        dropped,
+        vec![("notes/plan.md".to_string(), Some("owner".to_string()))],
+        "the draft the pass ended before it stopped is announced"
+    );
+}
+
+/// The `base` folder under `origins` that holds a snapshot copy of `rel`.
+fn base_copy_of(origins: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let mut dirs = vec![origins.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let base = dir.join("base");
+        if base.join(rel).is_file() {
+            return Some(base);
+        }
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    None
+}
+
 /// A conflict the pull left in the reviewed folder is still settled against the
 /// folder, even while the domain reviews changes.
 ///

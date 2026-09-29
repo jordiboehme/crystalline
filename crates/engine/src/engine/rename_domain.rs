@@ -869,6 +869,15 @@ impl Engine {
         // spellings as aliases; references the index row step unbound (the
         // new name was another domain's spelling) bind again. Before the
         // journal goes: a crash here is finished by redoing just this.
+        //
+        // The new name is held under the old name's audience until the old
+        // name's frame is out. A push that rebinds links announces every
+        // registered domain, the new name among them, with no audience of
+        // its own; a session whose cache predates the rename does not list
+        // the new name as hidden, so without the hold an outsider could hear
+        // a private domain's new name before the old frame marks its cache
+        // stale.
+        let new_held = self.capture_audience(&new, old_audience.clone());
         self.mark_names_stale();
         self.refresh_names().await;
         self.resolve_pending_everywhere().await;
@@ -891,6 +900,9 @@ impl Engine {
         // against the snapshot, the new one's against each session's own
         // check, since its records were re-keyed rather than destroyed.
         self.announce_domain(&old, None, Some(old_audience));
+        // Released before the new name's own frame, which keeps the ordinary
+        // per-session check: the old frame has marked every cache stale.
+        drop(new_held);
         self.announce_domain(&new, None, None);
 
         let entry = self.domain_entry(&new)?;

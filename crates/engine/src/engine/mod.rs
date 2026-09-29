@@ -938,6 +938,10 @@ pub struct Engine {
     // index's spellings. See `Engine::spelling_replaces_issued`.
     #[cfg(any(test, feature = "testing"))]
     spelling_replaces: std::sync::atomic::AtomicU64,
+    // The test seam for the spelling push's faults. See
+    // `Engine::set_spelling_push_fault`.
+    #[cfg(any(test, feature = "testing"))]
+    spelling_push_fault: std::sync::Mutex<Option<names::SpellingPushFault>>,
     // The test seam for the name adoption: how many times it ran. See
     // `Engine::adoptions_run`.
     #[cfg(any(test, feature = "testing"))]
@@ -1279,6 +1283,8 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+#[cfg(any(test, feature = "testing"))]
+pub use names::SpellingPushFault;
 
 /// What a write is told when it reaches a domain that reviews changes before
 /// they land and nobody can say whose draft it would join.
@@ -1748,6 +1754,8 @@ impl Engine {
             virtual_domain_names: std::sync::RwLock::new(BTreeMap::new()),
             #[cfg(any(test, feature = "testing"))]
             spelling_replaces: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            spelling_push_fault: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),

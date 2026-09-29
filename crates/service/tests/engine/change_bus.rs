@@ -1072,6 +1072,45 @@ async fn a_virtual_domains_scaffold_import_and_manifest_save_announce() {
     assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Modified);
 }
 
+/// A virtual import's guard is pushed a row only after that row is written:
+/// the entries the batch refused (a skip, an invalid file) are announced
+/// nowhere, and every row that landed is announced once, after the batch.
+#[tokio::test]
+async fn a_virtual_import_announces_only_the_rows_it_wrote() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    engine.domain_add_virtual("vault").await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .import_domain_files(
+            "vault",
+            &[
+                ("one.md".to_string(), engram("One", "one", "imported")),
+                ("broken.md".to_string(), "no frontmatter at all".to_string()),
+                (
+                    "again.md".to_string(),
+                    engram("Again", "one", "same permalink"),
+                ),
+                ("two.md".to_string(), engram("Two", "two", "imported")),
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let mut heard: Vec<(ChangeKind, String)> = drain(&mut rx)
+        .iter()
+        .map(|c| (engram_of(c).kind, engram_of(c).path.clone()))
+        .collect();
+    heard.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        heard,
+        vec![
+            (ChangeKind::Added, "one.md".to_string()),
+            (ChangeKind::Added, "two.md".to_string()),
+        ]
+    );
+}
+
 /// Dropping a draft that stands over nothing (`clear_row`) announces a
 /// draft-scoped `deleted` under the row's own permalink.
 #[tokio::test]
@@ -1189,6 +1228,50 @@ async fn leaving_review_mode_announces_each_dropped_draft_under_its_own_permalin
     );
 }
 
+/// Leaving review mode with more drafts than the collapse threshold is one
+/// `domain` event: the batch guard keeps the view collecting after each drop
+/// it takes (`push_drops_from`), so the drops reach the collapse rule as one
+/// batch rather than one event each.
+#[tokio::test]
+async fn leaving_review_mode_past_the_collapse_threshold_announces_the_domain_once() {
+    let (_tmp, engine, _scratch) = engine_fixture(true).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    let many = crystalline_service::changes::COLLAPSE_THRESHOLD + 1;
+    for n in 0..many {
+        engine
+            .write_engram_as(&write_params(&format!("Draft {n}"), false), None, &ada)
+            .await
+            .unwrap();
+    }
+    let mut rx = engine.changes().subscribe();
+    engine
+        .set_review_mode(
+            "notes",
+            None,
+            crystalline_service::ReviewModeConfirm::Confirmed {
+                folds: vec![("ada".to_string(), crystalline_service::FoldChoice::Discard)],
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    let dropped = heard
+        .iter()
+        .filter(|c| matches!(c, Change::Engram(e) if e.draft_of.as_deref() == Some("ada")))
+        .count();
+    assert_eq!(dropped, 0, "no drop is announced on its own: {heard:?}");
+    assert!(
+        heard.iter().any(
+            |c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "notes")
+        ),
+        "{heard:?}"
+    );
+}
+
 /// The same rule on a virtual domain, whose write reads the row rather than
 /// a file to tell a creation from a replacement.
 #[tokio::test]
@@ -1285,6 +1368,59 @@ async fn a_domain_name_change_announces_the_linking_domain_body(store: Arc<Mutex
 both_backends!(
     a_domain_name_change_announces_the_linking_domain,
     a_domain_name_change_announces_the_linking_domain_body
+);
+
+/// A push that fails after its replace committed has still changed what links
+/// mean, so the linking domain is announced all the same. The seam fails the
+/// push right after the replace.
+async fn a_push_that_fails_after_its_replace_still_announces_body(store: Arc<Mutex<dyn Store>>) {
+    let (tmp, engine, _scratch) = engine_fixture_on(store, false).await;
+    seed(
+        &tmp.path().join("notes"),
+        "guide.md",
+        &engram("Guide", "guide", "See [[platform:runbook]] first."),
+    );
+    seed(
+        &tmp.path().join("oak"),
+        "runbook.md",
+        &engram("Runbook", "runbook", "Restart it."),
+    );
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    seed(
+        &tmp.path().join("oak"),
+        "MANIFEST.md",
+        &manifest("oak").replacen(
+            "status: stable\n",
+            "status: stable\ndomain_name: platform\n",
+            1,
+        ),
+    );
+    engine.set_spelling_push_fault(Some(
+        crystalline_service::engine::SpellingPushFault::FailAfterReplace,
+    ));
+    let replaces = engine.spelling_replaces_issued();
+    engine
+        .sync_paths("oak", vec!["MANIFEST.md".to_string()])
+        .await
+        .unwrap();
+    engine.refresh_names().await;
+    engine.set_spelling_push_fault(None);
+    assert!(
+        engine.spelling_replaces_issued() > replaces,
+        "the premise: the push reached its replace"
+    );
+    let heard = drain(&mut rx);
+    assert!(
+        heard.iter().any(
+            |c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "notes")
+        ),
+        "{heard:?}"
+    );
+}
+both_backends!(
+    a_push_that_fails_after_its_replace_still_announces,
+    a_push_that_fails_after_its_replace_still_announces_body
 );
 
 /// Item 12: a retag that writes two engrams and then fails on the MANIFEST's

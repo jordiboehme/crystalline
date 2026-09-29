@@ -18,6 +18,19 @@ use crate::params::DomainArgs;
 /// The path of a domain's MANIFEST, relative to its root.
 const MANIFEST_PATH: &str = "MANIFEST.md";
 
+/// A fault the spelling push takes, armed with
+/// [`Engine::set_spelling_push_fault`]. Test-only.
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpellingPushFault {
+    /// [`Engine::refresh_names`] takes an unchanged push as a changed one and
+    /// announces every registered domain, as a push that rebound links does.
+    ReportChanged,
+    /// The push fails right after its replace committed the new spellings.
+    FailAfterReplace,
+}
+
 impl Engine {
     /// The current name table, rebuilt when stale. Never touches the store
     /// once the virtual names are loaded.
@@ -70,6 +83,11 @@ impl Engine {
         let pushed = {
             let store = self.store.lock().await;
             self.push_spellings(&*store, &pairs).await
+        };
+        #[cfg(any(test, feature = "testing"))]
+        let pushed = match (pushed, self.spelling_push_fault()) {
+            (Ok(false), Some(SpellingPushFault::ReportChanged)) => Ok(true),
+            (pushed, _) => pushed,
         };
         match pushed {
             // The push reset and rebound references in every domain and names
@@ -504,12 +522,50 @@ impl Engine {
             return Ok(false);
         }
         tracing::debug!(spellings = ?changed, "domain name spellings changed meaning");
-        store.reset_references_to_spellings(&changed).await?;
+        // The new spellings are committed from here on, so what a link means
+        // has changed whatever happens next: a failure below is logged and
+        // the push still answers true, and the caller announces every domain.
+        if let Err(e) = self.rebind_changed_spellings(store, &changed).await {
+            tracing::warn!(
+                "the domain name spellings changed, but binding the links that spell them \
+                 again failed ({e}); the next sync or name change binds them"
+            );
+        }
+        Ok(true)
+    }
 
+    /// The half of the spelling push after the new spellings are committed:
+    /// unbind every reference spelled with a changed name and bind every
+    /// pending one again.
+    async fn rebind_changed_spellings(
+        &self,
+        store: &dyn Store,
+        changed: &[String],
+    ) -> crystalline_index::Result<()> {
+        #[cfg(any(test, feature = "testing"))]
+        if self.spelling_push_fault() == Some(SpellingPushFault::FailAfterReplace) {
+            return Err(crystalline_index::IndexError::Db(
+                "the test seam failed the spelling push after its replace".to_string(),
+            ));
+        }
+        store.reset_references_to_spellings(changed).await?;
         // The reset unbound references in every domain that spelled one of
         // the changed names, whoever registers it, so every row gets a pass.
-        resolve_pending_in_every_domain(store).await?;
-        Ok(true)
+        resolve_pending_in_every_domain(store).await
+    }
+
+    /// Arm (or, with `None`, disarm) a fault in the spelling push, for the
+    /// tests that pin what a push announces. Nothing in the daemon, the CLI or
+    /// the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn set_spelling_push_fault(&self, fault: Option<SpellingPushFault>) {
+        *self.spelling_push_fault.lock().unwrap() = fault;
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    fn spelling_push_fault(&self) -> Option<SpellingPushFault> {
+        *self.spelling_push_fault.lock().unwrap()
     }
 
     /// Bind every pending reference in every domain the index knows, for a

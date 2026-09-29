@@ -413,6 +413,62 @@ async fn a_private_domains_rename_and_removal_are_silent_to_an_outsider_and_hear
     );
 }
 
+/// The order hazard in a rename's last steps: the spelling push that follows
+/// the config step may announce every registered domain, the new name among
+/// them, before the old name's captured frame has marked any cache stale. An
+/// outsider whose cache was built while the name was still `lab` does not list
+/// `vault` as hidden, so the new name is held under the old name's audience
+/// until the old frame is out. The seam makes the push report a change, which
+/// in the paths traced today it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_whose_push_announces_every_domain_leaks_no_new_name_to_an_outsider() {
+    let fx = serve(false, false).await;
+    fx.auth
+        .set_domain_visibility("lab", true, "root")
+        .await
+        .unwrap();
+    let ada = login(fx.addr, "ada", "adapw").await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    let mut outsider = open(fx.addr, Some(&ada), None).await;
+    let mut member = open(fx.addr, Some(&root), None).await;
+    fx.engine.set_spelling_push_fault(Some(
+        crystalline_service::engine::SpellingPushFault::ReportChanged,
+    ));
+    fx.engine
+        .rename_domain(
+            "lab",
+            "vault",
+            true,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    fx.engine.set_spelling_push_fault(None);
+    let heard = read_until(&mut outsider, Duration::from_secs(2), |_| false).await;
+    let names: Vec<String> = heard
+        .iter()
+        .filter_map(|f| {
+            serde_json::from_str::<serde_json::Value>(&f.data).ok()?["domain"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "lab" || name == "vault"),
+        "the outsider hears neither the old nor the new name: {heard:?}"
+    );
+    let heard = read_until(&mut member, Duration::from_secs(3), |frames| {
+        let names = domains_of(frames);
+        names.iter().any(|name| name == "lab") && names.iter().any(|name| name == "vault")
+    })
+    .await;
+    let names = domains_of(&heard);
+    assert!(
+        names.contains(&"lab".to_string()) && names.contains(&"vault".to_string()),
+        "a member hears the rename: {heard:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_members_revoked_access_is_captured_before_a_rename_so_they_do_not_hear_it() {
     // Ruled 2026-09-27: the audience is what the engine
