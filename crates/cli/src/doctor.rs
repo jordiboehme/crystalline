@@ -1910,16 +1910,11 @@ fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
 }
 
 /// The temporary file [`write_fix`] writes first: a hidden sibling
-/// (`.<name>.doctor-fix.<pid>`), so neither a sync nor remote change
+/// (`.<name>.doctor-fix.<pid>.<seq>`), so neither a sync nor remote change
 /// detection, which walk every file that is not hidden, ever picks up one a
 /// crash left behind.
 fn fix_temp_path(file: &Path) -> std::path::PathBuf {
-    let mut name = std::ffi::OsString::from(".");
-    if let Some(own) = file.file_name() {
-        name.push(own);
-    }
-    name.push(format!(".doctor-fix.{}", std::process::id()));
-    file.with_file_name(name)
+    crystalline_core::path::hidden_temp_path(file, "doctor-fix")
 }
 
 /// What `--fix` would write for a file with repeated keys, or why it leaves
@@ -4466,7 +4461,10 @@ mod tests {
         let tmp = fix_temp_path(Path::new("/kb/a/dup.md"));
         assert_eq!(tmp.parent(), Some(Path::new("/kb/a")));
         let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(name, format!(".dup.md.doctor-fix.{}", std::process::id()));
+        assert!(
+            name.starts_with(&format!(".dup.md.doctor-fix.{}.", std::process::id())),
+            "{name}"
+        );
     }
 
     /// The fixed file keeps the original's permissions.

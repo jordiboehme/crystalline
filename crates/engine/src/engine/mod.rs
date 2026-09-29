@@ -5706,10 +5706,6 @@ fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, contents.as_bytes())
 }
 
-/// Distinguishes one write's temp file from another's within this process. See
-/// [`write_bytes`].
-static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
@@ -5718,22 +5714,11 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
         })?;
     }
     // Write to a sibling temp then rename so the watcher never sees a partial
-    // file. The name carries a process-lifetime counter as well as the pid:
-    // the pid alone gives every writer in this process the same temp path, so
-    // two writes to one file racing inside one daemon would interleave their
-    // bytes there and rename the blend into place. Per-file locking keeps the
-    // guarded verbs off each other, but the counter is what makes the temp
-    // file private to a single write whichever path produced it.
-    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // The suffix is appended to the whole filename rather than replacing its
-    // extension, so an attachment's temp file keeps naming the file it belongs
-    // to (`shot.png.tmp.<pid>.<seq>`) instead of claiming an extension it never
-    // had. For a `.md` engram the two spellings produce the same name.
-    let name = abs
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let tmp = abs.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+    // file. The name is hidden, so a crash between the write and the rename
+    // leaves nothing a sync or a share picks up, and its counter keeps two
+    // writes to one file inside one process apart: the pid alone would give
+    // both the same temp path and they would interleave their bytes there.
+    let tmp = crystalline_core::path::hidden_temp_path(abs, "tmp");
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,

@@ -652,6 +652,22 @@ mod tests {
         detect_local_changes_with(dir, base, GeneratedIndexes::Shared).unwrap()
     }
 
+    /// A write the daemon was killed in the middle of leaves its temp file
+    /// behind; it is hidden, so no share ever proposes it.
+    #[test]
+    fn a_hidden_temp_file_left_by_a_crash_is_not_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "notes/a.md", b"alpha");
+        write(dir.path(), "assets/shot.png", b"png");
+        let base = base_of(&[("notes/a.md", b"alpha"), ("assets/shot.png", b"png")]);
+        for target in ["notes/a.md", "assets/shot.png", "index.md"] {
+            let tmp = crystalline_core::path::hidden_temp_path(&dir.path().join(target), "tmp");
+            std::fs::write(&tmp, b"half written").unwrap();
+        }
+        let result = local(dir.path(), &base);
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+    }
+
     /// A base snapshot of `(path, content)` pairs, the content stamped the way
     /// a pull would have recorded it.
     fn base_of(entries: &[(&str, &[u8])]) -> BTreeMap<String, BaseStamp> {

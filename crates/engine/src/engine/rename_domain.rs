@@ -1168,11 +1168,7 @@ impl Engine {
         };
         if let ContentSource::File { root } = &source {
             let abs = join_rel(root, &desc.path);
-            let name = abs
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let probe = abs.with_file_name(format!("{name}.tmp.{}.probe", std::process::id()));
+            let probe = crystalline_core::path::hidden_temp_path(&abs, "probe");
             match std::fs::write(&probe, b"") {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&probe);
