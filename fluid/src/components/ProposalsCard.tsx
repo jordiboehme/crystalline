@@ -341,7 +341,9 @@ function KeptBranchNotices({
         >
           <p>{branch.message}</p>
           {branch.reason !== null && (
-            <p className="text-caption opacity-80">{branch.reason}</p>
+            <p className="text-caption break-words opacity-80">
+              {branch.reason}
+            </p>
           )}
         </div>
       ))}
