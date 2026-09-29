@@ -7843,3 +7843,77 @@ async fn a_team_discard_announces_the_restored_engram_under_the_discarding_accou
     }
     assert!(rx.try_recv().is_err(), "once");
 }
+
+/// Issue 113, Jordi's ruling: a share preview on a review-mode domain moves
+/// no pull request and deletes no branch, even when its pull consumes a
+/// merge. The share or the next sync does that.
+#[tokio::test]
+async fn a_review_mode_share_preview_does_no_branch_cleanup() {
+    use crystalline_remote::provider::{OriginSpec, ProposalRequest, ProposalState, Provider};
+    let f = reviewed_origin_fixture().await;
+    let forge = f.forge.clone().expect("the origin fixture carries a forge");
+    // The origin `build_fixture` registers (`overlay_domains.rs:200-202`).
+    let spec = OriginSpec {
+        repo: "acme/team".to_string(),
+        subpath: None,
+        branch: "main".to_string(),
+    };
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let share = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(share["outcome"], "proposed", "{share}");
+    let number = share["number"].as_u64().unwrap();
+    let branch = share["branch"].as_str().unwrap().to_string();
+    // Somebody bases a pull request of their own on the share branch.
+    let head = forge.branch_commit(&branch).unwrap();
+    Provider::create_branch(&*forge, &spec, "big-change", &head)
+        .await
+        .unwrap();
+    let hand = Provider::create_proposal(
+        &*forge,
+        &spec,
+        &ProposalRequest {
+            title: "by hand".to_string(),
+            body: String::new(),
+            branch: "big-change".to_string(),
+            base_branch: branch.clone(),
+        },
+    )
+    .await
+    .unwrap()
+    .number;
+    // The share merges.
+    forge.set_branch("main", &head);
+    forge.set_proposal_state(number, ProposalState::Merged);
+
+    let before = forge.calls().len();
+    f.engine
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            crystalline_service::engine::PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    let delta = forge.calls().split_off(before);
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("delete_branch") || c.starts_with("update_proposal")),
+        "{delta:?}"
+    );
+    assert_eq!(forge.proposal_base(hand).as_deref(), Some(branch.as_str()));
+
+    f.engine
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(forge.proposal_base(hand).as_deref(), Some("main"));
+    assert!(forge.calls().contains(&format!("delete_branch:{branch}")));
+}

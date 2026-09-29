@@ -117,6 +117,11 @@ pub struct OriginState {
     /// not wrong. Retried at the start of share, withdraw and status.
     #[serde(default)]
     pub stack_link_pending: bool,
+    /// Merged shares whose branch still has to be deleted upstream, oldest
+    /// first. Written in the same save that consumes the merge, so a crash
+    /// between the save and the cleanup only delays the delete.
+    #[serde(default)]
+    pub merged_branches: Vec<MergedBranch>,
 }
 
 /// The recorded shape of a file in the base snapshot: enough to tell, without
@@ -328,6 +333,52 @@ pub struct Conflict {
     pub detected_at: DateTime<Utc>,
 }
 
+/// A merged share's branch, waiting to be deleted upstream once no open pull
+/// request is based on it any more. Deleting a branch closes every open pull
+/// request based on it, and the forge will not reopen one, so the branch goes
+/// only after each of them was moved to `onto`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedBranch {
+    /// The merged share's pull request number.
+    pub number: u64,
+    /// The share branch to delete.
+    pub branch: String,
+    /// The branch the share merged into, where a pull request based on
+    /// `branch` is moved.
+    pub onto: String,
+    /// Why the branch is still there, once a cleanup had to keep it.
+    #[serde(default)]
+    pub kept: Option<BranchKept>,
+}
+
+/// Why a merged share's branch was kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchKept {
+    /// The open pull request still based on the branch, or `None` when the
+    /// open pull requests could not be listed at all.
+    pub blocked_by: Option<u64>,
+    /// The forge's own answer, as the error displays it.
+    pub reason: String,
+}
+
+impl MergedBranch {
+    /// The one sentence every surface shows for a kept branch, or `None`
+    /// while nothing kept it.
+    pub fn kept_message(&self) -> Option<String> {
+        let kept = self.kept.as_ref()?;
+        Some(match kept.blocked_by {
+            Some(number) => format!(
+                "Branch {} is kept: pull request #{number} is based on it and could not be moved to {}. The next sync tries again.",
+                self.branch, self.onto
+            ),
+            None => format!(
+                "Branch {} is kept: the open pull requests could not be listed. The next sync tries again.",
+                self.branch
+            ),
+        })
+    }
+}
+
 impl OriginState {
     /// A fresh, empty state for a domain that has never pulled from `repo`
     /// yet: `base_commit` empty, every collection empty, at
@@ -349,6 +400,7 @@ impl OriginState {
             stacks_available: None,
             repair_pending: false,
             stack_link_pending: false,
+            merged_branches: Vec::new(),
         }
     }
 
@@ -1552,5 +1604,46 @@ mod tests {
 
         let loaded = OriginState::load(dir.path()).unwrap().expect("state loads");
         assert_eq!(loaded.proposals[0].author_login, None);
+    }
+
+    #[test]
+    fn a_state_saved_before_the_merged_branch_queue_loads_with_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sample_state();
+        state.save(dir.path()).unwrap();
+        let path = dir.path().join("state.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("merged_branches");
+        std::fs::write(&path, raw.to_string()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert!(loaded.merged_branches.is_empty());
+    }
+
+    #[test]
+    fn a_kept_branch_says_which_pull_request_holds_it() {
+        let mut entry = MergedBranch {
+            number: 3,
+            branch: "crystalline/share-1".to_string(),
+            onto: "main".to_string(),
+            kept: None,
+        };
+        assert_eq!(entry.kept_message(), None);
+        entry.kept = Some(BranchKept {
+            blocked_by: Some(7),
+            reason: "boom".to_string(),
+        });
+        assert_eq!(
+            entry.kept_message().unwrap(),
+            "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again."
+        );
+        entry.kept = Some(BranchKept {
+            blocked_by: None,
+            reason: "offline".to_string(),
+        });
+        assert_eq!(
+            entry.kept_message().unwrap(),
+            "Branch crystalline/share-1 is kept: the open pull requests could not be listed. The next sync tries again."
+        );
     }
 }

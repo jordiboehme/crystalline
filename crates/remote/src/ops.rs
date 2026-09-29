@@ -55,8 +55,8 @@ use crate::provider::{
     TreeWrite, UpstreamChange,
 };
 use crate::state::{
-    self, BaseStamp, Conflict, DirectShare, OriginState, Proposal, ProposalStatus, ProposedChange,
-    ProposedFile,
+    self, BaseStamp, BranchKept, Conflict, DirectShare, MergedBranch, OriginState, Proposal,
+    ProposalStatus, ProposedChange, ProposedFile,
 };
 
 /// Above this many changed files (after subpath filtering) a compare is
@@ -176,6 +176,10 @@ pub struct OriginStatusReport {
     /// Direct commits this machine put on the connected branch, newest first,
     /// from [`crate::state::OriginState::direct_shares`].
     pub direct_shares: Vec<DirectShare>,
+    /// Merged shares whose branch was kept because an open pull request is
+    /// still based on it and could not be moved, or the open pull requests
+    /// could not be listed. Empty when nothing is kept.
+    pub kept_branches: Vec<MergedBranch>,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -548,11 +552,39 @@ fn manifest_candidates(
 /// so once the merge is in history [`adopt_rebased_layers`] takes each
 /// survivor's new head where the move carried none of that layer's own work.
 /// Without that a plain merge would leave the whole chain looking amended.
+///
+/// A consumed merge's branch is queued in the same save, and deleted once
+/// every open pull request based on it was moved to the branch the share
+/// merged into ([`retire_merged_branches`]). This is [`pull_with`] running
+/// that cleanup.
 pub async fn pull(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
+) -> Result<PullReport, RemoteError> {
+    pull_with(provider, spec, domain_root, state_dir, BranchCleanup::Run).await
+}
+
+/// Whether a pull runs the merged-branch cleanup ([`retire_merged_branches`])
+/// or leaves the queue for a later pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCleanup {
+    /// Move the pull requests off every queued branch and delete it.
+    Run,
+    /// Queue a consumed merge's branch and touch nothing on the forge: what a
+    /// share preview's pull does, since a preview makes no provider write.
+    Defer,
+}
+
+/// [`pull`], with the merged-branch cleanup run or deferred as `cleanup`
+/// says. Everything else is the same pull.
+pub async fn pull_with(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    cleanup: BranchCleanup,
 ) -> Result<PullReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::Refused(
@@ -565,12 +597,12 @@ pub async fn pull(
         .await?
     {
         HeadProbe::Unchanged => {
-            return settle_up_to_date(provider, spec, state_dir, state, None).await;
+            return settle_up_to_date(provider, spec, state_dir, state, None, cleanup).await;
         }
         HeadProbe::Changed { head, etag } => (head, etag),
     };
     if head == state.base_commit {
-        return settle_up_to_date(provider, spec, state_dir, state, Some(new_etag)).await;
+        return settle_up_to_date(provider, spec, state_dir, state, Some(new_etag), cleanup).await;
     }
 
     // Refresh open proposals first so a just-merged one can override its own
@@ -627,6 +659,7 @@ pub async fn pull(
                 head,
                 new_etag,
                 transitions,
+                cleanup,
             )
             .await;
         }
@@ -745,10 +778,9 @@ pub async fn pull(
     }
     state.save(state_dir)?;
 
-    // Best-effort branch cleanup, after the state is durable; errors are
-    // ignored entirely (the branch lingering upstream harms nothing).
-    for prop in &consumed {
-        let _ = provider.delete_branch(spec, &prop.branch).await;
+    // Branch cleanup, after the state is durable.
+    if cleanup == BranchCleanup::Run {
+        retire_merged_branches(provider, spec, &mut state, state_dir).await;
     }
 
     Ok(PullReport {
@@ -762,8 +794,9 @@ pub async fn pull(
     })
 }
 
-/// Moves every Merged record out of the chain and into history, returning
-/// them so the caller can delete their branches once its state is durable.
+/// Moves every Merged record out of the chain and into history, queues its
+/// branch in [`OriginState::merged_branches`] for [`retire_merged_branches`]
+/// to delete once the caller's state is durable, and returns the records.
 ///
 /// The one rule beyond the move: when the last open layer leaves this way, the
 /// stack number goes with it. A number naming a chain with nothing open in it
@@ -779,6 +812,17 @@ fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
     if merged.is_empty() {
         return merged;
     }
+    // Where each one went, read off the chain before it leaves: the branch is
+    // queued for [`retire_merged_branches`] in the same save as the move.
+    for prop in &merged {
+        let onto = merged_into(state, prop.number);
+        state.merged_branches.push(MergedBranch {
+            number: prop.number,
+            branch: prop.branch.clone(),
+            onto,
+            kept: None,
+        });
+    }
     state
         .proposals
         .retain(|p| p.status != ProposalStatus::Merged);
@@ -793,6 +837,102 @@ fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
         state.stack_number = None;
     }
     merged
+}
+
+/// The branch a merged layer merged into: the nearest layer below it that is
+/// still open, else the branch the domain tracks. The walk [`repair_chain`]
+/// makes to pick a survivor's new base.
+fn merged_into(state: &OriginState, number: u64) -> String {
+    state
+        .proposals
+        .iter()
+        .position(|p| p.number == number)
+        .and_then(|index| {
+            state.proposals[..index]
+                .iter()
+                .rev()
+                .find(|p| p.status == ProposalStatus::Open)
+                .map(|p| p.branch.clone())
+        })
+        .unwrap_or_else(|| state.branch.clone())
+}
+
+/// Deletes the branch of every queued merged share once no open pull request
+/// is based on it (issue 113).
+///
+/// Deleting a branch closes every open pull request based on it, and the forge
+/// will not reopen one. So each one - a layer of ours the forge did not move,
+/// or one somebody pushed by hand onto the share branch - is moved to the
+/// branch the share merged into first, title and body untouched. A branch with
+/// a pull request that could not be moved stays, with the reason recorded for
+/// the status, and the next pull tries again. One listing per pass, and none
+/// when nothing is queued. Never fails the pull: the queue is already durable.
+async fn retire_merged_branches(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) {
+    if state.merged_branches.is_empty() {
+        return;
+    }
+    let mut open = match provider.list_open_proposals(spec).await {
+        Ok(open) => open,
+        Err(e) => {
+            let reason = e.to_string();
+            for entry in &mut state.merged_branches {
+                entry.kept = Some(BranchKept {
+                    blocked_by: None,
+                    reason: reason.clone(),
+                });
+            }
+            save_cleanup(state, state_dir);
+            return;
+        }
+    };
+    let mut kept = Vec::new();
+    for mut entry in std::mem::take(&mut state.merged_branches) {
+        let mut blocker: Option<BranchKept> = None;
+        for pr in open.iter_mut().filter(|pr| pr.base == entry.branch) {
+            match provider
+                .update_proposal(spec, pr.number, None, None, Some(&entry.onto))
+                .await
+            {
+                // Followed in the list too, so a later entry in this same pass
+                // that deletes `onto` sees the pull request standing on it.
+                Ok(()) => pr.base = entry.onto.clone(),
+                Err(e) => {
+                    blocker.get_or_insert(BranchKept {
+                        blocked_by: Some(pr.number),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+        match blocker {
+            None => {
+                // Best effort, as before: a branch already gone is fine.
+                let _ = provider.delete_branch(spec, &entry.branch).await;
+            }
+            Some(why) => {
+                entry.kept = Some(why);
+                kept.push(entry);
+            }
+        }
+    }
+    state.merged_branches = kept;
+    save_cleanup(state, state_dir);
+}
+
+/// Saves what a cleanup pass changed. A failure is logged, not raised: the
+/// queue it would update was saved before the pass, so the next pull repeats
+/// the pass.
+fn save_cleanup(state: &OriginState, state_dir: &Path) {
+    if let Err(e) = state.save(state_dir) {
+        tracing::debug!(
+            "recording the merged-branch cleanup failed; the next pull repeats it: {e}"
+        );
+    }
 }
 
 /// Adopts the rebase the forge performs on a chain when a layer below it
@@ -1111,6 +1251,12 @@ pub async fn status(
         repair_pending: state.repair_pending,
         stack_link_pending: state.stack_link_pending,
         direct_shares: state.direct_shares.clone(),
+        kept_branches: state
+            .merged_branches
+            .iter()
+            .filter(|b| b.kept.is_some())
+            .cloned()
+            .collect(),
     })
 }
 
@@ -2142,10 +2288,12 @@ pub enum PlannedAction {
 
 /// The read-only twin of [`propose`]: runs the same pull, conflicts guard,
 /// change detection and open/declined/divergence classification, but performs
-/// no provider write and moves no record. It DOES perform the pull's writes
-/// to the working tree - freshness is part of previewing honestly, and a plan
-/// computed against a stale base would name changes a real share would never
-/// make.
+/// no provider write and moves no share record. It DOES perform the pull's
+/// writes to the working tree - freshness is part of previewing honestly, and
+/// a plan computed against a stale base would name changes a real share would
+/// never make. Its pull defers the merged-branch cleanup too: a merge it
+/// consumes is queued, and the share or the next sync moves the pull requests
+/// off that branch and deletes it.
 ///
 /// On a stackable chain it walks the open layers down exactly as [`propose`]
 /// does, skipping each layer whose branch ref is gone (a share settles those
@@ -2169,7 +2317,7 @@ pub async fn propose_preview(
     options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
     let title = options.title;
-    pull(provider, spec, domain_root, state_dir).await?;
+    pull_with(provider, spec, domain_root, state_dir, BranchCleanup::Defer).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
@@ -4882,18 +5030,19 @@ async fn settle_up_to_date(
     state_dir: &Path,
     mut state: OriginState,
     new_etag: Option<Option<String>>,
+    cleanup: BranchCleanup,
 ) -> Result<PullReport, RemoteError> {
     let (transitions, _touched) = refresh_proposals(provider, spec, &mut state).await?;
-    let consumed = consume_merged(&mut state);
+    consume_merged(&mut state);
     if let Some(etag) = new_etag {
         state.ref_etag = etag;
     }
     state.last_checked = Some(Utc::now());
     state.save(state_dir)?;
-    // Best-effort branch cleanup once the state is durable, exactly as the
-    // moved-trunk arm does it.
-    for prop in &consumed {
-        let _ = provider.delete_branch(spec, &prop.branch).await;
+    // Branch cleanup once the state is durable, exactly as the moved-trunk
+    // arm does it.
+    if cleanup == BranchCleanup::Run {
+        retire_merged_branches(provider, spec, &mut state, state_dir).await;
     }
     Ok(PullReport {
         up_to_date: true,
@@ -4952,6 +5101,7 @@ async fn rebaseline(
     head: String,
     new_etag: Option<String>,
     transitions: Vec<(u64, ProposalStatus)>,
+    cleanup: BranchCleanup,
 ) -> Result<PullReport, RemoteError> {
     let bytes = provider.tarball(spec, &head).await?;
     let (extracted, skipped_large) = extract_tarball(&bytes, spec.subpath.as_deref())?;
@@ -4998,10 +5148,9 @@ async fn rebaseline(
     }
     state.save(state_dir)?;
 
-    // Best-effort branch cleanup once the state is durable; a branch lingering
-    // upstream harms nothing, so errors are ignored entirely.
-    for prop in &consumed {
-        let _ = provider.delete_branch(spec, &prop.branch).await;
+    // Branch cleanup once the state is durable.
+    if cleanup == BranchCleanup::Run {
+        retire_merged_branches(provider, spec, &mut state, state_dir).await;
     }
 
     Ok(PullReport {

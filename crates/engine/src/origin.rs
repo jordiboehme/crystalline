@@ -1755,6 +1755,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: vec![crystalline_remote::state::DirectShare {
                 sha: "c0ffee".to_string(),
@@ -1823,6 +1824,7 @@ mod tests {
             stack_number: Some(42),
             stack_wedged: vec![7],
             repair_pending: true,
+            kept_branches: Vec::new(),
             stack_link_pending: true,
             direct_shares: Vec::new(),
         };
@@ -1851,6 +1853,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -1879,6 +1882,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -1908,6 +1912,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         }
@@ -2425,6 +2430,7 @@ mod tests {
             stack_number: stacked.then_some(42),
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         }
@@ -2614,6 +2620,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -2656,6 +2663,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };

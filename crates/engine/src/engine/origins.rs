@@ -1385,6 +1385,10 @@ impl Engine {
     ///
     /// `origin` is what [`Engine::origin_spec_for_domain`] resolved, borrowed
     /// whole: the spec, the domain's folder and its origin state directory.
+    ///
+    /// `cleanup` is what the pull does with a merged share's branch. A preview
+    /// passes `Defer`, so its pull queues a merged branch and leaves the forge
+    /// alone.
     pub(super) async fn overlay_share_tree(
         &self,
         domain: &str,
@@ -1392,12 +1396,13 @@ impl Engine {
         provider: &dyn Provider,
         origin: (&OriginSpec, &Path, &Path),
         acting: Option<&str>,
+        cleanup: ops::BranchCleanup,
     ) -> Result<Option<PreparedShare>> {
         let Some(who) = drafting else {
             return Ok(None);
         };
         let (spec, root, state_dir) = origin;
-        let report = ops::pull(provider, spec, root, state_dir)
+        let report = ops::pull_with(provider, spec, root, state_dir, cleanup)
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))
             .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
@@ -1534,6 +1539,7 @@ impl Engine {
                 provider.as_ref(),
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
+                ops::BranchCleanup::Run,
             )
             .await?;
         // The share runs against the staged tree, and the provider it runs with
@@ -1821,6 +1827,7 @@ impl Engine {
                 provider.as_ref(),
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
+                ops::BranchCleanup::Defer,
             )
             .await?;
         // Pinned exactly as the share pins it, and for the same reason: a

@@ -208,11 +208,20 @@ pub(super) struct IssueCommentResponse {
     pub(super) created_at: Option<String>,
 }
 
-/// `GET .../pulls?state=open` entry, trimmed to the head ref and sha.
+/// `GET .../pulls?state=open` entry, trimmed to the head and base refs.
 #[derive(Debug, Deserialize)]
 pub(super) struct OpenProposalListItem {
     pub(super) number: u64,
     pub(super) head: HeadRef,
+    pub(super) base: BaseRef,
+}
+
+/// The branch a listed pull request targets. Required: a row without one
+/// must fail the listing rather than read as based on nothing.
+#[derive(Debug, Deserialize)]
+pub(super) struct BaseRef {
+    #[serde(rename = "ref")]
+    pub(super) reference: String,
 }
 
 #[derive(Debug, Deserialize)]

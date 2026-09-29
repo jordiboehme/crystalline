@@ -664,6 +664,7 @@ impl Provider for GitHubProvider {
                     number: item.number,
                     branch: item.head.reference,
                     head_sha: item.head.sha,
+                    base: item.base.reference,
                 });
             }
             if count < COMPARE_PER_PAGE {

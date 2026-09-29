@@ -164,6 +164,10 @@ pub struct OpenProposalRef {
     pub branch: String,
     /// The commit that branch currently points at.
     pub head_sha: String,
+    /// The branch the proposal targets, the one it merges into. What a branch
+    /// cleanup reads to find every pull request standing on a branch it is
+    /// about to delete.
+    pub base: String,
 }
 
 /// Forge-neutral access to the operations Crystalline needs to collaborate
