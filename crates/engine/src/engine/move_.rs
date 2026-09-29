@@ -511,6 +511,12 @@ impl Engine {
                 audience: None,
             }));
         }
+        // The new address may be what a link in another domain has been
+        // waiting for. A draft move returned above, through `move_within`.
+        if readdressed {
+            self.bind_references_to(&dest_domain, &dest_permalink, &src.title)
+                .await;
+        }
 
         // `links_rewritten` counts engrams, as it always has; the references
         // inside them are `references_rewritten`, and `rewritten` names the

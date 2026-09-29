@@ -677,7 +677,7 @@ impl Engine {
         // Whether an engram stood at the destination before this write, read
         // under the write lock: an overwrite that creates is `added`, so the
         // switcher's counts follow, and only a replacement is `modified`.
-        let replaced = match &source {
+        let (replaced, title_before) = match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &path);
                 // The bytes this write replaces, kept so a write the index
@@ -706,18 +706,24 @@ impl Engine {
                     put_back(&abs, previous.as_deref());
                     return Err(e);
                 }
-                previous.is_some()
+                (
+                    previous.is_some(),
+                    previous
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .and_then(engram_title),
+                )
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
                 let domain_id = store
                     .upsert_domain(&p.domain, None, DomainKind::Virtual)
                     .await?;
-                let replaced = store.engram_content(domain_id, &path).await?.is_some();
+                let before = store.engram_content(domain_id, &path).await?;
                 let stamp = virtual_stamp(&markdown);
                 self.index_markdown(&*store, domain_id, &path, &markdown, stamp, None, true)
                     .await?;
-                replaced
+                (before.is_some(), before.as_deref().and_then(engram_title))
             }
         };
 
@@ -741,6 +747,12 @@ impl Engine {
         // engram, the source of its routing bullets, so refresh the cache the
         // sync `routing_text` reads; a MANIFEST of either kind may declare a
         // new name.
+        // A new engram, or one whose title changed, may be what a link in
+        // another domain has been waiting for.
+        if !replaced || title_before.as_deref() != Some(p.title.as_str()) {
+            self.bind_references_to(&p.domain, &permalink, &p.title)
+                .await;
+        }
         self.after_source_write(&source, &path).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
@@ -1067,6 +1079,13 @@ impl Engine {
             draft_of: None,
             audience: None,
         }));
+        // A save that moved the permalink or changed the title may be what a
+        // link in another domain has been waiting for.
+        let (_, title_after) = engram_names(&content, &permalink);
+        if permalink != desc.permalink || title_after != desc.title {
+            self.bind_references_to(&desc.domain, &permalink, &title_after)
+                .await;
+        }
 
         // A save can rewrite a MANIFEST or the titles a folder index lists,
         // same as an edit.

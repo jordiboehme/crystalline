@@ -600,6 +600,60 @@ impl Engine {
         }
     }
 
+    /// Bind the pending references in other domains that name an engram a
+    /// base write just added, moved or retitled in `domain`, by its permalink
+    /// or its title, and announce each domain that bound something. Called
+    /// with no store guard held. Best effort: the write has landed, so a
+    /// failure is logged, never returned; the next resolve pass binds the
+    /// rows. Never for a draft write: another actor's links must not bind to
+    /// somebody's draft.
+    pub(super) async fn bind_references_to(&self, domain: &str, permalink: &str, title: &str) {
+        let mut targets = vec![permalink.to_string()];
+        if !title.is_empty() && !title.eq_ignore_ascii_case(permalink) {
+            targets.push(title.to_string());
+        }
+        let store = self.store.lock().await;
+        let bound = async {
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(Vec::new());
+            };
+            let spellings: Vec<String> = store
+                .domain_spellings()
+                .await?
+                .into_iter()
+                .filter(|(_, holder)| *holder == id)
+                .map(|(spelling, _)| spelling)
+                .collect();
+            let counts = store
+                .resolve_references_to(id, &spellings, &targets)
+                .await?;
+            let mut named = Vec::new();
+            for name in self.registered_domain_names() {
+                if let Some(other) = store.domain_id(&name).await?
+                    && counts.iter().any(|(bound, _)| *bound == other)
+                {
+                    named.push(name);
+                }
+            }
+            crystalline_index::Result::Ok(named)
+        }
+        .await;
+        drop(store);
+        match bound {
+            Ok(mut names) => {
+                names.sort();
+                for name in names {
+                    self.announce_domain(&name, None, None);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "binding the references that name '{permalink}' in '{domain}' failed: {e}"
+                );
+            }
+        }
+    }
+
     /// One resolve pass per domain row the index's spellings reach, each in
     /// its own transaction under its own store-lock window. `base_done` names
     /// the domains whose base rows need no pass; their drafts still get one.

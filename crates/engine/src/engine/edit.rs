@@ -410,7 +410,7 @@ impl Engine {
 
         // Answered by whichever arm below runs, so the tail's `SourceEdited`
         // reports the count whichever kind of source this write landed on.
-        let (normalized, checksum) = match source {
+        let (normalized, checksum, before, after) = match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
@@ -453,7 +453,12 @@ impl Engine {
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
                     .await
                     .map_err(SourceEditFailure::after)?;
-                (count, sha256_hex(edited.as_bytes()))
+                (
+                    count,
+                    sha256_hex(edited.as_bytes()),
+                    engram_names(&current, &desc.permalink),
+                    engram_names(&edited, &desc.permalink),
+                )
             }
             ContentSource::Virtual => {
                 let current = {
@@ -508,7 +513,12 @@ impl Engine {
                 )
                 .await
                 .map_err(SourceEditFailure::before)?;
-                (count, sha256_hex(edited.as_bytes()))
+                (
+                    count,
+                    sha256_hex(edited.as_bytes()),
+                    engram_names(&current, &desc.permalink),
+                    engram_names(&edited, &desc.permalink),
+                )
             }
         };
 
@@ -531,6 +541,12 @@ impl Engine {
             draft_of: None,
             audience: None,
         }));
+        // An edit that moved the permalink or changed the title may be what a
+        // link in another domain has been waiting for.
+        if after != before {
+            self.bind_references_to(&desc.domain, &after.0, &after.1)
+                .await;
+        }
 
         // An edit may have rewritten this domain's MANIFEST, its routing and
         // its declared name. The store locks above are all released.

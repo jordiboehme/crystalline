@@ -91,7 +91,7 @@ pub use search::{
     semantic_hydrate_sql, semantic_phase1_sql,
 };
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -111,9 +111,10 @@ use crate::store::{
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
     Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
     SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    domain_url_needles, folder_slash, in_transaction, names_a_domain_url, page_window,
-    reference_match, referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
-    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
+    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
+    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
+    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
+    spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -1208,6 +1209,57 @@ impl Store for PostgresStore {
                     .rows_affected();
             }
             Ok(bound)
+        })
+        .await
+    }
+
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>> {
+        if spellings.is_empty() || targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let spelled = placeholders(2, spellings.len());
+        let first = 2 + spellings.len();
+        let targeted = (first..first + targets.len())
+            .map(|i| format!("lower(${i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = || {
+            let mut out = vec![Param::Int(domain.0)];
+            out.extend(spellings.iter().map(|s| Param::Text(s.clone())));
+            out.extend(targets.iter().map(|t| Param::Text(t.clone())));
+            out
+        };
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+            for table in ["relation", "link"] {
+                let sql = count_references_to_sql(table, "$1", &spelled, &targeted);
+                let rows = bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                for row in rows {
+                    let id: i64 = row.try_get(0).map_err(IndexError::from)?;
+                    let n: i64 = row.try_get(1).map_err(IndexError::from)?;
+                    *counts.entry(id).or_default() += n as u64;
+                }
+                let sql = resolve_references_to_sql(table, "$1", &spelled, &targeted);
+                bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(id, n)| (DomainId(id), n))
+                .collect())
         })
         .await
     }

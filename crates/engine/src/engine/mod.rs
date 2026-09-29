@@ -3905,6 +3905,29 @@ impl Engine {
     }
 }
 
+/// The title an engram's text declares, if it parses.
+fn engram_title(text: &str) -> Option<String> {
+    parse_engram(text)
+        .ok()
+        .map(|engram| engram.frontmatter.title)
+}
+
+/// An engram's `(permalink, title)` as its text declares them, the permalink
+/// falling back to `fallback_permalink` when the frontmatter names none.
+fn engram_names(text: &str, fallback_permalink: &str) -> (String, String) {
+    match parse_engram(text) {
+        Ok(engram) => (
+            engram
+                .frontmatter
+                .permalink
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| fallback_permalink.to_string()),
+            engram.frontmatter.title,
+        ),
+        Err(_) => (fallback_permalink.to_string(), String::new()),
+    }
+}
+
 /// What a batch owes the change bus for rows it has already committed, said
 /// when the guard drops: on the normal exit and on every early `?` alike, so a
 /// batch that fails halfway still tells open pages about what landed. A row is

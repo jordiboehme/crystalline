@@ -1618,6 +1618,185 @@ parity!(
     resolving_by_spelling_binds_only_those_rows
 );
 
+/// A record for an engram that lands without a resolve pass of its own, as a
+/// base write's row does before the cross-domain bind runs.
+fn titled_record(path: &str, permalink: &str, title: &str) -> EngramRecord {
+    EngramRecord {
+        title: title.to_string(),
+        ..record(path, permalink, &format!("# {title}\n"), "sha")
+    }
+}
+
+async fn ids(store: &dyn Store, names: &[&str]) -> Vec<DomainId> {
+    let mut out = Vec::new();
+    for name in names {
+        out.push(store.domain_id(name).await.unwrap().unwrap());
+    }
+    out
+}
+
+/// Item 13: a base write in `ops` binds the pending rows in other domains that
+/// name it, counted per domain, and leaves `ops`'s own rows to its own pass.
+async fn resolve_references_to_binds_only_other_domains_and_counts_per_domain(store: &dyn Store) {
+    let (home, side, ops) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:runbook"),
+    );
+    write(
+        side.path(),
+        "also.md",
+        &source_engram("Also", "also", "ops:runbook"),
+    );
+    write(
+        ops.path(),
+        "own.md",
+        &source_engram("Own", "own", "ops:runbook"),
+    );
+    for (name, dir) in [("home", &home), ("side", &side), ("ops", &ops)] {
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    let found = ids(store, &["home", "side", "ops"]).await;
+    let (home_id, side_id, ops_id) = (found[0], found[1], found[2]);
+    store
+        .upsert_engram(ops_id, &titled_record("runbook.md", "runbook", "Runbook"))
+        .await
+        .unwrap();
+
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    let mut want = vec![(home_id, 2), (side_id, 2)];
+    want.sort_by_key(|(id, _)| id.0);
+    assert_eq!(bound, want, "the relation and the link, per domain");
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    let own = store.lookup_id("ops", "own").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, own).await,
+        None,
+        "ops's own rows are its own pass's"
+    );
+    assert!(
+        store
+            .resolve_references_to(ops_id, &["ops".to_string()], &["runbook".to_string()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain_on_both_backends,
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain
+);
+
+/// The title arm binds too, in any letter case (Review Focus 4).
+async fn resolve_references_to_binds_by_title_too(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "a.md",
+        &source_engram("A", "a", "ops:Restart runbook"),
+    );
+    write(
+        home.path(),
+        "b.md",
+        &source_engram("B", "b", "ops:restart RUNBOOK"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("restart-runbook.md", "restart-runbook", "Restart runbook"),
+        )
+        .await
+        .unwrap();
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["restart-runbook".to_string(), "Restart runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 4)]);
+    for permalink in ["a", "b"] {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            Some(("ops".to_string(), "restart-runbook".to_string())),
+            "{permalink}"
+        );
+    }
+}
+parity!(
+    resolve_references_to_binds_by_title_too_on_both_backends,
+    resolve_references_to_binds_by_title_too
+);
+
+async fn resolve_references_to_leaves_other_targets_pending(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "to-runbook.md",
+        &source_engram("To Runbook", "to-runbook", "ops:runbook"),
+    );
+    write(
+        home.path(),
+        "to-other.md",
+        &source_engram("To Other", "to-other", "ops:other"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    for (path, permalink, title) in [
+        ("runbook.md", "runbook", "Runbook"),
+        ("other.md", "other", "Other"),
+    ] {
+        store
+            .upsert_engram(ops_id, &titled_record(path, permalink, title))
+            .await
+            .unwrap();
+    }
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 2)]);
+    let other = store.lookup_id("home", "to-other").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, other).await,
+        None,
+        "not this write's target"
+    );
+}
+parity!(
+    resolve_references_to_leaves_other_targets_pending_on_both_backends,
+    resolve_references_to_leaves_other_targets_pending
+);
+
 /// A core [`crystalline_core::LinkResolver`] over the same engrams and the
 /// same spelling table the store holds, so the index verdict can be compared
 /// with `core::address::resolve`, the rule verify follows. `viewer` reads one

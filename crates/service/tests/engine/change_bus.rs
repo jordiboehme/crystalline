@@ -1331,3 +1331,95 @@ both_backends!(
     a_retag_that_fails_halfway_announces_what_it_wrote,
     a_retag_that_fails_halfway_announces_what_it_wrote_body
 );
+
+/// Item 13: writing the engram a link in another domain waits for binds that
+/// link at once, and that domain hears it.
+async fn a_new_engram_binds_a_waiting_link_in_another_domain_and_announces_it_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (tmp, engine, _scratch) = engine_fixture_on(store, false).await;
+    seed(
+        &tmp.path().join("notes"),
+        "guide.md",
+        &engram("Guide", "guide", "- relates_to [[oak:Restart runbook]]"),
+    );
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .write_engram(&WriteParams {
+            domain: "oak".to_string(),
+            ..write_params("Restart runbook", false)
+        })
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(
+        heard.iter().any(
+            |c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "notes")
+        ),
+        "{heard:?}"
+    );
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "guide".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["relations"][0]["resolved"], true, "{read}");
+}
+both_backends!(
+    a_new_engram_binds_a_waiting_link_in_another_domain_and_announces_it,
+    a_new_engram_binds_a_waiting_link_in_another_domain_and_announces_it_body
+);
+
+/// A draft is one actor's: another domain's links never bind to it.
+async fn a_draft_write_binds_nothing_elsewhere_body(store: Arc<Mutex<dyn Store>>) {
+    let (tmp, engine, _scratch) = engine_fixture_on(store, true).await;
+    seed(
+        &tmp.path().join("oak"),
+        "guide.md",
+        &engram("Guide", "guide", "- relates_to [[notes:Restart runbook]]"),
+    );
+    engine.sync(None).await.unwrap();
+    let mut rx = engine.changes().subscribe();
+    let receipt = engine
+        .write_engram_as(
+            &write_params("Restart runbook", false),
+            None,
+            &Scope::User {
+                account: "ada".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["draft"], true, "{receipt}");
+    let heard = drain(&mut rx);
+    assert!(
+        !heard
+            .iter()
+            .any(|c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "oak")),
+        "{heard:?}"
+    );
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "guide".to_string(),
+                domain: Some("oak".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["relations"][0]["resolved"], false, "{read}");
+}
+both_backends!(
+    a_draft_write_binds_nothing_elsewhere,
+    a_draft_write_binds_nothing_elsewhere_body
+);

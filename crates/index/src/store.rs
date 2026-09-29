@@ -267,6 +267,54 @@ pub fn resolve_spelled_references_sql(table: &str, list: &str) -> String {
     )
 }
 
+/// The rows [`Store::resolve_references_to`] binds, as a `WHERE` clause over one
+/// reference table: pending rows in every domain but `domain` (the caller's
+/// placeholder), spelled with one of `spellings` and naming one of `targets`
+/// (placeholder lists; each target placeholder comes wrapped in `lower()`),
+/// that the base candidates now answer. The `to_domain IS NOT NULL` term
+/// repeats the partial index's own condition, as in
+/// [`reset_spelled_references_sql`].
+fn references_to_where(table: &str, domain: &str, spellings: &str, targets: &str) -> String {
+    format!(
+        "{table}.to_domain IS NOT NULL AND {table}.to_domain IN ({spellings}) \
+         AND {table}.to_id IS NULL AND {table}.domain_id <> {domain} \
+         AND lower({table}.to_target) IN ({targets}) \
+         AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
+/// The count half of [`Store::resolve_references_to`]: how many rows per
+/// domain the bind below will take. No `RETURNING`, so both dialects share
+/// one shape.
+#[doc(hidden)]
+pub fn count_references_to_sql(
+    table: &str,
+    domain: &str,
+    spellings: &str,
+    targets: &str,
+) -> String {
+    format!(
+        "SELECT {table}.domain_id, count(*) FROM {table} WHERE {} GROUP BY {table}.domain_id",
+        references_to_where(table, domain, spellings, targets)
+    )
+}
+
+/// The bind half of [`Store::resolve_references_to`].
+#[doc(hidden)]
+pub fn resolve_references_to_sql(
+    table: &str,
+    domain: &str,
+    spellings: &str,
+    targets: &str,
+) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} WHERE {}",
+        references_to_where(table, domain, spellings, targets),
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
 /// The edge half of [`Store::engrams_referencing_domains`]: every base engram
 /// with a relation or link row naming one of the spellings in `list`.
 ///
@@ -1977,6 +2025,24 @@ pub trait Store: Send + Sync {
     /// Opens its own transaction: never call it between [`Store::begin`] and
     /// [`Store::commit`].
     async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Bind the pending relation and link rows in every domain but `domain`
+    /// (every actor's rows) whose `to_domain` is one of `spellings` and whose
+    /// target, lowercased, is one of `targets` lowercased, by the base rule
+    /// every resolve pass uses. Answers the number bound per domain, sorted by
+    /// id, domains with none left out. The pass a base write in `domain` needs
+    /// when it adds an engram or changes its permalink or title: `targets`
+    /// are that permalink and that title, `spellings` every name `domain`
+    /// answers to.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>>;
 
     /// Rename a domain row in place: `domain.name` becomes `new` and the id
     /// stays, so every engram and every bound reference stays attached. The
