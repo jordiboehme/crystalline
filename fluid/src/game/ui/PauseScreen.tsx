@@ -26,7 +26,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { RELOCK_DELAY_MS } from "../core/input";
 import { PAUSE_ESC_GUARD_MS } from "../session";
-import { C64_BLUE, C64_LIGHT_BLUE } from "./DeviceRefusal";
+import { C64_BLUE, C64_LIGHT_BLUE, C64_TEXT } from "./DeviceRefusal";
 import { PAUSE_LEGEND, unbrokenLegend } from "./keys";
 
 /** The pause screen's accessible name. */
@@ -116,7 +116,7 @@ export function PauseScreen({
   }, [now, openedAt, readyAt, onContinue, onLeave]);
 
   const button =
-    "uppercase underline decoration-dotted underline-offset-4 hover:bg-[#6c5eb5] hover:text-[#352879] focus:bg-[#6c5eb5] focus:text-[#352879] focus:outline-none disabled:no-underline disabled:opacity-60 disabled:hover:bg-transparent disabled:hover:text-[#6c5eb5]";
+    "uppercase underline decoration-dotted underline-offset-4 hover:bg-[#a49bd1] hover:text-[#352879] focus:bg-[#a49bd1] focus:text-[#352879] focus:outline-none disabled:no-underline disabled:opacity-60 disabled:hover:bg-transparent disabled:hover:text-[#a49bd1]";
 
   return (
     <div
@@ -134,7 +134,7 @@ export function PauseScreen({
     >
       <div
         className="w-full max-w-2xl p-8"
-        style={{ background: C64_BLUE, color: C64_LIGHT_BLUE }}
+        style={{ background: C64_BLUE, color: C64_TEXT }}
       >
         <p>{where === null ? "BREAK" : `BREAK IN ${where.toUpperCase()}`}</p>
         <p aria-live="polite" className="min-h-[1.75rem]">

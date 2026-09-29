@@ -11,8 +11,10 @@
  * The screen itself is a small love letter: border and phosphor colors are
  * the VICE palette, the RAM line counts engram bytes, and the links are LOAD
  * commands with reverse-video hover, the way the real machine highlighted
- * text. It renders through a portal so no anchor ever nests inside the
- * header's home link.
+ * text. The text is the palette's light blue lightened in the same hue
+ * until it reaches WCAG AA (4.5:1) on the screen colour, and so is the
+ * reverse video; the border keeps the palette's own. It renders through a
+ * portal so no anchor ever nests inside the header's home link.
  *
  * Three LOAD lines are listed: the source, the coffee, and `LOAD"GAME",8,1`,
  * which launches the station at `/π` (M4 C1, C3). The same command can be
@@ -69,7 +71,7 @@ export const LINE_CAP = 40;
 
 /** The reverse-video highlight every LOAD line shares. */
 const LOAD_CLASSES =
-  "hover:bg-[#7c70da] hover:text-[#40318d] focus:bg-[#7c70da] focus:text-[#40318d] focus:outline-none";
+  "hover:bg-[#aea6e8] hover:text-[#40318d] focus:bg-[#aea6e8] focus:text-[#40318d] focus:outline-none";
 
 type Phase = "idle" | "shattering" | "about";
 
@@ -211,7 +213,7 @@ function C64Screen({
         className="plaque-in w-full max-w-lg rounded-sm bg-[#7c70da] p-6 shadow-2xl outline-none sm:p-10"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="relative bg-[#40318d] px-4 py-5 font-mono text-sm leading-6 text-[#7c70da]">
+        <div className="relative bg-[#40318d] px-4 py-5 font-mono text-sm leading-6 text-[#aea6e8]">
           <div
             aria-hidden
             className="crt-scan pointer-events-none absolute inset-0"
@@ -245,7 +247,7 @@ function C64Screen({
           <button
             type="button"
             onClick={onClose}
-            className="relative mt-4 font-mono text-xs text-[#7c70da] hover:bg-[#7c70da] hover:text-[#40318d] focus:bg-[#7c70da] focus:text-[#40318d] focus:outline-none"
+            className="relative mt-4 font-mono text-xs text-[#aea6e8] hover:bg-[#aea6e8] hover:text-[#40318d] focus:bg-[#aea6e8] focus:text-[#40318d] focus:outline-none"
           >
             RUN/STOP (ESC)
           </button>

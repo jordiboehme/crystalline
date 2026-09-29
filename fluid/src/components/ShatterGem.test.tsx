@@ -31,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { api } from "../api/client";
 import { releasePrimedAudio } from "../game/launch";
+import { classColours, contrastRatio } from "../test/contrast";
 import {
   answersFor,
   domainsResponse,
@@ -473,6 +474,29 @@ describe("the C64 screen's launch (M4 C1 to C4)", () => {
       expect(made).toEqual([0]);
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("draws its text and its reverse video at WCAG AA (4.5:1)", async () => {
+    // Mutation caught: the text or the reverse video in the palette's own
+    // light blue (2.5:1 on the screen colour).
+    renderAt("/");
+    const dialog = await openScreen();
+    const text = dialog.querySelector<HTMLElement>(".font-mono.text-sm");
+    if (!text) throw new Error("no screen");
+    const [fg] = classColours(text.className, "text-");
+    const [bg] = classColours(text.className, "bg-");
+    expect(contrastRatio(fg!, bg!)).toBeGreaterThanOrEqual(4.5);
+    const controls = [
+      ...within(dialog).getAllByRole("link"),
+      within(dialog).getByRole("button", { name: "RUN/STOP (ESC)" }),
+    ];
+    for (const control of controls) {
+      for (const state of ["hover:", "focus:"]) {
+        const [on] = classColours(control.className, `${state}bg-`);
+        const [ink] = classColours(control.className, `${state}text-`);
+        expect(contrastRatio(ink!, on!)).toBeGreaterThanOrEqual(4.5);
+      }
     }
   });
 

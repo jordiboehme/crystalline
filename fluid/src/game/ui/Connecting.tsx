@@ -28,7 +28,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { HANDSHAKE_MS } from "../audio/modem";
-import { C64_BLUE, C64_LIGHT_BLUE } from "./DeviceRefusal";
+import { C64_BLUE, C64_LIGHT_BLUE, C64_TEXT } from "./DeviceRefusal";
 
 /** The screen's accessible name. */
 export const CONNECTING_LABEL = "Connecting";
@@ -140,7 +140,7 @@ export function Connecting({ number, name, onDone }: ConnectingProps) {
       <div
         aria-hidden
         className="w-full max-w-2xl p-8"
-        style={{ background: C64_BLUE, color: C64_LIGHT_BLUE }}
+        style={{ background: C64_BLUE, color: C64_TEXT }}
       >
         {shown.map((part, i) => (
           <p key={i} className="min-h-[1.75rem]">

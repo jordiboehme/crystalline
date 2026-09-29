@@ -21,7 +21,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { createMixer, makeAudioContext, type Mixer } from "../audio/mixer";
 import { playPatch, type PlayingPatch } from "../audio/synth";
-import { C64_BLUE, C64_LIGHT_BLUE } from "../ui/DeviceRefusal";
+import { C64_BLUE, C64_LIGHT_BLUE, C64_TEXT } from "../ui/DeviceRefusal";
 import { SOUNDS, busOf } from "./sounds";
 
 const LOOPS = new Set(
@@ -89,7 +89,7 @@ export default function SoundBoard() {
         minHeight: "100vh",
         padding: "24px 16px",
         background: C64_BLUE,
-        color: C64_LIGHT_BLUE,
+        color: C64_TEXT,
         fontFamily: "monospace",
       }}
     >
@@ -124,8 +124,8 @@ function buttonStyle(on: boolean) {
     padding: "6px 10px",
     fontFamily: "inherit",
     border: `2px solid ${C64_LIGHT_BLUE}`,
-    background: on ? C64_LIGHT_BLUE : "transparent",
-    color: on ? C64_BLUE : C64_LIGHT_BLUE,
+    background: on ? C64_TEXT : "transparent",
+    color: on ? C64_BLUE : C64_TEXT,
     cursor: "pointer",
   } as const;
 }
