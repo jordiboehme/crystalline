@@ -2045,8 +2045,9 @@ async fn retry_stack_link(
 /// provider write call is made; detect local changes against the
 /// now-current base, reporting [`ProposeOutcome::NothingToShare`] when there
 /// are none; supersede any declined proposal (moved to history keeping
-/// `Declined`, its branch best-effort deleted); then either update the one
-/// open proposal in place or create a new one.
+/// `Declined`, its branch queued for [`retire_branches`], which deletes it
+/// unless an open pull request is based on it or comes from it); then either
+/// update the one open proposal in place or create a new one.
 ///
 /// Two shapes of chain live behind that last step. On a forge that serves
 /// stacks, with `stacks_allowed` on, a share never rewrites what is already
@@ -4658,8 +4659,10 @@ async fn finish_pending_repair(
 }
 
 /// Withdraws a share proposal: closes its pull request on the forge (an Open
-/// one), best-effort deletes its branch, optionally restores the shared files
-/// to their pre-share content, and moves the record to history as
+/// one), queues its branch for [`retire_branches`], which deletes it unless an
+/// open pull request is based on it or comes from it (then it is kept and
+/// named in `kept_branches`), optionally restores the shared files to their
+/// pre-share content, and moves the record to history as
 /// [`ProposalStatus::Withdrawn`].
 ///
 /// Target: `proposal_number`, or the single Open proposal when `None`; on a

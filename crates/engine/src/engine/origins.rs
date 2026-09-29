@@ -1937,8 +1937,10 @@ impl Engine {
     }
 
     /// Withdraws a share proposal for one domain: closes its pull request on
-    /// the forge, best-effort deletes its branch, optionally restores the
-    /// shared files (`revert`) and records it as withdrawn. Under the
+    /// the forge, retires its branch (deleted unless an open pull request is
+    /// based on it or comes from it, then kept and named in `kept_branches`),
+    /// optionally restores the shared files (`revert`) and records it as
+    /// withdrawn. Under the
     /// domain's origin lock; syncs and embeds afterward only when files
     /// moved. Refuses when collaboration is off and on a read-only instance.
     ///

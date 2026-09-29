@@ -1753,8 +1753,11 @@ pub struct WithdrawBody {
     summary = "Withdraw one of a team domain's open proposals.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Closes the proposal's pull request, deletes \
-                   its branch best-effort and records it as withdrawn. With \
+                   `personal`). Closes the proposal's pull request, retires \
+                   its branch and records it as withdrawn. The branch is \
+                   deleted unless an open pull request is based on it or \
+                   comes from it; then it is kept and the sync status \
+                   names it under `kept_branches`. With \
                    `revert` true the shared files are restored from the \
                    origin as well, and files a reviewer amended on the \
                    proposal branch are left alone and reported under \
