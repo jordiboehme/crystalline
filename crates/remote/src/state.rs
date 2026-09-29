@@ -121,7 +121,8 @@ pub struct OriginState {
     /// merged share's, a declined share's once the next share superseded it,
     /// and a withdrawn share's. Written in the same save that retires the
     /// record, so a crash between the save and the cleanup only delays the
-    /// delete. The on-disk key is the one 0.20.x wrote for merged shares.
+    /// delete. The on-disk key is the one the merged-branch queue was first
+    /// written under; no released build wrote it.
     #[serde(rename = "merged_branches", default)]
     pub retire_queue: Vec<QueuedBranch>,
 }

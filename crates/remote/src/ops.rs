@@ -903,9 +903,13 @@ enum Retired {
 ///
 /// Entries are worked dependents first: an entry bound for another queued
 /// entry's branch goes before it, so the listing already shows every pull
-/// request the dependent moved onto that branch. A branch that is really gone
-/// (deleted now, or found gone by a probe) passes its own `onto` to every
-/// entry bound for it; a branch that is still there never does.
+/// request the dependent moved onto that branch. A merged share's branch that
+/// is really gone (deleted now, or found gone by a probe) passes its own `onto`
+/// to every entry bound for it, because its commits are in that `onto`. A
+/// declined or withdrawn share's branch never does, gone or not: its commits
+/// are nowhere else, so an entry bound for it keeps pointing at it, its next
+/// move fails and it is kept as `target_gone`, for a person to move or close
+/// the pull request by hand.
 async fn retire_branches(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -1028,6 +1032,9 @@ async fn retire_one(
                 .iter()
                 .chain(pending.iter())
                 .filter(|other| other.why == RetireWhy::Merged && other.onto == entry.branch)
+                // A refused delete is never retried and its pull requests are
+                // never moved again, so none of them waits for this branch.
+                .filter(|other| other.kept_kind() != Some(KeptKind::DeleteRefused))
                 .flat_map(|other| {
                     open.iter()
                         .filter(move |pr| pr.number != other.number && pr.base == other.branch)
@@ -1132,17 +1139,25 @@ async fn delete_or_probe(
     }
 }
 
-/// A branch that is really gone passes its own `onto` to every entry bound for
-/// it. A notice about the old target (`base`, `target_gone`) goes with it; one
-/// about the entry's own branch (`head`, `delete_refused`, `awaited`) stays.
+/// A merged share's branch that is really gone passes its own `onto` to every
+/// entry bound for it; a declined or withdrawn share's never does (see
+/// [`retire_branches`]). A merged entry's notice about the old target (`base`,
+/// `target_gone`) goes with it; a notice about the entry's own branch (`head`,
+/// `delete_refused`, `awaited`, and `base` on a declined or withdrawn entry)
+/// stays.
 fn follow_retired<'a>(gone: &QueuedBranch, rest: impl Iterator<Item = &'a mut QueuedBranch>) {
+    if gone.why != RetireWhy::Merged {
+        return;
+    }
     for other in rest {
         if other.onto == gone.branch {
             other.onto = gone.onto.clone();
-            if matches!(
-                other.kept_kind(),
-                Some(KeptKind::Base | KeptKind::TargetGone)
-            ) {
+            if other.why == RetireWhy::Merged
+                && matches!(
+                    other.kept_kind(),
+                    Some(KeptKind::Base | KeptKind::TargetGone)
+                )
+            {
                 other.kept = None;
             }
         }
