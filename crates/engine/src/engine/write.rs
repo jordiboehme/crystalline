@@ -175,6 +175,7 @@ impl Engine {
         Ok(store
             .find_engram(domain, permalink)
             .await?
+            // Intended: once the writer's draft deleted the exact holder, no title namesake is named.
             .filter(|found| {
                 !entries
                     .iter()
@@ -429,6 +430,18 @@ impl Engine {
                 )
                 .await?
         {
+            // A holder that answers to another permalink is a title namesake
+            // or the writer's own draft at `rel`. When it stands at the slug
+            // path the landing has already refused it as another engram, and
+            // that refusal wins: the collision would offer an overwrite the
+            // landing then refuses too. A holder with this very permalink
+            // keeps its own answer, so a create never hears of overwrite=true
+            // for an unreadable file while the permalink lives elsewhere.
+            if held != permalink
+                && let Err(refused) = landing
+            {
+                return Err(refused);
+            }
             return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
         }
         let path = landing?;
@@ -591,22 +604,12 @@ impl Engine {
         // each other past it must still be caught HERE, atomically with the
         // write below - `overlay_draft` was resolved once, above, and is
         // reused rather than re-paired.
-        if !p.overwrite
-            && let Some((at, held)) = self
-                .permalink_taken(
-                    &p.domain,
-                    &rel,
-                    &permalink,
-                    overlay_draft,
-                    view.joined().is_some(),
-                )
-                .await?
-        {
-            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
-        }
+        //
         // The landing, settled again under the lock: an overwrite whose owner
         // moved, or a path another writer filled, since the unlocked look
-        // above is refused here rather than written over.
+        // above is refused here rather than written over. Worked out ahead of
+        // the create check so that check can prefer its refusal the way the
+        // unlocked one does.
         let settled = self
             .capture_landing(
                 &view,
@@ -619,7 +622,26 @@ impl Engine {
                 scope,
                 join,
             )
-            .await?;
+            .await;
+        if !p.overwrite
+            && let Some((at, held)) = self
+                .permalink_taken(
+                    &p.domain,
+                    &rel,
+                    &permalink,
+                    overlay_draft,
+                    view.joined().is_some(),
+                )
+                .await?
+        {
+            if held != permalink
+                && let Err(refused) = settled
+            {
+                return Err(refused);
+            }
+            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
+        }
+        let settled = settled?;
         if settled != path {
             return Err(EngineError::Conflict(format!(
                 "the engram '{permalink}' in domain '{}' moved while this write waited. Nothing was written; try again",

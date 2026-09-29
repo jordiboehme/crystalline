@@ -749,6 +749,62 @@ async fn a_create_whose_title_namesake_lives_elsewhere_keeps_the_collision() {
     );
 }
 
+const GAMMA_HELD: &str = "'gamma.md' in domain 'notes' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram";
+
+#[tokio::test]
+async fn a_create_at_a_slug_path_whose_namesake_answers_to_another_permalink_hears_m2() {
+    // `gamma.md` is titled Gamma, so the title match finds it for `gamma`,
+    // but it answers to `custom-gamma`: a create must not be offered an
+    // overwrite that the landing then refuses.
+    let other = engram("Gamma", "custom-gamma", "Not gamma.");
+    let (tmp, engine, _scratch) = fixture(false, &[("gamma.md", other.clone())]).await;
+    for overwrite in [false, true] {
+        let err = engine
+            .write_engram(&capture("Gamma", None, "Gamma body.", overwrite))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, GAMMA_HELD, "overwrite={overwrite}");
+        assert!(
+            !err.contains("already exists in domain") && !err.contains("overwrite=true"),
+            "no collision marker and no overwrite offer: {err}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("notes/gamma.md")).unwrap(),
+        other
+    );
+}
+
+#[tokio::test]
+async fn a_create_at_a_slug_path_the_writers_draft_holds_under_another_permalink_hears_m2() {
+    let other = engram("Gamma", "custom-gamma", "Not gamma.");
+    let (tmp, engine, _scratch) = fixture(true, &[("archive/else.md", other.clone())]).await;
+    ada_moves(&engine, "custom-gamma", "gamma.md").await;
+    for overwrite in [false, true] {
+        let err = engine
+            .write_engram_as(
+                &capture("Gamma", None, "Gamma body.", overwrite),
+                None,
+                &ada(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, GAMMA_HELD, "overwrite={overwrite}");
+        assert!(
+            !err.contains("already exists in domain") && !err.contains("overwrite=true"),
+            "no collision marker and no overwrite offer: {err}"
+        );
+    }
+    let notes = tmp.path().join("notes");
+    assert!(!notes.join("gamma.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(notes.join("archive/else.md")).unwrap(),
+        other
+    );
+}
+
 // --- a create reads the permalink the way the writer's view holds it --------
 
 #[tokio::test]
