@@ -155,7 +155,9 @@
  * runs once that ends. It loads the current address again (or the one a
  * move sent it to) through the session's loader, builds the room with
  * the arrival and the landing the room was entered with, and diffs it
- * with the room shown (`diffRooms`, C16): `same` does nothing; `text`
+ * with the room shown (`diffRooms`, C16): `same` does nothing unless the
+ * markdown the CRT reader shows changed where no room text comes from (the
+ * lead paragraph before the first heading), which counts as `text`; `text`
  * re-enters the room keeping the player, the doors, the malfunctions and
  * the latches, and flickers the lights for `FLICKER_MS`; `shape` shows
  * `STATION RECONFIGURING`, dips the lights for `DIP_MS` and enters the
@@ -1803,7 +1805,11 @@ export function createSession(opts: SessionOptions): Session {
     const built = roomFor(loaded, entryArrival, entryLanding);
     switch (diffRooms(room, built.room)) {
       case "same":
-        return;
+        // The room is built from the sections alone, but the CRT reader
+        // shows the whole markdown: a changed lead paragraph (the text
+        // before the first heading) is a text change all the same.
+        if (place?.content === built.place?.content) return;
+      // falls through
       case "text":
         if (!reenterKept(built.place, built.room, built.address)) return;
         dip = { kind: "flicker", at: stationTime(), next: null };

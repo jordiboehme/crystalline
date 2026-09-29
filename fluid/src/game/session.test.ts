@@ -4305,6 +4305,48 @@ describe("live changes (M4 C13 to C19)", () => {
     expect(session.current).toEqual(ROOM_AT);
   });
 
+  it("takes a changed lead paragraph as a text change: flicker, cue and the reader's new text", async () => {
+    // Mutation caught: `same` returning whatever the markdown (the lead
+    // paragraph before the first heading builds no room text, so the room
+    // serialises equal: no flicker, no cue, and the reader keeps the old
+    // text until a later change re-enters the room).
+    const releaded = placeOf({
+      content: CANNED_BRIDGE.content.replace(
+        "# Station Crystalline\n",
+        "# Station Crystalline\n\nA lead paragraph, written since.\n",
+      ),
+    });
+    expect(releaded.content).not.toBe(CANNED_BRIDGE.content);
+    expect(diffRooms(built(placeOf()), built(releaded))).toBe("same");
+    facing.kind = "terminal";
+    const { cues, sink } = recordSound();
+    const session = await standIn(placeOf(), { sound: sink });
+    const drawnBefore = drawn.length;
+    const base = Math.max(
+      ...drawn.slice(-20).map((d) => d.levels.reduce((a, b) => a + b, 0)),
+    );
+    cues.length = 0;
+    answers.set("hall", engramOf(releaded));
+    session.changed(frameOf());
+    await run(COALESCE_MS + FLICKER_MS + 200);
+    expect(cues).toContainEqual({ kind: "terminal" });
+    const low = drawn
+      .slice(drawnBefore)
+      .filter((d) => d.levels.reduce((a, b) => a + b, 0) < 0.8 * base);
+    expect(low.length).toBeGreaterThan(0);
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(hud.reader.mock.calls.at(-1)?.[0]?.content).toBe(releaded.content);
+
+    // The same markdown again: nothing to do.
+    cues.length = 0;
+    session.closeReader();
+    session.changed(frameOf());
+    await run(COALESCE_MS + FLICKER_MS + 200);
+    expect(cues).not.toContainEqual({ kind: "terminal" });
+  });
+
   it("sends a terminal cue on a text change and the dark room's ambience when the room goes dark (M4 C17, C19, C22)", async () => {
     // Mutation caught: the text change silent, the dark room entered with
     // its lit ambience.
