@@ -300,6 +300,7 @@ import {
 } from "./world/move";
 import { LIFT_RIDE_MS } from "./timing";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
+import { readerBody } from "./ui/crt";
 import { roomFor } from "./world/station";
 import type {
   Box,
@@ -1805,9 +1806,14 @@ export function createSession(opts: SessionOptions): Session {
     const built = roomFor(loaded, entryArrival, entryLanding);
     let diff = diffRooms(room, built.room);
     // The room is built from the sections alone, but the CRT reader shows
-    // the whole markdown: a changed lead paragraph (the text before the
-    // first heading) is a text change all the same.
-    if (diff === "same" && place?.content !== built.place?.content)
+    // the whole body: a changed lead paragraph (the text before the first
+    // heading) is a text change all the same. The frontmatter is not: the
+    // reader never shows it (a verified stamp, a salience, a status).
+    if (
+      diff === "same" &&
+      readerBody(place?.content ?? "") !==
+        readerBody(built.place?.content ?? "")
+    )
       diff = "text";
     switch (diff) {
       case "same":

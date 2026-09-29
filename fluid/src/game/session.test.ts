@@ -4347,6 +4347,31 @@ describe("live changes (M4 C13 to C19)", () => {
     expect(cues).not.toContainEqual({ kind: "terminal" });
   });
 
+  it("takes a change to the frontmatter alone as no change", async () => {
+    // Mutation caught: the whole markdown compared, frontmatter and all (a
+    // verified stamp or a status change would flicker and cue, while the
+    // reader, which never shows the frontmatter, shows the same text).
+    const restamped = placeOf({
+      content: CANNED_BRIDGE.content.replace(
+        "status: stable\n",
+        "status: stable\nverified: 2026-09-29\n",
+      ),
+    });
+    expect(restamped.content).not.toBe(CANNED_BRIDGE.content);
+    expect(diffRooms(built(placeOf()), built(restamped))).toBe("same");
+    const { cues, sink } = recordSound();
+    const session = await standIn(placeOf(), { sound: sink });
+    const before = rooms.length;
+    cues.length = 0;
+    asked = [];
+    answers.set("hall", engramOf(restamped));
+    session.changed(frameOf());
+    await run(COALESCE_MS + FLICKER_MS + 200);
+    expect(loadsOf("hall")).toBeGreaterThan(0);
+    expect(cues).not.toContainEqual({ kind: "terminal" });
+    expect(rooms.length).toBe(before);
+  });
+
   it("sends a terminal cue on a text change and the dark room's ambience when the room goes dark (M4 C17, C19, C22)", async () => {
     // Mutation caught: the text change silent, the dark room entered with
     // its lit ambience.

@@ -141,6 +141,23 @@ type OpenBlock =
   | { kind: "paragraph"; parts: string[] }
   | { kind: "list"; prefix: string; parts: string[] };
 
+/** The source lines of `markdown` after a leading `---` frontmatter block. */
+function bodyLines(markdown: string): string[] {
+  const source = markdown.split(/\r?\n/);
+  if (source[0]?.trim() !== "---") return source;
+  let i = 1;
+  while (i < source.length && source[i]?.trim() !== "---") i++;
+  return source.slice(i + 1);
+}
+
+/**
+ * The part of an engram's markdown the reader shows: everything after a
+ * leading `---` frontmatter block, which the reader never draws.
+ */
+export function readerBody(markdown: string): string {
+  return bodyLines(markdown).join("\n");
+}
+
 /**
  * An engram's markdown as screen lines, `columns` wide, plus the line index
  * of each `##` section by heading text. See the module doc for the rules.
@@ -150,16 +167,11 @@ export function crtLines(
   columns = CRT_COLUMNS,
 ): { lines: CrtLine[]; sections: Map<string, number[]> } {
   const width = Math.max(1, Math.floor(columns));
-  const source = markdown.split(/\r?\n/);
+  const source = bodyLines(markdown);
   const lines: CrtLine[] = [];
   const sections = new Map<string, number[]>();
 
   let i = 0;
-  if (source[0]?.trim() === "---") {
-    i = 1;
-    while (i < source.length && source[i]?.trim() !== "---") i++;
-    i++;
-  }
 
   let open: OpenBlock | null = null;
   // The source indent of each open list level, outermost first.
