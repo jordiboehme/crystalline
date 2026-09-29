@@ -51,10 +51,12 @@ const SHARING_DIRECT: &str = "direct";
 pub const DOMAIN_NAME_KEY: &str = "domain_name";
 
 /// Declare `name` as the domain's canonical name in MANIFEST `source`: an
-/// existing [`DOMAIN_NAME_KEY`] line is rewritten in place, a missing one
-/// goes right after `title`, where a person adding it by hand usually puts
-/// it. Two writers that pick the same place leave a merge nothing to
-/// reconcile.
+/// existing [`DOMAIN_NAME_KEY`] key, however it is spelled, is rewritten in
+/// place, a missing one goes right after `title`, where a person adding it
+/// by hand usually puts it. Two writers that pick the same place leave a
+/// merge nothing to reconcile. A frontmatter that cannot be cut into key
+/// blocks (flow style) is left as it is; see
+/// [`crate::emit::set_frontmatter_field_after`].
 pub fn set_declared_name(source: &str, name: &str) -> String {
     crate::emit::set_frontmatter_field_after(source, DOMAIN_NAME_KEY, name, "title")
 }

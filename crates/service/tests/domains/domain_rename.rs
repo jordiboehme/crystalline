@@ -1346,6 +1346,63 @@ both_backends!(
     a_local_rename_through_rename_domain_leaves_manifest_and_links_body
 );
 
+/// A full rename of `eng` over `manifest_text`, answering the MANIFEST it
+/// leaves behind without the `generated` stamp the edit path adds.
+async fn manifest_after_rename(store: Arc<Mutex<dyn Store>>, manifest_text: &str) -> String {
+    let m = machine(store).await;
+    std::fs::write(m.root.join("eng/MANIFEST.md"), manifest_text).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], true, "{report}");
+    std::fs::read_to_string(m.root.join("eng/MANIFEST.md"))
+        .unwrap()
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with("generated: "))
+        .collect()
+}
+
+/// A MANIFEST that names no domain yet gets `domain_name` right after the
+/// title, where a person adding it by hand puts it.
+async fn a_rename_puts_a_new_domain_name_right_after_the_title_body(store: Arc<Mutex<dyn Store>>) {
+    let renamed = manifest_after_rename(store, &manifest("Eng")).await;
+    assert_eq!(
+        renamed,
+        manifest("Eng").replacen("title: Eng\n", "title: Eng\ndomain_name: platform\n", 1)
+    );
+}
+both_backends!(
+    a_rename_puts_a_new_domain_name_right_after_the_title,
+    a_rename_puts_a_new_domain_name_right_after_the_title_body
+);
+
+/// A `domain_name` key spelled with quotes is the key: it is rewritten where
+/// it stands, never joined by a second copy the MANIFEST could not parse
+/// with.
+async fn a_rename_rewrites_a_quoted_domain_name_key_in_place_body(store: Arc<Mutex<dyn Store>>) {
+    let quoted = manifest("Eng").replacen(
+        "status: current\n",
+        "status: current\n\"domain_name\": eng-team\n",
+        1,
+    );
+    let renamed = manifest_after_rename(store, &quoted).await;
+    assert_eq!(
+        renamed,
+        manifest("Eng").replacen(
+            "status: current\n",
+            "status: current\ndomain_name: platform\n",
+            1
+        )
+    );
+}
+both_backends!(
+    a_rename_rewrites_a_quoted_domain_name_key_in_place,
+    a_rename_rewrites_a_quoted_domain_name_key_in_place_body
+);
+
 /// Two private domains of bob's beside the full-rename machine, `archive`
 /// (ada is a viewer) and `vault` (ada cannot see it), each with an `old.md`
 /// linking to `eng` by its canonical name. Answers that engram's text.
