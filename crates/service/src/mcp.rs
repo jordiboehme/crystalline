@@ -1697,9 +1697,8 @@ impl McpServer {
     /// to the one page it was invited into.
     ///
     /// The name is checked against what the GRANT opens
-    /// ([`Engine::granted_draft_named`]), which is the draft's own address,
-    /// its path and the path with the suffix off - the three spellings an
-    /// engram is addressed by - and against the path the join was opened for,
+    /// ([`Engine::granted_draft_named`]), which is the draft's own address or
+    /// its title - and against the path the join was opened for,
     /// so one of the owner's other drafts answering the same name routes
     /// nothing.
     async fn joined_for(
@@ -1722,7 +1721,7 @@ impl McpServer {
                 .await
                 .ok()
                 .flatten();
-            if named.is_some_and(|(_, path)| path == join.path) {
+            if named.is_some_and(|(_, path, _)| path == join.path) {
                 return Some(join);
             }
         }

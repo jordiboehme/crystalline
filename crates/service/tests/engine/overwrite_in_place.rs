@@ -532,7 +532,7 @@ async fn a_joined_refusal_names_the_path_the_caller_built_never_a_file_in_the_ow
         .to_string();
     assert_eq!(
         err,
-        "this session is working inside ada's draft of 'conventions/Code Review Standards.md', so a write to 'conventions/secret-plan.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+        "this session is working inside ada's draft of 'conventions/code-review-standards', so a write to 'conventions/secret-plan.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
     );
     assert!(!err.contains("Secret Plan.md"), "{err}");
 }
@@ -659,7 +659,7 @@ async fn a_joined_landing_refusal_never_names_a_file_only_the_owners_draft_holds
         .to_string();
     assert_eq!(
         err,
-        "this session is working inside ada's draft of 'conventions/code-review-standards.md', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+        "this session is working inside ada's draft of 'conventions/other-page', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
     );
     assert!(
         !err.contains("Secret Plan") && !err.contains("private"),

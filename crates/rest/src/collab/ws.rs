@@ -121,11 +121,11 @@ pub async fn join(
     }
     .map_err(join_error)?;
     // **The address the room opened is the path the link was for.** The two
-    // are resolved by different ladders - a grant matches a draft's permalink,
-    // its path or the path with the suffix off, while a room resolves its
-    // address through the owner's own view, which also matches a draft's
-    // TITLE - so one of the owner's OTHER drafts can answer the name the grant
-    // was checked against, and the greeting would hand it over. Checked here
+    // are resolved by different ladders - a grant matches only the drafts the
+    // link was for, by permalink or title, while a room resolves its address
+    // through the owner's own view, over ALL of their drafts - so one of the
+    // owner's OTHER drafts can answer the name the grant was checked against,
+    // and the greeting would hand it over. Checked here
     // rather than before the join because the room is what resolves the
     // address, and answered with the ordinary miss: which of somebody's drafts
     // answers to a name is not a caller's to learn. The connection is already
@@ -249,7 +249,7 @@ async fn whose_document(
             granted: None,
         });
     };
-    let Some((owner, path)) = state
+    let Some((owner, path, _)) = state
         .engine
         .granted_draft_named(domain, permalink, Some(owner), &scope)
         .await?
@@ -273,8 +273,10 @@ async fn whose_document(
         .holds(&mine, &holder, domain, &owner, &path)
     {
         return Err(
-            crate::engine::EngineError::Refused(crate::engine::granted_needs_join(&owner, &path))
-                .into(),
+            crate::engine::EngineError::Refused(crate::engine::granted_needs_join(
+                &owner, permalink,
+            ))
+            .into(),
         );
     }
     Ok(Room {

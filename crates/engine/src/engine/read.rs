@@ -58,7 +58,14 @@ impl Engine {
     /// screen to open a link on. If only the browser could see a granted
     /// draft, somebody could be handed a colleague's page and their own agent
     /// could not be shown what they were looking at. So the account's agent
-    /// sees it where its person does - at the path the link was for.
+    /// sees it where its person does - the draft the link was for.
+    ///
+    /// **By the names every engram answers to.** The granted draft answers to
+    /// its permalink and to its title, the title compared case-insensitively
+    /// like the resolver's title step, and never to its file path. A
+    /// permalink match beats a title match; among equals the path that sorts
+    /// first byte-wise wins. A title the reader's own drafts answer stays
+    /// theirs.
     ///
     /// **And nowhere else.** The widening is this function and this function
     /// only: search, listing, the reference candidate set and every other read
@@ -153,6 +160,8 @@ impl Engine {
             let store = self.store.lock().await;
             store.domain_id(&domain).await?
         };
+        // Every live grant that answers the name, and how.
+        let mut answers: Vec<(GrantMatch, String, String, GrantedDraft)> = Vec::new();
         for (path, owner) in held {
             if owner == account {
                 continue;
@@ -162,14 +171,14 @@ impl Engine {
             let Some(draft) = self.overlay_draft_at(&domain, &owner, &path).await? else {
                 continue;
             };
-            let names = [
-                draft.permalink.as_str(),
-                path.as_str(),
-                path.trim_end_matches(".md"),
-            ];
-            if !names.contains(&bare.as_str()) {
-                continue;
+            if let Some(how) = grant_match(&draft, &bare) {
+                answers.push((how, path, owner, draft));
             }
+        }
+        // A permalink match first; among equals the path that sorts first
+        // byte-wise, the tie-break `find_engram` uses.
+        answers.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        for (how, path, owner, draft) in answers {
             // **The reader's own row at that path wins.** A link handed to
             // somebody is not a reason to hide their own unfolded work from
             // them: the precedence is the mode's own - your own draft, then
@@ -182,6 +191,26 @@ impl Engine {
                 && own.holds_own_entry(domain_id, &path).await?
             {
                 continue;
+            }
+            // A title the reader's own drafts answer is theirs: their own
+            // work first, then what a grant widens. Read without registering
+            // anything, like the id lookup above.
+            if how == GrantMatch::Title
+                && let (Some(domain_id), Some(actor)) = (domain_id, own.actor())
+            {
+                let entries = {
+                    let store = self.store.lock().await;
+                    store.overlay_entries(domain_id, actor).await?
+                };
+                let wanted = bare.to_lowercase();
+                let theirs = entries
+                    .iter()
+                    .filter(|entry| !entry.tombstone)
+                    .filter_map(|entry| parse_engram(&entry.content).ok())
+                    .any(|engram| engram.frontmatter.title.to_lowercase() == wanted);
+                if theirs {
+                    continue;
+                }
             }
             return Ok(Some(granted_draft_json(&domain, &owner, &draft)?));
         }

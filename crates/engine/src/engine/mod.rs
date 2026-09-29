@@ -1325,12 +1325,34 @@ pub fn joined_write_is_elsewhere(owner: &str, draft: &str, path: &str) -> String
     )
 }
 
-pub fn granted_needs_join(owner: &str, path: &str) -> String {
+pub fn granted_needs_join(owner: &str, permalink: &str) -> String {
     format!(
-        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
+        "'{permalink}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
          Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or \
          draft your own copy in your own overlay and leave theirs as it stands."
     )
+}
+
+/// How a granted draft answers an identifier. Ordered: a permalink match
+/// beats a title match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GrantMatch {
+    Permalink,
+    Title,
+}
+
+/// Whether `draft` answers `identifier` (a `crystalline://` URL already
+/// reduced to its permalink): by its permalink, exactly, or by its title,
+/// lowercased on both sides the way the resolver's title step compares. A
+/// path or a path stem answers nothing, for a granted draft as for every
+/// other engram.
+pub(crate) fn grant_match(draft: &GrantedDraft, identifier: &str) -> Option<GrantMatch> {
+    if draft.permalink == identifier {
+        return Some(GrantMatch::Permalink);
+    }
+    let title = parse_engram(&draft.content).ok()?.frontmatter.title;
+    (!title.is_empty() && title.to_lowercase() == identifier.to_lowercase())
+        .then_some(GrantMatch::Title)
 }
 
 /// What somebody inside a join is told when the draft they joined is no longer

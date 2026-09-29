@@ -1130,9 +1130,14 @@ impl Engine {
         refuse_not_an_engram(&p.content)?;
         let (desc, source) = view.resolve(&p.identifier).await?;
         if desc.path != expected_path {
+            // The room is keyed by its draft's permalink, which the room's own
+            // address carries.
+            let joined = CrystallineUrl::parse(&p.identifier)
+                .map(|url| url.permalink)
+                .unwrap_or_else(|| p.identifier.clone());
             return Err(EngineError::Refused(joined_write_is_elsewhere(
                 view.writing_actor()?,
-                expected_path,
+                &joined,
                 &desc.path,
             )));
         }
@@ -1398,10 +1403,9 @@ impl Engine {
     ///
     /// Asked only when an ordinary resolution has already missed, and only for
     /// a caller holding at least one live link in this domain - which is
-    /// almost nobody, almost never. The name is matched against what the link
-    /// actually opens: the draft's own address, its path, and the path with
-    /// the suffix off, which are the three spellings the editor and the API
-    /// address an engram by.
+    /// almost nobody, almost never. The name is matched the way
+    /// [`grant_match`] matches it: the draft's permalink, or its title. A file
+    /// path names no engram, a granted draft included.
     pub(super) async fn teach_granted_miss(
         &self,
         domain: &str,
@@ -1411,7 +1415,7 @@ impl Engine {
         Ok(self
             .granted_draft_named(domain, identifier, None, scope)
             .await?
-            .map(|(owner, path)| granted_needs_join(&owner, &path)))
+            .map(|(owner, _, permalink)| granted_needs_join(&owner, &permalink)))
     }
 
     /// Present a share-link and open a join on the draft it names.
@@ -1565,7 +1569,8 @@ impl Engine {
     }
 
     /// The draft this caller holds a live link to that `identifier` names, as
-    /// `(owner, path)`, or `None` when the name is nothing of the sort.
+    /// `(owner, path, permalink)`, or `None` when the name is nothing of the
+    /// sort.
     ///
     /// `owner` narrows it to one author's, which is what a caller asking to
     /// open a room over somebody's document needs: it names whose, and the
@@ -1575,11 +1580,11 @@ impl Engine {
     ///
     /// Asked only where an answer would change what a caller is told, and only
     /// for a caller holding at least one live link in this domain - which is
-    /// almost nobody, almost never. The name is matched against what the link
-    /// actually opens: the draft's own address, its path, and the path with
-    /// the suffix off, which are the three spellings the editor and the API
-    /// address an engram by. A link whose draft has gone matches nothing, so a
-    /// dead link teaches nothing and opens nothing.
+    /// almost nobody, almost never. The name is matched the way
+    /// [`grant_match`] matches it: the draft's permalink, or its title. A
+    /// permalink match beats a title match, and among equals the path that
+    /// sorts first byte-wise wins. A link whose draft has gone matches nothing,
+    /// so a dead link teaches nothing and opens nothing.
     #[doc(hidden)]
     pub async fn granted_draft_named(
         &self,
@@ -1587,7 +1592,7 @@ impl Engine {
         identifier: &str,
         owner: Option<&str>,
         scope: &crate::scope::Scope,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<(String, String, String)>> {
         let Some(account) = crate::scope::overlay_actor(scope) else {
             return Ok(None);
         };
@@ -1598,6 +1603,10 @@ impl Engine {
             .overlay_grants_held(&account, domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let bare = CrystallineUrl::parse(identifier)
+            .map(|url| url.permalink)
+            .unwrap_or_else(|| identifier.to_string());
+        let mut answers: Vec<(GrantMatch, String, String, String)> = Vec::new();
         for (path, held_owner) in held {
             if held_owner == account || owner.is_some_and(|want| want != held_owner) {
                 continue;
@@ -1605,16 +1614,15 @@ impl Engine {
             let Some(draft) = self.overlay_draft_at(domain, &held_owner, &path).await? else {
                 continue;
             };
-            let names = [
-                draft.permalink.as_str(),
-                path.as_str(),
-                path.trim_end_matches(".md"),
-            ];
-            if names.contains(&identifier) {
-                return Ok(Some((held_owner, path)));
+            if let Some(how) = grant_match(&draft, &bare) {
+                answers.push((how, path, held_owner, draft.permalink));
             }
         }
-        Ok(None)
+        answers.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        Ok(answers
+            .into_iter()
+            .next()
+            .map(|(_, path, owner, permalink)| (owner, path, permalink)))
     }
 
     /// What a join may do to the OWNER's files, and what it may not.
@@ -1759,19 +1767,18 @@ impl Engine {
                 // path, it is a join to nothing: its author renamed it, folded
                 // it or took it back, and a refusal naming the page they joined
                 // would be a sentence about somewhere that is not there.
-                if self
+                let Some(joined) = self
                     .overlay_draft_at(domain, &join.owner, &join.path)
                     .await?
-                    .is_none()
-                {
+                else {
                     return Err(EngineError::Refused(joined_draft_is_gone(
                         &join.owner,
                         &join.path,
                     )));
-                }
+                };
                 return Err(EngineError::Refused(joined_write_is_elsewhere(
                     &join.owner,
-                    &join.path,
+                    &joined.permalink,
                     shown,
                 )));
             }
@@ -1793,10 +1800,13 @@ impl Engine {
         // that the draft is gone) nor write. A dead row would have taken a
         // path away from somebody it was never about, so it takes nothing: the
         // write goes back to being their own, which is what it always was.
-        if self.overlay_draft_at(domain, &owner, path).await?.is_none() {
+        let Some(draft) = self.overlay_draft_at(domain, &owner, path).await? else {
             return Ok(());
-        }
-        Err(EngineError::Refused(granted_needs_join(&owner, path)))
+        };
+        Err(EngineError::Refused(granted_needs_join(
+            &owner,
+            &draft.permalink,
+        )))
     }
 
     /// A registered domain's row id and content source, upserting the row the
@@ -2135,7 +2145,7 @@ mod landing_race_tests {
         let err = writer.await.unwrap().unwrap_err().to_string();
         assert_eq!(
             err,
-            "this session is working inside ada's draft of 'conventions/Code Review Standards.md', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+            "this session is working inside ada's draft of 'other-page', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
         );
         assert!(!err.contains("Secret Plan"), "{err}");
     }
