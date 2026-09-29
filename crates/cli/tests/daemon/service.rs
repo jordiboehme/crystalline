@@ -4773,6 +4773,11 @@ fn an_autostarted_daemon_works_in_the_state_directory() {
     let work = env.dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
 
+    // No daemon answers yet, so the one inspected below is the client's
+    // autostart.
+    let (running, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(!running, "no daemon before the client starts one: {out}");
+
     let client = Mcp::spawn_in(&env, &work, None);
     env.wait_ready();
 
@@ -4805,7 +4810,11 @@ fn an_autostarted_daemon_works_in_the_state_directory() {
         .lines()
         .find(|l| l.starts_with("Runs in: "))
         .unwrap_or_else(|| panic!("status names where the daemon runs: {human}"));
-    assert!(line.ends_with("crystalline"), "the state directory: {line}");
+    assert_eq!(
+        line,
+        format!("Runs in: {working_dir}"),
+        "the same directory as the JSON report: {human}"
+    );
 
     let (_, doctor) = env.run(&["doctor"]);
     assert!(

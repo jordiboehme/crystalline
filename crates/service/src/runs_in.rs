@@ -47,7 +47,8 @@ pub struct RunsIn {
     pub in_job: Option<bool>,
     /// Windows, in a job: whether its immediate job lets a child break away.
     /// `None` when not in a job, when the limits could not be read and off
-    /// Windows.
+    /// Windows. It speaks for the immediate job only: with nested jobs, a
+    /// parent job that forbids breakaway can still keep a child inside.
     pub job_allows_breakaway: Option<bool>,
     /// Windows: the package full name the daemon runs under; `None` when it
     /// has none, and off Windows.
@@ -83,19 +84,25 @@ impl RunsIn {
             .unwrap_or("working directory unknown")
     }
 
-    /// The job in words, `None` off Windows (where `in_job` is never set).
-    fn job(&self) -> Option<String> {
-        let in_job = self.in_job?;
-        let mut job = match (in_job, self.job_allows_breakaway) {
-            (false, _) => "none".to_string(),
-            (true, Some(true)) => "yes, breakaway allowed".to_string(),
-            (true, Some(false)) => "yes, breakaway not allowed".to_string(),
-            (true, None) => "yes, breakaway unknown".to_string(),
+    /// A Windows report: the job was read or a package is known. Neither is
+    /// ever set off Windows.
+    fn is_windows(&self) -> bool {
+        self.in_job.is_some() || self.package.is_some()
+    }
+
+    /// The job in words, for a Windows report.
+    fn job(&self) -> String {
+        let mut job = match (self.in_job, self.job_allows_breakaway) {
+            (None, _) => "unknown".to_string(),
+            (Some(false), _) => "none".to_string(),
+            (Some(true), Some(true)) => "yes, breakaway allowed".to_string(),
+            (Some(true), Some(false)) => "yes, breakaway not allowed".to_string(),
+            (Some(true), None) => "yes, breakaway unknown".to_string(),
         };
         if self.breakaway_refused {
             job.push_str(", refused at start");
         }
-        Some(job)
+        job
     }
 
     fn package_identity(&self) -> &str {
@@ -104,21 +111,23 @@ impl RunsIn {
 
     /// The one short line `crystalline status` prints after `Runs in:`.
     pub fn summary(&self) -> String {
-        match self.job() {
-            Some(job) => format!(
-                "{} (job: {job}, package identity: {})",
+        if self.is_windows() {
+            format!(
+                "{} (job: {}, package identity: {})",
                 self.dir(),
+                self.job(),
                 self.package_identity()
-            ),
-            None => self.dir().to_string(),
+            )
+        } else {
+            self.dir().to_string()
         }
     }
 
     /// Doctor's lines, one fact each.
     pub fn details(&self) -> Vec<String> {
         let mut lines = vec![format!("daemon working directory: {}", self.dir())];
-        if let Some(job) = self.job() {
-            lines.push(format!("daemon job: {job}"));
+        if self.is_windows() {
+            lines.push(format!("daemon job: {}", self.job()));
             lines.push(format!(
                 "daemon package identity: {}",
                 self.package_identity()
@@ -145,7 +154,7 @@ impl RunsIn {
             && (self.job_allows_breakaway == Some(false) || self.breakaway_refused);
         if cannot_leave {
             warnings.push(format!(
-                "the daemon runs inside the job of the program that started it and cannot leave it. {MAY_HOLD_FILES}"
+                "the daemon runs inside a job it cannot leave, from the program that started it or from one around it such as a CI runner. {MAY_HOLD_FILES}"
             ));
         }
         if let Some(package) = &self.package {
@@ -174,16 +183,16 @@ fn job_and_package() -> (Option<bool>, Option<bool>, Option<String>) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     let mut member: windows_sys::core::BOOL = 0;
-    // This process's pseudo handle, a null job handle (any job at all) and a
-    // valid out pointer.
+    // SAFETY: this process's pseudo handle, a null job handle (any job at
+    // all) and a valid out pointer.
     let asked = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut member) };
     let in_job = (asked != 0).then_some(member != 0);
 
     let job_allows_breakaway = if in_job == Some(true) {
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // A null job handle reads the immediate job of this process, the one
-        // whose limit decides a child's breakaway; the buffer is the struct
-        // the class names, with its exact size.
+        // SAFETY: a null job handle reads the immediate job of this process,
+        // the one whose limit decides a child's breakaway; the buffer is the
+        // struct the class names, with its exact size.
         let read = unsafe {
             QueryInformationJobObject(
                 std::ptr::null_mut(),
@@ -217,7 +226,8 @@ fn package_full_name() -> Option<String> {
     use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 
     let mut len: u32 = 0;
-    // Asked for the length first: a zero length and a null buffer.
+    // SAFETY: the length is asked for first, with a zero length and a null
+    // buffer.
     let rc = unsafe { GetCurrentPackageFullName(&mut len, std::ptr::null_mut()) };
     if rc == APPMODEL_ERROR_NO_PACKAGE {
         return None;
@@ -227,7 +237,7 @@ fn package_full_name() -> Option<String> {
         return None;
     }
     let mut buf = vec![0u16; len as usize];
-    // A buffer of exactly the length the first call asked for.
+    // SAFETY: a buffer of exactly the length the first call asked for.
     let rc = unsafe { GetCurrentPackageFullName(&mut len, buf.as_mut_ptr()) };
     if rc != ERROR_SUCCESS {
         tracing::debug!("could not read this process's package identity (error {rc})");
@@ -278,6 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn a_known_package_is_shown_even_when_the_job_could_not_be_read() {
+        let unread = RunsIn {
+            working_dir: Some(r"C:\s\crystalline".to_string()),
+            package: Some("Claude_x".to_string()),
+            ..RunsIn::default()
+        };
+        assert_eq!(
+            unread.summary(),
+            r"C:\s\crystalline (job: unknown, package identity: Claude_x)"
+        );
+        assert_eq!(
+            unread.details(),
+            [
+                r"daemon working directory: C:\s\crystalline",
+                "daemon job: unknown",
+                "daemon package identity: Claude_x",
+            ]
+        );
+    }
+
+    #[test]
     fn details_name_every_fact_and_the_windows_ones_only_on_windows() {
         let unix = RunsIn {
             working_dir: Some("/s/crystalline".to_string()),
@@ -309,7 +340,7 @@ mod tests {
         let stuck = windows(true, Some(false), None).warnings();
         assert_eq!(stuck.len(), 1, "{stuck:?}");
         assert!(
-            stuck[0].starts_with("the daemon runs inside the job of the program that started it"),
+            stuck[0].starts_with("the daemon runs inside a job it cannot leave"),
             "{stuck:?}"
         );
 

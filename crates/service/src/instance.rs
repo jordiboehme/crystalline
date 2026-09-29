@@ -1705,7 +1705,12 @@ fn config_env_for_daemon(value: &std::ffi::OsStr) -> Option<PathBuf> {
     if value.is_empty() {
         return None;
     }
-    let expanded = config::expand_tilde(&value.to_string_lossy());
+    // Tilde expansion needs text; a value that is not UTF-8 is kept as it is,
+    // so the daemon never gets a different file name.
+    let expanded = match value.to_str() {
+        Some(text) => config::expand_tilde(text),
+        None => PathBuf::from(value),
+    };
     if expanded.is_absolute() {
         return None;
     }
@@ -2187,6 +2192,16 @@ mod tests {
         assert_eq!(config_env_for_daemon(OsStr::new("")), None);
         assert_eq!(config_env_for_daemon(cwd.join("c.yaml").as_os_str()), None);
         assert_eq!(config_env_for_daemon(OsStr::new("~/c.yaml")), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"conf/\xffconfig.yaml");
+            assert_eq!(
+                config_env_for_daemon(raw),
+                Some(cwd.join(raw)),
+                "a value that is not UTF-8 keeps its bytes"
+            );
+        }
     }
 
     /// The working directory is created before the spawn: a missing one would

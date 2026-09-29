@@ -209,10 +209,23 @@ impl Bridge {
         Bridge::start(cmd)
     }
 
-    fn start(mut cmd: Command) -> Bridge {
+    /// As [`Bridge::attach`], with the client's stderr (its log, the one a
+    /// harness keeps) written to `log` at the default `warn` level.
+    fn attach_logging_to(env: &Env, log: &Path) -> Bridge {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.env("RUST_LOG", "warn").arg("mcp");
+        Bridge::start_with(cmd, std::fs::File::create(log).unwrap().into())
+    }
+
+    fn start(cmd: Command) -> Bridge {
+        Bridge::start_with(cmd, Stdio::null())
+    }
+
+    fn start_with(mut cmd: Command, stderr: Stdio) -> Bridge {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -547,11 +560,13 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
         std::io::Error::last_os_error()
     );
 
-    let bridge = Bridge::attach(&env);
+    let client_log_path = env.dir.join("client.stderr");
+    let bridge = Bridge::attach_logging_to(&env, &client_log_path);
     let status = wait_for_ctl_status(&env);
     let log = std::fs::read_to_string(env.state_dir().join("daemon.log")).unwrap_or_default();
     let (_, doctor) = run(&env, &["doctor"]);
     drop(bridge);
+    let client_log = std::fs::read_to_string(&client_log_path).unwrap_or_default();
     shutdown_daemon(&env);
     // The job handle goes last; the job has no kill-on-close limit.
     // SAFETY: `job` is a valid handle owned by this test and closed once.
@@ -566,7 +581,11 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
         "the daemon's startup warning is in daemon.log: {log}"
     );
     assert!(
-        doctor.contains("[warning] the daemon runs inside the job of the program that started it"),
+        client_log.contains("Windows refused the breakaway"),
+        "the client says it too, in the log its harness keeps: {client_log}"
+    );
+    assert!(
+        doctor.contains("[warning] the daemon runs inside a job it cannot leave"),
         "doctor warns: {doctor}"
     );
 }
