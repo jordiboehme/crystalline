@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../../api/client";
 import { DOMAINS_QUERY_KEY, readListing } from "../../api/domains";
+import { mountKeyingAtOnce } from "../../test/gap";
 import { answersFor, type Answer } from "../../test/harness";
 import { LevelSelect } from "./LevelSelect";
 import {
@@ -306,5 +307,38 @@ describe("LevelSelect", () => {
     expect(rows().at(-1)).toBe("d199");
     expect(rows()).toHaveLength(LEVEL_ROWS);
     expect(screen.getByText("200/200")).toBeInTheDocument();
+  });
+});
+
+describe("LevelSelect's first key", () => {
+  // Mutation caught: the field's focus or the key listener set in a
+  // passive effect, a task after the commit that shows the select: a fast
+  // first key after the cheat word goes into no field, or an Esc is lost.
+  it("takes a key sent the moment the select is shown", async () => {
+    apiMock.mockImplementation(
+      answersFor({ "/domains": () => listing(["eng"]) }),
+    );
+    const onClose = vi.fn<() => void>();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { sent, unmount } = await mountKeyingAtOnce(
+      <QueryClientProvider client={client}>
+        <LevelSelect current="eng" onJump={vi.fn()} onClose={onClose} />
+      </QueryClientProvider>,
+      'input[aria-label="Domain name"]',
+      [{ key: "Escape" }],
+    );
+    try {
+      expect(sent).toHaveLength(1);
+      // The key went to the field: it had the focus when the key came.
+      expect(sent[0]!.target).toBe(
+        document.querySelector('input[aria-label="Domain name"]'),
+      );
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      client.clear();
+    }
   });
 });

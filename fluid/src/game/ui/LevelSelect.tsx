@@ -25,7 +25,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../../api/domains";
 import { GAME_STALE_MS } from "../data/source";
@@ -86,11 +86,13 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
   const at = stepSelection(shown.length, selected, 0);
   const { start, end } = levelWindow(shown.length, at);
 
-  useEffect(() => {
+  // Layout effects: the focus and the keys are in place in the commit
+  // that shows the select, so a fast first key after it opens is not lost.
+  useLayoutEffect(() => {
     field.current?.focus();
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.key) {

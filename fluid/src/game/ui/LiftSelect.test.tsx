@@ -6,6 +6,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { mountKeyingAtOnce } from "../../test/gap";
 import type { LiftStop } from "../world/types";
 import { LiftSelect } from "./LiftSelect";
 import { LEVEL_ROWS } from "./levels";
@@ -218,5 +219,34 @@ describe("LiftSelect", () => {
     expect(rows().at(-1)).toBe("d199");
     expect(rows()).toHaveLength(LEVEL_ROWS);
     expect(screen.getByText("200/200")).toBeInTheDocument();
+  });
+});
+
+describe("LiftSelect's first key", () => {
+  // Mutation caught: the field's focus or the key listener set in a
+  // passive effect, a task after the commit that shows the overlay: a
+  // fast first key after Space goes into no field, or an Esc is lost.
+  it("takes a key sent the moment the overlay is shown", async () => {
+    const onClose = vi.fn<() => void>();
+    const { sent, unmount } = await mountKeyingAtOnce(
+      <LiftSelect
+        stops={[stop("Deck one"), stop("Deck two")]}
+        note={null}
+        onRide={vi.fn()}
+        onClose={onClose}
+      />,
+      'input[aria-label="Stop name"]',
+      [{ key: "Escape" }],
+    );
+    try {
+      expect(sent).toHaveLength(1);
+      // The key went to the field: it had the focus when the key came.
+      expect(sent[0]!.target).toBe(
+        document.querySelector('input[aria-label="Stop name"]'),
+      );
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+    }
   });
 });

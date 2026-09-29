@@ -28,7 +28,7 @@
  * the overlay closed.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { LiftStop } from "../world/types";
 import {
@@ -93,11 +93,13 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
   const at = stepSelection(shown.length, selected, 0);
   const { start, end } = levelWindow(shown.length, at);
 
-  useEffect(() => {
+  // Layout effects: the focus and the keys are in place in the commit
+  // that shows the overlay, so a fast first key after Space is not lost.
+  useLayoutEffect(() => {
     field.current?.focus();
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.key) {
