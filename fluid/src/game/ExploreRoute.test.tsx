@@ -1647,6 +1647,46 @@ describe("ExploreRoute", () => {
     // Mutation caught: the input taking a key the connecting screen
     // cancelled (the key that skips the screen also acts in the station:
     // F opening a Fluid tab, W walking).
+    it("skips the connecting screen on a key sent the moment it appears", async () => {
+      // Mutation caught: the skip listener added in a passive effect, a
+      // task after the commit that shows the screen: a key in between is
+      // lost and the screen stays up (the gap the Esc test above falls
+      // into when the machine is loaded).
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      serve();
+      let sent: KeyboardEvent | null = null;
+      const probe = new MutationObserver(() => {
+        if (sent !== null) return;
+        if (!document.querySelector('[role="dialog"][aria-label="Connecting"]'))
+          return;
+        probe.disconnect();
+        sent = new KeyboardEvent("keydown", {
+          key: "a",
+          code: "KeyA",
+          bubbles: true,
+          cancelable: true,
+        });
+        act(() => {
+          document.body.dispatchEvent(sent!);
+        });
+      });
+      probe.observe(document.body, { childList: true, subtree: true });
+      try {
+        const view = renderAt("/%CF%80");
+        await waitFor(() => {
+          expect(sent).not.toBeNull();
+        });
+        await settle(100);
+        expect(sent!.defaultPrevented).toBe(true);
+        expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+        view.unmount();
+      } finally {
+        probe.disconnect();
+      }
+    });
+
     it("takes the key that skips the connecting screen as no command (M4 C26)", async () => {
       gl.available = true;
       stubAudio();

@@ -84,7 +84,8 @@ export function Connecting({ number, name, onDone }: ConnectingProps) {
     };
   }, []);
 
-  useEffect(() => {
+  // In the commit that shows it too, so the first key already skips it.
+  useLayoutEffect(() => {
     let done = false;
     const finish = () => {
       if (done) return;
