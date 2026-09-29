@@ -20,7 +20,8 @@ postgres = ["crystalline-index/postgres"]
 # The test seams this crate carries outside plain `cfg(test)`: the engine's
 # arming methods and counters and nudge's share-walk counter. Off by
 # default; crystalline-service's `testing` feature turns it on for that
-# package's test builds, which is how its integration tests reach them.
+# package's test builds, which is how its integration tests reach them, and
+# crystalline-rest's dev-dependency turns it on for the event stream's tests.
 testing = []
 
 [dependencies]

@@ -1050,6 +1050,11 @@ pub struct Engine {
     // gives up, when a test wants less than the real limit.
     #[cfg(any(test, feature = "testing"))]
     rename_drain_wait: std::sync::Mutex<Option<std::time::Duration>>,
+    // The event-stream seam: while armed, `hidden_domains` fails the way an
+    // accounts store that cannot answer does. See
+    // `Engine::fail_hidden_domains`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_hidden_domains: std::sync::atomic::AtomicBool,
 }
 
 /// One drafted engram, as the share-link surface hands it to the account a
@@ -1768,6 +1773,8 @@ impl Engine {
             rename_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_drain_wait: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            fail_hidden_domains: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1958,6 +1965,14 @@ impl Engine {
         }
     }
 
+    /// Arm (`true`) or disarm a failure of every [`Engine::hidden_domains`]
+    /// call, the answer a locked or unreadable accounts store gives.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_hidden_domains(&self, on: bool) {
+        self.fail_hidden_domains
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The private domains `scope` may not see, or `None` for no filtering at
     /// all.
     ///
@@ -1977,6 +1992,13 @@ impl Engine {
         &self,
         scope: &crate::scope::Scope,
     ) -> Result<Option<HashSet<String>>> {
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .fail_hidden_domains
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::Internal("armed".to_string()));
+        }
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };

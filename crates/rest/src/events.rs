@@ -869,6 +869,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_re_resolution_drops_the_event_and_retries_on_the_next() {
+        // Catches the fail-closed branch turned into an admit: an accounts
+        // store that cannot answer must drop the event rather than let it
+        // through on a stale cache, and the next event must try again.
+        let (_dir, state) = state().await;
+        state
+            .auth
+            .add_user("keeper", "keeper", None, crate::Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        state
+            .auth
+            .set_domain_visibility("lab", true, "keeper")
+            .await
+            .unwrap();
+        state.engine.set_domain_access(state.access.clone());
+        let bus = state.engine.changes();
+        let mut subscriber = subscriber(
+            &state,
+            &anonymous(),
+            Some(HashSet::from(["lab".to_string()])),
+            bus.subscribe(),
+            None,
+        );
+
+        state.engine.fail_hidden_domains(true);
+        subscriber.resolved_at = Instant::now() - (VISIBILITY_TTL + Duration::from_secs(1));
+        bus.announce(modified("1")).unwrap();
+        assert!(
+            !hears(&mut subscriber).await,
+            "a refresh that fails drops the event, even for a visible domain"
+        );
+
+        state.engine.fail_hidden_domains(false);
+        bus.announce(modified("2")).unwrap();
+        assert!(
+            hears(&mut subscriber).await,
+            "and the next event tries again"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lag_marks_the_cache_stale() {
         // Catches a lag that trusted the cache afterwards: the
         // lost events may include a rename's captured frame, so the next
