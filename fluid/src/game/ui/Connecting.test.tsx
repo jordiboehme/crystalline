@@ -32,9 +32,78 @@ describe("Connecting", () => {
     act(() => {
       vi.advanceTimersByTime(Math.ceil((chars * 1000) / TYPE_CPS));
     });
-    for (const line of LINES)
-      expect(screen.getByText(line)).toBeInTheDocument();
+    for (const line of LINES) expect(dialog.textContent).toContain(line);
     expect(onDone).not.toHaveBeenCalled();
+  });
+
+  // Mutation caught: the typing timed by `Date.now()` (a wall clock set
+  // back stalls the lines); the clock read at the interval's rate instead
+  // of the elapsed time.
+  it("types by performance.now(), not by the wall clock", () => {
+    render(<Connecting number="555-0142" name="ENG" onDone={vi.fn()} />);
+    const dialog = screen.getByRole("dialog", { name: CONNECTING_LABEL });
+    // The wall clock steps back an hour, as an NTP step or a wake can.
+    vi.setSystemTime(Date.now() - 3_600_000);
+    act(() => {
+      vi.advanceTimersByTime(
+        Math.ceil(((LINES[0]!.length + 1) * 1000) / TYPE_CPS),
+      );
+    });
+    expect(dialog.textContent).toContain("ATDT 555-0142");
+  });
+
+  // Mutation caught: the focus left where it was (a screen reader user
+  // hears nothing of the screen), or not given back when it goes.
+  it("takes the focus when it shows and gives it back when it goes", () => {
+    const before = document.createElement("button");
+    document.body.append(before);
+    before.focus();
+    try {
+      const view = render(
+        <Connecting number="555-0142" name="ENG" onDone={vi.fn()} />,
+      );
+      expect(document.activeElement).toBe(
+        screen.getByRole("dialog", { name: CONNECTING_LABEL }),
+      );
+      view.unmount();
+      expect(document.activeElement).toBe(before);
+    } finally {
+      before.remove();
+    }
+  });
+
+  // Mutation caught: no live region (a screen reader hears nothing for up
+  // to five seconds), one mounted only with its text, or the typed
+  // characters themselves announced one by one.
+  it("hands each whole line to a polite live region mounted empty", () => {
+    render(<Connecting number="555-0142" name="ENG" onDone={vi.fn()} />);
+    const dialog = screen.getByRole("dialog", { name: CONNECTING_LABEL });
+    const live = dialog.querySelectorAll('[aria-live="polite"]');
+    expect(live).toHaveLength(1);
+    const region = live[0]!;
+    expect(region.textContent).toBe("");
+    // A line half typed is not in it yet.
+    act(() => {
+      vi.advanceTimersByTime(Math.ceil((4 * 1000) / TYPE_CPS));
+    });
+    expect(region.textContent).toBe("");
+    act(() => {
+      vi.advanceTimersByTime(
+        Math.ceil(((LINES[0]!.length + 1) * 1000) / TYPE_CPS),
+      );
+    });
+    expect(region.textContent).toBe("ATDT 555-0142");
+    act(() => {
+      vi.advanceTimersByTime(
+        Math.ceil((LINES.join("").length * 1000) / TYPE_CPS),
+      );
+    });
+    expect([...region.children].map((p) => p.textContent)).toEqual(LINES);
+    // The typed characters are hidden from a screen reader.
+    for (const p of dialog.querySelectorAll("p")) {
+      if (region.contains(p)) continue;
+      expect(p.closest("[aria-hidden]")).not.toBeNull();
+    }
   });
 
   // Mutation caught: the `preventDefault` dropped (an Esc that skips the
@@ -116,6 +185,11 @@ describe("Connecting", () => {
     const second = render(
       <Connecting number="555-0142" name="ENG" onDone={late} />,
     );
+    // The focus it takes queues jsdom's own zero-delay selection timer:
+    // let that one run, so the count below is the screen's timers alone.
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
     second.unmount();
     expect(vi.getTimerCount()).toBe(0);
     act(() => {

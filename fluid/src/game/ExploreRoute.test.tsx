@@ -1330,6 +1330,33 @@ describe("ExploreRoute", () => {
     view.unmount();
   });
 
+  it("opens the new address of a move from the reader's F (M4 C18)", async () => {
+    // Mutation caught: the reader's F reading `current` alone, which opens
+    // the old permalink's page, a 404 since the move.
+    gl.available = true;
+    serve();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    sessionStub.factory = (opts) => ({
+      ...stubSession(opts, { ride: vi.fn(), closeLift: vi.fn() }),
+      current: { kind: "engram", domain: "eng", permalink: "alpha" },
+      page: { kind: "engram", domain: "eng", permalink: "notes/alpha" },
+    });
+    const view = renderAt("/%CF%80/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(made.options).toHaveLength(1);
+      expect(made.openFluid).not.toBeNull();
+    });
+    act(() => {
+      made.openFluid?.();
+    });
+    expect(open).toHaveBeenCalledWith(
+      "/d/eng/e/notes/alpha",
+      "_blank",
+      "noopener",
+    );
+    view.unmount();
+  });
+
   it("invalidates with Fluid's table and passes its identity (M4 C13)", async () => {
     // Mutation caught: no identity passed, the game inbound prefix not
     // invalidated, the mount's reset after the first go or refetching.
@@ -1601,7 +1628,8 @@ describe("ExploreRoute", () => {
       expect(sound.dials.map((d) => d.number)).toEqual([dialNumber("eng")]);
       expect(sound.dials[0]?.director).toBe(sound.directors.at(-1));
       await settle(1_000);
-      expect(within(dialog).getByText("ENG")).toBeInTheDocument();
+      // Typed out, and handed whole to the screen's live region.
+      expect(within(dialog).getAllByText("ENG")).toHaveLength(2);
       // A click skips it and hands the session its keys back.
       fireEvent.click(dialog);
       expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
