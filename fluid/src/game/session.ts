@@ -1803,13 +1803,15 @@ export function createSession(opts: SessionOptions): Session {
       return;
     }
     const built = roomFor(loaded, entryArrival, entryLanding);
-    switch (diffRooms(room, built.room)) {
+    let diff = diffRooms(room, built.room);
+    // The room is built from the sections alone, but the CRT reader shows
+    // the whole markdown: a changed lead paragraph (the text before the
+    // first heading) is a text change all the same.
+    if (diff === "same" && place?.content !== built.place?.content)
+      diff = "text";
+    switch (diff) {
       case "same":
-        // The room is built from the sections alone, but the CRT reader
-        // shows the whole markdown: a changed lead paragraph (the text
-        // before the first heading) is a text change all the same.
-        if (place?.content === built.place?.content) return;
-      // falls through
+        return;
       case "text":
         if (!reenterKept(built.place, built.room, built.address)) return;
         dip = { kind: "flicker", at: stationTime(), next: null };
