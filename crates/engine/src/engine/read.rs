@@ -1,5 +1,21 @@
 use super::*;
 
+/// Whether a grant matched only by its TITLE yields to what the reader's own
+/// view answers `name` with: an engram in that view whose permalink is the
+/// name (the team's page, unless they deleted it, or a draft of their own),
+/// or one of their own drafts that answers it the way
+/// [`DomainView::resolve_draft`] would. The one title rule for reads, unjoined
+/// edits and saves ([`Engine::granted_answer`]) and for the joined and room
+/// lookups ([`Engine::granted_draft_named`]).
+pub(super) async fn title_grant_yields(
+    own: &DomainView<'_>,
+    domain_id: DomainId,
+    name: &str,
+) -> Result<bool> {
+    Ok(own.permalink_holder(domain_id, name).await?.is_some()
+        || own.holds_own_draft_named(domain_id, name).await?)
+}
+
 impl Engine {
     // --- read ----------------------------------------------------------------
 
@@ -242,8 +258,7 @@ impl Engine {
                 let answered = match view_answers {
                     Some(answered) => answered,
                     None => {
-                        let answered = own.permalink_holder(domain_id, &bare).await?.is_some()
-                            || own.holds_own_draft_named(domain_id, &bare).await?;
+                        let answered = title_grant_yields(&own, domain_id, &bare).await?;
                         view_answers = Some(answered);
                         answered
                     }

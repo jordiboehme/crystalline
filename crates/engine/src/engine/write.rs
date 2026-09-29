@@ -1445,6 +1445,17 @@ impl Engine {
             .map(|(owner, _, permalink)| granted_needs_join(&owner, &permalink)))
     }
 
+    /// How many unjoined edits and saves asked the accounts store whether a
+    /// granted draft answers their name, since this engine was built. The
+    /// seam exists because a check that finds nothing changes no answer.
+    /// Nothing in the daemon, the CLI or the MCP surface reads this.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn granted_name_checks_run(&self) -> u64 {
+        self.granted_name_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The join sentence for an unjoined edit or save whose name a read would
     /// answer with a granted draft ([`Engine::granted_answer`]).
     ///
@@ -1453,15 +1464,25 @@ impl Engine {
     /// would be written into the caller's own draft of the team's page with
     /// that title, a write somewhere other than the page they were just shown.
     /// Nothing is asked for a caller with no account, and nothing is written.
+    ///
+    /// Nor for a domain that takes changes directly, or an instance that
+    /// serves no accounts: no grant can apply there, so an ordinary edit
+    /// makes no accounts-store call for it and cannot fail on one.
     pub(super) async fn refuse_granted_name(
         &self,
         domain: &str,
         identifier: &str,
         scope: &crate::scope::Scope,
     ) -> Result<()> {
-        if crate::scope::overlay_actor(scope).is_none() {
+        if crate::scope::overlay_actor(scope).is_none()
+            || !self.reviews_changes(domain)
+            || self.domain_access.get().is_none()
+        {
             return Ok(());
         }
+        #[cfg(any(test, feature = "testing"))]
+        self.granted_name_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hidden = self.hidden_for(scope).await?;
         match self
             .granted_answer(domain, identifier, scope, &hidden)
@@ -1640,8 +1661,12 @@ impl Engine {
     /// almost nobody, almost never. The name is matched the way
     /// [`grant_match`] matches it: the draft's permalink, or its title. A
     /// permalink match beats a title match, and among equals the path that
-    /// sorts first byte-wise wins. A link whose draft has gone matches nothing,
-    /// so a dead link teaches nothing and opens nothing.
+    /// sorts first byte-wise wins. A title match applies only where a read's
+    /// would ([`super::read::title_grant_yields`]): when nothing in the
+    /// caller's own view has that name as its permalink and none of their own
+    /// drafts answers it.
+    /// A link whose draft has gone matches nothing, so a dead link teaches
+    /// nothing and opens nothing.
     #[doc(hidden)]
     pub async fn granted_draft_named(
         &self,
@@ -1680,10 +1705,29 @@ impl Engine {
             }
         }
         answers.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
-        Ok(answers
-            .into_iter()
-            .next()
-            .map(|(_, path, owner, permalink)| (owner, path, permalink)))
+        let Some((how, path, owner, permalink)) = answers.into_iter().next() else {
+            return Ok(None);
+        };
+        // A title match yields the way a read's does (`title_grant_yields`),
+        // so a name that reads as the reader's own page never routes a joined
+        // write or opens a room into the grant. Permalink matches sort first,
+        // so the best answer being a title match means every answer is one.
+        if how == GrantMatch::Title {
+            let hidden = self.hidden_for(scope).await?;
+            let Ok(own) = DomainView::for_read(self, domain, &hidden, scope) else {
+                return Ok(None);
+            };
+            let domain_id = {
+                let store = self.store.lock().await;
+                store.domain_id(domain).await?
+            };
+            if let Some(domain_id) = domain_id
+                && super::read::title_grant_yields(&own, domain_id, &bare).await?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((owner, path, permalink)))
     }
 
     /// What a join may do to the OWNER's files, and what it may not.

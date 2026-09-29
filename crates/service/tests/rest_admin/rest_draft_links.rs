@@ -1546,6 +1546,99 @@ async fn an_unjoined_edit_of_a_granted_title_is_refused_like_the_read_answers() 
     );
 }
 
+/// The joined and room lookup takes a title match the way a read does: a
+/// grant found only by its title yields to the team page whose permalink is
+/// the name, so a joined write of that name is not routed into the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_joined_lookup_yields_a_title_to_a_team_permalink() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    std::fs::write(f.root.join("team/restart.md"), TEAM_RESTART).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let hers = draft_in(&f, "alice", "notes", "Restart", "What alice drafted.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    // The title as the draft spells it is no team page's permalink, so it
+    // still opens the grant, and so does the draft's own permalink.
+    let (owner, path, permalink) = f
+        .engine
+        .granted_draft_named("team", "Restart", Some("alice"), &as_account("bob"))
+        .await
+        .unwrap()
+        .expect("the title opens the grant");
+    assert_eq!((owner.as_str(), path.as_str()), ("alice", hers.as_str()));
+    assert_ne!(
+        permalink, "restart",
+        "the premise: the draft's permalink differs"
+    );
+    let by_permalink = f
+        .engine
+        .granted_draft_named("team", &permalink, Some("alice"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_permalink.map(|(_, path, _)| path),
+        Some(hers.clone()),
+        "a permalink match never yields"
+    );
+
+    // `restart` matches the grant's title too, and it is the team page's
+    // permalink: the read answers the team page, and so does this lookup.
+    let team = f
+        .engine
+        .granted_draft_named("team", "restart", Some("alice"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(team, None);
+}
+
+/// An unjoined edit asks the accounts store about grants only where a grant
+/// can apply: a domain that takes changes directly never asks, so an accounts
+/// store that cannot answer never fails an ordinary edit there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unjoined_edit_asks_about_grants_only_in_a_reviewing_domain() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let plain = f.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(
+        plain.join("MANIFEST.md"),
+        MANIFEST.replace("title: team", "title: plain"),
+    )
+    .unwrap();
+    std::fs::write(plain.join("plan.md"), PLAN).unwrap();
+    f.engine
+        .domain_add_local(Some("plain"), Some(plain.to_str().unwrap()))
+        .await
+        .unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let before = f.engine.granted_name_checks_run();
+    let mut edit = append_edit("bob's line in a plain domain");
+    edit.identifier = "plan".to_string();
+    edit.domain = "plain".to_string();
+    f.engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.engine.granted_name_checks_run(),
+        before,
+        "no grant can apply in a domain that takes changes directly"
+    );
+
+    // The same edit in the reviewing domain asks, which is where the join
+    // refusal lives.
+    edit.domain = "team".to_string();
+    f.engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.granted_name_checks_run(), before + 1);
+}
+
 /// An absolute address naming another domain never matches a grant here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn another_domains_address_matches_no_grant() {

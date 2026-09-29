@@ -942,6 +942,11 @@ pub struct Engine {
     // `Engine::set_spelling_push_fault`.
     #[cfg(any(test, feature = "testing"))]
     spelling_push_fault: std::sync::Mutex<Option<names::SpellingPushFault>>,
+    // The test seam for the granted-name check on an unjoined edit or save:
+    // how many times it reached the accounts store. See
+    // `Engine::granted_name_checks_run`.
+    #[cfg(any(test, feature = "testing"))]
+    granted_name_checks: std::sync::atomic::AtomicU64,
     // The test seam for the name adoption: how many times it ran. See
     // `Engine::adoptions_run`.
     #[cfg(any(test, feature = "testing"))]
@@ -1756,6 +1761,8 @@ impl Engine {
             spelling_replaces: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             spelling_push_fault: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            granted_name_checks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
