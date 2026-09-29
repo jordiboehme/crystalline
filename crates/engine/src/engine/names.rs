@@ -612,23 +612,34 @@ impl Engine {
         if !title.is_empty() && !title.eq_ignore_ascii_case(permalink) {
             targets.push(title.to_string());
         }
-        let store = self.store.lock().await;
         let bound = async {
-            let Some(id) = store.domain_id(domain).await? else {
-                return Ok(Vec::new());
+            let counts = {
+                let store = self.store.lock().await;
+                let Some(id) = store.domain_id(domain).await? else {
+                    return Ok(Vec::new());
+                };
+                let spellings: Vec<String> = store
+                    .domain_spellings()
+                    .await?
+                    .into_iter()
+                    .filter(|(_, holder)| *holder == id)
+                    .map(|(spelling, _)| spelling)
+                    .collect();
+                store
+                    .resolve_references_to(id, &spellings, &targets)
+                    .await?
             };
-            let spellings: Vec<String> = store
-                .domain_spellings()
-                .await?
-                .into_iter()
-                .filter(|(_, holder)| *holder == id)
-                .map(|(spelling, _)| spelling)
-                .collect();
-            let counts = store
-                .resolve_references_to(id, &spellings, &targets)
-                .await?;
+            // Nearly every write binds nothing elsewhere: then neither the
+            // configuration nor the domain ids are read at all.
+            if counts.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Read with no store guard held, since it may read the config
+            // file; the ids are then asked under a guard of their own.
+            let registered = self.registered_domain_names();
+            let store = self.store.lock().await;
             let mut named = Vec::new();
-            for name in self.registered_domain_names() {
+            for name in registered {
                 if let Some(other) = store.domain_id(&name).await?
                     && counts.iter().any(|(bound, _)| *bound == other)
                 {
@@ -638,7 +649,6 @@ impl Engine {
             crystalline_index::Result::Ok(named)
         }
         .await;
-        drop(store);
         match bound {
             Ok(mut names) => {
                 names.sort();

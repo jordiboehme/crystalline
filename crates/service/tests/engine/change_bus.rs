@@ -1425,3 +1425,192 @@ both_backends!(
     a_draft_write_binds_nothing_elsewhere,
     a_draft_write_binds_nothing_elsewhere_body
 );
+
+/// Whether `notes/guide`'s one relation is bound, as a read reports it.
+async fn guide_resolved(engine: &Engine) -> serde_json::Value {
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "guide".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    read["relations"][0]["resolved"].clone()
+}
+
+/// Whether `heard` holds a `domain` frame for `notes`.
+fn notes_heard(heard: &[Change]) -> bool {
+    heard
+        .iter()
+        .any(|c| matches!(c, Change::Domain(DomainChanged { domain, .. }) if domain == "notes"))
+}
+
+/// `notes/guide` waits for `[[oak:<target>]]`, and `oak/runbook` (Runbook)
+/// stands beside it, both synced.
+async fn waiting_for(
+    store: Arc<Mutex<dyn Store>>,
+    target: &str,
+) -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let (tmp, engine, scratch) = engine_fixture_on(store, false).await;
+    seed(
+        &tmp.path().join("notes"),
+        "guide.md",
+        &engram("Guide", "guide", &format!("- relates_to [[oak:{target}]]")),
+    );
+    seed(
+        &tmp.path().join("oak"),
+        "runbook.md",
+        &engram("Runbook", "runbook", "The steps."),
+    );
+    engine.sync(None).await.unwrap();
+    assert_eq!(guide_resolved(&engine).await, false, "the link waits");
+    (tmp, engine, scratch)
+}
+
+/// An edit that retitles an engram binds a link elsewhere that waited for
+/// the new title, and that domain hears it.
+async fn an_edit_that_retitles_binds_a_waiting_link_in_another_domain_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (_tmp, engine, _scratch) = waiting_for(store, "Restart runbook").await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .edit_engram(&EditParams {
+            identifier: "runbook".to_string(),
+            domain: "oak".to_string(),
+            operation: "find_replace".to_string(),
+            find_text: Some("title: Runbook".to_string()),
+            content: Some("title: Restart runbook".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(notes_heard(&heard), "{heard:?}");
+    assert_eq!(guide_resolved(&engine).await, true);
+}
+both_backends!(
+    an_edit_that_retitles_binds_a_waiting_link_in_another_domain,
+    an_edit_that_retitles_binds_a_waiting_link_in_another_domain_body
+);
+
+/// A save (the path a co-editing room's text lands through) that retitles
+/// an engram binds a link elsewhere that waited for the new title.
+async fn a_save_that_retitles_binds_a_waiting_link_in_another_domain_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (_tmp, engine, _scratch) = waiting_for(store, "Restart runbook").await;
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "runbook".to_string(),
+                domain: Some("oak".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .save_engram(
+            &SaveParams {
+                domain: "oak".to_string(),
+                identifier: "runbook".to_string(),
+                content: engram("Restart runbook", "runbook", "The steps."),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(notes_heard(&heard), "{heard:?}");
+    assert_eq!(guide_resolved(&engine).await, true);
+}
+both_backends!(
+    a_save_that_retitles_binds_a_waiting_link_in_another_domain,
+    a_save_that_retitles_binds_a_waiting_link_in_another_domain_body
+);
+
+/// A move to the permalink a link elsewhere waited for binds that link.
+async fn a_move_to_a_waited_for_permalink_binds_a_link_in_another_domain_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (_tmp, engine, _scratch) = waiting_for(store, "restart-runbook").await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .move_engram(
+            &MoveParams {
+                identifier: "runbook".to_string(),
+                domain: "oak".to_string(),
+                destination: "restart-runbook".to_string(),
+                destination_domain: None,
+                permalink: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(notes_heard(&heard), "{heard:?}");
+    assert_eq!(guide_resolved(&engine).await, true);
+}
+both_backends!(
+    a_move_to_a_waited_for_permalink_binds_a_link_in_another_domain,
+    a_move_to_a_waited_for_permalink_binds_a_link_in_another_domain_body
+);
+
+/// A restore brings a deleted engram back, and a link elsewhere that lost
+/// it binds again at once.
+async fn a_restore_binds_a_waiting_link_in_another_domain_body(store: Arc<Mutex<dyn Store>>) {
+    let (tmp, engine, _scratch) = waiting_for(store, "gamma").await;
+    let content = engram("Gamma", "gamma", "Restored.");
+    engine
+        .restore_engram("oak", "gamma.md", &content, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        guide_resolved(&engine).await,
+        true,
+        "bound before the delete"
+    );
+    engine
+        .delete_engram(&DeleteParams {
+            identifier: "gamma".to_string(),
+            domain: "oak".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    // The guide is written again while gamma is gone, so its link is
+    // indexed afresh and waits.
+    seed(
+        &tmp.path().join("notes"),
+        "guide.md",
+        &engram(
+            "Guide",
+            "guide",
+            "- relates_to [[oak:gamma]]\n\nStill waiting.",
+        ),
+    );
+    engine.sync(None).await.unwrap();
+    assert_eq!(guide_resolved(&engine).await, false, "the link waits");
+    let mut rx = engine.changes().subscribe();
+    engine
+        .restore_engram("oak", "gamma.md", &content, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(notes_heard(&heard), "{heard:?}");
+    assert_eq!(guide_resolved(&engine).await, true);
+}
+both_backends!(
+    a_restore_binds_a_waiting_link_in_another_domain,
+    a_restore_binds_a_waiting_link_in_another_domain_body
+);

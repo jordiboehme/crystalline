@@ -743,16 +743,16 @@ impl Engine {
             draft_of: None,
             audience: None,
         }));
-        // A virtual write may have landed or replaced this domain's MANIFEST
-        // engram, the source of its routing bullets, so refresh the cache the
-        // sync `routing_text` reads; a MANIFEST of either kind may declare a
-        // new name.
         // A new engram, or one whose title changed, may be what a link in
         // another domain has been waiting for.
         if !replaced || title_before.as_deref() != Some(p.title.as_str()) {
             self.bind_references_to(&p.domain, &permalink, &p.title)
                 .await;
         }
+        // A virtual write may have landed or replaced this domain's MANIFEST
+        // engram, the source of its routing bullets, so refresh the cache the
+        // sync `routing_text` reads; a MANIFEST of either kind may declare a
+        // new name.
         self.after_source_write(&source, &path).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
@@ -1411,6 +1411,10 @@ impl Engine {
             draft_of: None,
             audience: None,
         }));
+        // A restored engram is an added one, and may be what a link in
+        // another domain has been waiting for since it went.
+        let (_, title) = engram_names(content, &permalink);
+        self.bind_references_to(domain, &permalink, &title).await;
         self.nudge_embed();
         Ok(json!({
             "domain": domain,
