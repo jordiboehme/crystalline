@@ -248,6 +248,27 @@ describe("createDirector", () => {
     expect(panner.disconnects).toBe(1);
   });
 
+  // Mutation caught: a shot's end, arriving after `dispose` took its
+  // panner down, running its callback all the same (a second disconnect,
+  // an end callback on a disposed director).
+  it("does nothing on a shot's end that arrives after dispose", () => {
+    const { ctx, director } = setup();
+    director.cue({
+      kind: "door",
+      sound: "bulkhead",
+      open: false,
+      pan: 0.3,
+      gain: 1,
+    });
+    const panner = ctx.ofKind("panner")[0]!;
+    director.dispose();
+    expect(panner.disconnects).toBe(1);
+    for (const node of ctx.nodes) {
+      (node as unknown as { end?: () => void }).end?.();
+    }
+    expect(panner.disconnects).toBe(1);
+  });
+
   // Mutation caught: a noise buffer filled per patch name (fifteen two
   // second buffers kept for the context's life, where two do).
   it("fills one noise buffer per bus, whatever the patches", () => {

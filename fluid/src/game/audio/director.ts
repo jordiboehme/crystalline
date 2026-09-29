@@ -22,9 +22,9 @@
  *   placed shot's panner is disconnected as soon as the shot has ended.
  *   Noise plays from one seeded buffer per bus (the synth keeps a buffer
  *   per seed name, and a name per patch would keep fifteen two-second
- *   buffers for the context's life). While the context is not running the one-shots
- *   are dropped: its clock stands still, and everything scheduled on it
- *   would sound at once when it runs again.
+ *   buffers for the context's life). While the context is not running the
+ *   one-shots are dropped: its clock stands still, and everything
+ *   scheduled on it would sound at once when it runs again.
  * - **The drone.** One looping drone per room: a `room` cue with the
  *   ambience playing keeps it (whatever the seed), another cross-fades,
  *   the old one fading out over `CROSSFADE_S` while the new one fades in
@@ -191,6 +191,8 @@ export function createDirector(mixer: Mixer): Director {
       panner === null && ended === undefined
         ? undefined
         : () => {
+            // `dispose` took every panner down and let go of every shot.
+            if (disposed) return;
             if (panner !== null) {
               panner.disconnect();
               panners.delete(panner);
