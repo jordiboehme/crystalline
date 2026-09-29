@@ -2314,3 +2314,60 @@ both_backends!(
     a_full_rename_of_a_domain_without_a_manifest_is_still_refused_naming_local,
     a_full_rename_of_a_domain_without_a_manifest_is_still_refused_naming_local_body
 );
+
+async fn a_reviewing_domain_without_a_manifest_is_refused_naming_local_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(store, FLOW_MANIFEST, None).await;
+    std::fs::remove_file(m.root.join("eng/MANIFEST.md")).unwrap();
+    engine.sync(None).await.unwrap();
+    let err = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("a full rename needs a MANIFEST to write");
+    let said = err.to_string();
+    assert!(
+        said.contains("domain 'eng' has no MANIFEST to write the new name into")
+            && said.contains("--local"),
+        "{said}"
+    );
+    assert!(!m.journal().is_file(), "nothing was started");
+    assert!(!engine.is_renaming("eng"));
+}
+both_backends!(
+    a_reviewing_domain_without_a_manifest_is_refused_naming_local,
+    a_reviewing_domain_without_a_manifest_is_refused_naming_local_body
+);
+
+async fn a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(store, FLOW_MANIFEST, None).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("the failpoint stops the rename");
+    assert!(m.journal().is_file(), "the journal stays");
+    drop(engine);
+
+    let restarted = m.engine(false).await;
+    let recovered = restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("a journal was left to finish");
+    assert_eq!(recovered["manifest_written"], false, "{recovered}");
+    assert_eq!(recovered["manifest_draft"], false, "{recovered}");
+    assert_eq!(recovered["note"], KEPT_IN_DRAFT, "{recovered}");
+    assert_eq!(owner_manifest_draft(&m).await, None, "nothing was drafted");
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        FLOW_MANIFEST
+    );
+    assert!(!m.journal().is_file(), "the rename finished");
+}
+both_backends!(
+    a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note,
+    a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_body
+);

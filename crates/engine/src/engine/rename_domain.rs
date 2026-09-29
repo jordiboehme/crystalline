@@ -296,7 +296,7 @@ impl Engine {
         // Judged on the text the MANIFEST step would edit: in a reviewing
         // domain the caller's draft when there is one. A kept MANIFEST is not
         // drafted.
-        let manifest_kept = !local_only && !self.manifest_takes_name(old, scope).await?;
+        let manifest_kept = !local_only && !self.manifest_takes_name(old, new, scope).await?;
         let manifest_draft = reviewing_draft && !manifest_kept;
         self.refuse_shared_index(old).await?;
         self.refuse_leftovers(new, &state_dir, scope).await?;
@@ -1154,13 +1154,7 @@ impl Engine {
     /// case. A file domain is asked by writing and removing a file beside
     /// its MANIFEST, since permission bits do not say who may write.
     async fn refuse_unwritable_manifest(&self, old: &str, new: &str) -> Result<bool> {
-        let refusal = |why: String| {
-            EngineError::Invalid(format!(
-                "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
-                 {new} --local` or pick This machine only in Rename domain on the domain page, which \
-                 leaves the MANIFEST and the links as they are"
-            ))
-        };
+        let refusal = |why: String| manifest_refusal(old, new, why);
         if self.reviews_changes(old) {
             return Ok(true);
         }
@@ -1196,9 +1190,26 @@ impl Engine {
     /// one, else the base, read through the same view `rename_manifest` edits.
     /// False for a frontmatter in flow style or one that cannot be cut into
     /// keys, which the step then leaves as it is.
-    async fn manifest_takes_name(&self, old: &str, scope: &crate::scope::Scope) -> Result<bool> {
+    async fn manifest_takes_name(
+        &self,
+        old: &str,
+        new: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<bool> {
         let view = DomainView::for_write(self, old, scope).await?;
-        let (desc, source) = view.resolve("manifest").await?;
+        // No MANIFEST at all, in a file or a reviewing domain alike, is the
+        // refusal a file domain gets, naming `--local`.
+        let (desc, source) = match view.resolve("manifest").await {
+            Ok(found) => found,
+            Err(EngineError::NotFound(_)) => {
+                return Err(manifest_refusal(
+                    old,
+                    new,
+                    format!("domain '{old}' has no MANIFEST to write the new name into"),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         Ok(match view.text_at(&source, &desc).await? {
             Some(text) => crystalline_core::manifest::can_declare_name(&text),
             // A draft that deletes the MANIFEST: nothing to judge here, and
@@ -1724,6 +1735,16 @@ fn quoted_list(names: &[String]) -> String {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// The refusal of a full rename whose MANIFEST cannot be written, naming
+/// the way out: a rename on this machine only.
+fn manifest_refusal(old: &str, new: &str, why: String) -> EngineError {
+    EngineError::Invalid(format!(
+        "{why}; to rename it on this machine only, run `crystalline domain rename {old} \
+         {new} --local` or pick This machine only in Rename domain on the domain page, which \
+         leaves the MANIFEST and the links as they are"
+    ))
 }
 
 #[cfg(test)]
