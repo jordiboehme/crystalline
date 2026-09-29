@@ -748,3 +748,149 @@ async fn a_create_whose_title_namesake_lives_elsewhere_keeps_the_collision() {
         "permalink 'gamma' already exists in domain 'notes' (at archive/g.md); pass overwrite=true to replace"
     );
 }
+
+// --- a create reads the permalink the way the writer's view holds it --------
+
+#[tokio::test]
+async fn a_create_whose_cross_folder_holder_the_writers_draft_deleted_lands() {
+    let moved = "archive/code-review-standards.md";
+    let old = engram("Code Review Standards", PERMALINK, "The old rule.");
+    let (tmp, engine, _scratch) = fixture(true, &[(moved, old.clone())]).await;
+    engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: PERMALINK.to_string(),
+                domain: "notes".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    // In ada's view nothing answers to the permalink any more, so her create
+    // is a create: no M5 naming an engram she deleted, no collision either.
+    let receipt = engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "The new rule.",
+                false,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["path"], SLUG, "{receipt}");
+    assert_eq!(receipt["draft"], true);
+    assert_eq!(receipt["action"], "created");
+    let notes = tmp.path().join("notes");
+    assert_eq!(std::fs::read_to_string(notes.join(moved)).unwrap(), old);
+}
+
+#[tokio::test]
+async fn a_create_whose_permalink_only_the_writers_own_draft_holds_elsewhere_hears_m5() {
+    let (_tmp, engine, _scratch) = fixture(true, &[]).await;
+    engine
+        .write_engram_as(
+            &capture("Code Review Standards", Some("conventions"), "Mine.", false),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    ada_moves(&engine, PERMALINK, "private/Secret Plan.md").await;
+    let err = engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Again.",
+                false,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'private/Secret Plan.md' in folder 'private', not in folder 'conventions'. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram"
+    );
+}
+
+#[tokio::test]
+async fn a_joined_create_across_folders_hears_m5_naming_only_the_team_file() {
+    let moved = "archive/code-review-standards.md";
+    let (_tmp, engine, _scratch) = fixture(
+        true,
+        &[(
+            moved,
+            engram("Code Review Standards", PERMALINK, "The team's rule."),
+        )],
+    )
+    .await;
+    let (bob, mut join) = bob_in_adas_draft();
+    join.path = SLUG.to_string();
+    let err = engine
+        .write_engram_joined(
+            &capture("Code Review Standards", Some("conventions"), "x", false),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(err, CREATE_ACROSS);
+}
+
+#[tokio::test]
+async fn a_joined_create_never_hears_of_a_file_only_the_owners_draft_holds() {
+    let (_tmp, engine, _scratch) = fixture(true, &[]).await;
+    engine
+        .write_engram_as(
+            &capture(
+                "Code Review Standards",
+                Some("conventions"),
+                "Private.",
+                false,
+            ),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    ada_moves(&engine, PERMALINK, "private/Secret Plan.md").await;
+    // The page granted to bob sits at the slug path and is another engram.
+    engine
+        .write_engram_as(
+            &capture("Other Page", Some("conventions"), "Granted.", false),
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    ada_moves(&engine, "conventions/other-page", SLUG).await;
+    let (bob, mut join) = bob_in_adas_draft();
+    join.path = SLUG.to_string();
+    let result = engine
+        .write_engram_joined(
+            &capture("Code Review Standards", Some("conventions"), "x", false),
+            None,
+            &bob,
+            Some(&join),
+        )
+        .await;
+    let text = match &result {
+        Ok(receipt) => receipt.to_string(),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !text.contains("Secret Plan") && !text.contains("private/"),
+        "{text}"
+    );
+}

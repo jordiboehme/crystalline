@@ -135,28 +135,52 @@ impl Engine {
     /// different error, and the later one under the write lock that is the
     /// actual race guard - so the two can never drift into two readings of
     /// "taken".
+    ///
+    /// In review mode "the writer's view" is the one
+    /// [`DomainView::permalink_holder`] reads for an overwrite: the writer's
+    /// own drafts with this exact permalink, then the base row unless the
+    /// writer's own tombstone deletes its path. So a create never hears of an
+    /// engram its writer already deleted, and an address only the writer's
+    /// own draft holds is named like any other holder. `joined` leaves the
+    /// owner's other drafts out: somebody working inside one granted page is
+    /// never told what else the owner's draft holds.
     async fn permalink_taken(
         &self,
         domain: &str,
         rel: &str,
         permalink: &str,
         overlay_draft: Option<(&str, DomainId)>,
+        joined: bool,
     ) -> Result<Option<(String, String)>> {
         let store = self.store.lock().await;
-        Ok(match overlay_draft {
-            Some((actor, domain_id)) => match store.overlay_entry(domain_id, actor, rel).await? {
-                Some(entry) if entry.tombstone => None,
-                Some(entry) => Some((entry.path, entry.permalink)),
-                None => store
-                    .find_engram(domain, permalink)
-                    .await?
-                    .map(|existing| (existing.path, existing.permalink)),
-            },
-            None => store
+        let Some((actor, domain_id)) = overlay_draft else {
+            return Ok(store
                 .find_engram(domain, permalink)
                 .await?
-                .map(|existing| (existing.path, existing.permalink)),
-        })
+                .map(|existing| (existing.path, existing.permalink)));
+        };
+        match store.overlay_entry(domain_id, actor, rel).await? {
+            Some(entry) if entry.tombstone => return Ok(None),
+            Some(entry) => return Ok(Some((entry.path, entry.permalink))),
+            None => {}
+        }
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        if !joined
+            && let Some(entry) = entries
+                .iter()
+                .find(|entry| !entry.tombstone && entry.permalink == permalink)
+        {
+            return Ok(Some((entry.path.clone(), entry.permalink.clone())));
+        }
+        Ok(store
+            .find_engram(domain, permalink)
+            .await?
+            .filter(|found| {
+                !entries
+                    .iter()
+                    .any(|entry| entry.tombstone && entry.path == found.path)
+            })
+            .map(|existing| (existing.path, existing.permalink)))
     }
 
     /// Where a capture lands and whether it may land there, decided before a
@@ -396,7 +420,13 @@ impl Engine {
         // answer there.
         if !p.overwrite
             && let Some((at, held)) = self
-                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .permalink_taken(
+                    &p.domain,
+                    &rel,
+                    &permalink,
+                    overlay_draft,
+                    view.joined().is_some(),
+                )
                 .await?
         {
             return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
@@ -563,7 +593,13 @@ impl Engine {
         // reused rather than re-paired.
         if !p.overwrite
             && let Some((at, held)) = self
-                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .permalink_taken(
+                    &p.domain,
+                    &rel,
+                    &permalink,
+                    overlay_draft,
+                    view.joined().is_some(),
+                )
                 .await?
         {
             return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
@@ -2062,5 +2098,71 @@ mod landing_race_tests {
             "this session is working inside ada's draft of 'conventions/Code Review Standards.md', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
         );
         assert!(!err.contains("Secret Plan"), "{err}");
+    }
+
+    /// A plain create waits for its file's write lock while an engram in
+    /// another folder takes the same permalink: the check under the lock is
+    /// the one that answers, with M5 and without the collision marker, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn a_create_whose_permalink_is_taken_elsewhere_while_it_waits_hears_m5() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root.clone()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        let slug = "conventions/code-review-standards.md";
+        let lock = engine.write_lock(&join_rel(&root, slug));
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .write_engram(&WriteParams {
+                        domain: "notes".to_string(),
+                        title: "Code Review Standards".to_string(),
+                        content: "The new rule.".to_string(),
+                        folder: Some("conventions".to_string()),
+                        engram_type: None,
+                        tags: Vec::new(),
+                        status: None,
+                        metadata: None,
+                        overwrite: false,
+                        share_link: None,
+                        model: None,
+                    })
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let archived = "archive/code-review-standards.md";
+        std::fs::write(root.join(archived), ENGRAM).unwrap();
+        engine
+            .sync_paths("notes", vec![archived.to_string()])
+            .await
+            .unwrap();
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'archive/code-review-standards.md' in folder 'archive', not in folder 'conventions'. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram"
+        );
+        assert!(!root.join(slug).exists(), "nothing written");
     }
 }
