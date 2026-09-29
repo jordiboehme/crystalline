@@ -867,6 +867,13 @@ fn merged_into(state: &OriginState, number: u64) -> String {
 /// a pull request that could not be moved stays, with the reason recorded for
 /// the status, and the next pull tries again. One listing per pass, and none
 /// when nothing is queued. Never fails the pull: the queue is already durable.
+///
+/// A deleted branch can be another entry's `onto`: a middle layer kept on the
+/// bottom layer's branch, then the bottom merges. Every such entry, kept or
+/// still to come, then takes the deleted entry's own `onto`, so it is never
+/// bound for a branch that is gone. Its `kept` is cleared, since the reason
+/// was about the old target: the entry reads as queued until the next pass
+/// tries the new one.
 async fn retire_merged_branches(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -890,8 +897,10 @@ async fn retire_merged_branches(
             return;
         }
     };
-    let mut kept = Vec::new();
-    for mut entry in std::mem::take(&mut state.merged_branches) {
+    let mut kept: Vec<MergedBranch> = Vec::new();
+    let mut queue: std::collections::VecDeque<MergedBranch> =
+        std::mem::take(&mut state.merged_branches).into();
+    while let Some(mut entry) = queue.pop_front() {
         let mut blocker: Option<BranchKept> = None;
         for pr in open.iter_mut().filter(|pr| pr.base == entry.branch) {
             match provider
@@ -913,6 +922,15 @@ async fn retire_merged_branches(
             None => {
                 // Best effort, as before: a branch already gone is fine.
                 let _ = provider.delete_branch(spec, &entry.branch).await;
+                // Applied at every delete, so a chain of them resolves
+                // transitively: this entry's own `onto` was already rewritten
+                // by any earlier delete in the pass.
+                for other in kept.iter_mut().chain(queue.iter_mut()) {
+                    if other.onto == entry.branch {
+                        other.onto = entry.onto.clone();
+                        other.kept = None;
+                    }
+                }
             }
             Some(why) => {
                 entry.kept = Some(why);

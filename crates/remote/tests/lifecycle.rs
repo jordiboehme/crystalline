@@ -10283,7 +10283,7 @@ async fn a_share_preview_leaves_merged_branches_and_pull_requests_alone() {
 }
 
 #[tokio::test]
-async fn a_pull_request_moved_by_one_cleanup_is_moved_again_by_the_next() {
+async fn a_pull_request_moved_by_one_entry_is_moved_again_by_the_next_entry_in_the_same_pass() {
     let mock = MockProvider::new();
     mock.close_proposals_when_their_base_is_deleted();
     let (sub, first) = shared_once(&mock).await;
@@ -10320,4 +10320,109 @@ async fn a_pull_request_moved_by_one_cleanup_is_moved_again_by_the_next() {
         ProposalState::Open
     );
     assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+}
+
+#[tokio::test]
+async fn a_re_baselining_pull_moves_a_hand_made_pull_request_before_the_branch_goes() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    // The share merged while the trunk this domain records was rewritten out
+    // of existence, so the compare answers 404 and the pull re-baselines.
+    let mut state = load_state(&sub.state_dir);
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    merge_into_main(&mock, first.number, &first.branch);
+
+    let before = mock.calls().len();
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.re_baselined, "{report:?}");
+    let moved = call_at(&delta, &format!("update_proposal_base:{hand}:main"));
+    let deleted = call_at(&delta, &format!("delete_branch:{}", first.branch));
+    assert!(moved < deleted, "moved first, deleted after: {delta:?}");
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), hand)
+            .await
+            .unwrap(),
+        ProposalState::Open,
+        "the hand-made pull request survived"
+    );
+    assert!(load_state(&sub.state_dir).merged_branches.is_empty());
+}
+
+#[tokio::test]
+async fn a_kept_branch_follows_its_target_when_that_branch_is_retired() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let (bottom, middle) = (&layers[0], &layers[1]);
+    let hand = stacked_layer(&mock, "big-change", &middle.branch).await;
+    mock.fail_update_proposal(hand);
+
+    // The middle layer merges into the bottom one; its pull request cannot
+    // be moved, so the middle branch is kept, bound for the bottom branch.
+    mock.set_proposal_state(middle.number, ProposalState::Merged);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.merged_branches.len(), 1);
+    assert_eq!(state.merged_branches[0].onto, bottom.branch);
+    assert!(state.merged_branches[0].kept.is_some());
+
+    // The bottom layer merges and its branch is retired: the kept entry now
+    // goes where the bottom branch went, and reads as queued, not kept, so no
+    // message names the branch that is gone.
+    merge_into_main(&mock, bottom.number, &bottom.branch);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", bottom.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state.merged_branches.len(),
+        1,
+        "{:?}",
+        state.merged_branches
+    );
+    let entry = &state.merged_branches[0];
+    assert_eq!(entry.branch, middle.branch);
+    assert_eq!(entry.onto, "main", "the target followed the retired branch");
+    assert_eq!(entry.kept, None, "re-evaluated on the next pass");
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.kept_branches.is_empty(),
+        "{:?}",
+        report.kept_branches
+    );
+
+    // The next sync finishes it without anybody acting.
+    mock.heal_update_proposal(hand);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", middle.branch))
+    );
+    assert!(load_state(&sub.state_dir).merged_branches.is_empty());
 }
