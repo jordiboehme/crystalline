@@ -819,7 +819,10 @@ async fn nameless_add_writes_the_basename_default_back_into_a_bare_manifest() {
     assert_eq!(report["domain"], "my-notes");
     assert_eq!(report["name_origin"], "derived");
     let manifest = std::fs::read_to_string(folder.join("MANIFEST.md")).unwrap();
-    assert!(manifest.contains("domain_name: my-notes"), "{manifest}");
+    assert!(
+        manifest.contains("title: My Notes\ndomain_name: my-notes\npermalink: manifest\n"),
+        "the name lands right after the title: {manifest}"
+    );
 }
 
 /// A brand-new folder with no MANIFEST at all gets one scaffolded that

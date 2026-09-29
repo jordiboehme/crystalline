@@ -50,6 +50,15 @@ const SHARING_DIRECT: &str = "direct";
 /// the enum kind the other two registry entries use.
 pub const DOMAIN_NAME_KEY: &str = "domain_name";
 
+/// Declare `name` as the domain's canonical name in MANIFEST `source`: an
+/// existing [`DOMAIN_NAME_KEY`] line is rewritten in place, a missing one
+/// goes right after `title`, where a person adding it by hand usually puts
+/// it. Two writers that pick the same place leave a merge nothing to
+/// reconcile.
+pub fn set_declared_name(source: &str, name: &str) -> String {
+    crate::emit::set_frontmatter_field_after(source, DOMAIN_NAME_KEY, name, "title")
+}
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -76,7 +85,7 @@ recorded_at: {today}\n\
 - Note the folder layout new engrams should reuse\n"
     );
     if validate_domain_name(name).is_ok() {
-        crate::emit::set_frontmatter_field(&text, DOMAIN_NAME_KEY, name)
+        set_declared_name(&text, name)
     } else {
         text
     }

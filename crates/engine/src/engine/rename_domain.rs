@@ -955,7 +955,7 @@ impl Engine {
                 &actor,
                 None,
                 &scope,
-                move |current| Ok(set_frontmatter_field(current, DOMAIN_NAME_KEY, &new)),
+                move |current| Ok(crystalline_core::manifest::set_declared_name(current, &new)),
             )
             .await?;
             matches!(source, ContentSource::Virtual) && overlay.is_none()

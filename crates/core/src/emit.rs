@@ -294,6 +294,56 @@ pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
     set_frontmatter_line(source, &[key], format_scalar_line(key, value))
 }
 
+/// Set a scalar frontmatter field like [`set_frontmatter_field`], except that
+/// a key the frontmatter does not hold yet goes right after the `after` key
+/// (its continuation lines and any blank lines inside it included) instead
+/// of at the end. Falls back to
+/// [`set_frontmatter_field`] when the key is already there, when `after` is
+/// not, or when the source has no frontmatter block. The new line uses the
+/// frontmatter's own line ending.
+pub fn set_frontmatter_field_after(source: &str, key: &str, value: &str, after: &str) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return set_frontmatter_field(source, key, value);
+    }
+    let raw = &source[fm_span.clone()];
+    let sets = |line: &str, k: &str| line_sets_key(line.trim_end_matches(['\n', '\r']), k);
+    if raw.split_inclusive('\n').any(|l| sets(l, key))
+        || !raw.split_inclusive('\n').any(|l| sets(l, after))
+    {
+        return set_frontmatter_field(source, key, value);
+    }
+    let ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let new_line = format_scalar_line(key, value);
+    let mut new_raw = String::with_capacity(raw.len() + new_line.len() + ending.len());
+    let mut in_anchor = false;
+    let mut inserted = false;
+    for line in raw.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        // A blank line inside the anchor's block (a `|` scalar) does not end
+        // it; the new line goes after the whole block.
+        if in_anchor && !inserted && !is_value_continuation(content) && !content.trim().is_empty() {
+            new_raw.push_str(&new_line);
+            new_raw.push_str(ending);
+            inserted = true;
+        }
+        if !in_anchor && line_sets_key(content, after) {
+            in_anchor = true;
+        }
+        new_raw.push_str(line);
+    }
+    if !inserted {
+        new_raw.push_str(&new_line);
+        new_raw.push_str(ending);
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
 /// Replace the first frontmatter line that sets any of `keys` with `new_line`,
 /// appending it when none of them is present. Creates a frontmatter block when
 /// the source has none. The keys are tried in order, so a caller can name a
@@ -1034,6 +1084,50 @@ pub fn prepend_body(source: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_field_goes_right_after_the_named_key_and_its_continuation_lines() {
+        let source =
+            "---\ntype: manifest\ntitle: >\n  Long\n  name\npermalink: manifest\n---\n\n# KB\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\ntype: manifest\ntitle: >\n  Long\n  name\ndomain_name: kb\npermalink: manifest\n---\n\n# KB\n"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_block_scalar_title_does_not_end_the_title() {
+        let source = "---\ntype: manifest\ntitle: |\n  Long\n\n  name\npermalink: manifest\n---\n";
+        let named = set_frontmatter_field_after(source, "domain_name", "kb", "title");
+        assert_eq!(
+            named,
+            "---\ntype: manifest\ntitle: |\n  Long\n\n  name\ndomain_name: kb\npermalink: manifest\n---\n"
+        );
+        assert!(crate::parse::parse_engram(&named).is_ok(), "{named}");
+    }
+
+    #[test]
+    fn a_present_field_is_rewritten_in_place_and_a_missing_anchor_appends() {
+        let present = "---\ndomain_name: old\ntitle: KB\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(present, "domain_name", "kb", "title"),
+            "---\ndomain_name: kb\ntitle: KB\n---\n"
+        );
+        let no_title = "---\ntype: manifest\n---\n";
+        assert_eq!(
+            set_frontmatter_field_after(no_title, "domain_name", "kb", "title"),
+            "---\ntype: manifest\ndomain_name: kb\n---\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_frontmatter_gets_a_crlf_line() {
+        let source = "---\r\ntitle: KB\r\nstatus: stable\r\n---\r\n";
+        assert_eq!(
+            set_frontmatter_field_after(source, "domain_name", "kb", "title"),
+            "---\r\ntitle: KB\r\ndomain_name: kb\r\nstatus: stable\r\n---\r\n"
+        );
+    }
 
     /// A document whose body lines are numbered in the assertions below, with
     /// the frontmatter taking lines 1 through 5 so a range that reached into it

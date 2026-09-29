@@ -569,11 +569,7 @@ fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
     let manifest = root.join("MANIFEST.md");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
-    let updated = crystalline_core::emit::set_frontmatter_field(
-        &text,
-        crystalline_core::DOMAIN_NAME_KEY,
-        name,
-    );
+    let updated = crystalline_core::manifest::set_declared_name(&text, name);
     if updated != text {
         std::fs::write(&manifest, updated)
             .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;

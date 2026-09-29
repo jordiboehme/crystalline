@@ -314,9 +314,8 @@ impl Engine {
             None,
             &scope,
             move |current| {
-                Ok(set_frontmatter_field(
+                Ok(crystalline_core::manifest::set_declared_name(
                     current,
-                    DOMAIN_NAME_KEY,
                     &local_owned,
                 ))
             },
