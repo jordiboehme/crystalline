@@ -1727,6 +1727,59 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
     assert_eq!(on_disk, ALPHA, "the reviewed file stands: {on_disk:?}");
 }
 
+/// Issue 112, spec item 7: the question an overwrite puts and the write it
+/// asks about resolve ONE landing. Bob works inside ada's draft of a page
+/// whose file name is not its title's slug, and ada has that page open. The
+/// preview has to screen the file the write lands in, not the slug path the
+/// title spells: screening `beta.md` would refuse the join, answer `None`,
+/// and the write would then compose into ada's open page without asking.
+#[tokio::test]
+async fn a_joined_overwrite_of_a_title_named_page_asks_about_the_room_the_write_lands_in() {
+    let (tmp, engine, _scratch) = engine_fixture(true).await;
+    std::fs::write(
+        tmp.path().join("eng/Beta Notes.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nA rule about beta.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let hers = sessions.join("eng", "beta", Some("ada")).await.unwrap();
+    let doc = sync_client(&hers).await;
+    append_line(&hers, &doc, "ada typed this").await;
+
+    let bob = crystalline_service::Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    };
+    let join = crystalline_service::Join {
+        account: "bob".to_string(),
+        holder: crystalline_service::Holder::Process(1),
+        domain: "eng".to_string(),
+        path: "Beta Notes.md".to_string(),
+        owner: "ada".to_string(),
+        expires_at: None,
+    };
+    let capture = wholesale_capture("Beta", REPLACEMENT, true);
+    let target = engine
+        .live_write_target(&capture, &bob, Some(&join), None)
+        .await
+        .expect("the preview finds ada's open page, so the question is put");
+    assert_eq!(target.permalink, "beta");
+
+    let receipt = engine
+        .write_engram_present(&capture, None, &bob, Some(&join), None)
+        .await
+        .expect("the capture lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    assert_eq!(receipt["path"].as_str(), Some("Beta Notes.md"), "{receipt}");
+    assert_eq!(
+        receipt["joined"].as_str(),
+        Some("landed in ada's draft"),
+        "{receipt}"
+    );
+}
+
 /// **Ruling from review.** The refusal a client that cannot be asked gets is
 /// the same one at the legacy era, which is what nearly every client in the
 /// field still speaks: the gate is era AND capability, so a handshake at
