@@ -1403,6 +1403,40 @@ both_backends!(
     a_rename_rewrites_a_quoted_domain_name_key_in_place_body
 );
 
+/// A MANIFEST in flow style cannot take the new name key by key: the
+/// rename leaves it byte for byte, reports it as not written and says why.
+async fn a_rename_reports_a_flow_style_manifest_as_not_written_body(store: Arc<Mutex<dyn Store>>) {
+    let m = machine(store).await;
+    let flow = "---\n{type: manifest, title: Eng, permalink: manifest, tags: [manifest], status: current, recorded_at: 2026-01-01, domain_name: eng-team}\n---\n\n# Eng\n\n## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n";
+    std::fs::write(m.root.join("eng/MANIFEST.md"), flow).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], false, "{report}");
+    let note = report["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("domain_name") && note.contains("by hand"),
+        "{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        flow
+    );
+    // The MANIFEST still declares the old name, and so does the record.
+    let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    assert_eq!(
+        cfg.domains["platform"].canonical_seen.as_deref(),
+        Some("eng-team")
+    );
+}
+both_backends!(
+    a_rename_reports_a_flow_style_manifest_as_not_written,
+    a_rename_reports_a_flow_style_manifest_as_not_written_body
+);
+
 /// Two private domains of bob's beside the full-rename machine, `archive`
 /// (ada is a viewer) and `vault` (ada cannot see it), each with an `old.md`
 /// linking to `eng` by its canonical name. Answers that engram's text.

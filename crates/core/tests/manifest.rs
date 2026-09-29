@@ -877,6 +877,22 @@ fn the_declared_name_goes_right_after_the_title() {
 }
 
 #[test]
+fn a_name_can_be_declared_unless_the_frontmatter_cannot_be_cut_into_keys() {
+    use crystalline_core::manifest::can_declare_name;
+    assert!(can_declare_name("---\ntitle: KB\n---\n"));
+    assert!(can_declare_name(
+        "---\ntitle: KB\n\"domain_name\": kb\n---\n"
+    ));
+    assert!(
+        can_declare_name("# KB\n"),
+        "no frontmatter: a block is created"
+    );
+    assert!(!can_declare_name(
+        "---\n{title: KB, domain_name: kb}\n---\n"
+    ));
+}
+
+#[test]
 fn the_template_declares_the_name_right_after_the_title() {
     let source = manifest_template("eng", "2026-09-28");
     assert!(

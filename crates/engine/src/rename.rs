@@ -136,6 +136,11 @@ pub(crate) struct RenameJournal {
     /// reviews changes) rather than into the folder or the database.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manifest_draft: bool,
+    /// Whether the MANIFEST's frontmatter cannot take the new name key by
+    /// key (flow style, for one), so the MANIFEST step leaves it as it is and
+    /// the report says it was not written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manifest_kept: bool,
     /// What the relink step did, recorded with the step so a rename finished
     /// by a later call or at the next start reports the whole of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

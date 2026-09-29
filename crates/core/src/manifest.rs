@@ -61,6 +61,15 @@ pub fn set_declared_name(source: &str, name: &str) -> String {
     crate::emit::set_frontmatter_field_after(source, DOMAIN_NAME_KEY, name, "title")
 }
 
+/// Whether [`set_declared_name`] can write a name into MANIFEST `source`:
+/// true when it has no frontmatter (a block is created) or one that cuts
+/// into key blocks, false for flow style and anything else it leaves as it
+/// is.
+pub fn can_declare_name(source: &str) -> bool {
+    crate::frontmatter::split_frontmatter(source)
+        .is_none_or(|parts| crate::frontmatter::key_blocks(parts.yaml).is_some())
+}
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
