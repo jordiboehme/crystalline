@@ -1386,9 +1386,9 @@ impl Engine {
     /// `origin` is what [`Engine::origin_spec_for_domain`] resolved, borrowed
     /// whole: the spec, the domain's folder and its origin state directory.
     ///
-    /// `cleanup` is what the pull does with a merged share's branch. A preview
-    /// passes `Defer`, so its pull queues a merged branch and leaves the forge
-    /// alone.
+    /// `cleanup` is what the pull does with a queued share branch. A share and
+    /// a preview both pass `Defer`: the preview makes no provider write, and
+    /// the share's own pull in `ops::propose` runs the cleanup, once.
     pub(super) async fn overlay_share_tree(
         &self,
         domain: &str,
@@ -1539,7 +1539,7 @@ impl Engine {
                 provider.as_ref(),
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
-                ops::BranchCleanup::Run,
+                ops::BranchCleanup::Defer,
             )
             .await?;
         // The share runs against the staged tree, and the provider it runs with

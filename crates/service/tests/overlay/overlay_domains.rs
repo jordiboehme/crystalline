@@ -7919,3 +7919,72 @@ async fn a_review_mode_share_preview_does_no_branch_cleanup() {
     assert_eq!(forge.proposal_base(hand).as_deref(), Some("main"));
     assert!(forge.calls().contains(&format!("delete_branch:{branch}")));
 }
+
+/// Item 3: a review-mode share runs the branch cleanup once, in the pull
+/// `ops::propose` makes, and never a second time in the staging pull before
+/// it. The queued branch stays kept by a backport opened from it, so every
+/// pass that runs lists the open pull requests: one listing is one pass.
+#[tokio::test]
+async fn a_review_mode_share_lists_the_open_pull_requests_once() {
+    use crystalline_remote::provider::{OriginSpec, ProposalRequest, ProposalState, Provider};
+    const LATER: &str = "---\ntype: engram\ntitle: Later\npermalink: later\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Later\n\n- [decision] a second change #team\n";
+    let f = reviewed_origin_fixture().await;
+    let forge = f.forge.clone().expect("the origin fixture carries a forge");
+    let spec = OriginSpec {
+        repo: "acme/team".to_string(),
+        subpath: None,
+        branch: "main".to_string(),
+    };
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let share = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(share["outcome"], "proposed", "{share}");
+    let number = share["number"].as_u64().unwrap();
+    let branch = share["branch"].as_str().unwrap().to_string();
+    // A backport opened from the share branch keeps it once the share merges.
+    Provider::create_proposal(
+        &*forge,
+        &spec,
+        &ProposalRequest {
+            title: "backport".to_string(),
+            body: String::new(),
+            branch: branch.clone(),
+            base_branch: "release-1.2".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let head = forge.branch_commit(&branch).unwrap();
+    forge.set_branch("main", &head);
+    forge.set_proposal_state(number, ProposalState::Merged);
+    // A sync consumes the merge and queues the branch, kept by the backport.
+    f.engine
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    f.draft("team", "owner", "later.md", LATER).await;
+
+    let before = forge.calls().len();
+    let second = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    let delta = forge.calls().split_off(before);
+    assert_eq!(
+        delta
+            .iter()
+            .filter(|call| *call == "list_open_proposals")
+            .count(),
+        1,
+        "{delta:?}"
+    );
+    assert!(
+        !delta.contains(&format!("delete_branch:{branch}")),
+        "the backport keeps it: {delta:?}"
+    );
+}
