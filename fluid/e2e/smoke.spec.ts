@@ -179,6 +179,16 @@ test("the Help menu reaches the Handbook and the shortcut map, and the top bar f
     .first()
     .evaluate((el) => el.scrollWidth - el.clientWidth);
   expect(overflow).toBeLessThanOrEqual(0);
+  // The row's own overflow is not always counted by the header, so the last
+  // control and the search field are checked directly: the account icon must
+  // end inside the screen and the search field must keep a usable width.
+  const account = await page
+    .getByRole("button", { name: USER, exact: true })
+    .boundingBox();
+  expect(account).not.toBeNull();
+  expect(account!.x + account!.width).toBeLessThanOrEqual(360);
+  const search = await page.getByRole("searchbox").boundingBox();
+  expect(search!.width).toBeGreaterThanOrEqual(60);
 });
 
 test("the Rename dialog opens from the domain page and can be cancelled", async ({
