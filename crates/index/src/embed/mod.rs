@@ -31,8 +31,9 @@ pub use chunk::{
     estimate_tokens, fingerprint,
 };
 pub use models::{
-    Architecture, LOCAL_MODELS, LocalModel, cached_model_dirs, hub_dir_name, local_model,
-    lookup_local_model, prune_model_cache,
+    Architecture, LOCAL_MODELS, LocalModel, SnapshotChoice, cached_model_dirs, choose_snapshot,
+    hub_dir_name, local_model, lookup_local_model, older_snapshot_warning, prune_model_cache,
+    retire_older_snapshots,
 };
 
 /// How many chunks are embedded per provider call.
@@ -141,6 +142,24 @@ pub async fn download_local_model(cfg: &EmbeddingsConfig) -> Result<ModelDownloa
     #[cfg(feature = "local-embeddings")]
     {
         local::download(cfg).await
+    }
+    #[cfg(not(feature = "local-embeddings"))]
+    {
+        let _ = cfg;
+        Err(IndexError::Unsupported(
+            "this build has no local embedding support; rebuild with the 'local-embeddings' feature".into(),
+        ))
+    }
+}
+
+/// Fetch the pinned commit of the configured local model in the background,
+/// quietly: no first-use notice and no progress line, because the caller is
+/// a daemon already serving on an older cached snapshot. The running process
+/// keeps the snapshot it loaded; the next start picks the pinned one up.
+pub async fn update_local_model(cfg: &EmbeddingsConfig) -> Result<ModelDownload> {
+    #[cfg(feature = "local-embeddings")]
+    {
+        local::update(cfg).await
     }
     #[cfg(not(feature = "local-embeddings"))]
     {

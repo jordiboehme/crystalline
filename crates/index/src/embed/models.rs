@@ -38,8 +38,18 @@ pub struct LocalModel {
     /// hash, never a branch: hf-hub answers a hash from
     /// `snapshots/<hash>/` in the cache without any network call, and a
     /// download gets exactly the files this build was tested with. Moving it
-    /// is a deliberate change, and an install whose cache holds another
-    /// commit downloads once.
+    /// is a deliberate change: an install whose cache holds only another
+    /// commit starts on that one (see [`choose_snapshot`]) and switches at a
+    /// later start, once the pinned commit is cached and carries the same
+    /// weights and tokenizer.
+    ///
+    /// The index keys stored vectors by [`LocalModel::id`] alone, never by
+    /// commit. So a pin bump that changes the content of `model.safetensors`
+    /// or `tokenizer.json` must also change `id`: that is what sends every
+    /// chunk through the existing model-change path to be embedded again.
+    /// A bump that leaves both files as they were keeps the id. Today every
+    /// loadable commit of both entries carries the same two files, so any
+    /// older snapshot a cache holds switches over without re-embedding.
     pub revision: &'static str,
     /// The embedding width.
     pub dims: usize,
@@ -137,6 +147,283 @@ pub fn lookup_local_model(id: &str) -> Result<&'static LocalModel> {
 /// The hf-hub cache directory name for a repository id: `models--<org>--<name>`.
 pub fn hub_dir_name(repo: &str) -> String {
     format!("models--{}", repo.replace('/', "--"))
+}
+
+/// Which cached snapshot of a model a start loads, decided from the cache
+/// directory alone with no network call. See [`choose_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotChoice {
+    /// The pinned commit is complete in the cache. `others` names every other
+    /// snapshot of the repo there, which [`retire_older_snapshots`] removes
+    /// once the pinned one has loaded.
+    Pinned { others: Vec<String> },
+    /// An older complete snapshot is used instead of the pinned commit.
+    Older {
+        /// The commit in use.
+        commit: String,
+        /// False: the pinned commit is not complete in the cache yet, and a
+        /// `crystalline model download` (or the daemon's background fetch)
+        /// brings it. True: the pinned commit is complete but its weights or
+        /// tokenizer differ from `commit`'s, so switching would leave the
+        /// index holding vectors from other weights, and the start stays on
+        /// `commit`.
+        pinned_differs: bool,
+    },
+    /// No complete snapshot: the pinned commit is downloaded.
+    Missing,
+}
+
+/// The files whose content decides whether two snapshots embed alike: the
+/// weights and the tokenizer. `config.json` is left out on purpose - granite's
+/// commits differ there only in `classifier_pooling` (unused, the pooling is
+/// in `local.rs`) and `max_position_embeddings` (the rope table size, far
+/// above the input cap).
+const CONTENT_FILES: [&str; 2] = ["model.safetensors", "tokenizer.json"];
+
+/// Decide which snapshot of `model` a start loads, from `models_dir` alone.
+///
+/// 1. The pinned commit, when every file the loader needs is under
+///    `snapshots/<revision>/`.
+/// 2. Otherwise another complete snapshot of the same repository: the commit
+///    `refs/main` names, else the newest by modification time (ties by
+///    name, so the choice is deterministic). A snapshot missing any file of
+///    [`LocalModel::files`] is never chosen.
+/// 3. Otherwise [`SnapshotChoice::Missing`].
+///
+/// When the pinned commit is complete and an older complete snapshot is
+/// also cached, the two are compared by the content of
+/// [`CONTENT_FILES`]: equal content switches to the pinned one, different
+/// content stays on the older one, because the index keys its vectors by
+/// model id and could not tell the weights apart.
+pub fn choose_snapshot(models_dir: &Path, model: &LocalModel) -> SnapshotChoice {
+    let repo_dir = models_dir.join(model.cache_dir_name());
+    let snapshots = repo_dir.join("snapshots");
+    let mut others: Vec<String> = snapshot_commits(&snapshots)
+        .into_iter()
+        .filter(|c| c != model.revision)
+        .collect();
+    others.sort();
+    let pinned_complete = snapshot_complete(&snapshots.join(model.revision), model);
+    let older = older_snapshot(&repo_dir, &others, model);
+    match (pinned_complete, older) {
+        (true, None) => SnapshotChoice::Pinned { others },
+        (true, Some(commit)) => {
+            let pinned = snapshots.join(model.revision);
+            let old = snapshots.join(&commit);
+            if CONTENT_FILES
+                .iter()
+                .all(|f| same_content(&pinned.join(f), &old.join(f)))
+            {
+                SnapshotChoice::Pinned { others }
+            } else {
+                SnapshotChoice::Older {
+                    commit,
+                    pinned_differs: true,
+                }
+            }
+        }
+        (false, Some(commit)) => SnapshotChoice::Older {
+            commit,
+            pinned_differs: false,
+        },
+        (false, None) => SnapshotChoice::Missing,
+    }
+}
+
+/// The directory names under `snapshots/`. A missing directory lists nothing.
+fn snapshot_commits(snapshots: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(snapshots) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Every file the loader needs is present (a symlink counts when its blob is
+/// there, which `is_file` follows).
+fn snapshot_complete(dir: &Path, model: &LocalModel) -> bool {
+    model.files.iter().all(|f| dir.join(f).is_file())
+}
+
+/// The older complete snapshot a start would use: the one `refs/main` names,
+/// else the newest by modification time, ties by name.
+fn older_snapshot(repo_dir: &Path, others: &[String], model: &LocalModel) -> Option<String> {
+    let snapshots = repo_dir.join("snapshots");
+    let complete: Vec<&String> = others
+        .iter()
+        .filter(|c| snapshot_complete(&snapshots.join(c), model))
+        .collect();
+    if let Ok(main) = std::fs::read_to_string(repo_dir.join("refs").join("main")) {
+        let main = main.trim();
+        if let Some(c) = complete.iter().find(|c| c.as_str() == main) {
+            return Some((*c).clone());
+        }
+    }
+    complete
+        .into_iter()
+        .map(|c| {
+            let modified = std::fs::metadata(snapshots.join(c))
+                .and_then(|m| m.modified())
+                .ok();
+            (modified, c)
+        })
+        .max()
+        .map(|(_, c)| c.clone())
+}
+
+/// True when two cached files hold the same bytes. hf-hub stores a file as
+/// `blobs/<etag>` and points the snapshot entry at it with a symlink, and the
+/// etag of an LFS file is the sha256 of its content, so two links are
+/// compared by their blob names without reading 220 MB. A plain file (a
+/// pre-seeded copy, or a Windows cache, which copies instead of linking) is
+/// compared by the sha256 of both files' content instead. A file that cannot
+/// be read counts as different: staying on the older snapshot is the safe
+/// side.
+fn same_content(a: &Path, b: &Path) -> bool {
+    if let (Some(x), Some(y)) = (blob_name(a), blob_name(b)) {
+        return x == y;
+    }
+    match (sha256_file(a), sha256_file(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The blob a snapshot symlink points at, by file name, or `None` for a file
+/// that is not a symlink.
+fn blob_name(path: &Path) -> Option<String> {
+    let meta = path.symlink_metadata().ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::read_link(path).ok()?;
+    target.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(crate::hex_lower(&hasher.finalize()))
+}
+
+/// Remove the snapshots of `model` other than the pinned commit, once a start
+/// has loaded the pinned one, returning the commits that went.
+///
+/// It acts only when [`choose_snapshot`] answers
+/// [`SnapshotChoice::Pinned`]: a start that stayed on an older snapshot
+/// (not downloaded yet, or different weights) never loses it. Beside each
+/// removed snapshot directory, a `refs/` file naming it and every blob only
+/// its links pointed at go too; a blob a remaining snapshot still links to
+/// stays. Only this model's repository directory is ever touched. A removal
+/// that fails (a read-only pre-seeded `CRYSTALLINE_MODELS_DIR`) is logged
+/// and skipped: an untidy cache costs disk and nothing else.
+pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<String> {
+    let SnapshotChoice::Pinned { others } = choose_snapshot(models_dir, model) else {
+        return Vec::new();
+    };
+    let repo_dir = models_dir.join(model.cache_dir_name());
+    let snapshots = repo_dir.join("snapshots");
+    let blobs_of = |commit: &str| -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(snapshots.join(commit)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| blob_name(&e.path()))
+            .collect()
+    };
+    let mut removed = Vec::new();
+    let mut freed_blobs: Vec<String> = Vec::new();
+    for commit in &others {
+        let blobs = blobs_of(commit);
+        let dir = snapshots.join(commit);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                freed_blobs.extend(blobs);
+                removed.push(commit.clone());
+            }
+            Err(e) => tracing::warn!(
+                model = model.id,
+                commit = %commit,
+                path = %dir.display(),
+                "leaving an older snapshot of the embedding model in place: {e}"
+            ),
+        }
+    }
+    // Blobs a remaining snapshot still links to are shared, and stay.
+    let kept: Vec<String> = snapshot_commits(&snapshots)
+        .iter()
+        .flat_map(|c| blobs_of(c))
+        .collect();
+    for blob in freed_blobs {
+        if kept.contains(&blob) {
+            continue;
+        }
+        let path = repo_dir.join("blobs").join(&blob);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), "leaving a model blob in place: {e}");
+        }
+    }
+    // A ref naming a removed commit would point at nothing.
+    if let Ok(entries) = std::fs::read_dir(repo_dir.join("refs")) {
+        for entry in entries.flatten() {
+            let names_removed = std::fs::read_to_string(entry.path())
+                .map(|c| removed.iter().any(|r| r == c.trim()))
+                .unwrap_or(false);
+            if names_removed {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if !removed.is_empty() {
+        tracing::info!(
+            model = model.id,
+            commits = %removed.join(", "),
+            "removed older snapshots of the embedding model now that the pinned commit is loaded"
+        );
+    }
+    removed
+}
+
+/// The one warning a start on an older snapshot logs, shared with doctor so
+/// both say the same. `None` for any other choice.
+pub fn older_snapshot_warning(model: &LocalModel, choice: &SnapshotChoice) -> Option<String> {
+    match choice {
+        SnapshotChoice::Older {
+            commit,
+            pinned_differs: false,
+        } => Some(format!(
+            "embedding model {} is running on cached commit {commit}, not the pinned commit {}; \
+             run `crystalline model download` to update (a daemon also fetches it in the \
+             background and uses it from the next start)",
+            model.id, model.revision
+        )),
+        SnapshotChoice::Older {
+            commit,
+            pinned_differs: true,
+        } => Some(format!(
+            "embedding model {} stays on cached commit {commit}: the pinned commit {} is cached \
+             too, but its weights or tokenizer differ, and switching would need the index \
+             re-embedded",
+            model.id, model.revision
+        )),
+        _ => None,
+    }
 }
 
 /// Every model directory in the cache with its size in bytes, sorted by repo
@@ -580,5 +867,256 @@ mod tests {
             lookup_local_model("bge-small-en-v1.5").unwrap().revision,
             "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
         );
+    }
+
+    const OLD_A: &str = "1111111111111111111111111111111111111111";
+    const OLD_B: &str = "2222222222222222222222222222222222222222";
+
+    /// A snapshot the way hf-hub writes one on unix: each file a relative
+    /// symlink into `blobs/<etag>`, the etag here being `<tag>-<file>` so two
+    /// snapshots share a blob exactly when they pass the same tag.
+    #[cfg(unix)]
+    fn linked_snapshot(root: &Path, model: &LocalModel, commit: &str, tag: &str) {
+        let repo = root.join(model.cache_dir_name());
+        let blobs = repo.join("blobs");
+        let snap = repo.join("snapshots").join(commit);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            let etag = format!("{tag}-{file}");
+            std::fs::write(blobs.join(&etag), tag.as_bytes()).unwrap();
+            std::os::unix::fs::symlink(format!("../../blobs/{etag}"), snap.join(file)).unwrap();
+        }
+    }
+
+    /// A snapshot of plain files, the way a copied pre-seed looks.
+    fn copied_snapshot(root: &Path, model: &LocalModel, commit: &str, content: &[u8]) {
+        let snap = root
+            .join(model.cache_dir_name())
+            .join("snapshots")
+            .join(commit);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            std::fs::write(snap.join(file), content).unwrap();
+        }
+    }
+
+    fn set_main(root: &Path, model: &LocalModel, commit: &str) {
+        let refs = root.join(model.cache_dir_name()).join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), commit).unwrap();
+    }
+
+    fn granite() -> &'static LocalModel {
+        lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap()
+    }
+
+    #[test]
+    fn an_empty_cache_has_no_snapshot_to_choose() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite()),
+            SnapshotChoice::Missing
+        );
+        assert!(retire_older_snapshots(tmp.path(), granite()).is_empty());
+    }
+
+    /// `refs/main` decides between two older snapshots; without it the
+    /// newest by modification time does.
+    #[test]
+    fn refs_main_picks_the_older_snapshot_and_else_the_newest_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        copied_snapshot(root, granite(), OLD_A, b"a");
+        copied_snapshot(root, granite(), OLD_B, b"b");
+        let snaps = root.join(granite().cache_dir_name()).join("snapshots");
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let new = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let touch = |commit: &str, t: std::time::SystemTime| {
+            std::fs::File::open(snaps.join(commit))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        touch(OLD_A, new);
+        touch(OLD_B, old);
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Older {
+                commit: OLD_A.to_string(),
+                pinned_differs: false
+            },
+            "without refs/main the newest snapshot is chosen"
+        );
+        set_main(root, granite(), OLD_B);
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Older {
+                commit: OLD_B.to_string(),
+                pinned_differs: false
+            },
+            "refs/main wins over modification time"
+        );
+        // refs/main naming an incomplete snapshot is passed over.
+        std::fs::remove_file(snaps.join(OLD_B).join("tokenizer.json")).unwrap();
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Older {
+                commit: OLD_A.to_string(),
+                pinned_differs: false
+            }
+        );
+    }
+
+    /// Linked snapshots compare by blob name, so the same etag switches to
+    /// the pinned commit and another etag stays on the older one.
+    #[cfg(unix)]
+    #[test]
+    fn linked_snapshots_are_compared_by_their_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_snapshot(root, granite(), OLD_A, "same");
+        linked_snapshot(root, granite(), granite().revision, "same");
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Pinned {
+                others: vec![OLD_A.to_string()]
+            }
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_snapshot(root, granite(), OLD_A, "old");
+        linked_snapshot(root, granite(), granite().revision, "new");
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Older {
+                commit: OLD_A.to_string(),
+                pinned_differs: true
+            }
+        );
+        // Nothing is retired while the start stays on the older snapshot.
+        assert!(retire_older_snapshots(root, granite()).is_empty());
+        assert!(
+            root.join(granite().cache_dir_name())
+                .join("snapshots")
+                .join(OLD_A)
+                .is_dir()
+        );
+    }
+
+    /// A copied pre-seed beside a linked pinned download is compared by
+    /// content: the blob name alone would never match a plain file.
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_snapshot_is_compared_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_snapshot(root, granite(), granite().revision, "same");
+        copied_snapshot(root, granite(), OLD_A, b"same");
+        assert!(matches!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Pinned { .. }
+        ));
+        copied_snapshot(root, granite(), OLD_A, b"other");
+        assert_eq!(
+            choose_snapshot(root, granite()),
+            SnapshotChoice::Older {
+                commit: OLD_A.to_string(),
+                pinned_differs: true
+            }
+        );
+    }
+
+    /// Once the pinned commit is loaded, the other snapshots of that repo go,
+    /// with their refs and the blobs only they used; a shared blob, the
+    /// pinned snapshot and every other repository stay.
+    #[cfg(unix)]
+    #[test]
+    fn retiring_removes_only_the_older_snapshots_of_that_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        linked_snapshot(root, g, g.revision, "same");
+        linked_snapshot(root, g, OLD_A, "same");
+        // An incomplete leftover that only an older snapshot used a blob for.
+        linked_snapshot(root, g, OLD_B, "stray");
+        std::fs::remove_file(
+            root.join(g.cache_dir_name())
+                .join("snapshots")
+                .join(OLD_B)
+                .join("model.safetensors"),
+        )
+        .unwrap();
+        set_main(root, g, OLD_A);
+        let bge = lookup_local_model("bge-small-en-v1.5").unwrap();
+        copied_snapshot(root, bge, OLD_A, b"bge");
+
+        let removed = retire_older_snapshots(root, g);
+        assert_eq!(removed, vec![OLD_A.to_string(), OLD_B.to_string()]);
+        let repo = root.join(g.cache_dir_name());
+        assert!(!repo.join("snapshots").join(OLD_A).exists());
+        assert!(!repo.join("snapshots").join(OLD_B).exists());
+        assert!(
+            !repo.join("refs").join("main").exists(),
+            "refs/main named a removed commit"
+        );
+        for file in g.files {
+            assert!(
+                repo.join("snapshots").join(g.revision).join(file).is_file(),
+                "the pinned {file} still resolves"
+            );
+            // The stray snapshot's weights link was already gone, so only
+            // the blobs it still linked to are its to take along.
+            if *file != "model.safetensors" {
+                assert!(
+                    !repo.join("blobs").join(format!("stray-{file}")).exists(),
+                    "a blob only a removed snapshot used goes: {file}"
+                );
+            }
+            assert!(
+                repo.join("blobs").join(format!("same-{file}")).is_file(),
+                "a blob the pinned snapshot shares stays: {file}"
+            );
+        }
+        assert!(
+            root.join(bge.cache_dir_name())
+                .join("snapshots")
+                .join(OLD_A)
+                .is_dir(),
+            "another model's snapshots are never touched"
+        );
+        assert_eq!(
+            choose_snapshot(root, g),
+            SnapshotChoice::Pinned { others: vec![] }
+        );
+        assert!(retire_older_snapshots(root, g).is_empty());
+    }
+
+    /// A pre-seeded cache the process may not write keeps its older
+    /// snapshot, and retiring it is not an error.
+    #[cfg(unix)]
+    #[test]
+    fn retiring_in_a_read_only_cache_logs_and_keeps_going() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        copied_snapshot(root, g, g.revision, b"same");
+        copied_snapshot(root, g, OLD_A, b"same");
+        let snaps = root.join(g.cache_dir_name()).join("snapshots");
+        // Read-only the way a mounted pre-seed is: every directory, so not
+        // even the files inside the older snapshot can go.
+        for dir in [snaps.join(OLD_A), snaps.clone()] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let removed = retire_older_snapshots(root, g);
+        for dir in [snaps.clone(), snaps.join(OLD_A)] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(snaps.join(OLD_A).join("model.safetensors").is_file());
+        assert!(snaps.join(g.revision).is_dir());
     }
 }

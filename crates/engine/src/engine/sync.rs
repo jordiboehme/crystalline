@@ -549,6 +549,13 @@ impl Engine {
         if self.read_only {
             return None;
         }
+        self.active_local_model().map(|m| m.repo)
+    }
+
+    /// The table entry of the active model when the configured provider is
+    /// the local one, whatever the instance's mode. `None` for a remote
+    /// provider or a model this build does not know.
+    fn active_local_model(&self) -> Option<&'static crystalline_index::LocalModel> {
         let local = match self.config.read().unwrap().embeddings.as_ref() {
             Some(e) => e.provider.trim() == "local",
             // No embeddings block is the local provider on the default model.
@@ -557,7 +564,78 @@ impl Engine {
         if !local {
             return None;
         }
-        crystalline_index::local_model(&self.model_id).map(|m| m.repo)
+        crystalline_index::local_model(&self.model_id)
+    }
+
+    /// Settle the active model's cached snapshots, once per start and only
+    /// after the model has LOADED, beside [`Engine::prune_model_cache`].
+    ///
+    /// - Loaded the pinned commit while older snapshots of the same repo are
+    ///   still cached: those go now ([`crystalline_index::retire_older_snapshots`]),
+    ///   on a writable instance only, for the same reason the prune is.
+    /// - Started on an older snapshot because the pinned commit is not cached
+    ///   yet: the pinned commit is fetched in the background, never blocking
+    ///   the start or a search. This process keeps the snapshot it loaded;
+    ///   the next start switches. A failed fetch (offline, a mirror without
+    ///   that commit, a read-only cache) is one log line, and the next start
+    ///   tries again. There is no retry loop.
+    /// - Stayed on an older snapshot because the pinned one has other weights:
+    ///   nothing happens. The load logged why, and doctor shows it.
+    pub async fn settle_model_snapshots(&self, models_dir: PathBuf) {
+        let Some(model) = self.active_local_model() else {
+            return;
+        };
+        let dir = models_dir.clone();
+        let choice =
+            tokio::task::spawn_blocking(move || crystalline_index::choose_snapshot(&dir, model))
+                .await;
+        match choice {
+            Ok(crystalline_index::SnapshotChoice::Pinned { others })
+                if !others.is_empty() && !self.read_only =>
+            {
+                let retired = tokio::task::spawn_blocking(move || {
+                    crystalline_index::retire_older_snapshots(&models_dir, model)
+                })
+                .await;
+                if let Err(err) = retired {
+                    tracing::warn!("the model snapshot cleanup task failed: {err}");
+                }
+            }
+            Ok(crystalline_index::SnapshotChoice::Older {
+                commit,
+                pinned_differs: false,
+            }) => {
+                let ecfg = self
+                    .config
+                    .read()
+                    .unwrap()
+                    .embeddings
+                    .clone()
+                    .unwrap_or_else(|| crystalline_core::config::EmbeddingsConfig {
+                        provider: "local".to_string(),
+                        model: model.id.to_string(),
+                        endpoint: None,
+                        api_key_env: None,
+                    });
+                tokio::spawn(async move {
+                    match crystalline_index::update_local_model(&ecfg).await {
+                        Ok(_) => tracing::info!(
+                            model = model.id,
+                            pinned = model.revision,
+                            "fetched the pinned commit of the embedding model; the next start uses it"
+                        ),
+                        Err(err) => tracing::warn!(
+                            model = model.id,
+                            commit = %commit,
+                            pinned = model.revision,
+                            "could not fetch the pinned commit of the embedding model, staying on the cached one until the next start: {err}"
+                        ),
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("the model snapshot check failed: {err}"),
+        }
     }
 
     /// Prune the model cache down to the active model's weights, recording what

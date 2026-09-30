@@ -31,7 +31,10 @@ use hf_hub::{HFClient, HFError};
 use indexmap::IndexMap;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use super::models::{Architecture, LocalModel, lookup_local_model};
+use super::models::{
+    Architecture, LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model,
+    older_snapshot_warning,
+};
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
 use crate::error::{IndexError, Result};
@@ -144,11 +147,24 @@ fn configured_or_default(cfg: &EmbeddingsConfig) -> &str {
     }
 }
 
-/// Pre-fetch the model files and report the cache location and size.
+/// Pre-fetch the model files and report the cache location and size. Always
+/// the pinned commit, whatever older snapshot the cache holds: after this, the
+/// next start loads the pinned one.
 pub async fn download(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+    fetch_pinned(cfg, true).await
+}
+
+/// [`download`] without the first-use notice or a progress line, for a daemon
+/// fetching the pinned commit in the background while it serves on an older
+/// snapshot.
+pub async fn update(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+    fetch_pinned(cfg, false).await
+}
+
+async fn fetch_pinned(cfg: &EmbeddingsConfig, announce: bool) -> Result<super::ModelDownload> {
     let model = lookup_local_model(configured_or_default(cfg))?;
     let cache_dir = models_cache_dir()?;
-    let files = ensure_files(&cache_dir, model).await?;
+    let files = ensure_files(&cache_dir, model, announce).await?;
     // Metadata sizing only: a handful of stat calls, which no blocking task
     // has to carry now that the fetch itself is async.
     let bytes = files
@@ -175,6 +191,22 @@ struct ModelFiles {
 }
 
 impl ModelFiles {
+    /// The files of one cached snapshot, read straight from
+    /// `snapshots/<commit>/`, which [`choose_snapshot`] has already found
+    /// complete.
+    fn from_snapshot(cache_dir: &Path, model: &LocalModel, commit: &str) -> ModelFiles {
+        let dir = cache_dir
+            .join(model.cache_dir_name())
+            .join("snapshots")
+            .join(commit);
+        let paths = model
+            .files
+            .iter()
+            .map(|f| ((*f).to_string(), dir.join(f)))
+            .collect();
+        ModelFiles { paths }
+    }
+
     fn get(&self, name: &str) -> Option<&PathBuf> {
         self.paths.get(name)
     }
@@ -314,14 +346,51 @@ impl ProgressHandler for ByteProgress {
 /// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
 /// never dials out just to check. Every file is fetched at the model's pinned
 /// commit (`LocalModel::revision`), so a cache holding another commit counts
-/// as not cached.
-async fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
+/// as not cached here; the load path looks for one first (see
+/// [`load_files_with`]). `announce` false drops the notice and the progress
+/// line, for the daemon's quiet background fetch.
+async fn ensure_files(cache_dir: &Path, model: &LocalModel, announce: bool) -> Result<ModelFiles> {
+    let client = cache_client(cache_dir)?;
+    ensure_files_with(&client, cache_dir, model, announce).await
+}
+
+/// The hub client on a cache directory that exists.
+fn cache_client(cache_dir: &Path) -> Result<HFClient> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
-    let client = hub_client(cache_dir)?;
-    ensure_files_with(&client, cache_dir, model).await
+    hub_client(cache_dir)
+}
+
+/// The files a start loads: the snapshot [`choose_snapshot`] picks from the
+/// cache alone. The pinned commit goes through [`ensure_files_with`] as
+/// before (no network call when it is complete); an older complete snapshot
+/// is used as it is, with no network call and one warning; only when the cache
+/// holds no complete snapshot at all is the pinned commit downloaded.
+async fn load_files_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+) -> Result<ModelFiles> {
+    // A blocking thread: comparing a copied pre-seed with the pinned commit
+    // hashes both weight files.
+    let dir = cache_dir.to_path_buf();
+    let choice = tokio::task::spawn_blocking(move || choose_snapshot(&dir, model))
+        .await
+        .map_err(|e| IndexError::Embedding(format!("model cache check failed: {e}")))?;
+    if let SnapshotChoice::Older { commit, .. } = &choice {
+        if let Some(warning) = older_snapshot_warning(model, &choice) {
+            tracing::warn!(
+                model = model.id,
+                commit = %commit,
+                pinned = model.revision,
+                "{warning}"
+            );
+        }
+        return Ok(ModelFiles::from_snapshot(cache_dir, model, commit));
+    }
+    ensure_files_with(client, cache_dir, model, true).await
 }
 
 /// [`ensure_files`] on a given client, so a test can point the network side
@@ -330,11 +399,12 @@ async fn ensure_files_with(
     client: &HFClient,
     cache_dir: &Path,
     model: &LocalModel,
+    announce: bool,
 ) -> Result<ModelFiles> {
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
     let cached = is_cached(client, model).await?;
-    if !cached {
+    if !cached && announce {
         eprintln!(
             "crystalline: downloading embedding model {} to {} (first use, about {} MB)...",
             model.repo,
@@ -342,7 +412,7 @@ async fn ensure_files_with(
             model.download_mb
         );
     }
-    let show_progress = !cached && std::io::stderr().is_terminal();
+    let show_progress = !cached && announce && std::io::stderr().is_terminal();
 
     let (owner, name) = repo_parts(model)?;
     let repo = client.model(owner, name);
@@ -431,7 +501,8 @@ async fn is_cached(client: &HFClient, model: &LocalModel) -> Result<bool> {
 /// Load the model, self-healing once from a corrupt cache. The fetch is awaited
 /// here; only the weight load goes to a blocking thread.
 async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
-    let files = ensure_files(cache_dir, model).await?;
+    let client = cache_client(cache_dir)?;
+    let files = load_files_with(&client, cache_dir, model).await?;
     match build_on_blocking(files, model).await {
         Ok(encoder) => Ok(encoder),
         Err(first) => {
@@ -441,7 +512,7 @@ async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<En
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
             wipe_model_dir(cache_dir, model);
-            let files = ensure_files(cache_dir, model).await?;
+            let files = ensure_files(cache_dir, model, true).await?;
             build_on_blocking(files, model).await
         }
     }
@@ -654,9 +725,11 @@ mod tests {
 
     use super::{
         MAX_INPUT_CHARS, cached_path, cap_chars, check_model_type, cls_pool, ensure_files_with,
-        pad_id,
+        load_files_with, pad_id,
     };
-    use crate::embed::models::{LocalModel, lookup_local_model};
+    use crate::embed::models::{
+        LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model, older_snapshot_warning,
+    };
 
     #[test]
     fn cls_pooling_takes_the_first_position_of_every_row() {
@@ -839,7 +912,7 @@ mod tests {
 
         let files = tokio::time::timeout(
             Duration::from_secs(20),
-            ensure_files_with(&client, tmp.path(), granite),
+            ensure_files_with(&client, tmp.path(), granite, true),
         )
         .await
         .expect("a warm cache must not wait on the network")
@@ -919,7 +992,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            ensure_files_with(&client, tmp.path(), granite),
+            ensure_files_with(&client, tmp.path(), granite, true),
         )
         .await
         .expect("the stub answers at once");
@@ -930,6 +1003,242 @@ mod tests {
         assert!(
             request_line.contains(&wanted),
             "expected a request for {wanted}, got {request_line}"
+        );
+    }
+
+    /// A listener that answers every request with a 404 and reports the
+    /// request line of the first one: the Hub has nothing to give, and the
+    /// test sees what was asked for.
+    fn stub_hub() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let first = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = tx.send(first);
+            }
+        });
+        (endpoint, rx)
+    }
+
+    /// A cache holding only an older snapshot, with `refs/main` naming it (a
+    /// pre-seeded copy from before the pin), starts on that snapshot with no
+    /// network call, and the start says so.
+    #[tokio::test]
+    async fn an_older_cached_snapshot_loads_without_the_network_and_is_reported() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let files = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("an older cached snapshot must not wait on the network")
+        .unwrap();
+        for file in granite.files {
+            let path = files.get(file).unwrap();
+            assert!(
+                path.to_string_lossy().contains(older),
+                "{file} resolved to {}",
+                path.display()
+            );
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the older snapshot dialled out: {other:?}"),
+        }
+
+        let choice = choose_snapshot(tmp.path(), granite);
+        assert_eq!(
+            choice,
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: false
+            }
+        );
+        let warning = older_snapshot_warning(granite, &choice).unwrap();
+        assert!(warning.contains(granite.id), "{warning}");
+        assert!(warning.contains(older), "{warning}");
+        assert!(warning.contains(granite.revision), "{warning}");
+        assert!(
+            warning.contains("run `crystalline model download` to update"),
+            "{warning}"
+        );
+    }
+
+    /// An older snapshot missing a file the loader needs is not used: the
+    /// start falls through to downloading the pinned commit.
+    #[tokio::test]
+    async fn an_incomplete_older_snapshot_falls_through_to_the_pinned_download() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let weights = tmp
+            .path()
+            .join(granite.cache_dir_name())
+            .join("snapshots")
+            .join(older)
+            .join("model.safetensors");
+        std::fs::remove_file(&weights).unwrap();
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Missing
+        );
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "the stub has no files to give");
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let wanted = format!("/{}/resolve/{}/config.json", granite.repo, granite.revision);
+        assert!(
+            request_line.contains(&wanted),
+            "expected a request for {wanted}, got {request_line}"
+        );
+    }
+
+    /// With both the pinned commit and an older one cached, and the weights
+    /// and tokenizer alike, the pinned commit wins.
+    #[tokio::test]
+    async fn the_pinned_snapshot_wins_over_an_older_one_with_the_same_content() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Pinned {
+                others: vec![older.to_string()]
+            }
+        );
+        let files = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        for file in granite.files {
+            assert!(
+                files
+                    .get(file)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(granite.revision),
+                "{file}"
+            );
+        }
+    }
+
+    /// A pinned commit whose weights differ from the older snapshot the
+    /// index was built with is not switched to: the start stays on the
+    /// older one and says why.
+    #[tokio::test]
+    async fn a_pinned_snapshot_with_other_weights_leaves_the_start_on_the_older_one() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        std::fs::write(
+            tmp.path()
+                .join(granite.cache_dir_name())
+                .join("snapshots")
+                .join(granite.revision)
+                .join("model.safetensors"),
+            b"other weights",
+        )
+        .unwrap();
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        let choice = choose_snapshot(tmp.path(), granite);
+        assert_eq!(
+            choice,
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: true
+            }
+        );
+        let warning = older_snapshot_warning(granite, &choice).unwrap();
+        assert!(warning.contains("re-embedded"), "{warning}");
+        let files = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        assert!(
+            files
+                .get("model.safetensors")
+                .unwrap()
+                .to_string_lossy()
+                .contains(older)
+        );
+    }
+
+    /// The daemon's background fetch of the pinned commit failing (offline,
+    /// or a mirror without that commit) leaves the older snapshot exactly as
+    /// it was, and the next start chooses it again.
+    #[tokio::test]
+    async fn a_failed_background_fetch_keeps_the_older_snapshot() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite, false),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err());
+        // The fetch asked for the pinned commit, not for main.
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request_line.contains(granite.revision), "{request_line}");
+        for file in granite.files {
+            assert!(
+                tmp.path()
+                    .join(granite.cache_dir_name())
+                    .join("snapshots")
+                    .join(older)
+                    .join(file)
+                    .is_file(),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: false
+            }
         );
     }
 }
