@@ -110,7 +110,7 @@ serde_yaml_ng = "0.10.0"
 toml = "1.1.6"
 async-trait = "0.1.92"
 uuid = { version = "1.26.1", features = ["v4"] }
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 anyhow = "1.0.104"
 etcetera = "0.11.0"
 walkdir = "2.5.0"
