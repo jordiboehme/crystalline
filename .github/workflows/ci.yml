@@ -165,7 +165,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: nextest@0.9.146
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -173,16 +175,16 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo nextest run
         # The `ci` profile is the default one plus a single retry, so an
         # environmental failure on a hosted runner reports FLAKY instead of
         # turning a green change red. A test that fails twice still fails.
-        run: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci --locked
 
       - name: cargo test --doc
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --locked
 
   postgres-parity:
     name: postgres-parity
@@ -219,7 +221,7 @@ jobs:
         run: PGPASSWORD=crystalline psql -h localhost -U postgres -d crystalline_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
       - name: cargo test (parity suite on both backends)
-        run: cargo test -p crystalline-index
+        run: cargo test -p crystalline-index --locked
 
   # Fluid, the browser UI. Nothing under fluid/ is part of the cargo workspace,
   # so its gates are a job of their own: they neither wait on the Rust matrix
@@ -367,7 +369,7 @@ jobs:
       # Debug rather than release: the smoke drives the API, not the throughput
       # of the index, and a release build would cost more than the run does.
       - name: Build crystalline
-        run: cargo build -p crystalline
+        run: cargo build -p crystalline --locked
 
       - name: Install the browser
         run: pnpm exec playwright install --with-deps chromium
@@ -464,7 +466,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build crystalline for musl
-        run: cargo build --release --target x86_64-unknown-linux-musl -p crystalline
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p crystalline
 
   # Dogfoods the bundled action end to end: it downloads the latest release
   # binary from jordiboehme/crystalline and verifies a fixture domain. A

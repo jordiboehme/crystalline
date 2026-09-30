@@ -138,8 +138,9 @@ jobs:
             fi
 
             packaging/mcpb/generate-manifest.sh "$platform" "$version" "$stage"
-            npx --yes @anthropic-ai/mcpb validate "$stage"
-            npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
+            # The packer is pinned like every other release tool; bump it deliberately.
+            npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
+            npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
           done
 
           # Universal bundle: macOS arm64 plus windows amd64 in one package,
@@ -152,8 +153,8 @@ jobs:
           cp bundle/windows-amd64/server/crystalline.exe "$stage/server/crystalline.exe"
 
           packaging/mcpb/generate-manifest.sh universal "$version" "$stage"
-          npx --yes @anthropic-ai/mcpb validate "$stage"
-          npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
 
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

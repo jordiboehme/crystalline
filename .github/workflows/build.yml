@@ -232,8 +232,12 @@ jobs:
           fi
           echo "bundle: $(find fluid/dist -type f | wc -l) files staged for the embed"
 
+      # --locked: Cargo.lock is the build's input, and a lockfile that would
+      # need an update fails the build instead of being re-resolved on the
+      # runner. The dev channel's version rewrite above keeps the lockfile in
+      # step with Cargo.toml for exactly this reason.
       - name: Build crystalline
-        run: cargo build --release --target ${{ matrix.target }} -p crystalline
+        run: cargo build --release --locked --target ${{ matrix.target }} -p crystalline
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -478,9 +482,10 @@ jobs:
       # .msi package: only the two Windows legs produce one, built with the
       # WiX v3 toolset and driven by cargo-wix from crates/cli/wix/main.wxs.
       # windows-latest preinstalls WiX; the windows-11-arm image ships
-      # without it (verified 2026-07-11), so the guard step below installs it
-      # there. The MSI installs per machine into Program Files, puts the
-      # binary on the system PATH and upgrades in place thanks to the frozen
+      # without it (verified 2026-07-11), so the guard step below installs the
+      # pinned package there and asserts the version on both legs. The MSI
+      # installs per machine into Program Files, puts the binary on the system
+      # PATH and upgrades in place thanks to the frozen
       # UpgradeCode in the wxs, which stays shared across arches: on Windows
       # on Arm the arm64 MSI major-upgrades an emulated-x64 install in
       # place, which is the desired behavior.
@@ -488,16 +493,25 @@ jobs:
         if: matrix.msi
         shell: pwsh
         run: |
+          # WiX v3 pinned: windows-latest preinstalls 3.14.1.8722 and the
+          # windows-11-arm image has none, so the arm leg installs the
+          # Chocolatey package that ships the same build. Either way the
+          # version is asserted, so an image update that moves WiX fails here
+          # instead of changing the MSI toolchain unnoticed. Move both values
+          # together.
+          $want = '3.14.1.8722'
           $candle = (Get-Command candle.exe -ErrorAction SilentlyContinue).Source
           if (-not $candle) {
-            choco install wixtoolset --no-progress -y
+            choco install wixtoolset --version 3.14.1.20250415 --no-progress -y
             # A GITHUB_PATH append only reaches later steps, and choco's PATH
             # edit does not reach this shell either, so verify by full path.
             $candle = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin\candle.exe"
             if (-not (Test-Path $candle)) { throw "candle.exe not found after WiX install" }
             Split-Path $candle | Add-Content -Path $env:GITHUB_PATH
           }
-          "WiX candle $((Get-Item $candle).VersionInfo.FileVersion) at $candle"
+          $got = (Get-Item $candle).VersionInfo.FileVersion
+          "WiX candle $got at $candle"
+          if ($got -ne $want) { throw "WiX candle is $got, expected $want" }
 
       - name: Install cargo-wix
         if: matrix.msi
