@@ -1585,7 +1585,7 @@ impl McpServer {
     /// touches.
     ///
     /// Last walked at the 3.2.0 -> 3.4.0 bump (2026-09-17): both clauses are
-    /// unchanged (`uses_legacy_lifecycle` and `ProtocolVersion::has_initialize` are
+    /// unchanged (`uses_legacy_lifecycle` and `is_legacy_version` are
     /// byte-identical, and so is `is_legacy_request`, which only moved to a
     /// let-chain and a new error alias), `negotiate_protocol_version` is
     /// byte-identical too, and 3.3.0's new `ServerHandler::negotiate_initialize`
