@@ -153,7 +153,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | The scale-out variant: nginx replicas in front when one daemon port is not enough |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
-| [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
+| [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |

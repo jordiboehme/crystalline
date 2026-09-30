@@ -2543,7 +2543,7 @@ pub(crate) fn contradiction_reload_remedy(c: &serde_json::Value) -> Option<Vec<S
     }
     if c["load_retry"].as_bool().unwrap_or(false) {
         return Some(vec![
-            "  the download is tried again on its own, after five minutes at first and then at most once an hour"
+            "  the download is tried again on its own, the wait doubling from five minutes up to an hour"
                 .to_string(),
         ]);
     }
@@ -4166,7 +4166,7 @@ mod contradictions_status_tests {
         );
         let retrying = vec![
             head,
-            "  the download is tried again on its own, after five minutes at first and then at most once an hour",
+            "  the download is tried again on its own, the wait doubling from five minutes up to an hour",
         ];
         assert_eq!(contradictions_lines(&block(true, false)), retrying);
         assert_eq!(contradictions_lines(&block(true, true)), retrying);
