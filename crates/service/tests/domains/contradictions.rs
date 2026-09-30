@@ -1634,6 +1634,48 @@ async fn sweep(engine: &Engine) -> serde_json::Value {
         .unwrap()
 }
 
+/// Final review M5: a truncation line belongs to its rule, so it follows the
+/// `--family` and `--rule` filters the findings follow. A temporal sweep
+/// never says V302 pairs are not counted; a V302 sweep does.
+#[tokio::test]
+async fn truncation_lines_follow_the_family_and_rule_filters() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    let lines = |families: &[&str], rules: &[&str]| {
+        let p = EvolveParams {
+            domains: vec!["notes".to_string()],
+            families: families.iter().map(|f| f.to_string()).collect(),
+            rules: rules.iter().map(|r| r.to_string()).collect(),
+            limit: Some(50),
+            today: Some("2026-09-27".to_string()),
+            ..EvolveParams::default()
+        };
+        let engine = engine.clone();
+        async move {
+            let value = engine
+                .evolve_detect(&p, &Scope::Unrestricted)
+                .await
+                .unwrap();
+            value["truncations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    assert_eq!(lines(&[], &[]).await, vec![NOT_COUNTED.to_string()]);
+    assert_eq!(
+        lines(&["meaning"], &[]).await,
+        vec![NOT_COUNTED.to_string()]
+    );
+    assert_eq!(lines(&[], &["V302"]).await, vec![NOT_COUNTED.to_string()]);
+    assert!(lines(&["temporal"], &[]).await.is_empty());
+    assert!(lines(&[], &["V301"]).await.is_empty());
+    assert!(lines(&["meaning"], &["V301"]).await.is_empty());
+}
+
 fn v302(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     value["queue"]
         .as_array()

@@ -171,12 +171,14 @@ impl Engine {
             engrams_scanned += swept.report.engrams_scanned;
             unparsed += swept.unparsed;
             // A cap that fired is domain-local, so the merged list names the
-            // domain it fired in.
+            // domain it fired in. A line belongs to the rule it opens with and
+            // follows the same family and rule filters as the findings.
             truncations.extend(
                 swept
                     .report
                     .truncations
                     .iter()
+                    .filter(|t| truncation_in_scope(t, &families, &rules))
                     .map(|t| format!("{name} - {t}")),
             );
             // Counted before the family and rule filters below, because what an
@@ -1211,5 +1213,23 @@ impl Engine {
         }
         graph.nodes.sort_by_key(|n| n.id.0);
         Ok(graph)
+    }
+}
+
+/// Whether a truncation line passes the family and rule filters. Every line
+/// the sweep writes opens with its rule id (`V302: ...`, `V201 skipped ...`);
+/// a line that names no known rule is kept, so a filter never hides a note it
+/// cannot place.
+fn truncation_in_scope(line: &str, families: &[Family], rules: &[&str]) -> bool {
+    let id: String = line
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match rule_info(&id) {
+        Some(info) => {
+            (families.is_empty() || families.contains(&info.family))
+                && (rules.is_empty() || rules.contains(&info.id))
+        }
+        None => true,
     }
 }
