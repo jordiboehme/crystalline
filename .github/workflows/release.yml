@@ -466,7 +466,8 @@ jobs:
 
   images:
     name: publish container images
-    needs: build
+    # sbom too, so a release whose SBOMs failed pushes no image either.
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
@@ -651,10 +652,11 @@ jobs:
   # Fluid, the browser UI, as an image of its own. It carries no binary and
   # consumes nothing the build matrix produces, but it still waits on it: a tag
   # whose binaries failed to build is not a release, and a UI image published
-  # for one would point at a Crystalline nobody can install.
+  # for one would point at a Crystalline nobody can install. It waits on the
+  # SBOM job for the same reason.
   fluid-image:
     name: publish the Fluid image
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     # Same tag guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.

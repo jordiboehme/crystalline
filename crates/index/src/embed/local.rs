@@ -360,7 +360,12 @@ async fn ensure_files_with(
                 .maybe_progress(show_progress.then(|| ByteProgress::new(file)))
                 .send()
                 .await
-                .map_err(|e| IndexError::Embedding(format!("downloading {file}: {e}")))?,
+                .map_err(|e| {
+                    IndexError::Embedding(format!(
+                        "downloading {file} at commit {}: {e}",
+                        model.revision
+                    ))
+                })?,
         };
         paths.insert((*file).to_string(), path);
     }
@@ -410,7 +415,8 @@ async fn cached_path(client: &HFClient, model: &LocalModel, name: &str) -> Resul
         Ok(path) => Ok(Some(path)),
         Err(HFError::LocalEntryNotFound { .. }) => Ok(None),
         Err(e) => Err(IndexError::Embedding(format!(
-            "reading the model cache for {name}: {e}"
+            "reading the model cache for {name} at commit {}: {e}",
+            model.revision
         ))),
     }
 }
@@ -776,6 +782,44 @@ mod tests {
         }
         std::fs::create_dir_all(dir.join("refs")).unwrap();
         std::fs::write(dir.join("refs").join("main"), commit).unwrap();
+    }
+
+    /// What a pinned download writes: the files under `snapshots/<commit>/`
+    /// and no `refs/` at all, because hf-hub records no ref for a commit.
+    fn cache_at_pin(cache: &Path, model: &LocalModel) {
+        let snap = cache
+            .join(model.cache_dir_name())
+            .join("snapshots")
+            .join(model.revision);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            std::fs::write(snap.join(file), b"x").unwrap();
+        }
+    }
+
+    /// The second start after a fresh pinned download finds every file in
+    /// the cache. The lookup has to name the commit: without `refs/main` a
+    /// lookup of the default branch would miss and dial out.
+    #[tokio::test]
+    async fn a_pinned_download_without_refs_is_found_in_the_cache() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        cache_at_pin(tmp.path(), granite);
+        assert!(
+            !tmp.path()
+                .join(granite.cache_dir_name())
+                .join("refs")
+                .exists()
+        );
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        for file in granite.files {
+            let path = cached_path(&client, granite, file)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{file} is not found in a refs-less cache"));
+            assert!(path.to_string_lossy().contains(granite.revision));
+        }
     }
 
     /// An install that downloaded from main when main was the pinned commit

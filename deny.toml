@@ -3,8 +3,10 @@
 # and every push to main (.github/workflows/ci.yml, job cargo-deny).
 
 [graph]
-# Every platform, so the Windows-only and macOS-only crates are audited
-# from a Linux runner too.
+# No target list: every platform is audited, so the Windows-only and
+# macOS-only crates are audited from a Linux runner too. All features, so
+# optional crates are audited too (the same as the CLI's --all-features, so
+# a bare `cargo deny check` matches CI).
 all-features = true
 
 [advisories]
@@ -22,7 +24,6 @@ ignore = [
 # purpose.
 allow = [
     "0BSD",
-    "AGPL-3.0-or-later",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
@@ -35,6 +36,27 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+# The workspace crates carry Crystalline's own license. It is allowed for
+# them by name only, so a third-party AGPL dependency still fails. A new
+# workspace crate needs an entry here.
+exceptions = [
+    { crate = "crystalline", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-core", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-engine", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-identity", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-index", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-remote", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-rest", allow = ["AGPL-3.0-or-later"] },
+    { crate = "crystalline-service", allow = ["AGPL-3.0-or-later"] },
+]
+
+# cfg_block has no license field, only a LICENSE file (Apache-2.0). The
+# clarification makes the result independent of cargo-deny's license-file
+# detection; the hash pins the file it was checked against.
+[[licenses.clarify]]
+crate = "cfg_block"
+expression = "Apache-2.0"
+license-files = [{ path = "LICENSE", hash = 0xc9663a1e }]
 
 [bans]
 # Reported, never failing: duplicate versions are common in a graph this

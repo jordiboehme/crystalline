@@ -9,9 +9,9 @@
 # it for a dev-channel build, with the version scripts/dev-version.sh computed;
 # the stable release builds what the tag says and never calls this. The cargo
 # target rewrites the workspace entries of Cargo.lock too, because the builds
-# run with --locked. Both files
-# are rewritten together because Fluid compares its own version against the
-# server's and would warn about a version skew that does not exist.
+# run with --locked. Both files are rewritten together because Fluid compares
+# its own version against the server's and would warn about a version skew
+# that does not exist.
 #
 #   bash scripts/set-build-version.sh <version> [cargo|fluid|all]
 #
@@ -52,11 +52,11 @@ set_cargo() {
   # moves; no dependency is re-resolved.
   local lock="$root/Cargo.lock"
   VERSION="$version" perl -0pi -e \
-    's/(\[\[package\]\]\nname = "crystalline(?:-[a-z]+)?"\nversion = )"[^"]*"(\n(?!source = ))/$1"$ENV{VERSION}"$2/g' \
+    's/(\[\[package\]\]\nname = "crystalline(?:-[a-z0-9_-]+)?"\nversion = )"[^"]*"(\n(?!source = ))/$1"$ENV{VERSION}"$2/g' \
     "$lock"
   local members moved
-  members="$(grep -cE '^name = "crystalline(-[a-z]+)?"$' "$lock" || true)"
-  moved="$(grep -A1 -E '^name = "crystalline(-[a-z]+)?"$' "$lock" | grep -cx "version = \"$version\"" || true)"
+  members="$(grep -cE '^name = "crystalline(-[a-z0-9_-]+)?"$' "$lock" || true)"
+  moved="$(grep -A1 -E '^name = "crystalline(-[a-z0-9_-]+)?"$' "$lock" | grep -cx "version = \"$version\"" || true)"
   if [ "$members" = "0" ] || [ "$members" != "$moved" ]; then
     echo "set-build-version: Cargo.lock has $members workspace entries and $moved of them say '$version'" >&2
     exit 1

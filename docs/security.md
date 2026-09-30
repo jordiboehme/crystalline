@@ -119,9 +119,9 @@ Every release has a `SHA256SUMS` file that lists every other asset.
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-On Windows, run `Get-FileHash <file>` in PowerShell and compare the hash with the line in `SHA256SUMS` by hand.
+On macOS the command is `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Windows, run `Get-FileHash <file>` in PowerShell and compare the hash with the line in `SHA256SUMS` by hand.
 
-Since 0.21.2, every release asset, `SHA256SUMS` included, has a build provenance attestation. It proves that the file was built by this repository's release workflow from the tagged commit. Verify it with the GitHub CLI:
+Since 0.21.2, every release asset, `SHA256SUMS` included, has a build provenance attestation. It proves that the file was built by this repository's release workflow from the tagged commit. Verify it with the GitHub CLI. `gh` must be signed in (`gh auth login`) for this and for the `gh release verify` commands below; offline, download the attestation with `gh attestation download` and pass it with `--bundle`.
 
 ```sh
 gh attestation verify crystalline-v0.21.2-windows-amd64.msi --repo jordiboehme/crystalline
@@ -139,18 +139,25 @@ The container images `crystalline`, its `with-model` variant and `crystalline-fl
 gh attestation verify oci://ghcr.io/jordiboehme/crystalline:0.21.2 --repo jordiboehme/crystalline
 ```
 
+Since 0.21.2, releases are immutable: once a release is published, its files and its tag cannot change. GitHub attests each immutable release as well. Check the release as a whole, or one downloaded file against it:
+
+```sh
+gh release verify v0.21.2 --repo jordiboehme/crystalline
+gh release verify-asset v0.21.2 crystalline-v0.21.2-windows-amd64.msi --repo jordiboehme/crystalline
+```
+
 How a release is built:
 
 - On GitHub-hosted runners, from the tagged commit.
 - Every action in the workflows is pinned by commit.
-- `cargo build --locked` with the committed `Cargo.lock`. WiX, the mcpb packer and the cargo tools are pinned to exact versions.
+- `cargo build --locked` with the committed `Cargo.lock`. WiX, the mcpb packer and the cargo tools are pinned to exact versions. The mcpb packer's own npm dependencies are not pinned; they are resolved when the release is built.
 - Dependencies are audited in CI on every pull request and every push to main: `cargo-deny` with `deny.toml` checks RustSec advisories, a license allowlist and crates.io as the only source, and `pnpm audit --prod` checks the web UI's runtime dependencies. Ignored advisories are listed with a dated reason in `deny.toml`.
 
 The Windows binaries and the MSI are not Authenticode signed yet. SmartScreen warns, and AppLocker or WDAC cannot allow them by a publisher rule (general Windows behaviour for unsigned files). The macOS binaries are signed and notarized.
 
 ## License
 
-Crystalline is licensed under the GNU AGPL v3.0 or later (see [LICENSE](../LICENSE)). The third-party licenses the binary may contain are the allowlist in [`deny.toml`](../deny.toml), and the SBOMs list each component with its license.
+Crystalline is licensed under the GNU AGPL v3.0 or later (see [LICENSE](../LICENSE)). The third-party licenses the binary may contain are the allowlist in [`deny.toml`](../deny.toml). The SBOMs list the dependencies that ship, with their versions and, where a package declares one, its license. The Rust SBOMs also name the build-time crates and mark them as excluded, because they are not part of the binary.
 
 ## Known gaps
 
