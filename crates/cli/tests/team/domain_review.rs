@@ -15,7 +15,7 @@ use assert_cmd::Command;
 use crate::common::isolate;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// An isolated home holding a file domain `team` in review mode, with one draft

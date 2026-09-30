@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -548,6 +548,8 @@ fn init_add_sync_status_end_to_end() {
     bin()
         .args(["domain", "remove", "eng", "--config"])
         .arg(&config)
+        .args(["--db"])
+        .arg(&db)
         .assert()
         .success();
     assert!(domain_dir.join("alpha.md").exists(), "files untouched");
@@ -2535,4 +2537,24 @@ fn domain_init_refuses_a_bad_name() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot name a domain"));
     assert!(!root.join("MANIFEST.md").exists(), "nothing scaffolded");
+}
+
+/// The guard for the whole suite: a command built by the shared helper that
+/// is given no `--db`, `--config` or environment of its own must resolve its
+/// default index under the per-process test home, never under the real
+/// `HOME`. `status` on a machine with no index reports the path it looked at
+/// without creating anything, so it is the smallest reliable probe.
+#[test]
+fn a_bare_command_resolves_its_default_paths_under_the_test_home() {
+    let out = bin().args(["--json", "status"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let db = std::path::PathBuf::from(report["db_path"].as_str().expect("status names its db"));
+    let home = crate::common::default_home();
+    assert!(
+        db.starts_with(home),
+        "the default index {} is outside the test home {}",
+        db.display(),
+        home.display()
+    );
 }

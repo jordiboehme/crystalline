@@ -107,3 +107,44 @@ pub fn isolated_state_dir(home: &Path) -> PathBuf {
         .expect("the isolation environment sets this platform's state-home variable");
     base.join("crystalline")
 }
+
+/// The default home every command built by [`crystalline`] and
+/// [`crystalline_std`] runs under, one per test process.
+///
+/// A test that does not isolate its child itself (most of them pass explicit
+/// `--db` and `--config` paths and never think about it) would otherwise fall
+/// through to the developer's real `~/.local/state/crystalline`, opening and
+/// migrating the real index. The directory is created lazily under the system
+/// temp dir and lives for the whole process; a test that sets its own
+/// variables afterwards simply overrides these.
+pub fn default_home() -> &'static Path {
+    static HOME: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        // Statics are never dropped, so the directory is kept explicitly; it
+        // is empty until a child writes into it and the OS temp cleaner owns
+        // it from here.
+        tempfile::Builder::new()
+            .prefix("crystalline-cli-test-home-")
+            .tempdir()
+            .expect("create the default test home")
+            .keep()
+    });
+    &HOME
+}
+
+/// A `crystalline` command already isolated under [`default_home`].
+pub fn crystalline() -> Command {
+    let mut cmd = Command::cargo_bin("crystalline").expect("the crystalline binary is built");
+    for (name, value) in isolation_env(default_home()) {
+        cmd.env(name, value);
+    }
+    cmd
+}
+
+/// The same as [`crystalline`], as a plain `std::process::Command`.
+pub fn crystalline_std() -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+    for (name, value) in isolation_env(default_home()) {
+        cmd.env(name, value);
+    }
+    cmd
+}

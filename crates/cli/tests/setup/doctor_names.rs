@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::common::{isolate, isolated_state_dir};
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// A scratch home, and the config and index paths inside its state

@@ -11,7 +11,7 @@ use crate::common::isolate;
 use crate::common::isolation_env;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 // `isolate` and `isolation_env` (both from `common`) redirect every base

@@ -19,7 +19,7 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// Redirect `HOME` and the XDG base directories into `home` and point `PATH`

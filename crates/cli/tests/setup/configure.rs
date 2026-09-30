@@ -9,7 +9,7 @@ use assert_cmd::Command;
 use crate::common::isolate;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 // `isolate` (from `common`) redirects every base directory a child can

@@ -3,15 +3,13 @@
 
 use std::time::Instant;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 
 use crate::common::fixtures_dir;
 
 #[test]
 fn prompt_text_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -33,8 +31,7 @@ fn prompt_text_matches_snapshot() {
 
 #[test]
 fn prompt_json_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -57,8 +54,7 @@ fn prompt_json_matches_snapshot() {
 
 #[test]
 fn prompt_text_read_only_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -91,8 +87,7 @@ fn prompt_text_read_only_matches_snapshot() {
 
 #[test]
 fn prompt_json_read_only_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -116,8 +111,7 @@ fn prompt_json_read_only_matches_snapshot() {
 
 #[test]
 fn missing_manifest_warns_on_stderr_but_still_exits_0() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -140,8 +134,7 @@ fn missing_manifest_warns_on_stderr_but_still_exits_0() {
 #[test]
 fn prompt_system_output_is_byte_identical_across_separate_invocations() {
     let run = || {
-        Command::cargo_bin("crystalline")
-            .unwrap()
+        crate::common::crystalline()
             .current_dir(fixtures_dir().join("prompt-fixture"))
             .args([
                 "prompt",
@@ -171,8 +164,7 @@ fn prompt_system_output_is_byte_identical_across_separate_invocations() {
 /// prompt the text format prints.
 #[test]
 fn prompt_copilot_format_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -205,8 +197,7 @@ fn prompt_copilot_format_matches_snapshot() {
 /// transcript, so the copilot format prints nothing at all for it.
 #[test]
 fn prompt_copilot_format_suppresses_resume() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",
@@ -229,8 +220,7 @@ fn prompt_copilot_format_suppresses_resume() {
 #[test]
 fn prompt_copilot_format_tolerates_missing_and_garbage_stdin() {
     for stdin in ["", "not json"] {
-        let output = Command::cargo_bin("crystalline")
-            .unwrap()
+        let output = crate::common::crystalline()
             .current_dir(fixtures_dir().join("prompt-fixture"))
             .args([
                 "prompt",
@@ -265,8 +255,7 @@ fn prompt_copilot_format_tolerates_missing_and_garbage_stdin() {
 /// doing nothing.
 #[test]
 fn bare_prompt_without_a_kind_fails_with_subcommand_help() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .args(["prompt"])
         .assert()
         .failure()
@@ -277,8 +266,7 @@ fn bare_prompt_without_a_kind_fails_with_subcommand_help() {
 /// into its custom instructions: static copy, printed as one paragraph.
 #[test]
 fn prompt_connector_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .args(["prompt", "connector"])
         .assert()
         .success()
@@ -296,8 +284,7 @@ fn prompt_connector_matches_snapshot() {
 
 #[test]
 fn prompt_connector_json_matches_snapshot() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .args(["prompt", "connector", "--json"])
         .assert()
         .success()
@@ -316,8 +303,7 @@ fn prompt_connector_json_matches_snapshot() {
 #[test]
 fn prompt_connector_is_byte_identical_across_invocations() {
     let run = || {
-        Command::cargo_bin("crystalline")
-            .unwrap()
+        crate::common::crystalline()
             .args(["prompt", "connector"])
             .assert()
             .success()
@@ -338,8 +324,7 @@ fn prompt_connector_is_byte_identical_across_invocations() {
 #[test]
 fn prompt_connector_works_with_no_config() {
     let tmp = tempfile::tempdir().unwrap();
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(tmp.path())
         .env("CRYSTALLINE_CONFIG", tmp.path().join("config.yaml"))
         .args(["prompt", "connector"])
@@ -374,8 +359,7 @@ fn prompt_system_scaffolded_30_domains_stays_under_500ms() {
     std::fs::write(tmp.path().join("config.yaml"), config_yaml).unwrap();
 
     let start = Instant::now();
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(tmp.path())
         .args(["prompt", "system", "--config", "config.yaml"])
         .assert()
@@ -406,8 +390,7 @@ fn the_harness_flag_never_changes_the_routing_block() {
             "config.yaml",
         ];
         args.extend_from_slice(extra);
-        Command::cargo_bin("crystalline")
-            .unwrap()
+        crate::common::crystalline()
             .current_dir(fixtures_dir().join("prompt-fixture"))
             .args(&args)
             .assert()
@@ -460,8 +443,7 @@ fn scaffold_domains(names: &[&str]) -> tempfile::TempDir {
 fn prompt_system_renders_only_the_named_domains() {
     let tmp = scaffold_domains(&["alpha", "beta", "gamma"]);
 
-    let out = Command::cargo_bin("crystalline")
-        .unwrap()
+    let out = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -493,8 +475,7 @@ fn prompt_system_renders_only_the_named_domains() {
     );
 
     // Every format, not just the default one.
-    let json = Command::cargo_bin("crystalline")
-        .unwrap()
+    let json = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -520,8 +501,7 @@ fn prompt_system_renders_only_the_named_domains() {
         .collect();
     assert_eq!(names, vec!["alpha"]);
 
-    let copilot = Command::cargo_bin("crystalline")
-        .unwrap()
+    let copilot = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -553,8 +533,7 @@ fn prompt_system_renders_only_the_named_domains() {
 fn prompt_system_refuses_a_domain_that_is_not_registered() {
     let tmp = scaffold_domains(&["alpha", "beta"]);
 
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -584,8 +563,7 @@ fn prompt_system_refuses_a_domain_that_is_not_registered() {
 /// The `--workspace` help says what actually scopes and what only reorders.
 #[test]
 fn the_workspace_help_names_prompt_rules_and_says_what_repo_config_does() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .args(["prompt", "system", "--help"])
         .assert()
         .success()
@@ -617,8 +595,7 @@ fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
     )
     .unwrap();
 
-    let out = Command::cargo_bin("crystalline")
-        .unwrap()
+    let out = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -644,8 +621,7 @@ fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
     // Naming an excluded domain alongside an included one still renders the
     // included one: the flag narrows what survived the workspace scoping, it
     // does not replace it.
-    let out = Command::cargo_bin("crystalline")
-        .unwrap()
+    let out = crate::common::crystalline()
         .current_dir(tmp.path())
         .args([
             "prompt",
@@ -673,8 +649,7 @@ fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
 
     // The `--domain` flag's own help states the guarantee this test proves,
     // in the same words: the workspace's `prompt.rules` exclusion wins.
-    let help = Command::cargo_bin("crystalline")
-        .unwrap()
+    let help = crate::common::crystalline()
         .args(["prompt", "system", "--help"])
         .assert()
         .success()
@@ -694,8 +669,7 @@ fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
 /// prints the routing block, byte for byte what the snapshot holds.
 #[test]
 fn prompt_system_text_format_tolerates_garbage_stdin() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir().join("prompt-fixture"))
         .args([
             "prompt",

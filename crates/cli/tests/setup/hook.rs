@@ -31,7 +31,7 @@ const NUDGE_REASON: &str = "Review this conversation for durable learnings befor
 const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// Redirect `HOME` and the XDG base directories into `home`, so the state
@@ -1364,7 +1364,7 @@ impl DaemonEnv {
     /// Start the daemon against this environment's config and wait until it
     /// answers.
     fn serve(&mut self) {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
         let child = cmd
             .args(["serve", "--config"])
@@ -1399,7 +1399,7 @@ impl DaemonEnv {
 
     /// Run a one-shot command, returning (success, stdout).
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
         let out = cmd.args(args).output().unwrap();
         (
@@ -1445,7 +1445,7 @@ impl DaemonEnv {
     /// Run `hook prompt` against this environment, returning the child's
     /// output and how long the whole spawn took.
     fn hook_prompt(&self, session: &str, prompt: &str) -> (std::process::Output, Duration) {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
         let start = Instant::now();
         let mut child = cmd
@@ -1475,7 +1475,7 @@ impl DaemonEnv {
             "hook_event_name": "SessionStart",
         })
         .to_string();
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
         let mut child = cmd
             .args(["prompt", "system", "--harness", "claude-code"])
