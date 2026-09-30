@@ -4460,6 +4460,7 @@ impl Engine {
     /// inherited them) are the orphan collector's, which ages them out on the
     /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
+        self.forget_contradiction_domain(name);
         self.discovered_domains.write().unwrap().remove(name);
         self.mark_names_stale();
         if let Some(tx) = &self.watch_tx {

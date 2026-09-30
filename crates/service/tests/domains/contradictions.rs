@@ -1916,6 +1916,96 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
     );
 }
 
+/// A file domain `notes` holding the Node 18 and Node 20 engrams, on an
+/// engine with the topic provider and `loader`, synced and embedded.
+async fn file_engine(loader: ScorerLoader) -> (tempfile::TempDir, std::path::PathBuf, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let engram = |title: &str, body: &str| {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n{body}\n",
+            title.to_lowercase()
+        )
+    };
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Build notes\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("eighteen.md"), engram("Eighteen", NODE_18)).unwrap();
+    std::fs::write(dir.join("twenty.md"), engram("Twenty", NODE_20)).unwrap();
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::file(dir.clone()));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(config_path),
+    )
+    .with_state_dir(root.join("state"))
+    .with_scorer_loader(loader);
+    let engine = Arc::new(engine);
+    engine.sync(None).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    (tmp, dir, engine)
+}
+
+/// Final review I1: removing a domain clears its rows, so a domain added
+/// back under the same name from the same folder in one daemon lifetime is
+/// scored again, never skipped as settled over an empty table (unscored
+/// must not read as clean, lesson 37).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_removed_and_added_back_is_scored_again() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, dir, engine) = file_engine(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 0)
+    );
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+
+    engine.domain_remove("notes").await.unwrap();
+    engine
+        .domain_add_local(Some("notes"), Some(dir.to_str().unwrap()))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert!(
+        engine.contradictions_wanted(),
+        "pending is unknown again, so the tick asks"
+    );
+    let unknown = sweep(&engine).await;
+    assert_eq!(
+        v302_truncations(&unknown),
+        vec![NOT_COUNTED.to_string()],
+        "not counted, never quiet: {unknown}"
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 0),
+        "the re-added domain is scored again"
+    );
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+}
+
 /// Final review I3: a pair is fresh while both engrams' observation lines
 /// are what the model read, not while their files are byte for byte the
 /// same. Acknowledging a finding (the V302 remedy itself) or raising an

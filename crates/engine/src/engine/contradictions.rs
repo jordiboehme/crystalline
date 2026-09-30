@@ -177,6 +177,22 @@ impl Engine {
         self.reset_contradiction_state();
     }
 
+    /// Forget what the pass remembers about the domain `name`: called when
+    /// it is unregistered or collected, which clears its rows. Without this a
+    /// domain added back under the same name from the same files would match
+    /// its settled digest and its sweep count, and read as clean over an
+    /// empty table. Pending becomes unknown, so the tick asks for a pass, and
+    /// the generation moves, so a walk that started before the removal
+    /// publishes nothing about it.
+    pub(crate) fn forget_contradiction_domain(&self, name: &str) {
+        let mut state = self.contradiction_state.lock().unwrap();
+        state.settled.remove(name);
+        state.counted.remove(name);
+        state.failed.remove(name);
+        state.pending = None;
+        state.generation = state.generation.wrapping_add(1);
+    }
+
     /// Forget everything the pass remembers and move the generation on.
     fn reset_contradiction_state(&self) {
         let mut state = self.contradiction_state.lock().unwrap();
@@ -633,7 +649,7 @@ impl Engine {
             if scope.as_ref().is_some_and(|ids| !ids.contains(&domain_id)) {
                 continue;
             }
-            let digest = walk_digest(model, threshold, &self.model_id, &stamps);
+            let digest = walk_digest(model, threshold, &self.model_id, domain_id, &stamps);
             let (settled, known) = {
                 let state = self.contradiction_state.lock().unwrap();
                 let settled = state
@@ -866,7 +882,13 @@ impl Engine {
                     .await?
                     .embedded_for(&self.model_id);
                 Some((
-                    walk_digest(model, related_threshold(), &self.model_id, &stamps),
+                    walk_digest(
+                        model,
+                        related_threshold(),
+                        &self.model_id,
+                        domain_id,
+                        &stamps,
+                    ),
                     coverage,
                 ))
             } else {
@@ -1007,12 +1029,16 @@ async fn run_scorer(
 }
 
 /// What a domain looked like to a walk: the NLI model, the related line, the
-/// embedding model and every path with its checksum. Built from the stamps
-/// alone, never from the vectors, so checking it costs one narrow read.
+/// embedding model, the domain's id and every path with its checksum. Built
+/// from the stamps alone, never from the vectors, so checking it costs one
+/// narrow read. The id is there for a domain removed and added back under
+/// its old name: its rows were cleared with it, and a new id never matches
+/// the old record (the removal also forgets the record).
 fn walk_digest(
     model: &NliModel,
     threshold: f64,
     embedding_model: &str,
+    domain: DomainId,
     stamps: &HashMap<String, FileStamp>,
 ) -> String {
     let mut h = Sha256::new();
@@ -1021,6 +1047,7 @@ fn walk_digest(
     h.update(threshold.to_bits().to_le_bytes());
     h.update(embedding_model.as_bytes());
     h.update([0]);
+    h.update(domain.0.to_le_bytes());
     let mut paths: Vec<(&String, &FileStamp)> = stamps.iter().collect();
     paths.sort_by(|a, b| a.0.cmp(b.0));
     for (path, stamp) in paths {
@@ -1066,28 +1093,34 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_digest_moves_with_a_stamp_the_model_or_the_embedding_model_only() {
+    fn the_walk_digest_moves_with_a_stamp_the_model_the_embedding_model_or_the_domain_only() {
         let full = nli_model(NliProfile::Full);
         let light = nli_model(NliProfile::Light);
+        let d = DomainId(1);
         let stamps: HashMap<String, FileStamp> = [
             ("a.md".to_string(), stamp("1")),
             ("b.md".to_string(), stamp("2")),
         ]
         .into();
-        let base = walk_digest(full, 0.8, "granite", &stamps);
-        assert_eq!(base, walk_digest(full, 0.8, "granite", &stamps.clone()));
+        let base = walk_digest(full, 0.8, "granite", d, &stamps);
+        assert_eq!(base, walk_digest(full, 0.8, "granite", d, &stamps.clone()));
         let mut edited = stamps.clone();
         edited.insert("b.md".to_string(), stamp("3"));
-        assert_ne!(base, walk_digest(full, 0.8, "granite", &edited));
+        assert_ne!(base, walk_digest(full, 0.8, "granite", d, &edited));
         let mut touched = stamps.clone();
         touched.get_mut("a.md").unwrap().mtime = 99;
         assert_eq!(
             base,
-            walk_digest(full, 0.8, "granite", &touched),
+            walk_digest(full, 0.8, "granite", d, &touched),
             "a touch that keeps the content keeps the digest"
         );
-        assert_ne!(base, walk_digest(light, 0.8, "granite", &stamps));
-        assert_ne!(base, walk_digest(full, 0.7, "granite", &stamps));
-        assert_ne!(base, walk_digest(full, 0.8, "bge", &stamps));
+        assert_ne!(base, walk_digest(light, 0.8, "granite", d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.7, "granite", d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.8, "bge", d, &stamps));
+        assert_ne!(
+            base,
+            walk_digest(full, 0.8, "granite", DomainId(2), &stamps),
+            "the same files under another domain id are another domain"
+        );
     }
 }
