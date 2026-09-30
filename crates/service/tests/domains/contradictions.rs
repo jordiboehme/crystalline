@@ -1037,6 +1037,48 @@ async fn a_failing_pair_is_not_rewalked_on_every_write_and_the_model_idles_out()
     assert!(!engine.mark_contradiction_retry());
 }
 
+/// Final review M2: the tick marks a retry only while the model is loaded,
+/// but the mark can outlive that (the tick marked while a pass or an embed
+/// was in flight, and no walk came before the idle drop). A walk that finds
+/// such a stale mark with the model gone retries nothing and loads nothing.
+#[tokio::test]
+async fn a_stale_retry_mark_after_an_idle_drop_loads_nothing() {
+    let failing = FailsOn::new("Node 19");
+    let loads = Arc::new(AtomicUsize::new(0));
+    let (_tmp, engine) = engine_with(loader_of(failing.clone(), loads.clone())).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Nineteen", NODE_19))
+        .await
+        .unwrap();
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 2)
+    );
+    assert!(engine.mark_contradiction_retry(), "marked while loaded");
+    engine.drop_idle_scorer_at(
+        tokio::time::Instant::now() + NLI_IDLE_DROP + std::time::Duration::from_secs(1),
+    );
+    assert!(!engine.contradiction_scorer_loaded());
+    let failed = failing.failed.load(Ordering::SeqCst);
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 2)
+    );
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        1,
+        "the stale mark loads nothing"
+    );
+    assert_eq!(
+        failing.failed.load(Ordering::SeqCst),
+        failed,
+        "and retries nothing"
+    );
+    assert!(!engine.contradiction_scorer_loaded());
+}
+
 /// Review round 1, finding 6: a store write that fails is a failure of that
 /// pair, not of the walk.
 #[tokio::test]

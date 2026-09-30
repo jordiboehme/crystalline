@@ -403,8 +403,13 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (generation, retry) = {
             let mut state = self.contradiction_state.lock().unwrap();
-            (state.generation, std::mem::take(&mut state.retry_due))
+            // A mark is taken either way, and honoured only while the model
+            // is still loaded: a mark that outlived an idle drop must not
+            // load the model for a pair that is known to fail.
+            let due = std::mem::take(&mut state.retry_due);
+            (state.generation, due)
         };
+        let retry = retry && self.contradiction_scorer_loaded();
         let work = self.contradiction_work(model, retry).await?;
         let mut pending: BTreeMap<String, usize> = work
             .iter()
