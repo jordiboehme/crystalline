@@ -27,7 +27,8 @@ const SHORTCUTS: { keys: string; does: string }[] = [
 
 export default function HelpOverlayBody({
   onClose,
-}: Pick<HelpOverlayProps, "onClose">): ReactElement {
+  returnFocusTo,
+}: Pick<HelpOverlayProps, "onClose" | "returnFocusTo">): ReactElement {
   return (
     <Dialog.Root
       open
@@ -39,7 +40,16 @@ export default function HelpOverlayBody({
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        <Dialog.Content
+          onCloseAutoFocus={(event) => {
+            const target = returnFocusTo;
+            if (target) {
+              event.preventDefault();
+              target.focus();
+            }
+          }}
+          className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900"
+        >
           <Dialog.Title className="text-lg font-semibold">
             Keyboard shortcuts
           </Dialog.Title>
@@ -66,7 +76,7 @@ export default function HelpOverlayBody({
               rel="noreferrer"
               className="text-accent-700 underline hover:no-underline dark:text-accent-300"
             >
-              Handbook
+              Handbook <span className="sr-only">(opens in a new tab)</span>
             </a>
             .
           </p>

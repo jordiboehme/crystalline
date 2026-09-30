@@ -152,11 +152,12 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("the Help menu reaches the Handbook and the shortcut map, and the top bar fits a phone", async ({
+test("the Help menu reaches the Handbook and the shortcut map and gives focus back", async ({
   page,
 }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Help" }).click();
+  const help = page.getByRole("button", { name: "Help", exact: true });
+  await help.click();
   const handbook = page.getByRole("menuitem", {
     name: "Handbook (opens in a new tab)",
   });
@@ -164,32 +165,93 @@ test("the Help menu reaches the Handbook and the shortcut map, and the top bar f
     "href",
     "https://jordiboehme.github.io/crystalline/",
   );
-  await page.getByRole("menuitem", { name: /^Keyboard shortcuts/ }).click();
-  await expect(
-    page.getByRole("dialog", { name: /keyboard shortcuts/i }),
-  ).toBeVisible();
   await page.keyboard.press("Escape");
 
-  // A phone: the extra icon must not push the row past the screen. jsdom has
-  // no layout, so only a browser can see this.
-  await page.setViewportSize({ width: 360, height: 780 });
-  await expect(page.getByRole("button", { name: "Help" })).toBeVisible();
-  const overflow = await page
-    .locator("header")
-    .first()
-    .evaluate((el) => el.scrollWidth - el.clientWidth);
-  expect(overflow).toBeLessThanOrEqual(0);
-  // The row's own overflow is not always counted by the header, so the last
-  // control and the search field are checked directly: the account icon must
-  // end inside the screen and the search field must keep a usable width.
-  const account = await page
-    .getByRole("button", { name: USER, exact: true })
-    .boundingBox();
-  expect(account).not.toBeNull();
-  expect(account!.x + account!.width).toBeLessThanOrEqual(360);
-  const search = await page.getByRole("searchbox").boundingBox();
-  expect(search!.width).toBeGreaterThanOrEqual(60);
+  // A menu item opens a dialog: twice, so the second open is served from the
+  // cached chunk. Escape must hand focus back to the Help button and leave the
+  // page clickable (Radix sets pointer-events: none on the body while a menu
+  // and a dialog overlap, and a mishandled close can leave it there).
+  for (let round = 0; round < 2; round += 1) {
+    await help.click();
+    await page.getByRole("menuitem", { name: /^Keyboard shortcuts/ }).click();
+    await expect(
+      page.getByRole("dialog", { name: /keyboard shortcuts/i }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toBeHidden();
+    await expect(help).toBeFocused();
+    await expect(page.locator("body")).not.toHaveCSS("pointer-events", "none");
+  }
 });
+
+/**
+ * Measure the top bar the way a reader sees it: the boxes of the controls, not
+ * the header's scrollWidth, which a squeezed flex row never grows.
+ */
+async function topBarBoxes(page: Page, width: number) {
+  await page.setViewportSize({ width, height: 780 });
+  await expect(
+    page.getByRole("button", { name: "Help", exact: true }),
+  ).toBeVisible();
+  return page.evaluate(() => {
+    const row = document.querySelector("header > div");
+    const input =
+      document.querySelector<HTMLInputElement>("input[type=search]");
+    const style = input ? getComputedStyle(input) : null;
+    const typing = input
+      ? input.clientWidth -
+        parseFloat(style!.paddingLeft) -
+        parseFloat(style!.paddingRight)
+      : 0;
+    const account = row?.lastElementChild?.getBoundingClientRect();
+    return {
+      viewport: document.documentElement.clientWidth,
+      rowOverflow: row ? row.scrollWidth - row.clientWidth : 0,
+      accountRight: account ? account.right : null,
+      hasSearch: input !== null,
+      typing,
+    };
+  });
+}
+
+for (const share of [false, true]) {
+  for (const width of [360, 640, 767, 768]) {
+    test(`the top bar fits ${width} px${share ? " with Share and a long name" : ""}`, async ({
+      page,
+    }) => {
+      if (share) {
+        // Share shows for an admin once GitHub is on; the status is a
+        // read, so a canned answer is enough and nothing is written.
+        await page.route("**/api/v1/settings/github", (route) =>
+          route.fulfill({ json: { enabled: true, connected: false } }),
+        );
+        // A long display name, to squeeze the account button.
+        await page.route("**/api/v1/auth/me", async (route) => {
+          const response = await route.fetch();
+          const body = (await response.json()) as {
+            user?: { display: string } | null;
+          };
+          if (body.user) {
+            body.user.display = "Bartholomew Featherstonehaugh-Smythe";
+          }
+          await route.fulfill({ response, json: body });
+        });
+        await page.reload();
+        await expect(
+          page.getByRole("button", { name: "Share changes" }),
+        ).toBeVisible();
+      }
+      const boxes = await topBarBoxes(page, width);
+      expect(boxes.hasSearch).toBe(true);
+      expect(boxes.accountRight).not.toBeNull();
+      expect(boxes.accountRight!).toBeLessThanOrEqual(boxes.viewport);
+      expect(boxes.rowOverflow).toBeLessThanOrEqual(0);
+      // The room left to type in: the box minus its padding. 40 px is about
+      // five characters, the least that still reads as a field.
+      expect(boxes.typing).toBeGreaterThanOrEqual(40);
+    });
+  }
+}
 
 test("the Rename dialog opens from the domain page and can be cancelled", async ({
   page,

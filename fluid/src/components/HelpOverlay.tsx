@@ -15,12 +15,25 @@ const HelpOverlayBody = lazy(() => import("./HelpOverlayBody"));
 export interface HelpOverlayProps {
   open: boolean;
   onClose: () => void;
+  /**
+   * Where focus goes when the map closes, when it was opened from a menu item.
+   * The item is gone by then and the dialog mounts lazily, so it cannot have
+   * noted the trigger itself; each opener sets it, to the button or to null,
+   * so a stale value never survives. Null means the dialog's default.
+   */
+  returnFocusTo?: HTMLElement | null | undefined;
 }
 
-export function HelpOverlay({ open, onClose }: HelpOverlayProps): ReactElement {
+export function HelpOverlay({
+  open,
+  onClose,
+  returnFocusTo,
+}: HelpOverlayProps): ReactElement {
   return (
     <Suspense fallback={null}>
-      {open && <HelpOverlayBody onClose={onClose} />}
+      {open && (
+        <HelpOverlayBody onClose={onClose} returnFocusTo={returnFocusTo} />
+      )}
     </Suspense>
   );
 }
