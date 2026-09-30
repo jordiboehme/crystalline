@@ -51,6 +51,9 @@ pub fn names_period(text: &str) -> bool {
         return true;
     }
     let bytes = text.as_bytes();
+    // A day 1 to 31 and a month 1 to 12, each followed by a full stop. A
+    // run that goes on after the second stop ("18.19.0", "1.2.3") or that
+    // follows a digit and a stop ("10.0.0.1") is a version or an address.
     let day_month = runs.windows(2).any(|w| {
         let ((s1, e1), (s2, e2)) = (w[0], w[1]);
         (1..=2).contains(&(e1 - s1))
@@ -58,6 +61,10 @@ pub fn names_period(text: &str) -> bool {
             && bytes.get(e1) == Some(&b'.')
             && s2 == e1 + 1
             && bytes.get(e2) == Some(&b'.')
+            && matches!(text[s1..e1].parse::<u32>(), Ok(1..=31))
+            && matches!(text[s2..e2].parse::<u32>(), Ok(1..=12))
+            && !bytes.get(e2 + 1).is_some_and(u8::is_ascii_digit)
+            && !(s1 >= 2 && bytes[s1 - 1] == b'.' && bytes[s1 - 2].is_ascii_digit())
     });
     if day_month {
         return true;
@@ -128,6 +135,28 @@ mod tests {
             "The key is 12345 long",
         ] {
             assert!(!names_period(line), "{line}");
+        }
+    }
+
+    /// Version strings and addresses are two short digit runs with stops,
+    /// like a German day and month, but never a period.
+    #[test]
+    fn versions_and_addresses_do_not_name_a_period() {
+        for line in [
+            "The build uses Node 18.19.0",
+            "The gateway answers on 10.0.0.1",
+            "The client pins v1.2.3",
+            "The mirror serves 192.168.1.20",
+            "Die Vorlage liegt unter 40.13.",
+        ] {
+            assert!(!names_period(line), "{line}");
+        }
+        for line in [
+            "Gilt bis 27.9.",
+            "Seit dem 27.09.2026",
+            "Am 1.12. zieht das Lager um",
+        ] {
+            assert!(names_period(line), "{line}");
         }
     }
 
