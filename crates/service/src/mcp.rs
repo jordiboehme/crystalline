@@ -1592,6 +1592,15 @@ impl McpServer {
     /// is an opt-in helper that restates the default `initialize` body - this
     /// server overrides `initialize` to supply its own downgrade target and does
     /// not call it.
+    ///
+    /// Walked again at the 3.4.0 -> 3.5.0 bump (2026-09-30): rmcp deleted
+    /// `is_legacy_version` and answers the same comparison through the new public
+    /// `ProtocolVersion::has_initialize` (`as_str() < "2026-07-28"`), so both
+    /// clauses read the same; `negotiate_protocol_version` only renamed its
+    /// locals; `is_legacy_request` is unchanged apart from header validation on
+    /// the `initialize` branch. `ProtocolVersion::default()` now is `LATEST`
+    /// (2026-07-28), so a default test client names the era in `initialize`
+    /// and is answered 2025-11-25 with a session, the path rmcp 3.2.0 opened.
     fn holder_of(&self, ctx: &RequestContext<RoleServer>) -> Option<crate::join::Holder> {
         match self.transport {
             Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
