@@ -1,0 +1,49 @@
+# cargo-deny configuration: advisories, licenses, sources and bans.
+# CI runs `cargo deny --all-features --locked check` on every pull request
+# and every push to main (.github/workflows/ci.yml, job cargo-deny).
+
+[graph]
+# Every platform, so the Windows-only and macOS-only crates are audited
+# from a Linux runner too.
+all-features = true
+
+[advisories]
+# An ignored advisory needs a reason and the date of the decision, in the
+# reason text: { id = "RUSTSEC-YYYY-NNNN", reason = "YYYY-MM-DD: why" }.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "2026-09-30: rsa (Marvin attack) comes in through openidconnect, which uses it only to verify identity provider signatures with public keys, and as a dev dependency for the test identity provider's fixture keys; the timing leak needs private-key decryption or signing on a server, which Crystalline never does, and no fixed version exists upstream yet" },
+    { id = "RUSTSEC-2024-0436", reason = "2026-09-30: paste is unmaintained, not vulnerable; it is a compile-time proc macro that comes in through gemm under candle and runs no code at runtime, and no maintained version exists upstream (the gemm and candle releases still depend on it)" },
+    { id = "RUSTSEC-2026-0215", reason = "2026-09-30: smallstr is unmaintained, not vulnerable; it comes in through yrs 0.28.0 (the co-editing engine), which is the newest yrs release, so no version without it exists upstream yet" },
+]
+
+[licenses]
+# Exactly the licenses the lockfile uses today (2026-09-30). A dependency
+# that brings a new license fails the check until it is added here on
+# purpose.
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Reported, never failing: duplicate versions are common in a graph this
+# size, and the workspace path dependencies carry no version.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

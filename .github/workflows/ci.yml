@@ -444,6 +444,51 @@ jobs:
       - name: The docs' action pins match the workspace version
         run: bash scripts/version-pins.sh
 
+  # Dependency audit for the Rust graph: advisories (RustSec), licenses (the
+  # allowlist in deny.toml), sources (crates.io only) and bans (warnings).
+  # Not gated on `changes`: a new advisory appears without any change here,
+  # and it should show on the next pull request, whatever that touches.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # The workspace pin, so the action's container does not resolve a
+          # different toolchain than the build.
+          rust-version: '1.98.0'
+          arguments: --all-features --locked
+          command: check
+
+  # Dependency audit for the Fluid bundle's runtime dependencies. Only
+  # --prod: what ships inside the binary is the production graph; the dev
+  # tools (vite, vitest, eslint) never reach a reader.
+  fluid-audit:
+    name: fluid-audit
+    runs-on: ubuntu-latest
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    defaults:
+      run:
+        working-directory: fluid
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable pnpm
+          pnpm --version
+
+      - name: pnpm audit --prod
+        run: pnpm audit --prod
+
   musl-spike:
     name: musl-spike
     needs: changes
