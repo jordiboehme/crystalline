@@ -2961,8 +2961,8 @@ fn is_embedding_listing(repo: &str) -> bool {
 /// correction 15, so this runs the same under a running daemon as without
 /// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
 /// status`'s answer when a daemon served this run's file stamps; its
-/// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed` and
-/// `embedding_pending` are read from there and never recomputed (lesson 36) -
+/// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
+/// `load_retry`, `read_only` and `embedding_pending` are read from there and never recomputed (lesson 36) -
 /// a direct read has no worker, so those stay null/false, the same shape
 /// `crystalline status`'s standalone fallback reports.
 fn contradiction_summary(
@@ -2991,6 +2991,8 @@ fn contradiction_summary(
     let pending = live.and_then(|c| c["pending_pairs"].as_u64());
     let failing = live.and_then(|c| c["failing_pairs"].as_u64());
     let load_failed = live.is_some_and(|c| c["load_failed"].as_bool().unwrap_or(false));
+    let load_retry = live.is_some_and(|c| c["load_retry"].as_bool().unwrap_or(false));
+    let read_only = live.is_some_and(|c| c["read_only"].as_bool().unwrap_or(false));
     let embedding_pending = live.is_some_and(|c| c["embedding_pending"].as_bool().unwrap_or(false));
     let last_error = live
         .and_then(|c| c["last_error"].as_str())
@@ -2999,7 +3001,8 @@ fn contradiction_summary(
         None => serde_json::json!({
             "profile": setting, "model": null, "repo": null, "downloaded": null,
             "reason": null, "pending_pairs": null, "failing_pairs": null,
-            "last_error": null, "load_failed": false, "embedding_pending": false,
+            "last_error": null, "load_failed": false, "load_retry": false,
+            "read_only": read_only, "embedding_pending": false,
             "stale_checkpoints": stale,
         }),
         Some(m) => {
@@ -3022,6 +3025,7 @@ fn contradiction_summary(
                 "profile": setting, "model": m.id, "repo": m.repo, "downloaded": downloaded,
                 "reason": reason, "pending_pairs": pending, "failing_pairs": failing,
                 "last_error": last_error, "load_failed": load_failed,
+                "load_retry": load_retry, "read_only": read_only,
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
             })
         }
@@ -5303,6 +5307,33 @@ mod tests {
         assert_eq!(summary["reason"], serde_json::Value::Null);
         assert_eq!(summary["pending_pairs"], 12);
         assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    /// Final review M1: the row takes `read_only` and `load_retry` from the
+    /// daemon, so its remedy on a read-only daemon is a restart, never the
+    /// `config set` that daemon would refuse.
+    #[test]
+    fn a_read_only_daemons_load_failure_names_a_restart() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0,
+            "last_error": "contradiction model error: bad weights",
+            "load_failed": true, "load_retry": false, "read_only": true,
+            "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        assert_eq!(summary["read_only"], true);
+        assert_eq!(summary["load_retry"], false);
+        let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
+        report.contradictions = Some(summary);
+        let out = render_human(&report);
+        assert!(
+            out.contains("not retried until the daemon restarts (it serves read-only and refuses the setting); restart the daemon"),
+            "{out}"
+        );
+        assert!(!out.contains("crystalline config set"), "{out}");
     }
 
     /// L7/lesson 62: no daemon answered (a direct read, or one that has not

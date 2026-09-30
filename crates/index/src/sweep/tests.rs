@@ -3498,7 +3498,7 @@ fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
     assert_eq!(
         detect(&sweep).truncations,
         vec![
-            "V302: 2 related pairs not scored: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)"
+            "V302: 2 related pairs not scored: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)"
         ]
     );
     sweep.contradictions_pending = 0;
@@ -3506,7 +3506,15 @@ fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
     assert_eq!(
         detect(&sweep).truncations,
         vec![
-            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)"
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)"
+        ]
+    );
+    // A read-only daemon refuses the setting, so a restart is the remedy.
+    sweep.contradiction_read_only = true;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; the daemon is read-only, so restarting it retries)"
         ]
     );
 }

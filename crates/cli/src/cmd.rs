@@ -2491,6 +2491,8 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             "scored_pairs": scored_pairs,
             "last_error": null,
             "load_failed": false,
+            "load_retry": false,
+            "read_only": false,
             "embedding_pending": false,
         },
     }))
@@ -2526,16 +2528,30 @@ pub(crate) fn pair_word(n: u64) -> &'static str {
     if n == 1 { "pair" } else { "pairs" }
 }
 
-/// The remedy for a load failure that will not retry on its own (Task 6: a
-/// failed load waits for `evolve.contradictions` to be set again or for the
-/// daemon to restart). A command on its own line, never folded into the
+/// The remedy for a load failure, on its own lines, never folded into the
 /// reason sentence above it (lesson 36's copy-paste test), and `None` when
-/// nothing is stuck. Only ever `Some` on the daemon path: `load_failed` is
-/// always `false` on a direct read, which has no worker to have failed.
-/// Shared with doctor's row so the two surfaces name the same fix.
+/// nothing is stuck. A failed download is tried again by the daemon on its
+/// own, so it gets a note rather than a command. A build error waits for
+/// `evolve.contradictions` to be set again or for a restart (Task 6), and on
+/// a read-only daemon, which refuses the setting, only a restart. Only ever
+/// `Some` on the daemon path: `load_failed` is always `false` on a direct
+/// read, which has no worker to have failed. Shared with doctor's row so the
+/// two surfaces name the same fix.
 pub(crate) fn contradiction_reload_remedy(c: &serde_json::Value) -> Option<Vec<String>> {
     if !c["load_failed"].as_bool().unwrap_or(false) {
         return None;
+    }
+    if c["load_retry"].as_bool().unwrap_or(false) {
+        return Some(vec![
+            "  the download is tried again on its own, after five minutes at first and then at most once an hour"
+                .to_string(),
+        ]);
+    }
+    if c["read_only"].as_bool().unwrap_or(false) {
+        return Some(vec![
+            "  not retried until the daemon restarts (it serves read-only and refuses the setting); restart the daemon"
+                .to_string(),
+        ]);
     }
     let profile = c["profile"].as_str().unwrap_or("<profile>");
     Some(vec![
@@ -4106,7 +4122,7 @@ mod contradictions_status_tests {
 
     /// A load failure is a different reason from a parked batch failure, even
     /// though the pending count is known (the walk counted candidates before
-    /// it ever reached the model). Singular "1 pair pending", and a load
+    /// it ever reached the model). Singular "1 pair pending", and a build
     /// failure never retries on its own, so the remedy is its own line
     /// (lesson 36's copy-paste test).
     #[test]
@@ -4125,6 +4141,35 @@ mod contradictions_status_tests {
                 "  crystalline config set evolve.contradictions full",
             ]
         );
+    }
+
+    /// Final review M1 and I4: a read-only daemon refuses the setting, so
+    /// its remedy is a restart, never a command it would refuse; a failed
+    /// download is tried again by the daemon itself, so it gets a note.
+    #[test]
+    fn the_load_failure_remedy_fits_a_read_only_daemon_and_a_failed_download() {
+        let block = |retry: bool, read_only: bool| {
+            json!({ "contradictions": {
+                "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+                "pending_pairs": 1, "failing_pairs": 0, "scored_pairs": 0,
+                "last_error": "contradiction model error: offline", "load_failed": true,
+                "load_retry": retry, "read_only": read_only, "embedding_pending": false,
+            }})
+        };
+        let head = "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 1 pair pending, the model could not be loaded: contradiction model error: offline";
+        assert_eq!(
+            contradictions_lines(&block(false, true)),
+            vec![
+                head,
+                "  not retried until the daemon restarts (it serves read-only and refuses the setting); restart the daemon",
+            ]
+        );
+        let retrying = vec![
+            head,
+            "  the download is tried again on its own, after five minutes at first and then at most once an hour",
+        ];
+        assert_eq!(contradictions_lines(&block(true, false)), retrying);
+        assert_eq!(contradictions_lines(&block(true, true)), retrying);
     }
 
     /// L7/lesson 62: partial embedding coverage is named, so a bare "0 pairs

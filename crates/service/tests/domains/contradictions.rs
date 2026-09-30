@@ -13,7 +13,8 @@ use crystalline_index::{ContradictionRow, EmbeddingProvider, IndexError, TursoSt
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::engine::{
-    ConfigureAction, ContradictionOutcome, NLI_IDLE_DROP, ScorerLoader,
+    ConfigureAction, ContradictionOutcome, NLI_FETCH_RETRY_FIRST, NLI_FETCH_RETRY_MAX,
+    NLI_IDLE_DROP, ScorerLoader,
 };
 use crystalline_service::params::{EditParams, EvolveParams, MoveParams, WriteParams};
 use tokio::sync::Mutex;
@@ -614,6 +615,113 @@ async fn a_failed_load_waits_for_a_setting_change_and_never_loops() {
     set(&engine, "evolve.contradictions", "full").await;
     engine.score_contradictions().await.unwrap();
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+/// Final review I4: a download that failed (offline at the first pass, a DNS
+/// blip, a proxy outage) is not a broken checkpoint. The tick tries it again
+/// on its own after five minutes, then after ten, twenty and so on up to an
+/// hour, never in between; a setting change starts the wait over.
+#[tokio::test(start_paused = true)]
+async fn a_failed_download_is_retried_on_the_tick_with_a_backoff() {
+    let (s, attempts) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let offline = Arc::new(AtomicUsize::new(2));
+    let loader: ScorerLoader = {
+        let (s, attempts, offline) = (s.clone(), attempts.clone(), offline.clone());
+        Arc::new(move |_model: &'static NliModel| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            if offline.load(Ordering::SeqCst) > 0 {
+                offline.fetch_sub(1, Ordering::SeqCst);
+                ready(Err(IndexError::NliFetch(
+                    "downloading model.safetensors: offline".to_string(),
+                )))
+            } else {
+                ready(Ok(s.clone() as Arc<dyn ContradictionScorer>))
+            }
+        })
+    };
+    let (_tmp, engine) = engine_with(loader).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    let minute = std::time::Duration::from_secs(60);
+
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["load_failed"], true, "{status}");
+    assert_eq!(status["load_retry"], true, "a download retries: {status}");
+    assert!(
+        !engine.contradictions_wanted(),
+        "not before its wait is over"
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "a write asks no load");
+
+    tokio::time::advance(NLI_FETCH_RETRY_FIRST - minute).await;
+    assert!(!engine.contradictions_wanted());
+    tokio::time::advance(minute).await;
+    assert!(
+        engine.contradictions_wanted(),
+        "five minutes on, the tick asks"
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "tried once more");
+
+    // The second failure waits twice as long.
+    tokio::time::advance(NLI_FETCH_RETRY_FIRST).await;
+    assert!(!engine.contradictions_wanted(), "the wait doubled");
+    tokio::time::advance(NLI_FETCH_RETRY_FIRST).await;
+    assert!(engine.contradictions_wanted());
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 0),
+        "back online: loaded and scored"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["load_failed"], false, "{status}");
+    assert!(status["last_error"].is_null(), "{status}");
+}
+
+/// A build error stays blocked however long the tick waits (the loader has
+/// already wiped and fetched the checkpoint once); only a set setting or a
+/// restart asks again.
+#[tokio::test(start_paused = true)]
+async fn a_failed_build_is_never_retried_by_the_tick() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let loader: ScorerLoader = {
+        let attempts = attempts.clone();
+        Arc::new(move |_model: &'static NliModel| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            ready(Err(IndexError::Nli(
+                "building model: bad weights".to_string(),
+            )))
+        })
+    };
+    let (_tmp, engine) = engine_with(loader).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["load_retry"], false, "{status}");
+    tokio::time::advance(NLI_FETCH_RETRY_MAX * 3).await;
+    assert!(!engine.contradictions_wanted());
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::ModelUnavailable
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1594,7 +1702,7 @@ const NOT_COUNTED: &str =
 
 /// What the V302 lines say instead of promising a pass while the model's
 /// failed load blocks the daemon.
-const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)";
+const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)";
 
 /// While a failed load blocks the pass, an edit leaves the domain uncounted
 /// for good, so the line names the failure and where to read it rather than

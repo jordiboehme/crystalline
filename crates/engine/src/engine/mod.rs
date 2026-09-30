@@ -1791,6 +1791,14 @@ pub enum ContradictionOutcome {
 /// How long the loaded NLI model may sit unused before the tick drops it.
 pub const NLI_IDLE_DROP: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The first wait before a contradiction model whose download failed is
+/// tried again. Each further failure doubles it, up to
+/// [`NLI_FETCH_RETRY_MAX`].
+pub const NLI_FETCH_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest wait between two tries of a contradiction model download.
+pub const NLI_FETCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Builds the scorer for a model. The daemon's is
 /// [`crystalline_index::nli::load_scorer`]; a test hands in a stub.
 pub type ScorerLoader = Arc<
@@ -1887,10 +1895,19 @@ pub(crate) struct ContradictionState {
     /// Whether that failure has been logged, so it is logged once.
     pub(crate) error_logged: bool,
     /// The model repo whose load failed. The loader wipes the checkpoint and
-    /// downloads it again on any build error, so the pass never asks for that
-    /// model again by itself: only a set `evolve.contradictions`, another
-    /// profile or a daemon start does.
+    /// downloads it again on a build error, so after a build error the pass
+    /// never asks for that model again by itself: only a set
+    /// `evolve.contradictions`, another profile or a daemon start does. A
+    /// failed download is different, see `load_retry_at`.
     pub(crate) load_failed: Option<&'static str>,
+    /// When a load that failed to download may be tried again: the tick asks
+    /// for a pass once this has passed. `None` after a build error, which is
+    /// never retried by itself.
+    pub(crate) load_retry_at: Option<tokio::time::Instant>,
+    /// The wait that set `load_retry_at`: [`NLI_FETCH_RETRY_FIRST`], doubled
+    /// by every further download failure up to [`NLI_FETCH_RETRY_MAX`], and
+    /// forgotten by a setting change or a load that succeeds.
+    pub(crate) load_backoff: Option<std::time::Duration>,
 }
 
 /// The loaded scorer and when it last scored.

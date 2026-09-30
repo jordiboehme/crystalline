@@ -83,10 +83,17 @@ fn hub_repo(model: &'static NliModel) -> HubRepo<'static> {
 /// while loading an NLI model never renders as "embedding error" in status or
 /// doctor; the text underneath already names "contradiction model" and its
 /// repository (`hub_repo`'s `what`), so nothing is lost by the rename.
-fn as_nli(e: IndexError) -> IndexError {
+///
+/// Everything that comes out of the cache directory lookup and the fetch is
+/// download-class, [`IndexError::NliFetch`], which the daemon tries again
+/// later on its own; only a build error blocks the model until the setting
+/// changes.
+fn as_fetch(e: IndexError) -> IndexError {
     match e {
-        IndexError::Embedding(m) => IndexError::Nli(m),
-        other => other,
+        IndexError::Embedding(m) | IndexError::Nli(m) | IndexError::NliFetch(m) => {
+            IndexError::NliFetch(m)
+        }
+        other => IndexError::NliFetch(other.to_string()),
     }
 }
 
@@ -94,10 +101,10 @@ impl LocalNli {
     /// Load `model`, downloading on first use. The fetch is awaited; the
     /// weight load runs on a blocking thread.
     pub async fn load(model: &'static NliModel) -> Result<LocalNli> {
-        let cache_dir = models_cache_dir().map_err(as_nli)?;
+        let cache_dir = models_cache_dir().map_err(as_fetch)?;
         let files = ensure_files(&cache_dir, &hub_repo(model))
             .await
-            .map_err(as_nli)?;
+            .map_err(as_fetch)?;
         match build_on_blocking(files, model).await {
             Ok(nli) => Ok(nli),
             Err(first) => {
@@ -107,7 +114,7 @@ impl LocalNli {
                 wipe_repo_dir(&cache_dir, model.repo);
                 let files = ensure_files(&cache_dir, &hub_repo(model))
                     .await
-                    .map_err(as_nli)?;
+                    .map_err(as_fetch)?;
                 build_on_blocking(files, model).await
             }
         }
@@ -488,16 +495,26 @@ mod tests {
 
     /// `hub.rs`'s errors stay labeled `Embedding` there (the embedding loader
     /// shares that module), so the NLI loader relabels them at its own call
-    /// boundary.
+    /// boundary, as the download-class failure the daemon retries later.
     #[test]
-    fn as_nli_relabels_a_shared_hub_error_and_leaves_others_alone() {
+    fn as_fetch_relabels_every_fetch_error_as_a_retryable_nli_error() {
         let hub_err = IndexError::Embedding("downloading model.safetensors: offline".to_string());
-        let relabeled = as_nli(hub_err);
-        assert!(matches!(relabeled, IndexError::Nli(_)));
-        assert!(relabeled.to_string().contains("offline"), "{relabeled}");
+        let relabeled = as_fetch(hub_err);
+        assert!(matches!(relabeled, IndexError::NliFetch(_)));
+        let text = relabeled.to_string();
+        assert!(text.contains("offline"), "{text}");
+        assert!(text.starts_with("contradiction model error: "), "{text}");
 
-        let other = IndexError::Invalid("unrelated".to_string());
-        assert!(matches!(as_nli(other), IndexError::Invalid(_)));
+        let io = IndexError::Io {
+            path: "/models".to_string(),
+            source: std::io::Error::other("read-only file system"),
+        };
+        let relabeled = as_fetch(io);
+        assert!(matches!(relabeled, IndexError::NliFetch(_)));
+        assert!(
+            relabeled.to_string().contains("read-only file system"),
+            "{relabeled}"
+        );
     }
 
     /// Review focus 5, the half that runs without a download: the pad id is

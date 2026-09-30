@@ -81,6 +81,9 @@ pub(crate) struct SweepContradictions {
     /// so the daemon neither counts nor scores until the setting is set
     /// again or it restarts: the truncation lines must not promise a pass.
     pub(crate) model_unavailable: bool,
+    /// This daemon serves read-only, so the setting cannot be set here and a
+    /// restart is the one way to ask for an unavailable model again.
+    pub(crate) read_only: bool,
     /// Related pairs with no scored row at their current checksums.
     pub(crate) pending: usize,
     /// The related pairs reached the per-domain cap.
@@ -125,11 +128,14 @@ impl Engine {
     /// "nothing left" rather than "not counted yet", lesson 37/62), the
     /// subset of those that are known-failing and parked, the pairs scored
     /// for the model across the index, why the model could not be loaded, and
-    /// two flags status and doctor use to pick which reason to name (L1):
-    /// `load_failed` (the model itself never loaded, as against a batch that
-    /// failed while scoring) and `embedding_pending` (a settled domain still
-    /// has a possible candidate with no lead vector yet, so its pending count
-    /// of zero is not the whole story).
+    /// the flags status and doctor use to pick which reason and remedy to
+    /// name (L1): `load_failed` (the model itself never loaded, as against a
+    /// batch that failed while scoring), `load_retry` (that failure was a
+    /// download, which the daemon tries again on its own), `read_only` (the
+    /// setting cannot be set here, so only a restart retries a blocked load)
+    /// and `embedding_pending` (a settled domain still has a possible
+    /// candidate with no lead vector yet, so its pending count of zero is not
+    /// the whole story).
     pub async fn contradictions_status(&self) -> Result<Value> {
         let profile = self
             .config
@@ -151,6 +157,7 @@ impl Engine {
         let failing_pairs =
             model.and_then(|m| state.pending.as_ref().map(|_| failed_count(&state, m.repo)));
         let load_failed = model.is_some_and(|m| state.load_failed == Some(m.repo));
+        let load_retry = load_failed && state.load_retry_at.is_some();
         let embedding_pending = state.settled.values().any(|s| s.coverage.is_some());
         Ok(json!({
             "profile": profile,
@@ -160,6 +167,8 @@ impl Engine {
             "scored_pairs": scored,
             "last_error": state.last_error,
             "load_failed": load_failed,
+            "load_retry": load_retry,
+            "read_only": self.read_only,
             "embedding_pending": embedding_pending,
         }))
     }
@@ -237,7 +246,8 @@ impl Engine {
     }
 
     /// Whether the tick should ask for a pass: the check is on, nothing is
-    /// scoring, the model's last load did not fail, and pending is unknown (a
+    /// scoring, the model's last load did not fail (or failed to download and
+    /// its wait is over), and pending is unknown (a
     /// fresh start, a changed setting), holds a pair no batch has failed on
     /// (a pass the budget cut short), or holds a failed pair while the model
     /// is loaded (the tick's retry).
@@ -251,7 +261,9 @@ impl Engine {
         let loaded = self.contradiction_scorer_loaded();
         let state = self.contradiction_state.lock().unwrap();
         if state.load_failed == Some(model.repo) {
-            return false;
+            // A failed download asks again once its wait is over; a build
+            // error never does.
+            return load_retry_due(&state, tokio::time::Instant::now());
         }
         match &state.pending {
             None => true,
@@ -382,13 +394,25 @@ impl Engine {
 
     /// Whether `model`'s last load failed and nothing has lifted it since.
     /// A failure recorded for another model is forgotten here: the profile
-    /// moved, which is a setting change.
+    /// moved, which is a setting change. A failed download whose wait is over
+    /// is lifted here too, so this walk tries the load once more; the reason
+    /// and the backoff stay until a load succeeds.
     fn load_blocked(&self, model: &'static NliModel) -> bool {
         let mut state = self.contradiction_state.lock().unwrap();
         match state.load_failed {
-            Some(repo) if repo == model.repo => true,
+            Some(repo) if repo == model.repo => {
+                if load_retry_due(&state, tokio::time::Instant::now()) {
+                    state.load_failed = None;
+                    state.load_retry_at = None;
+                    false
+                } else {
+                    true
+                }
+            }
             Some(_) => {
                 state.load_failed = None;
+                state.load_retry_at = None;
+                state.load_backoff = None;
                 state.last_error = None;
                 state.error_logged = false;
                 false
@@ -429,17 +453,47 @@ impl Engine {
             });
         }
         let scorer = match self.scorer_for(model).await {
-            Ok(scorer) => scorer,
+            Ok(scorer) => {
+                let mut state = self.contradiction_state.lock().unwrap();
+                state.load_backoff = None;
+                state.load_retry_at = None;
+                scorer
+            }
             Err(e) => {
                 let current = self.contradiction_model().map(|m| m.repo);
                 let mut state = self.contradiction_state.lock().unwrap();
                 if state.generation == generation && current == Some(model.repo) {
-                    if !state.error_logged {
-                        tracing::warn!(
-                            model = model.repo,
-                            "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
-                        );
-                        state.error_logged = true;
+                    if matches!(e, IndexError::NliFetch(_)) {
+                        // A download that failed is tried again later, each
+                        // failure waiting twice as long, up to an hour.
+                        let wait = state
+                            .load_backoff
+                            .map_or(NLI_FETCH_RETRY_FIRST, |w| (w * 2).min(NLI_FETCH_RETRY_MAX));
+                        state.load_backoff = Some(wait);
+                        state.load_retry_at = Some(tokio::time::Instant::now() + wait);
+                        if !state.error_logged {
+                            tracing::warn!(
+                                model = model.repo,
+                                "the contradiction model could not be downloaded; it is tried again in {} minutes: {e}",
+                                wait.as_secs() / 60
+                            );
+                            state.error_logged = true;
+                        } else {
+                            tracing::info!(
+                                model = model.repo,
+                                "the contradiction model could still not be downloaded; it is tried again in {} minutes: {e}",
+                                wait.as_secs() / 60
+                            );
+                        }
+                    } else {
+                        state.load_retry_at = None;
+                        if !state.error_logged {
+                            tracing::warn!(
+                                model = model.repo,
+                                "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
+                            );
+                            state.error_logged = true;
+                        }
                     }
                     state.last_error = Some(e.to_string());
                     state.load_failed = Some(model.repo);
@@ -938,6 +992,7 @@ impl Engine {
         }
         // Read, never lifted: `load_blocked` is the walk's to clear.
         out.model_unavailable = state.load_failed == Some(model.repo);
+        out.read_only = self.read_only;
         Ok(out)
     }
 
@@ -946,7 +1001,10 @@ impl Engine {
     /// Handing out a loaded scorer does not count as use: only a walk that
     /// scored a pair does, so walks that retry a failing pair and score
     /// nothing let the model idle out.
-    async fn scorer_for(&self, model: &'static NliModel) -> Result<Arc<dyn ContradictionScorer>> {
+    async fn scorer_for(
+        &self,
+        model: &'static NliModel,
+    ) -> crystalline_index::Result<Arc<dyn ContradictionScorer>> {
         {
             let mut held = self.scorer.lock().unwrap();
             if let Some(h) = held.as_ref()
@@ -994,6 +1052,11 @@ fn record_counts(
             }
         }
     }
+}
+
+/// Whether a failed load is a download whose wait is over at `now`.
+fn load_retry_due(state: &ContradictionState, now: tokio::time::Instant) -> bool {
+    state.load_retry_at.is_some_and(|at| now >= at)
 }
 
 /// How many failed pairs the state holds for `repo`.

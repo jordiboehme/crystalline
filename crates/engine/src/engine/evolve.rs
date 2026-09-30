@@ -1047,6 +1047,7 @@ impl Engine {
             contradiction_model: meaning.model.map(|m| m.id.to_string()).unwrap_or_default(),
             contradictions_uncounted: meaning.uncounted,
             contradiction_model_unavailable: meaning.model_unavailable,
+            contradiction_read_only: meaning.read_only,
             contradictions_pending: meaning.pending,
             contradiction_candidates_capped: meaning.capped,
             contradiction_unembedded: meaning.unembedded,

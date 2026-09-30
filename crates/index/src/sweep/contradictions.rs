@@ -18,7 +18,11 @@ const PERIOD: &str = "One of these lines names a period; if both held at differe
 
 /// Why nothing is counted or scored while the model cannot be loaded, and
 /// where to read more.
-const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)";
+const UNAVAILABLE: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)";
+
+/// [`UNAVAILABLE`] on a read-only daemon, which refuses the setting: only a
+/// restart asks for the model again there.
+const UNAVAILABLE_READ_ONLY: &str = "the contradiction model could not be loaded (crystalline status and crystalline doctor say why; the daemon is read-only, so restarting it retries)";
 
 /// One stored row that still stands.
 struct Live<'a> {
@@ -173,9 +177,14 @@ fn notes(input: &SweepInput, report: &mut SweepReport) {
     // With the model unavailable the daemon runs no pass until the setting
     // is set again, so neither line may promise one.
     let unavailable = input.contradiction_model_unavailable;
+    let reason = if input.contradiction_read_only {
+        UNAVAILABLE_READ_ONLY
+    } else {
+        UNAVAILABLE
+    };
     if input.contradictions_uncounted {
         report.truncations.push(if unavailable {
-            format!("V302: related pairs not counted: {UNAVAILABLE}")
+            format!("V302: related pairs not counted: {reason}")
         } else {
             "V302: related pairs not counted yet (the daemon counts them after embedding)"
                 .to_string()
@@ -184,7 +193,7 @@ fn notes(input: &SweepInput, report: &mut SweepReport) {
     if input.contradictions_pending > 0 {
         report.truncations.push(if unavailable {
             format!(
-                "V302: {} related pairs not scored: {UNAVAILABLE}",
+                "V302: {} related pairs not scored: {reason}",
                 input.contradictions_pending
             )
         } else {

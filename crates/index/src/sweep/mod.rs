@@ -1093,6 +1093,9 @@ pub struct SweepInput {
     /// setting to be set again, so the lines above name that and point at
     /// `status` and `doctor` rather than promise a pass that will not run.
     pub contradiction_model_unavailable: bool,
+    /// The daemon serves read-only and refuses a set setting, so the line for
+    /// an unavailable model names a restart as the one way to retry.
+    pub contradiction_read_only: bool,
     /// Related pairs the daemon has not scored yet; a non-zero count is a
     /// truncation line, so a quiet `V302` never reads as a clean domain.
     pub contradictions_pending: usize,
@@ -1138,6 +1141,7 @@ impl SweepInput {
             contradiction_model: String::new(),
             contradictions_uncounted: false,
             contradiction_model_unavailable: false,
+            contradiction_read_only: false,
             contradictions_pending: 0,
             contradiction_candidates_capped: false,
             contradiction_unembedded: 0,
