@@ -58,6 +58,7 @@ pub struct LocalNli {
 fn hub_repo(model: &'static NliModel) -> HubRepo<'static> {
     HubRepo {
         repo: model.repo,
+        revision: "main",
         files: model.files,
         download_mb: model.download_mb,
         what: "contradiction model",
@@ -89,7 +90,7 @@ impl LocalNli {
     /// weight load runs on a blocking thread.
     pub async fn load(model: &'static NliModel) -> Result<LocalNli> {
         let cache_dir = models_cache_dir().map_err(as_fetch)?;
-        let files = ensure_files(&cache_dir, &hub_repo(model))
+        let files = ensure_files(&cache_dir, &hub_repo(model), true)
             .await
             .map_err(as_fetch)?;
         match build_on_blocking(files, model).await {
@@ -99,7 +100,7 @@ impl LocalNli {
                     "crystalline: contradiction model failed to load ({first}); re-downloading once..."
                 );
                 wipe_repo_dir(&cache_dir, model.repo);
-                let files = ensure_files(&cache_dir, &hub_repo(model))
+                let files = ensure_files(&cache_dir, &hub_repo(model), true)
                     .await
                     .map_err(as_fetch)?;
                 build_on_blocking(files, model).await

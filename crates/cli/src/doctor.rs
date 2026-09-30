@@ -67,8 +67,8 @@ use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{
-    FileStamp, Store, TagCluster, cached_model_dirs, configured_model_id, local_model,
-    tag_clusters_with_aliases,
+    FileStamp, LocalModel, SnapshotChoice, Store, TagCluster, cached_model_dirs, choose_snapshot,
+    configured_model_id, local_model, tag_clusters_with_aliases,
 };
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
@@ -2936,9 +2936,25 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
             })
         })
         .collect();
+    let local_provider = cfg
+        .embeddings
+        .as_ref()
+        .is_none_or(|e| e.provider.trim() == "local");
+    let model_snapshot = match (entry.filter(|_| local_provider), config::models_dir()) {
+        // A blocking thread: a copied snapshot beside the pinned one is
+        // compared by hashing both weight files.
+        (Some(model), Ok(dir)) => {
+            tokio::task::spawn_blocking(move || model_snapshot_summary(&dir, model))
+                .await
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
     Ok(serde_json::json!({
         "configured_model": configured,
         "configured_repo": configured_repo,
+        "model_snapshot": model_snapshot,
         "configured_model_bytes": configured_model_bytes,
         "total_chunks": coverage.total_chunks,
         "embedded_with_configured_model": embedded_with_configured,
@@ -3031,6 +3047,25 @@ fn contradiction_summary(
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
             })
         }
+    }
+}
+
+/// The cached snapshot the local model starts on, when it is not the pinned
+/// commit: the same choice a daemon start makes, from the cache alone. `None`
+/// when the start loads the pinned commit or downloads it. Only ever a
+/// warning in the report, never a problem: a start on an older snapshot
+/// works, and the index was built with it.
+fn model_snapshot_summary(models_dir: &Path, model: &LocalModel) -> Option<serde_json::Value> {
+    match choose_snapshot(models_dir, model) {
+        SnapshotChoice::Older {
+            commit,
+            pinned_differs,
+        } => Some(serde_json::json!({
+            "commit": commit,
+            "pinned": model.revision,
+            "pinned_differs": pinned_differs,
+        })),
+        _ => None,
     }
 }
 
@@ -3612,6 +3647,24 @@ pub fn render_human(report: &DoctorReport) -> String {
             // a read-only instance or a remote provider never prunes, so
             // there they stay marked stale until someone clears them by hand.
             let _ = writeln!(out, "  cached models: {}", listed.join("; "));
+        }
+        // A start on an older cached snapshot: a warning, never counted in
+        // `remaining_problems`, because the model works and the index was
+        // built with it.
+        if let Some(snap) = e["model_snapshot"].as_object() {
+            let commit = snap["commit"].as_str().unwrap_or_default();
+            let pinned = snap["pinned"].as_str().unwrap_or_default();
+            if snap["pinned_differs"] == serde_json::Value::Bool(true) {
+                let _ = writeln!(
+                    out,
+                    "  warning: the model runs on cached commit {commit}; the pinned commit {pinned} is cached too, but its weights or tokenizer differ, so it is not used (switching would need the index re-embedded)"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  warning: the model runs on cached commit {commit}, not the pinned commit {pinned}; once it is downloaded, the next start uses it if its weights and tokenizer are the same (run `crystalline model download` to update)"
+                );
+            }
         }
         // The coverage figure never goes out bare while a rebuild is
         // unfinished: the incident was a coverage number read as normal when it
@@ -4416,6 +4469,77 @@ mod tests {
             !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 220 MB [stale]"),
             "the model in use is not marked stale: {out}"
         );
+    }
+
+    /// A start on an older cached snapshot is a warning line under the
+    /// embeddings, naming the commit in use and the pinned one, and never a
+    /// problem: the exit code stays 0.
+    #[test]
+    fn an_older_model_snapshot_is_a_warning_and_not_a_problem() {
+        let granite = local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(model_snapshot_summary(tmp.path(), granite).is_none());
+        let snap = tmp
+            .path()
+            .join(granite.cache_dir_name())
+            .join("snapshots")
+            .join(older);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in granite.files {
+            std::fs::write(snap.join(file), b"x").unwrap();
+        }
+        let summary = model_snapshot_summary(tmp.path(), granite).unwrap();
+
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 10,
+            "total_chunks": 10,
+            "configured_model": granite.id,
+            "configured_repo": granite.repo,
+            "configured_model_bytes": 100u64,
+            "stale_chunks": 0,
+            "model_snapshot": summary,
+            "cached_models": [],
+        }));
+        let out = render_human(&report);
+        assert!(
+            out.contains("warning: the model runs on cached commit"),
+            "{out}"
+        );
+        assert!(out.contains(older), "{out}");
+        assert!(out.contains(granite.revision), "{out}");
+        assert!(
+            out.contains("once it is downloaded, the next start uses it"),
+            "{out}"
+        );
+        assert!(out.contains("crystalline model download"), "{out}");
+        assert_eq!(report.remaining_problems(), 0);
+        assert!(out.contains("0 problem(s) remaining"), "{out}");
+
+        // The pinned commit cached with other weights: still a warning only.
+        let pinned = tmp
+            .path()
+            .join(granite.cache_dir_name())
+            .join("snapshots")
+            .join(granite.revision);
+        std::fs::create_dir_all(&pinned).unwrap();
+        for file in granite.files {
+            std::fs::write(pinned.join(file), b"other").unwrap();
+        }
+        let summary = model_snapshot_summary(tmp.path(), granite).unwrap();
+        assert_eq!(summary["pinned_differs"], serde_json::Value::Bool(true));
+        report.embeddings.as_mut().unwrap()["model_snapshot"] = summary;
+        let out = render_human(&report);
+        assert!(out.contains("re-embedded"), "{out}");
+        assert_eq!(report.remaining_problems(), 0);
+
+        // Once the pinned commit has the same content, it is the start's
+        // choice and the warning is gone.
+        for file in granite.files {
+            std::fs::write(pinned.join(file), b"x").unwrap();
+        }
+        assert!(model_snapshot_summary(tmp.path(), granite).is_none());
     }
 
     /// Where the daemon runs, in full, and the warning when it cannot leave

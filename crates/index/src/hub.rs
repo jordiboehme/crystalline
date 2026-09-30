@@ -29,6 +29,10 @@ use crate::error::{IndexError, Result};
 pub(crate) struct HubRepo<'a> {
     /// The Hugging Face repository id, `<owner>/<name>`.
     pub repo: &'a str,
+    /// The pinned commit every file is fetched at and resolved from, a full
+    /// 40-character hash: hf-hub answers it from `snapshots/<hash>/` alone,
+    /// with no network call and no `refs/main` lookup.
+    pub revision: &'a str,
     /// The files to fetch, in fetch order.
     pub files: &'a [&'a str],
     /// The approximate first-use download, in megabytes.
@@ -47,6 +51,21 @@ pub(crate) struct HubFiles {
 }
 
 impl HubFiles {
+    /// The files of one cached snapshot, read straight from
+    /// `snapshots/<commit>/`, which the caller has already found complete.
+    pub(crate) fn from_snapshot(cache_dir: &Path, repo: &HubRepo<'_>, commit: &str) -> HubFiles {
+        let dir = cache_dir
+            .join(hub_dir_name(repo.repo))
+            .join("snapshots")
+            .join(commit);
+        let paths = repo
+            .files
+            .iter()
+            .map(|f| ((*f).to_string(), dir.join(f)))
+            .collect();
+        HubFiles { paths }
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&PathBuf> {
         self.paths.get(name)
     }
@@ -82,6 +101,14 @@ impl HubFiles {
 
     pub(crate) fn weights(&self) -> Result<&PathBuf> {
         self.required("model.safetensors")
+    }
+
+    /// The `snapshots/<commit>/` directory the files were resolved in.
+    pub(crate) fn snapshot_dir(&self) -> Result<PathBuf> {
+        self.weights()?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| IndexError::Embedding("the model weights have no directory".into()))
     }
 }
 
@@ -189,18 +216,40 @@ impl ProgressHandler for ByteProgress {
 /// callers, CI) keeps exactly the single notice line, never per-byte output.
 /// A file already present in the cache is resolved with no network call at
 /// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
-/// never dials out just to check.
-pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result<HubFiles> {
+/// never dials out just to check. Every file is fetched at the pinned commit
+/// ([`HubRepo::revision`]), so a cache holding another commit counts as not
+/// cached here. `announce` false drops the notice and the progress line, for
+/// a daemon's quiet background fetch.
+pub(crate) async fn ensure_files(
+    cache_dir: &Path,
+    repo: &HubRepo<'_>,
+    announce: bool,
+) -> Result<HubFiles> {
+    let client = cache_client(cache_dir)?;
+    ensure_files_with(&client, cache_dir, repo, announce).await
+}
+
+/// The hub client on a cache directory that exists.
+pub(crate) fn cache_client(cache_dir: &Path) -> Result<HFClient> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
+    hub_client(cache_dir)
+}
 
-    let client = hub_client(cache_dir)?;
+/// [`ensure_files`] on a given client, so a test can point the network side
+/// at a listener it controls. Every request names `repo.revision`.
+pub(crate) async fn ensure_files_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    repo: &HubRepo<'_>,
+    announce: bool,
+) -> Result<HubFiles> {
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
-    let cached = is_cached(&client, repo).await?;
-    if !cached {
+    let cached = is_cached(client, repo).await?;
+    if !cached && announce {
         eprintln!(
             "crystalline: downloading {} {} to {} (first use, about {} MB)...",
             repo.what,
@@ -209,17 +258,18 @@ pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result
             repo.download_mb
         );
     }
-    let show_progress = !cached && std::io::stderr().is_terminal();
+    let show_progress = !cached && announce && std::io::stderr().is_terminal();
 
     let (owner, name) = repo_parts(repo.repo)?;
     let remote = client.model(owner, name);
     let mut paths = IndexMap::with_capacity(repo.files.len());
     for file in repo.files {
-        let path = match cached_path(&client, repo, file).await? {
+        let path = match cached_path(client, repo, file).await? {
             Some(path) => path,
             None => remote
                 .download_file()
                 .filename(*file)
+                .revision(repo.revision)
                 // Progress is opt in in hf-hub: leaving the handler off is the
                 // suppression, so exactly one progress mechanism is ever active
                 // and it is the one this module controls and TTY-gates itself.
@@ -228,8 +278,8 @@ pub(crate) async fn ensure_files(cache_dir: &Path, repo: &HubRepo<'_>) -> Result
                 .await
                 .map_err(|e| {
                     IndexError::Embedding(format!(
-                        "downloading {file} for {} {}: {e}",
-                        repo.what, repo.repo
+                        "downloading {file} for {} {} at commit {}: {e}",
+                        repo.what, repo.repo, repo.revision
                     ))
                 })?,
         };
@@ -263,7 +313,9 @@ pub(crate) fn hub_client(cache_dir: &Path) -> Result<HFClient> {
 /// does not hold it. `local_files_only` answers from the cache directory alone
 /// and never touches the network, and `LocalEntryNotFound` is the miss; a plain
 /// download would HEAD the repository even on a warm cache, which is what the
-/// air-gapped and CI-prefetch paths must not do.
+/// air-gapped and CI-prefetch paths must not do. It asks for the pinned
+/// commit, which hf-hub answers from `snapshots/<hash>/` alone; without the
+/// revision it would look up `refs/main`, which a pinned download never writes.
 pub(crate) async fn cached_path(
     client: &HFClient,
     repo: &HubRepo<'_>,
@@ -274,6 +326,7 @@ pub(crate) async fn cached_path(
         .model(owner, repo_name)
         .download_file()
         .filename(name)
+        .revision(repo.revision)
         .local_files_only(true)
         .send()
         .await
@@ -281,8 +334,8 @@ pub(crate) async fn cached_path(
         Ok(path) => Ok(Some(path)),
         Err(HFError::LocalEntryNotFound { .. }) => Ok(None),
         Err(e) => Err(IndexError::Embedding(format!(
-            "reading the model cache for {name} of {} {}: {e}",
-            repo.what, repo.repo
+            "reading the model cache for {name} of {} {} at commit {}: {e}",
+            repo.what, repo.repo, repo.revision
         ))),
     }
 }

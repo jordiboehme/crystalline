@@ -12,8 +12,8 @@
 //! features) so the release binaries stay portable, and both it and the weight
 //! load run on a blocking thread so neither stalls the async runtime; the
 //! download itself is async and is awaited before that thread starts. A load
-//! failure from a truncated or corrupt cache self-heals: the model directory is
-//! wiped and fetched once more before giving up.
+//! failure of the pinned snapshot self-heals: that snapshot is removed and
+//! fetched once more before giving up.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,14 +22,18 @@ use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use crystalline_core::config::EmbeddingsConfig;
+use crystalline_core::config::{self, EmbeddingsConfig};
+use hf_hub::HFClient;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use super::models::{Architecture, LocalModel, lookup_local_model};
+use super::models::{
+    Architecture, LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model,
+    note_loaded_snapshot, older_snapshot_warning, remove_failed_pinned_snapshot,
+};
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
 use crate::error::{IndexError, Result};
-use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read, wipe_repo_dir};
+use crate::hub::{HubFiles, HubRepo, cache_client, ensure_files, models_cache_dir, pad_id, read};
 
 /// The model's maximum input length in tokens. Both table entries truncate
 /// here: the chunker never produces more, and granite's 32k positions
@@ -139,11 +143,24 @@ fn configured_or_default(cfg: &EmbeddingsConfig) -> &str {
     }
 }
 
-/// Pre-fetch the model files and report the cache location and size.
+/// Pre-fetch the model files and report the cache location and size. Always
+/// the pinned commit, whatever older snapshot the cache holds: after this, the
+/// next start loads the pinned one.
 pub async fn download(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+    fetch_pinned(cfg, true).await
+}
+
+/// [`download`] without the first-use notice or a progress line, for a daemon
+/// fetching the pinned commit in the background while it serves on an older
+/// snapshot.
+pub async fn update(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+    fetch_pinned(cfg, false).await
+}
+
+async fn fetch_pinned(cfg: &EmbeddingsConfig, announce: bool) -> Result<super::ModelDownload> {
     let model = lookup_local_model(configured_or_default(cfg))?;
     let cache_dir = models_cache_dir()?;
-    let files = ensure_files(&cache_dir, &hub_repo(model)).await?;
+    let files = ensure_files(&cache_dir, &hub_repo(model), announce).await?;
     // Metadata sizing only: a handful of stat calls, which no blocking task
     // has to carry now that the fetch itself is async.
     let bytes = files
@@ -163,27 +180,158 @@ pub async fn download(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
 fn hub_repo(model: &'static LocalModel) -> HubRepo<'static> {
     HubRepo {
         repo: model.repo,
+        revision: model.revision,
         files: model.files,
         download_mb: model.download_mb,
         what: "embedding model",
     }
 }
 
+/// The files a start loads: the snapshot [`choose_snapshot`] picks from the
+/// cache alone. The pinned commit goes through [`ensure_files_with`] as
+/// before (no network call when it is complete); an older complete snapshot
+/// is used as it is, with no network call and one warning; only when the cache
+/// holds no complete snapshot at all is the pinned commit downloaded.
+async fn load_files_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+) -> Result<(HubFiles, SnapshotChoice)> {
+    // A blocking thread: comparing a copied pre-seed with the pinned commit
+    // hashes both weight files.
+    let dir = cache_dir.to_path_buf();
+    let choice = tokio::task::spawn_blocking(move || choose_snapshot(&dir, model))
+        .await
+        .map_err(|e| IndexError::Embedding(format!("model cache check failed: {e}")))?;
+    if let SnapshotChoice::Older { commit, .. } = &choice {
+        if let Some(warning) = older_snapshot_warning(model, &choice) {
+            tracing::warn!(
+                model = model.id,
+                commit = %commit,
+                pinned = model.revision,
+                "{warning}"
+            );
+        }
+        let files = HubFiles::from_snapshot(cache_dir, &hub_repo(model), commit);
+        return Ok((files, choice));
+    }
+    let files = ensure_files_with(client, cache_dir, model, true).await?;
+    Ok((files, choice))
+}
+
+/// [`crate::hub::ensure_files_with`] for an embedding model, so a test can
+/// point the network side at a listener it controls. Every request names
+/// `model.revision`.
+async fn ensure_files_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+    announce: bool,
+) -> Result<HubFiles> {
+    crate::hub::ensure_files_with(client, cache_dir, &hub_repo(model), announce).await
+}
+
+/// [`crate::hub::cached_path`] for one of an embedding model's files at its
+/// pinned commit, with no network call.
+#[cfg(test)]
+async fn cached_path(
+    client: &HFClient,
+    model: &'static LocalModel,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    crate::hub::cached_path(client, &hub_repo(model), name).await
+}
+
 /// Load the model, self-healing once from a corrupt cache. The fetch is awaited
 /// here; only the weight load goes to a blocking thread.
 async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
-    let files = ensure_files(cache_dir, &hub_repo(model)).await?;
+    let client = cache_client(cache_dir)?;
+    load_encoder_with(&client, cache_dir, model).await
+}
+
+/// [`load_encoder`] on a given client, so a test can point the network side
+/// at a listener it controls.
+///
+/// An older snapshot that fails to build is never wiped: it may be the only
+/// copy an air-gapped host has, or a pre-seed the user owns. It is logged and
+/// left as it is. When the pinned commit is simply not cached yet, the start
+/// falls through to the pinned path (download, then the self-heal below);
+/// when the pinned commit is cached with other weights, the start fails
+/// rather than load weights the index was not embedded with. The self-heal
+/// is the pinned path's alone, and it removes only the pinned snapshot it
+/// failed to build.
+async fn load_encoder_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+) -> Result<Encoder> {
+    let (files, choice) = load_files_with(client, cache_dir, model).await?;
+    if let SnapshotChoice::Older {
+        commit,
+        pinned_differs,
+    } = choice
+    {
+        let snapshot = files.snapshot_dir()?;
+        match build_on_blocking(files, model).await {
+            Ok(encoder) => {
+                note_loaded_snapshot(&snapshot);
+                return Ok(encoder);
+            }
+            Err(e) if pinned_differs => {
+                return Err(IndexError::Embedding(format!(
+                    "cached commit {commit} of embedding model {} failed to load ({e}), and \
+                     the pinned commit {} is not used in its place because its weights or \
+                     tokenizer differ from the ones the index was embedded with; the cache \
+                     was left as it is",
+                    model.id, model.revision
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = model.id,
+                    commit = %commit,
+                    pinned = model.revision,
+                    "cached commit {commit} of the embedding model failed to load ({e}); \
+                     leaving it in place and using the pinned commit {} instead",
+                    model.revision
+                );
+                let files = ensure_files_with(client, cache_dir, model, true).await?;
+                return load_pinned(client, cache_dir, model, files).await;
+            }
+        }
+    }
+    load_pinned(client, cache_dir, model, files).await
+}
+
+/// Build the pinned commit's files, self-healing once from a corrupt cache:
+/// the pinned snapshot is removed and fetched again before the failure is
+/// surfaced.
+async fn load_pinned(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+    files: HubFiles,
+) -> Result<Encoder> {
+    let snapshot = files.snapshot_dir()?;
     match build_on_blocking(files, model).await {
-        Ok(encoder) => Ok(encoder),
+        Ok(encoder) => {
+            note_loaded_snapshot(&snapshot);
+            Ok(encoder)
+        }
         Err(first) => {
-            // A truncated or corrupt cache: wipe the model directory and fetch
-            // once more before surfacing the failure.
+            // A truncated or corrupt download: remove the pinned snapshot
+            // (and, in Crystalline's own cache, the blobs only it used) and
+            // fetch once more before surfacing the failure. Never another
+            // snapshot, and never anything else in a folder the user provides.
             eprintln!(
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
-            wipe_repo_dir(cache_dir, model.repo);
-            let files = ensure_files(cache_dir, &hub_repo(model)).await?;
-            build_on_blocking(files, model).await
+            remove_failed_pinned_snapshot(cache_dir, model, config::models_dir_is_user_provided());
+            let files = ensure_files_with(client, cache_dir, model, true).await?;
+            let snapshot = files.snapshot_dir()?;
+            let encoder = build_on_blocking(files, model).await?;
+            note_loaded_snapshot(&snapshot);
+            Ok(encoder)
         }
     }
 }
@@ -221,8 +369,10 @@ fn build_encoder(files: &HubFiles, model: &LocalModel) -> Result<Encoder> {
         .map_err(|e| IndexError::Embedding(format!("configuring truncation: {e}")))?;
 
     let device = Device::Cpu;
-    // Safety: the file is a trusted, freshly verified download; mmap is the
-    // standard candle load path. BF16 weights (granite) become F32 here.
+    // Safety: the file is a snapshot from the model cache, either the pinned
+    // download or an older snapshot of the same repository a person placed
+    // there; mmap is the standard candle load path, and a file changed under
+    // the mapping is a corrupt cache, which the loader reports. BF16 weights (granite) become F32 here.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(
             std::slice::from_ref(files.weights()?),
@@ -339,10 +489,23 @@ fn normalize_l2(v: &Tensor) -> candle_core::Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Tensor};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
-    use super::{MAX_INPUT_CHARS, cap_chars, check_model_type, cls_pool};
-    use crate::embed::models::lookup_local_model;
+    use candle_core::{Device, Tensor};
+    use hf_hub::HFClient;
+
+    use super::{
+        MAX_INPUT_CHARS, cached_path, cap_chars, check_model_type, cls_pool, ensure_files_with,
+        load_encoder_with, load_files_with,
+    };
+    use crate::embed::models::{
+        LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model, older_snapshot_warning,
+    };
 
     #[test]
     fn cls_pooling_takes_the_first_position_of_every_row() {
@@ -390,5 +553,607 @@ mod tests {
         // The cap is generous enough that no chunk-sized text is ever cut.
         let chunk = "word ".repeat(crate::embed::DEFAULT_MAX_TOKENS);
         assert_eq!(cap_chars(&chunk, MAX_INPUT_CHARS), chunk.as_str());
+    }
+
+    /// An hf-hub client on `cache`, whose every network call goes to
+    /// `endpoint`: a listener the test controls, so a request is seen rather
+    /// than answered by the real Hub.
+    fn test_client(cache: &Path, endpoint: &str) -> HFClient {
+        HFClient::builder()
+            .cache_dir(cache.to_path_buf())
+            .endpoint(endpoint)
+            .build()
+            .unwrap()
+    }
+
+    /// The cache an earlier release left behind: the model's files under
+    /// `snapshots/<commit>/` and `refs/main` naming that commit, which is
+    /// what a download of the default branch writes.
+    fn cache_from_main(cache: &Path, model: &LocalModel, commit: &str) {
+        let dir = cache.join(model.cache_dir_name());
+        let snap = dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            std::fs::write(snap.join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs").join("main"), commit).unwrap();
+    }
+
+    /// What a pinned download writes: the files under `snapshots/<commit>/`
+    /// and no `refs/` at all, because hf-hub records no ref for a commit.
+    fn cache_at_pin(cache: &Path, model: &LocalModel) {
+        let snap = cache
+            .join(model.cache_dir_name())
+            .join("snapshots")
+            .join(model.revision);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            std::fs::write(snap.join(file), b"x").unwrap();
+        }
+    }
+
+    /// The second start after a fresh pinned download finds every file in
+    /// the cache. The lookup has to name the commit: without `refs/main` a
+    /// lookup of the default branch would miss and dial out.
+    #[tokio::test]
+    async fn a_pinned_download_without_refs_is_found_in_the_cache() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        cache_at_pin(tmp.path(), granite);
+        assert!(
+            !tmp.path()
+                .join(granite.cache_dir_name())
+                .join("refs")
+                .exists()
+        );
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        for file in granite.files {
+            let path = cached_path(&client, granite, file)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{file} is not found in a refs-less cache"));
+            assert!(path.to_string_lossy().contains(granite.revision));
+        }
+    }
+
+    /// An install that downloaded from main when main was the pinned commit
+    /// keeps working with no network call at all: the air-gapped and
+    /// prefetched-image paths depend on it.
+    #[tokio::test]
+    async fn a_cached_snapshot_at_the_pinned_commit_resolves_without_the_network() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        cache_from_main(tmp.path(), granite, granite.revision);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let files = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite, true),
+        )
+        .await
+        .expect("a warm cache must not wait on the network")
+        .unwrap();
+
+        for file in granite.files {
+            let path = files.get(file).unwrap();
+            assert!(
+                path.to_string_lossy().contains(granite.revision),
+                "{file} resolved to {}",
+                path.display()
+            );
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the warm cache dialled out: {other:?}"),
+        }
+    }
+
+    /// A cache at another commit is not the pinned model, even though
+    /// `refs/main` names it.
+    #[tokio::test]
+    async fn a_snapshot_at_another_commit_is_not_the_pinned_model() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let other = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, other);
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        assert!(
+            cached_path(&client, granite, "model.safetensors")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Nothing of the other commit was touched by the lookup.
+        assert!(
+            tmp.path()
+                .join(granite.cache_dir_name())
+                .join("snapshots")
+                .join(other)
+                .join("model.safetensors")
+                .is_file()
+        );
+    }
+
+    /// A download asks the Hub for the pinned commit, not for main.
+    #[tokio::test]
+    async fn the_download_asks_for_the_pinned_commit() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let first = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = tx.send(first);
+        });
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite, true),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "the stub has no files to give");
+
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let wanted = format!("/{}/resolve/{}/config.json", granite.repo, granite.revision);
+        assert!(
+            request_line.contains(&wanted),
+            "expected a request for {wanted}, got {request_line}"
+        );
+    }
+
+    /// A listener that answers every request with a 404 and reports the
+    /// request line of the first one: the Hub has nothing to give, and the
+    /// test sees what was asked for.
+    fn stub_hub() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let first = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = tx.send(first);
+            }
+        });
+        (endpoint, rx)
+    }
+
+    /// A cache holding only an older snapshot, with `refs/main` naming it (a
+    /// pre-seeded copy from before the pin), starts on that snapshot with no
+    /// network call, and the start says so.
+    #[tokio::test]
+    async fn an_older_cached_snapshot_loads_without_the_network_and_is_reported() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let files = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("an older cached snapshot must not wait on the network")
+        .unwrap()
+        .0;
+        for file in granite.files {
+            let path = files.get(file).unwrap();
+            assert!(
+                path.to_string_lossy().contains(older),
+                "{file} resolved to {}",
+                path.display()
+            );
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the older snapshot dialled out: {other:?}"),
+        }
+
+        let choice = choose_snapshot(tmp.path(), granite);
+        assert_eq!(
+            choice,
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: false
+            }
+        );
+        let warning = older_snapshot_warning(granite, &choice).unwrap();
+        assert!(warning.contains(granite.id), "{warning}");
+        assert!(warning.contains(older), "{warning}");
+        assert!(warning.contains(granite.revision), "{warning}");
+        assert!(
+            warning.contains("run `crystalline model download` to update"),
+            "{warning}"
+        );
+    }
+
+    /// An older snapshot missing a file the loader needs is not used: the
+    /// start falls through to downloading the pinned commit.
+    #[tokio::test]
+    async fn an_incomplete_older_snapshot_falls_through_to_the_pinned_download() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let weights = tmp
+            .path()
+            .join(granite.cache_dir_name())
+            .join("snapshots")
+            .join(older)
+            .join("model.safetensors");
+        std::fs::remove_file(&weights).unwrap();
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Missing
+        );
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "the stub has no files to give");
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let wanted = format!("/{}/resolve/{}/config.json", granite.repo, granite.revision);
+        assert!(
+            request_line.contains(&wanted),
+            "expected a request for {wanted}, got {request_line}"
+        );
+    }
+
+    /// With both the pinned commit and an older one cached, and the weights
+    /// and tokenizer alike, the pinned commit wins.
+    #[tokio::test]
+    async fn the_pinned_snapshot_wins_over_an_older_one_with_the_same_content() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Pinned {
+                others: vec![older.to_string()]
+            }
+        );
+        let (files, _) = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        for file in granite.files {
+            assert!(
+                files
+                    .get(file)
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(granite.revision),
+                "{file}"
+            );
+        }
+    }
+
+    /// A pinned commit whose weights differ from the older snapshot the
+    /// index was built with is not switched to: the start stays on the
+    /// older one and says why.
+    #[tokio::test]
+    async fn a_pinned_snapshot_with_other_weights_leaves_the_start_on_the_older_one() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        std::fs::write(
+            tmp.path()
+                .join(granite.cache_dir_name())
+                .join("snapshots")
+                .join(granite.revision)
+                .join("model.safetensors"),
+            b"other weights",
+        )
+        .unwrap();
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        let choice = choose_snapshot(tmp.path(), granite);
+        assert_eq!(
+            choice,
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: true
+            }
+        );
+        let warning = older_snapshot_warning(granite, &choice).unwrap();
+        assert!(warning.contains("re-embedded"), "{warning}");
+        let (files, _) = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        assert!(
+            files
+                .get("model.safetensors")
+                .unwrap()
+                .to_string_lossy()
+                .contains(older)
+        );
+    }
+
+    /// The daemon's background fetch of the pinned commit failing (offline,
+    /// or a mirror without that commit) leaves the older snapshot exactly as
+    /// it was, and the next start chooses it again.
+    #[tokio::test]
+    async fn a_failed_background_fetch_keeps_the_older_snapshot() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite, false),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err());
+        // The fetch asked for the pinned commit, not for main.
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request_line.contains(granite.revision), "{request_line}");
+        for file in granite.files {
+            assert!(
+                tmp.path()
+                    .join(granite.cache_dir_name())
+                    .join("snapshots")
+                    .join(older)
+                    .join(file)
+                    .is_file(),
+                "{file}"
+            );
+        }
+        assert_eq!(
+            choose_snapshot(tmp.path(), granite),
+            SnapshotChoice::Older {
+                commit: older.to_string(),
+                pinned_differs: false
+            }
+        );
+    }
+
+    /// An older snapshot that fails to build (here: files that are not a
+    /// model at all) is left exactly as it is: the start falls through to the
+    /// pinned download, which the stub refuses, and nothing in the cache is
+    /// removed. An air-gapped pre-seed survives a bad start.
+    #[tokio::test]
+    async fn a_failed_build_of_an_older_snapshot_removes_nothing() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err());
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request_line.contains(granite.revision), "{request_line}");
+        let repo = tmp.path().join(granite.cache_dir_name());
+        for file in granite.files {
+            assert!(
+                repo.join("snapshots").join(older).join(file).is_file(),
+                "{file} of the older snapshot survives"
+            );
+        }
+        assert!(repo.join("refs").join("main").is_file());
+    }
+
+    /// With the pinned commit cached under other weights, a failed build of
+    /// the older snapshot fails the start: loading the pinned weights would
+    /// leave the index embedded with others. Nothing is removed and nothing
+    /// dials out.
+    #[tokio::test]
+    async fn a_failed_older_build_beside_other_pinned_weights_fails_and_keeps_both() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        let snaps = tmp.path().join(granite.cache_dir_name()).join("snapshots");
+        std::fs::write(
+            snaps.join(granite.revision).join("model.safetensors"),
+            b"other weights",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let err = load_encoder_with(&client, tmp.path(), granite)
+            .await
+            .err()
+            .expect("the start fails")
+            .to_string();
+        assert!(err.contains(older), "{err}");
+        assert!(err.contains("not used in its place"), "{err}");
+        for file in granite.files {
+            assert!(snaps.join(older).join(file).is_file(), "{file}");
+            assert!(snaps.join(granite.revision).join(file).is_file(), "{file}");
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the failed start dialled out: {other:?}"),
+        }
+    }
+
+    /// A listener that serves every file of `revision` as the single byte
+    /// `x`, the way the Hub answers a download (HEAD with the etag and the
+    /// commit, then GET with the bytes), and counts the GETs. What it serves
+    /// is not a model, so every build of it fails.
+    fn serving_hub(revision: &'static str) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let gets = Arc::new(AtomicU64::new(0));
+        let counter = gets.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let path = line.split_whitespace().nth(1).unwrap_or_default();
+                let file = path.rsplit('/').next().unwrap_or_default();
+                let etag = {
+                    use sha2::{Digest, Sha256};
+                    crate::hex_lower(&Sha256::digest(file.as_bytes()))
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nX-Repo-Commit: {revision}\r\n\
+                     Content-Length: 1\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes());
+                if line.starts_with("GET") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(b"x");
+                }
+            }
+        });
+        (endpoint, gets)
+    }
+
+    /// Both builds fail: the older snapshot (not a model), then the pinned
+    /// download (not a model either). The self-heal removes and fetches the
+    /// pinned snapshot once more, and the older snapshot, its ref and every
+    /// file of it survive: the self-heal only ever removes the snapshot it
+    /// failed to build.
+    #[tokio::test]
+    async fn a_double_build_failure_removes_only_the_pinned_snapshot() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, gets) = serving_hub(granite.revision);
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "neither snapshot is a model");
+        // On unix the failed snapshot's files are links, so the self-heal
+        // removes the blobs only it used and the refetch downloads them all
+        // again. On Windows hf-hub copies instead of linking, the blobs
+        // cannot be told apart from the older snapshot's, they stay, and the
+        // refetch reuses them (a HEAD, no GET).
+        let expected_gets = if cfg!(unix) {
+            2 * granite.files.len() as u64
+        } else {
+            granite.files.len() as u64
+        };
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            expected_gets,
+            "the pinned files were fetched and, after the self-heal, fetched again where they could be removed"
+        );
+        let repo = tmp.path().join(granite.cache_dir_name());
+        for file in granite.files {
+            assert!(
+                repo.join("snapshots").join(older).join(file).is_file(),
+                "{file} of the older snapshot survives"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("refs").join("main")).unwrap(),
+            older
+        );
+    }
+
+    /// The plain self-heal case: no older snapshot, the pinned download does
+    /// not build, the whole repository directory is cleared and every file
+    /// is downloaded again, on every platform.
+    #[tokio::test]
+    async fn a_failed_pinned_build_alone_in_the_cache_is_downloaded_again_in_full() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, gets) = serving_hub(granite.revision);
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "what the stub serves is not a model");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            2 * granite.files.len() as u64,
+            "the cleared cache fetched every file a second time"
+        );
     }
 }

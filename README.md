@@ -87,7 +87,7 @@ The package ships a systemd unit, installed disabled: see [Linux server with sys
 <details>
 <summary>Windows</summary>
 
-Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet, so verify against `SHA256SUMS` and confirm the SmartScreen prompt (More info > Run anyway).
+Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet. Verify the download against `SHA256SUMS` or with `gh attestation verify <file> --repo jordiboehme/crystalline` ([how](docs/security.md#verify-a-release)), then confirm the SmartScreen prompt (More info > Run anyway).
 
 </details>
 
@@ -167,6 +167,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 - [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, virtual domains, architecture.
 - [FAQ](docs/faq.md): the short answers, and why not just a folder of files.
 - [Deployment](docs/deployment.md): every scenario from a laptop to an air-gapped server, one diagram each.
+- [Security](docs/security.md): what Crystalline reads, writes and sends, how to close the local listener, and how to verify a release.
 - Found a rough edge or a missing piece? [Open an issue](https://github.com/jordiboehme/crystalline/issues) - and if Crystalline made your agent a better peer, a star helps others find it.
 
 ## Support
@@ -179,10 +180,21 @@ Crystalline is free and open source. If it earned its place in your workflow, yo
 
 Crystalline is local-first: no telemetry, no analytics, no accounts and no data collection by the developer. Every engram lives as a markdown file plus a local search index on your own machine, entirely under your control.
 
-Two outbound connections exist, each opt-in and user-initiated - nothing else ever leaves the machine:
+Crystalline never sends your knowledge to a language model: the model runs in your agent harness, which receives what Crystalline answers and passes it to the provider you chose there.
 
-- **GitHub**, only once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with - governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
-- **Hugging Face**, for a one-time download of the local embedding model, automatic on first start or explicit via `crystalline model download` - governed by the [Hugging Face privacy policy](https://huggingface.co/privacy).
+One outbound connection happens by default:
+
+- **Hugging Face**, for a one-time download of the local embedding model. It starts automatically on first start, or explicitly with `crystalline model download`, and sends no engram data. Once the model is cached, no further call is made. Point `HF_ENDPOINT` at a mirror, or `CRYSTALLINE_MODELS_DIR` at a pre-fetched copy, to avoid the connection. Governed by the [Hugging Face privacy policy](https://huggingface.co/privacy).
+
+Every other connection exists only after you turn it on:
+
+- **GitHub**, once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with. `github.api_url` points it at a GitHub Enterprise server instead. Governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) or your own server's terms.
+- **Hugging Face again**, once you turn on the contradiction check (`evolve.contradictions`), for a one-time download of its local NLI model into the same cache. It sends no engram data.
+- **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
+- **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
+- **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to share one search index between instances. The index holds the text of your engrams.
+
+Nothing else leaves the machine.
 
 The developer shares nothing with anyone. Data retention is entirely user-controlled: deleting a domain or an engram deletes the data, and uninstalling Crystalline leaves your markdown untouched.
 
