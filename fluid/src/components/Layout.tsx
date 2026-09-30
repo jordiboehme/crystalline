@@ -25,6 +25,7 @@ import {
   AArrowDown,
   AArrowUp,
   CircleHelp,
+  CircleUserRound,
   ExternalLink,
   FoldHorizontal,
   House,
@@ -983,7 +984,7 @@ function TopBar({
         controls keep aligning with the content's edge at either width.
       */}
       <div
-        className={`mx-auto flex h-14 w-full items-center gap-3 px-4 ${
+        className={`mx-auto flex h-14 w-full items-center gap-1.5 px-3 sm:gap-3 sm:px-4 ${
           fullWidth ? "" : "max-w-350"
         }`}
       >
@@ -1001,7 +1002,7 @@ function TopBar({
           className={`flex items-center gap-1.5 rounded text-lg font-semibold tracking-tight hover:opacity-80 ${FOCUS_RING}`}
         >
           <ShatterGem />
-          Fluid
+          <span className="sr-only sm:not-sr-only">Fluid</span>
         </Link>
 
         <SearchBox />
@@ -1358,10 +1359,21 @@ function UserMenu() {
 
   return (
     <DropdownMenu.Root>
+      {/*
+        Below the small breakpoint the name gives way to an icon so the top bar
+        fits a phone; the name stays the accessible name either way.
+      */}
       <DropdownMenu.Trigger
+        aria-label={label}
         className={`${BUTTON.ghost} max-w-40 truncate border border-slate-300 dark:border-slate-700`}
       >
-        {label}
+        <CircleUserRound
+          aria-hidden="true"
+          size={16}
+          strokeWidth={1.75}
+          className="sm:hidden"
+        />
+        <span className="hidden sm:inline">{label}</span>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
