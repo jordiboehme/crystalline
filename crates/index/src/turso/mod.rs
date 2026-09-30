@@ -999,6 +999,9 @@ pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a
 /// both engrams still exist: a delete that lands while a batch scores the
 /// pair leaves nothing behind (turso enforces no foreign key that would
 /// refuse the orphan). Each `EXISTS` seeks the engram primary key.
+///
+/// -- actor: by id - both engrams are named by their ids, which are base
+/// rows: drafts are never scored.
 #[doc(hidden)]
 pub const INSERT_CONTRADICTION_PAIR_SQL: &str = "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
