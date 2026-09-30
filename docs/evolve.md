@@ -37,7 +37,7 @@ What it reads: two current engrams in one domain (neither speculative, validity 
 | `light` | multilingual-MiniLMv2-L12-mnli-xnli | German, English and mixed on a small machine; about a quarter of the compute, lower recall |
 | `english-only` | DeBERTa-v3-base-mnli-fever-anli | English-only knowledge; best English quality |
 
-Every profile but `off` needs a build with the `local-embeddings` feature (every published binary and image has it) and downloads its model on first use into the same cache as the embedding model. `crystalline status` and `crystalline doctor` show the profile, the model and how many pairs are pending. The models' weights are MIT licensed; the XNLI and ANLI data they were trained on is licensed for non-commercial use only.
+Every profile but `off` needs a build with the `local-embeddings` feature (every published binary and image has it) and downloads its model on first use into the same cache as the embedding model. `crystalline status` and `crystalline doctor` show the profile, the model and how many pairs are pending. Drafts are never scored, so in a review-mode domain an author's open draft hides the V302 findings on the engram being drafted until it is published: the sweep reads the draft, and the stored rows belong to the published engram, the same way V301 speaks only about the version the caller reads. The models' weights are MIT licensed; the XNLI and ANLI data they were trained on is licensed for non-commercial use only.
 
 ### An engram's lifecycle
 
