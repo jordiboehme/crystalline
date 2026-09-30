@@ -138,8 +138,9 @@ jobs:
             fi
 
             packaging/mcpb/generate-manifest.sh "$platform" "$version" "$stage"
-            npx --yes @anthropic-ai/mcpb validate "$stage"
-            npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
+            # The packer is pinned like every other release tool; bump it deliberately.
+            npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
+            npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
           done
 
           # Universal bundle: macOS arm64 plus windows amd64 in one package,
@@ -152,8 +153,8 @@ jobs:
           cp bundle/windows-amd64/server/crystalline.exe "$stage/server/crystalline.exe"
 
           packaging/mcpb/generate-manifest.sh universal "$version" "$stage"
-          npx --yes @anthropic-ai/mcpb validate "$stage"
-          npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
 
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -191,15 +192,128 @@ jobs:
           path: skill-out/*.zip
           if-no-files-found: error
 
+  # CycloneDX SBOMs: one per release target for the Rust binary (the crates
+  # of Cargo.lock that the crystalline package links for that target; a
+  # host-default run would drop the Windows-only crates), and one for the
+  # Fluid bundle every binary embeds. No tag guard: a workflow_dispatch dry
+  # run generates and checks them too, it just has nowhere to publish them.
+  # Kept out of build.yml on purpose, so the dev channel stays as it is.
+  sbom:
+    name: generate the SBOMs
+    needs: notes
+    runs-on: ubuntu-latest
+    # Read only: the tools this job installs never get a token that can write.
+    permissions:
+      contents: read
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # The same version string the archives carry (build.yml), so an SBOM
+      # sits next to the archive it describes under the same prefix.
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      # cargo-cyclonedx writes a file next to every workspace member's
+      # Cargo.toml whatever --manifest-path says, so the crates/cli one is
+      # kept and the rest removed. It has no --locked flag; the diff check at
+      # the end proves it did not touch the lockfile.
+      - name: Generate the Rust SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p sbom
+          while read -r target platform; do
+            [ -n "$target" ] || continue
+            name="crystalline-${version}-${platform}.cdx"
+            cargo cyclonedx --manifest-path crates/cli/Cargo.toml \
+              --format json --spec-version 1.5 \
+              --target "$target" --override-filename "$name"
+            mv "crates/cli/${name}.json" "sbom/${name}.json"
+            find crates -name "${name}.json" -delete
+          done <<'TARGETS'
+          aarch64-apple-darwin macos-arm64
+          x86_64-apple-darwin macos-intel
+          x86_64-unknown-linux-musl linux-amd64
+          aarch64-unknown-linux-musl linux-arm64
+          x86_64-pc-windows-msvc windows-amd64
+          aarch64-pc-windows-msvc windows-arm64
+          TARGETS
+          git diff --exit-code Cargo.lock
+
+      - name: Enable corepack
+        working-directory: fluid
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable pnpm
+          pnpm --version
+
+      # The store, not the lockfile alone, carries the license data, hence
+      # the install. The file goes to ../sbom, never under fluid/dist: the
+      # service crate embeds everything in that folder into the binary.
+      - name: Generate the Fluid SBOM
+        working-directory: fluid
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm sbom --sbom-format cyclonedx --sbom-type application \
+            --sbom-spec-version 1.5 --prod \
+            --out "../sbom/crystalline-fluid-${{ steps.version.outputs.version }}.cdx.json"
+
+      # Cheap guards against an SBOM that is empty or describes the wrong
+      # platform.
+      - name: Check the SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la sbom
+          test "$(find sbom -name '*.cdx.json' | wc -l)" -eq 7
+          for f in sbom/*.cdx.json; do
+            jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5" and (.components | length) > 20' "$f" > /dev/null
+          done
+          for f in sbom/crystalline-*-windows-*.cdx.json; do
+            jq -e '[.components[].name] | index("windows-sys") != null' "$f" > /dev/null
+          done
+          for f in sbom/crystalline-*-linux-*.cdx.json; do
+            jq -e '[.components[].name] | index("windows-sys") == null' "$f" > /dev/null
+          done
+          jq -e '[.components[].name] | index("react") != null' sbom/crystalline-fluid-*.cdx.json > /dev/null
+
+      - name: Upload the SBOMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sboms
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
   publish:
     name: publish release
-    needs: [build, mcpb]
+    needs: [build, mcpb, sbom]
     runs-on: ubuntu-latest
     # Only a tag push produces a real GitHub Release; workflow_dispatch stops
     # after the build matrix above so it can be used as a dry run.
     if: github.ref_type == 'tag'
+    # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -217,10 +331,129 @@ jobs:
           # anything a reader downloads. Its files carry none of the extensions
           # below today, so the filter alone would do; the path exclusion is
           # what keeps that true when the bundler starts emitting something new.
-          find downloads -type f -not -path 'downloads/fluid-dist/*' \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' \) -exec cp {} release/ \;
+          # The SBOMs (`*.cdx.json`) are release assets too, so they are listed in
+          # SHA256SUMS like everything else.
+          find downloads -type f -not -path 'downloads/fluid-dist/*' \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -la
+
+      # actions/attest fails only when a whole subject list matches nothing,
+      # so a single renamed asset would drop out of its attestation without a
+      # sound. Every path and glob the attest steps below use is checked here
+      # first, and a missing one stops the release before anything is signed.
+      - name: Check the attestation subjects exist
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in \
+            SHA256SUMS \
+            "crystalline-fluid-${TAG}.cdx.json" \
+            "crystalline-${TAG}.mcpb"; do
+            [ -f "release/$f" ] || { echo "::error::missing attestation subject release/$f"; missing=1; }
+          done
+          for p in macos-arm64 macos-intel linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
+            [ -f "release/crystalline-${TAG}-${p}.cdx.json" ] || { echo "::error::missing SBOM release/crystalline-${TAG}-${p}.cdx.json"; missing=1; }
+          done
+          for f in macos-arm64.tar.gz macos-arm64.mcpb macos-intel.tar.gz macos-intel.mcpb \
+            linux-amd64.tar.gz linux-arm64.tar.gz \
+            windows-amd64.zip windows-amd64.msi windows-amd64.mcpb \
+            windows-arm64.zip windows-arm64.msi windows-arm64.mcpb; do
+            [ -f "release/crystalline-${TAG}-${f}" ] || { echo "::error::missing attestation subject release/crystalline-${TAG}-${f}"; missing=1; }
+          done
+          for g in \
+            'release/crystalline_*_amd64.deb' \
+            'release/crystalline_*_arm64.deb' \
+            "release/crystalline-${TAG}-*.tar.gz" \
+            "release/crystalline-${TAG}-*.zip" \
+            "release/crystalline-${TAG}-*.msi" \
+            'release/crystalline_*.deb' \
+            "release/crystalline-${TAG}*.mcpb"; do
+            compgen -G "$g" > /dev/null || { echo "::error::no attestation subject matches $g"; missing=1; }
+          done
+          exit "$missing"
+
+      # Build provenance for every release asset, SHA256SUMS and the SBOMs
+      # included, in one attestation. Verify with
+      # `gh attestation verify <file> --repo jordiboehme/crystalline`.
+      # Before the release is created, so a failed attestation stops the
+      # release rather than leaving it published without provenance.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/*
+
+      # Each platform's SBOM, attested against the assets that carry that
+      # platform's binary. The universal .mcpb carries two binaries and gets
+      # both SBOMs.
+      - name: Attest the macos-arm64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-macos-arm64.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-macos-arm64.tar.gz
+            release/crystalline-${{ github.ref_name }}-macos-arm64.mcpb
+            release/crystalline-${{ github.ref_name }}.mcpb
+
+      - name: Attest the macos-intel SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-macos-intel.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-macos-intel.tar.gz
+            release/crystalline-${{ github.ref_name }}-macos-intel.mcpb
+
+      - name: Attest the linux-amd64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-linux-amd64.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-linux-amd64.tar.gz
+            release/crystalline_*_amd64.deb
+
+      - name: Attest the linux-arm64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-linux-arm64.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-linux-arm64.tar.gz
+            release/crystalline_*_arm64.deb
+
+      - name: Attest the windows-amd64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-windows-amd64.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-windows-amd64.zip
+            release/crystalline-${{ github.ref_name }}-windows-amd64.msi
+            release/crystalline-${{ github.ref_name }}-windows-amd64.mcpb
+            release/crystalline-${{ github.ref_name }}.mcpb
+
+      - name: Attest the windows-arm64 SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-${{ github.ref_name }}-windows-arm64.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-windows-arm64.zip
+            release/crystalline-${{ github.ref_name }}-windows-arm64.msi
+            release/crystalline-${{ github.ref_name }}-windows-arm64.mcpb
+
+      # Fluid is embedded in every binary, so its SBOM is attested against
+      # every asset that carries one. The archive globs name the tag, which
+      # keeps the two skill zips (no binary inside) out.
+      - name: Attest the Fluid SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          sbom-path: release/crystalline-fluid-${{ github.ref_name }}.cdx.json
+          subject-path: |
+            release/crystalline-${{ github.ref_name }}-*.tar.gz
+            release/crystalline-${{ github.ref_name }}-*.zip
+            release/crystalline-${{ github.ref_name }}-*.msi
+            release/crystalline_*.deb
+            release/crystalline-${{ github.ref_name }}*.mcpb
 
       - name: Create GitHub Release
         env:
@@ -233,14 +466,18 @@ jobs:
 
   images:
     name: publish container images
-    needs: build
+    # sbom too, so a release whose SBOMs failed pushes no image either.
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -315,6 +552,7 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       - name: Build and push
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -324,9 +562,23 @@ jobs:
           # No provenance attestations: they publish as extra unknown/unknown
           # platform entries in the image index, which registry UIs list next
           # to the real platforms, and nothing consumes them here.
+          # The GitHub attestation below is stored beside the image, not inside its index.
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # Provenance for the pushed image index, stored in the registry beside
+      # it. Verify with
+      # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline:<version> --repo jordiboehme/crystalline`.
+      # No storage record: that needs a third permission and an
+      # organisation-owned repository.
+      - name: Attest the image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/jordiboehme/crystalline
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
 
       - name: Generate with-model image metadata
         id: meta_with_model
@@ -374,6 +626,7 @@ jobs:
           grep -q "Model ready" <<< "$output"
 
       - name: Build and push the with-model image
+        id: push_with_model
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -381,24 +634,39 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           # Same as the runtime push: no unknown/unknown attestation entries.
+          # The GitHub attestation below is stored beside the image, not inside its index.
           provenance: false
           tags: ${{ steps.meta_with_model.outputs.tags }}
           labels: ${{ steps.meta_with_model.outputs.labels }}
 
+      # As for the runtime image above; verify with
+      # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline:<version>-with-model --repo jordiboehme/crystalline`.
+      - name: Attest the with-model image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/jordiboehme/crystalline
+          subject-digest: ${{ steps.push_with_model.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
   # Fluid, the browser UI, as an image of its own. It carries no binary and
   # consumes nothing the build matrix produces, but it still waits on it: a tag
   # whose binaries failed to build is not a release, and a UI image published
-  # for one would point at a Crystalline nobody can install.
+  # for one would point at a Crystalline nobody can install. It waits on the
+  # SBOM job for the same reason.
   fluid-image:
     name: publish the Fluid image
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     # Same tag guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -435,6 +703,7 @@ jobs:
       # same bytes whatever the target is, so only the nginx stage is built per
       # platform and nothing runs emulated.
       - name: Build and push
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: fluid
@@ -444,9 +713,20 @@ jobs:
           push: true
           # Same as the crystalline pushes: no unknown/unknown attestation
           # entries in the image index.
+          # The GitHub attestation below is stored beside the image, not inside its index.
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # As for the runtime image in the images job; verify with
+      # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline-fluid:<version> --repo jordiboehme/crystalline`.
+      - name: Attest the Fluid image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/jordiboehme/crystalline-fluid
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
 
   homebrew:
     name: update homebrew tap

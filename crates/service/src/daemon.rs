@@ -579,7 +579,14 @@ pub async fn run_serve(
                 // it is read-only, when the provider is a remote one, or when
                 // the active model is not one this build knows).
                 match crystalline_core::config::models_dir() {
-                    Ok(dir) => e.prune_model_cache(dir).await,
+                    Ok(dir) => {
+                        e.prune_model_cache(dir.clone()).await;
+                        // The same moment settles the active model's own
+                        // snapshots: older ones go once the pinned one has
+                        // loaded, and a start on an older one fetches the
+                        // pinned commit in the background.
+                        e.settle_model_snapshots(dir).await;
+                    }
                     Err(err) => tracing::warn!("could not locate the model cache: {err}"),
                 }
                 // Schedule on the worker, like every other caller: an inline

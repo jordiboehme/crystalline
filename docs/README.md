@@ -18,6 +18,7 @@ The [Crystalline Handbook](https://jordiboehme.github.io/crystalline/) is the lo
 | [Virtual domains](virtual-domains.md) | Engrams that live in the database, with no folder behind them |
 | [Architecture](architecture.md) | The crates, the daemon and the one source of truth |
 | [Deployment](deployment.md) | Every scenario with a diagram, the container image and the environment variables |
+| [Security](security.md) | What Crystalline reads, writes and sends, the local listener, hardening settings and how to verify a release |
 | [FAQ](faq.md) | Short answers, and why not just a folder of files |
 
 ## What to say
