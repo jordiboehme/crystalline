@@ -10,12 +10,15 @@
 all-features = true
 
 [advisories]
+# Vulnerabilities fail the build wherever they sit in the tree. An
+# "unmaintained" notice only counts for crates the workspace depends on
+# directly, so a notice deep in the tree cannot stop every PR and the dev
+# channel for a crate nobody here can replace (Jordi, 2026-09-30).
+unmaintained = "workspace"
 # An ignored advisory needs a reason and the date of the decision, in the
 # reason text: { id = "RUSTSEC-YYYY-NNNN", reason = "YYYY-MM-DD: why" }.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "2026-09-30: rsa (Marvin attack) comes in through openidconnect, which uses it only to verify identity provider signatures with public keys, and as a dev dependency for the test identity provider's fixture keys; the timing leak needs private-key decryption or signing on a server, which Crystalline never does, and no fixed version exists upstream yet" },
-    { id = "RUSTSEC-2024-0436", reason = "2026-09-30: paste is unmaintained, not vulnerable; it is a compile-time proc macro that comes in through gemm under candle and runs no code at runtime, and no maintained version exists upstream (the gemm and candle releases still depend on it)" },
-    { id = "RUSTSEC-2026-0215", reason = "2026-09-30: smallstr is unmaintained, not vulnerable; it comes in through yrs 0.28.0 (the co-editing engine), which is the newest yrs release, so no version without it exists upstream yet" },
 ]
 
 [licenses]
