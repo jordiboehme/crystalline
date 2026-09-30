@@ -10,7 +10,7 @@ Crystalline is an MCP server with a background daemon, a CLI and a web UI in one
 |---|---|---|
 | Runs a language model | No. The only model is a small local embedding model for search vectors | Yes, through its provider |
 | Sends data to an LLM provider | No, unless you set a remote embedding endpoint (see below) | Yes, including everything Crystalline returns to it |
-| Runs shell commands | No. There is no shell or exec tool. The only processes it starts are its own daemon, the `crystalline` on the PATH (a version check during install) and the harness CLIs (`claude`, `codex`, `copilot`) during install, uninstall and provisioning | Yes, under its own permission rules |
+| Runs shell commands | No. There is no shell or exec tool. The only processes it starts are its own daemon, the `crystalline` on the PATH (a version check during install) and the harness CLIs (`claude`, `codex`, `copilot`, or `gh copilot` as the fallback) during install, uninstall and provisioning | Yes, under its own permission rules |
 | Reads files | Files in registered domain folders, its own config, state and model folders, and the harness settings during install and uninstall | Whatever its permissions allow |
 | Network | See [Outbound connections](#outbound-connections) | Its provider, and whatever its tools reach |
 
@@ -28,10 +28,10 @@ One connection happens by default. Every other one exists only after you turn it
   - To use a mirror, set `HF_ENDPOINT`. To use a copy fetched ahead of time, set `CRYSTALLINE_MODELS_DIR`. The `with-model` container image has the model built in. See [Air-gapped or egress-restricted](deployment.md#air-gapped-or-egress-restricted).
   - If a Hugging Face token is present, it is sent with the download. The token is read from `HF_TOKEN`, from the file `HF_TOKEN_PATH` names, or from the token file a Hugging Face login leaves in `HF_HOME`. Set `HF_HUB_DISABLE_IMPLICIT_TOKEN` to stop that.
   - The model weights are stored with Hugging Face's Xet storage. The storage host is handed out by huggingface.co at download time. An egress allowlist that holds only `huggingface.co` may therefore not be enough. A mirror or a pre-fetched copy avoids the question.
-- **GitHub** (opt-in, `github.enabled`). Team collaboration talks to `api.github.com` and to `github.com` for the sign-in device flow. `github.api_url` points it at a GitHub Enterprise server instead. While collaboration is on and connected, the daemon polls each GitHub-backed domain every `github.poll_secs` seconds (default 300, minimum 60).
-- **Your single sign-on provider** (opt-in). When OIDC sign-in is configured for the web UI, Crystalline talks to the issuer you name in `auth.oidc.issuer`.
+- **GitHub** (opt-in, `github.enabled`). Team collaboration talks to `api.github.com`, to `codeload.github.com` for repository downloads (the API redirects archive downloads there, which is GitHub behaviour), and to `github.com` for the sign-in device flow. `github.api_url` points it at a GitHub Enterprise server instead. While collaboration is on and connected, the daemon polls each GitHub-backed domain every `github.poll_secs` seconds (default 300, minimum 60).
+- **Your single sign-on provider** (opt-in). When OIDC sign-in is configured for the web UI, Crystalline talks to the issuer you name in `auth.oidc.issuer`. The token endpoint and the key set come from the issuer's discovery document and can be on other hosts of the provider.
 - **A remote embedding service** (opt-in). With `embeddings.provider: openai-compatible` in `config.yaml`, the text of your engrams is sent to the endpoint you configure. The default provider is local and sends nothing. This key is not in the settings registry, so an agent cannot switch it with the `configure` tool.
-- **A PostgreSQL server** (opt-in). With `database.backend: postgres` and `database.url`, the search index lives in that database, and the index holds engram text. See [Shared database collaboration](deployment.md#shared-database-collaboration).
+- **A PostgreSQL server** (opt-in). With `database.backend: postgres` and `database.url`, the search index lives in that database, and the index holds engram text. These keys are in the settings registry, so an agent that may change settings can set them with the `configure` tool; the change applies at the next daemon start. See [Shared database collaboration](deployment.md#shared-database-collaboration).
 
 Nothing else. There is no telemetry and no update check.
 
@@ -43,7 +43,7 @@ That endpoint carries MCP over HTTP, the JSON API and the web UI.
 
 - The JSON API and the web UI require an account. A daemon with no account yet lets a caller on loopback create the first admin. On any other bind it asks for a one-time setup token that it prints at startup.
 - MCP over HTTP is open by default (`auth.mcp` is `false`). Any process that can reach the port is served without a token. It can read and write every domain that is not private, and it can change settings, register domains and apply provisioning. On a shared host this includes processes of other users.
-- The HTTP transport accepts only loopback `Host` headers by default, as a guard against DNS rebinding. `service.allowed_hosts` adds more names.
+- The `Host` allow-list guards the MCP endpoint and the OAuth endpoints, loopback only by default, as a guard against DNS rebinding. `service.allowed_hosts` adds more names. A browser reaching the web UI and the JSON API needs no entry; those need an account instead.
 - There is no built-in TLS. For anything other than localhost, put a TLS terminator in front (see [Web UI from the daemon](deployment.md#web-ui-from-the-daemon)).
 
 How to close it:
@@ -51,13 +51,13 @@ How to close it:
 - `crystalline config set auth.mcp true`: every MCP connection over HTTP then needs a personal token, issued in Fluid or from the CLI (see [Authenticated agents](deployment.md#authenticated-agents)).
 - `crystalline config set service.http false`: no HTTP endpoint at all, if your agents only use stdio. The web UI goes away with it.
 
-Both apply the next time the daemon starts. The config file is per user, so the setting holds for every daemon that user starts.
+Both apply the next time the daemon starts. The config file is per user, so the setting holds for every daemon that user starts. An environment variable of the same key (`CRYSTALLINE_AUTH_MCP`, `CRYSTALLINE_SERVICE_HTTP`) wins over the config file; the container image sets `CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411`.
 
 The daemon also has a local control channel: a Unix socket (`service.sock` in the state directory) on macOS and Linux, and a named pipe on Windows. It carries the stdio MCP sessions that `crystalline mcp` relays to the daemon, and the operator commands of the CLI, for example `sync`, `status`, `reindex`, `configure`, `tool` and `shutdown`. A stdio session is treated as the machine owner and passes every access check.
 
 ## Hardening settings
 
-Set these with `crystalline config set <key> <value>`. Every one of them is in the settings registry, so an agent can also change them with the `configure` tool: over stdio, and over HTTP while `auth.mcp` is off or when the agent's account is an admin. A read-only daemon refuses every settings change.
+Set these with `crystalline config set <key> <value>`. Every one of them is in the settings registry, so an agent can also change them with the `configure` tool: over stdio, and over HTTP while `auth.mcp` is off or when the agent's account is an admin. That includes `auth.mcp`, `service.http`, `database.backend` and `database.url`, so an agent can turn token checks off or point the search index at another database. Watch `config.yaml` for changes you did not make. A read-only daemon refuses every settings change.
 
 | Setting | Effect | Default |
 |---|---|---|
@@ -69,9 +69,11 @@ Set these with `crystalline config set <key> <value>`. Every one of them is in t
 | `recall.enabled` | The per-prompt hook hands the agent matching engrams | `true` |
 | `skills.serve` | Serves the agent skills over MCP; `auto` skips a stdio session whose harness already has them as files | `auto` |
 | `auth.anonymous` | `true` serves JSON API requests with no identity at viewer level | `false` |
-| `service.allowed_hosts` | Extra `Host` header values the HTTP endpoint accepts; `*` accepts any | loopback only |
+| `service.allowed_hosts` | Extra `Host` header values the MCP endpoint and the OAuth endpoints accept; `*` accepts any | loopback only |
+| `service.ui` | `false` stops serving the web UI | `true` |
+| `service.api` | `false` stops serving the JSON API, and the web UI with it | `true` |
 
-`auth.mcp`, `service.http`, `service.read_only`, `skills.serve`, `auth.anonymous` and `service.allowed_hosts` apply the next time the daemon starts. The others apply at once.
+`auth.mcp`, `service.http`, `service.read_only`, `skills.serve`, `auth.anonymous`, `service.allowed_hosts`, `service.ui` and `service.api` apply the next time the daemon starts. The others apply at once.
 
 ## What Crystalline writes
 
@@ -98,16 +100,16 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
 - The state folder holds:
   - `index.db`, the search index, which holds engram text;
   - `web-auth.db`, the accounts and sessions;
-  - `service.lock`, `service.json`, `service.sock` and `daemon.log`;
+  - `service.lock`, `service.json` and `daemon.log`, and `service.sock` on macOS and Linux;
   - `tmp/`, the daemon's scratch folder;
-  - `origins/`, the state of team domains, and `origins/github-token.json` only when the OS keychain cannot be used (on Windows this file gets no extra access restriction; on macOS and Linux it is readable by the owner only);
+  - `origins/`, the state of team domains, and `origins/github-token.json` (plus `origins/github-token-personal-<name>.json` for personal GitHub identities) only when the OS keychain cannot be used (on Windows this file gets no extra access restriction; on macOS and Linux it is readable by the owner only);
   - `overlays/`, the review-mode drafts;
   - `instance-id`, `installs.json` and `hooks/maintenance.json`.
 - The GitHub token is otherwise kept in the OS keychain (Credential Manager on Windows).
 
 Nothing is encrypted at rest. Use disk encryption.
 
-`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies four skills into `~/.claude/skills`. With `--project` it writes into the project's `.claude/` folder instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
+`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies four skills into `~/.claude/skills`. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
 
 ## Verify a release
 
@@ -140,11 +142,11 @@ gh attestation verify oci://ghcr.io/jordiboehme/crystalline:0.21.2 --repo jordib
 How a release is built:
 
 - On GitHub-hosted runners, from the tagged commit.
-- Every action in the build and release workflows is pinned by commit.
+- Every action in the workflows is pinned by commit.
 - `cargo build --locked` with the committed `Cargo.lock`. WiX, the mcpb packer and the cargo tools are pinned to exact versions.
-- Dependencies are audited in CI on every pull request and every push to main: `cargo-deny` with `deny.toml` checks RustSec advisories, a license allowlist and crates.io as the only source, and `pnpm audit --prod` checks the web UI's runtime dependencies.
+- Dependencies are audited in CI on every pull request and every push to main: `cargo-deny` with `deny.toml` checks RustSec advisories, a license allowlist and crates.io as the only source, and `pnpm audit --prod` checks the web UI's runtime dependencies. Ignored advisories are listed with a dated reason in `deny.toml`.
 
-The Windows binaries and the MSI are not Authenticode signed yet. SmartScreen warns, and AppLocker or WDAC can allow them only by file hash. The macOS binaries are signed and notarized.
+The Windows binaries and the MSI are not Authenticode signed yet. SmartScreen warns, and AppLocker or WDAC cannot allow them by a publisher rule (general Windows behaviour for unsigned files). The macOS binaries are signed and notarized.
 
 ## License
 
@@ -157,7 +159,8 @@ Crystalline is licensed under the GNU AGPL v3.0 or later (see [LICENSE](../LICEN
 - On Windows the config and state folders, including the search index and the accounts database, are in the roaming profile.
 - The generated `index.md` files are rewritten and removed on their own while `index.files` is on.
 - `provision` can register MCP servers, skills and agents that a domain's MANIFEST ships into your harnesses, and the server asks for no confirmation.
-- `add_domain` accepts any folder the account can read.
+- `add_domain` accepts any folder the daemon's user can read.
+- An agent that may change settings can change every key in the settings registry, including `auth.mcp`, `service.http` and the database connection. There is no confirmation step.
 - There is no server-side allowlist of tools and no read-only flag per local domain. Read-only is daemon-wide.
 - There is no encryption at rest and no built-in TLS.
 - The builds are not reproducible.
