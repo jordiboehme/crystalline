@@ -202,6 +202,9 @@ jobs:
     name: generate the SBOMs
     needs: notes
     runs-on: ubuntu-latest
+    # Read only: the tools this job installs never get a token that can write.
+    permissions:
+      contents: read
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     steps:
