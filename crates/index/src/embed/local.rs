@@ -1465,10 +1465,20 @@ mod tests {
         .await
         .expect("the stub answers at once");
         assert!(result.is_err(), "neither snapshot is a model");
+        // On unix the failed snapshot's files are links, so the self-heal
+        // removes the blobs only it used and the refetch downloads them all
+        // again. On Windows hf-hub copies instead of linking, the blobs
+        // cannot be told apart from the older snapshot's, they stay, and the
+        // refetch reuses them (a HEAD, no GET).
+        let expected_gets = if cfg!(unix) {
+            2 * granite.files.len() as u64
+        } else {
+            granite.files.len() as u64
+        };
         assert_eq!(
             gets.load(Ordering::SeqCst),
-            2 * granite.files.len() as u64,
-            "the pinned files were fetched, removed by the self-heal and fetched again"
+            expected_gets,
+            "the pinned files were fetched and, after the self-heal, fetched again where they could be removed"
         );
         let repo = tmp.path().join(granite.cache_dir_name());
         for file in granite.files {
@@ -1480,6 +1490,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.join("refs").join("main")).unwrap(),
             older
+        );
+    }
+
+    /// The plain self-heal case: no older snapshot, the pinned download does
+    /// not build, the whole repository directory is cleared and every file
+    /// is downloaded again, on every platform.
+    #[tokio::test]
+    async fn a_failed_pinned_build_alone_in_the_cache_is_downloaded_again_in_full() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (endpoint, gets) = serving_hub(granite.revision);
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "what the stub serves is not a model");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            2 * granite.files.len() as u64,
+            "the cleared cache fetched every file a second time"
         );
     }
 }

@@ -435,16 +435,60 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
 /// Remove the pinned snapshot a start just failed to build, so the next
 /// fetch writes it fresh: the self-heal for a truncated or corrupt download.
 ///
-/// Only that one snapshot directory goes, never another snapshot of the
-/// repository (an older one may be the only copy an air-gapped host has).
-/// In Crystalline's own cache the blobs only that snapshot linked to and a
-/// ref naming it go too, so the fetch downloads the bytes again. In a
-/// folder the user provides (`user_dir`, a `CRYSTALLINE_MODELS_DIR`)
-/// nothing outside the snapshot directory is touched: its blobs stay, and
-/// a fetch may then link the same bytes again.
+/// Never another complete snapshot of the repository: an older one may be
+/// the only copy an air-gapped host has.
+///
+/// - In a folder the user provides (`user_dir`, a `CRYSTALLINE_MODELS_DIR`):
+///   the failed snapshot directory and nothing else. Its blobs and refs
+///   stay, and a fetch may link the same bytes again.
+/// - In Crystalline's own cache with no other complete snapshot: the whole
+///   repository directory, as before older snapshots were used, so the
+///   fetch starts clean on every platform (a Windows cache copies files
+///   instead of linking them, so its blobs cannot be told apart by link).
+/// - In Crystalline's own cache beside another complete snapshot: the failed
+///   snapshot directory, a ref naming it, and the blobs only it links to.
+///   Where the snapshot's files are copies rather than links (Windows), the
+///   blobs cannot be told apart and stay; that is logged, because the fetch
+///   may reuse them.
 pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user_dir: bool) {
     let repo_dir = models_dir.join(model.cache_dir_name());
-    remove_snapshots(&repo_dir, model, &[model.revision.to_string()], !user_dir);
+    let snapshots = repo_dir.join("snapshots");
+    let pinned = [model.revision.to_string()];
+    if user_dir {
+        remove_snapshots(&repo_dir, model, &pinned, false);
+        return;
+    }
+    let other_complete = snapshot_commits(&snapshots)
+        .iter()
+        .any(|c| c != model.revision && snapshot_complete(&snapshots.join(c), model));
+    if !other_complete {
+        if let Err(e) = std::fs::remove_dir_all(&repo_dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                model = model.id,
+                path = %repo_dir.display(),
+                "could not clear the embedding model's cache directory: {e}"
+            );
+        }
+        return;
+    }
+    let copied = std::fs::read_dir(snapshots.join(model.revision))
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| blob_name(&repo_dir, &e.path()).is_none())
+        })
+        .unwrap_or(false);
+    remove_snapshots(&repo_dir, model, &pinned, true);
+    if copied {
+        tracing::warn!(
+            model = model.id,
+            path = %repo_dir.join("blobs").display(),
+            "removed the pinned snapshot of the embedding model that failed to load, but its \
+             files were copies, so the blobs they came from stay and the next fetch may reuse them"
+        );
+    }
 }
 
 /// Remove the given snapshot directories of one repository and, with
@@ -1402,5 +1446,48 @@ mod tests {
             repo.join("refs").join("main").is_file(),
             "a ref in the user's folder stays, even one naming the removed commit"
         );
+    }
+
+    /// The plain self-heal case in Crystalline's own cache: the pinned
+    /// snapshot is the only one, so the whole repository directory goes, as
+    /// before older snapshots were used. Plain files, so this holds where the
+    /// cache copies instead of linking too.
+    #[test]
+    fn the_self_heal_clears_the_repository_when_the_pinned_snapshot_is_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        copied_snapshot(root, g, g.revision, b"corrupt");
+        let repo = root.join(g.cache_dir_name());
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::write(repo.join("blobs").join("stale"), b"corrupt").unwrap();
+
+        remove_failed_pinned_snapshot(root, g, false);
+        assert!(!repo.exists(), "the whole repository directory is cleared");
+    }
+
+    /// Beside another complete snapshot, a copied (not linked) pinned
+    /// snapshot loses only its own directory: the other snapshot stays, and
+    /// the blobs, which cannot be told apart, stay too.
+    #[test]
+    fn the_self_heal_keeps_blobs_it_cannot_attribute_beside_another_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        copied_snapshot(root, g, OLD_A, b"old");
+        copied_snapshot(root, g, g.revision, b"corrupt");
+        let repo = root.join(g.cache_dir_name());
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::write(repo.join("blobs").join("kept"), b"corrupt").unwrap();
+
+        remove_failed_pinned_snapshot(root, g, false);
+        assert!(!repo.join("snapshots").join(g.revision).exists());
+        for file in g.files {
+            assert!(
+                repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                "{file}"
+            );
+        }
+        assert!(repo.join("blobs").join("kept").is_file());
     }
 }
