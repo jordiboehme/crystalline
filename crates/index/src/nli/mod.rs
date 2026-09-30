@@ -20,8 +20,9 @@ pub use candidates::{
     related_threshold, score_rows, scorer_inputs, windows_overlap,
 };
 pub use models::{
-    CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliArch, NliModel, NliProfile, nli_model,
-    nli_model_by_repo, weights_cached,
+    CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliModel, NliProfile, RETIRED_NLI_REPOS,
+    accepted_setting_values, is_nli_checkpoint, nli_model, nli_model_by_repo, repo_weights_cached,
+    unknown_setting_note, weights_cached,
 };
 pub use period::names_period;
 pub use stub::StubScorer;
@@ -117,6 +118,10 @@ impl OrderAggregation {
     pub fn combine(self, ab: f32, ba: f32) -> f32 {
         match self {
             OrderAggregation::Mean => (ab + ba) / 2.0,
+            // `f32::min` ignores a NaN operand, which would let the other
+            // order alone clear the line; a NaN in either order stays a NaN,
+            // as it does under `Mean`, and a NaN never clears a threshold.
+            OrderAggregation::Min if ab.is_nan() || ba.is_nan() => f32::NAN,
             OrderAggregation::Min => ab.min(ba),
         }
     }
@@ -171,5 +176,9 @@ mod tests {
     fn the_two_aggregations_combine_both_orders() {
         assert!((OrderAggregation::Mean.combine(0.9, 0.5) - 0.7).abs() < 1e-6);
         assert_eq!(OrderAggregation::Min.combine(0.9, 0.5), 0.5);
+        for how in [OrderAggregation::Mean, OrderAggregation::Min] {
+            assert!(how.combine(f32::NAN, 0.99).is_nan(), "{how:?}");
+            assert!(how.combine(0.99, f32::NAN).is_nan(), "{how:?}");
+        }
     }
 }

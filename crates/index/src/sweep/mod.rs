@@ -122,10 +122,12 @@ pub const MAX_TWIN_PAIRS: usize = 1000;
 pub const MAX_TWIN_FINDINGS: usize = 10;
 
 /// The lead-vector cosine at or above which two engrams are related enough for
-/// the contradiction check to score their observation lines. A placeholder the
-/// measurement replaces (plans/2026-09-27-contradiction-check-plan.md Task 11);
-/// always below [`TWIN_THRESHOLD`], so twins are scored too. The eval harness
-/// overrides it with `CRYSTALLINE_NLI_RELATED`.
+/// the contradiction check to score their observation lines. Measured on the
+/// probes corpus (research/2026-09-30-contradiction-measurement.md): 0.70 to
+/// 0.85 gave identical results there, and a lower value adds scoring work
+/// without a measured gain, so it stays at 0.80. Always below
+/// [`TWIN_THRESHOLD`], so twins are scored too. The eval harness overrides it
+/// with `CRYSTALLINE_NLI_RELATED`.
 pub const RELATED_THRESHOLD: f64 = 0.80;
 
 /// The most related pairs one domain keeps for scoring, highest cosine first.
@@ -140,10 +142,11 @@ pub const MAX_LINE_PAIRS_PER_PAIR: usize = 64;
 /// above this, so the finding line can move without a rescore.
 pub const CONTRADICTION_STORE_FLOOR: f32 = 0.5;
 
-/// How the two reading orders of a line pair combine into its score. A
-/// placeholder the measurement settles; both raw orders are stored, so a
-/// change needs no rescore.
-pub const ORDER_AGGREGATION: OrderAggregation = OrderAggregation::Mean;
+/// How the two reading orders of a line pair combine into its score. `Min`
+/// reached the same recall as `Mean` with higher precision for the `full`
+/// model on the probes corpus (research/2026-09-30-contradiction-measurement.md).
+/// Both raw orders are stored, so a change needs no rescore.
+pub const ORDER_AGGREGATION: OrderAggregation = OrderAggregation::Min;
 
 /// The most `V302` findings one domain sweep emits, highest score first.
 pub const MAX_CONTRADICTION_FINDINGS: usize = 10;

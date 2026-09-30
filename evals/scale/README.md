@@ -57,7 +57,7 @@ embed and would report seconds where the pass takes an hour. It refuses in that
 state rather than reporting a number that looks like a result.
 
 Options: `--bin` (default `target/release/crystalline`), `--corpus`, `--out`,
-`--stage all|base|embed|daemon|nli`, `--nli-profile full|light|english-only`,
+`--stage all|base|embed|daemon|nli`, `--nli-profile full`,
 `--nli-lift yes|no`, and `STATE_DIR` in the environment for the state
 directory, which defaults to `/tmp/crystalline-scale` because a unix socket
 path holds at most 103 bytes and a state directory under a deep working copy
@@ -80,7 +80,7 @@ and one in ten mixed, and negatives that must stay quiet (compatible facts, the
 same frame with a different scope, different periods with and without dates,
 paraphrases and entailments), with German number and date formats.
 
-`run.sh --stage nli --nli-profile full` (or `light`, `english-only`) scores the
+`run.sh --stage nli --nli-profile full` scores the
 corpus with that profile after the `embed` stage and dumps every stored row to
 `<out>/nli-<profile>.json`; `evals/nli/evaluate.py` turns a dump and the sidecar
 into the report the measurement note is written from. Precision runs on a

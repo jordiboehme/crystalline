@@ -375,7 +375,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "evolve.contradictions",
-            doc: "Let the daemon read the observation lines of related engrams with a local NLI model, so evolve raises V302 for a pair it reads as a possible contradiction: off (default), full (German, English and mixed, best quality, about 1.1 GB while scoring), light (German, English and mixed on a small machine) or english-only; every profile but off needs the local-embeddings build feature and downloads its model on first use",
+            doc: "Let the daemon read the observation lines of related engrams with a local NLI model, so evolve raises V302 for a pair it reads as a possible contradiction: off (default) or full (German, English and mixed, best quality, about 1.1 GB while scoring); full needs the local-embeddings build feature and downloads its model on first use",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
@@ -1591,7 +1591,8 @@ fn set_evolve_contradictions(config: &mut GlobalConfig, value: &str) -> Result<(
     let parsed = value.trim().to_ascii_lowercase();
     if !crystalline_index::nli::CONTRADICTION_SETTING_VALUES.contains(&parsed.as_str()) {
         return Err(SettingsError(format!(
-            "evolve.contradictions must be off, full, light or english-only, got '{value}'"
+            "evolve.contradictions must be {}, got '{value}'",
+            crystalline_index::nli::accepted_setting_values()
         )));
     }
     if parsed != "off" && !crystalline_index::nli::LOCAL_NLI_AVAILABLE {
@@ -3559,25 +3560,35 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "evolve.contradictions must be off, full, light or english-only, got 'maybe'"
+            "evolve.contradictions must be off or full, got 'maybe'"
         );
+        // The two profiles a development build had are refused like any
+        // other unknown value, naming what is accepted.
+        for removed in ["light", "english-only", "English-Only"] {
+            let err = apply(&mut cfg, "evolve.contradictions", removed)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("evolve.contradictions must be off or full, got '{removed}'")
+            );
+            assert_eq!(cfg.evolve, None, "a refused value writes nothing");
+        }
         // An explicit off is written, so a later default never overrides it.
         apply(&mut cfg, "evolve.contradictions", "off").unwrap();
         assert_eq!(
             evolve_contradictions_effective(&cfg),
             ("off".to_string(), false)
         );
-        for profile in ["full", "light", "english-only"] {
-            let got = apply(&mut cfg, "evolve.contradictions", profile);
-            if crystalline_index::nli::LOCAL_NLI_AVAILABLE {
-                got.unwrap();
-                assert_eq!(cfg.evolve_contradictions(), profile);
-            } else {
-                assert_eq!(
-                    got.unwrap_err().to_string(),
-                    crystalline_index::nli::NLI_FEATURE_MISSING
-                );
-            }
+        let got = apply(&mut cfg, "evolve.contradictions", "full");
+        if crystalline_index::nli::LOCAL_NLI_AVAILABLE {
+            got.unwrap();
+            assert_eq!(cfg.evolve_contradictions(), "full");
+        } else {
+            assert_eq!(
+                got.unwrap_err().to_string(),
+                crystalline_index::nli::NLI_FEATURE_MISSING
+            );
         }
         unset(&mut cfg, "evolve.contradictions").unwrap();
         assert_eq!(

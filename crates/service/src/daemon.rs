@@ -2372,7 +2372,11 @@ pub async fn run_embed_tick(
                     // Nothing left to embed is when the contradiction pass
                     // sees every lead vector: asked while its pending count is
                     // unknown (a fresh start, a changed setting) or non-zero.
-                    // Off, and a model whose load failed, ask for nothing.
+                    // Off asks for nothing. A model whose load failed asks for
+                    // nothing either until its retry is due: a failed download
+                    // waits out its backoff and is then asked for again, a
+                    // build error stays blocked until the setting is set
+                    // again or the daemon restarts.
                     Ok(0) => {
                         if engine.contradictions_wanted() {
                             engine.request_contradictions();

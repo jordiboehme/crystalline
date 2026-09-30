@@ -2572,7 +2572,16 @@ pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
         return Vec::new();
     };
     let Some(model) = c["model"].as_str() else {
-        return vec!["Contradictions: off".to_string()];
+        // A configured value this build does not know (a development build's
+        // removed profile, or a hand edit) runs as off; say so and what is
+        // accepted, instead of a bare "off" that hides the stale setting.
+        let unknown = c["profile"]
+            .as_str()
+            .and_then(crystalline_index::nli::unknown_setting_note);
+        return match unknown {
+            Some(note) => vec![format!("Contradictions: off ({note})")],
+            None => vec!["Contradictions: off".to_string()],
+        };
     };
     let profile = c["profile"].as_str().unwrap_or_default();
     let pending = match c["pending_pairs"].as_u64() {
@@ -4196,14 +4205,36 @@ mod contradictions_status_tests {
     #[test]
     fn pending_not_yet_known_is_named_not_counted_yet() {
         let data = json!({ "contradictions": {
-            "profile": "light", "model": "multilingual-minilmv2-l12-mnli-xnli",
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
             "pending_pairs": null, "failing_pairs": null, "scored_pairs": 3,
             "last_error": null, "load_failed": false, "embedding_pending": false,
         }});
         assert_eq!(
             contradictions_lines(&data),
-            vec!["Contradictions: light (multilingual-minilmv2-l12-mnli-xnli), not counted yet"]
+            vec!["Contradictions: full (mdeberta-v3-base-xnli-2mil7), not counted yet"]
         );
+    }
+
+    /// A config file written by a development build that still had `light` or
+    /// `english-only` does not break anything: the check is off, and status
+    /// says the value is not known and names the accepted ones.
+    #[test]
+    fn a_removed_profile_in_the_config_reads_as_off_with_the_accepted_values_named() {
+        for removed in ["light", "english-only"] {
+            let data = json!({ "contradictions": {
+                "profile": removed, "model": null,
+                "pending_pairs": null, "failing_pairs": null, "scored_pairs": 0,
+                "last_error": null, "load_failed": false, "embedding_pending": false,
+            }});
+            let lines = contradictions_lines(&data);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].starts_with("Contradictions: off ("), "{lines:?}");
+            assert!(lines[0].contains(&format!("'{removed}'")), "{lines:?}");
+            assert!(lines[0].contains("not a known value"), "{lines:?}");
+            assert!(lines[0].contains("off or full"), "{lines:?}");
+        }
+        let off = json!({ "contradictions": { "profile": "off", "model": null }});
+        assert_eq!(contradictions_lines(&off), vec!["Contradictions: off"]);
     }
 
     #[test]

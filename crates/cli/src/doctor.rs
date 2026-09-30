@@ -2949,11 +2949,11 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
 }
 
 /// Whether a cached repository belongs in the embedding listing: anything but
-/// a checkpoint of the contradiction check's model table (plan correction
-/// 14). The contradictions row lists NLI checkpoints on its own terms, so a
+/// a checkpoint of the contradiction check's model table or a retired one
+/// (plan correction 14). The contradictions row lists NLI checkpoints on its own terms, so a
 /// checkpoint would otherwise show up twice with two different verdicts.
 fn is_embedding_listing(repo: &str) -> bool {
-    crystalline_index::nli::nli_model_by_repo(repo).is_none()
+    !crystalline_index::nli::is_nli_checkpoint(repo)
 }
 
 /// The contradictions row: the profile and its model from config, whether the
@@ -2970,21 +2970,23 @@ fn contradiction_summary(
     daemon_status: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     use crystalline_index::nli::{
-        LOCAL_NLI_AVAILABLE, NLI_FEATURE_MISSING, NLI_MODELS, NliProfile, nli_model, weights_cached,
+        LOCAL_NLI_AVAILABLE, NLI_FEATURE_MISSING, NLI_MODELS, NliProfile, RETIRED_NLI_REPOS,
+        nli_model, repo_weights_cached,
     };
     let setting = cfg.evolve_contradictions();
     let model = NliProfile::from_setting(setting).map(nli_model);
     let models_dir = config::models_dir().ok();
     let cached = |repo: &str| {
-        models_dir.as_deref().is_some_and(|dir| {
-            NLI_MODELS
-                .iter()
-                .any(|m| m.repo == repo && weights_cached(dir, m))
-        })
+        models_dir
+            .as_deref()
+            .is_some_and(|dir| repo_weights_cached(dir, repo))
     };
+    // The retired checkpoints of a development build count too: they are on
+    // disk, no profile runs them, and the next daemon start prunes them.
     let stale: Vec<&str> = NLI_MODELS
         .iter()
         .map(|m| m.repo)
+        .chain(RETIRED_NLI_REPOS)
         .filter(|repo| Some(*repo) != model.map(|m| m.repo) && cached(repo))
         .collect();
     let live = daemon_status.map(|d| &d["contradictions"]);
@@ -3667,7 +3669,17 @@ pub fn render_human(report: &DoctorReport) -> String {
     if let Some(c) = &report.contradictions {
         match c["model"].as_str() {
             None => {
-                let _ = writeln!(out, "contradictions: off");
+                let unknown = c["profile"]
+                    .as_str()
+                    .and_then(crystalline_index::nli::unknown_setting_note);
+                match unknown {
+                    Some(note) => {
+                        let _ = writeln!(out, "contradictions: off ({note})");
+                    }
+                    None => {
+                        let _ = writeln!(out, "contradictions: off");
+                    }
+                }
             }
             Some(model) => {
                 let state = match (c["downloaded"].as_bool(), c["reason"].as_str()) {
@@ -5187,8 +5199,8 @@ mod tests {
     fn the_contradictions_row_says_pending_is_not_counted_without_a_daemon() {
         let mut report = report_with_orphans(IndexAccess::Direct, &[]);
         report.contradictions = Some(serde_json::json!({
-            "profile": "light", "model": "multilingual-minilmv2-l12-mnli-xnli",
-            "repo": "MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli",
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
             "downloaded": true, "reason": null, "pending_pairs": null,
             "failing_pairs": null, "last_error": null, "load_failed": false,
             "embedding_pending": false, "stale_checkpoints": [],
@@ -5204,7 +5216,36 @@ mod tests {
         assert!(!is_embedding_listing(
             crystalline_index::nli::NLI_MODELS[0].repo
         ));
+        for retired in crystalline_index::nli::RETIRED_NLI_REPOS {
+            assert!(
+                !is_embedding_listing(retired),
+                "a retired NLI checkpoint is not an embedding model either: {retired}"
+            );
+        }
         assert!(is_embedding_listing("BAAI/bge-small-en-v1.5"));
+    }
+
+    /// A config file that still says `light` or `english-only` (a development
+    /// build's) reads as off, and doctor says the value is not known and what
+    /// is accepted. The summary is built by the real `contradiction_summary`,
+    /// so this is the path a stale file takes.
+    #[test]
+    fn doctor_names_a_removed_profile_as_not_known_and_lists_the_accepted_values() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        for removed in ["light", "english-only"] {
+            let summary = contradiction_summary(&cfg_with_profile(removed), None);
+            assert_eq!(summary["model"], serde_json::Value::Null, "{summary}");
+            assert_eq!(summary["profile"], removed);
+            let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+            report.contradictions = Some(summary);
+            let out = render_human(&report);
+            assert!(out.contains("contradictions: off ("), "{out}");
+            assert!(out.contains(&format!("'{removed}'")), "{out}");
+            assert!(out.contains("not a known value"), "{out}");
+            assert!(out.contains("off or full"), "{out}");
+        }
     }
 
     // --- contradiction_summary, driven directly ------------------------
@@ -5343,7 +5384,7 @@ mod tests {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ModelsDirOverride::set(tmp.path());
-        let summary = contradiction_summary(&cfg_with_profile("light"), None);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None);
         assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
         assert_ne!(summary["pending_pairs"], serde_json::json!(0), "{summary}");
         assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
@@ -5429,14 +5470,14 @@ mod tests {
     }
 
     /// Plan correction 14, from `contradiction_summary`'s own side: a
-    /// checkpoint cached for a profile the config does not run is listed as
-    /// stale, and the configured model's own (uncached) state is unaffected.
+    /// checkpoint cached for a model the config does not run (here a retired
+    /// one, left by a development build) is listed as stale, and the configured model's own (uncached) state is unaffected.
     #[test]
     fn contradiction_summary_lists_an_unused_cached_checkpoint_as_stale() {
-        use crystalline_index::nli::{NliProfile, nli_model};
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Light).repo);
+        let retired = crystalline_index::nli::RETIRED_NLI_REPOS[0];
+        seed_nli_checkpoint(tmp.path(), retired);
         let _env = ModelsDirOverride::set(tmp.path());
         let summary = contradiction_summary(&cfg_with_profile("full"), None);
         let stale: Vec<&str> = summary["stale_checkpoints"]
@@ -5445,7 +5486,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(stale, vec![nli_model(NliProfile::Light).repo]);
+        assert_eq!(stale, vec![retired]);
         assert_eq!(
             summary["downloaded"], false,
             "the configured (full) model itself is not the one that is cached: {summary}"

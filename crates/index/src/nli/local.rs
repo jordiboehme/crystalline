@@ -5,13 +5,10 @@
 //! with the same first-use notice and progress line, and a load failure from a
 //! corrupt cache wipes the repository and fetches once more.
 //!
-//! The two heads load differently. candle's `DebertaV2SeqClassificationModel`
-//! reads `pooler.dense` and `classifier` through `vb.root()`, so it is handed
-//! `vb.pp("deberta")`; `XLMRobertaForSequenceClassification` adds `roberta`
-//! itself and takes the root. The pair template is the tokenizer's own
-//! post-processor (`[CLS] a [SEP] b [SEP]` for DeBERTa, `<s> a </s></s> b </s>`
-//! for XLM-R), and the pad id is the checkpoint's (XLM-R pads with 1, and
-//! candle derives its positions from `ne(padding_idx)`).
+//! candle's `DebertaV2SeqClassificationModel` reads `pooler.dense` and
+//! `classifier` through `vb.root()`, so it is handed `vb.pp("deberta")`. The
+//! pair template is the tokenizer's own post-processor (`[CLS] a [SEP] b
+//! [SEP]`), and the pad id is the checkpoint's.
 //!
 //! Shutdown: the fetch is an async future a caller can stop awaiting, but
 //! hf-xet runs parts of a download as `spawn_blocking` tasks on the calling
@@ -27,12 +24,9 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::{
     Config as DebertaConfig, DebertaV2SeqClassificationModel,
 };
-use candle_transformers::models::xlm_roberta::{
-    Config as XlmConfig, XLMRobertaForSequenceClassification,
-};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
-use super::models::{NliArch, NliModel};
+use super::models::NliModel;
 #[cfg(test)]
 use super::models::{NliProfile, nli_model};
 use super::{ContradictionScorer, MAX_LINE_TOKENS, contradiction_index};
@@ -55,17 +49,10 @@ const MAX_LINE_CHARS: usize = MAX_LINE_TOKENS * 16;
 /// A loaded NLI checkpoint.
 pub struct LocalNli {
     model: &'static NliModel,
-    head: Head,
+    head: Box<DebertaV2SeqClassificationModel>,
     tokenizer: Tokenizer,
     device: Device,
     contradiction: usize,
-}
-
-enum Head {
-    // Both boxed: the heads are large and unequal (candle's DeBERTa carries
-    // its whole config by value).
-    Deberta(Box<DebertaV2SeqClassificationModel>),
-    XlmRoberta(Box<XLMRobertaForSequenceClassification>),
 }
 
 fn hub_repo(model: &'static NliModel) -> HubRepo<'static> {
@@ -178,24 +165,14 @@ impl LocalNli {
         let compute = || -> candle_core::Result<Vec<Vec<f32>>> {
             let input_ids = Tensor::from_vec(ids, (batch, seq), &self.device)?;
             let attention = Tensor::from_vec(mask, (batch, seq), &self.device)?;
-            let logits = match &self.head {
-                // DebertaV2Model's own default mask is I64 and its token
-                // types U32, so these are the dtypes it expects.
-                Head::Deberta(m) => {
-                    let token_types = Tensor::from_vec(types, (batch, seq), &self.device)?;
-                    m.forward(
-                        &input_ids,
-                        Some(token_types),
-                        Some(attention.to_dtype(DType::I64)?),
-                    )?
-                }
-                // RoBERTa pairs carry no segment ids: zeros, whatever the
-                // tokenizer reported.
-                Head::XlmRoberta(m) => {
-                    let token_types = input_ids.zeros_like()?;
-                    m.forward(&input_ids, &attention, &token_types)?
-                }
-            };
+            // DebertaV2Model's own default mask is I64 and its token types
+            // U32, so these are the dtypes it expects.
+            let token_types = Tensor::from_vec(types, (batch, seq), &self.device)?;
+            let logits = self.head.forward(
+                &input_ids,
+                Some(token_types),
+                Some(attention.to_dtype(DType::I64)?),
+            )?;
             logits.to_vec2::<f32>()
         };
         compute().map_err(|e| IndexError::Nli(format!("inference: {e}")))
@@ -264,34 +241,12 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
         .map_err(|e| IndexError::Nli(format!("loading weights: {e}")))?
     };
     let build_error = |e: candle_core::Error| IndexError::Nli(format!("building model: {e}"));
-    let head = match model.architecture {
-        NliArch::DebertaV2 => {
-            let config: DebertaConfig = serde_json::from_str(&config_text)
-                .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
-            Head::Deberta(Box::new(
-                DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
-                    .map_err(build_error)?,
-            ))
-        }
-        NliArch::XlmRoberta => {
-            // candle's XLM-R config makes fields required that a checkpoint
-            // may leave to the transformers defaults: fill those rather than
-            // failing the load over them.
-            let mut filled = raw.clone();
-            if let Some(obj) = filled.as_object_mut() {
-                obj.entry("position_embedding_type")
-                    .or_insert_with(|| serde_json::json!("absolute"));
-                obj.entry("type_vocab_size")
-                    .or_insert_with(|| serde_json::json!(1));
-            }
-            let config: XlmConfig = serde_json::from_value(filled)
-                .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
-            Head::XlmRoberta(Box::new(
-                XLMRobertaForSequenceClassification::new(labels.len(), &config, vb)
-                    .map_err(build_error)?,
-            ))
-        }
-    };
+    let config: DebertaConfig = serde_json::from_str(&config_text)
+        .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
+    let head = Box::new(
+        DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
+            .map_err(build_error)?,
+    );
     Ok(LocalNli {
         model,
         head,
@@ -304,7 +259,7 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
 /// The `model_type` in `config.json` must be the table entry's, so a cache
 /// holding another model's files fails here by name.
 fn check_model_type(config: &serde_json::Value, model: &NliModel) -> Result<()> {
-    let want = model.architecture.model_type();
+    let want = model.model_type;
     match config.get("model_type").and_then(|v| v.as_str()) {
         Some(found) if found == want => Ok(()),
         found => Err(IndexError::Nli(format!(
@@ -314,8 +269,8 @@ fn check_model_type(config: &serde_json::Value, model: &NliModel) -> Result<()> 
     }
 }
 
-/// `config.json`'s `id2label`, keys parsed to row indices. candle's XLM-R
-/// config does not carry it, so both arms read it here.
+/// `config.json`'s `id2label`, keys parsed to row indices, which candle's
+/// DeBERTa config does not carry.
 fn id2label(config: &serde_json::Value) -> Result<BTreeMap<u32, String>> {
     let map = config
         .get("id2label")
@@ -463,9 +418,9 @@ mod tests {
         assert!(check_model_type(&raw, deberta).is_ok());
         let labels = id2label(&raw).unwrap();
         assert_eq!(labels.get(&2).map(String::as_str), Some("contradiction"));
-        let err = check_model_type(&raw, nli_model(NliProfile::Light))
-            .unwrap_err()
-            .to_string();
+        let other: serde_json::Value =
+            serde_json::from_str(r#"{"model_type": "xlm-roberta"}"#).unwrap();
+        let err = check_model_type(&other, deberta).unwrap_err().to_string();
         assert!(
             err.contains("xlm-roberta") && err.contains("deberta-v2"),
             "{err}"
@@ -485,8 +440,8 @@ mod tests {
     #[test]
     fn an_nli_failure_is_never_labeled_an_embedding_error() {
         let raw: serde_json::Value =
-            serde_json::from_str(r#"{"model_type": "deberta-v2"}"#).unwrap();
-        let err = check_model_type(&raw, nli_model(NliProfile::Light)).unwrap_err();
+            serde_json::from_str(r#"{"model_type": "xlm-roberta"}"#).unwrap();
+        let err = check_model_type(&raw, nli_model(NliProfile::Full)).unwrap_err();
         assert!(matches!(err, IndexError::Nli(_)), "{err:?}");
         let text = err.to_string();
         assert!(!text.contains("embedding error"), "{text}");
@@ -518,9 +473,9 @@ mod tests {
     }
 
     /// Review focus 5, the half that runs without a download: the pad id is
-    /// what the checkpoint says, and for XLM-R that is 1, never 0.
+    /// what the checkpoint says, here 1, never a default 0.
     #[test]
-    fn the_pad_id_is_read_from_the_checkpoint_and_one_for_xlm_roberta() {
+    fn the_pad_id_is_read_from_the_checkpoint() {
         let t = Tokenizer::from_bytes(
             br#"{"version": "1.0", "truncation": null, "padding": null,
                  "added_tokens": [], "normalizer": null, "pre_tokenizer": null,

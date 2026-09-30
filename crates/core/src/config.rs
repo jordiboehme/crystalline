@@ -277,7 +277,7 @@ impl GlobalConfig {
     }
 
     /// The contradiction check's profile, from `evolve.contradictions`:
-    /// `off`, `full`, `light` or `english-only`. Absent means
+    /// `off` or `full`. Absent means
     /// [`DEFAULT_EVOLVE_CONTRADICTIONS`]. Returned as written; the engine maps
     /// it to a model and reads anything it does not know as off.
     pub fn evolve_contradictions(&self) -> &str {

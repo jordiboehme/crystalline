@@ -375,9 +375,7 @@ stage_nli() {
   local profile="$NLI_PROFILE" repo
   case "$profile" in
     full) repo="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7" ;;
-    light) repo="MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli" ;;
-    english-only) repo="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli" ;;
-    *) echo "--nli-profile must be full, light or english-only" >&2; return 2 ;;
+    *) echo "--nli-profile must be full" >&2; return 2 ;;
   esac
   if [ "$NLI_LIFT" = "yes" ] && [ ! -f "$CORPUS/contradictions.json" ]; then
     echo "--nli-lift yes measures precision on planted pairs; generate a probes corpus with --contradictions" >&2

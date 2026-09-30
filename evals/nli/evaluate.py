@@ -297,7 +297,7 @@ def main() -> int:
     parser.add_argument("--sidecar", type=Path)
     parser.add_argument("--log", type=Path)
     parser.add_argument("--rss", type=Path)
-    parser.add_argument("--langs", help="comma separated, for example en for the english-only profile")
+    parser.add_argument("--langs", help="comma separated, for example en to score the English pairs only")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()

@@ -14,7 +14,7 @@ transformers and torch versions it ran with.
     uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu torch
     uv pip install --python .venv/bin/python transformers sentencepiece protobuf tiktoken
     .venv/bin/python evals/nli/parity.py
-    .venv/bin/python evals/nli/parity.py --model MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli
+    .venv/bin/python evals/nli/parity.py --model MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7
 
 Point HF_HUB_CACHE at the directory the Rust loader downloaded into
 (CRYSTALLINE_MODELS_DIR) and set HF_HUB_OFFLINE=1 to check the very bytes the
@@ -34,8 +34,6 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 # repo -> the short id the Rust table names it by (crates/index/src/nli/models.rs)
 MODELS = {
     "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7": "mdeberta-v3-base-xnli-2mil7",
-    "MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli": "multilingual-minilmv2-l12-mnli-xnli",
-    "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli": "deberta-v3-base-mnli-fever-anli",
 }
 
 MAX_LINE_TOKENS = 254
@@ -133,7 +131,7 @@ def fixture_for(repo: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", choices=sorted(MODELS), help="one repository; default every model")
+    parser.add_argument("--model", choices=sorted(MODELS), help="one repository; default every model in the table")
     parser.add_argument("--out", type=Path, default=Path("crates/index/tests/fixtures"))
     args = parser.parse_args()
     repos = [args.model] if args.model else list(MODELS)

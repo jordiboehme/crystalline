@@ -3007,13 +3007,15 @@ fn stored(
     }
 }
 
-/// The finding line is pinned here rather than read from the model table, so
-/// the measurement moving a model's threshold never moves these tests.
+/// The finding line and the aggregation are pinned here rather than read from
+/// the model table and the product constant, so the measurement moving either
+/// never moves these tests.
 fn meaning_input(facts: Vec<EngramFacts>, rows: Vec<ContradictionRow>) -> SweepInput {
     let mut sweep = input(facts);
     sweep.contradictions = rows;
     sweep.contradiction_model = "nli-x".to_string();
     sweep.options.contradiction_threshold = 0.85;
+    sweep.options.order_aggregation = OrderAggregation::Mean;
     sweep
 }
 
@@ -3077,7 +3079,7 @@ fn v302_is_quiet_below_the_line_when_off_and_on_a_retired_speculative_or_disjoin
     let b = observed(2, "two", &[(5, "y")]);
     let low = detect(&meaning_input(
         vec![a.clone(), b.clone()],
-        vec![stored(1, 2, 5, "x", 5, "y", 0.84, 0.84)],
+        vec![stored(1, 2, 5, "x", 5, "y", 0.69, 0.69)],
     ));
     assert!(!fired(&low).contains(&"V302"));
     let nan = detect(&meaning_input(

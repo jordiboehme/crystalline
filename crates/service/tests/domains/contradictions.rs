@@ -5,9 +5,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_core::config::{
+    DomainEntry, EvolveConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+};
 use crystalline_index::nli::{
-    ContradictionScorer, NLI_MODELS, NliModel, NliProfile, StubScorer, nli_model,
+    ContradictionScorer, NliModel, NliProfile, RETIRED_NLI_REPOS, StubScorer, nli_model,
 };
 use crystalline_index::{ContradictionRow, EmbeddingProvider, IndexError, TursoStore};
 use crystalline_service::Engine;
@@ -36,8 +38,19 @@ async fn engine_with_domains(
     provider: Arc<dyn EmbeddingProvider>,
     domains: &[&str],
 ) -> (tempfile::TempDir, Arc<Engine>) {
+    engine_with_config(provider, domains, |_| {}).await
+}
+
+/// [`engine_with_domains`] with `edit` applied to the config before the engine
+/// is built, which is how a hand-edited value reaches it.
+async fn engine_with_config(
+    provider: Arc<dyn EmbeddingProvider>,
+    domains: &[&str],
+    edit: impl FnOnce(&mut GlobalConfig),
+) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = GlobalConfig::default();
+    edit(&mut cfg);
     for name in domains {
         cfg.domains
             .insert(name.to_string(), DomainEntry::virtual_domain());
@@ -72,11 +85,6 @@ async fn set(engine: &Engine, key: &str, value: &str) {
 async fn the_profile_names_one_model_and_off_names_none() {
     let (_tmp, engine) = engine().await;
     assert!(engine.contradiction_model().is_none(), "off by default");
-    set(&engine, "evolve.contradictions", "light").await;
-    assert_eq!(
-        engine.contradiction_model().map(|m| m.repo),
-        Some(nli_model(NliProfile::Light).repo)
-    );
     set(&engine, "evolve.contradictions", "full").await;
     assert_eq!(
         engine.contradiction_model().map(|m| m.profile),
@@ -84,6 +92,56 @@ async fn the_profile_names_one_model_and_off_names_none() {
     );
     set(&engine, "evolve.contradictions", "off").await;
     assert!(engine.contradiction_model().is_none());
+}
+
+/// Only `off` and `full` ship: `light` and `english-only` (a development
+/// build's profiles) are refused by `config set` with the accepted values
+/// named, and nothing is written.
+#[tokio::test]
+async fn a_removed_profile_is_refused_with_the_accepted_values() {
+    let (_tmp, engine) = engine().await;
+    for removed in ["light", "english-only"] {
+        let err = engine
+            .configure(&ConfigureAction::Set {
+                key: "evolve.contradictions".to_string(),
+                value: removed.to_string(),
+            })
+            .await
+            .expect_err("a removed profile is refused");
+        let text = err.to_string();
+        assert!(text.contains("off or full"), "{text}");
+        assert!(text.contains(&format!("'{removed}'")), "{text}");
+        assert!(engine.contradiction_model().is_none(), "still off");
+    }
+}
+
+/// A config file written by a development build that still says `light` must
+/// not break the daemon: the engine reads it as off (no model, nothing
+/// scored, no walk wanted), the status block still carries the raw value so
+/// status and doctor can say it is not known, and a pass is an honest no-op.
+#[tokio::test]
+async fn a_config_that_still_says_light_reads_as_off_and_reports_the_raw_value() {
+    let (_tmp, engine) =
+        engine_with_config(Arc::new(crate::support::TopicEmbedder), &["notes"], |cfg| {
+            cfg.evolve = Some(EvolveConfig {
+                contradictions: Some("light".to_string()),
+            });
+        })
+        .await;
+    assert!(engine.contradiction_model().is_none());
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["profile"], "light");
+    assert!(status["model"].is_null(), "{status}");
+    assert_eq!(status["scored_pairs"], 0);
+    assert!(!engine.contradictions_wanted());
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    // Fixing the value is one `config set` away.
+    set(&engine, "evolve.contradictions", "off").await;
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["profile"], "off");
 }
 
 /// A hub-shaped cache directory with one weight file.
@@ -95,38 +153,60 @@ fn hub_dir(root: &std::path::Path, repo: &str) {
     std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
 }
 
+fn cached_repos(root: &std::path::Path) -> Vec<String> {
+    crystalline_index::cached_model_dirs(root)
+        .into_iter()
+        .map(|(repo, _)| repo)
+        .collect()
+}
+
 #[tokio::test]
 async fn the_model_cache_keeps_the_configured_profile_and_drops_the_others() {
     let (_tmp, engine) = engine().await;
     let cache = tempfile::tempdir().unwrap();
     let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
     hub_dir(cache.path(), granite);
-    for m in &NLI_MODELS {
-        hub_dir(cache.path(), m.repo);
+    hub_dir(cache.path(), nli_model(NliProfile::Full).repo);
+    // The checkpoints of the two profiles a development build had.
+    for retired in RETIRED_NLI_REPOS {
+        hub_dir(cache.path(), retired);
     }
-    set(&engine, "evolve.contradictions", "light").await;
+    set(&engine, "evolve.contradictions", "full").await;
     engine.prune_model_cache(cache.path().to_path_buf()).await;
-    let left: Vec<String> = crystalline_index::cached_model_dirs(cache.path())
-        .into_iter()
-        .map(|(repo, _)| repo)
-        .collect();
     assert_eq!(
-        left,
+        cached_repos(cache.path()),
         vec![
-            nli_model(NliProfile::Light).repo.to_string(),
+            nli_model(NliProfile::Full).repo.to_string(),
             granite.to_string()
         ],
-        "the embedding model and the configured profile stay (sorted by repo id)"
+        "the embedding model and the configured profile stay, the retired checkpoints go (sorted by repo id)"
     );
 
     // Off keeps no NLI checkpoint at all.
     set(&engine, "evolve.contradictions", "off").await;
     engine.prune_model_cache(cache.path().to_path_buf()).await;
-    let left: Vec<String> = crystalline_index::cached_model_dirs(cache.path())
-        .into_iter()
-        .map(|(repo, _)| repo)
-        .collect();
-    assert_eq!(left, vec![granite.to_string()]);
+    assert_eq!(cached_repos(cache.path()), vec![granite.to_string()]);
+}
+
+/// An install whose config still says `light` has the retired checkpoint on
+/// disk: the unknown value keeps nothing, so the prune takes it.
+#[tokio::test]
+async fn a_retired_checkpoint_is_pruned_when_the_config_still_names_its_profile() {
+    let (_tmp, engine) =
+        engine_with_config(Arc::new(crate::support::TopicEmbedder), &["notes"], |cfg| {
+            cfg.evolve = Some(EvolveConfig {
+                contradictions: Some("light".to_string()),
+            });
+        })
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+    hub_dir(cache.path(), granite);
+    for retired in RETIRED_NLI_REPOS {
+        hub_dir(cache.path(), retired);
+    }
+    engine.prune_model_cache(cache.path().to_path_buf()).await;
+    assert_eq!(cached_repos(cache.path()), vec![granite.to_string()]);
 }
 
 // --- the daemon pass -------------------------------------------------------
@@ -294,37 +374,20 @@ async fn an_edit_requeues_the_pair() {
     );
 }
 
-/// Review focus 4. Two models never sit in memory together: the old one is
-/// dropped before the new one loads, which a failed first load makes visible.
-/// A failed load is not retried by the next pass, only once the setting is
-/// set again. Rows land under the model that scored them, and the old model's
-/// rows stay.
+/// Review focus 4, for the one model that ships. A failed load is not retried
+/// by the next pass, only once the setting is set again. The rows of the
+/// first walk stay.
 #[tokio::test]
-async fn a_profile_switch_drops_the_old_scorer_before_loading_the_new_one() {
-    let light = nli_model(NliProfile::Light);
-    let light_stub = Arc::new(StubScorer::new(light.repo, 0.7));
+async fn a_failed_load_is_asked_for_again_only_when_the_setting_is_set_again() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let loader: ScorerLoader = {
-        let (full_stub, light_stub, attempts) = (stub(), light_stub.clone(), attempts.clone());
-        Arc::new(move |model: &'static NliModel| {
+        let (full_stub, attempts) = (stub(), attempts.clone());
+        Arc::new(move |_model: &'static NliModel| {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
-            if model.profile == NliProfile::Light {
-                // Only this closure still holds the full model: the engine let
-                // go of it before it asked for light.
-                assert_eq!(
-                    Arc::strong_count(&full_stub),
-                    1,
-                    "the full scorer is dropped before the light load starts"
-                );
-            }
-            let s: Arc<dyn ContradictionScorer> = if model.profile == NliProfile::Full {
-                full_stub.clone()
-            } else {
-                light_stub.clone()
-            };
-            if model.profile == NliProfile::Light && n == 1 {
+            let s: Arc<dyn ContradictionScorer> = full_stub.clone();
+            if n == 0 {
                 ready(Err(IndexError::Nli(
-                    "the first light download failed".to_string(),
+                    "the first download failed".to_string(),
                 )))
             } else {
                 ready(Ok(s))
@@ -336,24 +399,14 @@ async fn a_profile_switch_drops_the_old_scorer_before_loading_the_new_one() {
     three(&engine).await;
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
-    );
-    assert!(engine.contradiction_scorer_loaded());
-
-    set(&engine, "evolve.contradictions", "light").await;
-    assert_eq!(
-        engine.score_contradictions().await.unwrap(),
         ContradictionOutcome::ModelUnavailable
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    assert!(
-        !engine.contradiction_scorer_loaded(),
-        "the full model went before light was asked for"
-    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(!engine.contradiction_scorer_loaded());
     assert!(
         engine
             .contradiction_last_error()
-            .is_some_and(|e| e.contains("the first light download failed")),
+            .is_some_and(|e| e.contains("the first download failed")),
         "{:?}",
         engine.contradiction_last_error()
     );
@@ -367,28 +420,23 @@ async fn a_profile_switch_drops_the_old_scorer_before_loading_the_new_one() {
     );
     assert_eq!(
         attempts.load(Ordering::SeqCst),
-        2,
+        1,
         "nor by the next pass: the loader wipes and downloads again on a failure"
     );
 
     // Setting the profile again is what asks for another load.
-    set(&engine, "evolve.contradictions", "light").await;
+    set(&engine, "evolve.contradictions", "full").await;
     assert!(engine.contradiction_last_error().is_none());
     assert!(engine.contradictions_wanted());
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
         scored(1, 4, 0)
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        rows(&engine, light.repo).await.len(),
-        4,
-        "every line pair at 0.7, under light"
-    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
         rows(&engine, full().repo).await.len(),
         1,
-        "full's rows stay where they were"
+        "the one pair above the store floor"
     );
 }
 
@@ -1214,28 +1262,25 @@ async fn a_failed_store_write_skips_the_pair_and_the_walk_goes_on() {
 }
 
 /// Review round 1, finding 1: a setting change that lands while a walk runs
-/// under the old profile is not lost. The old walk publishes nothing, so the
-/// new profile is scored without any write.
+/// is not lost. The old walk finishes its pairs, which are valid scores of
+/// the same model, but publishes nothing: pending stays unknown, so the next
+/// pass recounts without any write.
 #[tokio::test]
 async fn a_setting_change_during_a_walk_is_not_lost() {
-    let light = nli_model(NliProfile::Light);
     let (gate, entered) = (
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
     );
+    let first_load = Arc::new(AtomicBool::new(true));
     let loader: ScorerLoader = {
-        let (gate, entered) = (gate.clone(), entered.clone());
-        let (full_stub, light_stub) = (stub(), Arc::new(StubScorer::new(light.repo, 0.7)));
-        Arc::new(move |model: &'static NliModel| {
+        let (gate, entered, first_load) = (gate.clone(), entered.clone(), first_load.clone());
+        let full_stub = stub();
+        Arc::new(move |_model: &'static NliModel| {
             let (gate, entered) = (gate.clone(), entered.clone());
-            let s: Arc<dyn ContradictionScorer> = if model.profile == NliProfile::Full {
-                full_stub.clone()
-            } else {
-                light_stub.clone()
-            };
-            let full = model.profile == NliProfile::Full;
+            let s: Arc<dyn ContradictionScorer> = full_stub.clone();
+            let hold = first_load.swap(false, Ordering::SeqCst);
             let held: futures::future::BoxFuture<'static, Loaded> = Box::pin(async move {
-                if full {
+                if hold {
                     entered.notify_one();
                     gate.notified().await;
                 }
@@ -1253,13 +1298,14 @@ async fn a_setting_change_during_a_walk_is_not_lost() {
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
         .await
-        .expect("the full walk reached the loader");
-    set(&engine, "evolve.contradictions", "light").await;
+        .expect("the walk reached the loader");
+    set(&engine, "evolve.contradictions", "full").await;
     gate.notify_one();
     first.await.unwrap();
-    assert!(
-        rows(&engine, full().repo).await.is_empty(),
-        "the walk stopped before scoring under a profile the setting left"
+    assert_eq!(
+        rows(&engine, full().repo).await.len(),
+        1,
+        "the old walk's scores of the same model stand"
     );
     assert!(
         engine.contradictions_wanted(),
@@ -1267,32 +1313,30 @@ async fn a_setting_change_during_a_walk_is_not_lost() {
     );
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(0, 0, 0),
+        "the recount finds nothing left to score"
     );
-    assert_eq!(rows(&engine, light.repo).await.len(), 4);
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+    assert!(
+        !engine.contradictions_wanted(),
+        "and the pending count is known again"
+    );
 }
 
 /// Finding 1 at its narrowest: the setting moves while the walk's last pair
 /// is scoring, so the walk finishes that pair and then has nothing left. What
-/// it found is under the old profile's generation and is not published, so
-/// pending stays unknown and the new profile is asked for.
+/// it found is under the old generation and is not published, so pending
+/// stays unknown and the next pass recounts.
 #[tokio::test]
 async fn a_setting_change_during_the_last_pair_is_not_lost() {
-    let light = nli_model(NliProfile::Light);
     let entered = Arc::new(AtomicBool::new(false));
     let (release, rx) = std::sync::mpsc::channel();
     let blocking: Arc<dyn ContradictionScorer> = Arc::new(Blocking {
         entered: entered.clone(),
         release: std::sync::Mutex::new(rx),
     });
-    let light_stub: Arc<dyn ContradictionScorer> = Arc::new(StubScorer::new(light.repo, 0.7));
-    let loader: ScorerLoader = Arc::new(move |model: &'static NliModel| {
-        if model.profile == NliProfile::Full {
-            ready(Ok(blocking.clone()))
-        } else {
-            ready(Ok(light_stub.clone()))
-        }
-    });
+    let loader: ScorerLoader =
+        Arc::new(move |_model: &'static NliModel| ready(Ok(blocking.clone())));
     let (_tmp, engine) = engine_with(loader).await;
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
@@ -1307,19 +1351,22 @@ async fn a_setting_change_during_the_last_pair_is_not_lost() {
     })
     .await
     .expect("the pass reached the scorer");
-    set(&engine, "evolve.contradictions", "light").await;
+    set(&engine, "evolve.contradictions", "full").await;
     release.send(()).unwrap();
     pass.await.unwrap();
     assert!(
         engine.contradictions_wanted(),
-        "the full walk did not publish its empty pending over the change"
+        "the old walk did not publish its empty pending over the change"
     );
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0),
-        "light is scored without any write"
+        scored(0, 0, 0),
+        "recounted without any write"
     );
-    assert_eq!(rows(&engine, light.repo).await.len(), 4);
+    assert!(
+        !engine.contradictions_wanted(),
+        "and the pending count is known again"
+    );
 }
 
 /// Review round 1, finding 7: turning the check off ends the walk in flight

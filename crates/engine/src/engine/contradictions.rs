@@ -1113,8 +1113,9 @@ async fn run_scorer(
 /// embedding model, the domain's id and every path with its checksum. Built
 /// from the stamps alone, never from the vectors, so checking it costs one
 /// narrow read. The id is there for a domain removed and added back under
-/// its old name: its rows were cleared with it, and a new id never matches
-/// the old record (the removal also forgets the record).
+/// its old name: its rows were cleared with it. The id alone is not the
+/// guard, since an id can stay the same; the forget hook on removal is, and
+/// the id only keeps a digest from matching a record of another domain.
 fn walk_digest(
     model: &NliModel,
     threshold: f64,
@@ -1176,7 +1177,11 @@ mod tests {
     #[test]
     fn the_walk_digest_moves_with_a_stamp_the_model_the_embedding_model_or_the_domain_only() {
         let full = nli_model(NliProfile::Full);
-        let light = nli_model(NliProfile::Light);
+        // A second model, as a later release's table would carry.
+        let other: &'static NliModel = Box::leak(Box::new(NliModel {
+            repo: "example/another-nli-model",
+            ..*full
+        }));
         let d = DomainId(1);
         let stamps: HashMap<String, FileStamp> = [
             ("a.md".to_string(), stamp("1")),
@@ -1195,7 +1200,7 @@ mod tests {
             walk_digest(full, 0.8, "granite", d, &touched),
             "a touch that keeps the content keeps the digest"
         );
-        assert_ne!(base, walk_digest(light, 0.8, "granite", d, &stamps));
+        assert_ne!(base, walk_digest(other, 0.8, "granite", d, &stamps));
         assert_ne!(base, walk_digest(full, 0.7, "granite", d, &stamps));
         assert_ne!(base, walk_digest(full, 0.8, "bge", d, &stamps));
         assert_ne!(

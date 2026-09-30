@@ -821,7 +821,7 @@ describe("the maintenance screen", () => {
         cleanPayload({
           truncations: [
             "V302: 3 related pairs not scored yet (the daemon scores them after embedding)",
-            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again retries)",
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)",
           ],
         }),
     });

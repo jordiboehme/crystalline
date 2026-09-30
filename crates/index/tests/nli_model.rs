@@ -1,14 +1,13 @@
-//! The real NLI checkpoints, behind `CRYSTALLINE_TEST_NLI=1` (369 to 558 MB
-//! each on a cold cache): logits parity against Python transformers for every
-//! profile, run as one mixed-length padded batch through the real path, then
-//! the flipped-fact checks for the two multilingual profiles. The measurement
-//! does not start until the parity test passes for all three. Skipped with a
+//! The real NLI checkpoint, behind `CRYSTALLINE_TEST_NLI=1` (558 MB on a cold
+//! cache): logits parity against Python transformers, run as one mixed-length
+//! padded batch through the real path, then the flipped-fact checks. The
+//! measurement does not start until the parity test passes. Skipped with a
 //! note otherwise, like the postgres leg.
 //!
 //! `CRYSTALLINE_MODELS_DIR` must point at a directory of its own, and the
 //! tests refuse to run without it: the default is the user's real model
 //! cache, where a running daemon prunes checkpoints its setting does not name
-//! (possibly mid-test) and 1.4 GB would land unasked.
+//! (possibly mid-test) and 558 MB would land unasked.
 //!
 //! Run it on the release profile: an unoptimized candle takes many minutes
 //! over the 270-token parity batch, the release build about twenty seconds.
@@ -41,7 +40,7 @@ fn enabled() -> bool {
 }
 
 #[tokio::test]
-async fn nli_parity_holds_for_every_profile_as_one_padded_batch() {
+async fn nli_parity_holds_as_one_padded_batch() {
     if !enabled() {
         return;
     }
@@ -127,11 +126,10 @@ async fn nli_parity_holds_for_every_profile_as_one_padded_batch() {
     assert!(misses.is_empty(), "parity misses:\n{}", misses.join("\n"));
 }
 
-/// Every profile is scored and printed first, the English one included for
-/// the record, so a miss still leaves all the numbers in the log; only the
-/// two multilingual profiles are held to the German pair.
+/// Every profile is scored and printed first, so a miss still leaves all the
+/// numbers in the log, then each is held to the English and the German pair.
 #[tokio::test]
-async fn the_multilingual_profiles_separate_a_flipped_fact_from_an_unrelated_one() {
+async fn the_profiles_separate_a_flipped_fact_from_an_unrelated_one() {
     if !enabled() {
         return;
     }
@@ -161,10 +159,7 @@ async fn the_multilingual_profiles_separate_a_flipped_fact_from_an_unrelated_one
         );
         scored.push((profile, model, flipped, unrelated, flipped_de));
     }
-    for (profile, model, flipped, unrelated, flipped_de) in scored {
-        if profile == NliProfile::EnglishOnly {
-            continue;
-        }
+    for (_profile, model, flipped, unrelated, flipped_de) in scored {
         assert!(
             flipped >= model.threshold,
             "{}: flipped fact scored {flipped}",

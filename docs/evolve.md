@@ -34,10 +34,8 @@ What it reads: two current engrams in one domain (neither speculative, validity 
 |---|---|---|
 | `off` (default) | none | no scoring, no download |
 | `full` | mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 | German, English and mixed; best quality; a 558 MB download, about 1.1 GB while scoring |
-| `light` | multilingual-MiniLMv2-L12-mnli-xnli | German, English and mixed on a small machine; about a quarter of the compute, lower recall |
-| `english-only` | DeBERTa-v3-base-mnli-fever-anli | English-only knowledge; best English quality |
 
-Every profile but `off` needs a build with the `local-embeddings` feature (every published binary and image has it) and downloads its model on first use into the same cache as the embedding model. `crystalline status` and `crystalline doctor` show the profile, the model and how many pairs are pending. Drafts are never scored, so in a review-mode domain an author's open draft hides the V302 findings on the engram being drafted until it is published: the sweep reads the draft, and the stored rows belong to the published engram, the same way V301 speaks only about the version the caller reads. The models' weights are MIT licensed; the XNLI and ANLI data they were trained on is licensed for non-commercial use only.
+`full` needs a build with the `local-embeddings` feature (every published binary and image has it) and downloads its model on first use into the same cache as the embedding model. A config file that still names a value this version does not know (`light` or `english-only` from a development build, or a typo) does not break anything: the check stays off, `crystalline status` and `crystalline doctor` say the value is not known and name the accepted ones, and `crystalline config set evolve.contradictions` refuses it the same way. `crystalline status` and `crystalline doctor` show the profile, the model and how many pairs are pending. Drafts are never scored, so in a review-mode domain an author's open draft hides the V302 findings on the engram being drafted until it is published: the sweep reads the draft, and the stored rows belong to the published engram, the same way V301 speaks only about the version the caller reads. The model's weights are MIT licensed; the XNLI and ANLI data they were trained on is licensed for non-commercial use only.
 
 ### An engram's lifecycle
 

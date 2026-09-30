@@ -146,7 +146,8 @@ pub fn cached_model_dirs(models_dir: &Path) -> Vec<(String, u64)> {
     found
 }
 
-/// Remove every cached directory for a repository `LOCAL_MODELS` or `NLI_MODELS` lists whose
+/// Remove every cached directory for a repository `LOCAL_MODELS`, `NLI_MODELS` or
+/// `RETIRED_NLI_REPOS` lists whose
 /// id is not in `keep`, returning what went and how many bytes it freed,
 /// sorted by repo id.
 ///
@@ -169,8 +170,7 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
     let mut candidates: Vec<(String, PathBuf)> = hub_dirs(models_dir)
         .into_iter()
         .filter(|(repo, _)| {
-            LOCAL_MODELS.iter().any(|m| m.repo == repo)
-                || crate::nli::NLI_MODELS.iter().any(|m| m.repo == repo)
+            LOCAL_MODELS.iter().any(|m| m.repo == repo) || crate::nli::is_nli_checkpoint(repo)
         })
         .collect();
     candidates.sort();
@@ -553,16 +553,19 @@ mod tests {
         let root = tmp.path();
         let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
         let full = crate::nli::NLI_MODELS[0].repo;
-        let light = crate::nli::NLI_MODELS[1].repo;
+        let [retired_a, retired_b] = crate::nli::RETIRED_NLI_REPOS;
         hub_dir(root, granite, &[7u8; 64]);
         hub_dir(root, full, &[1u8; 16]);
-        hub_dir(root, light, &[2u8; 16]);
+        hub_dir(root, retired_a, &[2u8; 16]);
+        hub_dir(root, retired_b, &[3u8; 16]);
         let removed = prune_model_cache(root, &[granite, full]).unwrap();
-        let repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
+        let mut repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
+        repos.sort();
+        let mut want = vec![retired_a, retired_b];
+        want.sort();
         assert_eq!(
-            repos,
-            [light],
-            "the NLI checkpoint nobody kept goes, the kept one stays"
+            repos, want,
+            "the retired NLI checkpoints of a development build go, the kept one stays"
         );
         assert!(root.join(hub_dir_name(full)).is_dir());
         assert!(root.join(hub_dir_name(granite)).is_dir());
