@@ -312,17 +312,28 @@ impl ProgressHandler for ByteProgress {
 /// callers, CI) keeps exactly the single notice line, never per-byte output.
 /// A file already present in the cache is resolved with no network call at
 /// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
-/// never dials out just to check.
+/// never dials out just to check. Every file is fetched at the model's pinned
+/// commit (`LocalModel::revision`), so a cache holding another commit counts
+/// as not cached.
 async fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
-
     let client = hub_client(cache_dir)?;
+    ensure_files_with(&client, cache_dir, model).await
+}
+
+/// [`ensure_files`] on a given client, so a test can point the network side
+/// at a listener it controls. Every request names `model.revision`.
+async fn ensure_files_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &LocalModel,
+) -> Result<ModelFiles> {
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
-    let cached = is_cached(&client, model).await?;
+    let cached = is_cached(client, model).await?;
     if !cached {
         eprintln!(
             "crystalline: downloading embedding model {} to {} (first use, about {} MB)...",
@@ -337,11 +348,12 @@ async fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles
     let repo = client.model(owner, name);
     let mut paths = IndexMap::with_capacity(model.files.len());
     for file in model.files {
-        let path = match cached_path(&client, model, file).await? {
+        let path = match cached_path(client, model, file).await? {
             Some(path) => path,
             None => repo
                 .download_file()
                 .filename(*file)
+                .revision(model.revision)
                 // Progress is opt in in hf-hub: leaving the handler off is the
                 // suppression, so exactly one progress mechanism is ever active
                 // and it is the one this module controls and TTY-gates itself.
@@ -381,13 +393,16 @@ fn hub_client(cache_dir: &Path) -> Result<HFClient> {
 /// not hold it. `local_files_only` answers from the cache directory alone and
 /// never touches the network, and `LocalEntryNotFound` is the miss; a plain
 /// download would HEAD the repository even on a warm cache, which is what the
-/// air-gapped and CI-prefetch paths must not do.
+/// air-gapped and CI-prefetch paths must not do. It asks for the pinned
+/// commit, which hf-hub answers from `snapshots/<hash>/` alone; without the
+/// revision it would look up `refs/main`, which a pinned download never writes.
 async fn cached_path(client: &HFClient, model: &LocalModel, name: &str) -> Result<Option<PathBuf>> {
     let (owner, repo) = repo_parts(model)?;
     match client
         .model(owner, repo)
         .download_file()
         .filename(name)
+        .revision(model.revision)
         .local_files_only(true)
         .send()
         .await
@@ -623,10 +638,19 @@ fn wipe_model_dir(cache_dir: &Path, model: &LocalModel) {
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Tensor};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::time::Duration;
 
-    use super::{MAX_INPUT_CHARS, cap_chars, check_model_type, cls_pool, pad_id};
-    use crate::embed::models::lookup_local_model;
+    use candle_core::{Device, Tensor};
+    use hf_hub::HFClient;
+
+    use super::{
+        MAX_INPUT_CHARS, cached_path, cap_chars, check_model_type, cls_pool, ensure_files_with,
+        pad_id,
+    };
+    use crate::embed::models::{LocalModel, lookup_local_model};
 
     #[test]
     fn cls_pooling_takes_the_first_position_of_every_row() {
@@ -727,5 +751,141 @@ mod tests {
         // The cap is generous enough that no chunk-sized text is ever cut.
         let chunk = "word ".repeat(crate::embed::DEFAULT_MAX_TOKENS);
         assert_eq!(cap_chars(&chunk, MAX_INPUT_CHARS), chunk.as_str());
+    }
+
+    /// An hf-hub client on `cache`, whose every network call goes to
+    /// `endpoint`: a listener the test controls, so a request is seen rather
+    /// than answered by the real Hub.
+    fn test_client(cache: &Path, endpoint: &str) -> HFClient {
+        HFClient::builder()
+            .cache_dir(cache.to_path_buf())
+            .endpoint(endpoint)
+            .build()
+            .unwrap()
+    }
+
+    /// The cache an earlier release left behind: the model's files under
+    /// `snapshots/<commit>/` and `refs/main` naming that commit, which is
+    /// what a download of the default branch writes.
+    fn cache_from_main(cache: &Path, model: &LocalModel, commit: &str) {
+        let dir = cache.join(model.cache_dir_name());
+        let snap = dir.join("snapshots").join(commit);
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in model.files {
+            std::fs::write(snap.join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs").join("main"), commit).unwrap();
+    }
+
+    /// An install that downloaded from main when main was the pinned commit
+    /// keeps working with no network call at all: the air-gapped and
+    /// prefetched-image paths depend on it.
+    #[tokio::test]
+    async fn a_cached_snapshot_at_the_pinned_commit_resolves_without_the_network() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        cache_from_main(tmp.path(), granite, granite.revision);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let files = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("a warm cache must not wait on the network")
+        .unwrap();
+
+        for file in granite.files {
+            let path = files.get(file).unwrap();
+            assert!(
+                path.to_string_lossy().contains(granite.revision),
+                "{file} resolved to {}",
+                path.display()
+            );
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the warm cache dialled out: {other:?}"),
+        }
+    }
+
+    /// A cache at another commit is not the pinned model, even though
+    /// `refs/main` names it.
+    #[tokio::test]
+    async fn a_snapshot_at_another_commit_is_not_the_pinned_model() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let other = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, other);
+        let client = test_client(tmp.path(), "http://127.0.0.1:9");
+
+        assert!(
+            cached_path(&client, granite, "model.safetensors")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Nothing of the other commit was touched by the lookup.
+        assert!(
+            tmp.path()
+                .join(granite.cache_dir_name())
+                .join("snapshots")
+                .join(other)
+                .join("model.safetensors")
+                .is_file()
+        );
+    }
+
+    /// A download asks the Hub for the pinned commit, not for main.
+    #[tokio::test]
+    async fn the_download_asks_for_the_pinned_commit() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let first = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = tx.send(first);
+        });
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            ensure_files_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "the stub has no files to give");
+
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let wanted = format!("/{}/resolve/{}/config.json", granite.repo, granite.revision);
+        assert!(
+            request_line.contains(&wanted),
+            "expected a request for {wanted}, got {request_line}"
+        );
     }
 }

@@ -20,6 +20,7 @@ filter = '''
         | (binary(rest) & test(/^(rest_api|rest_evolve|rest_files|rest_setup_api|ui_serving)::/))
         | (binary(auth) & test(/^(oauth|oidc)::/))))
     | (package(crystalline) & binary(daemon) & test(/^service::/))
+    | (package(crystalline-index) & test(/^embed::local::tests::/))
 '''
 test-group = 'forge-wire'
 

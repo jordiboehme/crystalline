@@ -34,6 +34,13 @@ pub struct LocalModel {
     pub id: &'static str,
     /// The Hugging Face repository the weights come from.
     pub repo: &'static str,
+    /// The Hugging Face commit the files are fetched at. A full 40-character
+    /// hash, never a branch: hf-hub answers a hash from
+    /// `snapshots/<hash>/` in the cache without any network call, and a
+    /// download gets exactly the files this build was tested with. Moving it
+    /// is a deliberate change, and an install whose cache holds another
+    /// commit downloads once.
+    pub revision: &'static str,
     /// The embedding width.
     pub dims: usize,
     /// Which encoder the weights load into.
@@ -53,6 +60,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
     LocalModel {
         id: "granite-embedding-97m-multilingual-r2",
         repo: "ibm-granite/granite-embedding-97m-multilingual-r2",
+        revision: "835ad14087e140460703cf0fae09f97d469d65c2",
         dims: 384,
         architecture: Architecture::ModernBert,
         query_prefix: "",
@@ -68,6 +76,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
     LocalModel {
         id: "bge-small-en-v1.5",
         repo: "BAAI/bge-small-en-v1.5",
+        revision: "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
         dims: 384,
         architecture: Architecture::Bert,
         query_prefix: "Represent this sentence for searching relevant passages: ",
@@ -542,5 +551,34 @@ mod tests {
             "the bigger model measures bigger: {cached:?}"
         );
         assert_eq!(cached_model_dirs(&root.join("missing")), Vec::new());
+    }
+
+    /// Every model is fetched at a fixed commit, never at a branch: a full
+    /// 40-character hash is what hf-hub resolves from the cache without a
+    /// network call, and what makes a download the files this build was
+    /// tested with.
+    #[test]
+    fn every_model_is_pinned_to_a_full_commit_hash() {
+        for m in LOCAL_MODELS {
+            assert_eq!(m.revision.len(), 40, "{}", m.id);
+            assert!(
+                m.revision
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{}: {}",
+                m.id,
+                m.revision
+            );
+        }
+        assert_eq!(
+            lookup_local_model("granite-embedding-97m-multilingual-r2")
+                .unwrap()
+                .revision,
+            "835ad14087e140460703cf0fae09f97d469d65c2"
+        );
+        assert_eq!(
+            lookup_local_model("bge-small-en-v1.5").unwrap().revision,
+            "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+        );
     }
 }

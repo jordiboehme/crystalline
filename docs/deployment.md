@@ -200,7 +200,7 @@ flowchart LR
 
 ## Air-gapped or egress-restricted
 
-When a host has no outbound network access, or the first-start model download delay is unwanted for any other reason, use the `with-model` image, or set `CRYSTALLINE_MODELS_DIR` on any install to point at a model directory fetched ahead of time, so nothing in the runtime path ever needs the network. This is orthogonal to read access: combine it with either the read-write [team server](#team-server) shape or the read-only git-sync shape, since air-gapping is about the model rather than about who can write. See [Run in a container](#run-in-a-container) for the image variants and `CRYSTALLINE_MODELS_DIR`.
+When a host has no outbound network access, or the first-start model download delay is unwanted for any other reason, use the `with-model` image, or set `CRYSTALLINE_MODELS_DIR` on any install to point at a model directory fetched ahead of time, so nothing in the runtime path ever needs the network. This is orthogonal to read access: combine it with either the read-write [team server](#team-server) shape or the read-only git-sync shape, since air-gapping is about the model rather than about who can write. See [Run in a container](#run-in-a-container) for the image variants and `CRYSTALLINE_MODELS_DIR`. The model is fetched at a fixed commit (for the default model `835ad14087e140460703cf0fae09f97d469d65c2`), so a pre-fetched directory has to hold that snapshot: `crystalline model download` of the same release writes exactly that, and a copy fetched by another tool at a different commit is downloaded again once.
 
 ```mermaid
 flowchart LR
