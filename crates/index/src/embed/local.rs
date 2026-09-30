@@ -33,7 +33,7 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use super::models::{
     Architecture, LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model,
-    older_snapshot_warning,
+    note_loaded_snapshot, older_snapshot_warning,
 };
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
@@ -238,6 +238,14 @@ impl ModelFiles {
     fn weights(&self) -> Result<&PathBuf> {
         self.required("model.safetensors")
     }
+
+    /// The `snapshots/<commit>/` directory the files were resolved in.
+    fn snapshot_dir(&self) -> Result<PathBuf> {
+        self.weights()?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| IndexError::Embedding("the model weights have no directory".into()))
+    }
 }
 
 /// Adapts hf-hub's [`ProgressHandler`] events into a single carriage-return
@@ -372,7 +380,7 @@ async fn load_files_with(
     client: &HFClient,
     cache_dir: &Path,
     model: &'static LocalModel,
-) -> Result<ModelFiles> {
+) -> Result<(ModelFiles, SnapshotChoice)> {
     // A blocking thread: comparing a copied pre-seed with the pinned commit
     // hashes both weight files.
     let dir = cache_dir.to_path_buf();
@@ -388,9 +396,11 @@ async fn load_files_with(
                 "{warning}"
             );
         }
-        return Ok(ModelFiles::from_snapshot(cache_dir, model, commit));
+        let files = ModelFiles::from_snapshot(cache_dir, model, commit);
+        return Ok((files, choice));
     }
-    ensure_files_with(client, cache_dir, model, true).await
+    let files = ensure_files_with(client, cache_dir, model, true).await?;
+    Ok((files, choice))
 }
 
 /// [`ensure_files`] on a given client, so a test can point the network side
@@ -502,9 +512,78 @@ async fn is_cached(client: &HFClient, model: &LocalModel) -> Result<bool> {
 /// here; only the weight load goes to a blocking thread.
 async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
     let client = cache_client(cache_dir)?;
-    let files = load_files_with(&client, cache_dir, model).await?;
+    load_encoder_with(&client, cache_dir, model).await
+}
+
+/// [`load_encoder`] on a given client, so a test can point the network side
+/// at a listener it controls.
+///
+/// An older snapshot that fails to build is never wiped: it may be the only
+/// copy an air-gapped host has, or a pre-seed the user owns. It is logged and
+/// left as it is. When the pinned commit is simply not cached yet, the start
+/// falls through to the pinned path (download, then the self-heal below);
+/// when the pinned commit is cached with other weights, the start fails
+/// rather than load weights the index was not embedded with. The self-heal
+/// wipe is the pinned path's alone, as it was before older snapshots were
+/// used at all.
+async fn load_encoder_with(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+) -> Result<Encoder> {
+    let (files, choice) = load_files_with(client, cache_dir, model).await?;
+    if let SnapshotChoice::Older {
+        commit,
+        pinned_differs,
+    } = choice
+    {
+        let snapshot = files.snapshot_dir()?;
+        match build_on_blocking(files, model).await {
+            Ok(encoder) => {
+                note_loaded_snapshot(&snapshot);
+                return Ok(encoder);
+            }
+            Err(e) if pinned_differs => {
+                return Err(IndexError::Embedding(format!(
+                    "cached commit {commit} of embedding model {} failed to load ({e}), and \
+                     the pinned commit {} is not used in its place because its weights or \
+                     tokenizer differ from the ones the index was embedded with; the cache \
+                     was left as it is",
+                    model.id, model.revision
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = model.id,
+                    commit = %commit,
+                    pinned = model.revision,
+                    "cached commit {commit} of the embedding model failed to load ({e}); \
+                     leaving it in place and using the pinned commit {} instead",
+                    model.revision
+                );
+                let files = ensure_files_with(client, cache_dir, model, true).await?;
+                return load_pinned(client, cache_dir, model, files).await;
+            }
+        }
+    }
+    load_pinned(client, cache_dir, model, files).await
+}
+
+/// Build the pinned commit's files, self-healing once from a corrupt cache:
+/// the model directory is wiped and fetched again before the failure is
+/// surfaced.
+async fn load_pinned(
+    client: &HFClient,
+    cache_dir: &Path,
+    model: &'static LocalModel,
+    files: ModelFiles,
+) -> Result<Encoder> {
+    let snapshot = files.snapshot_dir()?;
     match build_on_blocking(files, model).await {
-        Ok(encoder) => Ok(encoder),
+        Ok(encoder) => {
+            note_loaded_snapshot(&snapshot);
+            Ok(encoder)
+        }
         Err(first) => {
             // A truncated or corrupt cache: wipe the model directory and fetch
             // once more before surfacing the failure.
@@ -512,8 +591,11 @@ async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<En
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
             wipe_model_dir(cache_dir, model);
-            let files = ensure_files(cache_dir, model, true).await?;
-            build_on_blocking(files, model).await
+            let files = ensure_files_with(client, cache_dir, model, true).await?;
+            let snapshot = files.snapshot_dir()?;
+            let encoder = build_on_blocking(files, model).await?;
+            note_loaded_snapshot(&snapshot);
+            Ok(encoder)
         }
     }
 }
@@ -551,8 +633,10 @@ fn build_encoder(files: &ModelFiles, model: &LocalModel) -> Result<Encoder> {
         .map_err(|e| IndexError::Embedding(format!("configuring truncation: {e}")))?;
 
     let device = Device::Cpu;
-    // Safety: the file is a trusted, freshly verified download; mmap is the
-    // standard candle load path. BF16 weights (granite) become F32 here.
+    // Safety: the file is a snapshot from the model cache, either the pinned
+    // download or an older snapshot of the same repository a person placed
+    // there; mmap is the standard candle load path, and a file changed under
+    // the mapping is a corrupt cache, which the loader reports. BF16 weights (granite) become F32 here.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(
             std::slice::from_ref(files.weights()?),
@@ -725,7 +809,7 @@ mod tests {
 
     use super::{
         MAX_INPUT_CHARS, cached_path, cap_chars, check_model_type, cls_pool, ensure_files_with,
-        load_files_with, pad_id,
+        load_encoder_with, load_files_with, pad_id,
     };
     use crate::embed::models::{
         LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model, older_snapshot_warning,
@@ -1060,7 +1144,8 @@ mod tests {
         )
         .await
         .expect("an older cached snapshot must not wait on the network")
-        .unwrap();
+        .unwrap()
+        .0;
         for file in granite.files {
             let path = files.get(file).unwrap();
             assert!(
@@ -1146,7 +1231,7 @@ mod tests {
                 others: vec![older.to_string()]
             }
         );
-        let files = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        let (files, _) = load_files_with(&client, tmp.path(), granite).await.unwrap();
         for file in granite.files {
             assert!(
                 files
@@ -1190,7 +1275,7 @@ mod tests {
         );
         let warning = older_snapshot_warning(granite, &choice).unwrap();
         assert!(warning.contains("re-embedded"), "{warning}");
-        let files = load_files_with(&client, tmp.path(), granite).await.unwrap();
+        let (files, _) = load_files_with(&client, tmp.path(), granite).await.unwrap();
         assert!(
             files
                 .get("model.safetensors")
@@ -1240,5 +1325,78 @@ mod tests {
                 pinned_differs: false
             }
         );
+    }
+
+    /// An older snapshot that fails to build (here: files that are not a
+    /// model at all) is left exactly as it is: the start falls through to the
+    /// pinned download, which the stub refuses, and nothing in the cache is
+    /// removed. An air-gapped pre-seed survives a bad start.
+    #[tokio::test]
+    async fn a_failed_build_of_an_older_snapshot_removes_nothing() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, rx) = stub_hub();
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err());
+        let request_line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request_line.contains(granite.revision), "{request_line}");
+        let repo = tmp.path().join(granite.cache_dir_name());
+        for file in granite.files {
+            assert!(
+                repo.join("snapshots").join(older).join(file).is_file(),
+                "{file} of the older snapshot survives"
+            );
+        }
+        assert!(repo.join("refs").join("main").is_file());
+    }
+
+    /// With the pinned commit cached under other weights, a failed build of
+    /// the older snapshot fails the start: loading the pinned weights would
+    /// leave the index embedded with others. Nothing is removed and nothing
+    /// dials out.
+    #[tokio::test]
+    async fn a_failed_older_build_beside_other_pinned_weights_fails_and_keeps_both() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        cache_at_pin(tmp.path(), granite);
+        let snaps = tmp.path().join(granite.cache_dir_name()).join("snapshots");
+        std::fs::write(
+            snaps.join(granite.revision).join("model.safetensors"),
+            b"other weights",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = test_client(
+            tmp.path(),
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+
+        let err = load_encoder_with(&client, tmp.path(), granite)
+            .await
+            .err()
+            .expect("the start fails")
+            .to_string();
+        assert!(err.contains(older), "{err}");
+        assert!(err.contains("not used in its place"), "{err}");
+        for file in granite.files {
+            assert!(snaps.join(older).join(file).is_file(), "{file}");
+            assert!(snaps.join(granite.revision).join(file).is_file(), "{file}");
+        }
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the failed start dialled out: {other:?}"),
+        }
     }
 }

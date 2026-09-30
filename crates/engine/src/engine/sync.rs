@@ -1,4 +1,5 @@
 use super::*;
+use crystalline_index::SnapshotChoice;
 
 impl Engine {
     // --- sync / reindex (ctl + CLI) ------------------------------------------
@@ -572,7 +573,9 @@ impl Engine {
     ///
     /// - Loaded the pinned commit while older snapshots of the same repo are
     ///   still cached: those go now ([`crystalline_index::retire_older_snapshots`]),
-    ///   on a writable instance only, for the same reason the prune is.
+    ///   on a writable instance only, for the same reason the prune is, and
+    ///   only in the default model cache: a `CRYSTALLINE_MODELS_DIR` is the
+    ///   user's folder and is never cleaned, which is logged instead.
     /// - Started on an older snapshot because the pinned commit is not cached
     ///   yet: the pinned commit is fetched in the background, never blocking
     ///   the start or a search. This process keeps the snapshot it loaded;
@@ -589,10 +592,16 @@ impl Engine {
         let choice =
             tokio::task::spawn_blocking(move || crystalline_index::choose_snapshot(&dir, model))
                 .await;
-        match choice {
-            Ok(crystalline_index::SnapshotChoice::Pinned { others })
-                if !others.is_empty() && !self.read_only =>
-            {
+        let choice = match choice {
+            Ok(choice) => choice,
+            Err(err) => {
+                tracing::warn!("the model snapshot check failed: {err}");
+                return;
+            }
+        };
+        let user_dir = crystalline_core::config::models_dir_is_user_provided();
+        match settle_action(&choice, self.read_only, user_dir) {
+            SettleAction::Retire => {
                 let retired = tokio::task::spawn_blocking(move || {
                     crystalline_index::retire_older_snapshots(&models_dir, model)
                 })
@@ -601,10 +610,16 @@ impl Engine {
                     tracing::warn!("the model snapshot cleanup task failed: {err}");
                 }
             }
-            Ok(crystalline_index::SnapshotChoice::Older {
-                commit,
-                pinned_differs: false,
-            }) => {
+            SettleAction::LeaveInUserDir => tracing::info!(
+                model = model.id,
+                path = %models_dir.display(),
+                "an older snapshot of the embedding model is still in CRYSTALLINE_MODELS_DIR; \
+                 the pinned commit is in use, and Crystalline never cleans a folder you provide"
+            ),
+            SettleAction::FetchPinned => {
+                let SnapshotChoice::Older { commit, .. } = choice else {
+                    return;
+                };
                 let ecfg = self
                     .config
                     .read()
@@ -633,8 +648,7 @@ impl Engine {
                     }
                 });
             }
-            Ok(_) => {}
-            Err(err) => tracing::warn!("the model snapshot check failed: {err}"),
+            SettleAction::Nothing => {}
         }
     }
 
@@ -989,5 +1003,99 @@ impl Engine {
     /// already is.
     pub(crate) fn nudge_embed(&self) {
         let _ = self.request_embed();
+    }
+}
+
+/// What [`Engine::settle_model_snapshots`] does after a start, decided from
+/// the snapshot choice alone so the gates are testable without a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleAction {
+    /// Remove the older snapshots: the pinned one is loaded, the instance is
+    /// writable and the folder is Crystalline's own cache.
+    Retire,
+    /// Older snapshots stay, because the folder is the user's; say so.
+    LeaveInUserDir,
+    /// Fetch the pinned commit in the background.
+    FetchPinned,
+    /// Nothing to do.
+    Nothing,
+}
+
+fn settle_action(choice: &SnapshotChoice, read_only: bool, user_dir: bool) -> SettleAction {
+    match choice {
+        SnapshotChoice::Pinned { others } if others.is_empty() || read_only => {
+            SettleAction::Nothing
+        }
+        SnapshotChoice::Pinned { .. } if user_dir => SettleAction::LeaveInUserDir,
+        SnapshotChoice::Pinned { .. } => SettleAction::Retire,
+        SnapshotChoice::Older {
+            pinned_differs: false,
+            ..
+        } => SettleAction::FetchPinned,
+        _ => SettleAction::Nothing,
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::{SettleAction, SnapshotChoice, settle_action};
+
+    fn pinned_with_older() -> SnapshotChoice {
+        SnapshotChoice::Pinned {
+            others: vec!["1111111111111111111111111111111111111111".into()],
+        }
+    }
+
+    /// Older snapshots are removed only from Crystalline's own cache on a
+    /// writable instance: a `CRYSTALLINE_MODELS_DIR` is never cleaned,
+    /// writable or not, and a read-only instance never cleans at all.
+    #[test]
+    fn older_snapshots_are_retired_only_in_the_default_cache_of_a_writable_instance() {
+        assert_eq!(
+            settle_action(&pinned_with_older(), false, false),
+            SettleAction::Retire
+        );
+        assert_eq!(
+            settle_action(&pinned_with_older(), false, true),
+            SettleAction::LeaveInUserDir
+        );
+        assert_eq!(
+            settle_action(&pinned_with_older(), true, true),
+            SettleAction::Nothing
+        );
+        assert_eq!(
+            settle_action(&pinned_with_older(), true, false),
+            SettleAction::Nothing
+        );
+        assert_eq!(
+            settle_action(&SnapshotChoice::Pinned { others: vec![] }, false, false),
+            SettleAction::Nothing
+        );
+    }
+
+    /// A start on an older snapshot fetches the pinned commit, whatever the
+    /// folder or the mode; a start held back by other weights, or with no
+    /// snapshot at all, does nothing.
+    #[test]
+    fn only_a_start_waiting_for_the_pinned_commit_fetches_it() {
+        let waiting = SnapshotChoice::Older {
+            commit: "1111111111111111111111111111111111111111".into(),
+            pinned_differs: false,
+        };
+        for (read_only, user_dir) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                settle_action(&waiting, read_only, user_dir),
+                SettleAction::FetchPinned
+            );
+        }
+        let differs = SnapshotChoice::Older {
+            commit: "1111111111111111111111111111111111111111".into(),
+            pinned_differs: true,
+        };
+        assert_eq!(settle_action(&differs, false, false), SettleAction::Nothing);
+        assert_eq!(
+            settle_action(&SnapshotChoice::Missing, false, false),
+            SettleAction::Nothing
+        );
     }
 }

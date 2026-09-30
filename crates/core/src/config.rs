@@ -1493,6 +1493,14 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
     Ok(cache_dir()?.join("models"))
 }
 
+/// True when `CRYSTALLINE_MODELS_DIR` names the model cache, so the folder is
+/// the user's rather than the default one Crystalline manages under its cache
+/// directory. Nothing is ever removed from the model's own snapshots in a
+/// folder the user provides.
+pub fn models_dir_is_user_provided() -> bool {
+    std::env::var(MODELS_DIR_ENV).is_ok_and(|dir| !dir.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

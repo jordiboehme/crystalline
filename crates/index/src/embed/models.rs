@@ -212,7 +212,7 @@ pub fn choose_snapshot(models_dir: &Path, model: &LocalModel) -> SnapshotChoice 
             let old = snapshots.join(&commit);
             if CONTENT_FILES
                 .iter()
-                .all(|f| same_content(&pinned.join(f), &old.join(f)))
+                .all(|f| same_content(&repo_dir, &pinned.join(f), &old.join(f)))
             {
                 SnapshotChoice::Pinned { others }
             } else {
@@ -282,25 +282,96 @@ fn older_snapshot(repo_dir: &Path, others: &[String], model: &LocalModel) -> Opt
 /// compared by the sha256 of both files' content instead. A file that cannot
 /// be read counts as different: staying on the older snapshot is the safe
 /// side.
-fn same_content(a: &Path, b: &Path) -> bool {
-    if let (Some(x), Some(y)) = (blob_name(a), blob_name(b)) {
+fn same_content(repo_dir: &Path, a: &Path, b: &Path) -> bool {
+    if let (Some(x), Some(y)) = (blob_name(repo_dir, a), blob_name(repo_dir, b)) {
         return x == y;
     }
-    match (sha256_file(a), sha256_file(b)) {
+    match (content_digest(a), content_digest(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
     }
 }
 
-/// The blob a snapshot symlink points at, by file name, or `None` for a file
-/// that is not a symlink.
-fn blob_name(path: &Path) -> Option<String> {
+/// The hf-hub blob a snapshot symlink points at, by file name. `None` for a
+/// file that is not a symlink, and for a link whose target is anywhere but
+/// this repository's own `blobs/` directory under a hex etag name: a link a
+/// person made to a file elsewhere says nothing about its content by name
+/// (two such links may both be called `model.safetensors`), so it is
+/// compared by content instead.
+fn blob_name(repo_dir: &Path, path: &Path) -> Option<String> {
     let meta = path.symlink_metadata().ok()?;
     if !meta.file_type().is_symlink() {
         return None;
     }
-    let target = std::fs::read_link(path).ok()?;
-    target.file_name().map(|n| n.to_string_lossy().into_owned())
+    let target = std::fs::canonicalize(path).ok()?;
+    let blobs = std::fs::canonicalize(repo_dir.join("blobs")).ok()?;
+    if target.parent() != Some(blobs.as_path()) {
+        return None;
+    }
+    let name = target.file_name()?.to_string_lossy().into_owned();
+    let hex_etag = matches!(name.len(), 40 | 64) && name.chars().all(|c| c.is_ascii_hexdigit());
+    hex_etag.then_some(name)
+}
+
+/// [`sha256_file`], remembered for the life of the process by path, size and
+/// modification time: a start compares the same two copied files once to
+/// load and once more to settle, and hashing 220 MB twice is waste.
+fn content_digest(path: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    static MEMO: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (
+        std::fs::canonicalize(path).ok()?,
+        meta.len(),
+        meta.modified().ok(),
+    );
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(d) = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(d.clone());
+    }
+    let digest = sha256_file(path)?;
+    memo.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, digest.clone());
+    Some(digest)
+}
+
+/// The snapshot directories this process has loaded a model from, by
+/// canonical path. [`retire_older_snapshots`] reads it: it acts only once the
+/// pinned snapshot is among them, and never removes one that is.
+fn loaded_snapshots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static LOADED: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Record that this process loaded a model from `snapshot_dir`
+/// (`snapshots/<commit>/`). The loader calls it after a successful build.
+pub fn note_loaded_snapshot(snapshot_dir: &Path) {
+    let dir = canonical(snapshot_dir);
+    let mut loaded = loaded_snapshots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !loaded.contains(&dir) {
+        loaded.push(dir);
+    }
+}
+
+fn is_loaded_snapshot(snapshot_dir: &Path) -> bool {
+    let dir = canonical(snapshot_dir);
+    loaded_snapshots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&dir)
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
@@ -323,31 +394,44 @@ fn sha256_file(path: &Path) -> Option<String> {
 /// has loaded the pinned one, returning the commits that went.
 ///
 /// It acts only when [`choose_snapshot`] answers
-/// [`SnapshotChoice::Pinned`]: a start that stayed on an older snapshot
-/// (not downloaded yet, or different weights) never loses it. Beside each
+/// [`SnapshotChoice::Pinned`] and this process has loaded the pinned
+/// snapshot ([`note_loaded_snapshot`]): a start that stayed on an older
+/// snapshot (not downloaded yet, or different weights) never loses it, and
+/// a snapshot this process loaded is never removed. The caller decides
+/// whether the folder is Crystalline's to clean at all: the daemon calls it
+/// only for the default model cache, never for a `CRYSTALLINE_MODELS_DIR`. Beside each
 /// removed snapshot directory, a `refs/` file naming it and every blob only
 /// its links pointed at go too; a blob a remaining snapshot still links to
 /// stays. Only this model's repository directory is ever touched. A removal
-/// that fails (a read-only pre-seeded `CRYSTALLINE_MODELS_DIR`) is logged
-/// and skipped: an untidy cache costs disk and nothing else.
+/// that fails is logged and skipped: an untidy cache costs disk and nothing
+/// else.
 pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<String> {
     let SnapshotChoice::Pinned { others } = choose_snapshot(models_dir, model) else {
         return Vec::new();
     };
     let repo_dir = models_dir.join(model.cache_dir_name());
     let snapshots = repo_dir.join("snapshots");
+    // Only once this process runs on the pinned commit: a daemon still on an
+    // older snapshot (a download finished in between) keeps it.
+    if !is_loaded_snapshot(&snapshots.join(model.revision)) {
+        return Vec::new();
+    }
     let blobs_of = |commit: &str| -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(snapshots.join(commit)) else {
             return Vec::new();
         };
         entries
             .flatten()
-            .filter_map(|e| blob_name(&e.path()))
+            .filter_map(|e| blob_name(&repo_dir, &e.path()))
             .collect()
     };
     let mut removed = Vec::new();
     let mut freed_blobs: Vec<String> = Vec::new();
     for commit in &others {
+        // Never a snapshot this process has loaded from.
+        if is_loaded_snapshot(&snapshots.join(commit)) {
+            continue;
+        }
         let blobs = blobs_of(commit);
         let dir = snapshots.join(commit);
         match std::fs::remove_dir_all(&dir) {
@@ -870,6 +954,12 @@ mod tests {
     }
 
     const OLD_A: &str = "1111111111111111111111111111111111111111";
+
+    /// A 64-hex etag for a test blob, the shape hf-hub names an LFS blob by.
+    fn etag(tag: &str, file: &str) -> String {
+        use sha2::{Digest, Sha256};
+        crate::hex_lower(&Sha256::digest(format!("{tag}-{file}").as_bytes()))
+    }
     const OLD_B: &str = "2222222222222222222222222222222222222222";
 
     /// A snapshot the way hf-hub writes one on unix: each file a relative
@@ -883,7 +973,7 @@ mod tests {
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::create_dir_all(&snap).unwrap();
         for file in model.files {
-            let etag = format!("{tag}-{file}");
+            let etag = etag(tag, file);
             std::fs::write(blobs.join(&etag), tag.as_bytes()).unwrap();
             std::os::unix::fs::symlink(format!("../../blobs/{etag}"), snap.join(file)).unwrap();
         }
@@ -923,6 +1013,9 @@ mod tests {
 
     /// `refs/main` decides between two older snapshots; without it the
     /// newest by modification time does.
+    /// Unix only: setting a directory's modification time goes through a
+    /// handle `File::open` cannot give on Windows.
+    #[cfg(unix)]
     #[test]
     fn refs_main_picks_the_older_snapshot_and_else_the_newest_does() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1052,6 +1145,21 @@ mod tests {
         let bge = lookup_local_model("bge-small-en-v1.5").unwrap();
         copied_snapshot(root, bge, OLD_A, b"bge");
 
+        // Nothing goes until this process has loaded the pinned snapshot.
+        assert!(retire_older_snapshots(root, g).is_empty());
+        assert!(
+            root.join(g.cache_dir_name())
+                .join("snapshots")
+                .join(OLD_A)
+                .is_dir()
+        );
+        note_loaded_snapshot(
+            &root
+                .join(g.cache_dir_name())
+                .join("snapshots")
+                .join(g.revision),
+        );
+
         let removed = retire_older_snapshots(root, g);
         assert_eq!(removed, vec![OLD_A.to_string(), OLD_B.to_string()]);
         let repo = root.join(g.cache_dir_name());
@@ -1070,12 +1178,12 @@ mod tests {
             // the blobs it still linked to are its to take along.
             if *file != "model.safetensors" {
                 assert!(
-                    !repo.join("blobs").join(format!("stray-{file}")).exists(),
+                    !repo.join("blobs").join(etag("stray", file)).exists(),
                     "a blob only a removed snapshot used goes: {file}"
                 );
             }
             assert!(
-                repo.join("blobs").join(format!("same-{file}")).is_file(),
+                repo.join("blobs").join(etag("same", file)).is_file(),
                 "a blob the pinned snapshot shares stays: {file}"
             );
         }
@@ -1111,6 +1219,7 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
 
+        note_loaded_snapshot(&snaps.join(g.revision));
         let removed = retire_older_snapshots(root, g);
         for dir in [snaps.clone(), snaps.join(OLD_A)] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1118,5 +1227,51 @@ mod tests {
         assert!(removed.is_empty(), "{removed:?}");
         assert!(snaps.join(OLD_A).join("model.safetensors").is_file());
         assert!(snaps.join(g.revision).is_dir());
+    }
+
+    /// Links a person made to files outside the repository's `blobs/` are
+    /// compared by content, not by the name they point at: both targets are
+    /// called `model.safetensors`, and the weights still differ.
+    #[cfg(unix)]
+    #[test]
+    fn links_outside_the_blob_store_are_compared_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        for (commit, content) in [(OLD_A, "old"), (g.revision, "new")] {
+            let data = root.join("data").join(content);
+            std::fs::create_dir_all(&data).unwrap();
+            let snap = root.join(g.cache_dir_name()).join("snapshots").join(commit);
+            std::fs::create_dir_all(&snap).unwrap();
+            for file in g.files {
+                std::fs::write(data.join(file), content).unwrap();
+                std::os::unix::fs::symlink(data.join(file), snap.join(file)).unwrap();
+            }
+        }
+        std::fs::create_dir_all(root.join(g.cache_dir_name()).join("blobs")).unwrap();
+        assert_eq!(
+            choose_snapshot(root, g),
+            SnapshotChoice::Older {
+                commit: OLD_A.to_string(),
+                pinned_differs: true
+            }
+        );
+    }
+
+    /// A snapshot this process loaded from is never retired, even when the
+    /// pinned one has been loaded too (a download finished while an older
+    /// snapshot was in use).
+    #[test]
+    fn a_snapshot_this_process_loaded_is_never_retired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        copied_snapshot(root, g, g.revision, b"same");
+        copied_snapshot(root, g, OLD_A, b"same");
+        let snaps = root.join(g.cache_dir_name()).join("snapshots");
+        note_loaded_snapshot(&snaps.join(OLD_A));
+        note_loaded_snapshot(&snaps.join(g.revision));
+        assert!(retire_older_snapshots(root, g).is_empty());
+        assert!(snaps.join(OLD_A).join("model.safetensors").is_file());
     }
 }

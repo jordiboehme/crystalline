@@ -2910,7 +2910,14 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         .as_ref()
         .is_none_or(|e| e.provider.trim() == "local");
     let model_snapshot = match (entry.filter(|_| local_provider), config::models_dir()) {
-        (Some(model), Ok(dir)) => model_snapshot_summary(&dir, model),
+        // A blocking thread: a copied snapshot beside the pinned one is
+        // compared by hashing both weight files.
+        (Some(model), Ok(dir)) => {
+            tokio::task::spawn_blocking(move || model_snapshot_summary(&dir, model))
+                .await
+                .ok()
+                .flatten()
+        }
         _ => None,
     };
     Ok(serde_json::json!({
@@ -3538,7 +3545,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             } else {
                 let _ = writeln!(
                     out,
-                    "  warning: the model runs on cached commit {commit}, not the pinned commit {pinned}; the pinned one is used after the next start once it is downloaded (run `crystalline model download` to update)"
+                    "  warning: the model runs on cached commit {commit}, not the pinned commit {pinned}; once it is downloaded, the next start uses it if its weights and tokenizer are the same (run `crystalline model download` to update)"
                 );
             }
         }
@@ -4335,7 +4342,7 @@ mod tests {
         assert!(out.contains(older), "{out}");
         assert!(out.contains(granite.revision), "{out}");
         assert!(
-            out.contains("used after the next start once it is downloaded"),
+            out.contains("once it is downloaded, the next start uses it"),
             "{out}"
         );
         assert!(out.contains("crystalline model download"), "{out}");
