@@ -38,6 +38,7 @@ import {
   Stethoscope,
   Sun,
   UnfoldHorizontal,
+  UserRoundX,
 } from "lucide-react";
 import {
   useCallback,
@@ -116,7 +117,7 @@ import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
 import { ownedPhrase, shareBadgeCount } from "./changes";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
-import { BUTTON, Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
+import { Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
 
 /**
  * What the command palette's shortcut is called on this keyboard.
@@ -593,6 +594,9 @@ export function Layout() {
   const [engramsOrder, setEngramsOrderState] = useState(storedEngramsOrder);
   const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
+  // The Help button, when it is what opened the shortcut map: a menu item has
+  // unmounted by the time the dialog closes, so focus would be lost to <body>.
+  const [helpReturn, setHelpReturn] = useState<HTMLElement | null>(null);
   // Registering a domain is the frame's own act rather than any screen's: it
   // is what the sidebar lists, and the sidebar is on every screen.
   const [creatingDomain, setCreatingDomain] = useState(false);
@@ -708,6 +712,7 @@ export function Layout() {
         id: "help",
         title: "Keyboard shortcuts",
         run: () => {
+          setHelpReturn(null);
           setHelpOpen(true);
         },
       },
@@ -793,6 +798,7 @@ export function Layout() {
         return;
       }
       if (event.key === "?") {
+        setHelpReturn(null);
         setHelpOpen(true);
         return;
       }
@@ -833,7 +839,8 @@ export function Layout() {
                   setNavOpen((open) => !open);
                 }}
                 onShare={openShare}
-                onHelp={() => {
+                onHelp={(opener) => {
+                  setHelpReturn(opener);
                   setHelpOpen(true);
                 }}
               />
@@ -890,6 +897,7 @@ export function Layout() {
         */}
               <HelpOverlay
                 open={helpOpen}
+                returnFocusTo={helpReturn}
                 onClose={() => {
                   setHelpOpen(false);
                 }}
@@ -968,7 +976,7 @@ function TopBar({
   /** Share the named domain, or open the picker when there is none. */
   onShare: (domain: string | null) => void;
   /** Open the keyboard shortcut map, the same one `?` opens. */
-  onHelp: () => void;
+  onHelp: (opener: HTMLElement | null) => void;
 }) {
   const { capabilities } = useAuth();
   const { fullWidth } = useFullWidth();
@@ -984,7 +992,7 @@ function TopBar({
         controls keep aligning with the content's edge at either width.
       */}
       <div
-        className={`mx-auto flex h-14 w-full items-center gap-1.5 px-3 sm:gap-3 sm:px-4 ${
+        className={`mx-auto flex h-14 w-full items-center gap-1 px-2 md:gap-3 md:px-4 ${
           fullWidth ? "" : "max-w-350"
         }`}
       >
@@ -999,10 +1007,10 @@ function TopBar({
 
         <Link
           to="/"
-          className={`flex items-center gap-1.5 rounded text-lg font-semibold tracking-tight hover:opacity-80 ${FOCUS_RING}`}
+          className={`flex min-h-6 min-w-6 items-center gap-1.5 rounded text-lg font-semibold tracking-tight hover:opacity-80 ${FOCUS_RING}`}
         >
           <ShatterGem />
-          <span className="sr-only sm:not-sr-only">Fluid</span>
+          <span className="sr-only md:not-sr-only">Fluid</span>
         </Link>
 
         <SearchBox />
@@ -1012,12 +1020,12 @@ function TopBar({
         <MaintenanceLink />
 
         {capabilities.readOnly && (
-          <span className="hidden sm:inline">
+          <span className="hidden md:inline">
             <Chip variant="caution">Read only</Chip>
           </span>
         )}
 
-        <span className="hidden sm:inline-flex">
+        <span className="hidden md:inline-flex">
           <WidthToggle />
         </span>
         <TextSizeToggle />
@@ -1046,7 +1054,7 @@ function TopBar({
  * face, because a control a pointer can reach is a control a pointer can press.
  *
  * The name is drawn where there is room for it and spoken either way, the way
- * the link beside it does it: below the small breakpoint the word folds away
+ * the link beside it does it: below the medium breakpoint the word folds away
  * and the glyph carries it, and the `aria-label` makes the two widths one
  * control to anything that reads the page.
  */
@@ -1064,7 +1072,7 @@ function ShareChanges({
     // Always a tooltip, and its label is the reason whenever there is one.
     // Not a nicety: dropping the wrapper once the action came alive would
     // unmount and rebuild the button under a reader who had just focused it,
-    // and below the small breakpoint the tooltip is also the only place the
+    // and below the medium breakpoint the tooltip is also the only place the
     // folded-away word is drawn for a pointer.
     <Tooltip label={share.reason ?? share.waiting ?? "Share changes"}>
       <button
@@ -1079,7 +1087,7 @@ function ShareChanges({
         className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded px-2 text-sm text-slate-600 hover:bg-slate-100 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:text-slate-300 dark:hover:bg-slate-800 dark:aria-disabled:hover:bg-transparent ${FOCUS_RING}`}
       >
         <Share2 aria-hidden="true" size={16} strokeWidth={1.75} />
-        <span className="hidden sm:inline">Share</span>
+        <span className="hidden md:inline">Share</span>
         {/*
           How much is waiting, drawn rather than spoken: the label stays the
           one control name a reader hears at either width, and the tooltip
@@ -1111,7 +1119,7 @@ function ShareChanges({
  * the other side.
  *
  * The name is drawn where there is room for it and spoken either way: below the
- * small breakpoint the top bar is a hamburger, a wordmark and a search field
+ * medium breakpoint the top bar is a hamburger, a wordmark and a search field
  * already, so the word folds away and the glyph carries it, with the
  * `aria-label` making the two widths the same control to anything that reads
  * the page.
@@ -1130,7 +1138,7 @@ function MaintenanceLink() {
       }
     >
       <Stethoscope aria-hidden="true" size={16} strokeWidth={1.75} />
-      <span className="hidden sm:inline">Maintenance</span>
+      <span className="hidden md:inline">Maintenance</span>
     </NavLink>
   );
 }
@@ -1172,11 +1180,11 @@ function SearchBox() {
           onChange={(event) => {
             setQuery(event.target.value);
           }}
-          className="w-full rounded border border-slate-300 bg-white py-1.5 pr-16 pl-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900"
+          className="w-full rounded border border-slate-300 bg-white py-1.5 px-2 text-sm outline-none md:pr-16 md:pl-3 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900"
         />
         <kbd
           aria-hidden="true"
-          className="text-caption pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded border border-slate-300 px-1 py-0.5 text-slate-500 sm:block dark:border-slate-700 dark:text-slate-400"
+          className="text-caption pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded border border-slate-300 px-1 py-0.5 text-slate-500 md:block dark:border-slate-700 dark:text-slate-400"
         >
           {PALETTE_HINT}
         </kbd>
@@ -1199,7 +1207,7 @@ function SearchBox() {
  * the sidebar's pair of names does: a control that announces its own state
  * leaves a reader to work out what pressing it would do.
  *
- * Below the small breakpoint it steps aside (the top bar wraps it in a span
+ * Below the medium breakpoint it steps aside (the top bar wraps it in a span
  * that is hidden there): on a phone the content is always full width, and the
  * top bar needs the room.
  */
@@ -1295,11 +1303,17 @@ function ThemeMenu() {
  * Maintenance, so it does not carry a word. A menu rather than a plain link
  * because the shortcut map had no visible way in at all; this is it.
  */
-function HelpMenu({ onShortcuts }: { onShortcuts: () => void }) {
+function HelpMenu({
+  onShortcuts,
+}: {
+  onShortcuts: (opener: HTMLElement | null) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
   return (
     <DropdownMenu.Root>
       <Tooltip label="Help">
         <DropdownMenu.Trigger
+          ref={triggerRef}
           aria-label="Help"
           className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
         >
@@ -1323,7 +1337,12 @@ function HelpMenu({ onShortcuts }: { onShortcuts: () => void }) {
               />
             </a>
           </DropdownMenu.Item>
-          <DropdownMenu.Item className={ITEM_CLASSES} onSelect={onShortcuts}>
+          <DropdownMenu.Item
+            className={ITEM_CLASSES}
+            onSelect={() => {
+              onShortcuts(triggerRef.current);
+            }}
+          >
             Keyboard shortcuts
             <kbd
               aria-hidden="true"
@@ -1352,6 +1371,10 @@ function HelpMenu({ onShortcuts }: { onShortcuts: () => void }) {
  * The anonymous viewer is named on the trigger itself rather than only inside
  * the menu: browsing without an account changes what the app will let you do,
  * so it is a fact that belongs on screen, not one you have to go looking for.
+ * Below the medium breakpoint there is no room for the words, so the anonymous
+ * state keeps its own glyph (a crossed-out person rather than the signed-in
+ * one) and the tooltip says the name or "Viewing anonymously" on hover and
+ * focus.
  */
 function UserMenu() {
   const { user, capabilities, logout } = useAuth();
@@ -1360,21 +1383,31 @@ function UserMenu() {
   return (
     <DropdownMenu.Root>
       {/*
-        Below the small breakpoint the name gives way to an icon so the top bar
-        fits a phone; the name stays the accessible name either way.
+        Below the medium breakpoint the name gives way to an icon so the top bar
+        fits a phone; the name stays the accessible name either way. The
+        classes are written out rather than layered on BUTTON.ghost: a phone
+        padding of 0 would lose to ghost's own px-2, since same-specificity
+        utilities are decided by stylesheet order, not by the class list.
       */}
-      <DropdownMenu.Trigger
-        aria-label={label}
-        className={`${BUTTON.ghost} max-w-40 truncate border border-slate-300 dark:border-slate-700`}
-      >
-        <CircleUserRound
-          aria-hidden="true"
-          size={16}
-          strokeWidth={1.75}
-          className="sm:hidden"
-        />
-        <span className="hidden sm:inline">{label}</span>
-      </DropdownMenu.Trigger>
+      <Tooltip label={label}>
+        <DropdownMenu.Trigger
+          aria-label={label}
+          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-300 text-sm text-slate-600 hover:bg-slate-100 md:block md:h-auto md:w-auto md:max-w-28 md:truncate lg:max-w-40 md:px-2 md:py-1 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
+        >
+          <span className="flex items-center justify-center md:hidden">
+            {user ? (
+              <CircleUserRound
+                aria-hidden="true"
+                size={16}
+                strokeWidth={1.75}
+              />
+            ) : (
+              <UserRoundX aria-hidden="true" size={16} strokeWidth={1.75} />
+            )}
+          </span>
+          <span className="hidden md:inline">{label}</span>
+        </DropdownMenu.Trigger>
+      </Tooltip>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
           align="end"
