@@ -195,6 +195,25 @@ fn row(
 /// Two engrams synced and embedded; their ids in key order and the
 /// checksums the store recorded for them.
 async fn two(store: &dyn Store, root: &Path) -> (DomainId, EngramId, String, EngramId, String) {
+    let t = two_in(store, root, "notes").await;
+    (t.domain, t.a, t.ca, t.b, t.cb)
+}
+
+/// What [`two_in`] synced: the domain, both engrams in key order with the
+/// checksums the store recorded and the paths they live at.
+struct Two {
+    domain: DomainId,
+    a: EngramId,
+    ca: String,
+    path_a: String,
+    b: EngramId,
+    cb: String,
+    path_b: String,
+}
+
+/// [`two`] in the domain `name`, with the paths kept, so a test can delete
+/// either side of the pair and keep a second domain beside the first.
+async fn two_in(store: &dyn Store, root: &Path, name: &str) -> Two {
     write(
         root,
         "alpha.md",
@@ -218,25 +237,58 @@ async fn two(store: &dyn Store, root: &Path) -> (DomainId, EngramId, String, Eng
         ),
     );
     let provider = FakeProvider::new("fake");
-    sync_and_embed(store, "notes", root, &provider).await;
+    sync_and_embed(store, name, root, &provider).await;
     let domain = store
-        .upsert_domain("notes", Some(&root.to_string_lossy()), DomainKind::File)
+        .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
         .await
         .unwrap();
     let stamps = store.file_stamps(domain).await.unwrap();
-    let alpha = store.find_engram("notes", "alpha").await.unwrap().unwrap();
-    let beta = store.find_engram("notes", "beta").await.unwrap().unwrap();
+    let alpha = store.find_engram(name, "alpha").await.unwrap().unwrap();
+    let beta = store.find_engram(name, "beta").await.unwrap().unwrap();
     let (first, second) = if alpha.id.0 < beta.id.0 {
         (alpha, beta)
     } else {
         (beta, alpha)
     };
-    (
+    Two {
         domain,
-        first.id,
-        stamps[&first.path].sha256.clone(),
-        second.id,
-        stamps[&second.path].sha256.clone(),
+        a: first.id,
+        ca: stamps[&first.path].sha256.clone(),
+        path_a: first.path.clone(),
+        b: second.id,
+        cb: stamps[&second.path].sha256.clone(),
+        path_b: second.path.clone(),
+    }
+}
+
+/// Score `t`'s pair with one line row.
+async fn score(store: &dyn Store, t: &Two) {
+    store
+        .replace_contradictions(
+            t.domain,
+            &pair(t.a, t.b, &t.ca, &t.cb),
+            0.9,
+            "nli-x",
+            "2026-09-27T10:00:00Z",
+            &[row(t.a, t.b, 5, 5, 0.9, 0.9, false)],
+        )
+        .await
+        .unwrap();
+}
+
+/// How many pair rows and line rows `domain` holds for `nli-x`.
+async fn held(store: &dyn Store, domain: DomainId) -> (usize, usize) {
+    (
+        store
+            .contradiction_pairs_scored(domain, "nli-x")
+            .await
+            .unwrap()
+            .len(),
+        store
+            .contradictions(domain, "nli-x", 0.0)
+            .await
+            .unwrap()
+            .len(),
     )
 }
 
@@ -356,99 +408,108 @@ parity!(
     a_replace_reads_back_by_domain_model_and_floor
 );
 
+/// Either side of a pair takes the pair with it: `engram_a` through the
+/// primary key and `engram_b` through its own index. Turso enforces no
+/// foreign keys, so the `OR engram_b` in the delete is the only guard for the
+/// higher id. Another domain's pair survives both deletes.
 async fn deleting_an_engram_takes_its_pairs_and_rows(store: &dyn Store) {
-    let tmp = tempfile::tempdir().unwrap();
-    let (domain, a, ca, b, cb) = two(store, tmp.path()).await;
-    store
-        .replace_contradictions(
-            domain,
-            &pair(a, b, &ca, &cb),
-            0.9,
-            "nli-x",
-            "2026-09-27T10:00:00Z",
-            &[row(a, b, 5, 5, 0.9, 0.9, false)],
-        )
-        .await
-        .unwrap();
-    store.delete_engram(domain, "alpha.md").await.unwrap();
-    assert!(
-        store
-            .contradiction_pairs_scored(domain, "nli-x")
-            .await
-            .unwrap()
-            .is_empty(),
-        "the pair went with the engram"
+    let (lower, higher, other) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
     );
-    assert!(
-        store
-            .contradictions(domain, "nli-x", 0.0)
-            .await
-            .unwrap()
-            .is_empty(),
-        "and so did its rows"
+    let kept = two_in(store, other.path(), "other").await;
+    score(store, &kept).await;
+
+    let t = two_in(store, lower.path(), "notes").await;
+    score(store, &t).await;
+    assert_eq!(held(store, t.domain).await, (1, 1));
+    store.delete_engram(t.domain, &t.path_a).await.unwrap();
+    assert_eq!(
+        held(store, t.domain).await,
+        (0, 0),
+        "the pair and its rows went with the lower id"
     );
+
+    let t = two_in(store, higher.path(), "third").await;
+    score(store, &t).await;
+    assert_eq!(held(store, t.domain).await, (1, 1));
+    store.delete_engram(t.domain, &t.path_b).await.unwrap();
+    assert_eq!(
+        held(store, t.domain).await,
+        (0, 0),
+        "the pair and its rows went with the higher id"
+    );
+
+    assert_eq!(
+        held(store, kept.domain).await,
+        (1, 1),
+        "another domain's pair is untouched"
+    );
+    assert_eq!(store.scored_pair_count("nli-x").await.unwrap(), 1);
 }
 parity!(
     delete_cascades_contradictions_parity,
     deleting_an_engram_takes_its_pairs_and_rows
 );
 
+/// A clear takes its own domain's rows and no other's; a wipe takes all.
 async fn clear_domain_and_wipe_clear_both_tables(store: &dyn Store) {
-    let tmp = tempfile::tempdir().unwrap();
-    let (domain, a, ca, b, cb) = two(store, tmp.path()).await;
-    store
-        .replace_contradictions(
-            domain,
-            &pair(a, b, &ca, &cb),
-            0.9,
-            "nli-x",
-            "2026-09-27T10:00:00Z",
-            &[row(a, b, 5, 5, 0.9, 0.9, false)],
-        )
-        .await
-        .unwrap();
-    store.clear_domain(domain).await.unwrap();
-    assert!(
-        store
-            .contradiction_pairs_scored(domain, "nli-x")
-            .await
-            .unwrap()
-            .is_empty()
+    let (tmp, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let t = two_in(store, tmp.path(), "notes").await;
+    let kept = two_in(store, other.path(), "other").await;
+    score(store, &t).await;
+    score(store, &kept).await;
+    store.clear_domain(t.domain).await.unwrap();
+    assert_eq!(held(store, t.domain).await, (0, 0));
+    assert_eq!(
+        held(store, kept.domain).await,
+        (1, 1),
+        "the other domain keeps its pair and rows"
     );
-    assert!(
-        store
-            .contradictions(domain, "nli-x", 0.0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(store.scored_pair_count("nli-x").await.unwrap(), 1);
 
     let tmp = tempfile::tempdir().unwrap();
-    let (domain, a, ca, b, cb) = two(store, tmp.path()).await;
-    store
-        .replace_contradictions(
-            domain,
-            &pair(a, b, &ca, &cb),
-            0.9,
-            "nli-x",
-            "2026-09-27T10:00:00Z",
-            &[row(a, b, 5, 5, 0.9, 0.9, false)],
-        )
-        .await
-        .unwrap();
+    let t = two_in(store, tmp.path(), "notes").await;
+    score(store, &t).await;
     store.wipe().await.unwrap();
     assert_eq!(store.scored_pair_count("nli-x").await.unwrap(), 0);
-    assert!(
-        store
-            .contradictions(domain, "nli-x", 0.0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(held(store, t.domain).await, (0, 0));
+    assert_eq!(held(store, kept.domain).await, (0, 0));
 }
 parity!(
     clear_and_wipe_contradictions_parity,
     clear_domain_and_wipe_clear_both_tables
+);
+
+/// A delete can land while a batch scores the pair. The write that follows
+/// stores nothing for an engram that is gone (turso has no foreign key to
+/// refuse it, postgres would refuse it with one), and it is no error: the
+/// pair is done because it no longer exists.
+async fn a_replace_after_either_engram_is_gone_stores_nothing(store: &dyn Store) {
+    let (lower, higher) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for (root, name, lower_side) in [(&lower, "notes", true), (&higher, "other", false)] {
+        let t = two_in(store, root.path(), name).await;
+        let gone = if lower_side { &t.path_a } else { &t.path_b };
+        store.delete_engram(t.domain, gone).await.unwrap();
+        store
+            .replace_contradictions(
+                t.domain,
+                &pair(t.a, t.b, &t.ca, &t.cb),
+                0.9,
+                "nli-x",
+                "2026-09-27T10:00:00Z",
+                &[row(t.a, t.b, 5, 5, 0.9, 0.9, false)],
+            )
+            .await
+            .expect("a vanished engram is not an error");
+        assert_eq!(held(store, t.domain).await, (0, 0), "{name}");
+    }
+    assert_eq!(store.scored_pair_count("nli-x").await.unwrap(), 0);
+}
+parity!(
+    replace_after_delete_parity,
+    a_replace_after_either_engram_is_gone_stores_nothing
 );
 
 /// Review focus 3. Every upsert runs the child-row delete, and `reindex

@@ -995,6 +995,15 @@ pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a
      WHERE cn.domain_id=?1 AND cn.model=?2 AND (cn.score_ab >= ?3 OR cn.score_ba >= ?3) \
      ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
 
+/// The pair row [`Store::replace_contradictions`] writes, stored only while
+/// both engrams still exist: a delete that lands while a batch scores the
+/// pair leaves nothing behind (turso enforces no foreign key that would
+/// refuse the orphan). Each `EXISTS` seeks the engram primary key.
+#[doc(hidden)]
+pub const INSERT_CONTRADICTION_PAIR_SQL: &str = "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+     WHERE EXISTS (SELECT 1 FROM engram e WHERE e.id=?2) AND EXISTS (SELECT 1 FROM engram e WHERE e.id=?3)";
+
 /// One engram's line rows, deleted by [`Store::delete_engram`]: the primary
 /// key serves `engram_a`, `idx_contradiction_engram_b` serves `engram_b`.
 #[doc(hidden)]
@@ -2803,10 +2812,10 @@ impl Store for TursoStore {
                     key,
                 )
                 .await?;
-            self.conn
+            let stored = self
+                .conn
                 .execute(
-                    "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    INSERT_CONTRADICTION_PAIR_SQL,
                     vec![
                         Value::Integer(domain.0),
                         Value::Integer(pair.a.0),
@@ -2819,6 +2828,10 @@ impl Store for TursoStore {
                     ],
                 )
                 .await?;
+            // Either engram went while the pair was scored: nothing to keep.
+            if stored == 0 {
+                return Ok(());
+            }
             for row in rows {
                 self.conn
                     .execute(

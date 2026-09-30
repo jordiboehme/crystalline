@@ -679,6 +679,19 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_contradiction_domain"],
             postgres_must_seek: &["idx_contradiction_domain"],
         },
+        // The pair write: both `EXISTS` probes seek the engram primary key,
+        // so a delete racing a scoring batch never costs an engram scan.
+        HotStatement {
+            issued_by: "Store::replace_contradictions (contradiction_pair)",
+            turso: || crystalline_index::turso::INSERT_CONTRADICTION_PAIR_SQL.to_string(),
+            postgres: || crystalline_index::postgres::INSERT_CONTRADICTION_PAIR_SQL.to_string(),
+            literals: &["1", "5", "6", "'ca'", "'cb'", "0.9", "'m'", "'t'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
         // The two per-engram deletes: the primary key serves `engram_a`, the
         // `engram_b` index the other half of the OR, so neither half scans.
         HotStatement {
