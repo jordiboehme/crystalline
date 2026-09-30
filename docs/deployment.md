@@ -208,6 +208,23 @@ flowchart LR
     D -->|HTTP, no egress| A[Agent]
 ```
 
+## Embedding model hardware
+
+On a Mac with Apple Silicon the local embedding model runs on the GPU through Metal. Every other platform runs it on the CPU: Linux, Windows, containers and Intel Macs. Intel Macs are left out because the GPU kernels the model needs use matrix instructions only Apple Silicon GPUs have. Nothing needs to be set up for Metal. Crystalline (the daemon, or a CLI command that embeds on its own) opens the GPU, loads the model there and embeds one test text. If any of that fails, it logs one warning with the reason and runs on the CPU, so a Mac without a usable GPU (a virtual machine, for example) works as before. Set `CRYSTALLINE_ACCELERATION=off` to keep the model on the CPU.
+
+The GPU takes the embedding work off the CPU, which matters for a daemon that shares the machine with other work. The results are the same to the last float digits on both devices (in a measurement on real engrams, the cosine between the CPU and the GPU vector of a chunk was never below 0.9999998), so an index embedded partly on the CPU and partly on the GPU needs no re-embedding. The GPU costs some more memory while the model is loaded. The very first start after an install compiles the GPU programs, which can take about 15 seconds once; macOS keeps them, so later starts are fast.
+
+`crystalline status` shows the device the loaded model runs on, for example `device: metal`, `device: cpu (fallback: <reason>)` or `device: cpu (off by CRYSTALLINE_ACCELERATION)`. `crystalline doctor` shows the device a model load would pick on this machine; it does not load the model, so a failure that shows only when the model runs is reported by `status`.
+
+```mermaid
+flowchart LR
+    S[Daemon start] --> Q{Apple Silicon and not off?}
+    Q -->|yes| G[Metal: load and test]
+    Q -->|no| C[CPU]
+    G -->|ok| M[Model on GPU]
+    G -->|any error| C
+```
+
 ## Shared database collaboration
 
 When several instances should share one index instead of each keeping its own, point them at a shared PostgreSQL database with pgvector using `examples/docker/compose.postgres.yaml`: an immutable image with `CRYSTALLINE_DATABASE_BACKEND=postgres` and `CRYSTALLINE_DATABASE_URL` set, no mounted config.yaml needed. Every instance searches and reads every domain it has registered, so knowledge one instance captures is immediately visible to the rest of them the moment they register that domain too - register the same domains on each instance you want to answer for them. An index row whose domain an instance has no registration for is not served by that instance, which is what keeps a domain somebody removed from going on answering there. Writes follow a single-writer-per-domain rule: each file domain has exactly one hosting instance that syncs and watches its files. Hosting is arbitrated by a host lock with a 30 second heartbeat and a 90 second stale takeover, so a second instance that tries to sync a domain it does not host is refused with the name of the current host and serves that domain read-from-database only. A virtual domain keeps its engrams in the database itself rather than on disk, so it is shared truth that any instance may write, guarded per engram by a compare-and-swap on the checksum so a stale edit is refused rather than silently clobbered. The local-first guarantees hold for a running daemon against a local database; a remote database trades some latency for the federation payoff.
@@ -349,6 +366,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` | `overlay`, the only value it takes | puts the domain in review mode: every write joins its author's own draft and the folder goes on saying what the team reviewed. Pair it with an origin - the `_ORIGIN` variable here, or an origin in `config.yaml` for a domain the file defines - because a reviewed change is proposed to the team on GitHub, and a reviewing domain with no origin collects drafts nobody can propose. The mode is taken as written: `crystalline domain review` refuses to turn it on without an origin, but a variable and a hand-edited config are believed. Any other value refuses at startup naming the variable, rather than being read as off |
 | `CRYSTALLINE_GITHUB_TOKEN` | this machine's GitHub token | read-only; `connect github` refuses while set |
 | `CRYSTALLINE_MODELS_DIR` | the model cache path | pre-existing, unchanged |
+| `CRYSTALLINE_ACCELERATION` | n/a (environment only) | `off` keeps the local embedding model on the CPU on an Apple Silicon Mac, where it otherwise runs on the GPU through Metal. Any other value, and no value, leaves the GPU on. Has no effect on other platforms, which always use the CPU. Read when the model loads. See [Embedding model hardware](#embedding-model-hardware) |
 | `CRYSTALLINE_CHANNEL` | install channel marker | set to `mcpb` by the Claude Desktop extension manifest so degraded-startup copy tells the user to update the extension rather than the binary; not meant to be set by hand |
 | `RUST_LOG` | n/a (not a Crystalline setting) | the log filter, in the tracing `EnvFilter` syntax: a level (`debug`) or per-crate directives (`crystalline_engine=debug,warn`); the daemon's own crates are `crystalline_service`, `crystalline_engine`, `crystalline_rest` and `crystalline_identity`. Unset means `info` for `serve` and `warn` for `crystalline mcp` and every other command. Logs always go to stderr, never to stdout, and a lifecycle hook (`crystalline hook ...`) logs only when this is set |
 

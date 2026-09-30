@@ -114,6 +114,10 @@ pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
 /// overlay state rather than being ignored.
 const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_MODELS_DIR",
+    // `crystalline_index::device`: `off` keeps the embedding model on the
+    // CPU on an Apple Silicon Mac. Read when the model loads, never through
+    // the settings registry.
+    crystalline_index::ACCELERATION_ENV,
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",
     "CRYSTALLINE_TEST_POSTGRES_URL",
@@ -1034,12 +1038,14 @@ mod tests {
             ("CRYSTALLINE_STALE_SECS", "15"),
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
             (CHANNEL_ENV, "mcpb"),
+            ("CRYSTALLINE_ACCELERATION", "off"),
         ])
         .unwrap();
         assert!(
             ov.is_empty(),
             "reserved variables must not become setting overrides"
         );
+        assert!(is_reserved("CRYSTALLINE_ACCELERATION"));
     }
 
     #[test]

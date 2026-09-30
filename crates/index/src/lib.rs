@@ -16,6 +16,7 @@
 //! `reindex --full` re-reads every file without destroying anything first.
 
 mod alias;
+pub mod device;
 pub mod embed;
 mod error;
 mod factory;
@@ -28,6 +29,7 @@ pub mod turso;
 pub mod vocab;
 
 pub use alias::AliasMap;
+pub use device::{ACCELERATION_ENV, CpuReason, DeviceKind, DeviceReport};
 pub use embed::{
     Architecture, ChunkParams, EMBED_PAGE_SIZE, EmbedReport, EmbeddingProvider, LocalModel,
     ModelDownload, SnapshotChoice, cached_model_dirs, choose_snapshot, chunk_engram,

@@ -40,6 +40,7 @@ turso = "0.8.1"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
+candle-metal-kernels = "0.11.0"
 # The model downloader: an async client over the same reqwest and rustls this
 # workspace already builds, so one HTTP stack serves every caller. Pinned to
 # rustls-tls and nothing else, because a feature this repo turns on here is a

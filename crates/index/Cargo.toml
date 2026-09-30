@@ -22,6 +22,9 @@ local-embeddings = [
     "dep:candle-transformers",
     "dep:tokenizers",
     "dep:hf-hub",
+    # Apple Silicon only (the target table below): the Metal device list,
+    # read before candle opens a device so a Mac without one never panics.
+    "dep:candle-metal-kernels",
 ]
 # The PostgreSQL backend: the sqlx pool, pgvector and the parallel store module.
 # Runtime is selected from config, so a release binary must carry this to honor
@@ -44,8 +47,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 
-# Local embedding stack, gated by `local-embeddings`. CPU only (no metal or cuda
-# features) so the release artifacts stay portable static binaries.
+# Local embedding stack, gated by `local-embeddings`. CPU everywhere except on
+# Apple Silicon Macs, where the target table below adds candle's `metal`
+# feature so the embedding model can run on the GPU (with a CPU fallback, see
+# src/device.rs). Linux, Windows and Intel Mac builds carry no metal crates.
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
@@ -56,6 +61,19 @@ hf-hub = { workspace = true, optional = true }
 # live database is needed at build time and the trait object stays object-safe.
 sqlx = { workspace = true, optional = true }
 pgvector = { workspace = true, optional = true }
+
+# The same three candle crates with Metal, on Apple Silicon Macs only. Intel
+# Macs are left out on purpose: candle-metal-kernels 0.11 does every matmul
+# through its MLX gemm kernels, whose source uses `simdgroup_matrix` (Apple GPU
+# family 7 and later, which no Intel Mac GPU has) and instantiates `bfloat`
+# kernels in the same library, so the shader library is not expected to build
+# on those GPUs. Optional here too, so the `local-embeddings` feature's `dep:`
+# entries switch both tables on together.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+candle-core = { workspace = true, optional = true, features = ["metal"] }
+candle-nn = { workspace = true, optional = true, features = ["metal"] }
+candle-transformers = { workspace = true, optional = true, features = ["metal"] }
+candle-metal-kernels = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
