@@ -416,22 +416,60 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
     if !is_loaded_snapshot(&snapshots.join(model.revision)) {
         return Vec::new();
     }
+    // Never a snapshot this process has loaded from.
+    let candidates: Vec<String> = others
+        .into_iter()
+        .filter(|c| !is_loaded_snapshot(&snapshots.join(c)))
+        .collect();
+    let removed = remove_snapshots(&repo_dir, model, &candidates, true);
+    if !removed.is_empty() {
+        tracing::info!(
+            model = model.id,
+            commits = %removed.join(", "),
+            "removed older snapshots of the embedding model now that the pinned commit is loaded"
+        );
+    }
+    removed
+}
+
+/// Remove the pinned snapshot a start just failed to build, so the next
+/// fetch writes it fresh: the self-heal for a truncated or corrupt download.
+///
+/// Only that one snapshot directory goes, never another snapshot of the
+/// repository (an older one may be the only copy an air-gapped host has).
+/// In Crystalline's own cache the blobs only that snapshot linked to and a
+/// ref naming it go too, so the fetch downloads the bytes again. In a
+/// folder the user provides (`user_dir`, a `CRYSTALLINE_MODELS_DIR`)
+/// nothing outside the snapshot directory is touched: its blobs stay, and
+/// a fetch may then link the same bytes again.
+pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user_dir: bool) {
+    let repo_dir = models_dir.join(model.cache_dir_name());
+    remove_snapshots(&repo_dir, model, &[model.revision.to_string()], !user_dir);
+}
+
+/// Remove the given snapshot directories of one repository and, with
+/// `own_cache`, the blobs only they linked to and the refs naming them,
+/// returning the commits that went. A blob a remaining snapshot still links
+/// to is shared and stays. A removal that fails is logged and skipped.
+fn remove_snapshots(
+    repo_dir: &Path,
+    model: &LocalModel,
+    commits: &[String],
+    own_cache: bool,
+) -> Vec<String> {
+    let snapshots = repo_dir.join("snapshots");
     let blobs_of = |commit: &str| -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(snapshots.join(commit)) else {
             return Vec::new();
         };
         entries
             .flatten()
-            .filter_map(|e| blob_name(&repo_dir, &e.path()))
+            .filter_map(|e| blob_name(repo_dir, &e.path()))
             .collect()
     };
     let mut removed = Vec::new();
     let mut freed_blobs: Vec<String> = Vec::new();
-    for commit in &others {
-        // Never a snapshot this process has loaded from.
-        if is_loaded_snapshot(&snapshots.join(commit)) {
-            continue;
-        }
+    for commit in commits {
         let blobs = blobs_of(commit);
         let dir = snapshots.join(commit);
         match std::fs::remove_dir_all(&dir) {
@@ -439,15 +477,18 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
                 freed_blobs.extend(blobs);
                 removed.push(commit.clone());
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(
                 model = model.id,
                 commit = %commit,
                 path = %dir.display(),
-                "leaving an older snapshot of the embedding model in place: {e}"
+                "leaving a snapshot of the embedding model in place: {e}"
             ),
         }
     }
-    // Blobs a remaining snapshot still links to are shared, and stay.
+    if !own_cache {
+        return removed;
+    }
     let kept: Vec<String> = snapshot_commits(&snapshots)
         .iter()
         .flat_map(|c| blobs_of(c))
@@ -473,13 +514,6 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-    }
-    if !removed.is_empty() {
-        tracing::info!(
-            model = model.id,
-            commits = %removed.join(", "),
-            "removed older snapshots of the embedding model now that the pinned commit is loaded"
-        );
     }
     removed
 }
@@ -1273,5 +1307,97 @@ mod tests {
         note_loaded_snapshot(&snaps.join(g.revision));
         assert!(retire_older_snapshots(root, g).is_empty());
         assert!(snaps.join(OLD_A).join("model.safetensors").is_file());
+    }
+
+    /// The self-heal's removal takes the pinned snapshot and, in
+    /// Crystalline's own cache, the blobs only it used; an older snapshot, a
+    /// blob it shares and its ref stay. Alone in the cache (the case from
+    /// before older snapshots were used), the pinned snapshot and all its
+    /// blobs go, so the next fetch downloads it again.
+    #[cfg(unix)]
+    #[test]
+    fn the_self_heal_removes_only_the_pinned_snapshot_in_the_own_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        linked_snapshot(root, g, OLD_A, "old");
+        linked_snapshot(root, g, g.revision, "new");
+        let repo = root.join(g.cache_dir_name());
+        // One file shared by both snapshots.
+        let shared = repo.join("snapshots").join(g.revision).join("config.json");
+        std::fs::remove_file(&shared).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../blobs/{}", etag("old", "config.json")),
+            &shared,
+        )
+        .unwrap();
+        set_main(root, g, OLD_A);
+
+        remove_failed_pinned_snapshot(root, g, false);
+        assert!(!repo.join("snapshots").join(g.revision).exists());
+        for file in g.files {
+            assert!(
+                repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                "{file}"
+            );
+            assert!(
+                repo.join("blobs").join(etag("old", file)).is_file(),
+                "{file}"
+            );
+            if *file != "config.json" {
+                assert!(
+                    !repo.join("blobs").join(etag("new", file)).exists(),
+                    "{file}"
+                );
+            }
+        }
+        assert!(repo.join("refs").join("main").is_file());
+
+        // The plain case: only the pinned snapshot, and it all goes.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_snapshot(root, g, g.revision, "new");
+        remove_failed_pinned_snapshot(root, g, false);
+        let repo = root.join(g.cache_dir_name());
+        assert!(!repo.join("snapshots").join(g.revision).exists());
+        for file in g.files {
+            assert!(
+                !repo.join("blobs").join(etag("new", file)).exists(),
+                "{file}"
+            );
+        }
+        assert_eq!(choose_snapshot(root, g), SnapshotChoice::Missing);
+    }
+
+    /// In a folder the user provides, the self-heal removes the pinned
+    /// snapshot directory and nothing else: no blob, no ref, no other
+    /// snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn the_self_heal_touches_nothing_outside_the_snapshot_in_a_user_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let g = granite();
+        linked_snapshot(root, g, OLD_A, "old");
+        linked_snapshot(root, g, g.revision, "new");
+        set_main(root, g, g.revision);
+
+        remove_failed_pinned_snapshot(root, g, true);
+        let repo = root.join(g.cache_dir_name());
+        assert!(!repo.join("snapshots").join(g.revision).exists());
+        for file in g.files {
+            assert!(
+                repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                "{file}"
+            );
+            assert!(
+                repo.join("blobs").join(etag("new", file)).is_file(),
+                "{file}"
+            );
+        }
+        assert!(
+            repo.join("refs").join("main").is_file(),
+            "a ref in the user's folder stays, even one naming the removed commit"
+        );
     }
 }

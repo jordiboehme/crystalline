@@ -12,8 +12,8 @@
 //! features) so the release binaries stay portable, and both it and the weight
 //! load run on a blocking thread so neither stalls the async runtime; the
 //! download itself is async and is awaited before that thread starts. A load
-//! failure from a truncated or corrupt cache self-heals: the model directory is
-//! wiped and fetched once more before giving up.
+//! failure of the pinned snapshot self-heals: that snapshot is removed and
+//! fetched once more before giving up.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use super::models::{
     Architecture, LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model,
-    note_loaded_snapshot, older_snapshot_warning,
+    note_loaded_snapshot, older_snapshot_warning, remove_failed_pinned_snapshot,
 };
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
@@ -524,8 +524,8 @@ async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<En
 /// falls through to the pinned path (download, then the self-heal below);
 /// when the pinned commit is cached with other weights, the start fails
 /// rather than load weights the index was not embedded with. The self-heal
-/// wipe is the pinned path's alone, as it was before older snapshots were
-/// used at all.
+/// is the pinned path's alone, and it removes only the pinned snapshot it
+/// failed to build.
 async fn load_encoder_with(
     client: &HFClient,
     cache_dir: &Path,
@@ -570,7 +570,7 @@ async fn load_encoder_with(
 }
 
 /// Build the pinned commit's files, self-healing once from a corrupt cache:
-/// the model directory is wiped and fetched again before the failure is
+/// the pinned snapshot is removed and fetched again before the failure is
 /// surfaced.
 async fn load_pinned(
     client: &HFClient,
@@ -585,12 +585,14 @@ async fn load_pinned(
             Ok(encoder)
         }
         Err(first) => {
-            // A truncated or corrupt cache: wipe the model directory and fetch
-            // once more before surfacing the failure.
+            // A truncated or corrupt download: remove the pinned snapshot
+            // (and, in Crystalline's own cache, the blobs only it used) and
+            // fetch once more before surfacing the failure. Never another
+            // snapshot, and never anything else in a folder the user provides.
             eprintln!(
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
-            wipe_model_dir(cache_dir, model);
+            remove_failed_pinned_snapshot(cache_dir, model, config::models_dir_is_user_provided());
             let files = ensure_files_with(client, cache_dir, model, true).await?;
             let snapshot = files.snapshot_dir()?;
             let encoder = build_on_blocking(files, model).await?;
@@ -792,16 +794,13 @@ fn normalize_l2(v: &Tensor) -> candle_core::Result<Tensor> {
     v.broadcast_div(&v.sqr()?.sum_keepdim(1)?.sqrt()?)
 }
 
-fn wipe_model_dir(cache_dir: &Path, model: &LocalModel) {
-    let dir = cache_dir.join(model.cache_dir_name());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use candle_core::{Device, Tensor};
@@ -1398,5 +1397,89 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("the failed start dialled out: {other:?}"),
         }
+    }
+
+    /// A listener that serves every file of `revision` as the single byte
+    /// `x`, the way the Hub answers a download (HEAD with the etag and the
+    /// commit, then GET with the bytes), and counts the GETs. What it serves
+    /// is not a model, so every build of it fails.
+    fn serving_hub(revision: &'static str) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let gets = Arc::new(AtomicU64::new(0));
+        let counter = gets.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let path = line.split_whitespace().nth(1).unwrap_or_default();
+                let file = path.rsplit('/').next().unwrap_or_default();
+                let etag = {
+                    use sha2::{Digest, Sha256};
+                    crate::hex_lower(&Sha256::digest(file.as_bytes()))
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nX-Repo-Commit: {revision}\r\n\
+                     Content-Length: 1\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes());
+                if line.starts_with("GET") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(b"x");
+                }
+            }
+        });
+        (endpoint, gets)
+    }
+
+    /// Both builds fail: the older snapshot (not a model), then the pinned
+    /// download (not a model either). The self-heal removes and fetches the
+    /// pinned snapshot once more, and the older snapshot, its ref and every
+    /// file of it survive: the self-heal only ever removes the snapshot it
+    /// failed to build.
+    #[tokio::test]
+    async fn a_double_build_failure_removes_only_the_pinned_snapshot() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let (endpoint, gets) = serving_hub(granite.revision);
+        let client = test_client(tmp.path(), &endpoint);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            load_encoder_with(&client, tmp.path(), granite),
+        )
+        .await
+        .expect("the stub answers at once");
+        assert!(result.is_err(), "neither snapshot is a model");
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            2 * granite.files.len() as u64,
+            "the pinned files were fetched, removed by the self-heal and fetched again"
+        );
+        let repo = tmp.path().join(granite.cache_dir_name());
+        for file in granite.files {
+            assert!(
+                repo.join("snapshots").join(older).join(file).is_file(),
+                "{file} of the older snapshot survives"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("refs").join("main")).unwrap(),
+            older
+        );
     }
 }
