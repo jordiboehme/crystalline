@@ -720,21 +720,34 @@ impl Engine {
                     .contradiction_pairs_scored(domain_id, model.repo)
                     .await?
             };
-            let all = {
-                let views: Vec<CandidateFacts<'_>> =
-                    facts.iter().map(ContradictionFact::view).collect();
-                let found = contradiction_candidates(&views, threshold, max_pairs);
-                if found.capped {
-                    tracing::info!(
-                        domain = %name,
-                        compared = found.compared,
-                        "contradiction candidates skipped: over the lead-vector cap"
-                    );
-                }
-                count.capped = found.full;
-                count.vectors_capped = found.capped.then_some(found.compared);
-                pending_pairs(&views, &found.pairs, &scored)
-            };
+            // The all-pairs cosine walk and the diff against the stored rows
+            // run on a blocking thread: a write to a large domain asks for
+            // this walk every time, and on a runtime worker it would hold up
+            // every MCP and HTTP request queued behind it. The facts move in
+            // and come back.
+            let (facts, full, vectors_capped, all) = tokio::task::spawn_blocking(move || {
+                let (full, vectors_capped, all) = {
+                    let views: Vec<CandidateFacts<'_>> =
+                        facts.iter().map(ContradictionFact::view).collect();
+                    let found = contradiction_candidates(&views, threshold, max_pairs);
+                    let all = pending_pairs(&views, &found.pairs, &scored);
+                    (found.full, found.capped.then_some(found.compared), all)
+                };
+                (facts, full, vectors_capped, all)
+            })
+            .await
+            .map_err(|e| {
+                EngineError::Internal(format!("contradiction candidate walk failed: {e}"))
+            })?;
+            if let Some(compared) = vectors_capped {
+                tracing::info!(
+                    domain = %name,
+                    compared,
+                    "contradiction candidates skipped: over the lead-vector cap"
+                );
+            }
+            count.capped = full;
+            count.vectors_capped = vectors_capped;
             // A known failure counts only while its pair is still pending at
             // the checksums it failed at; an edit makes it a new pair.
             let key = |p: &CandidatePair| failed_key(model, &facts[p.a], &facts[p.b]);
