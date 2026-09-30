@@ -24,14 +24,16 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::{
     Config as DebertaConfig, DebertaV2SeqClassificationModel,
 };
+use crystalline_core::config;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
 use super::models::NliModel;
 #[cfg(test)]
 use super::models::{NliProfile, nli_model};
 use super::{ContradictionScorer, MAX_LINE_TOKENS, contradiction_index};
+use crate::embed::models::{note_loaded_snapshot, remove_failed_snapshot};
 use crate::error::{IndexError, Result};
-use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read, wipe_repo_dir};
+use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read};
 
 /// Two lines of [`MAX_LINE_TOKENS`] plus the separators fit this window.
 const MAX_PAIR_TOKENS: usize = 512;
@@ -58,7 +60,7 @@ pub struct LocalNli {
 fn hub_repo(model: &'static NliModel) -> HubRepo<'static> {
     HubRepo {
         repo: model.repo,
-        revision: "main",
+        revision: model.revision,
         files: model.files,
         download_mb: model.download_mb,
         what: "contradiction model",
@@ -86,24 +88,43 @@ fn as_fetch(e: IndexError) -> IndexError {
 }
 
 impl LocalNli {
-    /// Load `model`, downloading on first use. The fetch is awaited; the
-    /// weight load runs on a blocking thread.
+    /// Load `model` at its pinned commit, downloading on first use. The
+    /// fetch is awaited; the weight load runs on a blocking thread.
+    ///
+    /// A build failure self-heals once the way the embedding model's pinned
+    /// path does ([`remove_failed_snapshot`]): only the pinned snapshot that
+    /// failed goes, and in a `CRYSTALLINE_MODELS_DIR` only its directory,
+    /// never a blob, a ref or another snapshot. Unlike the embedding model
+    /// there is no start on an older snapshot: no released build ever fetched
+    /// another commit of an NLI checkpoint, so there is nothing to fall back
+    /// to and nothing to settle.
     pub async fn load(model: &'static NliModel) -> Result<LocalNli> {
         let cache_dir = models_cache_dir().map_err(as_fetch)?;
         let files = ensure_files(&cache_dir, &hub_repo(model), true)
             .await
             .map_err(as_fetch)?;
+        let snapshot = files.snapshot_dir().map_err(as_fetch)?;
         match build_on_blocking(files, model).await {
-            Ok(nli) => Ok(nli),
+            Ok(nli) => {
+                note_loaded_snapshot(&snapshot);
+                Ok(nli)
+            }
             Err(first) => {
                 eprintln!(
                     "crystalline: contradiction model failed to load ({first}); re-downloading once..."
                 );
-                wipe_repo_dir(&cache_dir, model.repo);
+                remove_failed_snapshot(
+                    &cache_dir,
+                    &model.pinned(),
+                    config::models_dir_is_user_provided(),
+                );
                 let files = ensure_files(&cache_dir, &hub_repo(model), true)
                     .await
                     .map_err(as_fetch)?;
-                build_on_blocking(files, model).await
+                let snapshot = files.snapshot_dir().map_err(as_fetch)?;
+                let nli = build_on_blocking(files, model).await?;
+                note_loaded_snapshot(&snapshot);
+                Ok(nli)
             }
         }
     }

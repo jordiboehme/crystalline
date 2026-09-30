@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use crate::embed::hub_dir_name;
+use crate::embed::models::PinnedRepo;
 
 /// One value of `evolve.contradictions` other than `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,6 +96,23 @@ pub struct NliModel {
     pub id: &'static str,
     /// The Hugging Face repository, the key every stored row carries.
     pub repo: &'static str,
+    /// The commit every file is fetched at, never a branch: a full
+    /// 40-character hash is what hf-hub resolves from the cache without a
+    /// network call, and what makes a download the checkpoint the threshold
+    /// was measured on.
+    ///
+    /// The store keys every scored pair by [`NliModel::repo`] alone
+    /// (`contradiction_pair.model`, `contradiction.model`), never by commit.
+    /// So a pin bump that changes the content of `model.safetensors`,
+    /// `tokenizer.json` or the labels in `config.json` must also change the
+    /// key the rows carry, or stored scores outlive the model that produced
+    /// them: that is what sends every pair through the rescore a changed
+    /// model already gets. The repository id cannot change on its own, so
+    /// such a bump also has to give the stored key a new value (the
+    /// repository with the commit appended, for example) in the same change,
+    /// and re-measure [`NliModel::threshold`]. A bump that leaves those files
+    /// as they were keeps the key.
+    pub revision: &'static str,
     /// The `model_type` the downloaded `config.json` must declare; the
     /// weights load into candle's DeBERTa-v2 sequence classifier.
     pub model_type: &'static str,
@@ -121,6 +139,9 @@ pub const NLI_MODELS: [NliModel; 1] = [NliModel {
     profile: NliProfile::Full,
     id: "mdeberta-v3-base-xnli-2mil7",
     repo: "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+    // The commit the probes corpus was measured on, and the repository's
+    // `main` on 2026-09-30.
+    revision: "b5113eb38ab63efdd7f280f8c144ea8b13f978ce",
     model_type: "deberta-v2",
     languages: "multilingual",
     files: NLI_FILES,
@@ -146,13 +167,34 @@ pub fn nli_model_by_repo(repo: &str) -> Option<&'static NliModel> {
     NLI_MODELS.iter().find(|m| m.repo == repo || m.id == repo)
 }
 
-/// Whether the model's weights sit in the hf-hub cache under `models_dir`,
-/// read from the directory alone (no network, no feature needed).
-pub fn weights_cached(models_dir: &Path, model: &NliModel) -> bool {
-    repo_weights_cached(models_dir, model.repo)
+impl NliModel {
+    /// This checkpoint as the snapshot cleanup sees it.
+    pub fn pinned(&self) -> PinnedRepo<'static> {
+        PinnedRepo {
+            id: self.id,
+            repo: self.repo,
+            revision: self.revision,
+            files: self.files,
+            what: "contradiction model",
+        }
+    }
 }
 
-/// [`weights_cached`] for a bare repository, which a retired checkpoint is.
+/// Whether the model's weights sit in the hf-hub cache under `models_dir` at
+/// its pinned commit, read from the directory alone (no network, no feature
+/// needed). A snapshot of another commit does not count: the loader fetches
+/// the pinned one whatever else is cached.
+pub fn weights_cached(models_dir: &Path, model: &NliModel) -> bool {
+    models_dir
+        .join(hub_dir_name(model.repo))
+        .join("snapshots")
+        .join(model.revision)
+        .join("model.safetensors")
+        .is_file()
+}
+
+/// Whether any snapshot of a bare repository holds weights, which is what a
+/// retired checkpoint is asked: any commit of it on disk is one to prune.
 pub fn repo_weights_cached(models_dir: &Path, repo: &str) -> bool {
     let snapshots = models_dir.join(hub_dir_name(repo)).join("snapshots");
     let Ok(entries) = std::fs::read_dir(snapshots) else {
@@ -166,6 +208,54 @@ pub fn repo_weights_cached(models_dir: &Path, repo: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every NLI checkpoint is fetched at a fixed commit, never at a branch,
+    /// the same rule the embedding models follow: `full` at the commit its
+    /// threshold was measured on.
+    #[test]
+    fn every_nli_model_is_pinned_to_a_full_commit_hash() {
+        for m in NLI_MODELS {
+            assert_eq!(m.revision.len(), 40, "{}", m.id);
+            assert!(
+                m.revision
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{}: {}",
+                m.id,
+                m.revision
+            );
+            assert_eq!(m.pinned().revision, m.revision);
+            assert_eq!(m.pinned().repo, m.repo);
+            assert_eq!(m.pinned().files, m.files);
+        }
+        assert_eq!(
+            nli_model(NliProfile::Full).revision,
+            "b5113eb38ab63efdd7f280f8c144ea8b13f978ce"
+        );
+    }
+
+    /// Doctor's "downloaded" asks for the pinned commit, since the loader
+    /// fetches that one whatever else is cached; the retired checkpoints are
+    /// asked for any commit, since any of them on disk is one to prune.
+    #[test]
+    fn only_the_pinned_commit_counts_as_downloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = nli_model(NliProfile::Full);
+        let snap = |commit: &str| {
+            let dir = tmp
+                .path()
+                .join(hub_dir_name(m.repo))
+                .join("snapshots")
+                .join(commit);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        };
+        snap("0123456789abcdef0123456789abcdef01234567");
+        assert!(!weights_cached(tmp.path(), m));
+        assert!(repo_weights_cached(tmp.path(), m.repo));
+        snap(m.revision);
+        assert!(weights_cached(tmp.path(), m));
+    }
 
     #[test]
     fn every_profile_maps_to_exactly_one_model() {
@@ -245,7 +335,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let m = nli_model(NliProfile::Full);
         assert!(!weights_cached(tmp.path(), m));
-        let snap = tmp.path().join(hub_dir_name(m.repo)).join("snapshots/abc");
+        let snap = tmp
+            .path()
+            .join(hub_dir_name(m.repo))
+            .join("snapshots")
+            .join(m.revision);
         std::fs::create_dir_all(&snap).unwrap();
         std::fs::write(snap.join("config.json"), b"{}").unwrap();
         assert!(

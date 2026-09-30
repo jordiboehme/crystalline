@@ -113,6 +113,37 @@ impl LocalModel {
             Architecture::ModernBert => "modernbert",
         }
     }
+
+    /// This model as the snapshot cleanup sees it.
+    pub fn pinned(&self) -> PinnedRepo<'static> {
+        PinnedRepo {
+            id: self.id,
+            repo: self.repo,
+            revision: self.revision,
+            files: self.files,
+            what: "embedding model",
+        }
+    }
+}
+
+/// One repository fetched at a pinned commit, as the snapshot cleanup sees
+/// it. The embedding models of [`LOCAL_MODELS`] and the contradiction
+/// check's NLI checkpoint share the model cache and follow the same rules:
+/// nothing removes a snapshot this process loaded or another complete one,
+/// and in a folder the user provides only the snapshot that failed to build
+/// may go.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedRepo<'a> {
+    /// The short id the logs name it by.
+    pub id: &'a str,
+    /// The Hugging Face repository id, `<owner>/<name>`.
+    pub repo: &'a str,
+    /// The pinned commit, a full 40-character hash.
+    pub revision: &'a str,
+    /// The files the loader needs, all of which a complete snapshot holds.
+    pub files: &'a [&'a str],
+    /// What the logs call it: "embedding model" or "contradiction model".
+    pub what: &'a str,
 }
 
 /// The table entry for an id, by the short id or by the full repository id.
@@ -203,7 +234,7 @@ pub fn choose_snapshot(models_dir: &Path, model: &LocalModel) -> SnapshotChoice 
         .filter(|c| c != model.revision)
         .collect();
     others.sort();
-    let pinned_complete = snapshot_complete(&snapshots.join(model.revision), model);
+    let pinned_complete = snapshot_complete(&snapshots.join(model.revision), model.files);
     let older = older_snapshot(&repo_dir, &others, model);
     match (pinned_complete, older) {
         (true, None) => SnapshotChoice::Pinned { others },
@@ -244,8 +275,8 @@ fn snapshot_commits(snapshots: &Path) -> Vec<String> {
 
 /// Every file the loader needs is present (a symlink counts when its blob is
 /// there, which `is_file` follows).
-fn snapshot_complete(dir: &Path, model: &LocalModel) -> bool {
-    model.files.iter().all(|f| dir.join(f).is_file())
+fn snapshot_complete(dir: &Path, files: &[&str]) -> bool {
+    files.iter().all(|f| dir.join(f).is_file())
 }
 
 /// The older complete snapshot a start would use: the one `refs/main` names,
@@ -254,7 +285,7 @@ fn older_snapshot(repo_dir: &Path, others: &[String], model: &LocalModel) -> Opt
     let snapshots = repo_dir.join("snapshots");
     let complete: Vec<&String> = others
         .iter()
-        .filter(|c| snapshot_complete(&snapshots.join(c), model))
+        .filter(|c| snapshot_complete(&snapshots.join(c), model.files))
         .collect();
     if let Ok(main) = std::fs::read_to_string(repo_dir.join("refs").join("main")) {
         let main = main.trim();
@@ -421,7 +452,7 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
         .into_iter()
         .filter(|c| !is_loaded_snapshot(&snapshots.join(c)))
         .collect();
-    let removed = remove_snapshots(&repo_dir, model, &candidates, true);
+    let removed = remove_snapshots(&repo_dir, &model.pinned(), &candidates, true);
     if !removed.is_empty() {
         tracing::info!(
             model = model.id,
@@ -451,7 +482,14 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
 ///   blobs cannot be told apart and stay; that is logged, because the fetch
 ///   may reuse them.
 pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user_dir: bool) {
-    let repo_dir = models_dir.join(model.cache_dir_name());
+    remove_failed_snapshot(models_dir, &model.pinned(), user_dir);
+}
+
+/// [`remove_failed_pinned_snapshot`] for any pinned repository in the model
+/// cache, the contradiction check's NLI checkpoint included: the same three
+/// cases, the same guarantees.
+pub fn remove_failed_snapshot(models_dir: &Path, model: &PinnedRepo<'_>, user_dir: bool) {
+    let repo_dir = models_dir.join(hub_dir_name(model.repo));
     let snapshots = repo_dir.join("snapshots");
     let pinned = [model.revision.to_string()];
     if user_dir {
@@ -460,7 +498,7 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
     }
     let other_complete = snapshot_commits(&snapshots)
         .iter()
-        .any(|c| c != model.revision && snapshot_complete(&snapshots.join(c), model));
+        .any(|c| c != model.revision && snapshot_complete(&snapshots.join(c), model.files));
     if !other_complete {
         if let Err(e) = std::fs::remove_dir_all(&repo_dir)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -468,7 +506,8 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
             tracing::warn!(
                 model = model.id,
                 path = %repo_dir.display(),
-                "could not clear the embedding model's cache directory: {e}"
+                "could not clear the {}'s cache directory: {e}",
+                model.what
             );
         }
         return;
@@ -485,8 +524,9 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
         tracing::warn!(
             model = model.id,
             path = %repo_dir.join("blobs").display(),
-            "removed the pinned snapshot of the embedding model that failed to load, but its \
-             files were copies, so the blobs they came from stay and the next fetch may reuse them"
+            "removed the pinned snapshot of the {} that failed to load, but its \
+             files were copies, so the blobs they came from stay and the next fetch may reuse them",
+            model.what
         );
     }
 }
@@ -497,7 +537,7 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
 /// to is shared and stays. A removal that fails is logged and skipped.
 fn remove_snapshots(
     repo_dir: &Path,
-    model: &LocalModel,
+    model: &PinnedRepo<'_>,
     commits: &[String],
     own_cache: bool,
 ) -> Vec<String> {
@@ -526,7 +566,8 @@ fn remove_snapshots(
                 model = model.id,
                 commit = %commit,
                 path = %dir.display(),
-                "leaving a snapshot of the embedding model in place: {e}"
+                "leaving a snapshot of the {} in place: {e}",
+                model.what
             ),
         }
     }
@@ -1516,5 +1557,98 @@ mod tests {
             );
         }
         assert!(repo.join("blobs").join("kept").is_file());
+    }
+
+    /// A snapshot of `pinned`'s files, each a relative symlink into
+    /// `blobs/<etag>` on unix the way hf-hub writes one, with `refs/main`
+    /// naming it: the contradiction model's shape, which no
+    /// [`LocalModel`] helper can seed.
+    #[cfg(unix)]
+    fn linked_pinned(root: &Path, pinned: &PinnedRepo<'_>, commit: &str, tag: &str) {
+        let repo = root.join(hub_dir_name(pinned.repo));
+        let blobs = repo.join("blobs");
+        let snap = repo.join("snapshots").join(commit);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in pinned.files {
+            let etag = etag(tag, file);
+            std::fs::write(blobs.join(&etag), tag.as_bytes()).unwrap();
+            std::os::unix::fs::symlink(format!("../../blobs/{etag}"), snap.join(file)).unwrap();
+        }
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), commit).unwrap();
+    }
+
+    /// The contradiction model's self-heal follows the embedding model's
+    /// rules. In a folder the user provides, only the failed pinned snapshot
+    /// directory goes, even when it is the only snapshot there: its blobs,
+    /// its ref and the repository directory stay, where the loader before
+    /// the pin wiped the whole repository.
+    #[cfg(unix)]
+    #[test]
+    fn the_nli_self_heal_removes_only_the_failed_snapshot_in_a_user_folder() {
+        let nli = crate::nli::NLI_MODELS[0].pinned();
+        for other in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            if other {
+                linked_pinned(root, &nli, OLD_A, "old");
+            }
+            linked_pinned(root, &nli, nli.revision, "new");
+
+            remove_failed_snapshot(root, &nli, true);
+            let repo = root.join(hub_dir_name(nli.repo));
+            assert!(!repo.join("snapshots").join(nli.revision).exists());
+            for file in nli.files {
+                assert!(
+                    repo.join("blobs").join(etag("new", file)).is_file(),
+                    "{file}"
+                );
+                if other {
+                    assert!(
+                        repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                        "{file}"
+                    );
+                }
+            }
+            assert!(repo.join("refs").join("main").is_file());
+        }
+    }
+
+    /// In Crystalline's own cache the contradiction model's self-heal is the
+    /// embedding model's too: alone, the repository directory is cleared;
+    /// beside another complete snapshot, that snapshot and its blobs stay and
+    /// only the failed one with the blobs only it used goes.
+    #[cfg(unix)]
+    #[test]
+    fn the_nli_self_heal_in_the_own_cache_never_removes_another_snapshot() {
+        let nli = crate::nli::NLI_MODELS[0].pinned();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_pinned(root, &nli, nli.revision, "new");
+        remove_failed_snapshot(root, &nli, false);
+        assert!(!root.join(hub_dir_name(nli.repo)).exists());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_pinned(root, &nli, OLD_A, "old");
+        linked_pinned(root, &nli, nli.revision, "new");
+        remove_failed_snapshot(root, &nli, false);
+        let repo = root.join(hub_dir_name(nli.repo));
+        assert!(!repo.join("snapshots").join(nli.revision).exists());
+        for file in nli.files {
+            assert!(
+                repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                "{file}"
+            );
+            assert!(
+                repo.join("blobs").join(etag("old", file)).is_file(),
+                "{file}"
+            );
+            assert!(
+                !repo.join("blobs").join(etag("new", file)).exists(),
+                "{file}"
+            );
+        }
     }
 }

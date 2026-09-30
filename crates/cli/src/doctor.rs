@@ -2987,7 +2987,7 @@ fn contradiction_summary(
 ) -> serde_json::Value {
     use crystalline_index::nli::{
         LOCAL_NLI_AVAILABLE, NLI_FEATURE_MISSING, NLI_MODELS, NliProfile, RETIRED_NLI_REPOS,
-        nli_model, repo_weights_cached,
+        nli_model, repo_weights_cached, weights_cached,
     };
     let setting = cfg.evolve_contradictions();
     let model = NliProfile::from_setting(setting).map(nli_model);
@@ -3024,7 +3024,12 @@ fn contradiction_summary(
             "stale_checkpoints": stale,
         }),
         Some(m) => {
-            let downloaded = cached(m.repo);
+            // The pinned commit only: the loader fetches it whatever other
+            // snapshot of the repository is cached, so another commit on disk
+            // is not a download the daemon will use.
+            let downloaded = models_dir
+                .as_deref()
+                .is_some_and(|dir| weights_cached(dir, m));
             // A load failure already gets its own line from
             // `contradiction_wait_reason` (the model could not be loaded:
             // <error>); repeating `last_error` here too would print it twice.
@@ -5425,12 +5430,19 @@ mod tests {
     }
 
     /// Fabricates a cached NLI checkpoint at
-    /// `<dir>/<hub name>/snapshots/<id>/model.safetensors`, the shape
-    /// `weights_cached` reads (a config alone is not a download).
+    /// `<dir>/<hub name>/snapshots/<commit>/model.safetensors`, the shape
+    /// `weights_cached` reads (a config alone is not a download): the pinned
+    /// commit for a checkpoint this build runs, any commit for a retired one.
     fn seed_nli_checkpoint(dir: &Path, repo: &str) {
+        let commit = crystalline_index::nli::nli_model_by_repo(repo).map_or("abc", |m| m.revision);
+        seed_nli_snapshot(dir, repo, commit);
+    }
+
+    fn seed_nli_snapshot(dir: &Path, repo: &str, commit: &str) {
         let snap = dir
             .join(crystalline_index::hub_dir_name(repo))
-            .join("snapshots/abc");
+            .join("snapshots")
+            .join(commit);
         std::fs::create_dir_all(&snap).unwrap();
         std::fs::write(snap.join("model.safetensors"), b"w").unwrap();
     }
@@ -5472,6 +5484,31 @@ mod tests {
         assert_eq!(summary["reason"], serde_json::Value::Null);
         assert_eq!(summary["pending_pairs"], 12);
         assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    /// The contradiction model is fetched at a pinned commit, so another
+    /// commit of the same repository on disk is not the download the daemon
+    /// uses: the row says not downloaded, and never lists the live model's
+    /// repository as a stale checkpoint.
+    #[test]
+    fn another_commit_of_the_live_nli_model_is_not_a_download() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let full = nli_model(NliProfile::Full);
+        seed_nli_snapshot(
+            tmp.path(),
+            full.repo,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        assert_eq!(summary["downloaded"], false);
+        assert!(summary["reason"].is_string(), "{summary}");
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+        seed_nli_snapshot(tmp.path(), full.repo, full.revision);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        assert_eq!(summary["downloaded"], true);
     }
 
     /// Final review M1: the row takes `read_only` and `load_retry` from the

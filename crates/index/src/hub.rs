@@ -392,13 +392,6 @@ pub(crate) fn pad_id(
     }
 }
 
-/// Remove one repository's directory from the cache, so the next fetch starts
-/// clean. Best effort: a directory that is already gone is the goal.
-pub(crate) fn wipe_repo_dir(cache_dir: &Path, repo: &str) {
-    let dir = cache_dir.join(hub_dir_name(repo));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[cfg(test)]
 mod tests {
     use super::pad_id;
