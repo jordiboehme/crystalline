@@ -24,6 +24,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AArrowDown,
   AArrowUp,
+  CircleHelp,
+  ExternalLink,
   FoldHorizontal,
   House,
   Moon,
@@ -91,6 +93,7 @@ import {
   storedEngramsOrder,
 } from "../engramsOrder";
 import type { EngramsOrder, EngramsOrderChoice } from "../engramsOrder";
+import { HANDBOOK_URL } from "../handbook";
 import {
   domainRoute,
   githubSettingsRoute,
@@ -707,6 +710,13 @@ export function Layout() {
           setHelpOpen(true);
         },
       },
+      {
+        id: "help.handbook",
+        title: "Open the Handbook",
+        run: () => {
+          window.open(HANDBOOK_URL, "_blank", "noopener,noreferrer");
+        },
+      },
       // Named for the act rather than for the state it is in: a palette row
       // that read "Use full width" on one screen and "Use reading width" on
       // the next is one row a reader has to look twice at.
@@ -822,6 +832,9 @@ export function Layout() {
                   setNavOpen((open) => !open);
                 }}
                 onShare={openShare}
+                onHelp={() => {
+                  setHelpOpen(true);
+                }}
               />
               {/*
           Above everything, on every screen, for as long as this window is
@@ -947,11 +960,14 @@ function TopBar({
   navOpen,
   onToggleNav,
   onShare,
+  onHelp,
 }: {
   navOpen: boolean;
   onToggleNav: () => void;
   /** Share the named domain, or open the picker when there is none. */
   onShare: (domain: string | null) => void;
+  /** Open the keyboard shortcut map, the same one `?` opens. */
+  onHelp: () => void;
 }) {
   const { capabilities } = useAuth();
   const { fullWidth } = useFullWidth();
@@ -1003,6 +1019,7 @@ function TopBar({
         <WidthToggle />
         <TextSizeToggle />
         <ThemeMenu />
+        <HelpMenu onShortcuts={onHelp} />
         <UserMenu />
       </div>
     </header>
@@ -1257,6 +1274,57 @@ function ThemeMenu() {
               </DropdownMenu.RadioItem>
             ))}
           </DropdownMenu.RadioGroup>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+/**
+ * Where to learn more: the Handbook, and the shortcut map `?` opens.
+ *
+ * Beside the account menu, where people look for help, and icon-only like the
+ * other frame-level controls beside it: it matters less than Share and
+ * Maintenance, so it does not carry a word. A menu rather than a plain link
+ * because the shortcut map had no visible way in at all; this is it.
+ */
+function HelpMenu({ onShortcuts }: { onShortcuts: () => void }) {
+  return (
+    <DropdownMenu.Root>
+      <Tooltip label="Help">
+        <DropdownMenu.Trigger
+          aria-label="Help"
+          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
+        >
+          <CircleHelp aria-hidden="true" size={16} strokeWidth={1.75} />
+        </DropdownMenu.Trigger>
+      </Tooltip>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={6}
+          className={MENU_CLASSES}
+        >
+          <DropdownMenu.Item className={ITEM_CLASSES} asChild>
+            <a href={HANDBOOK_URL} target="_blank" rel="noreferrer">
+              Handbook <span className="sr-only">(opens in a new tab)</span>
+              <ExternalLink
+                aria-hidden="true"
+                size={12}
+                strokeWidth={1.75}
+                className="ml-auto text-slate-400"
+              />
+            </a>
+          </DropdownMenu.Item>
+          <DropdownMenu.Item className={ITEM_CLASSES} onSelect={onShortcuts}>
+            Keyboard shortcuts
+            <kbd
+              aria-hidden="true"
+              className="text-caption ml-auto rounded border border-slate-300 px-1 text-slate-500 dark:border-slate-700 dark:text-slate-400"
+            >
+              ?
+            </kbd>
+          </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
