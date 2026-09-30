@@ -32,7 +32,7 @@
 //!    interleaving. Covering test:
 //!    `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
 //!    `tests/users.rs`, which is the only one that spawns a second process, and
-//!    which is `#[cfg(unix)]` because turso 0.7.2 has no shared WAL
+//!    which is `#[cfg(unix)]` because turso 0.7.2 (still so at 0.8.1) has no shared WAL
 //!    coordination on the default Windows IO backend (that file says the whole
 //!    of it). `two_stores_on_one_file_interleave_writes` below covers the
 //!    ordering within one process and nothing about the locking.
@@ -1114,12 +1114,12 @@ fn last_admin_error(verb: &str, name: &str) -> anyhow::Error {
 /// a say, because both act after the open. That is the whole bug this flag
 /// fixes.
 ///
-/// `experimental_multiprocess_wal(true)` (turso 0.7.2) replaces that lock with
+/// `experimental_multiprocess_wal(true)` (turso 0.7.2, unchanged at 0.8.1) replaces that lock with
 /// a shared coordination file beside the database (`web-auth.db-tshm`): the
 /// open adds `OpenFlags::NoLock` instead of locking the file and writers
 /// coordinate through that mapping, so the busy timeout finally does the
 /// waiting it was always meant to do. The rest is read out of the turso 0.7.2
-/// and turso_core 0.7.2 sources (`Database::effective_open_flags_for_path`,
+/// and turso_core 0.7.2 sources, re-read at 0.8.1 (`Database::effective_open_flags_for_path`,
 /// `open_with_flags_async`) and, where noted, checked against a running
 /// daemon:
 ///
@@ -1183,7 +1183,7 @@ async fn open_database(path: &Path) -> Result<Database> {
 /// fallback: with no shared WAL coordination the open takes an exclusive,
 /// process-scoped lock on the file, so whichever of the daemon and the CLI
 /// opens second is refused at open time. That is today's situation on Windows,
-/// where turso 0.7.2's default IO backend reports no shared WAL coordination
+/// where turso 0.7.2's (and 0.8.1's) default IO backend reports no shared WAL coordination
 /// (only the off-by-default `experimental_win_iocp` backend does), and it is
 /// also what a state directory on a network filesystem gets. Turso words it as
 /// a byte-range lock failure, which is true and useless: what the person at the
@@ -1253,6 +1253,9 @@ impl AuthStore {
         conn.execute("PRAGMA busy_timeout = 5000", ())
             .await
             .context("setting the auth database busy timeout")?;
+        // Since turso 0.8.0 `execute_batch` takes exclusive use of the
+        // connection and fails with Misuse "connection is busy with another
+        // operation" while any `Rows` on it is still alive; none is open here.
         conn.execute_batch(SCHEMA)
             .await
             .context("creating the auth database schema")?;
@@ -4903,7 +4906,7 @@ mod tests {
     ///   Where it is off the flag is a documented no-op and legacy behavior
     ///   stays, so a 32-bit target never gets the coordination file.
     /// * an IO backend whose `supports_shared_wal_coordination` is true
-    ///   (turso_core 0.7.2 `io/mod.rs`, where the trait default is `false`).
+    ///   (turso_core 0.7.2 and 0.8.1 `io/mod.rs`, where the trait default is `false`).
     ///   The unix and io_uring backends override it to `true`; the default
     ///   Windows backend, `WindowsIO`, does not, and only `WindowsIOCP`,
     ///   compiled only under the off-by-default `experimental_win_iocp` cargo
