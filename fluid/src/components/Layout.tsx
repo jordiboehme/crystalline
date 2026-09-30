@@ -1016,7 +1016,9 @@ function TopBar({
           </span>
         )}
 
-        <WidthToggle />
+        <span className="hidden sm:inline-flex">
+          <WidthToggle />
+        </span>
         <TextSizeToggle />
         <ThemeMenu />
         <HelpMenu onShortcuts={onHelp} />
@@ -1140,7 +1142,7 @@ function SearchBox() {
   return (
     <form
       role="search"
-      className="mx-auto w-full max-w-xl flex-1"
+      className="mx-auto w-full max-w-xl min-w-0 flex-1"
       onSubmit={(event) => {
         event.preventDefault();
         const trimmed = query.trim();
@@ -1195,6 +1197,10 @@ function SearchBox() {
  * The name says which way it will switch rather than which way it is, the way
  * the sidebar's pair of names does: a control that announces its own state
  * leaves a reader to work out what pressing it would do.
+ *
+ * Below the small breakpoint it steps aside (the top bar wraps it in a span
+ * that is hidden there): on a phone the content is always full width, and the
+ * top bar needs the room.
  */
 function WidthToggle() {
   const { fullWidth, toggleFullWidth } = useFullWidth();
