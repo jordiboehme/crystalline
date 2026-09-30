@@ -3087,6 +3087,7 @@ impl Store for PostgresStore {
             return Ok(false);
         }
         // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        // No contradiction rows to delete: drafts are never scored.
         self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
