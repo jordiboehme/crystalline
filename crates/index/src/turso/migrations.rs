@@ -744,6 +744,11 @@ async fn apply_migrations(conn: &Connection, migrations: &[Migration]) -> Result
         // The DDL and the row that stamps it are one transaction, rolled back
         // together if anything in either fails.
         //
+        // Since turso 0.8.0 `execute_batch` takes exclusive use of the
+        // connection and fails with Misuse "connection is busy with another
+        // operation" while any `Rows` on it is still alive, so nothing here may
+        // hold one across this call.
+        //
         // Not belt and braces: `execute_batch` prepares and runs the statements
         // one at a time with no transaction of its own, so an unwrapped v13 -
         // which drops `engram` and renames another table into its place - can

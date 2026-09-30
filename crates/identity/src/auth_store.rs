@@ -1253,6 +1253,9 @@ impl AuthStore {
         conn.execute("PRAGMA busy_timeout = 5000", ())
             .await
             .context("setting the auth database busy timeout")?;
+        // Since turso 0.8.0 `execute_batch` takes exclusive use of the
+        // connection and fails with Misuse "connection is busy with another
+        // operation" while any `Rows` on it is still alive; none is open here.
         conn.execute_batch(SCHEMA)
             .await
             .context("creating the auth database schema")?;

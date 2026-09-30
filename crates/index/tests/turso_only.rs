@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crystalline_index::{Store, TursoStore, sync_domain};
+use crystalline_index::{RecentFilter, SearchQuery, Store, TursoStore, sync_domain};
 
 fn write(dir: &Path, rel: &str, content: &str) {
     let path = dir.join(rel);
@@ -74,13 +74,79 @@ async fn temporal_current_filter_uses_the_promoted_index() {
         .unwrap();
     let joined = plan.join(" | ");
     assert!(
-        joined.contains("USING INDEX") && joined.contains("idx_engram_current"),
+        (joined.contains("USING INDEX") || joined.contains("USING COVERING INDEX"))
+            && joined.contains("idx_engram_current"),
         "current filter should seek the promoted index, plan was: {joined}"
     );
     assert!(
-        !joined.contains("SCAN engram") || joined.contains("USING INDEX"),
+        !joined.contains("SCAN engram")
+            || joined.contains("USING INDEX")
+            || joined.contains("USING COVERING INDEX"),
         "current filter should not be a bare full scan, plan was: {joined}"
     );
+}
+
+/// A checkpoint after any read still succeeds.
+///
+/// turso 0.8.0 (#8032) refuses `PRAGMA wal_checkpoint` with Busy, "cannot
+/// checkpoint while another statement is active", when any other statement on
+/// the same connection is still mid-flight; 0.7.2 ran it anyway. The store
+/// checkpoints after every sync and at shutdown, so every read helper must
+/// leave its rows drained (`query_all`, `query_first`). This calls a spread of
+/// them against a file-backed store and then checkpoints after each one.
+#[tokio::test]
+async fn a_checkpoint_after_every_read_helper_is_never_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoStore::open(&dir.path().join("index.db"))
+        .await
+        .unwrap();
+    let domain_dir = tempfile::tempdir().unwrap();
+    write(
+        domain_dir.path(),
+        "a.md",
+        &engram("Alpha", "a", "engram", "", "alpha body about pears\n"),
+    );
+    write(
+        domain_dir.path(),
+        "sub/b.md",
+        &engram("Beta", "sub/b", "engram", "", "beta links [[a]]\n"),
+    );
+    sync_domain(&store, "d", domain_dir.path()).await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+
+    store.list_engrams("d", None, None).await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.find_engram("d", "a").await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.domain_names().await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.domain_stats().await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.vocabulary(Some("d"), None).await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.store_info().await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store.embedding_coverage().await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    store
+        .recent(&RecentFilter {
+            domains: None,
+            after: None,
+            engram_types: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    store.checkpoint_wal().await.unwrap();
+    let page = store
+        .search(&SearchQuery {
+            text: Some("pears".to_string()),
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert!(!page.items.is_empty(), "the lexical read found nothing");
+    store.checkpoint_wal().await.unwrap();
 }
 
 /// A body projection never reaches an unbounded sorter.

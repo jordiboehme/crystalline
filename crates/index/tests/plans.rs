@@ -22,14 +22,19 @@
 //! markers with each arm's own rows between them, and an `UPDATE` comes back as
 //! one row per table it reads.
 //!
-//! (b) The spellings these eighteen statements actually produce are `SEARCH
-//! <alias> USING INDEX <name> (<cols>)`, `SEARCH <alias> USING INTEGER PRIMARY
-//! KEY (rowid=?)`, `SCAN <table> AS <alias> USING INDEX <name>`, `MULTI-INDEX
-//! OR <alias> (<idx>, <idx>)` and, once the indexes are dropped, a bare `SCAN
+//! (b) The spellings these statements actually produce are `SEARCH <alias>
+//! USING INDEX <name> (<cols>)`, `SEARCH <alias> USING COVERING INDEX <name>
+//! (<cols>)` (turso 0.8.0 names a seek that a covering index answers this way;
+//! 0.7.2 always said `USING INDEX`), `SEARCH <alias> USING INTEGER PRIMARY KEY
+//! (rowid=?)`, `SCAN <table> AS <alias> USING INDEX <name>`, `MULTI-INDEX OR
+//! <alias> (<idx>, <idx>)` and, once the indexes are dropped, a bare `SCAN
 //! <table>`; plus the markers that read no table - `USE SORTER FOR ORDER BY`,
-//! `USE HASH TABLE FOR DISTINCT`, `CORRELATED SCALAR SUBQUERY <n>`, `COMPOUND
-//! QUERY`, `LEFT-MOST SUBQUERY`, `UNION ALL` and `SCAN CONSTANT ROW`. `USING
-//! COVERING INDEX` is in the crate's vocabulary and none of these produce it.
+//! `USE SORTER FOR GROUP BY`, `USE HASH TABLE FOR DISTINCT`, `HASH JOIN
+//! <table AS alias>`, `MATERIALIZE hash build input for <table>`, `CORRELATED
+//! SCALAR SUBQUERY <n>`, `COMPOUND QUERY`, `LEFT-MOST SUBQUERY`, `UNION ALL`
+//! and `SCAN CONSTANT ROW`, and a ` LEFT-JOIN` suffix on a join line. A hash
+//! join's build input shows its own `SCAN` line, so a hash join over a guarded
+//! table is still caught by that line.
 //!
 //! Two of those decided [`read_of`], which is why it is not a substring test on
 //! `USING INDEX`. `SCAN <table> USING INDEX <name>` is a FULL pass that happens
@@ -848,7 +853,8 @@ async fn seed(store: &dyn Store) -> DomainId {
 /// The three cases the eighteen statements produce, and the reasoning the module
 /// doc records the measurement for:
 ///
-/// - `SEARCH <name> USING ...` is a seek, unless the index it names is an
+/// - `SEARCH <name> USING ...` is a seek, whether it names `USING INDEX` or
+///   `USING COVERING INDEX` (turso 0.8.0), unless the index it names is an
 ///   `ephemeral_` one turso built for this query by reading the whole table.
 /// - `MULTI-INDEX OR <name> (<idx>, <idx>)` is a seek through two indexes at
 ///   once, and carries neither `SEARCH` nor the substring `USING INDEX`, which
@@ -858,8 +864,10 @@ async fn seed(store: &dyn Store) -> DomainId {
 ///   into it, so it needs a `scan_expected` reason exactly as a bare scan does.
 fn read_of(line: &str) -> Option<(&str, bool)> {
     if let Some(rest) = line.strip_prefix("SEARCH ") {
-        let seek = !line.contains("USING INDEX ephemeral_")
-            && (line.contains("USING INDEX") || line.contains("USING INTEGER PRIMARY KEY"));
+        let seek = !line.contains("INDEX ephemeral_")
+            && (line.contains("USING INDEX")
+                || line.contains("USING COVERING INDEX")
+                || line.contains("USING INTEGER PRIMARY KEY"));
         return Some((rest.split_whitespace().next()?, seek));
     }
     if let Some(rest) = line.strip_prefix("MULTI-INDEX OR ") {
