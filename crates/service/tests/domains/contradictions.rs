@@ -1915,3 +1915,83 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
         "{text}"
     );
 }
+
+/// Final review I3: a pair is fresh while both engrams' observation lines
+/// are what the model read, not while their files are byte for byte the
+/// same. Acknowledging a finding (the V302 remedy itself) or raising an
+/// engram's salience rewrites the file and leaves every line as it was, so
+/// the next walk loads no model and scores nothing. A changed line is a new
+/// question and is scored again.
+#[tokio::test]
+async fn a_frontmatter_edit_rescores_nothing_and_a_changed_line_rescores_the_pair() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s.clone(), loads.clone())).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 0)
+    );
+    let idle = || {
+        engine.drop_idle_scorer_at(
+            tokio::time::Instant::now() + NLI_IDLE_DROP + std::time::Duration::from_secs(1),
+        );
+        assert!(!engine.contradiction_scorer_loaded());
+    };
+    idle();
+
+    let row = v302(&sweep(&engine).await)[0].clone();
+    let permalink = row["permalink"].as_str().unwrap().to_string();
+    let scope = row["scope"].as_str().unwrap().to_string();
+    let before = content_of(&engine, &permalink).await;
+    engine
+        .edit_engram(&ack(&permalink, "V302 different builds", Some(&scope)))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_ne!(
+        content_of(&engine, &permalink).await,
+        before,
+        "the file moved"
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0),
+        "an acknowledgment is no new question"
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "and loads no model");
+
+    let salience = EditParams {
+        identifier: "twenty".to_string(),
+        domain: "notes".to_string(),
+        operation: "set_frontmatter".to_string(),
+        key: Some("salience".to_string()),
+        value: Some("7".to_string()),
+        ..EditParams::default()
+    };
+    let before = content_of(&engine, "twenty").await;
+    engine.edit_engram(&salience).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_ne!(
+        content_of(&engine, "twenty").await,
+        before,
+        "the file moved"
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0),
+        "a salience change is no new question"
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 1, "and loads no model");
+
+    // A changed observation line is: the pair is scored again.
+    let forwards = s.forwards();
+    engine.edit_engram(&append_to_twenty()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 6, 0)
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
+    assert!(s.forwards() > forwards);
+}

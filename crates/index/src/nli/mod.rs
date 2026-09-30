@@ -16,8 +16,8 @@ mod stub;
 
 pub use candidates::{
     CandidateFacts, CandidatePair, Candidates, LinePair, contradiction_candidates, eligible, fold,
-    line_pairs, max_related_pairs, observation_hash, pending_pairs, related_threshold, score_rows,
-    scorer_inputs, windows_overlap,
+    line_pairs, max_related_pairs, observation_hash, observations_digest, pending_pairs,
+    related_threshold, score_rows, scorer_inputs, windows_overlap,
 };
 pub use models::{
     CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliArch, NliModel, NliProfile, nli_model,

@@ -1543,9 +1543,11 @@ pub struct ScoredPair {
     pub a: EngramId,
     /// The engram with the higher id.
     pub b: EngramId,
-    /// `a`'s content checksum at scoring time, as `file_stamps` reports it.
+    /// `a`'s observation digest at scoring time
+    /// ([`crate::nli::observations_digest`]): what the model read, not the
+    /// file's checksum, so a frontmatter-only edit keeps the pair scored.
     pub checksum_a: String,
-    /// `b`'s content checksum at scoring time.
+    /// `b`'s observation digest at scoring time.
     pub checksum_b: String,
 }
 

@@ -20,7 +20,7 @@ use super::*;
 use crystalline_index::nli::{
     CandidateFacts, CandidatePair, ContradictionScorer, MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE,
     NliModel, NliProfile, contradiction_candidates, eligible, line_pairs, max_related_pairs,
-    nli_model, pending_pairs, related_threshold, score_rows, scorer_inputs,
+    nli_model, observations_digest, pending_pairs, related_threshold, score_rows, scorer_inputs,
 };
 use crystalline_index::{ContradictionRow, ScoredPair};
 
@@ -39,7 +39,10 @@ pub(crate) struct ContradictionFact {
     pub(crate) valid_from: Option<NaiveDate>,
     /// End of the validity window; absent is unbounded.
     pub(crate) valid_to: Option<NaiveDate>,
-    /// The content checksum `file_stamps` reports for the engram's path.
+    /// The observation digest ([`observations_digest`]): what the model
+    /// reads of the engram, which is what a scored pair and a parked failure
+    /// are keyed by. The file stamps only decide whether a domain is parsed
+    /// again ([`walk_digest`]).
     pub(crate) checksum: String,
     /// The lead vector for the active embedding model, when asked for and
     /// stored.
@@ -746,7 +749,7 @@ impl Engine {
 
     /// The contradiction check's facts for one domain's base engrams: the
     /// listing, each engram parsed through `source` (frontmatter status and
-    /// window, observations), its checksum from `stamps`, and, when
+    /// window, observations), its observation digest, and, when
     /// `with_lead_vectors`, its lead vector for the active embedding model.
     /// The one assembly of the check: the sweep never builds its own, it
     /// reads the counts the walk kept from this one
@@ -784,9 +787,9 @@ impl Engine {
         };
         let mut facts = Vec::with_capacity(descs.len());
         for d in &descs {
-            let Some(stamp) = stamps.get(&d.path) else {
+            if !stamps.contains_key(&d.path) {
                 continue;
-            };
+            }
             let Some(engram) = self.load_engram(source, domain_id, &d.path).await else {
                 continue;
             };
@@ -798,21 +801,22 @@ impl Engine {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| d.status.trim())
                 .to_lowercase();
+            let observations: Vec<FactObservation> = engram
+                .observations
+                .iter()
+                .map(|o| FactObservation {
+                    line: o.line,
+                    text: o.content.clone(),
+                })
+                .collect();
             facts.push(ContradictionFact {
                 id: d.id,
                 status,
                 valid_from: fm.valid_from,
                 valid_to: fm.valid_to,
-                checksum: stamp.sha256.clone(),
+                checksum: observations_digest(&observations),
                 lead_vector: vectors.remove(&d.id.0),
-                observations: engram
-                    .observations
-                    .iter()
-                    .map(|o| FactObservation {
-                        line: o.line,
-                        text: o.content.clone(),
-                    })
-                    .collect(),
+                observations,
             });
         }
         Ok(facts)

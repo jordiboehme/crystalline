@@ -27,7 +27,9 @@ pub struct CandidateFacts<'a> {
     pub valid_from: Option<NaiveDate>,
     /// End of the validity window; absent is unbounded.
     pub valid_to: Option<NaiveDate>,
-    /// The content checksum `file_stamps` reports for the engram's path.
+    /// What the model reads of the engram, [`observations_digest`]: a pair
+    /// stays scored while both digests match, whatever else in the files
+    /// changed.
     pub checksum: &'a str,
     /// The lead vector for the active embedding model, when stored.
     pub lead_vector: Option<&'a [f32]>,
@@ -215,6 +217,25 @@ pub fn fold(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The freshness key of one engram for the contradiction check: the
+/// lowercase hex sha256 of its observation texts, folded, in document order,
+/// lines with no words left out (they are never paired). Only these texts
+/// reach the model, so a frontmatter edit (an acknowledgment, a salience, a
+/// provenance refresh) or a prose edit leaves the key and every scored pair
+/// as they are, and a changed, added, removed or moved line changes it.
+pub fn observations_digest(observations: &[FactObservation]) -> String {
+    let mut h = Sha256::new();
+    for o in observations {
+        let folded = fold(&o.text);
+        if folded.is_empty() {
+            continue;
+        }
+        h.update(folded.as_bytes());
+        h.update([0]);
+    }
+    crate::hex_lower(&h.finalize())
+}
+
 /// The lowercase hex sha256 of the folded text.
 pub fn observation_hash(text: &str) -> String {
     let mut h = Sha256::new();
@@ -316,6 +337,34 @@ mod tests {
             line,
             text: text.to_string(),
         }
+    }
+
+    /// The digest follows what the model reads: the folded texts in order.
+    /// Line numbers (a line moved down by prose above it), whitespace runs
+    /// and wordless lines are not part of it; a changed or reordered text is.
+    #[test]
+    fn the_observations_digest_follows_the_folded_texts_in_order() {
+        let base = observations_digest(&[obs(5, "Node 18"), obs(6, "Retries back off")]);
+        assert_eq!(
+            base,
+            observations_digest(&[
+                obs(9, "Node  18 "),
+                obs(10, " "),
+                obs(11, "Retries back off")
+            ])
+        );
+        assert_ne!(
+            base,
+            observations_digest(&[obs(5, "Node 20"), obs(6, "Retries back off")])
+        );
+        assert_ne!(
+            base,
+            observations_digest(&[obs(5, "Retries back off"), obs(6, "Node 18")])
+        );
+        assert_ne!(
+            base,
+            observations_digest(&[obs(5, "Node 18Retries back off")])
+        );
     }
 
     fn unit(v: &[f32]) -> Vec<f32> {
