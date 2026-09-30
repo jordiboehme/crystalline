@@ -6,7 +6,7 @@
 use assert_cmd::Command;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn version_output_names_the_copyright_the_license_and_the_source() {
 /// the test that fails the day one of them is changed alone.
 #[test]
 fn the_version_block_and_the_banner_name_one_holder() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_crystalline"))
+    let out = crate::common::crystalline_std()
         .arg("--version")
         .output()
         .expect("the binary runs");

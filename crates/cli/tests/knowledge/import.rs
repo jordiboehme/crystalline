@@ -13,7 +13,7 @@ use predicates::prelude::*;
 use serde_json::Value;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// Scaffold and register a fresh domain, returning its root path. `import`

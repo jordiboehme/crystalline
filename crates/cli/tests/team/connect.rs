@@ -24,7 +24,7 @@ use assert_cmd::Command;
 use crate::common::isolate;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// A stand-in for the forge, answering `GET /user` as `login` for as long as

@@ -18,7 +18,7 @@ use serde_json::Value;
 use serde_json::json;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -1000,7 +1000,7 @@ fn a_held_lock_with_no_record_is_never_treated_as_stale() {
     let (home, state_dir) = isolated_home("held-no-record");
     let apply = |cmd: &mut Command| apply_home(cmd, &home);
 
-    let mut holder = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+    let mut holder = crate::common::crystalline_std();
     holder
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join("config"))

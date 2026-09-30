@@ -16,7 +16,7 @@ use assert_cmd::Command;
 use crate::common::isolate;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 /// A workspace: an isolated home holding a registered file domain `eng` and

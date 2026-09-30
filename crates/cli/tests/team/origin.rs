@@ -21,7 +21,7 @@ use assert_cmd::Command;
 use crate::common::isolate;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 // --- domain add --origin: flag validation (no network) -----------------------
@@ -1181,7 +1181,6 @@ mod chain {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use assert_cmd::Command;
     use serde_json::{Value, json};
 
     /// A stand-in daemon answering exactly one ctl command.
@@ -1317,7 +1316,7 @@ mod chain {
         }
 
         fn invoke(&self, args: &[&str]) -> std::process::Output {
-            let mut cmd = Command::cargo_bin("crystalline").unwrap();
+            let mut cmd = crate::common::crystalline();
             cmd.env("HOME", &self.dir)
                 .env("XDG_CONFIG_HOME", self.dir.join("config"))
                 .env("XDG_STATE_HOME", self.dir.join("state"))
