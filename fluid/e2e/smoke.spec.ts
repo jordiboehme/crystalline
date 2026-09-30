@@ -152,6 +152,35 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("the Help menu reaches the Handbook and the shortcut map, and the top bar fits a phone", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Help" }).click();
+  const handbook = page.getByRole("menuitem", {
+    name: "Handbook (opens in a new tab)",
+  });
+  await expect(handbook).toHaveAttribute(
+    "href",
+    "https://jordiboehme.github.io/crystalline/",
+  );
+  await page.getByRole("menuitem", { name: /^Keyboard shortcuts/ }).click();
+  await expect(
+    page.getByRole("dialog", { name: /keyboard shortcuts/i }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  // A phone: the extra icon must not push the row past the screen. jsdom has
+  // no layout, so only a browser can see this.
+  await page.setViewportSize({ width: 360, height: 780 });
+  await expect(page.getByRole("button", { name: "Help" })).toBeVisible();
+  const overflow = await page
+    .locator("header")
+    .first()
+    .evaluate((el) => el.scrollWidth - el.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+});
+
 test("the Rename dialog opens from the domain page and can be cancelled", async ({
   page,
 }) => {
