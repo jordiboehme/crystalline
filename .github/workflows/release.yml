@@ -338,6 +338,44 @@ jobs:
           sha256sum * > SHA256SUMS
           ls -la
 
+      # actions/attest fails only when a whole subject list matches nothing,
+      # so a single renamed asset would drop out of its attestation without a
+      # sound. Every path and glob the attest steps below use is checked here
+      # first, and a missing one stops the release before anything is signed.
+      - name: Check the attestation subjects exist
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in \
+            SHA256SUMS \
+            "crystalline-fluid-${TAG}.cdx.json" \
+            "crystalline-${TAG}.mcpb"; do
+            [ -f "release/$f" ] || { echo "::error::missing attestation subject release/$f"; missing=1; }
+          done
+          for p in macos-arm64 macos-intel linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
+            [ -f "release/crystalline-${TAG}-${p}.cdx.json" ] || { echo "::error::missing SBOM release/crystalline-${TAG}-${p}.cdx.json"; missing=1; }
+          done
+          for f in macos-arm64.tar.gz macos-arm64.mcpb macos-intel.tar.gz macos-intel.mcpb \
+            linux-amd64.tar.gz linux-arm64.tar.gz \
+            windows-amd64.zip windows-amd64.msi windows-amd64.mcpb \
+            windows-arm64.zip windows-arm64.msi windows-arm64.mcpb; do
+            [ -f "release/crystalline-${TAG}-${f}" ] || { echo "::error::missing attestation subject release/crystalline-${TAG}-${f}"; missing=1; }
+          done
+          for g in \
+            'release/crystalline_*_amd64.deb' \
+            'release/crystalline_*_arm64.deb' \
+            "release/crystalline-${TAG}-*.tar.gz" \
+            "release/crystalline-${TAG}-*.zip" \
+            "release/crystalline-${TAG}-*.msi" \
+            'release/crystalline_*.deb' \
+            "release/crystalline-${TAG}*.mcpb"; do
+            compgen -G "$g" > /dev/null || { echo "::error::no attestation subject matches $g"; missing=1; }
+          done
+          exit "$missing"
+
       # Build provenance for every release asset, SHA256SUMS and the SBOMs
       # included, in one attestation. Verify with
       # `gh attestation verify <file> --repo jordiboehme/crystalline`.
@@ -600,11 +638,8 @@ jobs:
           tags: ${{ steps.meta_with_model.outputs.tags }}
           labels: ${{ steps.meta_with_model.outputs.labels }}
 
-      # Provenance for the pushed image index, stored in the registry beside
-      # it. Verify with
-      # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline:<version> --repo jordiboehme/crystalline`.
-      # No storage record: that needs a third permission and an
-      # organisation-owned repository.
+      # As for the runtime image above; verify with
+      # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline:<version>-with-model --repo jordiboehme/crystalline`.
       - name: Attest the with-model image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -681,11 +716,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Provenance for the pushed image index, stored in the registry beside
-      # it. Verify with
+      # As for the runtime image in the images job; verify with
       # `gh attestation verify oci://ghcr.io/jordiboehme/crystalline-fluid:<version> --repo jordiboehme/crystalline`.
-      # No storage record: that needs a third permission and an
-      # organisation-owned repository.
       - name: Attest the Fluid image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
