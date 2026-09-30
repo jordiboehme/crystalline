@@ -1857,6 +1857,230 @@ async fn a_domain_prefixed_identifier_never_resolves_and_the_error_teaches_the_f
     assert_eq!(read["title"], json!("Guide"));
 }
 
+/// A domain-scoped identifier resolves by permalink and title only. A
+/// reference copied from the file tree - the folder plus the file name, with
+/// or without `.md`, in any case - is no identifier: it misses on reads, write
+/// verbs and validate_engrams alike, and the miss names the permalink its
+/// slug is, so the next call succeeds (#111).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_path_never_resolves_and_the_miss_names_the_permalink() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    let file = h.root.join("eng/guides/Agent Workflow Guide.md");
+    std::fs::write(
+        &file,
+        "---\ntype: guide\ntitle: Workflow\npermalink: guides/agent-workflow-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] the guide lives under guides #eng\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+        "guides/agent workflow guide",
+    ] {
+        let err = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .expect_err(identifier);
+        assert!(
+            err.contains(&format!(
+                "no engram '{identifier}' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
+            )),
+            "{identifier}: {err}"
+        );
+    }
+
+    // A write verb misses the same way and leaves the file alone.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "guides/Agent Workflow Guide", "domain": "eng",
+            "operation": "append", "content": "- [fact] edited by path #eng",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("Did you mean `guides/agent-workflow-guide`?"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // So does validate_engrams' identifier.
+    let err = call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "eng", "identifier": "guides/Agent Workflow Guide.md" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("Did you mean `guides/agent-workflow-guide`?"),
+        "{err}"
+    );
+
+    // The permalink the hint names resolves, and so does the title.
+    for identifier in ["guides/agent-workflow-guide", "workflow"] {
+        let read = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{identifier}: {e}"));
+        assert_eq!(
+            read["permalink"],
+            json!("guides/agent-workflow-guide"),
+            "{identifier}"
+        );
+    }
+
+    // The MANIFEST's filename is no identifier either, and the miss names
+    // its permalink, as the routing skill says.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "MANIFEST.md", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("no engram 'MANIFEST.md' in domain 'eng'. Did you mean `manifest`?"),
+        "{err}"
+    );
+
+    // A plain miss that slugifies to itself carries no hint.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "nope", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("no engram 'nope' in domain 'eng'"), "{err}");
+    assert!(!err.contains("Did you mean"), "{err}");
+}
+
+/// The hint only names a permalink the identifier's slug is. An engram with
+/// a custom permalink is not found through its file path at all: the miss
+/// stays plain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_permalink_is_not_hinted_from_its_file_path() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::create_dir_all(h.root.join("eng/guides")).unwrap();
+    std::fs::write(
+        h.root.join("eng/guides/Agent Workflow Guide.md"),
+        "---\ntype: guide\ntitle: Workflow\npermalink: agent-guide\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Workflow\n\n- [convention] agents read before they write #eng\n- [fact] this one carries a custom permalink #eng\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let err = call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "guides/Agent Workflow Guide", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("no engram 'guides/Agent Workflow Guide' in domain 'eng'"),
+        "{err}"
+    );
+    assert!(!err.contains("Did you mean"), "{err}");
+}
+
+/// After an in-place rename the old permalink is only the file's path, and a
+/// path is no identifier: a stale `alpha` misses on read, delete and move,
+/// with or without `.md`, and nothing is deleted or moved (#111).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_permalink_misses_after_an_in_place_rename() {
+    let h = Harness::new(&["eng"]).await;
+    let file = h.root.join("eng/alpha.md");
+    let text = |permalink: &str| {
+        format!(
+            "---\ntype: engram\ntitle: Renamed Page\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-09-01\n---\n\n# Renamed Page\n\n- [fact] the file stays where it was #eng\n- [fact] only the permalink moves #eng\n"
+        )
+    };
+    std::fs::write(&file, text("alpha")).unwrap();
+    h.engine.sync(None).await.unwrap();
+    std::fs::write(&file, text("beta")).unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for identifier in ["alpha", "alpha.md"] {
+        let miss = format!("no engram '{identifier}' in domain 'eng'");
+        let err = call(
+            peer,
+            "read_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "read {identifier}: {err}");
+        let err = call(
+            peer,
+            "delete_engram",
+            json!({ "identifier": identifier, "domain": "eng" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "delete {identifier}: {err}");
+        let err = call(
+            peer,
+            "move_engram",
+            json!({ "identifier": identifier, "domain": "eng", "destination": "moved/alpha" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(&miss), "move {identifier}: {err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        text("beta"),
+        "nothing was deleted or moved"
+    );
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "beta", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["path"], json!("alpha.md"));
+}
+
+/// The read_engram copy says a miss names the permalink it probably meant,
+/// and no longer offers the file path as an identifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_the_miss_hint() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let read = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "read_engram")
+        .expect("read_engram tool present");
+    let description = read.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("a miss names the permalink it probably meant"),
+        "read_engram teaches the miss hint: {description}"
+    );
+    assert!(
+        !description.contains("file path inside the domain"),
+        "read_engram no longer offers the file path: {description}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_filter_only_and_text_fallback() {
     let h = Harness::new(&["eng"]).await;
@@ -3551,6 +3775,104 @@ async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
     .await
     .unwrap_err();
     assert!(err.contains("set_frontmatter requires key"), "{err}");
+}
+
+/// Provenance is writable after the fact: a re-ingest moves an engram's
+/// resource to the new commit and a record's source_version with it (#105).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_writes_and_clears_resource_and_source_version() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry Doc", "content": "- [fact] a\n- [fact] b\n- [fact] c" }),
+    )
+    .await
+    .unwrap();
+
+    let url = "https://github.com/acme/api/blob/0a1b2c3d/docs/retry: notes.md#L10";
+    for (key, value) in [("resource", url), ("source_version", "0a1b2c3d")] {
+        call(
+            peer,
+            "edit_engram",
+            json!({ "domain": "eng", "identifier": "retry-doc", "operation": "set_frontmatter", "key": key, "value": value }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    }
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "retry-doc", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["frontmatter"]["resource"], json!(url));
+    let text = std::fs::read_to_string(h.root.join("eng/retry-doc.md")).unwrap();
+    let parsed = crystalline_core::parse_engram(&text).unwrap();
+    assert_eq!(parsed.frontmatter.resource.as_deref(), Some(url));
+    assert_eq!(
+        parsed
+            .frontmatter
+            .extra
+            .get("source_version")
+            .and_then(|v| v.as_str()),
+        Some("0a1b2c3d")
+    );
+
+    // An omitted value removes the key, like the date keys.
+    call(
+        peer,
+        "edit_engram",
+        json!({ "domain": "eng", "identifier": "retry-doc", "operation": "set_frontmatter", "key": "resource" }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(h.root.join("eng/retry-doc.md")).unwrap();
+    assert!(!text.contains("resource:"), "{text}");
+}
+
+/// edit_engram's copy names the provenance keys set_frontmatter accepts, so an
+/// agent reconciling an ingested engram finds the verb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_settable_provenance() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let edit = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram tool present");
+    let description = edit.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("source_date, resource, source_version, salience"),
+        "edit_engram lists the provenance keys: {description}"
+    );
+}
+
+/// evolve_engrams' copy names V111 and the verb that repairs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_v111() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let evolve = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "evolve_engrams")
+        .expect("evolve_engrams tool present");
+    let description = evolve.description.as_deref().unwrap_or("");
+    assert!(
+        description.contains("V111"),
+        "evolve_engrams names V111: {description}"
+    );
+    assert!(
+        description.contains("set_frontmatter key resource"),
+        "evolve_engrams names the repair: {description}"
+    );
 }
 
 /// A date key goes through the temporal write contract, so a timestamp is
@@ -6171,4 +6493,57 @@ async fn an_alias_of_a_hidden_domain_answers_like_an_unknown_name_over_mcp() {
             .unwrap();
         assert_eq!(browsed["domain"], "hush-lab", "{browsed}");
     }
+}
+
+/// Issue 112: the description says an overwrite keeps the file and where it
+/// refuses, so an agent regenerating an engram knows what will happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_an_overwrite_keeps_the_file() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        text.contains("in its own file, whatever that file is called"),
+        "{text}"
+    );
+    assert!(text.contains("move_engram it first"), "{text}");
+}
+
+/// Issue 113: origin_status says what a kept branch is, so an agent relays it
+/// instead of skipping an unknown key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_kept_branches() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    // origin_status is one of the six collaboration tools withheld from
+    // tools/list while github.enabled is off (as in
+    // tool_descriptions_teach_review_mode).
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "origin_status")
+        .expect("origin_status tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(text.contains("kept_branches"), "{text}");
 }

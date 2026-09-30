@@ -50,6 +50,9 @@ zip = { workspace = true }
 # The argon2 verification counter the `auth` unit test reads across the
 # crate boundary (see crystalline-identity's `testing` feature).
 crystalline-identity = { workspace = true, features = ["testing"] }
+# The engine's test seams (`fail_hidden_domains` for the event stream's
+# fail-closed branch).
+crystalline-engine = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tower-service = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -346,6 +346,11 @@ enum Command {
         /// never outlives Claude Desktop.
         #[arg(long, hide = true)]
         exit_when_idle: bool,
+        /// Set by the daemon spawn path, never by a person: Windows refused to
+        /// let this daemon leave the job of the program that started it, so it
+        /// runs inside that job. Reported by `crystalline doctor`.
+        #[arg(long, hide = true)]
+        breakaway_refused: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -431,10 +436,11 @@ enum Command {
         /// Extra frontmatter as a JSON object.
         #[arg(long)]
         metadata: Option<String>,
-        /// Overwrite an existing engram with the same permalink. Where
-        /// somebody has that page open in the web editor, the new text lands
-        /// in their open document while they are looking at it; the receipt
-        /// says so and names who is in there.
+        /// Replace the engram that already answers to this permalink, in its
+        /// own file, whatever that file is called; an engram in another folder
+        /// is refused. Where somebody has that page open in the web editor,
+        /// the new text lands in their open document while they are looking
+        /// at it; the receipt says so and names who is in there.
         #[arg(long)]
         overwrite: bool,
         /// Load the global config from this file instead of the default path.
@@ -445,7 +451,8 @@ enum Command {
     Read {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
-        /// name.
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// Restrict resolution to this domain.
         #[arg(long)]
@@ -458,7 +465,8 @@ enum Command {
     Edit {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
-        /// name.
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain.
         domain: String,
@@ -473,8 +481,8 @@ enum Command {
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
         /// The frontmatter field to assign, for set_frontmatter: status,
-        /// valid_from, valid_to, stale_after, source_date, salience or
-        /// verified.
+        /// valid_from, valid_to, stale_after, source_date, resource,
+        /// source_version, salience or verified.
         #[arg(long)]
         key: Option<String>,
         /// The value to assign, for set_frontmatter. Omit to remove the field;
@@ -508,7 +516,8 @@ enum Command {
     Move {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
-        /// name.
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's current domain.
         domain: String,
@@ -538,7 +547,8 @@ enum Command {
     Split {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
-        /// name.
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain. The new engram lands in the same domain.
         domain: String,
@@ -568,7 +578,8 @@ enum Command {
     Delete {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
-        /// name.
+        /// name. A file path is not an identifier: a miss names the permalink
+        /// it probably meant.
         identifier: String,
         /// The engram's domain.
         domain: String,
@@ -1786,6 +1797,7 @@ fn main() -> anyhow::Result<()> {
             daemon,
             autostarted,
             exit_when_idle,
+            breakaway_refused,
             read_only,
             take_over,
             config,
@@ -1812,6 +1824,7 @@ fn main() -> anyhow::Result<()> {
                     read_only,
                     take_over,
                     exit_when_idle,
+                    breakaway_refused,
                 )
             }) {
                 Ok(()) => Ok(()),
@@ -2894,6 +2907,28 @@ fn direct_share_lines(d: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// The share branches kept upstream, each as its sentence with the forge's
+/// reason under it, except for a refused delete, whose sentence already holds
+/// the reason. Nothing at all when none is kept, and an older daemon sends no
+/// key (nor any `kind`, so its reason line shows as before).
+fn kept_branch_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(kept) = d["kept_branches"].as_array() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for entry in kept {
+        let Some(message) = entry["message"].as_str() else {
+            continue;
+        };
+        lines.push(format!("  {message}"));
+        let refused = entry["kind"].as_str() == Some("delete_refused");
+        if !refused && let Some(reason) = entry["reason"].as_str() {
+            lines.push(format!("    {reason}"));
+        }
+    }
+    lines
+}
+
 /// What a reviewing domain is holding that no share would pick up: this
 /// session's own drafts, and - for whoever holds the domain - who else is
 /// drafting in it.
@@ -3123,6 +3158,9 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
         }
         if d["repair_pending"].as_bool().unwrap_or(false) {
             println!("  repair pending - the next share or withdraw finishes it");
+        }
+        for line in kept_branch_lines(d) {
+            println!("{line}");
         }
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(
@@ -4728,6 +4766,46 @@ mod tests {
         assert!(
             direct_share_lines(&json!({ "domain": "kb" })).is_empty(),
             "and neither does an older daemon"
+        );
+    }
+
+    /// A kept branch prints its sentence and the forge's reason under it, and
+    /// nothing prints when nothing is kept or the daemon is older.
+    #[test]
+    fn the_kept_branch_lines_name_the_branch_and_the_reason() {
+        assert_eq!(
+            kept_branch_lines(&json!({
+                "kept_branches": [{
+                    "branch": "crystalline/share-1",
+                    "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+                    "reason": "GitHub returned an unexpected answer (status 422): nope",
+                }],
+            })),
+            vec![
+                "  Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.".to_string(),
+                "    GitHub returned an unexpected answer (status 422): nope".to_string(),
+            ]
+        );
+        assert!(kept_branch_lines(&json!({ "kept_branches": [] })).is_empty());
+        assert!(kept_branch_lines(&json!({ "domain": "kb" })).is_empty());
+    }
+
+    /// A refused delete names its reason inside the sentence, so no second
+    /// line repeats it.
+    #[test]
+    fn a_refused_delete_prints_no_reason_line() {
+        assert_eq!(
+            kept_branch_lines(&json!({
+                "kept_branches": [{
+                    "branch": "crystalline/share-1",
+                    "kind": "delete_refused",
+                    "message": "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+                    "reason": "GitHub returned an unexpected answer (status 422): Reference update failed",
+                }],
+            })),
+            vec![
+                "  Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.".to_string(),
+            ]
         );
     }
 

@@ -48,7 +48,7 @@ import {
   Printer,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { discardChanges, refusalSentence } from "../api/admin";
@@ -94,7 +94,11 @@ import { RetireDialog } from "../components/RetireDialog";
 import { ShareDialog } from "../components/ShareDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
-import { plural } from "../format";
+import { domainSpellings } from "../domainNames";
+import type { RecentChange } from "../events/recent";
+import { useRecentChange } from "../events/recent";
+import { useHoldPlace, useScrollKeeper } from "../events/useScrollKeeper";
+import { formatActor, plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import { prefetchEngramEditor } from "../prefetch";
@@ -117,8 +121,17 @@ export default function EngramPage() {
    * dialog hands the counts over in the navigation state, since the dialog
    * that could have said so is gone by the time this page renders.
    */
-  const moved =
-    (useLocation().state as Partial<MovedState> | null)?.moved ?? null;
+  const location = useLocation();
+  const arrival = location.state as
+    (Partial<MovedState> & { followedFrom?: string }) | null;
+  const moved = arrival?.moved ?? null;
+  /**
+   * The permalink this page was at when the stream said it moved here, set
+   * by the follow below: the text is the same engram's, so the old address's
+   * payload stands in while the new one loads, and the page (and the live
+   * region that is about to announce the move) stays mounted through it.
+   */
+  const followedFrom = arrival?.followedFrom ?? null;
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
   // What the chip beside the title opened: the diff, the share dialog about
@@ -152,6 +165,12 @@ export default function EngramPage() {
   const detail = useQuery({
     queryKey: engramDetailKey(domain, permalink),
     queryFn: () => fetchEngramDetail(domain, permalink),
+    placeholderData: (previous, previousQuery) =>
+      followedFrom !== null &&
+      previousQuery?.queryKey[1] === domain &&
+      previousQuery.queryKey[2] === followedFrom
+        ? previous
+        : undefined,
   });
   const graph = useQuery({
     queryKey: graphKey(domain, permalink, NEIGHBORHOOD_DEPTH),
@@ -161,12 +180,57 @@ export default function EngramPage() {
     enabled: detail.isSuccess,
   });
 
-  // The names alone, and only once the listing has landed: the resolver reads
-  // a missing list as "this caller cannot tell whether a prefix is a domain"
-  // and an empty one as "none of them is", so handing it an empty array while
-  // the request is in flight would answer a question nobody can answer yet.
+  // What the stream last said about this engram, for the status line and
+  // for following a move. The stream itself only invalidates; the refetch
+  // that moves the text is the detail query's own.
+  const recent = useRecentChange(domain, permalink);
+  useEffect(() => {
+    if (recent?.kind === "moved_away" && recent.to) {
+      void navigate(engramRoute(domain, recent.to), {
+        replace: true,
+        state: { followedFrom: permalink },
+      });
+    }
+  }, [recent, domain, permalink, navigate]);
+  /*
+   * The stream's frame for the reader's own move through the dialog, which
+   * the "Moved" line above already says with its counts: that one frame is
+   * swallowed, and only while this history entry is the one the dialog
+   * landed on. Every later change, whoever made it, has its line.
+   */
+  const [ownMove, setOwnMove] = useState<{ at: string; key: string } | null>(
+    null,
+  );
+  const ownMoveNow =
+    moved !== null &&
+    recent?.kind === "moved_here" &&
+    ownMove?.at !== location.key
+      ? { at: location.key, key: changeKey(recent) }
+      : ownMove;
+  if (ownMoveNow !== ownMove) {
+    setOwnMove(ownMoveNow);
+  }
+  const swallowed =
+    recent !== null &&
+    ownMoveNow !== null &&
+    ownMoveNow.at === location.key &&
+    ownMoveNow.key === changeKey(recent);
+  useScrollKeeper({
+    address: `${domain}/${permalink}`,
+    fetching: detail.isFetching,
+    checksum: detail.data?.checksum,
+  });
+
+  // Every spelling of every domain, and only once the listing has landed: the
+  // resolver reads a missing table as "this caller cannot tell whether a
+  // prefix is a domain" and an empty one as "none of them is", so handing it
+  // an empty table while the request is in flight would answer a question
+  // nobody can answer yet.
   const domainNames = useMemo(
-    () => domains.data?.domains.map((entry) => entry.name),
+    () =>
+      domains.data === undefined
+        ? undefined
+        : domainSpellings(domains.data.domains),
     [domains.data],
   );
 
@@ -592,6 +656,20 @@ export default function EngramPage() {
             : "Your private draft. The shared tree has not moved; share it for review when it is ready."}
         </p>
       )}
+      {/*
+        What the stream last said about this page, for a minute. The region
+        is always there and never keyed, so a screen reader hears the text
+        arrive in a region it already knows, a followed move included.
+
+        Nothing for the frame of the reader's own move through the dialog
+        (swallowed above), and nothing at the old address, which is about to
+        follow the move.
+      */}
+      <RecentChangeLine
+        change={
+          recent && recent.kind !== "moved_away" && !swallowed ? recent : null
+        }
+      />
 
       <LifecycleBanner
         status={engram.frontmatter.status}
@@ -904,6 +982,85 @@ function EngramNotFound({
       </Link>
     </div>
   );
+}
+
+/** How long the status line stays after a change. A newer one resets it. */
+export const RECENT_CHANGE_MS = 60_000;
+
+/**
+ * "Updated a moment ago by ada": the same shape as the draft line above it,
+ * in the neutral chip colors rather than amber. Not a control, and no
+ * accessible name a journey could depend on beyond the region's own.
+ *
+ * It never counts up to "two minutes ago": it is gone at the minute. Between
+ * changes the region stays mounted, empty and visually hidden, so what a
+ * screen reader hears is text arriving in a live region it already knows.
+ */
+function RecentChangeLine({ change }: { change: RecentChange | null }) {
+  const shownKey = change ? changeKey(change) : null;
+  /** The change whose minute is over, by its key: a newer one shows again. */
+  const [expired, setExpired] = useState(() =>
+    change && isOver(change) ? shownKey : null,
+  );
+  /*
+   * A change the line has not shown before, which after a followed link can
+   * be one whose minute is already over (the page stays mounted across
+   * addresses, and so does this region, so a screen reader keeps hearing
+   * the one it already knows). Settled during render, not in an effect, so
+   * an old change never paints for a frame.
+   */
+  const [seen, setSeen] = useState(shownKey);
+  if (shownKey !== seen) {
+    setSeen(shownKey);
+    setExpired(change && isOver(change) ? shownKey : null);
+  }
+  useEffect(() => {
+    if (!change) return undefined;
+    const over = changeKey(change);
+    const timer = setTimeout(
+      () => {
+        setExpired(over);
+      },
+      Math.max(0, change.at + RECENT_CHANGE_MS - Date.now()),
+    );
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [change]);
+  const text = change && shownKey !== expired ? recentChangeText(change) : "";
+  // The line changes the height above the body when it comes and when it
+  // goes; the reader's place holds either way.
+  const line = useRef<HTMLParagraphElement>(null);
+  useHoldPlace(() => line.current?.nextElementSibling ?? null, text);
+  return (
+    <p
+      ref={line}
+      role="status"
+      aria-label="Recent change"
+      aria-live="polite"
+      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 empty:sr-only dark:bg-slate-800 dark:text-slate-200"
+    >
+      {text}
+    </p>
+  );
+}
+
+/** Whether a change's minute on the line is already over. */
+function isOver(change: RecentChange): boolean {
+  return Date.now() - change.at >= RECENT_CHANGE_MS;
+}
+
+function changeKey(change: RecentChange): string {
+  return `${change.kind}:${String(change.at)}:${change.actor ?? ""}`;
+}
+
+/** The line's words, the actor named the way the details panel names one. */
+function recentChangeText(change: RecentChange): string {
+  const verb =
+    change.kind === "moved_here"
+      ? "Moved here a moment ago"
+      : "Updated a moment ago";
+  return change.actor ? `${verb} by ${formatActor(change.actor)}` : verb;
 }
 
 /** Whether this failure is the server saying there is nothing at that address. */

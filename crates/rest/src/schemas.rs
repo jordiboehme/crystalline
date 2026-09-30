@@ -6,6 +6,10 @@
 //! same name, same fields, same doc comments, same serde spelling, so the
 //! published document is exactly what the store types used to produce.
 //! `the_copies_match_the_store_types` below keeps them from drifting.
+//!
+//! The change stream's wire types are copied here for the same reason: they
+//! live with the engine's change bus, and the engine has no business knowing
+//! about the API description and carries no `utoipa`.
 
 #![allow(dead_code)]
 
@@ -178,6 +182,87 @@ pub struct DomainMember {
     pub added_at: String,
 }
 
+/// What happened to the engram: the four things the sync engine counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Moved,
+}
+
+/// Where a moved engram came from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct MovedFrom {
+    /// Domain-relative, forward slashes, `.md`.
+    pub path: String,
+    pub permalink: String,
+}
+
+/// One engram changed, as every subscriber hears it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct EngramChanged {
+    pub domain: String,
+    /// After the change; for `deleted`, what the row had before it went.
+    pub permalink: String,
+    /// Domain-relative, forward slashes, `.md`; after the change.
+    pub path: String,
+    pub kind: ChangeKind,
+    /// `moved` only.
+    pub from: Option<MovedFrom>,
+    /// Lowercase hex SHA-256 of the new content, the value every write
+    /// receipt reports as `checksum`. Absent for `deleted`.
+    pub checksum: Option<String>,
+    /// Who made the change, as a display label. Null for a change the watcher
+    /// found on disk and for a write nobody signed.
+    pub actor: Option<String>,
+    /// Set when the change landed in this actor's draft overlay. Delivered to
+    /// that actor's own sessions and to nobody else.
+    pub draft_of: Option<String>,
+    /// Who may hear this event, when that was captured for its domain's name:
+    /// set by the bus, never by a feed point, while the domain is being
+    /// renamed or removed (ruled 2026-09-27: a path under the old name leaks
+    /// the name as surely as the domain event does). `None` keeps the
+    /// ordinary per-session check. Never on the wire.
+    #[serde(skip)]
+    pub audience: Option<DomainAudience>,
+}
+
+/// The identities that may read a domain, captured once by the engine at the
+/// moment of a change that takes the domain's name out of the privacy records
+/// (a removal, and the old name of a rename; ruled 2026-09-27).
+///
+/// `Everyone` when the domain is not private. `Accounts` when it is, naming
+/// every account that may read it: its owner, every member at any level and
+/// every instance admin by the role the accounts store records, disabled
+/// accounts left out. The names are the store's folded spelling (trimmed and
+/// lowercased), so a check folds `Scope::User.account` the same way, and a
+/// scope that carries `admin: true` reads too, since the surface's own admin
+/// flag outranks the stored role. The machine owner always reads, so it is
+/// never in the set. When the engine cannot read the records (no resolver
+/// installed yet, or a read error) it captures `Accounts` with nobody in it:
+/// the owner still hears the event, nobody else does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DomainAudience {
+    Everyone,
+    Accounts(std::collections::HashSet<String>),
+}
+
+/// A whole domain moved: refetch everything of it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct DomainChanged {
+    pub domain: String,
+    pub actor: Option<String>,
+    /// `Some`, resolved eagerly, only for a rename's old name and a removal:
+    /// that name's privacy record leaves with the change, so the route must
+    /// filter against this snapshot rather than a session's own lazy check.
+    /// `None` keeps the ordinary per-session check for every other domain
+    /// event. Never on the wire.
+    #[serde(skip)]
+    pub audience: Option<DomainAudience>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -297,6 +382,45 @@ mod tests {
                 added_at: s(),
             }]),
             published::<super::DomainMember>()
+        );
+        use crystalline_engine::changes as bus;
+        assert_eq!(
+            keys([
+                bus::ChangeKind::Added,
+                bus::ChangeKind::Modified,
+                bus::ChangeKind::Deleted,
+                bus::ChangeKind::Moved
+            ]),
+            published::<super::ChangeKind>()
+        );
+        assert_eq!(
+            keys([bus::MovedFrom {
+                path: s(),
+                permalink: s()
+            }]),
+            published::<super::MovedFrom>()
+        );
+        assert_eq!(
+            keys([bus::EngramChanged {
+                domain: s(),
+                permalink: s(),
+                path: s(),
+                kind: bus::ChangeKind::Moved,
+                from: None,
+                checksum: None,
+                actor: None,
+                draft_of: None,
+                audience: None,
+            }]),
+            published::<super::EngramChanged>()
+        );
+        assert_eq!(
+            keys([bus::DomainChanged {
+                domain: s(),
+                actor: None,
+                audience: None
+            }]),
+            published::<super::DomainChanged>()
         );
     }
 }

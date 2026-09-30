@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain_view::Occupant;
 
 impl Engine {
     // --- write ---------------------------------------------------------------
@@ -125,35 +126,153 @@ impl Engine {
     /// `rel`, from this writer's own point of view: the writer's own shadowed
     /// view in review mode (a name another actor is drafting under is free,
     /// and a path this writer has tombstoned is free again), the plain index
-    /// otherwise. `None` means free; `Some(path)` names where it is taken.
+    /// otherwise. `None` means free; `Some((path, permalink))` names where it
+    /// is taken and what the engram there answers to, which is not always
+    /// `permalink`: `find_engram` also answers a title namesake.
     ///
     /// Shared by [`Engine::write_engram_present`]'s two collision checks - the
     /// early, unlocked one that answers before `build_markdown` can raise a
     /// different error, and the later one under the write lock that is the
     /// actual race guard - so the two can never drift into two readings of
     /// "taken".
+    ///
+    /// In review mode "the writer's view" is the one
+    /// [`DomainView::permalink_holder`] reads for an overwrite: the writer's
+    /// own drafts with this exact permalink, then the base row unless the
+    /// writer's own tombstone deletes its path. So a create never hears of an
+    /// engram its writer already deleted, and an address only the writer's
+    /// own draft holds is named like any other holder. `joined` leaves the
+    /// owner's other drafts out: somebody working inside one granted page is
+    /// never told what else the owner's draft holds.
     async fn permalink_taken(
         &self,
         domain: &str,
         rel: &str,
         permalink: &str,
         overlay_draft: Option<(&str, DomainId)>,
-    ) -> Result<Option<String>> {
+        joined: bool,
+    ) -> Result<Option<(String, String)>> {
         let store = self.store.lock().await;
-        Ok(match overlay_draft {
-            Some((actor, domain_id)) => match store.overlay_entry(domain_id, actor, rel).await? {
-                Some(entry) if entry.tombstone => None,
-                Some(entry) => Some(entry.path),
-                None => store
-                    .find_engram(domain, permalink)
-                    .await?
-                    .map(|existing| existing.path),
-            },
-            None => store
+        let Some((actor, domain_id)) = overlay_draft else {
+            return Ok(store
                 .find_engram(domain, permalink)
                 .await?
-                .map(|existing| existing.path),
-        })
+                .map(|existing| (existing.path, existing.permalink)));
+        };
+        match store.overlay_entry(domain_id, actor, rel).await? {
+            Some(entry) if entry.tombstone => return Ok(None),
+            Some(entry) => return Ok(Some((entry.path, entry.permalink))),
+            None => {}
+        }
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        if !joined
+            && let Some(entry) = entries
+                .iter()
+                .find(|entry| !entry.tombstone && entry.permalink == permalink)
+        {
+            return Ok(Some((entry.path.clone(), entry.permalink.clone())));
+        }
+        Ok(store
+            .find_engram(domain, permalink)
+            .await?
+            // Intended: once the writer's draft deleted the exact holder, no title namesake is named.
+            .filter(|found| {
+                !entries
+                    .iter()
+                    .any(|entry| entry.tombstone && entry.path == found.path)
+            })
+            .map(|existing| (existing.path, existing.permalink)))
+    }
+
+    /// Where a capture lands and whether it may land there, decided before a
+    /// single byte is written (issue 112).
+    ///
+    /// An overwrite lands on the engram that already answers to the
+    /// permalink, in its own file, whatever that file is called; one living
+    /// in another folder is refused rather than duplicated. Every capture,
+    /// overwrite or not, is then checked against what stands at the landing
+    /// path: another engram there is never replaced, and an unreadable file is
+    /// replaced only by an overwrite. Run once unlocked (for the message) and
+    /// again under the write lock (for the race).
+    ///
+    /// Inside a join (`join` is the one that took), the owner an overwrite
+    /// finds is screened against the granted page before anything names it:
+    /// it can be a file only the owner's draft holds, and every refusal below
+    /// would print its path. The screen's own refusal names `rel`, the path
+    /// the caller built. Both runs screen, so a holder that moved while the
+    /// write waited is screened as well.
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_landing(
+        &self,
+        view: &DomainView<'_>,
+        domain_id: DomainId,
+        source: &ContentSource,
+        domain: &str,
+        rel: &str,
+        permalink: &str,
+        overwrite: bool,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<String> {
+        let path = match overwrite {
+            true => match view.permalink_holder(domain_id, permalink).await? {
+                Some(held) => {
+                    if let Some(join) = join {
+                        self.screen_granted_path_named(domain, &held, rel, scope, Some(join))
+                            .await?;
+                    }
+                    refuse_other_folder(domain, permalink, &held, rel)?;
+                    held
+                }
+                None => rel.to_string(),
+            },
+            false => rel.to_string(),
+        };
+        if path != rel {
+            if crystalline_core::is_reserved_path(&path) {
+                return Err(EngineError::Invalid(reserved_name_error(&path)));
+            }
+            if is_assets_reserved(&path) {
+                return Err(EngineError::Invalid(assets_reserved_error(&path)));
+            }
+            if path.eq_ignore_ascii_case("MANIFEST.md")
+                && matches!(source, ContentSource::File { .. })
+            {
+                return Err(EngineError::Invalid(MANIFEST_CAPTURE_REFUSAL.into()));
+            }
+        }
+        match view.occupant_at(domain_id, source, &path).await? {
+            Occupant::Free => {}
+            Occupant::Engram {
+                permalink: held,
+                at,
+            } if held == permalink => {
+                if !overwrite {
+                    return Err(EngineError::Conflict(collision_message(
+                        permalink,
+                        domain,
+                        &at.name(),
+                    )));
+                }
+            }
+            Occupant::Engram {
+                permalink: other,
+                at,
+            } => {
+                let at = at.name();
+                return Err(EngineError::Conflict(format!(
+                    "'{at}' in domain '{domain}' already holds the engram '{other}'. Pick another title or folder, or change '{other}' with edit_engram"
+                )));
+            }
+            Occupant::Unreadable { .. } if overwrite => {}
+            Occupant::Unreadable { at } => {
+                let at = at.name();
+                return Err(EngineError::Conflict(format!(
+                    "'{at}' in domain '{domain}' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
+                )));
+            }
+        }
+        Ok(path)
     }
 
     /// Create or overwrite an engram, then index it. A file domain writes the
@@ -262,27 +381,42 @@ impl Engine {
         if rel.eq_ignore_ascii_case("MANIFEST.md")
             && matches!(self.read_source(&p.domain), ContentSource::File { .. })
         {
-            return Err(EngineError::Invalid(
-                "a new engram cannot be written at the domain root as MANIFEST.md: in this domain that file is the MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder".into(),
-            ));
-        }
-
-        // A join is into ONE draft: a capture inside one that resolved
-        // anywhere else has nowhere to land, and is told so rather than
-        // writing into the owner's overlay at a path they never shared.
-        if let Some(join) = join {
-            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
-                .await?;
+            return Err(EngineError::Invalid(MANIFEST_CAPTURE_REFUSAL.into()));
         }
 
         // The domain's index id, resolved once here rather than once per
-        // collision check below: `overlay` and its domain id can never
-        // diverge, so the pair is paired in the type rather than re-paired at
-        // every read.
-        let overlay_draft = match overlay {
-            Some(actor) => Some((actor, self.domain_source(&p.domain).await?.0)),
-            None => None,
-        };
+        // check below, and ahead of the landing and the join screen that both
+        // read it: `overlay` and its domain id can never diverge, so the pair
+        // is paired in the type rather than re-paired at every read.
+        let (domain_id, _) = self.domain_source(&p.domain).await?;
+        let overlay_draft = overlay.map(|actor| (actor, domain_id));
+
+        // Where this capture lands: the slug path, or for an overwrite the
+        // file of the engram that already answers to the permalink. Its
+        // refusal is held until the join screen below has run.
+        let landing = self
+            .capture_landing(
+                &view,
+                domain_id,
+                &source,
+                &p.domain,
+                &rel,
+                &permalink,
+                p.overwrite,
+                scope,
+                join,
+            )
+            .await;
+        // A join is into ONE draft: screened on where the capture would land,
+        // or on the slug path when no landing could be worked out, and ahead of
+        // every refusal that names something inside the owner's draft. The
+        // refusal names `rel`, the path the caller built: the landing can be
+        // a file only the owner's draft holds.
+        if let Some(join) = join {
+            let screened = landing.as_deref().unwrap_or(&rel);
+            self.screen_granted_path_named(&p.domain, screened, &rel, scope, Some(join))
+                .await?;
+        }
 
         // **Ahead of `build_markdown`, deliberately.** A malformed capture at
         // a permalink that is already taken answers "permalink already
@@ -296,15 +430,31 @@ impl Engine {
         // or taken between the two still gets the correct, authoritative
         // answer there.
         if !p.overwrite
-            && let Some(at) = self
-                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+            && let Some((at, held)) = self
+                .permalink_taken(
+                    &p.domain,
+                    &rel,
+                    &permalink,
+                    overlay_draft,
+                    view.joined().is_some(),
+                )
                 .await?
         {
-            return Err(EngineError::Conflict(format!(
-                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
-                p.domain
-            )));
+            // A holder that answers to another permalink is a title namesake
+            // or the writer's own draft at `rel`. When it stands at the slug
+            // path the landing has already refused it as another engram, and
+            // that refusal wins: the collision would offer an overwrite the
+            // landing then refuses too. A holder with this very permalink
+            // keeps its own answer, so a create never hears of overwrite=true
+            // for an unreadable file while the permalink lives elsewhere.
+            if held != permalink
+                && let Err(refused) = landing
+            {
+                return Err(refused);
+            }
+            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
         }
+        let path = landing?;
 
         // The document this capture would land, built before any file lock is
         // taken because nothing about it needs one: it is the caller's own
@@ -340,7 +490,7 @@ impl Engine {
         let mut receipt = json!({
             "domain": p.domain,
             "permalink": permalink,
-            "path": rel,
+            "path": path,
             "title": p.title,
             "type": engram_type,
             "status": status,
@@ -404,7 +554,7 @@ impl Engine {
             // that permalink IS the MANIFEST's. What lands there is this
             // capture's document, and the rules are owed their say about it
             // exactly as an edit of the MANIFEST gets it.
-            let manifest_text = rel
+            let manifest_text = path
                 .eq_ignore_ascii_case("MANIFEST.md")
                 .then(|| markdown.clone());
             let applied = rooms
@@ -446,9 +596,9 @@ impl Engine {
         // `Engine::draft_lock` and `Engine::write_lock`. Taken before the store
         // lock, like every other holder.
         let write_lock = match overlay_draft {
-            Some((who, _)) => Some(self.draft_lock(&p.domain, who, &rel)?),
+            Some((who, _)) => Some(self.draft_lock(&p.domain, who, &path)?),
             None => match &source {
-                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
+                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &path))),
                 ContentSource::Virtual => None,
             },
         };
@@ -464,13 +614,47 @@ impl Engine {
         // each other past it must still be caught HERE, atomically with the
         // write below - `overlay_draft` was resolved once, above, and is
         // reused rather than re-paired.
+        //
+        // The landing, settled again under the lock: an overwrite whose owner
+        // moved, or a path another writer filled, since the unlocked look
+        // above is refused here rather than written over. Worked out ahead of
+        // the create check so that check can prefer its refusal the way the
+        // unlocked one does.
+        let settled = self
+            .capture_landing(
+                &view,
+                domain_id,
+                &source,
+                &p.domain,
+                &rel,
+                &permalink,
+                p.overwrite,
+                scope,
+                join,
+            )
+            .await;
         if !p.overwrite
-            && let Some(at) = self
-                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+            && let Some((at, held)) = self
+                .permalink_taken(
+                    &p.domain,
+                    &rel,
+                    &permalink,
+                    overlay_draft,
+                    view.joined().is_some(),
+                )
                 .await?
         {
+            if held != permalink
+                && let Err(refused) = settled
+            {
+                return Err(refused);
+            }
+            return Err(create_taken(&permalink, &p.domain, &at, &held, &rel));
+        }
+        let settled = settled?;
+        if settled != path {
             return Err(EngineError::Conflict(format!(
-                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
+                "the engram '{permalink}' in domain '{}' moved while this write waited. Nothing was written; try again",
                 p.domain
             )));
         }
@@ -479,7 +663,7 @@ impl Engine {
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
         if let Some((_, domain_id)) = overlay_draft {
-            let warning = view.write(domain_id, &rel, &markdown).await?;
+            let warning = view.write(domain_id, &path, &markdown).await?;
             receipt["draft"] = json!(true);
             // Whose draft it landed in, when that is not the caller's own, in
             // the words the joined save and the joined edit both use.
@@ -490,32 +674,86 @@ impl Engine {
             return Ok(receipt);
         }
 
-        match &source {
+        // Whether an engram stood at the destination before this write, read
+        // under the write lock: an overwrite that creates is `added`, so the
+        // switcher's counts follow, and only a replacement is `modified`.
+        let (replaced, title_before) = match &source {
             ContentSource::File { root } => {
-                let abs = join_rel(root, &rel);
+                let abs = join_rel(root, &path);
+                // The bytes this write replaces, kept so a write the index
+                // then refuses puts the path back the way it was found
+                // rather than leaving a file no row describes.
+                let previous = match std::fs::read(&abs) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
                 write_file(&abs, &markdown)?;
-                let store = self.store.lock().await;
-                let domain_id = store
-                    .upsert_domain(&p.domain, Some(&root.to_string_lossy()), DomainKind::File)
-                    .await?;
-                self.reindex_file(&*store, domain_id, root, &rel).await?;
+                let indexed = async {
+                    let store = self.store.lock().await;
+                    let domain_id = store
+                        .upsert_domain(&p.domain, Some(&root.to_string_lossy()), DomainKind::File)
+                        .await?;
+                    self.reindex_file(&*store, domain_id, root, &path).await
+                }
+                .await;
+                if let Err(e) = indexed {
+                    put_back(&abs, previous.as_deref());
+                    return Err(e);
+                }
+                (
+                    previous.is_some(),
+                    previous
+                        .as_deref()
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .and_then(engram_title),
+                )
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
                 let domain_id = store
                     .upsert_domain(&p.domain, None, DomainKind::Virtual)
                     .await?;
+                let before = store.engram_content(domain_id, &path).await?;
                 let stamp = virtual_stamp(&markdown);
-                self.index_markdown(&*store, domain_id, &rel, &markdown, stamp, None, true)
+                self.index_markdown(&*store, domain_id, &path, &markdown, stamp, None, true)
                     .await?;
+                (before.is_some(), before.as_deref().and_then(engram_title))
             }
-        }
+        };
 
+        // The store locks above are all released.
+        self.announce(Change::Engram(EngramChanged {
+            domain: p.domain.clone(),
+            permalink: permalink.clone(),
+            path: path.clone(),
+            kind: if replaced {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Added
+            },
+            from: None,
+            checksum: Some(sha256_hex(markdown.as_bytes())),
+            actor: Some(actor.clone()),
+            draft_of: None,
+            audience: None,
+        }));
+        // A new engram, or one whose title changed, may be what a link in
+        // another domain has been waiting for.
+        if !replaced || title_before.as_deref() != Some(p.title.as_str()) {
+            self.bind_references_to(&p.domain, &permalink, &p.title)
+                .await;
+        }
         // A virtual write may have landed or replaced this domain's MANIFEST
         // engram, the source of its routing bullets, so refresh the cache the
         // sync `routing_text` reads; a MANIFEST of either kind may declare a
-        // new name. The store locks above are all released.
-        self.after_source_write(&source, &rel).await;
+        // new name.
+        self.after_source_write(&source, &path).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
         self.nudge_embed();
@@ -578,13 +816,33 @@ impl Engine {
             .ok()?;
         let overlay = view.actor();
         let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
+        let source = self.content_source(&p.domain).ok()?;
+        // The read-only id lookup, never an upserting one: a preview writes
+        // nothing, and a domain with no row has no document anybody can have
+        // open (the pattern `granted_read` uses). The rename-in-flight
+        // refusal `domain_source` gave is covered: `localized_for` above
+        // waits for renames before this point.
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(&p.domain).await.ok()??
+        };
+        // A replacement preview, so the landing an overwrite would take. A
+        // landing that cannot be worked out answers `None` here: the write
+        // raises the real refusal a moment later, after its own join screen.
+        let joined = join.filter(|_| view.joined().is_some());
+        let path = self
+            .capture_landing(
+                &view, domain_id, &source, &p.domain, &rel, &permalink, true, scope, joined,
+            )
+            .await
+            .ok()?;
         // The same screen the write runs, run before anybody is named: a
         // grantee working inside one draft who aims a capture at another path
         // in the owner's overlay is refused by the write, and a question that
         // named who is in the room over that page would have disclosed it
         // ahead of the gate that refuses.
-        if let Some(join) = join.filter(|_| view.joined().is_some()) {
-            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
+        if let Some(join) = joined {
+            self.screen_granted_path_named(&p.domain, &path, &rel, scope, Some(join))
                 .await
                 .ok()?;
         }
@@ -669,6 +927,10 @@ impl Engine {
         // this write at all and must not gate it.
         let join = join.filter(|_| view.joined().is_some());
         refuse_not_an_engram(&p.content)?;
+        if join.is_none() {
+            self.refuse_granted_name(&p.domain, &p.identifier, scope)
+                .await?;
+        }
         let (desc, source) = match view.resolve(&p.identifier).await {
             Ok(resolved) => resolved,
             // A name this caller's own view cannot resolve, when they are
@@ -806,6 +1068,24 @@ impl Engine {
                 });
             receipt_permalink(found, desc.permalink.clone())
         };
+        self.announce(Change::Engram(EngramChanged {
+            domain: desc.domain.clone(),
+            permalink: permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(sha256_hex(content.as_bytes())),
+            actor: change_label(scope),
+            draft_of: None,
+            audience: None,
+        }));
+        // A save that moved the permalink or changed the title may be what a
+        // link in another domain has been waiting for.
+        let (_, title_after) = engram_names(&content, &permalink);
+        if permalink != desc.permalink || title_after != desc.title {
+            self.bind_references_to(&desc.domain, &permalink, &title_after)
+                .await;
+        }
 
         // A save can rewrite a MANIFEST or the titles a folder index lists,
         // same as an edit.
@@ -873,9 +1153,14 @@ impl Engine {
         refuse_not_an_engram(&p.content)?;
         let (desc, source) = view.resolve(&p.identifier).await?;
         if desc.path != expected_path {
+            // The room is keyed by its draft's permalink, which the room's own
+            // address carries.
+            let joined = CrystallineUrl::parse(&p.identifier)
+                .map(|url| url.permalink)
+                .unwrap_or_else(|| p.identifier.clone());
             return Err(EngineError::Refused(joined_write_is_elsewhere(
                 view.writing_actor()?,
-                expected_path,
+                &joined,
                 &desc.path,
             )));
         }
@@ -1114,6 +1399,22 @@ impl Engine {
                 });
             receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
+        // The function takes a view and no scope, so nobody is named.
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: permalink.clone(),
+            path: path.to_string(),
+            kind: ChangeKind::Added,
+            from: None,
+            checksum: Some(sha256_hex(content.as_bytes())),
+            actor: None,
+            draft_of: None,
+            audience: None,
+        }));
+        // A restored engram is an added one, and may be what a link in
+        // another domain has been waiting for since it went.
+        let (_, title) = engram_names(content, &permalink);
+        self.bind_references_to(domain, &permalink, &title).await;
         self.nudge_embed();
         Ok(json!({
             "domain": domain,
@@ -1129,10 +1430,9 @@ impl Engine {
     ///
     /// Asked only when an ordinary resolution has already missed, and only for
     /// a caller holding at least one live link in this domain - which is
-    /// almost nobody, almost never. The name is matched against what the link
-    /// actually opens: the draft's own address, its path, and the path with
-    /// the suffix off, which are the three spellings the editor and the API
-    /// address an engram by.
+    /// almost nobody, almost never. The name is matched the way
+    /// [`grant_match`] matches it: the draft's permalink, or its title. A file
+    /// path names no engram, a granted draft included.
     pub(super) async fn teach_granted_miss(
         &self,
         domain: &str,
@@ -1142,7 +1442,58 @@ impl Engine {
         Ok(self
             .granted_draft_named(domain, identifier, None, scope)
             .await?
-            .map(|(owner, path)| granted_needs_join(&owner, &path)))
+            .map(|(owner, _, permalink)| granted_needs_join(&owner, &permalink)))
+    }
+
+    /// How many unjoined edits and saves asked the accounts store whether a
+    /// granted draft answers their name, since this engine was built. The
+    /// seam exists because a check that finds nothing changes no answer.
+    /// Nothing in the daemon, the CLI or the MCP surface reads this.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn granted_name_checks_run(&self) -> u64 {
+        self.granted_name_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The join sentence for an unjoined edit or save whose name a read would
+    /// answer with a granted draft ([`Engine::granted_answer`]).
+    ///
+    /// Asked BEFORE the ordinary resolution, because the read asks the grant
+    /// first too: without it a title that reads as somebody's shared draft
+    /// would be written into the caller's own draft of the team's page with
+    /// that title, a write somewhere other than the page they were just shown.
+    /// Nothing is asked for a caller with no account, and nothing is written.
+    ///
+    /// Nor for a domain that takes changes directly, or an instance that
+    /// serves no accounts: no grant can apply there, so an ordinary edit
+    /// makes no accounts-store call for it and cannot fail on one.
+    pub(super) async fn refuse_granted_name(
+        &self,
+        domain: &str,
+        identifier: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if crate::scope::overlay_actor(scope).is_none()
+            || !self.reviews_changes(domain)
+            || self.domain_access.get().is_none()
+        {
+            return Ok(());
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.granted_name_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hidden = self.hidden_for(scope).await?;
+        match self
+            .granted_answer(domain, identifier, scope, &hidden)
+            .await?
+        {
+            Some((owner, draft)) => Err(EngineError::Refused(granted_needs_join(
+                &owner,
+                &draft.permalink,
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Present a share-link and open a join on the draft it names.
@@ -1296,7 +1647,8 @@ impl Engine {
     }
 
     /// The draft this caller holds a live link to that `identifier` names, as
-    /// `(owner, path)`, or `None` when the name is nothing of the sort.
+    /// `(owner, path, permalink)`, or `None` when the name is nothing of the
+    /// sort.
     ///
     /// `owner` narrows it to one author's, which is what a caller asking to
     /// open a room over somebody's document needs: it names whose, and the
@@ -1306,11 +1658,15 @@ impl Engine {
     ///
     /// Asked only where an answer would change what a caller is told, and only
     /// for a caller holding at least one live link in this domain - which is
-    /// almost nobody, almost never. The name is matched against what the link
-    /// actually opens: the draft's own address, its path, and the path with
-    /// the suffix off, which are the three spellings the editor and the API
-    /// address an engram by. A link whose draft has gone matches nothing, so a
-    /// dead link teaches nothing and opens nothing.
+    /// almost nobody, almost never. The name is matched the way
+    /// [`grant_match`] matches it: the draft's permalink, or its title. A
+    /// permalink match beats a title match, and among equals the path that
+    /// sorts first byte-wise wins. A title match applies only where a read's
+    /// would ([`super::read::title_grant_yields`]): when nothing in the
+    /// caller's own view has that name as its permalink and none of their own
+    /// drafts answers it.
+    /// A link whose draft has gone matches nothing, so a dead link teaches
+    /// nothing and opens nothing.
     #[doc(hidden)]
     pub async fn granted_draft_named(
         &self,
@@ -1318,7 +1674,7 @@ impl Engine {
         identifier: &str,
         owner: Option<&str>,
         scope: &crate::scope::Scope,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<(String, String, String)>> {
         let Some(account) = crate::scope::overlay_actor(scope) else {
             return Ok(None);
         };
@@ -1329,6 +1685,14 @@ impl Engine {
             .overlay_grants_held(&account, domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
+        // An absolute address naming another domain is not this domain's to
+        // answer, exactly as the resolver refuses it.
+        let bare = match CrystallineUrl::parse(identifier) {
+            Some(url) if url.domain != domain => return Ok(None),
+            Some(url) => url.permalink,
+            None => identifier.to_string(),
+        };
+        let mut answers: Vec<(GrantMatch, String, String, String)> = Vec::new();
         for (path, held_owner) in held {
             if held_owner == account || owner.is_some_and(|want| want != held_owner) {
                 continue;
@@ -1336,16 +1700,34 @@ impl Engine {
             let Some(draft) = self.overlay_draft_at(domain, &held_owner, &path).await? else {
                 continue;
             };
-            let names = [
-                draft.permalink.as_str(),
-                path.as_str(),
-                path.trim_end_matches(".md"),
-            ];
-            if names.contains(&identifier) {
-                return Ok(Some((held_owner, path)));
+            if let Some(how) = grant_match(&draft, &bare) {
+                answers.push((how, path, held_owner, draft.permalink));
             }
         }
-        Ok(None)
+        answers.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+        let Some((how, path, owner, permalink)) = answers.into_iter().next() else {
+            return Ok(None);
+        };
+        // A title match yields the way a read's does (`title_grant_yields`),
+        // so a name that reads as the reader's own page never routes a joined
+        // write or opens a room into the grant. Permalink matches sort first,
+        // so the best answer being a title match means every answer is one.
+        if how == GrantMatch::Title {
+            let hidden = self.hidden_for(scope).await?;
+            let Ok(own) = DomainView::for_read(self, domain, &hidden, scope) else {
+                return Ok(None);
+            };
+            let domain_id = {
+                let store = self.store.lock().await;
+                store.domain_id(domain).await?
+            };
+            if let Some(domain_id) = domain_id
+                && super::read::title_grant_yields(&own, domain_id, &bare).await?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((owner, path, permalink)))
     }
 
     /// What a join may do to the OWNER's files, and what it may not.
@@ -1465,26 +1847,44 @@ impl Engine {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<()> {
+        self.screen_granted_path_named(domain, path, path, scope, join)
+            .await
+    }
+
+    /// [`Engine::screen_granted_path`], screening `path` but naming `shown`
+    /// when a join refuses a write that lands elsewhere.
+    ///
+    /// A capture is screened on its landing path, which for an overwrite can
+    /// be a file that only the owner's draft holds, under a name the caller
+    /// never saw. The caller's grant covers one page, so the refusal names
+    /// the path the caller built from their own title instead.
+    pub(super) async fn screen_granted_path_named(
+        &self,
+        domain: &str,
+        path: &str,
+        shown: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<()> {
         if let Some(join) = join {
             if join.path != path {
                 // A join whose own draft has gone is not a join to a different
                 // path, it is a join to nothing: its author renamed it, folded
                 // it or took it back, and a refusal naming the page they joined
                 // would be a sentence about somewhere that is not there.
-                if self
+                let Some(joined) = self
                     .overlay_draft_at(domain, &join.owner, &join.path)
                     .await?
-                    .is_none()
-                {
+                else {
                     return Err(EngineError::Refused(joined_draft_is_gone(
                         &join.owner,
                         &join.path,
                     )));
-                }
+                };
                 return Err(EngineError::Refused(joined_write_is_elsewhere(
                     &join.owner,
-                    &join.path,
-                    path,
+                    &joined.permalink,
+                    shown,
                 )));
             }
             return Ok(());
@@ -1505,10 +1905,13 @@ impl Engine {
         // that the draft is gone) nor write. A dead row would have taken a
         // path away from somebody it was never about, so it takes nothing: the
         // write goes back to being their own, which is what it always was.
-        if self.overlay_draft_at(domain, &owner, path).await?.is_none() {
+        let Some(draft) = self.overlay_draft_at(domain, &owner, path).await? else {
             return Ok(());
-        }
-        Err(EngineError::Refused(granted_needs_join(&owner, path)))
+        };
+        Err(EngineError::Refused(granted_needs_join(
+            &owner,
+            &draft.permalink,
+        )))
     }
 
     /// A registered domain's row id and content source, upserting the row the
@@ -1546,5 +1949,556 @@ impl Engine {
             }
         };
         Ok((domain_id, source))
+    }
+}
+
+/// The refusal a capture earns at a file domain's MANIFEST, on either the slug
+/// path or a landing path.
+const MANIFEST_CAPTURE_REFUSAL: &str = "a new engram cannot be written at the domain root as MANIFEST.md: in this domain that file is the MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder";
+
+/// The one collision message: `mcp.rs` intercepts it by `COLLISION_MARKER`.
+fn collision_message(permalink: &str, domain: &str, at: &str) -> String {
+    format!(
+        "permalink '{permalink}' already exists in domain '{domain}' (at {at}); pass overwrite=true to replace"
+    )
+}
+
+/// A folder as a refusal names it.
+fn folder_place(folder: &str) -> String {
+    if folder.is_empty() {
+        "the domain root".to_string()
+    } else {
+        format!("folder '{folder}'")
+    }
+}
+
+/// Refuses an overwrite aimed at an engram living in another folder.
+///
+/// The folder asked for is the folder part of the slug path `rel`, not the
+/// `folder` argument: a `/` in the title nests the engram too (`Q3/Q4
+/// planning` lands at `q3/q4-planning.md`), and the slug path is the permalink
+/// prefix the caller actually addressed. It equals the normalized `folder`
+/// whenever the title holds no `/`. Compared by slug, so `Conventions` and
+/// `conventions` address one folder.
+fn refuse_other_folder(domain: &str, permalink: &str, held: &str, rel: &str) -> Result<()> {
+    other_folder(
+        domain,
+        permalink,
+        held,
+        rel,
+        "An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram",
+    )
+}
+
+/// The one reading of "the engram at `held` lives in another folder than the
+/// slug path `rel` addresses", with `advice` for what the caller can do.
+fn other_folder(domain: &str, permalink: &str, held: &str, rel: &str, advice: &str) -> Result<()> {
+    let asked = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let lives = held.rsplit_once('/').map_or("", |(dir, _)| dir);
+    if slugify(asked) == slugify(lives) {
+        return Ok(());
+    }
+    Err(EngineError::Conflict(format!(
+        "permalink '{permalink}' in domain '{domain}' belongs to '{held}' in {}, not in {}. {advice}",
+        folder_place(lives),
+        folder_place(asked)
+    )))
+}
+
+/// What a create hears when its permalink is already taken at `at` by an
+/// engram answering to `held`.
+///
+/// An engram that owns this exact permalink in another folder is not a
+/// collision an overwrite could settle (an overwrite would be refused with
+/// M1 as well), so it is refused at once, without the collision marker, and
+/// no client offers "overwrite or cancel?" for it (amended 2026-09-28). The
+/// same folder, or a title namesake that only `find_engram`'s title match
+/// found, keeps the one collision message. `at` is a base row or the
+/// writer's own draft at `rel`, never another actor's draft, so the folder
+/// named is one this writer may already read.
+fn create_taken(permalink: &str, domain: &str, at: &str, held: &str, rel: &str) -> EngineError {
+    if held == permalink
+        && let Err(refused) = other_folder(
+            domain,
+            permalink,
+            at,
+            rel,
+            "A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram",
+        )
+    {
+        return refused;
+    }
+    EngineError::Conflict(collision_message(permalink, domain, at))
+}
+
+/// Puts a path back the way a failed write found it: the bytes that were
+/// there, or no file at all. Best effort; a failure is logged, and the
+/// caller returns the error that made it necessary.
+fn put_back(abs: &Path, previous: Option<&[u8]>) {
+    let restored = match previous {
+        Some(bytes) => write_bytes(abs, bytes),
+        None => std::fs::remove_file(abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        }),
+    };
+    if let Err(e) = restored {
+        tracing::warn!(
+            "could not put {} back after a failed write: {e}",
+            abs.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod put_back_tests {
+    use super::*;
+
+    #[test]
+    fn put_back_restores_the_old_bytes_or_removes_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept.md");
+        std::fs::write(&kept, "new").unwrap();
+        put_back(&kept, Some(b"old"));
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "old");
+
+        let fresh = dir.path().join("fresh.md");
+        std::fs::write(&fresh, "new").unwrap();
+        put_back(&fresh, None);
+        assert!(!fresh.exists());
+    }
+}
+
+#[cfg(test)]
+mod landing_race_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+
+    const MANIFEST: &str = "---\ntype: manifest\ntitle: notes\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Everything about notes\n\n## When to Use\n\n- Route here for notes questions\n";
+    const OWNER: &str = "conventions/Code Review Standards.md";
+    const RENAMED: &str = "conventions/code-review-standards-old.md";
+    const ENGRAM: &str = "---\ntype: engram\ntitle: Code Review Standards\npermalink: conventions/code-review-standards\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Code Review Standards\n\nThe old rule.\n";
+
+    /// The owner moves while an overwrite waits for the write lock: the
+    /// landing settled under the lock differs from the one worked out
+    /// before it, and the write is refused with nothing written.
+    #[tokio::test]
+    async fn an_overwrite_whose_owner_moves_while_it_waits_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("conventions")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        std::fs::write(root.join(OWNER), ENGRAM).unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root.clone()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        // Hold the lock the overwrite will wait on.
+        let lock = engine.write_lock(&join_rel(&root, OWNER));
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .write_engram(&WriteParams {
+                        domain: "notes".to_string(),
+                        title: "Code Review Standards".to_string(),
+                        content: "The new rule.".to_string(),
+                        folder: Some("conventions".to_string()),
+                        engram_type: None,
+                        tags: Vec::new(),
+                        status: None,
+                        metadata: None,
+                        overwrite: true,
+                        share_link: None,
+                        model: None,
+                    })
+                    .await
+            })
+        };
+        // The writer holds its own handle on the lock once it waits on it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The owner is renamed in its folder, permalink kept, and indexed.
+        std::fs::rename(root.join(OWNER), root.join(RENAMED)).unwrap();
+        engine
+            .sync_paths("notes", vec![OWNER.to_string(), RENAMED.to_string()])
+            .await
+            .unwrap();
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "the engram 'conventions/code-review-standards' in domain 'notes' moved while this write waited. Nothing was written; try again"
+        );
+        assert!(
+            !root.join(OWNER).exists(),
+            "nothing written at the old landing"
+        );
+        assert_eq!(std::fs::read_to_string(root.join(RENAMED)).unwrap(), ENGRAM);
+    }
+
+    /// A joined overwrite waits for the owner's draft lock while the owner's
+    /// draft changes under it: the page granted to bob now answers to another
+    /// permalink, and the one bob addressed belongs to a file only her draft
+    /// holds, in another folder. The landing settled under the lock is
+    /// screened like the first one, so the refusal names the path bob built
+    /// and never that file.
+    #[tokio::test]
+    async fn a_joined_overwrite_whose_owner_moves_while_it_waits_names_no_private_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("conventions")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        std::fs::write(root.join(OWNER), ENGRAM).unwrap();
+        let mut entry = DomainEntry::file(root.clone());
+        entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+        let mut config = GlobalConfig::default();
+        config.domains.insert("notes".to_string(), entry);
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), config, None, None)
+                .with_state_dir(tmp.path().join("state")),
+        );
+        engine.sync(None).await.unwrap();
+        let params = |content: &str| WriteParams {
+            domain: "notes".to_string(),
+            title: "Code Review Standards".to_string(),
+            content: content.to_string(),
+            folder: Some("conventions".to_string()),
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: true,
+            share_link: None,
+            model: None,
+        };
+        let ada = crate::scope::Scope::User {
+            account: "ada".to_string(),
+            admin: false,
+        };
+        engine
+            .write_engram_as(&params("Ada's rule."), None, &ada)
+            .await
+            .unwrap();
+
+        let join = crate::join::Join {
+            account: "bob".to_string(),
+            holder: crate::join::Holder::Process(1),
+            domain: "notes".to_string(),
+            path: OWNER.to_string(),
+            owner: "ada".to_string(),
+            expires_at: None,
+        };
+        let lock = engine.draft_lock("notes", "ada", OWNER).unwrap();
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            let bobs = params("Bob's rule.");
+            tokio::spawn(async move {
+                let bob = crate::scope::Scope::User {
+                    account: "bob".to_string(),
+                    admin: false,
+                };
+                engine
+                    .write_engram_joined(&bobs, None, &bob, Some(&join))
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Ada's draft changes while bob waits, written straight into her
+        // rows: her own verbs would queue behind the lock this test holds.
+        {
+            let store = engine.store.lock().await;
+            let domain_id = store.domain_id("notes").await.unwrap().unwrap();
+            let other = ENGRAM.replace(
+                "permalink: conventions/code-review-standards",
+                "permalink: other-page",
+            );
+            for (path, text) in [(OWNER, other.as_str()), ("private/Secret Plan.md", ENGRAM)] {
+                let record = Engine::overlay_record(path, text).unwrap();
+                store
+                    .upsert_overlay(domain_id, "ada", &record)
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this session is working inside ada's draft of 'other-page', so a write to 'conventions/code-review-standards.md' has nowhere to land: leave that draft first, and the write goes back to being your own"
+        );
+        assert!(!err.contains("Secret Plan"), "{err}");
+    }
+
+    /// A plain create waits for its file's write lock while an engram in
+    /// another folder takes the same permalink: the check under the lock is
+    /// the one that answers, with M5 and without the collision marker, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn a_create_whose_permalink_is_taken_elsewhere_while_it_waits_hears_m5() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root.clone()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        let slug = "conventions/code-review-standards.md";
+        let lock = engine.write_lock(&join_rel(&root, slug));
+        let guard = lock.lock().await;
+        let writer = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .write_engram(&WriteParams {
+                        domain: "notes".to_string(),
+                        title: "Code Review Standards".to_string(),
+                        content: "The new rule.".to_string(),
+                        folder: Some("conventions".to_string()),
+                        engram_type: None,
+                        tags: Vec::new(),
+                        status: None,
+                        metadata: None,
+                        overwrite: false,
+                        share_link: None,
+                        model: None,
+                    })
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&lock) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reached the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let archived = "archive/code-review-standards.md";
+        std::fs::write(root.join(archived), ENGRAM).unwrap();
+        engine
+            .sync_paths("notes", vec![archived.to_string()])
+            .await
+            .unwrap();
+        drop(guard);
+
+        let err = writer.await.unwrap().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "permalink 'conventions/code-review-standards' in domain 'notes' belongs to 'archive/code-review-standards.md' in folder 'archive', not in folder 'conventions'. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram"
+        );
+        assert!(!root.join(slug).exists(), "nothing written");
+    }
+}
+
+#[cfg(test)]
+mod on_disk_name_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+
+    const MANIFEST: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions\n";
+
+    fn engram(title: &str, permalink: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule.\n"
+        )
+    }
+
+    /// Whether `dir`'s filesystem folds letter case (the macOS and Windows
+    /// default), the way `rename.rs`'s case tests ask it.
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("Probe");
+        std::fs::create_dir(&probe).unwrap();
+        let folds = dir.join("probe").exists();
+        std::fs::remove_dir(&probe).unwrap();
+        folds
+    }
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let abs = root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, text).unwrap();
+    }
+
+    /// A file domain `kb` over `root` holding `files`, synced; `late` lands
+    /// after the sync, so the index does not know it.
+    async fn engine_over(
+        root: &Path,
+        files: &[(&str, &str)],
+        late: &[(&str, &str)],
+    ) -> Arc<Engine> {
+        put(root, "MANIFEST.md", MANIFEST);
+        for (rel, text) in files {
+            put(root, rel, text);
+        }
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("kb".to_string(), DomainEntry::file(root.to_path_buf()));
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+        for (rel, text) in late {
+            put(root, rel, text);
+        }
+        engine
+    }
+
+    fn create(title: &str, folder: &str) -> WriteParams {
+        WriteParams {
+            domain: "kb".to_string(),
+            title: title.to_string(),
+            content: "Mine.".to_string(),
+            folder: Some(folder.to_string()),
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn m2_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        let held = engram("Custom Gamma", "custom-gamma");
+        let engine = engine_over(&root, &[("Notes/Gamma.md", &held)], &[]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        // Review Focus 3: the folder is named as it is on disk too.
+        assert_eq!(
+            err,
+            "'Notes/Gamma.md' in domain 'kb' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram"
+        );
+        assert!(!err.contains("already exists in domain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn m3_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        let engine = engine_over(&root, &[], &[]).await;
+        // Not valid UTF-8, so the read itself fails: a file with no
+        // frontmatter would still parse as an engram.
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/Gamma.md"), [0xff, 0xfe, 0x00]).unwrap();
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "'notes/Gamma.md' in domain 'kb' already holds a file that is not a readable engram. Pick another title or folder, or pass overwrite=true to replace it"
+        );
+        assert!(!err.contains("already exists in domain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_collision_message_names_the_file_as_it_is_on_disk_where_case_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !folds_case(tmp.path()) {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let root = tmp.path().join("kb");
+        // Landed after the sync, so only the file answers for the permalink.
+        let late = engram("Gamma", "notes/gamma");
+        let engine = engine_over(&root, &[], &[("notes/Gamma.md", &late)]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "permalink 'notes/gamma' already exists in domain 'kb' (at notes/Gamma.md); pass overwrite=true to replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_virtual_domain_names_the_path_it_was_asked_for() {
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("kb".to_string(), DomainEntry::virtual_domain());
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap();
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "permalink 'notes/gamma' already exists in domain 'kb' (at notes/gamma.md); pass overwrite=true to replace"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_name_is_named_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kb");
+        let held = engram("Custom Gamma", "custom-gamma");
+        let engine = engine_over(&root, &[("notes/gamma.md", &held)], &[]).await;
+        let err = engine
+            .write_engram(&create("gamma", "notes"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "'notes/gamma.md' in domain 'kb' already holds the engram 'custom-gamma'. Pick another title or folder, or change 'custom-gamma' with edit_engram"
+        );
     }
 }

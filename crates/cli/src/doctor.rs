@@ -37,12 +37,17 @@
 //! another domain holds here (shadowed), one several domains claim, an alias
 //! that does not resolve, a team domain whose MANIFEST declares no name, a
 //! derived domain still waiting to take its declared name, and links that
-//! spell a domain by a name only this machine uses. `--fix` removes orphan
-//! rows, the empty index rows removed domains left behind, and stale service
-//! artifacts, and respells those links; the rest, including the whole
-//! GitHub, environment, harnesses and provisioning sections, are
-//! report-only, and every finding
-//! that has a fix points at the right next command.
+//! spell a domain by a name only this machine uses; (l) a file whose
+//! frontmatter holds a key more than once (`verify` rule `E010`), which no
+//! sync can index. `--fix` removes orphan rows, the empty index rows removed
+//! domains left behind, and stale service artifacts, respells those links,
+//! and keeps one copy of a repeated frontmatter key whose copies all agree
+//! (in a team domain the copy the base snapshot has; in a domain that
+//! reviews changes only when that restores the base; never on a read-only
+//! instance), writing it through a rename so the file is never cut short;
+//! the rest, including the whole GitHub, environment, harnesses and
+//! provisioning sections, are report-only, and every finding that has a fix
+//! points at the right next command.
 //!
 //! The index reads are socket-first, the same shape `sync_dispatch` uses: a
 //! running daemon holds the index file, so its stamps are asked for over ctl
@@ -53,7 +58,7 @@
 //! the ones that do and what to do about it, and that counts as one
 //! unresolved problem so the exit code still says something is wrong.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -67,7 +72,7 @@ use crystalline_index::{
 };
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
-use crystalline_remote::state::{OriginState, verify_base};
+use crystalline_remote::state::{OriginState, read_base_file, verify_base};
 use crystalline_service::EnvOverlay;
 use crystalline_service::instance;
 use serde::{Deserialize, Serialize};
@@ -142,7 +147,8 @@ pub struct DomainDoctor {
     pub orphans_removed: usize,
     /// On-disk `.md` files not yet present in the index. Holds only files that
     /// parse; a file whose frontmatter fails to parse is never merely
-    /// unsynced, so it is reported under `unsyncable` instead.
+    /// unsynced, so it is reported under `unsyncable` (or, for a repeated
+    /// key, under `duplicate_keys`) instead.
     pub unindexed: Vec<String>,
     /// On-disk `.md` files that cannot be indexed at all, because their
     /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
@@ -150,6 +156,12 @@ pub struct DomainDoctor {
     pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
+    /// Files whose frontmatter holds a key more than once (`verify` rule
+    /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
+    pub duplicate_keys: Vec<DuplicateKeyFile>,
+    /// Second copies 0.20.0's overwrite left beside an engram. Both files
+    /// leave `unindexed`, since neither is merely unsynced.
+    pub stray_copies: Vec<StrayCopy>,
     /// MANIFEST policy keys - `generated_indexes`, `sharing` - whose declared
     /// value is not one the domain recognizes, each with the value it is read
     /// as. Empty when every declared policy parses and for a domain with no
@@ -192,6 +204,67 @@ pub struct EncodingIssue {
     /// The human message from `verify`.
     pub message: String,
 }
+
+/// A file whose frontmatter holds a top-level key more than once (`verify`
+/// rule `E010`), so no sync can index it, with what `--fix` did about it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateKeyFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// Every repeated key, with the lines of its copies and whether they agree.
+    pub keys: Vec<crystalline_core::frontmatter::DuplicateKey>,
+    /// Whether `--fix` would repair this file (every repeat agrees, the result
+    /// parses, the instance is not read-only and, in a reviewing domain, the
+    /// result restores the base). Decided on every run, so the report only
+    /// sends a person to `--fix` when it would work.
+    pub fixable: bool,
+    /// Whether `--fix` removed the extra copies in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) the file as it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_fixed: Option<String>,
+}
+
+/// A second file 0.20.0's `write_engram(overwrite: true)` left beside the
+/// engram it meant to replace: the new text, at the slug path of the title,
+/// while the engram lived in a file with another name. Both answer to one
+/// permalink, so only one of them can be indexed.
+#[derive(Debug, Clone, Serialize)]
+pub struct StrayCopy {
+    /// The copy, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The engram's own file, which the overwrite meant to replace.
+    pub original: String,
+    /// The permalink both files answer to.
+    pub permalink: String,
+    /// Whether both titles slugify to the copy's file name, as they do when
+    /// 0.20.0's overwrite wrote it. Otherwise the two files only share a
+    /// permalink by accident, and `--fix` never touches them.
+    pub from_overwrite: bool,
+    /// Whether the two hold the same text apart from `generated`.
+    pub same_text: bool,
+    /// Whether the copy was written after the original: its stamp is later,
+    /// and the original's file was not modified after the copy's.
+    pub newer: bool,
+    /// Whether `--fix` would settle it (delete an identical copy, or move the
+    /// newer text into the original and delete the copy).
+    pub fixable: bool,
+    /// Whether `--fix` settled it in this run.
+    pub fixed: bool,
+    /// Why `--fix` leaves (or left) it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What `--fix` says about a reviewing domain's file it will not rewrite.
+const REVIEWED_NOTE: &str =
+    "This domain reviews changes, so --fix leaves it: fix it in the repository";
+
+/// What `--fix` says on a read-only instance, which never writes a domain file.
+const READ_ONLY_NOTE: &str = "This instance is read-only, so --fix leaves it";
+
+/// What `--fix` says when the file changed between doctor's read and its write.
+const CHANGED_NOTE: &str = "The file changed while doctor ran, so --fix left it: run doctor again";
 
 /// A MANIFEST policy key whose declared value nobody recognizes, with what
 /// the domain reads it as. Reported, never fixed: a policy is a decision.
@@ -247,6 +320,20 @@ pub struct ServiceDoctor {
     /// identified: the reason, for a message that tells a person where to
     /// look. Nothing is ever signalled in this state, `--fix` included.
     pub holder_unknown: Option<String>,
+    /// Where the running daemon runs, as its record says: working directory
+    /// and, on Windows, job and package identity. `None` when no live daemon
+    /// recorded one (none running, or one older than 0.21.1), or `--fix`
+    /// dislodged it.
+    pub runs_in: Option<crystalline_service::runs_in::RunsIn>,
+}
+
+impl ServiceDoctor {
+    /// `--fix` dislodged the wedged daemon. Its record's facts describe a
+    /// process that is gone, so they are dropped with it.
+    fn mark_dislodged(&mut self) {
+        self.daemon_dislodged = true;
+        self.runs_in = None;
+    }
 }
 
 /// One team domain's origin diagnostics: whether its local origin state is
@@ -848,6 +935,8 @@ impl DoctorReport {
             n += d.unindexed.len();
             n += d.unsyncable.len();
             n += d.encoding_issues.len();
+            n += d.duplicate_keys.iter().filter(|f| !f.fixed).count();
+            n += d.stray_copies.iter().filter(|s| !s.fixed).count();
         }
         if self.service.lock_stale && !self.service.lock_removed {
             n += 1;
@@ -1060,6 +1149,7 @@ pub async fn run(
                 stamps,
                 rebuild_markers.get(name).cloned(),
                 fix,
+                cfg.read_only(),
             )
             .await?,
         );
@@ -1561,13 +1651,14 @@ async fn check_domain(
     daemon_stamps: Option<HashMap<String, FileStamp>>,
     rebuild_marker: Option<(String, Option<String>)>,
     fix: bool,
+    read_only: bool,
 ) -> Result<DomainDoctor> {
     // The marker is stamped onto every shape of report, not only the one the
     // on-disk checks run to the end of. A domain whose folder has gone is
     // exactly how a rebuild gets interrupted in the first place, and that
     // report must still say a rebuild did not finish rather than only that the
     // path is missing.
-    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix).await?;
+    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix, read_only).await?;
     if let Some((started, kind)) = rebuild_marker {
         d.rebuild_started = Some(started);
         d.rebuild_kind = kind;
@@ -1644,6 +1735,7 @@ async fn check_domain_checks(
     store: Option<&dyn Store>,
     daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
+    read_only: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
     // orphans, unindexed, encoding) do not apply. Report its database engram
@@ -1703,6 +1795,7 @@ async fn check_domain_checks(
     // path, the unindexed set does not, so they are normalised to the same
     // shape before comparing.
     let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
+    let mut duplicate_paths: BTreeSet<String> = BTreeSet::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
         for issue in report.issues {
             match issue.rule {
@@ -1717,10 +1810,76 @@ async fn check_domain_checks(
                     unsyncable_by_path
                         .insert(relative_slash_path(&path, &issue.path), issue.message);
                 }
+                "E010" => {
+                    duplicate_paths.insert(relative_slash_path(&path, &issue.path));
+                }
                 _ => {}
             }
         }
     }
+
+    // (l) A frontmatter key held more than once (E010): one entry per file,
+    // and with --fix one copy is kept when all copies agree. In a team
+    // domain the copy the base snapshot has is the one kept, so a file
+    // whose only local change was the extra copy stops being a change.
+    let base_dir = entry
+        .origin
+        .as_ref()
+        .and_then(|_| config::origin_state_dir(name).ok());
+    for rel in duplicate_paths {
+        let file = path.join(&rel);
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let keys = crystalline_core::frontmatter::duplicate_keys(&source);
+        if keys.is_empty() {
+            continue;
+        }
+        let base = base_dir
+            .as_deref()
+            .and_then(|dir| read_base_file(dir, &rel).ok().flatten())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let mut plan = plan_duplicate_fix(&source, base.as_deref(), entry.is_overlay());
+        // A read-only instance never writes a domain file, doctor included.
+        if read_only && plan.is_ok() {
+            plan = Err(READ_ONLY_NOTE.to_string());
+        }
+        let mut report = DuplicateKeyFile {
+            path: rel,
+            keys,
+            fixable: plan.is_ok(),
+            fixed: false,
+            not_fixed: plan.as_ref().err().cloned(),
+        };
+        if fix && let Ok(text) = plan {
+            match write_fix(&file, &source, &text) {
+                Ok(()) => report.fixed = true,
+                Err(note) => report.not_fixed = Some(note),
+            }
+        }
+        d.duplicate_keys.push(report);
+    }
+
+    // (m) 0.20.0's stray second copies. In every domain, team domains
+    // included: a fix is an ordinary local change the next share carries.
+    let mut stray_files: HashSet<String> = HashSet::new();
+    for pair in stray_pairs(&path) {
+        let report = settle_stray(&path, &pair, entry.is_overlay(), read_only, fix);
+        // Only a pair still on disk is its own finding. After a fix the
+        // engram's file may not be indexed yet (the copy was the indexed
+        // one), and then `unindexed` says so and sends the person to sync.
+        if !report.fixed {
+            stray_files.insert(pair.stray.rel.clone());
+            stray_files.insert(pair.original.rel.clone());
+        }
+        d.stray_copies.push(report);
+    }
+    let blocked: HashSet<String> = d
+        .duplicate_keys
+        .iter()
+        .filter(|f| !f.fixed)
+        .map(|f| f.path.clone())
+        .collect();
 
     // (a) + (b): DB orphans and unindexed files, from whichever route reached
     // the index. `domain_id` stays `None` on the daemon-served route, which is
@@ -1770,15 +1929,25 @@ async fn check_domain_checks(
         // A path with an E001 finding is not merely unsynced, it cannot be
         // indexed at all until its frontmatter is fixed - split it out.
         let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
-        unindexed.retain(|p| match unsyncable_by_path.remove(p) {
-            Some(message) => {
-                unsyncable.push(UnsyncableFile {
-                    path: p.clone(),
-                    message,
-                });
-                false
+        unindexed.retain(|p| {
+            // Both files of a stray pair are their own finding, above.
+            if stray_files.contains(p) {
+                return false;
             }
-            None => true,
+            // A repeated frontmatter key is its own finding, above.
+            if blocked.contains(p) {
+                return false;
+            }
+            match unsyncable_by_path.remove(p) {
+                Some(message) => {
+                    unsyncable.push(UnsyncableFile {
+                        path: p.clone(),
+                        message,
+                    });
+                    false
+                }
+                None => true,
+            }
         });
         d.unsyncable = unsyncable;
 
@@ -1805,6 +1974,272 @@ async fn check_domain_checks(
     }
 
     Ok(d)
+}
+
+/// Write `text` over `file` for `--fix`: into a sibling temporary file, then
+/// renamed into place, so a crash or a full disk never leaves the engram cut
+/// short. Right before the rename the file is read again, and if it no longer
+/// holds `source` (an agent or a person wrote it meanwhile) the fix is
+/// dropped and the newer text stays. The error is the note the report shows.
+fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
+    let tmp = fix_temp_path(file);
+    let written = std::fs::write(&tmp, text).and_then(|()| {
+        let permissions = std::fs::metadata(file)?.permissions();
+        std::fs::set_permissions(&tmp, permissions)
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Writing the file failed: {e}"));
+    }
+    if std::fs::read_to_string(file).ok().as_deref() != Some(source) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CHANGED_NOTE.to_string());
+    }
+    std::fs::rename(&tmp, file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Writing the file failed: {e}")
+    })
+}
+
+/// The temporary file [`write_fix`] writes first: a hidden sibling
+/// (`.<name>.doctor-fix.<pid>.<seq>`), so neither a sync nor remote change
+/// detection, which walk every file that is not hidden, ever picks up one a
+/// crash left behind.
+fn fix_temp_path(file: &Path) -> std::path::PathBuf {
+    crystalline_core::path::hidden_temp_path(file, "doctor-fix")
+}
+
+/// What `--fix` would write for a file with repeated keys, or why it leaves
+/// the file. A reviewing domain's folder only moves through a merge, so there
+/// the fix only counts when it restores the base snapshot byte for byte.
+fn plan_duplicate_fix(source: &str, base: Option<&str>, reviewing: bool) -> Result<String, String> {
+    use crystalline_core::frontmatter::{Collapse, collapse_duplicate_keys};
+    match collapse_duplicate_keys(source, base) {
+        Collapse::Collapsed(text) if reviewing && base != Some(text.as_str()) => {
+            Err(REVIEWED_NOTE.to_string())
+        }
+        Collapse::Collapsed(text) => Ok(text),
+        Collapse::ValuesDiffer(_) => Err(
+            "Another key in this file has different values, so --fix leaves the file".to_string(),
+        ),
+        Collapse::Unchanged | Collapse::NotRepairable => Err(
+            "The file still does not parse without the extra copies, so --fix leaves it"
+                .to_string(),
+        ),
+    }
+}
+
+/// One file of a stray pair: where it is and what it holds.
+#[derive(Debug, Clone)]
+struct StrayFile {
+    rel: String,
+    source: String,
+    /// The file's modification time, when it was the same right before and
+    /// right after `source` was read.
+    modified: Option<std::time::SystemTime>,
+    /// The title in the file's frontmatter.
+    title: String,
+}
+
+/// A stray copy and the engram's own file, answering to one permalink.
+#[derive(Debug, Clone)]
+struct StrayPair {
+    permalink: String,
+    /// Whether both titles slugify to the copy's file name.
+    from_overwrite: bool,
+    stray: StrayFile,
+    original: StrayFile,
+}
+
+/// Every pair of parsed markdown files in one folder that answer to one
+/// permalink, where exactly one of the two is named after the permalink's
+/// last segment: that one is the copy 0.20.0's overwrite wrote at the slug
+/// path of the title, the other the engram's own file. Only the file name is
+/// compared, since the overwrite kept the folder as the disk spells it and
+/// the permalink slugifies it. Neither side's index state is assumed.
+fn stray_pairs(root: &Path) -> Vec<StrayPair> {
+    let mut by_key: BTreeMap<(String, String), Vec<StrayFile>> = BTreeMap::new();
+    for rel in markdown_rel_paths(root) {
+        let file = root.join(&rel);
+        // The time is read before and after the text. A write in between
+        // would pair one text with the other's time, so then the time counts
+        // as unknown, and an unknown time never lets the fix run.
+        let mtime = || std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        let before = mtime();
+        let Ok(source) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let modified = before.filter(|&before| mtime() == Some(before));
+        let Ok(engram) = crystalline_core::parse_engram(&source) else {
+            continue;
+        };
+        // The permalink the index gives the file.
+        let permalink = engram
+            .frontmatter
+            .permalink
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| crystalline_core::slugify(&rel));
+        let folder = rel
+            .rsplit_once('/')
+            .map(|(folder, _)| folder.to_string())
+            .unwrap_or_default();
+        by_key
+            .entry((folder, permalink))
+            .or_default()
+            .push(StrayFile {
+                rel,
+                source,
+                modified,
+                title: engram.frontmatter.title.clone(),
+            });
+    }
+    let mut pairs = Vec::new();
+    for ((_, permalink), files) in by_key {
+        let [a, b] = files.as_slice() else {
+            continue;
+        };
+        let last = permalink.rsplit('/').next().unwrap_or(&permalink);
+        let stray_name = format!("{last}.md");
+        let named = |file: &StrayFile| file.rel.rsplit('/').next() == Some(stray_name.as_str());
+        let (stray, original) = match (named(a), named(b)) {
+            (true, false) => (a.clone(), b.clone()),
+            (false, true) => (b.clone(), a.clone()),
+            _ => continue,
+        };
+        // 0.20.0 wrote the copy at the slug of the title and found the
+        // original through that same title, so both titles lead to the
+        // copy's file name. Two files that only share a permalink do not.
+        let from_overwrite = [&stray, &original]
+            .iter()
+            .all(|file| crystalline_core::slugify(&file.title) == last);
+        pairs.push(StrayPair {
+            permalink,
+            from_overwrite,
+            stray,
+            original,
+        });
+    }
+    pairs
+}
+
+/// Whether two engrams hold the same text apart from `generated`: the
+/// frontmatter compared as parsed, the body byte for byte.
+fn same_apart_from_generated(a: &str, b: &str) -> bool {
+    let (Ok(mut a), Ok(mut b)) = (
+        crystalline_core::parse_engram(a),
+        crystalline_core::parse_engram(b),
+    ) else {
+        return false;
+    };
+    a.frontmatter.generated = None;
+    b.frontmatter.generated = None;
+    a.frontmatter == b.frontmatter && a.body == b.body
+}
+
+/// When a file was written: its `generated.at`, else its `recorded_at`, else
+/// the file's modification time.
+fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
+    let engram = crystalline_core::parse_engram(&file.source).ok();
+    let frontmatter = engram.as_ref().map(|e| &e.frontmatter);
+    if let Some(at) = frontmatter
+        .and_then(|f| f.generated.as_ref())
+        .and_then(|g| g.at)
+    {
+        return Some(at.with_timezone(&chrono::Utc));
+    }
+    if let Some(day) = frontmatter.and_then(|f| f.recorded_at) {
+        return day.and_hms_opt(0, 0, 0).map(|t| t.and_utc());
+    }
+    file.modified.map(chrono::DateTime::<chrono::Utc>::from)
+}
+
+/// What doctor reports about one stray pair, and what `--fix` did about it,
+/// in the order the spec rules: a reviewing domain and a read-only instance
+/// are left, an identical copy is deleted, a newer copy's text moves into the
+/// original and the copy goes, and a copy the original changed after is left.
+fn settle_stray(
+    root: &Path,
+    pair: &StrayPair,
+    reviewing: bool,
+    read_only: bool,
+    fix: bool,
+) -> StrayCopy {
+    let stray_abs = root.join(&pair.stray.rel);
+    let original_abs = root.join(&pair.original.rel);
+    let same_text = same_apart_from_generated(&pair.stray.source, &pair.original.source);
+    // Each side is stamped on its own, so a file with `generated.at` can meet
+    // one with only `recorded_at`, read as that day's midnight UTC: an exact
+    // time against a date, which can call either side newer within that day.
+    let stamped_newer = match (written_at(&pair.stray), written_at(&pair.original)) {
+        (Some(stray), Some(original)) => stray > original,
+        _ => false,
+    };
+    // A hand edit of the original in an editor leaves its `generated.at` as
+    // it was, so the stamps alone would let the copy's older text overwrite
+    // it. The original's file must also not have been modified after the
+    // copy's. A pull that rewrote the times makes this too careful, never
+    // careless: doctor then only reports and the person decides.
+    let original_touched_after = match (pair.original.modified, pair.stray.modified) {
+        (Some(original), Some(stray)) => original > stray,
+        _ => true,
+    };
+    let newer = stamped_newer && !original_touched_after;
+    let mut report = StrayCopy {
+        path: pair.stray.rel.clone(),
+        original: pair.original.rel.clone(),
+        permalink: pair.permalink.clone(),
+        from_overwrite: pair.from_overwrite,
+        same_text,
+        newer,
+        fixable: false,
+        fixed: false,
+        note: None,
+    };
+    // Not a copy from 0.20.0: reported, never adopted or deleted.
+    if !pair.from_overwrite {
+        return report;
+    }
+    if reviewing {
+        report.note = Some(REVIEWED_NOTE.to_string());
+        return report;
+    }
+    if read_only {
+        report.note = Some(READ_ONLY_NOTE.to_string());
+        return report;
+    }
+    report.fixable = same_text || newer;
+    if !fix || !report.fixable {
+        return report;
+    }
+    if !same_text {
+        // The adopt: the copy's bytes over the original, through the hidden
+        // temp and the re-read that drops the fix when the original changed.
+        if let Err(note) = write_fix(&original_abs, &pair.original.source, &pair.stray.source) {
+            report.note = Some(note);
+            return report;
+        }
+    }
+    // The copy is read again right before it goes: while it is the indexed
+    // file, a write by title lands on it, and that text must not be lost.
+    // After an adopt the next run then finds the pair again and compares.
+    if std::fs::read_to_string(&stray_abs).ok().as_deref() != Some(pair.stray.source.as_str()) {
+        report.note = Some(if same_text {
+            CHANGED_NOTE.to_string()
+        } else {
+            format!(
+                "{} now has the text of the copy. The copy changed while doctor ran, so --fix kept it: run doctor again",
+                pair.original.rel
+            )
+        });
+        return report;
+    }
+    match std::fs::remove_file(&stray_abs) {
+        Ok(()) => report.fixed = true,
+        // After an adopt the next run finds an identical pair and deletes it.
+        Err(e) => report.note = Some(format!("Deleting the copy failed: {e}")),
+    }
+    report
 }
 
 /// Every `.md` file under `root`, relative and forward-slashed, skipping
@@ -1964,6 +2399,14 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         }
         _ => None,
     };
+    // Read from the record, not asked over the socket: a daemon's working
+    // directory, job and package identity do not change while it runs, and a
+    // wedged daemon still has a record to read.
+    let runs_in = if alive {
+        info.as_ref().and_then(|i| i.runs_in.clone())
+    } else {
+        None
+    };
 
     let mut s = ServiceDoctor {
         lock_present,
@@ -1976,6 +2419,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         daemon_unresponsive,
         daemon_dislodged: false,
         holder_unknown,
+        runs_in,
     };
 
     if fix {
@@ -1985,7 +2429,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         // connecting client performs, refusals included.
         if s.daemon_unresponsive {
             match instance::dislodge_unresponsive().await {
-                Ok(instance::DislodgeOutcome::Dislodged { .. }) => s.daemon_dislodged = true,
+                Ok(instance::DislodgeOutcome::Dislodged { .. }) => s.mark_dislodged(),
                 // The holder recovered between the diagnosis and the fix;
                 // nothing to dislodge and nothing to report as unresolved.
                 Ok(instance::DislodgeOutcome::NotNeeded) => s.daemon_unresponsive = false,
@@ -2835,6 +3279,95 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
             }
         }
+        for f in &d.duplicate_keys {
+            // "rerun with --fix" only when --fix would repair the whole file;
+            // otherwise every key is named for a person to fix by hand.
+            let mixed = f.keys.iter().any(|k| !k.same_value);
+            for (i, k) in f.keys.iter().enumerate() {
+                let lines = crystalline_core::frontmatter::line_list(&k.lines);
+                let many = k.lines.len() > 2;
+                let _ = if f.fixed {
+                    // The file parses now but is not in the index yet; the
+                    // hint goes on the file's last line only.
+                    let hint = if i + 1 == f.keys.len() {
+                        format!(", run `crystalline sync --domain {}` to index it", d.name)
+                    } else {
+                        String::new()
+                    };
+                    writeln!(out, "  fixed {}: kept one `{}` line{hint}", f.path, k.key)
+                } else if !k.same_value {
+                    let rest = if many { "others" } else { "other" };
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with different values (verify rule E010): keep the right one and delete the {rest}",
+                        f.path, k.key
+                    )
+                } else if mixed {
+                    let which = if many { "all but one" } else { "one" };
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010): delete {which} of the lines",
+                        f.path, k.key
+                    )
+                } else if let Some(note) = &f.not_fixed {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010). {note}",
+                        f.path, k.key
+                    )
+                } else {
+                    writeln!(
+                        out,
+                        "  [problem] {} repeats the frontmatter key `{}` on lines {lines} with the same value (verify rule E010), rerun with --fix to keep one copy",
+                        f.path, k.key
+                    )
+                };
+            }
+        }
+        for s in &d.stray_copies {
+            let head = format!(
+                "{} is a second copy of {}, left by an overwrite in 0.20.0.",
+                s.path, s.original
+            );
+            let _ = if s.fixed && s.same_text {
+                writeln!(
+                    out,
+                    "  fixed {}: deleted, it had the same text as {}",
+                    s.path, s.original
+                )
+            } else if s.fixed {
+                writeln!(
+                    out,
+                    "  fixed {}: took the newer text from {} and deleted the copy",
+                    s.original, s.path
+                )
+            } else if !s.from_overwrite {
+                writeln!(
+                    out,
+                    "  [problem] {} and {} both use the permalink {}, so only one of them can be indexed. They are not a copy left by 0.20.0, so --fix leaves them: give one of them its own permalink",
+                    s.path, s.original, s.permalink
+                )
+            } else if let Some(note) = &s.note {
+                writeln!(out, "  [problem] {head} {note}")
+            } else if s.same_text {
+                writeln!(
+                    out,
+                    "  [problem] {head} It has the same text, rerun with --fix to delete it"
+                )
+            } else if s.newer {
+                writeln!(
+                    out,
+                    "  [problem] {head} It has the newer text, rerun with --fix to move it into {} and delete the copy",
+                    s.original
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [problem] {head} {} changed after it: compare the two, keep the right text in {} and delete the copy",
+                    s.original, s.original
+                )
+            };
+        }
         // "ok" is a claim about everything, so a domain whose index checks
         // never ran does not get to make it.
         if d.manifest_present
@@ -2843,6 +3376,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             && d.unindexed.is_empty()
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
+            && d.duplicate_keys.iter().all(|f| f.fixed)
+            && d.stray_copies.iter().all(|s| s.fixed)
             && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");
@@ -2924,8 +3459,29 @@ pub fn render_human(report: &DoctorReport) -> String {
     if let Some(detail) = &s.holder_unknown {
         let _ = writeln!(out, "  [problem] {detail}");
     }
-    if !s.lock_stale && !s.socket_orphaned && !s.daemon_unresponsive && s.holder_unknown.is_none() {
+    // Where the daemon runs (#115). Its warnings never count as problems,
+    // but a section that has one does not say "ok" either.
+    let warnings = s
+        .runs_in
+        .as_ref()
+        .map(|runs_in| runs_in.warnings())
+        .unwrap_or_default();
+    if !s.lock_stale
+        && !s.socket_orphaned
+        && !s.daemon_unresponsive
+        && s.holder_unknown.is_none()
+        && warnings.is_empty()
+    {
         let _ = writeln!(out, "  ok");
+    }
+    // Facts first, then what they may cause.
+    if let Some(runs_in) = &s.runs_in {
+        for line in runs_in.details() {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    for warning in &warnings {
+        let _ = writeln!(out, "  [warning] {warning}");
     }
     if let Ok(log_path) = config::daemon_log_path() {
         let _ = writeln!(out, "  daemon log: {}", log_path.display());
@@ -3846,6 +4402,109 @@ mod tests {
         );
     }
 
+    /// Where the daemon runs, in full, and the warning when it cannot leave
+    /// its job. A warning only: nothing on
+    /// this side can fix a job that forbids breakaway, so it never counts
+    /// toward the exit code. The Claude Desktop extension's daemon is inside
+    /// on purpose and gets the facts without the warning.
+    #[test]
+    fn doctor_shows_where_the_daemon_runs_and_warns_about_a_job_it_cannot_leave() {
+        use crystalline_service::runs_in::RunsIn;
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.service.runs_in = Some(RunsIn {
+            working_dir: Some(r"C:\Users\a\AppData\Roaming\crystalline".to_string()),
+            in_job: Some(true),
+            job_allows_breakaway: Some(false),
+            package: None,
+            breakaway_refused: true,
+            exits_when_idle: false,
+        });
+
+        let out = render_human(&report);
+        assert!(
+            out.contains(r"daemon working directory: C:\Users\a\AppData\Roaming\crystalline"),
+            "{out}"
+        );
+        assert!(
+            out.contains("daemon job: yes, breakaway not allowed, refused at start"),
+            "{out}"
+        );
+        assert!(out.contains("daemon package identity: none"), "{out}");
+        assert!(
+            out.contains("[warning] the daemon runs inside a job it cannot leave"),
+            "{out}"
+        );
+        assert!(
+            !service_section(&out).contains("  ok\n"),
+            "a section with a warning does not say ok: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "a warning, never a problem: doctor still exits 0"
+        );
+
+        report.service.runs_in.as_mut().unwrap().exits_when_idle = true;
+        let extension = render_human(&report);
+        assert!(
+            !extension.contains("[warning] the daemon runs inside"),
+            "{extension}"
+        );
+        assert!(extension.contains("on purpose"), "{extension}");
+        assert!(
+            service_section(&extension).contains("  ok\n"),
+            "facts alone leave the section ok: {extension}"
+        );
+
+        report.service.runs_in = None;
+        let none = render_human(&report);
+        assert!(
+            !none.contains("daemon working directory"),
+            "no record, no lines: {none}"
+        );
+    }
+
+    /// The `service:` section of a human report: its header and every
+    /// indented line after it.
+    fn service_section(out: &str) -> String {
+        let mut section = String::new();
+        let mut inside = false;
+        for line in out.lines() {
+            if line == "service:" {
+                inside = true;
+            } else if inside && !line.starts_with("  ") {
+                break;
+            }
+            if inside {
+                section.push_str(line);
+                section.push('\n');
+            }
+        }
+        section
+    }
+
+    /// `--fix` dislodged a wedged daemon: the facts of its record describe a
+    /// process that is gone, so doctor does not print them or warn about it.
+    #[test]
+    fn a_dislodged_daemon_leaves_no_facts_behind() {
+        use crystalline_service::runs_in::RunsIn;
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.service.daemon_unresponsive = true;
+        report.service.runs_in = Some(RunsIn {
+            working_dir: Some(r"C:\Users\a\AppData\Roaming\crystalline".to_string()),
+            in_job: Some(true),
+            job_allows_breakaway: Some(false),
+            ..RunsIn::default()
+        });
+
+        report.service.mark_dislodged();
+        assert!(report.service.daemon_dislodged);
+        let out = render_human(&report);
+        assert!(out.contains("dislodged an unresponsive daemon"), "{out}");
+        assert!(!out.contains("daemon working directory"), "{out}");
+        assert!(!out.contains("[warning]"), "{out}");
+    }
+
     /// The pre-existing shape, with none of the new keys, still renders: the
     /// report comes from a daemon that may be older than this binary.
     #[test]
@@ -4760,5 +5419,728 @@ mod tests {
             summary["downloaded"], false,
             "the configured (full) model itself is not the one that is cached: {summary}"
         );
+    }
+
+    /// The temporary file is hidden, so a sync or remote change detection,
+    /// which walk every file that is not hidden, never takes a leftover one
+    /// for an engram or a change to propose.
+    #[test]
+    fn write_fix_names_its_temporary_file_as_a_hidden_sibling() {
+        let tmp = fix_temp_path(Path::new("/kb/a/dup.md"));
+        assert_eq!(tmp.parent(), Some(Path::new("/kb/a")));
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!(".dup.md.doctor-fix.{}.", std::process::id())),
+            "{name}"
+        );
+    }
+
+    /// The fixed file keeps the original's permissions.
+    #[test]
+    #[cfg(unix)]
+    fn write_fix_keeps_the_original_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_fix(&file, "old", "new").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// The fix lands through a sibling file and a rename, so the engram is
+    /// never cut short, and it leaves no temporary file behind.
+    #[test]
+    fn write_fix_replaces_the_file_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old").unwrap();
+        write_fix(&file, "old", "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("dup.md")]);
+    }
+
+    /// A write that lands between doctor's read and its rename wins: the fix
+    /// is skipped with a reason and the newer text stays.
+    #[test]
+    fn write_fix_skips_a_file_that_changed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "changed by someone else").unwrap();
+        let err = write_fix(&file, "what doctor read", "collapsed").unwrap_err();
+        assert_eq!(err, CHANGED_NOTE);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "changed by someone else"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // --- 0.20.0's stray second copies ----------------------------------------
+
+    const O_PATH: &str = "conventions/Code Review Standards.md";
+    const S_PATH: &str = "conventions/code-review-standards.md";
+
+    /// The engram 0.20.0's overwrite meant to replace, and the copies of it.
+    fn review_standards(body: &str, generated_at: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: Code Review Standards\npermalink: conventions/code-review-standards\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ngenerated:\n  by: human:ada\n  at: {generated_at}\n---\n\n# Code Review Standards\n\n{body}\n"
+        )
+    }
+
+    const MANIFEST_KB: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n";
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let abs = root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, text).unwrap();
+    }
+
+    /// Set a file's modification time to `secs` after a fixed instant, so
+    /// the tests never depend on how fast they write.
+    fn set_mtime(root: &Path, rel: &str, secs: u64) {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000 + secs);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(rel))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// A file domain `kb` holding `files`, indexed with `first` alone when it
+    /// is named (so that file is the indexed one) and the rest written after,
+    /// then checked by doctor with `fix` and `read_only`. The files' times
+    /// follow their order, the first one modified last: [`pair`] lists the
+    /// copy first, as 0.20.0 wrote it after the original.
+    async fn stray_doctor(
+        files: &[(&str, String)],
+        first: Option<&str>,
+        edit: impl FnOnce(&mut DomainEntry),
+        fix: bool,
+        read_only: bool,
+    ) -> (tempfile::TempDir, DomainDoctor) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        put(&root, "MANIFEST.md", MANIFEST_KB);
+        for (rel, text) in files.iter().filter(|(rel, _)| Some(*rel) == first) {
+            put(&root, rel, text);
+        }
+        let store = TursoStore::open_in_memory().await.unwrap();
+        sync_domain(&store, "kb", &root).await.unwrap();
+        for (rel, text) in files.iter().filter(|(rel, _)| Some(*rel) != first) {
+            put(&root, rel, text);
+        }
+        if first.is_none() {
+            sync_domain(&store, "kb", &root).await.unwrap();
+        }
+        for (i, (rel, _)) in files.iter().enumerate() {
+            set_mtime(&root, rel, 60 * (files.len() - i) as u64);
+        }
+        let mut entry = DomainEntry::file(root);
+        edit(&mut entry);
+        let store_ref: &dyn Store = &store;
+        let d = check_domain_checks("kb", &entry, Some(store_ref), None, fix, read_only)
+            .await
+            .unwrap();
+        (dir, d)
+    }
+
+    fn pair(s: String, o: String) -> Vec<(&'static str, String)> {
+        vec![(S_PATH, s), (O_PATH, o)]
+    }
+
+    const OLDER: &str = "2026-09-01T10:00:00+00:00";
+    const NEWER: &str = "2026-09-20T10:00:00+00:00";
+
+    #[tokio::test]
+    async fn a_stray_copy_is_found_and_split_out_of_unindexed() {
+        let (_dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert_eq!(
+            (s.path.as_str(), s.original.as_str(), s.permalink.as_str()),
+            (S_PATH, O_PATH, "conventions/code-review-standards")
+        );
+        assert!(s.newer && !s.same_text && s.fixable && !s.fixed, "{s:?}");
+        assert!(
+            !d.unindexed.iter().any(|p| p == S_PATH || p == O_PATH),
+            "{:?}",
+            d.unindexed
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. It has the newer text, rerun with --fix to move it into conventions/Code Review Standards.md and delete the copy"),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["domains"][0]["stray_copies"].is_array(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_in_a_capitalized_folder_is_found() {
+        let text = |body: &str, at: &str| {
+            review_standards(body, at).replace(
+                "permalink: conventions/code-review-standards",
+                "permalink: team-notes/code-review-standards",
+            )
+        };
+        let (_dir, d) = stray_doctor(
+            &[
+                (
+                    "Team Notes/code-review-standards.md",
+                    text("The new rule.", NEWER),
+                ),
+                (
+                    "Team Notes/Code Review Standards.md",
+                    text("The old rule.", OLDER),
+                ),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        assert_eq!(
+            d.stray_copies[0].path,
+            "Team Notes/code-review-standards.md"
+        );
+        assert_eq!(
+            d.stray_copies[0].original,
+            "Team Notes/Code Review Standards.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_permalink_without_the_permalink_file_name_is_not_a_stray_copy() {
+        let (_dir, d) = stray_doctor(
+            &[
+                ("conventions/Review.md", review_standards("One.", NEWER)),
+                ("conventions/Standards.md", review_standards("Two.", OLDER)),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_is_found_when_it_is_the_indexed_one() {
+        let (_dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            Some(S_PATH),
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        assert_eq!(d.stray_copies[0].path, S_PATH);
+        assert!(
+            !d.unindexed.iter().any(|p| p == O_PATH),
+            "{:?}",
+            d.unindexed
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_deletes_an_identical_stray_copy() {
+        // Equal apart from `generated`.
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The rule.", NEWER),
+                review_standards("The rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(s.same_text && s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert!(!root.join(S_PATH).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            review_standards("The rule.", OLDER),
+            "the original is untouched"
+        );
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  fixed conventions/code-review-standards.md: deleted, it had the same text as conventions/Code Review Standards.md"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_moves_the_newer_text_into_the_original_and_deletes_the_copy() {
+        // The original is the indexed file, so nothing is left for a sync;
+        // the other way round is `fix_of_an_indexed_copy_sends_the_engram_to_sync`.
+        let newer = review_standards("The new rule.", NEWER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), review_standards("The old rule.", OLDER)),
+            Some(O_PATH),
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        assert!(!root.join(S_PATH).exists(), "the copy is gone");
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            newer,
+            "the file name stays, and so does the permalink"
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        assert!(
+            render_human(&report).contains("  fixed conventions/Code Review Standards.md: took the newer text from conventions/code-review-standards.md and deleted the copy"),
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_when_the_original_is_newer() {
+        // The original changed after the copy; and, Review Focus 5, a pair
+        // written at the same instant with different text is not "newer".
+        for (s_at, o_at) in [(OLDER, NEWER), (NEWER, NEWER)] {
+            let original = review_standards("The old rule, edited.", o_at);
+            let (dir, d) = stray_doctor(
+                &pair(review_standards("The new rule.", s_at), original.clone()),
+                None,
+                |_| {},
+                true,
+                false,
+            )
+            .await;
+            let s = &d.stray_copies[0];
+            assert!(!s.newer && !s.fixable && !s.fixed, "{s_at} {o_at}: {s:?}");
+            let root = dir.path().join("kb");
+            assert!(root.join(S_PATH).exists());
+            assert_eq!(
+                std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                original
+            );
+            let out = render_human(&DoctorReport {
+                domains: vec![d.clone()],
+                ..DoctorReport::default()
+            });
+            assert!(
+                out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. conventions/Code Review Standards.md changed after it: compare the two, keep the right text in conventions/Code Review Standards.md and delete the copy"),
+                "{out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_in_a_reviewing_domain() {
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |entry| entry.review = Some(crystalline_core::config::ReviewMode::Overlay),
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.fixed && !s.fixable, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(REVIEWED_NOTE));
+        assert!(dir.path().join("kb").join(S_PATH).exists());
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. This domain reviews changes, so --fix leaves it: fix it in the repository"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_on_a_read_only_instance() {
+        let (dir, d) = stray_doctor(
+            &pair(
+                review_standards("The new rule.", NEWER),
+                review_standards("The old rule.", OLDER),
+            ),
+            None,
+            |_| {},
+            true,
+            true,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.fixed, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(READ_ONLY_NOTE));
+        assert!(dir.path().join("kb").join(S_PATH).exists());
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. This instance is read-only, so --fix leaves it"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_drops_the_adopt_when_the_original_changes_during_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        let original = review_standards("The old rule.", OLDER);
+        put(&root, O_PATH, &original);
+        put(&root, S_PATH, &review_standards("The new rule.", NEWER));
+        set_mtime(&root, O_PATH, 60);
+        set_mtime(&root, S_PATH, 120);
+        let pairs = stray_pairs(&root);
+        assert_eq!(pairs.len(), 1);
+        // Somebody writes the original between doctor's read and its fix.
+        let edited = review_standards("Edited meanwhile.", OLDER);
+        std::fs::write(root.join(O_PATH), &edited).unwrap();
+        let s = settle_stray(&root, &pairs[0], false, false, true);
+        assert!(!s.fixed, "{s:?}");
+        assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE));
+        assert_eq!(std::fs::read_to_string(root.join(O_PATH)).unwrap(), edited);
+        assert!(root.join(S_PATH).exists(), "nothing deleted");
+        let out = render_human(&DoctorReport {
+            domains: vec![DomainDoctor {
+                path_exists: true,
+                manifest_present: true,
+                stray_copies: vec![s],
+                ..DomainDoctor::default()
+            }],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. {CHANGED_NOTE}"
+            )),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_runs_in_a_team_domain_and_leaves_local_changes() {
+        use crystalline_remote::changes::{LocalChange, detect_local_changes};
+        use crystalline_remote::state::BaseStamp;
+        let newer = review_standards("The new rule.", NEWER);
+        let older = review_standards("The old rule.", OLDER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), older.clone()),
+            None,
+            |entry| {
+                entry.origin = Some(OriginConfig {
+                    repo: "acme/kb".to_string(),
+                    path: None,
+                    branch: None,
+                    poll_secs: None,
+                })
+            },
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        let stamp = |text: &str| BaseStamp {
+            sha256: crate::receipt::sha256_hex(text.as_bytes()),
+            size: text.len() as u64,
+        };
+        let base: BTreeMap<String, BaseStamp> = [
+            ("MANIFEST.md".to_string(), stamp(MANIFEST_KB)),
+            (O_PATH.to_string(), stamp(&older)),
+            (S_PATH.to_string(), stamp(&newer)),
+        ]
+        .into_iter()
+        .collect();
+        let mut changes: Vec<String> = detect_local_changes(&root, &base)
+            .unwrap()
+            .changes
+            .iter()
+            .map(|change| match change {
+                LocalChange::Modified { path, .. } => format!("modified {path}"),
+                LocalChange::Deleted { path } => format!("deleted {path}"),
+                LocalChange::Added { path, .. } => format!("added {path}"),
+            })
+            .collect();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![format!("deleted {S_PATH}"), format!("modified {O_PATH}")],
+            "ordinary local changes for the next share"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_that_changes_during_the_run() {
+        // Both fixes: the identical delete and the adopt, where the copy is
+        // the file a write by title lands on while it is the indexed one.
+        for original_body in ["The rule.", "The old rule."] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("kb");
+            put(&root, O_PATH, &review_standards(original_body, OLDER));
+            put(&root, S_PATH, &review_standards("The rule.", NEWER));
+            set_mtime(&root, O_PATH, 60);
+            set_mtime(&root, S_PATH, 120);
+            let pairs = stray_pairs(&root);
+            assert_eq!(pairs.len(), 1);
+            // Somebody writes the copy between doctor's read and its delete.
+            let edited = review_standards("Written meanwhile.", NEWER);
+            std::fs::write(root.join(S_PATH), &edited).unwrap();
+            let s = settle_stray(&root, &pairs[0], false, false, true);
+            assert!(!s.fixed, "{original_body}: {s:?}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(S_PATH)).unwrap(),
+                edited,
+                "{original_body}: the new text survives"
+            );
+            if s.same_text {
+                assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE));
+                assert_eq!(
+                    std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                    review_standards(original_body, OLDER),
+                    "the identical delete writes nothing"
+                );
+            } else {
+                // The adopt already wrote the original: the note says so.
+                assert_eq!(
+                    s.note.as_deref(),
+                    Some(
+                        "conventions/Code Review Standards.md now has the text of the copy. The copy changed while doctor ran, so --fix kept it: run doctor again"
+                    )
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+                    review_standards("The rule.", NEWER)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_a_stray_copy_when_the_original_was_edited_by_hand_after_it() {
+        // An editor leaves `generated.at` as it was, so by the stamps alone
+        // the copy is newer; the original's file time says it changed after.
+        let copy = review_standards("The new rule.", NEWER);
+        let original = review_standards("The old rule, edited by hand.", OLDER);
+        let (dir, d) = stray_doctor(
+            &[(O_PATH, original.clone()), (S_PATH, copy.clone())],
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        let s = &d.stray_copies[0];
+        assert!(!s.newer && !s.fixable && !s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert_eq!(
+            std::fs::read_to_string(root.join(O_PATH)).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_to_string(root.join(S_PATH)).unwrap(), copy);
+        let out = render_human(&DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains("  [problem] conventions/code-review-standards.md is a second copy of conventions/Code Review Standards.md, left by an overwrite in 0.20.0. conventions/Code Review Standards.md changed after it: compare the two, keep the right text in conventions/Code Review Standards.md and delete the copy"),
+            "{out}"
+        );
+    }
+
+    /// An engram in `notes` with its own title and permalink.
+    fn note(title: &str, permalink: &str, body: &str, generated_at: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ngenerated:\n  by: human:ada\n  at: {generated_at}\n---\n\n# {title}\n\n{body}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn fix_leaves_two_files_that_only_share_a_permalink() {
+        // Copied by hand and retitled, the permalink left as it was; an agent
+        // then edited notes/meeting, so meeting.md is stamped and modified
+        // last. Not an overwrite from 0.20.0: reported, never touched.
+        let meeting = note("Meeting", "notes/meeting", "The agenda.", NEWER);
+        let september = note(
+            "Meeting 2026-09",
+            "notes/meeting",
+            "The September notes.",
+            OLDER,
+        );
+        let (dir, d) = stray_doctor(
+            &[
+                ("notes/meeting.md", meeting.clone()),
+                ("notes/Meeting 2026-09.md", september.clone()),
+            ],
+            None,
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert!(!s.from_overwrite && !s.fixable && !s.fixed, "{s:?}");
+        let root = dir.path().join("kb");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/meeting.md")).unwrap(),
+            meeting
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/Meeting 2026-09.md")).unwrap(),
+            september
+        );
+        let report = DoctorReport {
+            domains: vec![d.clone()],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains("  [problem] notes/meeting.md and notes/Meeting 2026-09.md both use the permalink notes/meeting, so only one of them can be indexed. They are not a copy left by 0.20.0, so --fix leaves them: give one of them its own permalink"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_of_an_indexed_copy_sends_the_engram_to_sync() {
+        // The copy was the indexed file: after the fix its row is an orphan
+        // (removed in the same run) and the engram's own file is not indexed
+        // yet, which doctor must say instead of "ok".
+        let newer = review_standards("The new rule.", NEWER);
+        let (dir, d) = stray_doctor(
+            &pair(newer.clone(), review_standards("The old rule.", OLDER)),
+            Some(S_PATH),
+            |_| {},
+            true,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies[0].fixed, "{:?}", d.stray_copies);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kb").join(O_PATH)).unwrap(),
+            newer
+        );
+        assert_eq!(d.unindexed, vec![O_PATH.to_string()]);
+        assert_eq!(
+            (d.orphans.clone(), d.orphans_removed),
+            (vec![S_PATH.to_string()], 1)
+        );
+        let report = DoctorReport {
+            domains: vec![d],
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        assert!(
+            render_human(&report).contains(
+                "  [problem] 1 file(s) not indexed yet, run: crystalline sync --domain kb"
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn one_permalink_in_two_folders_is_not_a_stray_copy() {
+        let (_dir, d) = stray_doctor(
+            &[
+                (
+                    "drafts/code-review-standards.md",
+                    review_standards("New.", NEWER),
+                ),
+                (
+                    "conventions/Code Review Standards.md",
+                    review_standards("Old.", OLDER),
+                ),
+            ],
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+    }
+
+    #[tokio::test]
+    async fn three_files_with_one_permalink_are_only_reported() {
+        let files = vec![
+            (S_PATH, review_standards("The new rule.", NEWER)),
+            (O_PATH, review_standards("The old rule.", OLDER)),
+            ("conventions/Review.md", review_standards("A third.", OLDER)),
+        ];
+        let (dir, d) = stray_doctor(&files, None, |_| {}, true, false).await;
+        assert!(d.stray_copies.is_empty(), "{:?}", d.stray_copies);
+        let root = dir.path().join("kb");
+        for (rel, text) in &files {
+            assert_eq!(
+                &std::fs::read_to_string(root.join(rel)).unwrap(),
+                text,
+                "{rel}"
+            );
+        }
+        assert_eq!(
+            d.unindexed.len(),
+            2,
+            "sync indexes one of the three: {:?}",
+            d.unindexed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stray_copy_without_a_permalink_key_is_found() {
+        // The index gives a file without the key the slug of its path.
+        let copy = review_standards("The new rule.", NEWER)
+            .replace("permalink: conventions/code-review-standards\n", "");
+        let (_dir, d) = stray_doctor(
+            &pair(copy, review_standards("The old rule.", OLDER)),
+            None,
+            |_| {},
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(d.stray_copies.len(), 1, "{:?}", d.stray_copies);
+        let s = &d.stray_copies[0];
+        assert_eq!((s.path.as_str(), s.original.as_str()), (S_PATH, O_PATH));
+        assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
     }
 }

@@ -146,4 +146,89 @@ mod tests {
         assert!(routing.content.starts_with("---\n"));
         assert!(skill("crystalline-nonesuch").is_none());
     }
+
+    #[test]
+    fn the_skills_teach_the_cross_domain_link_form() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        assert!(
+            capture.contains("`[[<domain>:<Title or permalink>]]`"),
+            "capture skill lacks the link form"
+        );
+        assert!(
+            capture.contains("This rule covers tool arguments only"),
+            "capture skill still reads like a ban"
+        );
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        assert!(
+            desktop.contains("`[[domain:Target]]`"),
+            "consolidated skill lacks the link form"
+        );
+        assert!(
+            desktop.contains("`[[<domain>:<Title or permalink>]]`"),
+            "consolidated skill lacks the relation form"
+        );
+    }
+
+    #[test]
+    fn the_skills_teach_that_a_miss_names_the_permalink() {
+        let hint = "A file path is not an identifier: a miss names the permalink it probably meant";
+        for name in ["crystalline-capture", "crystalline-intelligence"] {
+            let content = skill(name).unwrap().content;
+            assert!(content.contains(hint), "{name} lacks the miss hint");
+            assert!(
+                !content.contains("file path inside the domain"),
+                "{name} still offers the file path as an identifier"
+            );
+            assert!(
+                !content.contains("with or without `.md`"),
+                "{name} still offers the file path as an identifier"
+            );
+        }
+        let routing = skill("crystalline-routing").unwrap().content;
+        assert!(
+            routing.contains(
+                "The filename `MANIFEST.md` is not an identifier, and a miss names the permalink it probably meant"
+            ),
+            "routing skill calls MANIFEST.md no identifier and names the hint"
+        );
+        assert!(
+            !routing.contains("`MANIFEST.md` resolves"),
+            "routing skill no longer says MANIFEST.md resolves"
+        );
+    }
+
+    #[test]
+    fn the_capture_skill_lists_the_provenance_keys_as_settable() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        assert!(
+            capture
+                .contains("`source_date`, `resource`, `source_version`, `salience` and `verified`"),
+            "capture skill lists resource and source_version as settable"
+        );
+    }
+
+    #[test]
+    fn the_skills_teach_per_engram_provenance_and_citing_it() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        for needle in [
+            "- ingested_from [[",
+            "`[source]`",
+            "/blob/{sha}/{path}",
+            "V111",
+        ] {
+            assert!(capture.contains(needle), "capture skill lacks {needle}");
+        }
+        let routing = skill("crystalline-routing").unwrap().content;
+        assert!(
+            routing.contains("cite the location"),
+            "routing skill lacks the citing rule"
+        );
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        for needle in ["ingested_from", "cite that location"] {
+            assert!(
+                desktop.contains(needle),
+                "consolidated skill lacks {needle}"
+            );
+        }
+    }
 }

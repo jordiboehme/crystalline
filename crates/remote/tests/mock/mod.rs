@@ -127,6 +127,10 @@ struct Inner {
     update_proposal_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers [`RemoteError::Offline`].
     open_list_fails: bool,
+    /// Whether deleting a branch closes every open proposal based on it, the
+    /// way GitHub does. Off by default, so the scenarios that never model it
+    /// keep their exact call and state expectations.
+    close_orphans: bool,
     /// Whether this forge serves stacks at all. Until
     /// `MockProvider::enable_stacks` flips it, the four stack verbs answer
     /// [`RemoteError::StacksUnsupported`].
@@ -166,6 +170,15 @@ struct Inner {
     tree_counter: u64,
     proposal_counter: u64,
     calls: Vec<String>,
+    /// The head repository each proposal lists with. Absent means the
+    /// origin's own repository, which is where `create_proposal` opens them.
+    head_repos: HashMap<u64, Option<String>>,
+    /// Branches whose `delete_branch` fails, sticky until healed, with the
+    /// status and message the injected `Api` error carries. The branch stays.
+    delete_failures: HashMap<String, (u16, String)>,
+    /// Proposals the next listing shows as open whatever their state: the
+    /// forge's listing lagging right after a close.
+    listed_open_once: HashSet<u64>,
 }
 
 impl Inner {
@@ -378,8 +391,43 @@ impl MockProvider {
 
     /// Sets the lifecycle state a later [`Provider::proposal_state`] call will
     /// report for proposal `number`.
+    ///
+    /// Merging one also makes the forge's own move on a stack: every member of
+    /// the merged one's stack that was based on its branch now targets the
+    /// branch it merged into.
     pub fn set_proposal_state(&self, number: u64, state: ProposalState) {
-        self.inner.lock().unwrap().proposals.insert(number, state);
+        let mut inner = self.inner.lock().unwrap();
+        inner.proposals.insert(number, state);
+        if state != ProposalState::Merged {
+            return;
+        }
+        // The forge's own move on a stacked merge: every member of the merged
+        // one's stack that was based on its branch now targets the branch it
+        // merged into. A proposal outside the stack is left where it is,
+        // which is the case issue 113 is about.
+        let Some(merged) = inner.proposal_requests.get(&number).cloned() else {
+            return;
+        };
+        let members: Vec<u64> = inner
+            .stacks
+            .values()
+            .filter(|stack| stack.members.contains(&number))
+            .flat_map(|stack| stack.members.clone())
+            .collect();
+        for member in members {
+            if let Some(req) = inner.proposal_requests.get_mut(&member)
+                && member != number
+                && req.base_branch == merged.branch
+            {
+                req.base_branch = merged.base_branch.clone();
+            }
+        }
+    }
+
+    /// Makes `delete_branch` close every open proposal based on the deleted
+    /// branch, which is what the forge does and what issue 113 was about.
+    pub fn close_proposals_when_their_base_is_deleted(&self) {
+        self.inner.lock().unwrap().close_orphans = true;
     }
 
     /// The commit `branch` currently points at, or `None` if it was never
@@ -506,6 +554,58 @@ impl MockProvider {
             .unwrap()
             .update_proposal_failures
             .remove(&number);
+    }
+
+    /// Opens a pull request by hand, the way a teammate would on the forge:
+    /// `head` from `head_repo` (`None` for a deleted fork) into `base`, under
+    /// the number given. Later proposals are numbered above it.
+    pub fn open_pull_request(&self, number: u64, head: &str, head_repo: Option<&str>, base: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.proposal_counter = inner.proposal_counter.max(number);
+        inner.proposals.insert(number, ProposalState::Open);
+        inner.proposal_branches.insert(number, head.to_string());
+        inner.proposal_requests.insert(
+            number,
+            ProposalRequest {
+                title: format!("pull request {number}"),
+                body: String::new(),
+                branch: head.to_string(),
+                base_branch: base.to_string(),
+            },
+        );
+        inner
+            .head_repos
+            .insert(number, head_repo.map(str::to_string));
+    }
+
+    /// Makes [`Provider::delete_branch`] fail for `name` with an `Api` error
+    /// of `status` and `message`, leaving the branch in place, until
+    /// [`MockProvider::heal_delete_branch`].
+    pub fn fail_delete_branch(&self, name: &str, status: u16, message: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delete_failures
+            .insert(name.to_string(), (status, message.to_string()));
+    }
+
+    /// Lets [`Provider::delete_branch`] succeed again for `name`.
+    pub fn heal_delete_branch(&self, name: &str) {
+        self.inner.lock().unwrap().delete_failures.remove(name);
+    }
+
+    /// Removes a branch the way somebody does on the forge's own page: no
+    /// call is recorded and no proposal is touched.
+    pub fn delete_branch_by_hand(&self, name: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.branches.remove(name);
+        inner.etags.remove(name);
+    }
+
+    /// Makes the next [`Provider::list_open_proposals`] list `number` as open
+    /// whatever its state, once.
+    pub fn list_as_open_once(&self, number: u64) {
+        self.inner.lock().unwrap().listed_open_once.insert(number);
     }
 
     /// Turns this forge into one that serves stacks. Until this is called the
@@ -806,11 +906,38 @@ impl Provider for MockProvider {
         Ok(())
     }
 
-    async fn delete_branch(&self, _origin: &OriginSpec, name: &str) -> Result<(), RemoteError> {
+    async fn delete_branch(&self, origin: &OriginSpec, name: &str) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("delete_branch:{name}"));
+        if let Some((status, message)) = inner.delete_failures.get(name).cloned() {
+            return Err(RemoteError::Api { status, message });
+        }
         inner.branches.remove(name);
         inner.etags.remove(name);
-        inner.calls.push(format!("delete_branch:{name}"));
+        if inner.close_orphans {
+            // The forge closes every open proposal based on the deleted branch,
+            // and every one whose head it was, when that head is ours.
+            let ours = |n: &u64| {
+                inner
+                    .head_repos
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_else(|| Some(origin.repo.clone()))
+                    .is_some_and(|repo| repo == origin.repo)
+            };
+            let orphans: Vec<u64> = inner
+                .proposal_requests
+                .iter()
+                .filter(|(n, req)| {
+                    inner.proposals.get(*n) == Some(&ProposalState::Open)
+                        && (req.base_branch == name || (req.branch == name && ours(n)))
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            for number in orphans {
+                inner.proposals.insert(number, ProposalState::Declined);
+            }
+        }
         Ok(())
     }
 
@@ -945,16 +1072,17 @@ impl Provider for MockProvider {
 
     async fn list_open_proposals(
         &self,
-        _origin: &OriginSpec,
+        origin: &OriginSpec,
     ) -> Result<Vec<OpenProposalRef>, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push("list_open_proposals".to_string());
         if inner.open_list_fails {
             return Err(RemoteError::Offline);
         }
+        let stale = std::mem::take(&mut inner.listed_open_once);
         let mut out = Vec::new();
         for (number, state) in &inner.proposals {
-            if *state != ProposalState::Open {
+            if *state != ProposalState::Open && !stale.contains(number) {
                 continue;
             }
             let branch = inner
@@ -963,10 +1091,22 @@ impl Provider for MockProvider {
                 .cloned()
                 .unwrap_or_default();
             let head_sha = inner.branches.get(&branch).cloned().unwrap_or_default();
+            let base = inner
+                .proposal_requests
+                .get(number)
+                .map(|r| r.base_branch.clone())
+                .unwrap_or_default();
+            let head_repo = inner
+                .head_repos
+                .get(number)
+                .cloned()
+                .unwrap_or_else(|| Some(origin.repo.clone()));
             out.push(OpenProposalRef {
                 number: *number,
                 branch,
                 head_sha,
+                base,
+                head_repo,
             });
         }
         // `proposals` is a HashMap, so sort before returning: tests assert on

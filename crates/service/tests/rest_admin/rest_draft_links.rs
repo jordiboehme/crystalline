@@ -1155,6 +1155,526 @@ async fn a_granted_read_answers_the_draft_and_names_whose() {
     );
 }
 
+/// Bob holds alice's link to the draft at `path`.
+async fn bob_holds(f: &Fixture, alice: &Session, bob: &Session, path: &str) {
+    let token = f.mint(alice, path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "bob holds the grant");
+}
+
+fn read_as(identifier: &str) -> crystalline_service::params::ReadParams {
+    crystalline_service::params::ReadParams {
+        identifier: identifier.to_string(),
+        domain: Some("team".to_string()),
+        share_link: None,
+    }
+}
+
+/// `account`'s draft titled `title` in `folder`, answering its path.
+async fn draft_in(f: &Fixture, account: &str, folder: &str, title: &str, body: &str) -> String {
+    let receipt = f
+        .engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: title.to_string(),
+                content: body.to_string(),
+                folder: Some(folder.to_string()),
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &as_account(account),
+        )
+        .await
+        .expect("the draft lands");
+    receipt["path"].as_str().unwrap().to_string()
+}
+
+const TEAM_DEPLOY_NOTES: &str = "---\ntype: engram\ntitle: Deploy Notes\npermalink: deploy\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Deploy Notes\n\nWhat the team agreed.\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_draft_is_read_by_its_title_before_a_base_page_with_that_title() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f
+        .draft("alice", "Deploy Notes", "What alice drafted.")
+        .await;
+    // The team's own page under the same title, landed after her draft.
+    std::fs::write(f.root.join("team/deploy.md"), TEAM_DEPLOY_NOTES).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &path).await;
+
+    let read = f
+        .engine
+        .read_engram(&read_as("Deploy Notes"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("What alice drafted."),
+        "{read}"
+    );
+    assert_eq!(read["draft_owner"], "alice", "{read}");
+
+    // Somebody holding no link reads the title and gets the team's page.
+    let theirs = f
+        .engine
+        .read_engram(&read_as("Deploy Notes"), &as_account("carol"))
+        .await
+        .unwrap();
+    assert!(
+        theirs["content"]
+            .as_str()
+            .unwrap()
+            .contains("What the team agreed."),
+        "{theirs}"
+    );
+    assert!(theirs["draft_owner"].is_null(), "{theirs}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_draft_is_not_read_by_its_path() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f
+        .draft("alice", "Deploy Notes", "What alice drafted.")
+        .await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &path).await;
+    // `deploy-notes.md`: the stem is the permalink here, so only the file
+    // path itself is asked.
+    assert_eq!(path, "deploy-notes.md");
+    let missed = f
+        .engine
+        .read_engram(&read_as(&path), &as_account("bob"))
+        .await
+        .expect_err("a path is not an identifier");
+    assert!(
+        matches!(
+            missed,
+            crystalline_service::engine::EngineError::NotFound(_)
+        ),
+        "{missed}"
+    );
+    let said = missed.to_string();
+    assert!(!said.contains("What alice drafted."), "{said}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permalink_match_beats_another_grants_title_match() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    // alice's draft answers to the permalink `fresh`; carol's, whose path
+    // sorts first, only to the title "Fresh".
+    let alices = f.draft("alice", "Fresh", "alice's page.").await;
+    let carols = draft_in(&f, "carol", "a", "Fresh", "carol's page.").await;
+    assert!(carols.as_bytes() < alices.as_bytes(), "{carols} {alices}");
+    let alice = login(f.addr, "alice").await;
+    let carol = login(f.addr, "carol").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &alices).await;
+    bob_holds(&f, &carol, &bob, &carols).await;
+
+    let read = f
+        .engine
+        .read_engram(&read_as("fresh"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(read["draft_owner"], "alice", "{read}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_s_own_draft_with_that_title_wins_over_the_grant() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f
+        .draft("alice", "Deploy Notes", "What alice drafted.")
+        .await;
+    draft_in(&f, "bob", "mine", "Deploy Notes", "What bob drafted.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &path).await;
+
+    let read = f
+        .engine
+        .read_engram(&read_as("Deploy Notes"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("What bob drafted."),
+        "{read}"
+    );
+    assert_ne!(read["draft_owner"], "alice", "{read}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_join_refusal_names_the_permalink() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    assert_eq!(path, "fresh.md");
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &path).await;
+    // The verb an agent sends over MCP, held but not joined.
+    let said = f
+        .engine
+        .edit_engram_joined(
+            &append_edit("written without joining"),
+            Some("bob"),
+            &as_account("bob"),
+            None,
+        )
+        .await
+        .expect_err("an unjoined edit is refused")
+        .to_string();
+    assert_eq!(
+        said,
+        "'fresh' is alice's draft, shared with you to read: writing into it is a second step. Join the draft and your changes land in alice's copy, where alice reviews them; or draft your own copy in your own overlay and leave theirs as it stands."
+    );
+
+    // The other door: a page bob resolves himself, the team's `plan.md`,
+    // which alice has drafted over and shared. His edit resolves to the
+    // team's file and the grant screen on that path refuses it, naming the
+    // permalink too.
+    let over = f
+        .engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: "Plan".to_string(),
+                content: "What alice would change.".to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: true,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &as_account("alice"),
+        )
+        .await
+        .expect("alice drafts over the team's page");
+    assert_eq!(over["path"], "plan.md", "{over}");
+    bob_holds(&f, &alice, &bob, "plan.md").await;
+    let mut edit = append_edit("written without joining");
+    edit.identifier = "plan".to_string();
+    let said = f
+        .engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .expect_err("an unjoined edit of a granted path is refused")
+        .to_string();
+    assert!(
+        said.starts_with("'plan' is alice's draft, shared with you to read"),
+        "{said}"
+    );
+}
+
+/// Moves `account`'s draft at `path` to `destination`, giving it `permalink`.
+async fn give_permalink(
+    f: &Fixture,
+    account: &str,
+    path: &str,
+    destination: &str,
+    permalink: &str,
+) {
+    f.engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: path.trim_end_matches(".md").to_string(),
+                domain: "team".to_string(),
+                destination: destination.to_string(),
+                destination_domain: None,
+                permalink: Some(permalink.to_string()),
+                update_links: None,
+            },
+            &as_account(account),
+        )
+        .await
+        .expect("the draft moves and takes the permalink");
+}
+
+/// A grant matched by its title yields to the reader's own draft whose
+/// PERMALINK is the name, the resolver's order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_s_own_draft_with_that_permalink_wins_over_a_grants_title() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let hers = draft_in(&f, "alice", "notes", "Deploy", "What alice drafted.").await;
+    let his = draft_in(&f, "bob", "ops", "Deployment", "What bob drafted.").await;
+    give_permalink(&f, "bob", &his, "ops/runbook.md", "deploy").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    let read = f
+        .engine
+        .read_engram(&read_as("deploy"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("What bob drafted."),
+        "{read}"
+    );
+    assert_ne!(read["draft_owner"], "alice", "{read}");
+}
+
+/// The reader's own draft yields only when it answers the name exactly, the
+/// way the resolver would find it: a title that differs in case is not theirs,
+/// so the grant answers rather than nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_s_own_title_in_another_case_does_not_hide_the_grant() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let hers = f
+        .draft("alice", "Deploy Notes", "What alice drafted.")
+        .await;
+    draft_in(&f, "bob", "mine", "deploy notes", "What bob drafted.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    let read = f
+        .engine
+        .read_engram(&read_as("Deploy Notes"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(read["draft_owner"], "alice", "{read}");
+}
+
+const TEAM_RESTART: &str = "---\ntype: engram\ntitle: Restart Runbook\npermalink: restart\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Restart Runbook\n\nHow the team restarts.\n";
+
+/// A grant matched by its title yields to a team page whose permalink is the
+/// name; the title spelled as the draft has it still opens the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_team_permalink_beats_a_grants_title() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    std::fs::write(f.root.join("team/restart.md"), TEAM_RESTART).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let hers = draft_in(&f, "alice", "notes", "Restart", "What alice drafted.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    let team = f
+        .engine
+        .read_engram(&read_as("restart"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        team["content"]
+            .as_str()
+            .unwrap()
+            .contains("How the team restarts."),
+        "{team}"
+    );
+    assert!(team["draft_owner"].is_null(), "{team}");
+
+    let draft = f
+        .engine
+        .read_engram(&read_as("Restart"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(draft["draft_owner"], "alice", "{draft}");
+}
+
+/// An unjoined edit of a name the read answers with a granted draft is refused
+/// with the join sentence, naming the permalink, and never lands in the
+/// editor's own draft of the team's page with that title.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unjoined_edit_of_a_granted_title_is_refused_like_the_read_answers() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let hers = f
+        .draft("alice", "Deploy Notes", "What alice drafted.")
+        .await;
+    std::fs::write(f.root.join("team/deploy.md"), TEAM_DEPLOY_NOTES).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    let mut edit = append_edit("written without joining");
+    edit.identifier = "Deploy Notes".to_string();
+    let said = f
+        .engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .expect_err("the read answers alice's draft, so the edit needs a join")
+        .to_string();
+    assert!(
+        said.starts_with("'deploy-notes' is alice's draft, shared with you to read"),
+        "{said}"
+    );
+    assert!(
+        f.engine
+            .overlay_draft_at("team", "bob", "deploy.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing landed in bob's draft of the team's page"
+    );
+}
+
+/// The joined and room lookup takes a title match the way a read does: a
+/// grant found only by its title yields to the team page whose permalink is
+/// the name, so a joined write of that name is not routed into the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_joined_lookup_yields_a_title_to_a_team_permalink() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    std::fs::write(f.root.join("team/restart.md"), TEAM_RESTART).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let hers = draft_in(&f, "alice", "notes", "Restart", "What alice drafted.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &hers).await;
+
+    // The title as the draft spells it is no team page's permalink, so it
+    // still opens the grant, and so does the draft's own permalink.
+    let (owner, path, permalink) = f
+        .engine
+        .granted_draft_named("team", "Restart", Some("alice"), &as_account("bob"))
+        .await
+        .unwrap()
+        .expect("the title opens the grant");
+    assert_eq!((owner.as_str(), path.as_str()), ("alice", hers.as_str()));
+    assert_ne!(
+        permalink, "restart",
+        "the premise: the draft's permalink differs"
+    );
+    let by_permalink = f
+        .engine
+        .granted_draft_named("team", &permalink, Some("alice"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_permalink.map(|(_, path, _)| path),
+        Some(hers.clone()),
+        "a permalink match never yields"
+    );
+
+    // `restart` matches the grant's title too, and it is the team page's
+    // permalink: the read answers the team page, and so does this lookup.
+    let team = f
+        .engine
+        .granted_draft_named("team", "restart", Some("alice"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(team, None);
+}
+
+/// An unjoined edit asks the accounts store about grants only where a grant
+/// can apply: a domain that takes changes directly never asks, so an accounts
+/// store that cannot answer never fails an ordinary edit there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unjoined_edit_asks_about_grants_only_in_a_reviewing_domain() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let plain = f.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(
+        plain.join("MANIFEST.md"),
+        MANIFEST.replace("title: team", "title: plain"),
+    )
+    .unwrap();
+    std::fs::write(plain.join("plan.md"), PLAN).unwrap();
+    f.engine
+        .domain_add_local(Some("plain"), Some(plain.to_str().unwrap()))
+        .await
+        .unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let before = f.engine.granted_name_checks_run();
+    let mut edit = append_edit("bob's line in a plain domain");
+    edit.identifier = "plan".to_string();
+    edit.domain = "plain".to_string();
+    f.engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.engine.granted_name_checks_run(),
+        before,
+        "no grant can apply in a domain that takes changes directly"
+    );
+
+    // The same edit in the reviewing domain asks, which is where the join
+    // refusal lives.
+    edit.domain = "team".to_string();
+    f.engine
+        .edit_engram_joined(&edit, Some("bob"), &as_account("bob"), None)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.granted_name_checks_run(), before + 1);
+}
+
+/// An absolute address naming another domain never matches a grant here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_domains_address_matches_no_grant() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, &path).await;
+
+    let named = f
+        .engine
+        .granted_draft_named(
+            "team",
+            "crystalline://other/fresh",
+            None,
+            &as_account("bob"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(named, None);
+    let held = f
+        .engine
+        .granted_draft_named("team", "crystalline://team/fresh", None, &as_account("bob"))
+        .await
+        .unwrap();
+    assert_eq!(
+        held,
+        Some((
+            "alice".to_string(),
+            "fresh.md".to_string(),
+            "fresh".to_string()
+        ))
+    );
+}
+
 /// A grant whose draft has gone does not lock its grantee out of the path.
 ///
 /// The refusal that teaches "join, or draft your own" is only true while there

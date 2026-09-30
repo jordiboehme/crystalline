@@ -9,7 +9,11 @@
 //! permalink starts with the domain's own name: a permalink is
 //! domain-relative (the OKF Concept ID made explicit) and the domain name is
 //! per-user configuration, so persisting it into a file misleads as soon as
-//! the domain is registered under another name.
+//! the domain is registered under another name. `E010` is the one parse
+//! failure with a name of its own: a frontmatter key held more than once,
+//! reported per key with its lines when removing the later copies is all the
+//! file needs (everything else that does not parse stays `E001`).
+//! `crystalline doctor --fix` removes the extra copies when they all agree.
 //!
 //! `E009` is the odd one out twice over: it is about paths rather than
 //! frontmatter, and it is domain-scoped rather than per-file, so it runs from
@@ -21,7 +25,8 @@ use std::collections::BTreeMap;
 
 use crate::address::slugify;
 use crate::engram::RECOMMENDED_TYPES;
-use crate::parse::ParseError;
+use crate::frontmatter::{DuplicateKey, duplicate_keys, keep_first_copies, line_list};
+use crate::parse::{ParseError, parse_engram};
 
 use super::scanner::{Domain, ScannedFile};
 use super::{Severity, Sink};
@@ -52,14 +57,31 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
             return;
         }
         Err(ParseError::Yaml { message }) => {
-            sink.emit(
-                &file.path,
-                None,
-                "E001",
-                Severity::Error,
-                format!("frontmatter YAML is invalid: {message}"),
-                None,
-            );
+            // A key held more than once is its own finding when it is the
+            // only thing wrong: with every later copy removed, the file
+            // parses. Anything else stays the generic E001. The parse check
+            // is a defensive guard: `duplicate_keys` only finds repeats when
+            // every block parses alone, so today it always holds.
+            let repeated = duplicate_keys(&file.source);
+            let only_repeats = !repeated.is_empty()
+                && keep_first_copies(&file.source).is_some_and(|text| parse_engram(&text).is_ok());
+            if only_repeats {
+                // doctor --fix repairs a file only when every repeat in it
+                // agrees, so only then does the hint send a person there.
+                let doctor_fixes = repeated.iter().all(|r| r.same_value);
+                for repeat in &repeated {
+                    emit_repeated_key(file, repeat, doctor_fixes, sink);
+                }
+            } else {
+                sink.emit(
+                    &file.path,
+                    None,
+                    "E001",
+                    Severity::Error,
+                    format!("frontmatter YAML is invalid: {message}"),
+                    None,
+                );
+            }
             return;
         }
         Err(ParseError::FrontmatterNotMapping) => {
@@ -182,6 +204,53 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
             );
         }
     }
+}
+
+/// `E010`: one frontmatter key held more than once, pointing at the second
+/// copy's line. `doctor_fixes` says whether `crystalline doctor --fix` would
+/// repair the file (every repeat in it agrees); the hint names it only then,
+/// in the words doctor itself uses.
+fn emit_repeated_key(
+    file: &ScannedFile,
+    repeat: &DuplicateKey,
+    doctor_fixes: bool,
+    sink: &mut Sink,
+) {
+    let count = repeat.lines.len();
+    let times = if count == 2 {
+        "twice".to_string()
+    } else {
+        format!("{count} times")
+    };
+    let (values, fix) = if repeat.same_value {
+        let which = if count == 2 { "one" } else { "all but one" };
+        let doctor = if doctor_fixes {
+            ", or run `crystalline doctor --fix`"
+        } else {
+            ""
+        };
+        (
+            "the same value",
+            format!("delete {which} of the lines{doctor}"),
+        )
+    } else {
+        (
+            "different values",
+            "keep one line with the right value and delete the rest".to_string(),
+        )
+    };
+    sink.emit(
+        &file.path,
+        repeat.lines.get(1).copied(),
+        "E010",
+        Severity::Error,
+        format!(
+            "frontmatter key `{}` appears {times} (lines {}) with {values}",
+            repeat.key,
+            line_list(&repeat.lines)
+        ),
+        Some(fix),
+    );
 }
 
 /// `E009`: two or more of the domain's paths differ from each other only in
@@ -318,5 +387,88 @@ mod tests {
             "path `notes/ALPHA.md` differs only in case from `notes/Alpha.md`, `notes/alpha.md`; no macOS or Windows checkout can hold them all, so all but one disappear there without warning",
             "the wording has to stay true when the group is larger than a pair"
         );
+    }
+
+    fn document_findings(source: &str) -> Vec<Issue> {
+        crate::verify::check_document("eng", Path::new("alpha.md"), source)
+    }
+
+    #[test]
+    fn a_key_held_twice_with_one_value_is_one_e010_naming_key_and_lines() {
+        let source = "---\ntype: engram\ntitle: Alpha\ndomain_name: eng\npermalink: alpha\nstatus: stable\ndomain_name: eng\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        assert!(issues.iter().all(|i| i.rule != "E001"), "{issues:#?}");
+        let e010: Vec<&Issue> = issues.iter().filter(|i| i.rule == "E010").collect();
+        assert_eq!(e010.len(), 1, "{issues:#?}");
+        assert_eq!(e010[0].severity, Severity::Error);
+        assert_eq!(e010[0].line, Some(7));
+        assert_eq!(
+            e010[0].message,
+            "frontmatter key `domain_name` appears twice (lines 4 and 7) with the same value"
+        );
+        assert_eq!(
+            e010[0].fix.as_deref(),
+            Some("delete one of the lines, or run `crystalline doctor --fix`")
+        );
+    }
+
+    #[test]
+    fn a_key_held_three_times_with_different_values_says_so() {
+        let source = "---\ntype: engram\ntags: [a]\ntitle: Alpha\ntags: [b]\npermalink: alpha\ntags: [a]\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        let e010: Vec<&Issue> = issues.iter().filter(|i| i.rule == "E010").collect();
+        assert_eq!(e010.len(), 1, "{issues:#?}");
+        assert_eq!(
+            e010[0].message,
+            "frontmatter key `tags` appears 3 times (lines 3, 5 and 7) with different values"
+        );
+        assert_eq!(
+            e010[0].fix.as_deref(),
+            Some("keep one line with the right value and delete the rest")
+        );
+    }
+
+    #[test]
+    fn a_repeat_with_one_value_beside_one_with_two_does_not_offer_doctor() {
+        let source = "---\ntype: engram\ntags: [a]\ntitle: Alpha\ntags: [b]\nstatus: stable\nstatus: stable\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        let fixes: Vec<(&str, Option<&str>)> = issues
+            .iter()
+            .filter(|i| i.rule == "E010")
+            .map(|i| (i.message.as_str(), i.fix.as_deref()))
+            .collect();
+        assert_eq!(
+            fixes,
+            [
+                (
+                    "frontmatter key `tags` appears twice (lines 3 and 5) with different values",
+                    Some("keep one line with the right value and delete the rest")
+                ),
+                (
+                    "frontmatter key `status` appears twice (lines 6 and 7) with the same value",
+                    Some("delete one of the lines")
+                ),
+            ],
+            "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn a_key_held_three_times_with_one_value_asks_to_delete_all_but_one() {
+        let source = "---\ntype: engram\ntitle: Alpha\nstatus: stable\nstatus: stable\nstatus: stable\n---\n\nBody.\n";
+        let issues = document_findings(source);
+        let e010: Vec<&Issue> = issues.iter().filter(|i| i.rule == "E010").collect();
+        assert_eq!(e010.len(), 1, "{issues:#?}");
+        assert_eq!(
+            e010[0].fix.as_deref(),
+            Some("delete all but one of the lines, or run `crystalline doctor --fix`")
+        );
+    }
+
+    #[test]
+    fn a_repeat_beside_another_yaml_error_stays_e001() {
+        let source = "---\ntype: engram\ntitle: \"Alpha\nstatus: a\nstatus: a\n---\n\nBody.\n";
+        let rules: Vec<&str> = document_findings(source).iter().map(|i| i.rule).collect();
+        assert_eq!(rules, ["E001"]);
     }
 }

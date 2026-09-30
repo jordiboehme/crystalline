@@ -117,6 +117,14 @@ pub struct OriginState {
     /// not wrong. Retried at the start of share, withdraw and status.
     #[serde(default)]
     pub stack_link_pending: bool,
+    /// Every share branch Crystalline wants gone upstream, oldest first: a
+    /// merged share's, a declined share's once the next share superseded it,
+    /// and a withdrawn share's. Written in the same save that retires the
+    /// record, so a crash between the save and the cleanup only delays the
+    /// delete. The on-disk key is the one the merged-branch queue was first
+    /// written under; no released build wrote it.
+    #[serde(rename = "merged_branches", default)]
+    pub retire_queue: Vec<QueuedBranch>,
 }
 
 /// The recorded shape of a file in the base snapshot: enough to tell, without
@@ -328,6 +336,123 @@ pub struct Conflict {
     pub detected_at: DateTime<Utc>,
 }
 
+/// A share branch waiting to be deleted upstream once no open pull request is
+/// based on it or comes from it. Deleting a branch closes every open pull
+/// request based on it, and the forge will not reopen one, so the branch goes
+/// only once nothing uses it: a merged share's pull requests are moved to
+/// `onto` first, a declined or withdrawn share's are never moved, because
+/// moving them would change what they propose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedBranch {
+    /// The share's pull request number.
+    pub number: u64,
+    /// The share branch to delete.
+    pub branch: String,
+    /// The branch the share's pull requests belong on: for a merged share the
+    /// branch it merged into, for a declined or withdrawn one the branch it
+    /// was based on.
+    pub onto: String,
+    /// Which verb retired the share.
+    #[serde(default)]
+    pub why: RetireWhy,
+    /// Why the branch is still there, once a cleanup had to keep it.
+    #[serde(default)]
+    pub kept: Option<BranchKept>,
+}
+
+/// Why a queued branch was kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchKept {
+    /// The open pull request in the way, or `None` when the open pull requests
+    /// could not be listed or the delete was refused.
+    pub blocked_by: Option<u64>,
+    /// The forge's own answer, as the error displays it; empty when there is
+    /// none (a head or a declined or withdrawn base blocker).
+    pub reason: String,
+    /// What kept it.
+    #[serde(default)]
+    pub kind: KeptKind,
+}
+
+/// Which verb retired a share. A value a newer build wrote loads as `Merged`,
+/// which serde only allows on the last variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetireWhy {
+    /// A declined share, superseded by the next share.
+    Declined,
+    /// A withdrawn share.
+    Withdrawn,
+    /// A merged share.
+    #[default]
+    #[serde(other)]
+    Merged,
+}
+
+/// What keeps a queued branch. A value a newer build wrote loads as `Base`,
+/// which serde only allows on the last variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeptKind {
+    /// An open pull request from this repository comes from it.
+    Head,
+    /// A pull request based on it cannot move, because `onto` is gone.
+    TargetGone,
+    /// GitHub refused the delete for good.
+    DeleteRefused,
+    /// A merged entry's pull request still waits to move onto it.
+    Awaited,
+    /// An open pull request is based on it (or the listing failed).
+    #[default]
+    #[serde(other)]
+    Base,
+}
+
+impl QueuedBranch {
+    /// What kept this branch, or `None` while nothing did.
+    pub fn kept_kind(&self) -> Option<KeptKind> {
+        self.kept.as_ref().map(|kept| kept.kind)
+    }
+
+    /// The one sentence every surface shows for a kept branch, or `None`
+    /// while nothing kept it.
+    pub fn kept_message(&self) -> Option<String> {
+        let kept = self.kept.as_ref()?;
+        let branch = &self.branch;
+        Some(match (kept.kind, kept.blocked_by) {
+            (KeptKind::DeleteRefused, _) => format!(
+                "Branch {branch} could not be deleted: {}. Delete it by hand.",
+                kept.reason.strip_suffix('.').unwrap_or(&kept.reason)
+            ),
+            (_, None) => format!(
+                "Branch {branch} is kept: the open pull requests could not be listed. The next sync tries again."
+            ),
+            (KeptKind::Base, Some(number)) => match self.why {
+                RetireWhy::Merged => format!(
+                    "Branch {branch} is kept: pull request #{number} is based on it and could not be moved to {}. The next sync tries again.",
+                    self.onto
+                ),
+                RetireWhy::Declined => format!(
+                    "Branch {branch} is kept: pull request #{number} is based on it. The share was declined, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch."
+                ),
+                RetireWhy::Withdrawn => format!(
+                    "Branch {branch} is kept: pull request #{number} is based on it. The share was withdrawn, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch."
+                ),
+            },
+            (KeptKind::Head, Some(number)) => {
+                format!("Branch {branch} is kept: pull request #{number} comes from it.")
+            }
+            (KeptKind::Awaited, Some(number)) => {
+                format!("Branch {branch} is kept: pull request #{number} is still to move onto it.")
+            }
+            (KeptKind::TargetGone, Some(number)) => format!(
+                "Branch {branch} is kept: pull request #{number} is based on it and could not be moved to {}, because that branch no longer exists. Move or close pull request #{number} by hand.",
+                self.onto
+            ),
+        })
+    }
+}
+
 impl OriginState {
     /// A fresh, empty state for a domain that has never pulled from `repo`
     /// yet: `base_commit` empty, every collection empty, at
@@ -349,6 +474,7 @@ impl OriginState {
             stacks_available: None,
             repair_pending: false,
             stack_link_pending: false,
+            retire_queue: Vec::new(),
         }
     }
 
@@ -1552,5 +1678,132 @@ mod tests {
 
         let loaded = OriginState::load(dir.path()).unwrap().expect("state loads");
         assert_eq!(loaded.proposals[0].author_login, None);
+    }
+
+    #[test]
+    fn a_state_saved_before_the_merged_branch_queue_loads_with_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sample_state();
+        state.save(dir.path()).unwrap();
+        let path = dir.path().join("state.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("merged_branches");
+        std::fs::write(&path, raw.to_string()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert!(loaded.retire_queue.is_empty());
+    }
+
+    fn queued(why: RetireWhy, kept: Option<BranchKept>) -> QueuedBranch {
+        QueuedBranch {
+            number: 3,
+            branch: "crystalline/share-1".to_string(),
+            onto: "main".to_string(),
+            why,
+            kept,
+        }
+    }
+
+    fn kept(kind: KeptKind, blocked_by: Option<u64>, reason: &str) -> Option<BranchKept> {
+        Some(BranchKept {
+            blocked_by,
+            reason: reason.to_string(),
+            kind,
+        })
+    }
+
+    #[test]
+    fn every_kept_branch_has_its_own_sentence() {
+        assert_eq!(queued(RetireWhy::Merged, None).kept_message(), None);
+        let cases = [
+            (
+                queued(RetireWhy::Merged, kept(KeptKind::Base, Some(7), "boom")),
+                "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+            ),
+            (
+                queued(RetireWhy::Declined, kept(KeptKind::Base, None, "offline")),
+                "Branch crystalline/share-1 is kept: the open pull requests could not be listed. The next sync tries again.",
+            ),
+            (
+                queued(RetireWhy::Declined, kept(KeptKind::Base, Some(60), "")),
+                "Branch crystalline/share-1 is kept: pull request #60 is based on it. The share was declined, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch.",
+            ),
+            (
+                queued(RetireWhy::Withdrawn, kept(KeptKind::Base, Some(60), "")),
+                "Branch crystalline/share-1 is kept: pull request #60 is based on it. The share was withdrawn, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch.",
+            ),
+            (
+                queued(RetireWhy::Merged, kept(KeptKind::Head, Some(70), "")),
+                "Branch crystalline/share-1 is kept: pull request #70 comes from it.",
+            ),
+            (
+                queued(RetireWhy::Withdrawn, kept(KeptKind::Awaited, Some(50), "")),
+                "Branch crystalline/share-1 is kept: pull request #50 is still to move onto it.",
+            ),
+            (
+                QueuedBranch {
+                    onto: "crystalline/share-0".to_string(),
+                    ..queued(
+                        RetireWhy::Merged,
+                        kept(KeptKind::TargetGone, Some(50), "422"),
+                    )
+                },
+                "Branch crystalline/share-1 is kept: pull request #50 is based on it and could not be moved to crystalline/share-0, because that branch no longer exists. Move or close pull request #50 by hand.",
+            ),
+            (
+                queued(
+                    RetireWhy::Merged,
+                    kept(
+                        KeptKind::DeleteRefused,
+                        None,
+                        "GitHub returned an unexpected answer (status 422): Reference update failed.",
+                    ),
+                ),
+                "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+            ),
+        ];
+        for (entry, sentence) in cases {
+            assert_eq!(entry.kept_message().as_deref(), Some(sentence), "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_written_before_why_and_kind_loads_as_merged_and_base() {
+        let raw = serde_json::json!({
+            "number": 3,
+            "branch": "crystalline/share-1",
+            "onto": "main",
+            "kept": { "blocked_by": 7, "reason": "boom" },
+        });
+        let entry: QueuedBranch = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.why, RetireWhy::Merged);
+        assert_eq!(entry.kept_kind(), Some(KeptKind::Base));
+    }
+
+    #[test]
+    fn a_why_or_kind_from_a_newer_build_loads_as_the_default() {
+        let raw = serde_json::json!({
+            "number": 3,
+            "branch": "crystalline/share-1",
+            "onto": "main",
+            "why": "rebased",
+            "kept": { "blocked_by": 7, "reason": "", "kind": "sideways" },
+        });
+        let entry: QueuedBranch = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.why, RetireWhy::Merged);
+        assert_eq!(entry.kept_kind(), Some(KeptKind::Base));
+    }
+
+    #[test]
+    fn the_queue_keeps_its_old_key_on_disk() {
+        let mut state = sample_state();
+        state.retire_queue.push(queued(
+            RetireWhy::Withdrawn,
+            kept(KeptKind::Head, Some(70), ""),
+        ));
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["merged_branches"][0]["why"], "withdrawn");
+        assert_eq!(json["merged_branches"][0]["kept"]["kind"], "head");
+        assert!(json.get("retire_queue").is_none(), "{json}");
     }
 }

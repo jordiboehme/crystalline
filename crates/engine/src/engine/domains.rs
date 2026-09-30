@@ -342,7 +342,7 @@ impl Engine {
             ));
         }
 
-        match self.content_source(domain)? {
+        let rel = match self.content_source(domain)? {
             ContentSource::File { root } => {
                 let path = root.join("MANIFEST.md");
                 // The same compare-then-write section `save_engram` holds, for
@@ -379,6 +379,7 @@ impl Engine {
                     .await?;
                 self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
                     .await?;
+                "MANIFEST.md".to_string()
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
@@ -401,8 +402,37 @@ impl Engine {
                     true,
                 )
                 .await?;
+                desc.path
             }
-        }
+        };
+
+        // Where the MANIFEST row answers, read back the way a save's receipt
+        // reads it, then announced: the verb carries no scope, so nobody is
+        // named.
+        let permalink = {
+            let store = self.store.lock().await;
+            let found = store
+                .list_engrams(domain, Some(&rel), None)
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == rel)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, "manifest".to_string())
+        };
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink,
+            path: rel,
+            kind: ChangeKind::Modified,
+            from: None,
+            checksum: Some(sha256_hex(markdown.as_bytes())),
+            actor: None,
+            draft_of: None,
+            audience: None,
+        }));
 
         self.refresh_routing_cache().await;
 

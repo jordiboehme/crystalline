@@ -307,6 +307,8 @@ impl Engine {
         progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
         self.refresh_names().await;
+        // A reference elsewhere that already named this domain binds now.
+        self.resolve_references_into(&domain_name).await;
         // Embedding a whole freshly connected repo can outlast any client
         // timeout, so a daemon or in-process MCP server runs it on the embed
         // worker; without a worker (standalone one-shot commands, tests) the
@@ -1383,6 +1385,10 @@ impl Engine {
     ///
     /// `origin` is what [`Engine::origin_spec_for_domain`] resolved, borrowed
     /// whole: the spec, the domain's folder and its origin state directory.
+    ///
+    /// `cleanup` is what the pull does with a queued share branch. A share and
+    /// a preview both pass `Defer`: the preview makes no provider write, and
+    /// the share's own pull in `ops::propose` runs the cleanup, once.
     pub(super) async fn overlay_share_tree(
         &self,
         domain: &str,
@@ -1390,12 +1396,13 @@ impl Engine {
         provider: &dyn Provider,
         origin: (&OriginSpec, &Path, &Path),
         acting: Option<&str>,
+        cleanup: ops::BranchCleanup,
     ) -> Result<Option<PreparedShare>> {
         let Some(who) = drafting else {
             return Ok(None);
         };
         let (spec, root, state_dir) = origin;
-        let report = ops::pull(provider, spec, root, state_dir)
+        let report = ops::pull_with(provider, spec, root, state_dir, cleanup)
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))
             .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
@@ -1532,6 +1539,7 @@ impl Engine {
                 provider.as_ref(),
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
+                ops::BranchCleanup::Defer,
             )
             .await?;
         // The share runs against the staged tree, and the provider it runs with
@@ -1819,6 +1827,7 @@ impl Engine {
                 provider.as_ref(),
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
+                ops::BranchCleanup::Defer,
             )
             .await?;
         // Pinned exactly as the share pins it, and for the same reason: a
@@ -1928,8 +1937,10 @@ impl Engine {
     }
 
     /// Withdraws a share proposal for one domain: closes its pull request on
-    /// the forge, best-effort deletes its branch, optionally restores the
-    /// shared files (`revert`) and records it as withdrawn. Under the
+    /// the forge, retires its branch (deleted unless an open pull request is
+    /// based on it or comes from it, then kept and named in `kept_branches`),
+    /// optionally restores the shared files (`revert`) and records it as
+    /// withdrawn. Under the
     /// domain's origin lock; syncs and embeds afterward only when files
     /// moved. Refuses when collaboration is off and on a read-only instance.
     ///
@@ -2405,7 +2416,8 @@ impl Engine {
             // The targeted pass the import already takes: exactly these paths,
             // which is also what rebuilds a folder's listing beside a discarded
             // engram in a domain that shares its listings.
-            self.sync_paths(domain, touched).await?;
+            self.sync_paths_as(domain, touched, share_actor_label(actor).as_deref())
+                .await?;
             if !self.request_embed()
                 && let Err(e) = self.embed_pending().await
             {

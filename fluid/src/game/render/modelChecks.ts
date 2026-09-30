@@ -1,0 +1,731 @@
+/**
+ * The model checks the model tests share: test support, which only tests
+ * import. Nothing in the game reads it, so it never reaches a bundle.
+ *
+ * The fixture and decor tests (`models.test.ts`), the prop tests
+ * (`propModels.test.ts`) and the hero tests (`heroModels.test.ts` and the
+ * per-batch hero tests under `models/heroes/`) measure a built model the same
+ * ways: the winding of every triangle against its stored normal, points in a
+ * frame's local terms, points inside a floor box, whether a catalogue surface
+ * sits on a real upward face and stays clear above it (`upwardFaceAt`,
+ * `clearAbove` at a point, `clearAboveBox` over a whole curio host surface),
+ * whether every part traces a path back to the floor (or a hovering hero's
+ * lift, `heroLift`) or its wall through the parts it touches (`touching`,
+ * `looseParts`), and whether every glowing part (a screen, a frame, a portal,
+ * a signal light or a blinking one) touches a lit host or its wall. A prop or
+ * hero mesh, built once at the origin, is turned and placed the way the GPU
+ * places an instance (`placeMesh`, `placeParts`) before it is measured. The
+ * glow check works on a list of recorded kit calls (`Part`), which
+ * `recordingKitAt` records for a model built through a kit factory, and which
+ * the fixture tests record for the movers too; `heroAt`, `anchorOf` and
+ * `partsOf` are the one way every hero test builds a hero and its recorded
+ * parts at the origin. The mark tests read printed marks back from those
+ * parts the same ways: the parts in one ink (`inked`), the runs a line sets
+ * in the font (`runsOfLines`), a picture cut to its lit cells (`trimmed`)
+ * and a mark's cells rebuilt from its parts (`cellsOf`). The variant tests
+ * (2.7 Task 1) compare two builds' silhouettes instead of their exact
+ * triangles, since a later variant is free to shape a kind differently as
+ * long as it keeps the kind's envelope (2.7 C3): `occupancy` voxelises a
+ * mesh's surfaces in a frame's local terms and `silhouetteDelta` scores how
+ * much two occupancies differ.
+ */
+
+import type { Box, Hero, HeroKind } from "../world/types";
+import { CELL } from "../world/units";
+import { BLINK_GROUPS } from "./blink";
+import {
+  FLAG,
+  FLOATS_PER_VERTEX,
+  createBuilder,
+  type Builder,
+  type MeshData,
+  type Surface,
+  type V3,
+} from "./geometry";
+import { createKit, turnPoint, type Frame, type Kit } from "./kit";
+import { LOOKS, type Rgb } from "./looks";
+import type { KitAt } from "./models";
+import { buildHero } from "./models/heroes";
+import { pixelRuns, textRows } from "./models/heroes/pixels";
+
+/**
+ * One kit call, as a recording kit saw it: the builder it emitted into
+ * (the room's, or a mover's own), the primitive's name, the layer, flag
+ * and tint of its surface (-1, -1 and null where it took none) and the
+ * world positions of the vertices it emitted, three per triangle. The tint
+ * lets a shape test tell parts of one flag apart by their colour (a
+ * curio's keys, pads or mark).
+ */
+export interface Part {
+  builder: object;
+  method: string;
+  layer: number;
+  flag: number;
+  tint: Rgb | null;
+  points: V3[];
+}
+
+/** Every vertex position of a mesh, in order. */
+export function positions(m: MeshData): V3[] {
+  return Array.from({ length: m.count }, (_, i) => {
+    const o = i * FLOATS_PER_VERTEX;
+    const v = (k: number) => m.vertices[o + k] ?? NaN;
+    return [v(0), v(1), v(2)];
+  });
+}
+
+/** Every vertex normal of a mesh, in order. */
+export function normals(m: MeshData): V3[] {
+  return Array.from({ length: m.count }, (_, i) => {
+    const o = i * FLOATS_PER_VERTEX + 3;
+    const v = (k: number) => m.vertices[o + k] ?? NaN;
+    return [v(0), v(1), v(2)];
+  });
+}
+
+/** `p + q`. */
+export const add = (p: V3, q: V3): V3 => [
+  p[0] + q[0],
+  p[1] + q[1],
+  p[2] + q[2],
+];
+/** `p - q`. */
+export const sub = (p: V3, q: V3): V3 => [
+  p[0] - q[0],
+  p[1] - q[1],
+  p[2] - q[2],
+];
+/** `p * k`. */
+export const scale = (p: V3, k: number): V3 => [p[0] * k, p[1] * k, p[2] * k];
+/** The cross product `p x q`. */
+export const cross = (p: V3, q: V3): V3 => [
+  p[1] * q[2] - p[2] * q[1],
+  p[2] * q[0] - p[0] * q[2],
+  p[0] * q[1] - p[1] * q[0],
+];
+/** The dot product `p . q`. */
+export const dot = (p: V3, q: V3) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+
+/**
+ * The smallest agreement between a triangle's winding and its stored
+ * normal: the cosine between the stored normal and the geometric normal of
+ * the counter-clockwise order, over every triangle of the mesh. 1 is a
+ * perfect mesh; anything below 0.999 has a triangle wound the wrong way
+ * or a normal that does not match its face. Degenerate triangles are
+ * skipped.
+ */
+export function worstWinding(m: MeshData): number {
+  const ps = positions(m);
+  const ns = normals(m);
+  let worst = Infinity;
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
+    const n = ns[t];
+    if (!a || !b || !c || !n) throw new Error("short triangle");
+    const g = cross(sub(b, a), sub(c, a));
+    const len = Math.hypot(...g);
+    if (len < 1e-9) continue;
+    worst = Math.min(worst, dot(g, n) / len);
+  }
+  return worst;
+}
+
+/** A world point in a frame's local `[a, d, h]`. */
+export function toLocal(f: Frame, p: V3): V3 {
+  const o = sub(p, f.origin);
+  return [dot(o, f.along), dot(o, f.inward), o[1]];
+}
+
+/**
+ * The 0.1 m voxels a mesh's surfaces cover, in a frame's local terms, as
+ * "a,d,h" keys: every triangle is sampled on a barycentric grid no coarser
+ * than half a voxel (the grid's step is the longer of the triangle's own
+ * edges, in local terms, divided by at least two samples a voxel), so a
+ * large flat top counts by its area, not by its four corners. `cell`
+ * defaults to 0.1 m, the voxel `occupancy` and `silhouetteDelta` compare
+ * two builds of the same kind at (a variant keeps its silhouette close to
+ * its kind's variant 0, 2.7 C3).
+ */
+export function occupancy(m: MeshData, f: Frame, cell = 0.1): Set<string> {
+  const ps = positions(m);
+  const cells = new Set<string>();
+  const step = cell / 2;
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [p0, p1, p2] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!p0 || !p1 || !p2) continue;
+    const a = toLocal(f, p0);
+    const b = toLocal(f, p1);
+    const c = toLocal(f, p2);
+    const edge = (p: V3, q: V3) => Math.hypot(...sub(p, q));
+    const longest = Math.max(edge(a, b), edge(b, c), edge(c, a));
+    const n = Math.max(1, Math.ceil(longest / step));
+    for (let i = 0; i <= n; i++) {
+      for (let j = 0; i + j <= n; j++) {
+        const u = i / n;
+        const v = j / n;
+        const w = 1 - u - v;
+        const p: V3 = [
+          a[0] * w + b[0] * u + c[0] * v,
+          a[1] * w + b[1] * u + c[1] * v,
+          a[2] * w + b[2] * u + c[2] * v,
+        ];
+        const key = `${String(Math.floor(p[0] / cell))},${String(Math.floor(p[1] / cell))},${String(Math.floor(p[2] / cell))}`;
+        cells.add(key);
+      }
+    }
+  }
+  return cells;
+}
+
+/**
+ * How different two occupancies are: the share of voxels in one but not the
+ * other, of the voxels in either. 0 when the two sets are the same, 1 when
+ * they share no voxel at all; empty sets on both sides count as identical.
+ */
+export function silhouetteDelta(
+  a: ReadonlySet<string>,
+  b: ReadonlySet<string>,
+): number {
+  const union = new Set([...a, ...b]);
+  if (union.size === 0) return 0;
+  let apart = 0;
+  for (const key of union) if (a.has(key) !== b.has(key)) apart++;
+  return apart / union.size;
+}
+
+/**
+ * Whether a world point stands over a floor box, within `eps` metres
+ * (height is not looked at).
+ */
+export const inBox = (b: Box, p: V3, eps = 1e-4) =>
+  p[0] >= b.x0 - eps &&
+  p[0] <= b.x1 + eps &&
+  p[2] >= b.z0 - eps &&
+  p[2] <= b.z1 + eps;
+
+/** The closest point on triangle `a b c` to `p` (Ericson's method). */
+export function closestOnTriangle(p: V3, a: V3, b: V3, c: V3): V3 {
+  const ab = sub(b, a);
+  const ac = sub(c, a);
+  const ap = sub(p, a);
+  const d1 = dot(ab, ap);
+  const d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0) return a;
+  const bp = sub(p, b);
+  const d3 = dot(ab, bp);
+  const d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3) return b;
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) return add(a, scale(ab, d1 / (d1 - d3)));
+  const cp = sub(p, c);
+  const d5 = dot(ab, cp);
+  const d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6) return c;
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) return add(a, scale(ac, d2 / (d2 - d6)));
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+    return add(b, scale(sub(c, b), (d4 - d3) / (d4 - d3 + (d5 - d6))));
+  }
+  const denom = 1 / (va + vb + vc);
+  return add(a, add(scale(ab, vb * denom), scale(ac, vc * denom)));
+}
+
+/** How close two parts must come to count as touching, in metres. */
+const CONTACT = 0.03;
+
+/** A part's points with their bounds, measured once. */
+export interface Shape {
+  points: readonly V3[];
+  lo: V3;
+  hi: V3;
+}
+
+/** A shape of a list of points: the points and their bounding box. */
+export function shape(points: readonly V3[]): Shape {
+  const lo: V3 = [Infinity, Infinity, Infinity];
+  const hi: V3 = [-Infinity, -Infinity, -Infinity];
+  for (const p of points) {
+    for (const k of [0, 1, 2] as const) {
+      lo[k] = Math.min(lo[k], p[k]);
+      hi[k] = Math.max(hi[k], p[k]);
+    }
+  }
+  return { points, lo, hi };
+}
+
+/** Whether a point lies within `CONTACT` of a shape's bounds. */
+const nearBounds = (p: V3, s: Shape) =>
+  ([0, 1, 2] as const).every(
+    (k) => p[k] >= s.lo[k] - CONTACT && p[k] <= s.hi[k] + CONTACT,
+  );
+
+/**
+ * Whether any vertex of `from` lies within `CONTACT` (3 cm) of a triangle
+ * of `to`. Not symmetric: call it both ways round to ask whether two
+ * shapes touch.
+ */
+export function reaches(from: Shape, to: Shape): boolean {
+  const near = from.points.filter((p) => nearBounds(p, to));
+  if (near.length === 0) return false;
+  const pts = to.points;
+  for (let t = 0; t + 2 < pts.length; t += 3) {
+    const [a, b, c] = [pts[t], pts[t + 1], pts[t + 2]];
+    if (!a || !b || !c) continue;
+    for (const p of near) {
+      const q = closestOnTriangle(p, a, b, c);
+      if (Math.hypot(...sub(p, q)) <= CONTACT) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * How close two parts must come to count as touching in the float check: a
+ * little over `DECAL_LIFT`, so a light or decal on its face counts, and
+ * well under `reaches`' 3 cm, so a 1.5 cm gap under a shelf or a pack does
+ * not.
+ */
+const TOUCH = 0.012;
+
+/**
+ * Whether one shape is a sleeve round the other: their bounds overlap on
+ * every axis, and on at least two axes one's range holds the other's whole
+ * (a collar round a barrel, a ring round a tube). No vertex of either lies
+ * near a triangle of the other, so the vertex test alone would call it
+ * loose.
+ */
+function sleeve(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (!axes.every((k) => p.lo[k] < q.hi[k] && q.lo[k] < p.hi[k])) return false;
+  const holds = (o: Shape, i: Shape) =>
+    axes.filter((k) => o.lo[k] <= i.lo[k] + 1e-6 && i.hi[k] <= o.hi[k] + 1e-6)
+      .length >= 2;
+  return holds(p, q) || holds(q, p);
+}
+
+/**
+ * Whether two shapes overlap in volume: their bounds overlap on every axis
+ * by more than 1 cm. Catches a part built to run through another on
+ * purpose (the laser desk's arm through the emitter housing) that neither
+ * `sleeve` nor a vertex-to-triangle distance would call touching, without
+ * loosening the check for a true floater, whose bounds miss every part it
+ * should be resting on entirely.
+ */
+function overlapsVolume(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  return axes.every(
+    (k) => Math.min(p.hi[k], q.hi[k]) - Math.max(p.lo[k], q.lo[k]) > 0.01,
+  );
+}
+
+/**
+ * Whether one shape sits directly on the other with no seam: one's lowest
+ * point lands within 0.1 mm of the other's highest (either way round), and
+ * their plan footprints (the other two axes) overlap by more than 1 cm on
+ * both. Catches a part built to abut another exactly at the height a model
+ * steps in or out (a dome planter's collar flaring past its drum, a rim
+ * wider than the band it caps): the two never share a height, so `sleeve`
+ * and `overlapsVolume` both call it loose, and the step can run wider than
+ * `TOUCH`, so the vertex-to-triangle distance misses it too.
+ */
+function stacked(p: Shape, q: Shape): boolean {
+  const flush = (a: Shape, b: Shape) => Math.abs(a.hi[1] - b.lo[1]) <= 1e-4;
+  if (!flush(p, q) && !flush(q, p)) return false;
+  const plan = [0, 2] as const;
+  return plan.every(
+    (k) => Math.min(p.hi[k], q.hi[k]) - Math.max(p.lo[k], q.lo[k]) > 0.01,
+  );
+}
+
+/**
+ * Whether two parts touch: one is a sleeve round the other (`sleeve`), they
+ * overlap in volume by more than 1 cm on every axis (`overlapsVolume`), one
+ * sits flush on the other with a footprint they share by more than 1 cm
+ * (`stacked`), or a vertex of one lies within `TOUCH` of a triangle of the
+ * other.
+ */
+export function touching(p: Shape, q: Shape): boolean {
+  const axes = [0, 1, 2] as const;
+  if (axes.some((k) => p.lo[k] > q.hi[k] + TOUCH || q.lo[k] > p.hi[k] + TOUCH))
+    return false;
+  if (sleeve(p, q) || overlapsVolume(p, q) || stacked(p, q)) return true;
+  const near = (from: Shape, to: Shape) => {
+    for (let t = 0; t + 2 < to.points.length; t += 3) {
+      const [a, b, c] = [to.points[t], to.points[t + 1], to.points[t + 2]];
+      if (!a || !b || !c) continue;
+      for (const v of from.points)
+        if (Math.hypot(...sub(v, closestOnTriangle(v, a, b, c))) <= TOUCH)
+          return true;
+    }
+    return false;
+  };
+  return near(p, q) || near(q, p);
+}
+
+/**
+ * Every part with no path back to the floor or the wall through the parts
+ * it touches (`touching`): held parts start on the floor (a shape whose
+ * lowest point sits within 0.1 mm of `y = floor`) or, when `wall` is given, on
+ * the wall plane (some vertex within 0.1 mm of it, in the wall frame's
+ * terms); every other part joins once it touches a held one, repeated to a
+ * fixed point. What is left after that is loose, named `"<index>:<method>"`
+ * in build order: a genuine floater, not a part chained to the floor only
+ * through parts still unheld when it was its turn to check. Pass every
+ * part of a hero, built once at the origin; a part with no points (an
+ * empty primitive) is dropped rather than counted loose. `floor` is where
+ * parts are held from: 0, or a hovering hero's lift (`heroLift`, C4).
+ * `ceiling`, when given, holds a part whose highest point reaches it too:
+ * a fitting hung from the ceiling (the airlock's iris light, M3 C24).
+ */
+export function looseParts(
+  parts: readonly Part[],
+  wall: Frame | null,
+  floor = 0,
+  ceiling = Infinity,
+): string[] {
+  const solid = parts.filter((p) => p.points.length > 0);
+  const shapes = solid.map((p) => shape(p.points));
+  const held = shapes.map(
+    (s) =>
+      s.lo[1] <= floor + 1e-4 ||
+      s.hi[1] >= ceiling - 1e-4 ||
+      (wall !== null && s.points.some((q) => toLocal(wall, q)[1] <= 1e-4)),
+  );
+  for (let changed = true; changed;) {
+    changed = false;
+    shapes.forEach((s, i) => {
+      if (held[i]) return;
+      if (shapes.some((o, j) => held[j] && touching(s, o))) {
+        held[i] = true;
+        changed = true;
+      }
+    });
+  }
+  return solid
+    .map((p, i) => ({ p, i }))
+    .filter(({ i }) => !held[i])
+    .map(({ p, i }) => `${String(i)}:${p.method}`);
+}
+
+/**
+ * Whether some triangle of `mesh` faces straight up (its stored normal
+ * within 1e-3 of `(0, 1, 0)`), has all three corners at height `h` within
+ * 5 mm, and contains `(x, z)` in plan (the same half-plane sign on every
+ * edge): a catalogue surface is real geometry, not just a number in the
+ * catalogue.
+ */
+export function upwardFaceAt(
+  mesh: MeshData,
+  x: number,
+  z: number,
+  h: number,
+): boolean {
+  const ps = positions(mesh);
+  const ns = normals(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c, n] = [ps[t], ps[t + 1], ps[t + 2], ns[t]];
+    if (!a || !b || !c || !n) continue;
+    if (Math.hypot(n[0], n[1] - 1, n[2]) > 1e-3) continue;
+    if ([a, b, c].some((p) => Math.abs(p[1] - h) > 0.005)) continue;
+    const side = (p: V3, q: V3) =>
+      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
+    const s = [side(a, b), side(b, c), side(c, a)];
+    if (s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the column above `(x, z)`, from `h` up to `h + headroom` metres,
+ * is free of mesh: no triangle whose plan footprint contains the point
+ * rises above `h` (the surface's own top face, sitting at exactly `h`,
+ * does not count) while staying below `h + headroom`. A part hovering in
+ * reach over a catalogue surface fails this even where it never touches
+ * the surface's own height.
+ */
+export function clearAbove(
+  mesh: MeshData,
+  x: number,
+  z: number,
+  h: number,
+  headroom: number,
+): boolean {
+  const ps = positions(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!a || !b || !c) continue;
+    const side = (p: V3, q: V3) =>
+      (q[0] - p[0]) * (z - p[2]) - (q[2] - p[2]) * (x - p[0]);
+    const s = [side(a, b), side(b, c), side(c, a)];
+    if (!(s.every((v) => v >= -1e-9) || s.every((v) => v <= 1e-9))) continue;
+    const lo = Math.min(a[1], b[1], c[1]);
+    const hi = Math.max(a[1], b[1], c[1]);
+    if (hi > h + 0.005 && lo < h + headroom) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the box `clear` metres tall standing on a surface at height `h`
+ * over the plan box `box` is free of mesh: no triangle whose plan bounding
+ * box overlaps `box` (strictly, so one that only meets its edge does not
+ * count) has its top above `h + 0.003` while its bottom lies below
+ * `h + clear`. The surface's own top face, at `h` within 3 mm, does not
+ * count. It is the curio host test's check (C3): whatever stands on the
+ * surface up to `clear` tall meets nothing of its host. It uses the
+ * triangles' plan bounds rather than their exact outlines, so it errs
+ * strict: a slanted triangle whose bounds reach over the box is counted
+ * even where the triangle itself would miss it. Pass the surface box
+ * shrunk a little, so a wall or rail that only bounds it is not counted.
+ * `clearAbove` is the same question asked at one point.
+ */
+export function clearAboveBox(
+  mesh: MeshData,
+  box: Box,
+  h: number,
+  clear: number,
+): boolean {
+  const ps = positions(mesh);
+  for (let t = 0; t + 2 < ps.length; t += 3) {
+    const [a, b, c] = [ps[t], ps[t + 1], ps[t + 2]];
+    if (!a || !b || !c) continue;
+    const x0 = Math.min(a[0], b[0], c[0]);
+    const x1 = Math.max(a[0], b[0], c[0]);
+    const z0 = Math.min(a[2], b[2], c[2]);
+    const z1 = Math.max(a[2], b[2], c[2]);
+    if (x1 <= box.x0 || x0 >= box.x1 || z1 <= box.z0 || z0 >= box.z1) continue;
+    const lo = Math.min(a[1], b[1], c[1]);
+    const hi = Math.max(a[1], b[1], c[1]);
+    if (hi > h + 0.003 && lo < h + clear) return false;
+  }
+  return true;
+}
+
+/** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
+export function heroAt(kind: HeroKind, variant = 0): Hero {
+  return { kind, variant, x: 4.5, y: 3, turn: 0, seed: 1 };
+}
+
+/** Where a hero's mesh is placed, in world metres. */
+export const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
+
+/** A hero's recorded parts, built at the origin at turn 0. */
+export function partsOf(kind: HeroKind, variant = 0): Part[] {
+  const parts: Part[] = [];
+  buildHero(
+    recordingKitAt(createBuilder(), parts),
+    kind,
+    variant,
+    LOOKS.aperture,
+  );
+  return parts;
+}
+
+/**
+ * The flags the glow check looks at: emissive, frame, portal, signal and
+ * every blink group's (`FLAG.blink` to `FLAG.blink + BLINK_GROUPS - 1`).
+ * A lamp (the ceiling panels' flag) is not among them: a panel is part of
+ * the ceiling, never a model's light.
+ */
+export const GLOWING: readonly number[] = [
+  FLAG.emissive,
+  FLAG.frame,
+  FLAG.portal,
+  FLAG.signal,
+  ...Array.from({ length: BLINK_GROUPS }, (_, g) => FLAG.blink + g),
+];
+
+/** Whether a flag is a signal light's or a blinking light's: what a frame may host. */
+const isLight = (flag: number) =>
+  flag === FLAG.signal ||
+  (flag >= FLAG.blink && flag < FLAG.blink + BLINK_GROUPS);
+
+/**
+ * Every glowing part that floats: a part with a flag in `GLOWING` that is
+ * in contact with no lit host part (a vertex of one within
+ * `CONTACT` of a triangle of the other, either way round) and, when `wall`
+ * is given, does not reach within `CONTACT` of the wall plane either.
+ * Returns `"<index>:<method>"` for each, so the list must be empty: nothing
+ * glows in mid-air. Pass every part of the model, a fixture's movers
+ * included, since mover parts count as hosts too.
+ *
+ * A frame is a lit body whose edges glow (the shader lights it like any lit
+ * surface and adds its edge lines), so a frame part hosts a signal or a
+ * blinking light: a door's warning lamp sits on the frame of its jamb. It
+ * hosts nothing else (a screen or a portal on a frame is still named), and
+ * a frame itself still needs a lit host or the wall.
+ */
+export function floatingGlow(
+  parts: readonly Part[],
+  wall: Frame | null,
+): string[] {
+  const solid = parts.filter((p) => p.points.length > 0);
+  const hosts = solid
+    .filter((p) => !GLOWING.includes(p.flag))
+    .map((p) => shape(p.points));
+  const frames = solid
+    .filter((p) => p.flag === FLAG.frame)
+    .map((p) => shape(p.points));
+  return parts
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => GLOWING.includes(p.flag) && p.points.length > 0)
+    .filter(({ p }) => {
+      if (wall && p.points.some((q) => toLocal(wall, q)[1] <= CONTACT))
+        return false;
+      const glow = shape(p.points);
+      const own = isLight(p.flag) ? [...hosts, ...frames] : hosts;
+      return !own.some((h) => reaches(glow, h) || reaches(h, glow));
+    })
+    .map(({ p, i }) => `${String(i)}:${p.method}`);
+}
+
+/**
+ * A mesh turned and placed as the GPU places an instance: every position
+ * turned by `turnPoint` (quarter turns `t`) and moved to the anchor `at`,
+ * every normal turned. A prop or hero mesh is built at the origin, so this
+ * is where the model tests see it standing in a room.
+ */
+export function placeMesh(m: MeshData, t: number, at: V3): MeshData {
+  const vertices = Float32Array.from(m.vertices);
+  for (let i = 0; i < m.count; i++) {
+    const o = i * FLOATS_PER_VERTEX;
+    const v = (k: number) => vertices[o + k] ?? NaN;
+    const p = add(turnPoint([v(0), v(1), v(2)], t), at);
+    const n = turnPoint([v(3), v(4), v(5)], t);
+    vertices.set([...p, ...n], o);
+  }
+  return { vertices, count: m.count };
+}
+
+/**
+ * Recorded parts turned and placed the same way as `placeMesh` places
+ * their mesh, so the glow check sees them where the instance stands.
+ */
+export const placeParts = (parts: readonly Part[], t: number, at: V3): Part[] =>
+  parts.map((p) => ({
+    ...p,
+    points: p.points.map((q) => add(turnPoint(q, t), at)),
+  }));
+
+type Fn = (...args: unknown[]) => void;
+
+/** Calls a kit primitive by name. */
+const call = (kit: Kit, name: string, args: unknown[]) => {
+  (kit as unknown as Record<string, Fn | undefined>)[name]?.(...args);
+};
+
+/**
+ * A kit factory that emits into `builder` like `(f) => createKit(builder,
+ * f)` and also records every primitive call into `parts`: its name, its
+ * surface's layer, flag and tint, and its own vertices, emitted a second time
+ * into a scratch builder so each part's points are known apart from the
+ * mesh.
+ */
+export function recordingKitAt(builder: Builder, parts: Part[]): KitAt {
+  return (f: Frame): Kit => {
+    const kit = createKit(builder, f);
+    const wrapped: Record<string, Fn> = {};
+    for (const name of Object.keys(kit)) {
+      wrapped[name] = (...args: unknown[]) => {
+        call(kit, name, args);
+        const points: V3[] = [];
+        const scratch = {
+          vertex: (p: V3) => points.push([p[0], p[1], p[2]]),
+        } as unknown as Builder;
+        call(createKit(scratch, f), name, args);
+        const s = args.find(
+          (x): x is Surface =>
+            typeof x === "object" && x !== null && "flag" in x,
+        );
+        parts.push({
+          builder,
+          method: name,
+          layer: s?.layer ?? -1,
+          flag: s?.flag ?? -1,
+          tint: s?.tint ?? null,
+          points,
+        });
+      };
+    }
+    return wrapped as unknown as Kit;
+  };
+}
+
+/**
+ * The parts of `parts` painted exactly `ink`: drawn by any primitive, or
+ * only by `method` when one is given.
+ */
+export const inked = (
+  parts: readonly Part[],
+  ink: readonly number[],
+  method?: Part["method"],
+): Part[] =>
+  parts.filter(
+    (p) =>
+      (method === undefined || p.method === method) &&
+      p.tint?.join() === ink.join(),
+  );
+
+/** How many lit runs `lines` make in the font. */
+export const runsOfLines = (lines: string | readonly string[]): number =>
+  (typeof lines === "string" ? [lines] : lines).reduce(
+    (n, l) => n + pixelRuns(textRows(l)).length,
+    0,
+  );
+
+/** A picture with its all-dark rows and columns round the edge cut off. */
+export function trimmed(rows: readonly string[]): string[] {
+  const lit = (r: string) => r.includes("#");
+  const inRows = rows.filter(lit);
+  const cols = inRows[0]?.length ?? 0;
+  const litCol = (c: number) => inRows.some((r) => r[c] === "#");
+  let c0 = 0;
+  while (c0 < cols && !litCol(c0)) c0++;
+  let c1 = cols;
+  while (c1 > c0 && !litCol(c1 - 1)) c1--;
+  const first = rows.findIndex(lit);
+  const last = rows.length - [...rows].reverse().findIndex(lit);
+  return rows.slice(first, last).map((r) => r.slice(c0, c1));
+}
+
+/**
+ * A mark's lit cells rebuilt from its parts: `at` puts a part's recorded
+ * point into the reader's `[x, y]`, `x` to the right along the mark and
+ * `y` down it. The pixel is the smallest extent any part has there (some
+ * piece is one cell), and every part covers whole cells from the mark's
+ * top left. A mark turned about, mirrored or scrambled comes out as other
+ * rows than its own.
+ */
+export function cellsOf(
+  parts: readonly Part[],
+  at: (q: V3) => readonly [x: number, y: number],
+): { rows: string[]; px: number } {
+  const boxes = parts.map((p) => {
+    const xy = p.points.map(at);
+    const xs = xy.map((q) => q[0]);
+    const ys = xy.map((q) => q[1]);
+    return {
+      x0: Math.min(...xs),
+      x1: Math.max(...xs),
+      y0: Math.min(...ys),
+      y1: Math.max(...ys),
+    };
+  });
+  const px = Math.min(...boxes.map((b) => Math.min(b.x1 - b.x0, b.y1 - b.y0)));
+  const x0 = Math.min(...boxes.map((b) => b.x0));
+  const y0 = Math.min(...boxes.map((b) => b.y0));
+  const cell = (v: number, o: number) => Math.round((v - o) / px);
+  const cols = Math.max(...boxes.map((b) => cell(b.x1, x0)));
+  const height = Math.max(...boxes.map((b) => cell(b.y1, y0)));
+  const grid = Array.from({ length: height }, () =>
+    Array.from({ length: cols }, () => "."),
+  );
+  for (const b of boxes)
+    for (let r = cell(b.y0, y0); r < cell(b.y1, y0); r++)
+      for (let c = cell(b.x0, x0); c < cell(b.x1, x0); c++) {
+        const row = grid[r];
+        if (row) row[c] = "#";
+      }
+  return { rows: grid.map((r) => r.join("")), px };
+}

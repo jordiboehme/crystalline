@@ -4,10 +4,12 @@
  * address once the move answers.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import App from "../App";
 import { api } from "../api/client";
 import {
   answersFor,
@@ -68,6 +70,58 @@ beforeEach(() => {
 });
 
 describe("the move dialog", () => {
+  it("replaces the old address in history, so Back does not land on it", async () => {
+    // The old address answers nothing after the move, and a reading page
+    // there follows the move forward again: Back would seem to do nothing.
+    serve({
+      "/domains/eng/move": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              from: { domain: "eng", permalink: "alpha", path: "alpha.md" },
+              to: { domain: "eng", path: "guides/alpha.md" },
+              cross_domain: false,
+              links_rewritten: 0,
+            }
+          : null,
+      "/domains/eng/engrams/guides/alpha": () =>
+        detailResponse({ permalink: "guides/alpha" }),
+    });
+    function Probe() {
+      const how = useNavigationType();
+      const { pathname } = useLocation();
+      return <output data-testid="navigation">{`${how} ${pathname}`}</output>;
+    }
+    render(
+      <MemoryRouter
+        initialEntries={["/d/eng", "/d/eng/e/alpha"]}
+        initialIndex={1}
+      >
+        <App />
+        <Probe />
+      </MemoryRouter>,
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move engram" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("navigation")).toHaveTextContent(
+        "REPLACE /d/eng/e/guides/alpha",
+      );
+    });
+  });
+
   it("moves to the picked destination and navigates to the new address", async () => {
     const moved = vi.fn(() => ({
       from: { domain: "eng", permalink: "alpha", path: "alpha.md" },

@@ -648,4 +648,52 @@ describe("the rename dialog", () => {
       screen.queryByText("ops: 1 engram rewritten, 1 reference."),
     ).toBeNull();
   });
+
+  it("shows the engine's note under the rename summary", async () => {
+    const note =
+      "The MANIFEST's frontmatter is in a form Crystalline cannot change key by key (such as {title: ...}), so its domain_name was left as it is; set it to 'engineering' by hand.";
+    serveAs("admin", {
+      "/domains/eng/rename": (_path, init) => {
+        if (init?.method !== "POST") {
+          throw new ApiProblem(404, "not found", "no stub for GET");
+        }
+        return {
+          domain: "engineering",
+          previous: "eng",
+          local_only: false,
+          manifest_written: false,
+          manifest_draft: false,
+          note,
+          rewritten: [],
+          left_behind: [],
+          aliases: ["eng"],
+          shadows: [],
+        };
+      },
+      ...domainFixtures("engineering"),
+    });
+    renderApp("/d/eng");
+
+    const dialog = await openDialog();
+    await userEvent.type(
+      within(dialog).getByLabelText("New name"),
+      "engineering",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Rename" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "engineering" }),
+    ).toBeVisible();
+    const summary = screen.getByText("Renamed from eng.");
+    expect(summary).toBeVisible();
+    const status = summary.closest<HTMLElement>('[role="status"]');
+    expect(status).not.toBeNull();
+    const shown = within(status!).getByText(note);
+    expect(shown).toBeVisible();
+    expect(
+      summary.compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
 });

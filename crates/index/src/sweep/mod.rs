@@ -12,8 +12,9 @@
 //!   retirement being finished, work that has sat unshared past its window;
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
 //!   reciprocal relations, orphans, stubs, oversized engrams, attachments
-//!   nothing references, permalinks that drifted off their folder and links
-//!   that spell a domain by a name only this machine uses;
+//!   nothing references, permalinks that drifted off their folder, links
+//!   that spell a domain by a name only this machine uses and engrams an
+//!   ingestion record fed that do not say where they came from;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
@@ -356,7 +357,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 25] = [
+pub const RULES: [RuleInfo; 26] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -496,6 +497,13 @@ pub const RULES: [RuleInfo; 25] = [
         base: 40,
         summary: "domain spelled by a local-only name",
         instruction: "The link's domain prefix is a name only this machine uses - a local config key or a machine-local alias - rather than the domain's canonical name. Rewrite it with edit_engram operation find_replace, find_text the link as written and content the same link with the prefix replaced by the domain's canonical name, so the reference reads the same on every machine that has this domain.",
+    },
+    RuleInfo {
+        id: "V111",
+        family: Family::Structure,
+        base: 40,
+        summary: "ingested without resource",
+        instruction: "An ingestion record names this engram as knowledge it fed, or the engram declares ingested_from, but it carries no resource, so an answer from it cannot say where the knowledge came from. Read the record and the source, then set resource to the most specific location it was distilled from with edit_engram set_frontmatter key resource: the page, or for a git source the file at the ingested commit (https://github.com/org/repo/blob/sha/path). Set source_date too where the source has one. Guessing a location writes a false citation, so ask first. When no single location fits, acknowledge with evolve_ack V111.",
     },
     RuleInfo {
         id: "V201",
@@ -769,6 +777,9 @@ pub struct EngramFacts {
     /// when the engram captured it. Absent means the claim never recorded a
     /// hash, which `V008` reads as nothing to compare rather than as a change.
     pub analyzed_hash: Option<String>,
+    /// The `resource` frontmatter key: the location the knowledge was taken
+    /// from, trimmed, `None` when absent or blank. `V111` reads it.
+    pub resource: Option<String>,
     /// The distinct `assets/` paths the body links to, from
     /// `crystalline_core::find_asset_refs`: fenced code skipped, fragments
     /// stripped, in order of first appearance.
@@ -818,6 +829,7 @@ impl EngramFacts {
             generated_by: None,
             analyzes: None,
             analyzed_hash: None,
+            resource: None,
             asset_refs: Vec::new(),
             acks: Vec::new(),
             lead_vector: None,
@@ -1597,6 +1609,14 @@ impl<'a> Graph<'a> {
             .or_else(|| self.nodes.get(&id.0).map(|n| n.status.as_str()))
     }
 
+    /// The `type` of an engram, from either table.
+    fn engram_type(&self, id: EngramId) -> Option<&str> {
+        self.facts
+            .get(&id.0)
+            .map(|f| f.engram_type.as_str())
+            .or_else(|| self.nodes.get(&id.0).map(|n| n.engram_type.as_str()))
+    }
+
     /// The `domain/permalink` address of an engram, from either table.
     fn address(&self, id: EngramId) -> String {
         if let Some(f) = self.facts.get(&id.0) {
@@ -2191,6 +2211,7 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
     detect_unresolved(input, graph, report);
     detect_reciprocal(input, graph, report);
     detect_local_spellings(input, graph, report);
+    detect_unsourced_ingest(input, graph, report);
 }
 
 /// `V109`: the permalink's folder part differs from the folder the file sits
@@ -2314,6 +2335,96 @@ fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut Sw
                 .at_line((reference.line > 0).then_some(reference.line))
                 .scoped([reference.spelling.clone()]),
         );
+    }
+}
+
+/// Types `V111` never speaks about: the record itself and the structural files.
+const V111_EXEMPT_TYPES: [&str; 3] = ["ingestion", "manifest", "schema"];
+
+/// `V111`: an engram an ingestion record fed - one the record links, or one
+/// that declares `ingested_from` - that names no `resource`, so nothing says
+/// which page or file it was distilled from.
+///
+/// Judgment class: the location is recorded nowhere in the archive, and a
+/// repair that guessed it would write a false citation.
+///
+/// The evidence quotes a record's own `resource` verbatim. A URL holding a
+/// comma makes the renderer quote that cell, which is correct and only costs
+/// bytes.
+fn detect_unsourced_ingest(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    for fact in &input.engrams {
+        if fact.is_retired()
+            || fact.resource.is_some()
+            || V111_EXEMPT_TYPES
+                .iter()
+                .any(|t| fact.engram_type.eq_ignore_ascii_case(t))
+        {
+            continue;
+        }
+        let mut records: Vec<EngramId> = graph
+            .inbound_of(fact.id)
+            .iter()
+            .filter(|e| {
+                graph
+                    .engram_type(e.from)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("ingestion"))
+            })
+            .map(|e| e.from)
+            .chain(
+                graph
+                    .outbound_of(fact.id)
+                    .iter()
+                    .filter(|e| e.kind == EdgeKind::Relation && e.rel_type == "ingested_from")
+                    .map(|e| e.to),
+            )
+            .collect();
+        records.sort_by_key(|id| id.0);
+        records.dedup();
+        let dangling: Vec<&str> = input
+            .unresolved
+            .iter()
+            .filter(|r| r.from == fact.id && r.rel_type == "ingested_from")
+            .map(|r| {
+                if r.raw.is_empty() {
+                    r.target.as_str()
+                } else {
+                    r.raw.as_str()
+                }
+            })
+            .collect();
+        if records.is_empty() && dangling.is_empty() {
+            continue;
+        }
+        let mut named: Vec<String> = records.iter().map(|id| graph.address(*id)).collect();
+        named.extend(dangling.iter().map(|t| format!("[[{t}]]")));
+        let mut evidence: Vec<String> = records
+            .iter()
+            .map(|id| {
+                // A resolved `ingested_from` target that is not typed
+                // `ingestion` is labelled by the relation, not as a record.
+                let is_record = graph
+                    .engram_type(*id)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("ingestion"));
+                let record = if is_record {
+                    format!("ingestion record {}", graph.address(*id))
+                } else {
+                    format!("ingested_from {}", graph.address(*id))
+                };
+                match graph.facts.get(&id.0).and_then(|f| f.resource.as_deref()) {
+                    Some(url) => format!("{record} resource {url}"),
+                    None => record,
+                }
+            })
+            .collect();
+        evidence.extend(dangling.iter().map(|t| format!("ingested_from [[{t}]]")));
+        evidence.push("no resource".to_string());
+        report.findings.push(Finding::about("V111", fact).with(
+            Class::Judgment,
+            format!("ingested from {} but carries no resource", join_semis(named.iter())),
+            evidence.join("; "),
+            "edit_engram set_frontmatter key resource value <the page or file it was distilled from>"
+                .to_string(),
+        ));
     }
 }
 

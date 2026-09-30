@@ -45,6 +45,7 @@ import { DraftLinkDialog } from "../components/DraftLinkDialog";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
+import { domainSpellings } from "../domainNames";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -77,6 +78,7 @@ import {
   wikilinkCompletions,
   wikilinkResolverFacet,
 } from "../editor/wikilinkChips";
+import { useIgnoredEngram } from "../events/ignored";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
@@ -401,6 +403,10 @@ export default function EngramEditor() {
  * that has no document.
  */
 function EditorSurface({ engram }: { engram: EngramDetail }) {
+  // The room carries this document; the stream must not refetch its detail
+  // or graph under it. The tree, listing and switcher rows still fire, which
+  // a rename receipt wants anyway.
+  useIgnoredEngram(engram.domain, engram.permalink);
   const { user } = useAuth();
   // Anonymous can never reach this screen (`canWrite` gates it above); the
   // fallback only satisfies the types.
@@ -629,7 +635,10 @@ function Surface({
     queryFn: fetchDomains,
   });
   const domainNames = useMemo(
-    () => domains.data?.domains.map((entry) => entry.name),
+    () =>
+      domains.data === undefined
+        ? undefined
+        : domainSpellings(domains.data.domains),
     [domains.data],
   );
   const resolver = useMemo(

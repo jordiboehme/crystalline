@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use crystalline_index::{
-    ChunkParams, DomainKind, SearchQuery, Store, TursoStore, apply_scan, scan_paths,
-    sync_domain_with,
+    ChunkParams, DomainKind, PathChangeKind, SearchQuery, Store, TursoStore, apply_scan,
+    scan_paths, sync_domain_with,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -203,6 +203,82 @@ async fn unchanged_given_path_counts_one(store: &dyn Store) {
 parity!(
     an_unchanged_given_path_counts_as_one_unchanged,
     unchanged_given_path_counts_one
+);
+
+/// The report names every path the apply moved, with the permalink and the
+/// checksum a subscriber needs, and names nothing for a path it only counted
+/// as unchanged. Four kinds in one pass: a revised file, a renamed one, a
+/// deleted one and a new one.
+async fn the_report_names_every_path_it_moved(store: &dyn Store) {
+    let dir = seed(store, 3).await;
+    let root = dir.path();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(root, "f1.md", &engram("F1", "f1", "revised token"));
+    std::fs::rename(root.join("f2.md"), root.join("g2.md")).unwrap();
+    std::fs::remove_file(root.join("f0.md")).unwrap();
+    write(root, "new.md", &engram("New", "brand-new", "fresh token"));
+
+    let report = target(store, root, &["f0.md", "f1.md", "f2.md", "g2.md", "new.md"]).await;
+    let mut kinds: Vec<(PathChangeKind, String)> = report
+        .changes
+        .iter()
+        .map(|change| (change.kind, change.path.clone()))
+        .collect();
+    kinds.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        kinds,
+        vec![
+            (PathChangeKind::Deleted, "f0.md".to_string()),
+            (PathChangeKind::Modified, "f1.md".to_string()),
+            (PathChangeKind::Moved, "g2.md".to_string()),
+            (PathChangeKind::Added, "new.md".to_string()),
+        ]
+    );
+    let by_kind = |kind: PathChangeKind| report.changes.iter().find(|c| c.kind == kind).unwrap();
+    let moved = by_kind(PathChangeKind::Moved);
+    assert_eq!(moved.from.as_deref(), Some("f2.md"));
+    assert_eq!(moved.from_permalink.as_deref(), Some("f2"));
+    // `f2` was in step with its path, so the store lets it follow the move
+    // (`Store::rename_engram`); the report reads it back after the rename
+    // rather than carrying the old one forward.
+    assert_eq!(
+        moved.permalink.as_deref(),
+        Some("g2"),
+        "a path-derived permalink follows the rename"
+    );
+    assert!(
+        moved.checksum.is_some(),
+        "a rename keeps the content's checksum"
+    );
+    let deleted = by_kind(PathChangeKind::Deleted);
+    assert_eq!(
+        deleted.permalink.as_deref(),
+        Some("f0"),
+        "read before the row went"
+    );
+    assert!(deleted.checksum.is_none());
+    let domain = upsert_domain(store, "d", root).await;
+    let stamps = store.file_stamps(domain).await.unwrap();
+    let added = by_kind(PathChangeKind::Added);
+    assert_eq!(added.permalink.as_deref(), Some("brand-new"));
+    assert_eq!(
+        added.checksum,
+        stamps.get("new.md").map(|s| s.sha256.clone())
+    );
+    let modified = by_kind(PathChangeKind::Modified);
+    assert_eq!(
+        modified.checksum,
+        stamps.get("f1.md").map(|s| s.sha256.clone())
+    );
+
+    // An unchanged path is counted and never named.
+    let quiet = target(store, root, &["f1.md"]).await;
+    assert_eq!(quiet.unchanged, 1);
+    assert!(quiet.changes.is_empty(), "{:?}", quiet.changes);
+}
+parity!(
+    the_report_names_every_path_the_apply_moved,
+    the_report_names_every_path_it_moved
 );
 
 /// A brand-new file targeted by its path is added; nothing else is walked.

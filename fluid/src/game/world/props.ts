@@ -1,0 +1,1159 @@
+/**
+ * The prop catalogue: every kind of set dressing the dressing pass can
+ * place, and the tables that decide what goes where.
+ *
+ * Props are pure decoration. They never encode data; the room's content
+ * speaks only through its fixtures. This module holds no placement logic,
+ * only:
+ * - `PROP_CATALOGUE`, one `PropEntry` per kind, saying its anchor, how many
+ *   variants it has, whether it is a wall or ceiling run, whether it stands
+ *   only against a free wall, whether it is a condition extra a palette
+ *   never picks, whether it is a wide wall kind that reaches `WIDE_REACH` on
+ *   both sides of its anchor, whether it keeps clear (a person reads or uses
+ *   it, so nothing may stand in front of it), whether it is a ceiling span
+ *   that crosses the hall rather than hugging a wall, whether it is a
+ *   tall floor kind (`TALL_MIN` or more in every variant, E5), and whether
+ *   it is a rare kind;
+ * - `PALETTES`, the weighted picks each archetype draws free wall edges,
+ *   floor spots, mid-hall clusters and runs from, plus `FILLER`, a low
+ *   weight given to a few utility kinds in every archetype's wall palette
+ *   so a palette with few wall entries (the archive's signs) does not read
+ *   as a shop of one thing (ruling 8);
+ * - `EXTRAS`, the condition-only kinds and their counts (ruling 12): they
+ *   are placed before the regular floor props, on the same floor spots, and
+ *   a regular palette never draws one of them, which is why the `extra`
+ *   kinds, like the toppled crate, are marked apart in `PROP_CATALOGUE`
+ *   rather than folded into a palette. `wallBacked` (ruling 9) is a
+ *   separate constraint, only against a free wall: a wall-backed kind like
+ *   the fume cabinet still sits in a regular palette;
+ * - the density and geometry constants placement reads: `PROP_CAP`,
+ *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
+ *   `LANE_WIDTH`, `LANE_DEPTH`, `USE_LANE_DEPTH`, `TALL_MIN`, the cluster
+ *   constants (`CLUSTER_BLOCK`, `CLUSTER_INNER`, `CLUSTER_SHARE`,
+ *   `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`) and the span constants
+ *   (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
+ *
+ * - the rare kinds (2.6d C9 to C13): `RARE_PROP_KINDS` (the poster, the
+ *   canister cluster, the designer tower, the gravity console and the
+ *   marked crate), each drawn per room at `RARE_SHARES` or `MARK_SHARE` by
+ *   the rare step of `dress.ts` and never by a palette, the filler or the
+ *   extras, so a rare prop never reshuffles a weighted pick; `MARK_FROM`
+ *   (which crates the mark may relabel), `TOWER_DESK_GAP` and
+ *   `DESK_MACHINES` (where the tower stands).
+ *
+ * Every regular kind gets 2 variants, the crate 3 and the sign plate 6,
+ * its six pictograms (ruling 13). A rare kind has 1 or 2.
+ *
+ * This is a leaf of the generator side: it imports only `types.ts`, so
+ * `sites.ts` and `dress.ts` can read it without reaching `move.ts` or
+ * `generate.ts` (ruling 20).
+ */
+
+import type {
+  Archetype,
+  Condition,
+  FloorPropKind,
+  MachineKind,
+  PropAnchor,
+  PropKind,
+  WallPropKind,
+} from "./types";
+
+/** One entry of the catalogue: what a kind is and how it may be placed. */
+export interface PropEntry {
+  anchor: PropAnchor;
+  /** How many variants the models build: 2, 3 for the crate, 6 for the sign plate, 1 or 2 for a rare kind. */
+  variants: number;
+  /** A horizontal run, emitted one segment per wall edge (ruling 3). */
+  run: boolean;
+  /** Stands only against a free wall (ruling 9). */
+  wallBacked: boolean;
+  /** Placed only as a condition extra, never by a palette (ruling 12). */
+  extra: boolean;
+  /**
+   * A wide wall kind: its model reaches at least `WIDE_REACH` on both sides
+   * of its anchor at turn 0 (D4). Never true together with `run`.
+   */
+  wide: boolean;
+  /**
+   * A kind a person reads or uses at standing height, so no wall-side floor
+   * prop may stand in front of it (D2 as amended: corner-zone spots ignore
+   * it): every mandatory kind is keep-clear, and some optional kinds are
+   * too.
+   */
+  keepClear: boolean;
+  /**
+   * A ceiling kind that crosses the hall's interior in a straight line of
+   * segments, rather than hugging a wall (D9). Never true together with
+   * `run` or `extra`.
+   */
+  span: boolean;
+  /**
+   * A floor kind whose every variant stands at least `TALL_MIN` tall; the
+   * density measure counts them, `propModels.test.ts` pins it against
+   * geometry.
+   */
+  tall: boolean;
+  /**
+   * A rare kind (2.6d C10): placed only by the rare step of `dress.ts`,
+   * from the room's own rare draws, never by a palette, the filler or the
+   * extras. `RARE_PROP_KINDS` lists exactly these kinds.
+   */
+  rare: boolean;
+}
+
+/** An archetype's weighted picks and density knobs. */
+export interface Palette {
+  /** Weighted picks for free wall edges, before the filler. */
+  wall: readonly (readonly [WallPropKind, number])[];
+  /** The wall run kind, or null. */
+  wallRun: "cable-tray" | "pipe-bundle" | null;
+  /**
+   * Weighted picks for floor spots. Every palette holds at least one tall
+   * kind (E5), so a large hall shows some height along its walls and in its
+   * corners.
+   */
+  floor: readonly (readonly [FloorPropKind, number])[];
+  /** The ceiling run kind, or null. */
+  ceilingRun: "duct" | "ceiling-tray" | null;
+  /**
+   * The ceiling span kind hung across a large hall (D9), or null for none.
+   * A span follows the archetype's ceiling run family: `span-duct` under a
+   * duct, `span-tray` under a ceiling tray. Engineering hangs a span where
+   * its pipe runs leave a line clear (E3): a pipe run hangs in the span
+   * band, so `sites.ts` keeps every span line off its box (`pipeRunBox`),
+   * and a hall whose pipe runs block every line draws none. The council's
+   * ceiling stays bare.
+   */
+  ceilingSpan: "span-duct" | "span-tray" | null;
+  /** Corner-zone props: 1 always (bridge) or 1 to 2. */
+  cornerMax: 1 | 2;
+  /**
+   * Chance a free wall-side cell gets a floor prop: 1/4 on the bridge, 1/2
+   * everywhere else (E7). Keep-clear wall props still close the spots in
+   * front of them.
+   */
+  wallSide: number;
+  /**
+   * Weighted picks for the members of a mid-hall cluster (D6): plain floor
+   * kinds, never an extra and never a wall-backed kind, since a cluster
+   * stands in the open, away from every wall. Every palette holds at least
+   * one tall kind (E5), so a cluster reads over the ordinary props around
+   * it.
+   */
+  cluster: readonly (readonly [FloorPropKind, number])[];
+}
+
+/** How many of a condition's extra kind to place, drawn once from its own seed. */
+export interface ExtraRule {
+  kind: PropKind;
+  min: number;
+  max: number;
+}
+
+/** Every kind of prop the dressing pass can place, once each. */
+export const PROP_KINDS: readonly PropKind[] = [
+  // wall
+  "locker-bank",
+  "extinguisher",
+  "first-aid",
+  "intercom",
+  "keycard-reader",
+  "vent-grille",
+  "sign-plate",
+  "breaker-box",
+  "wall-monitor",
+  "padded-panel",
+  "light-strip",
+  "cable-tray",
+  "pipe-bundle",
+  "tool-board",
+  "conduit-cabinet",
+  "stowage-net",
+  "pipe-riser",
+  "saucer-poster",
+  // floor
+  "crate",
+  "barrel",
+  "trolley",
+  "stool",
+  "filing-cabinet",
+  "storage-shelf",
+  "planter",
+  "bench",
+  "specimen-shelf",
+  "fume-cabinet",
+  "traffic-cone",
+  "ladder",
+  "tool-cart",
+  "toppled-crate",
+  "debris-pile",
+  "cable-coil",
+  "crate-stack",
+  "drum-rack",
+  "gas-rack",
+  "potted-tree",
+  "ooze-canisters",
+  "designer-tower",
+  "gravity-console",
+  "marked-crate",
+  // ceiling
+  "duct",
+  "ceiling-tray",
+  "cable-loop",
+  "beacon",
+  "loose-cable",
+  "span-duct",
+  "span-tray",
+];
+
+/**
+ * The catalogue: what each kind is and how it may be placed. `PROP_KINDS`
+ * lists exactly the same kinds, once each.
+ */
+export const PROP_CATALOGUE = {
+  "locker-bank": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  extinguisher: {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "first-aid": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  intercom: {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "keycard-reader": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "vent-grille": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "sign-plate": {
+    anchor: "wall",
+    variants: 6,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "breaker-box": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "wall-monitor": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "padded-panel": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "light-strip": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "cable-tray": {
+    anchor: "wall",
+    variants: 2,
+    run: true,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "pipe-bundle": {
+    anchor: "wall",
+    variants: 2,
+    run: true,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "tool-board": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "conduit-cabinet": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "stowage-net": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "pipe-riser": {
+    anchor: "wall",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: true,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "saucer-poster": {
+    anchor: "wall",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: true,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  crate: {
+    anchor: "floor",
+    variants: 3,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  barrel: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  trolley: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  stool: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "filing-cabinet": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "storage-shelf": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  planter: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  bench: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "specimen-shelf": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "fume-cabinet": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: true,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "traffic-cone": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  ladder: {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: true,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "tool-cart": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "toppled-crate": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "debris-pile": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "cable-coil": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "crate-stack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "drum-rack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "gas-rack": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "potted-tree": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: true,
+    rare: false,
+  },
+  "ooze-canisters": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "designer-tower": {
+    anchor: "floor",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "gravity-console": {
+    anchor: "floor",
+    variants: 1,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  "marked-crate": {
+    anchor: "floor",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: true,
+  },
+  duct: {
+    anchor: "ceiling",
+    variants: 2,
+    run: true,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "ceiling-tray": {
+    anchor: "ceiling",
+    variants: 2,
+    run: true,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "cable-loop": {
+    anchor: "ceiling",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  beacon: {
+    anchor: "ceiling",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "loose-cable": {
+    anchor: "ceiling",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: true,
+    wide: false,
+    keepClear: false,
+    span: false,
+    tall: false,
+    rare: false,
+  },
+  "span-duct": {
+    anchor: "ceiling",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: true,
+    tall: false,
+    rare: false,
+  },
+  "span-tray": {
+    anchor: "ceiling",
+    variants: 2,
+    run: false,
+    wallBacked: false,
+    extra: false,
+    wide: false,
+    keepClear: false,
+    span: true,
+    tall: false,
+    rare: false,
+  },
+} satisfies Record<PropKind, PropEntry>;
+
+/**
+ * The low-weight wall filler every archetype's palette gets on top of its
+ * own picks (ruling 8): without it the archive's palette, signs alone,
+ * covers two thirds of its walls in one kind.
+ */
+export const FILLER: readonly (readonly [WallPropKind, number])[] = [
+  ["vent-grille", 1],
+  ["light-strip", 1],
+  ["breaker-box", 1],
+];
+
+/**
+ * The five archetypes' weighted picks and density knobs. Every wall palette
+ * holds at least one wide kind, weighted 4 to 6, above its small kinds at 2
+ * (D4), so a free edge draws a prop that fills it more often than one that
+ * dots it; the sign plate keeps 3 where it is the archive's and council's
+ * own pick. `FILLER` stays at 1 each.
+ */
+export const PALETTES = {
+  bridge: {
+    wall: [
+      ["wall-monitor", 2],
+      ["intercom", 2],
+      ["light-strip", 2],
+      ["conduit-cabinet", 5],
+      ["locker-bank", 3],
+    ],
+    wallRun: "cable-tray",
+    floor: [
+      ["stool", 3],
+      ["crate", 3],
+      ["crate-stack", 2],
+    ],
+    ceilingRun: "ceiling-tray",
+    ceilingSpan: "span-tray",
+    cornerMax: 1,
+    wallSide: 1 / 4,
+    cluster: [
+      ["crate", 3],
+      ["trolley", 2],
+      ["crate-stack", 3],
+    ],
+  },
+  engineering: {
+    wall: [
+      ["breaker-box", 2],
+      ["vent-grille", 2],
+      ["locker-bank", 4],
+      ["tool-board", 4],
+      ["pipe-riser", 4],
+    ],
+    wallRun: "pipe-bundle",
+    floor: [
+      ["barrel", 3],
+      ["crate", 3],
+      ["trolley", 3],
+      ["crate-stack", 2],
+      ["drum-rack", 2],
+    ],
+    ceilingRun: "duct",
+    ceilingSpan: "span-duct",
+    cornerMax: 2,
+    wallSide: 1 / 2,
+    cluster: [
+      ["crate", 3],
+      ["barrel", 3],
+      ["trolley", 2],
+      ["crate-stack", 3],
+      ["drum-rack", 2],
+    ],
+  },
+  archive: {
+    wall: [
+      ["sign-plate", 3],
+      ["conduit-cabinet", 4],
+      ["stowage-net", 4],
+    ],
+    wallRun: null,
+    floor: [
+      ["filing-cabinet", 3],
+      ["storage-shelf", 3],
+      ["crate", 3],
+      ["crate-stack", 2],
+    ],
+    ceilingRun: "ceiling-tray",
+    ceilingSpan: "span-tray",
+    cornerMax: 2,
+    wallSide: 1 / 2,
+    cluster: [
+      ["crate", 3],
+      ["trolley", 2],
+      ["filing-cabinet", 1],
+      ["crate-stack", 3],
+    ],
+  },
+  lab: {
+    wall: [
+      ["first-aid", 2],
+      ["extinguisher", 2],
+      ["vent-grille", 2],
+      ["tool-board", 4],
+      ["pipe-riser", 4],
+    ],
+    wallRun: null,
+    floor: [
+      ["fume-cabinet", 3],
+      ["specimen-shelf", 3],
+      ["stool", 3],
+      ["trolley", 3],
+      ["gas-rack", 2],
+    ],
+    ceilingRun: "duct",
+    ceilingSpan: "span-duct",
+    cornerMax: 2,
+    wallSide: 1 / 2,
+    cluster: [
+      ["trolley", 3],
+      ["crate", 2],
+      ["gas-rack", 3],
+    ],
+  },
+  council: {
+    wall: [
+      ["padded-panel", 6],
+      ["sign-plate", 3],
+    ],
+    wallRun: null,
+    floor: [
+      ["planter", 3],
+      ["bench", 3],
+      ["potted-tree", 2],
+    ],
+    ceilingRun: null,
+    ceilingSpan: null,
+    cornerMax: 2,
+    wallSide: 1 / 2,
+    cluster: [
+      ["planter", 3],
+      ["crate", 1],
+      ["potted-tree", 3],
+    ],
+  },
+} satisfies Record<Archetype, Palette>;
+
+/**
+ * The condition extras (ruling 12): kinds a regular palette never draws,
+ * placed only under their condition, before the regular floor props, on
+ * the same floor spots. `clean` gets none.
+ */
+export const EXTRAS = {
+  clean: [],
+  construction: [
+    { kind: "traffic-cone", min: 2, max: 4 },
+    { kind: "ladder", min: 1, max: 1 },
+    { kind: "tool-cart", min: 1, max: 1 },
+  ],
+  dim: [{ kind: "loose-cable", min: 2, max: 4 }],
+  derelict: [
+    { kind: "toppled-crate", min: 1, max: 2 },
+    { kind: "debris-pile", min: 1, max: 1 },
+    { kind: "cable-coil", min: 1, max: 3 },
+  ],
+} satisfies Record<Condition, readonly ExtraRule[]>;
+
+/**
+ * At most this many props in one room; beyond it the cap drops the rest
+ * (E8). The canned hub stays under it in every archetype and condition, so
+ * the cap never drops its ceiling, and the fullest room the generator can
+ * make (a 24 by 24 hall with four bays, about 317 candidates) still
+ * overflows it.
+ */
+export const PROP_CAP = 280;
+/** About this share of free wall cells gets a prop. */
+export const WALL_SHARE = 2 / 3;
+/** Chance a free wall-side cell gets a floor prop, unless the palette says otherwise. */
+export const WALL_SIDE_SHARE = 1 / 4;
+/** Chance a ceiling tray segment carries a cable loop. */
+export const LOOP_SHARE = 1 / 4;
+/** An extinguisher goes on the wall run about every this many cells. */
+export const EXTINGUISHER_EVERY = 6;
+/** Width of a clear lane, in metres. */
+export const LANE_WIDTH = 1.6;
+/**
+ * Depth of a clear lane from the wall in front of a door, hatch or portal,
+ * in metres: the ways out keep the full 4 m, since a sliding door opens
+ * from `APPROACH` (3 m) and nothing was shown to hold at less (E6).
+ */
+export const LANE_DEPTH = 4.0;
+/**
+ * Depth of the clear lane in front of a terminal or a machine, in metres
+ * (E6). A fixture is used from within `REACH` (2.2 m) of its wall point, so
+ * its whole usable depth lies inside the lane, and the use point the
+ * reachability test aims at (at most 1.45 m out) keeps the player's circle
+ * inside it too. Shallower than `LANE_DEPTH`, it frees the second-row cells
+ * of a corner zone near a fixture for floor props.
+ */
+export const USE_LANE_DEPTH = 2.5;
+/**
+ * Width of the viewing lane in front of a poster or the placard, in metres:
+ * the sheet's width along its wall. Floor props never enter it, so nothing
+ * stands between the player and a sheet (its bottom edge hangs at 1.2 m,
+ * lower than most floor props are tall).
+ */
+export const SHEET_LANE_WIDTH = 1.2;
+/** Depth of the viewing lane in front of a poster or the placard, in metres. */
+export const SHEET_LANE_DEPTH = 1.5;
+
+/** A wide wall prop reaches at least this far either side of its anchor, in metres (D4). */
+export const WIDE_REACH = 0.8;
+/**
+ * The wall band's depth, in metres: the world side's copy of the models'
+ * `FLUSH_DEPTH`, pinned equal by `propModels.test.ts` (D3). `dress.ts` must
+ * not import from `render/`, so this constant lives here rather than being
+ * read from the models.
+ */
+export const WALL_PROP_DEPTH = 0.3;
+/**
+ * The least a tall floor kind's model stands, in metres (E5): every variant
+ * of a kind marked `tall` in `PROP_CATALOGUE` reaches at least this height,
+ * under `FLOOR_TOP` (2.2), so it reads over a cluster of ordinary props in a
+ * large hall. `propModels.test.ts` pins it against the built geometry.
+ */
+export const TALL_MIN = 1.6;
+/**
+ * The side of a mid-hall cluster block, in cells (D6). The hall's interior
+ * band is tiled from its north-west corner into blocks this size, partial
+ * blocks dropped, and a cluster uses only a block's inner `CLUSTER_INNER`
+ * by `CLUSTER_INNER` cells, so two clusters always stand at least one cell
+ * (2 m) apart (E4).
+ */
+export const CLUSTER_BLOCK = 4;
+/**
+ * The side of a cluster block's inner square, in cells (E4): the block's
+ * spots are its cells `bx + 1` to `bx + CLUSTER_INNER` in both axes, one
+ * cell in from its north-west corner. At 3 in a block of 4 the square
+ * reaches the block's last row and column, and the block's first row and
+ * column stay empty, so two neighbouring clusters' inner cells are one
+ * empty cell apart. Every floor footprint is at most `MAX_FLOOR_PROP`
+ * (1.4 m), so a member stays 0.3 m inside its cell, and two clusters' boxes
+ * are at least 2 + 0.3 + 0.3 = 2.6 m apart, more than `CLUSTER_CLEAR`.
+ */
+export const CLUSTER_INNER = 3;
+/**
+ * Chance a cluster block holds a cluster (D6, E4): every block does. The
+ * draw stays in each block's stream, so tuning it is a one-constant change
+ * that moves no other draw.
+ */
+export const CLUSTER_SHARE = 1;
+/** The fewest members a cluster is drawn with (D6, E4). */
+export const CLUSTER_MIN = 3;
+/** The most members a cluster is drawn with (D6, E4). */
+export const CLUSTER_MAX = 5;
+/**
+ * How far a cluster member keeps clear of everything solid outside its own
+ * cluster, in metres (D7): its box grown by this much overlaps no taken box
+ * and no other floor prop. The player's circle is 0.7 m across, so a
+ * cluster narrows a way but never closes one.
+ */
+export const CLUSTER_CLEAR = 1.0;
+/** How many cells long one span segment is, in cell units (D9). */
+export const SPAN_CELLS = 2;
+/**
+ * Half a span's width across its line, in metres: the plan box `sites.ts`
+ * keeps clear of lamps, decor and pipe runs (D9, E3).
+ */
+export const SPAN_HALF = 0.35;
+/**
+ * Chance a large hall whose palette has a `ceilingSpan` hangs one span line
+ * (D9), drawn first from the room's own span stream, so some large halls
+ * carry one and the rest stay clear overhead.
+ */
+export const SPAN_SHARE = 2 / 3;
+
+/**
+ * The rare kinds (2.6d C10): placed only by the rare step of `dress.ts`,
+ * from their own draws, never by a palette, the filler or the extras.
+ */
+export const RARE_PROP_KINDS = [
+  "saucer-poster",
+  "ooze-canisters",
+  "designer-tower",
+  "gravity-console",
+  "marked-crate",
+] as const satisfies readonly PropKind[];
+
+/** A rare prop kind. */
+export type RarePropKind = (typeof RARE_PROP_KINDS)[number];
+
+/**
+ * Each drawn rare kind's chance per room, by archetype (2.6d C9). The
+ * first numbers; the discovery pass (2.6f) raises them.
+ */
+export const RARE_SHARES = {
+  "saucer-poster": {
+    bridge: 1 / 16,
+    council: 1 / 16,
+    engineering: 1 / 16,
+    archive: 1 / 8,
+    lab: 1 / 8,
+  },
+  "ooze-canisters": {
+    bridge: 0,
+    council: 0,
+    engineering: 1 / 10,
+    archive: 1 / 8,
+    lab: 1 / 10,
+  },
+  "designer-tower": {
+    bridge: 1 / 12,
+    council: 1 / 12,
+    engineering: 1 / 12,
+    archive: 1 / 12,
+    lab: 1 / 12,
+  },
+  "gravity-console": {
+    bridge: 0,
+    council: 0,
+    engineering: 1 / 10,
+    archive: 0,
+    lab: 1 / 10,
+  },
+} as const satisfies Record<
+  Exclude<RarePropKind, "marked-crate">,
+  Record<Archetype, number>
+>;
+
+/** Chance a room marks one of its crates (2.6d C9, C12), by archetype. */
+export const MARK_SHARE = {
+  bridge: 1 / 10,
+  council: 1 / 10,
+  engineering: 1 / 6,
+  archive: 1 / 10,
+  lab: 1 / 10,
+} as const satisfies Record<Archetype, number>;
+
+/**
+ * Which placed crates the mark may turn into a `marked-crate`, and into
+ * which variant (2.6d C12): a large crate (1.2 by 1.2) into the lone
+ * marked crate (1.0 by 0.8), either crate stack (1.2 by 1.2, 1.3 by 1.1)
+ * into the marked stack (1.2 by 1.1). Each marked footprint lies inside
+ * every footprint it replaces, so no check made for the old prop is lost.
+ */
+export const MARK_FROM = {
+  crate: { variants: [1, 2], to: 0 },
+  "crate-stack": { variants: [0, 1], to: 1 },
+} as const;
+
+/** How far the tower's near side stands from the cell border on its desk's side, in metres (2.6d C13). */
+export const TOWER_DESK_GAP = 0.05;
+
+/** The machines with a desk top a tower may stand beside, as a terminal (2.6d C13). */
+export const DESK_MACHINES = [
+  "workbench",
+  "lab-bench",
+] as const satisfies readonly MachineKind[];

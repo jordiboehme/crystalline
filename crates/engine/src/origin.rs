@@ -189,6 +189,10 @@ pub(crate) fn proposal_transitions_json(
 /// no proposal record to read its own history off, and the file list belongs
 /// to the commit rather than to a status glance.
 ///
+/// `kept_branches` names share branches Crystalline keeps upstream (merged,
+/// declined or withdrawn shares), each with why it was retired, what kept it
+/// and the sentence to show; always present, empty when nothing is kept.
+///
 /// `detail` is the one key here that is opt-in: `local_changes` stays the bare
 /// count it has always been, and only a caller that asked for the file list
 /// pays for it (see [`local_change_detail`] for its shape). `None` leaves the
@@ -227,6 +231,7 @@ pub(crate) fn status_report_json(
         "stack_wedged": report.stack_wedged,
         "repair_pending": report.repair_pending,
         "stack_link_pending": report.stack_link_pending,
+        "kept_branches": kept_branches_json(report),
         "direct_shares": report.direct_shares.iter().map(|share| json!({
             "sha": share.sha,
             "url": share.url,
@@ -442,6 +447,10 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
 /// proposal records for `origin_status`'s detailed view), this counts them:
 /// the status overview stays a glance rather than a second copy of
 /// `origin_status`.
+///
+/// `kept_branches` names share branches Crystalline keeps upstream (merged,
+/// declined or withdrawn shares), each with why it was retired, what kept it
+/// and the sentence to show; always present, empty when nothing is kept.
 pub(crate) fn origin_poll_status_json(
     domain: &str,
     report: &OriginStatusReport,
@@ -464,7 +473,36 @@ pub(crate) fn origin_poll_status_json(
         "stack_wedged": report.stack_wedged,
         "repair_pending": report.repair_pending,
         "stack_link_pending": report.stack_link_pending,
+        "kept_branches": kept_branches_json(report),
     })
+}
+
+/// The kept share branches as every surface shows them: the entry, why its
+/// share was retired, what kept it, the forge's reason (null when there is
+/// none) and the one sentence
+/// [`QueuedBranch::kept_message`](crystalline_remote::state::QueuedBranch::kept_message)
+/// words. An empty list when nothing is kept.
+fn kept_branches_json(report: &OriginStatusReport) -> Vec<Value> {
+    report
+        .kept_branches
+        .iter()
+        .map(|entry| {
+            json!({
+                "branch": entry.branch,
+                "number": entry.number,
+                "onto": entry.onto,
+                "why": entry.why,
+                "kind": entry.kept_kind(),
+                "blocked_by": entry.kept.as_ref().and_then(|k| k.blocked_by),
+                "reason": entry
+                    .kept
+                    .as_ref()
+                    .map(|k| k.reason.clone())
+                    .filter(|reason| !reason.is_empty()),
+                "message": entry.kept_message(),
+            })
+        })
+        .collect()
 }
 
 /// Shapes one [`DomainPollOutcome`] for `origin_poll_status_json`: `{
@@ -1755,6 +1793,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: vec![crystalline_remote::state::DirectShare {
                 sha: "c0ffee".to_string(),
@@ -1823,6 +1862,7 @@ mod tests {
             stack_number: Some(42),
             stack_wedged: vec![7],
             repair_pending: true,
+            kept_branches: Vec::new(),
             stack_link_pending: true,
             direct_shares: Vec::new(),
         };
@@ -1851,6 +1891,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -1879,6 +1920,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -1908,6 +1950,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         }
@@ -1954,6 +1997,52 @@ mod tests {
         assert_eq!(plain["stack_wedged"], json!([]));
         assert_eq!(plain["repair_pending"], false);
         assert_eq!(plain["stack_link_pending"], false);
+    }
+
+    #[test]
+    fn a_kept_branch_travels_with_its_message_in_both_shapes() {
+        use crystalline_remote::state::{BranchKept, KeptKind, QueuedBranch, RetireWhy};
+        let mut report = poll_status_fixture();
+        report.kept_branches = vec![QueuedBranch {
+            number: 3,
+            branch: "crystalline/share-1".to_string(),
+            onto: "main".to_string(),
+            why: RetireWhy::Merged,
+            kept: Some(BranchKept {
+                blocked_by: Some(7),
+                reason: "GitHub returned an unexpected answer (status 422): nope".to_string(),
+                kind: KeptKind::Base,
+            }),
+        }];
+        let expected = json!([{
+            "branch": "crystalline/share-1",
+            "number": 3,
+            "onto": "main",
+            "why": "merged",
+            "kind": "base",
+            "blocked_by": 7,
+            "reason": "GitHub returned an unexpected answer (status 422): nope",
+            "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+        }]);
+        assert_eq!(
+            status_report_json("eng", &report, None, None)["kept_branches"],
+            expected
+        );
+        assert_eq!(
+            origin_poll_status_json("eng", &report, None, None)["kept_branches"],
+            expected
+        );
+
+        // Present and empty rather than absent when nothing is kept.
+        let plain = poll_status_fixture();
+        assert_eq!(
+            status_report_json("eng", &plain, None, None)["kept_branches"],
+            json!([])
+        );
+        assert_eq!(
+            origin_poll_status_json("eng", &plain, None, None)["kept_branches"],
+            json!([])
+        );
     }
 
     #[test]
@@ -2425,6 +2514,7 @@ mod tests {
             stack_number: stacked.then_some(42),
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         }
@@ -2614,6 +2704,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };
@@ -2656,6 +2747,7 @@ mod tests {
             stack_number: None,
             stack_wedged: vec![],
             repair_pending: false,
+            kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: Vec::new(),
         };

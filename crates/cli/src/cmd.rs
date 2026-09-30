@@ -569,11 +569,7 @@ fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
     let manifest = root.join("MANIFEST.md");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
-    let updated = crystalline_core::emit::set_frontmatter_field(
-        &text,
-        crystalline_core::DOMAIN_NAME_KEY,
-        name,
-    );
+    let updated = crystalline_core::manifest::set_declared_name(&text, name);
     if updated != text {
         std::fs::write(&manifest, updated)
             .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
@@ -2610,6 +2606,16 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         // that outlives its clients has no line, not a "never".
         if let Some(secs) = data.get("idle_exit_secs").and_then(Value::as_u64) {
             println!("Lifetime: exits {secs}s after its last client disconnects");
+        }
+        // Where the daemon runs: its working directory and, on Windows, its
+        // job and package identity. `crystalline doctor` has the full lines
+        // and says when one of them could keep another program's files in use.
+        if let Some(runs_in) = data
+            .get("runs_in")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<crystalline_service::runs_in::RunsIn>(v).ok())
+        {
+            println!("Runs in: {}", runs_in.summary());
         }
     }
     let registered: Vec<&str> = data["registered"]

@@ -123,7 +123,12 @@ export default function MoveDialogBody({
             },
           }
         : undefined;
-    void navigate(engramRoute(receipt.domain, receipt.permalink), { state });
+    // A replace: the old address answers nothing after the move, so leaving
+    // it in history would make Back land on a page that only forwards here.
+    void navigate(engramRoute(receipt.domain, receipt.permalink), {
+      state,
+      replace: true,
+    });
   };
 
   const move = useMutation({

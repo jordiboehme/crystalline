@@ -1099,8 +1099,8 @@ async fn the_spelling_table_follows_the_name_table_precedence(store: &dyn Store)
     let ops = store.domain_id("ops").await.unwrap().unwrap();
     assert_eq!(
         store.resolve_pending_links(ops).await.unwrap(),
-        0,
-        "bound at sync time: a prefix that names no domain reads in the source's own"
+        1,
+        "pending at sync time, when `x` named no domain; bound now that it is an alias of ops"
     );
     let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
     let ops_runbook = store.lookup_id("ops", "runbook").await.unwrap().unwrap();
@@ -1268,6 +1268,766 @@ async fn resetting_a_spelling_unbinds_its_references(store: &dyn Store) {
 parity!(
     resetting_a_spelling_unbinds_its_references_on_both_backends,
     resetting_a_spelling_unbinds_its_references
+);
+
+// --- an explicit domain prefix resolves only in that domain -----------------
+
+/// The engram a source's references are bound to, as `(domain, permalink)`,
+/// or `None` when nothing is bound. Every source in these fixtures carries one
+/// target, written once as a relation and once as a prose link, so the one
+/// neighbor that is not the source itself is that target. The two resolution
+/// flags must agree, since both tables are bound by the same rule.
+async fn bound_target(store: &dyn Store, source: EngramId) -> Option<(String, String)> {
+    bound_target_as(store, source, None).await
+}
+
+/// [`bound_target`] for a source read in `actor`'s view: the stored verdict,
+/// and the target among what that actor sees.
+async fn bound_target_as(
+    store: &dyn Store,
+    source: EngramId,
+    actor: Option<&str>,
+) -> Option<(String, String)> {
+    let refs = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(refs.len(), 2, "one relation and one link: {refs:?}");
+    assert_eq!(
+        refs[0].resolved, refs[1].resolved,
+        "the relation and the link agree: {refs:?}"
+    );
+    let slice = store.neighbors(&[source], 1, actor).await.unwrap();
+    let targets: Vec<(String, String)> = slice
+        .nodes
+        .iter()
+        .filter(|n| n.id != source)
+        .map(|n| (n.domain.clone(), n.permalink.clone()))
+        .collect();
+    assert!(targets.len() <= 1, "one target at most: {targets:?}");
+    assert_eq!(
+        refs[0].resolved,
+        !targets.is_empty(),
+        "a resolved reference is an edge, an unresolved one is none: {refs:?} {targets:?}"
+    );
+    targets.into_iter().next()
+}
+
+/// A source engram whose only references are `[[inner]]`, once as a relation
+/// bullet and once in prose.
+fn source_engram(title: &str, permalink: &str, inner: &str) -> String {
+    engram(
+        title,
+        permalink,
+        "engram",
+        "",
+        &format!("- relates_to [[{inner}]]\n\nSee [[{inner}]] here.\n"),
+    )
+}
+
+/// The reported case. `[[ops:Runbook]]` names a domain nobody registered, and
+/// the home domain holds an engram called Runbook. An explicit prefix resolves
+/// only in the domain it names, so the reference stays unresolved: binding it
+/// to the home Runbook would draw an edge and a backlink the author never
+/// wrote. A typo in the prefix is the same case.
+async fn an_unknown_prefix_does_not_fall_back_to_home(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        dir.path(),
+        "unknown.md",
+        &source_engram("Unknown", "unknown", "ops:Runbook"),
+    );
+    write(
+        dir.path(),
+        "typo.md",
+        &source_engram("Typo", "typo", "hmoe:runbook"),
+    );
+    let report = sync_domain(store, "home", dir.path()).await.unwrap();
+    assert_eq!(report.links_resolved, 0, "{report:?}");
+    assert_eq!(report.relations_resolved, 0, "{report:?}");
+
+    for permalink in ["unknown", "typo"] {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            None,
+            "`{permalink}` names no domain, so it binds nothing at home"
+        );
+    }
+}
+parity!(
+    an_unknown_prefix_does_not_fall_back_to_home_on_both_backends,
+    an_unknown_prefix_does_not_fall_back_to_home
+);
+
+/// Spellings are exact: `Home` is not a spelling of the domain `home`, so
+/// `[[Home:Runbook]]` names no domain and stays unresolved, even inside
+/// `home` itself, where a Runbook exists.
+async fn a_wrong_case_home_prefix_stays_unresolved(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        dir.path(),
+        "upper.md",
+        &source_engram("Upper", "upper", "Home:Runbook"),
+    );
+    write(
+        dir.path(),
+        "exact.md",
+        &source_engram("Exact", "exact", "home:Runbook"),
+    );
+    sync_domain(store, "home", dir.path()).await.unwrap();
+
+    let upper = store.lookup_id("home", "upper").await.unwrap().unwrap();
+    assert_eq!(bound_target(store, upper).await, None);
+    let exact = store.lookup_id("home", "exact").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, exact).await,
+        Some(("home".to_string(), "runbook".to_string())),
+        "the exact spelling of the home domain still resolves there"
+    );
+}
+parity!(
+    a_wrong_case_home_prefix_stays_unresolved_on_both_backends,
+    a_wrong_case_home_prefix_stays_unresolved
+);
+
+/// A prefix that names no domain is not a prefix: the whole bracket text is
+/// tried at home. With both `Foo` and `typo:Foo` at home, `[[typo:Foo]]` lands
+/// on `typo:Foo`, never on `Foo`. A prefix that does name a domain never takes
+/// that road, even when home holds a title that matches the whole text.
+async fn the_whole_bracket_text_still_resolves_at_home(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        home.path(),
+        "foo.md",
+        &engram("Foo", "foo", "engram", "", "foo body\n"),
+    );
+    write(
+        home.path(),
+        "typo-foo.md",
+        &engram("typo:Foo", "typo-foo", "engram", "", "colon title\n"),
+    );
+    write(
+        home.path(),
+        "eng-overview.md",
+        &engram(
+            "eng:Overview",
+            "eng-overview",
+            "engram",
+            "",
+            "colon title\n",
+        ),
+    );
+    write(
+        home.path(),
+        "raw.md",
+        &source_engram("Raw", "raw", "typo:Foo"),
+    );
+    write(
+        home.path(),
+        "known.md",
+        &source_engram("Known", "known", "eng:Overview"),
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    sync_domain(store, "home", home.path()).await.unwrap();
+
+    let raw = store.lookup_id("home", "raw").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, raw).await,
+        Some(("home".to_string(), "typo-foo".to_string())),
+        "the whole text at home, not the bare target"
+    );
+    let known = store.lookup_id("home", "known").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, known).await,
+        None,
+        "`eng` is a domain without an Overview: a broken cross-domain link"
+    );
+}
+parity!(
+    the_whole_bracket_text_still_resolves_at_home_on_both_backends,
+    the_whole_bracket_text_still_resolves_at_home
+);
+
+/// An unknown prefix that later gains a meaning heals. Registering `ops`
+/// gives the pending link a domain to resolve in; a spelling added for a
+/// domain moves a link that was bound through the whole bracket text at home
+/// once the reset unbinds it.
+async fn a_prefix_that_gains_a_meaning_heals_the_link(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let ops = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "home runbook\n"),
+    );
+    write(
+        home.path(),
+        "x-runbook.md",
+        &engram("x:Runbook", "x-runbook", "engram", "", "colon title\n"),
+    );
+    write(
+        home.path(),
+        "pending.md",
+        &source_engram("Pending", "pending", "ops:Runbook"),
+    );
+    write(
+        home.path(),
+        "colon.md",
+        &source_engram("Colon", "colon", "x:Runbook"),
+    );
+    write(
+        ops.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "ops runbook\n"),
+    );
+    write(
+        eng.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "eng runbook\n"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    let pending = store.lookup_id("home", "pending").await.unwrap().unwrap();
+    let colon = store.lookup_id("home", "colon").await.unwrap().unwrap();
+    assert_eq!(bound_target(store, pending).await, None);
+    assert_eq!(
+        bound_target(store, colon).await,
+        Some(("home".to_string(), "x-runbook".to_string()))
+    );
+
+    // `ops` is registered: its own name is its spelling, and the next pass
+    // over home binds the pending link there.
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+    assert_eq!(
+        bound_target(store, pending).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+
+    // `x` becomes an alias of `eng`: the reset unbinds the colon-title link and
+    // the pass binds it in the domain it now names.
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    let eng_id = store.domain_id("eng").await.unwrap().unwrap();
+    let ops_id = store.domain_id("ops").await.unwrap().unwrap();
+    let changed = store
+        .replace_domain_spellings(&[
+            ("eng".to_string(), eng_id),
+            ("x".to_string(), eng_id),
+            ("home".to_string(), home_id),
+            ("ops".to_string(), ops_id),
+        ])
+        .await
+        .unwrap();
+    assert!(changed.contains(&"x".to_string()), "{changed:?}");
+    assert_eq!(
+        store.reset_references_to_spellings(&changed).await.unwrap(),
+        2
+    );
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+    assert_eq!(
+        bound_target(store, colon).await,
+        Some(("eng".to_string(), "runbook".to_string()))
+    );
+}
+parity!(
+    a_prefix_that_gains_a_meaning_heals_the_link_on_both_backends,
+    a_prefix_that_gains_a_meaning_heals_the_link
+);
+
+/// The pass after a registration binds the pending rows spelled with the new
+/// domain's names, in whichever domain they sit, and nothing else: a pending
+/// row spelled with another domain's name waits for its own domain's pass.
+async fn resolving_by_spelling_binds_only_those_rows(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let ops = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:Runbook"),
+    );
+    write(
+        home.path(),
+        "to-eng.md",
+        &source_engram("To Eng", "to-eng", "eng:Runbook"),
+    );
+    for dir in [&ops, &eng] {
+        write(
+            dir.path(),
+            "runbook.md",
+            &engram("Runbook", "runbook", "engram", "", "body\n"),
+        );
+    }
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    let to_eng = store.lookup_id("home", "to-eng").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        None,
+        "home was synced first"
+    );
+
+    assert_eq!(store.resolve_references_to_spellings(&[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        2,
+        "the relation and the link spelled `ops`"
+    );
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    assert_eq!(
+        bound_target(store, to_eng).await,
+        None,
+        "a row spelled `eng` is not this pass's"
+    );
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolving_by_spelling_binds_only_those_rows_on_both_backends,
+    resolving_by_spelling_binds_only_those_rows
+);
+
+/// A record for an engram that lands without a resolve pass of its own, as a
+/// base write's row does before the cross-domain bind runs.
+fn titled_record(path: &str, permalink: &str, title: &str) -> EngramRecord {
+    EngramRecord {
+        title: title.to_string(),
+        ..record(path, permalink, &format!("# {title}\n"), "sha")
+    }
+}
+
+async fn ids(store: &dyn Store, names: &[&str]) -> Vec<DomainId> {
+    let mut out = Vec::new();
+    for name in names {
+        out.push(store.domain_id(name).await.unwrap().unwrap());
+    }
+    out
+}
+
+/// Item 13: a base write in `ops` binds the pending rows in other domains that
+/// name it, counted per domain, and leaves `ops`'s own rows to its own pass.
+async fn resolve_references_to_binds_only_other_domains_and_counts_per_domain(store: &dyn Store) {
+    let (home, side, ops) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:runbook"),
+    );
+    write(
+        side.path(),
+        "also.md",
+        &source_engram("Also", "also", "ops:runbook"),
+    );
+    write(
+        ops.path(),
+        "own.md",
+        &source_engram("Own", "own", "ops:runbook"),
+    );
+    for (name, dir) in [("home", &home), ("side", &side), ("ops", &ops)] {
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    let found = ids(store, &["home", "side", "ops"]).await;
+    let (home_id, side_id, ops_id) = (found[0], found[1], found[2]);
+    store
+        .upsert_engram(ops_id, &titled_record("runbook.md", "runbook", "Runbook"))
+        .await
+        .unwrap();
+
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    let mut want = vec![(home_id, 2), (side_id, 2)];
+    want.sort_by_key(|(id, _)| id.0);
+    assert_eq!(bound, want, "the relation and the link, per domain");
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    let own = store.lookup_id("ops", "own").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, own).await,
+        None,
+        "ops's own rows are its own pass's"
+    );
+    assert!(
+        store
+            .resolve_references_to(ops_id, &["ops".to_string()], &["runbook".to_string()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain_on_both_backends,
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain
+);
+
+/// The title arm binds too, in any letter case (Review Focus 4).
+async fn resolve_references_to_binds_by_title_too(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "a.md",
+        &source_engram("A", "a", "ops:Restart runbook"),
+    );
+    write(
+        home.path(),
+        "b.md",
+        &source_engram("B", "b", "ops:restart RUNBOOK"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("restart-runbook.md", "restart-runbook", "Restart runbook"),
+        )
+        .await
+        .unwrap();
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["restart-runbook".to_string(), "Restart runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 4)]);
+    for permalink in ["a", "b"] {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            Some(("ops".to_string(), "restart-runbook".to_string())),
+            "{permalink}"
+        );
+    }
+}
+parity!(
+    resolve_references_to_binds_by_title_too_on_both_backends,
+    resolve_references_to_binds_by_title_too
+);
+
+async fn resolve_references_to_leaves_other_targets_pending(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "to-runbook.md",
+        &source_engram("To Runbook", "to-runbook", "ops:runbook"),
+    );
+    write(
+        home.path(),
+        "to-other.md",
+        &source_engram("To Other", "to-other", "ops:other"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    for (path, permalink, title) in [
+        ("runbook.md", "runbook", "Runbook"),
+        ("other.md", "other", "Other"),
+    ] {
+        store
+            .upsert_engram(ops_id, &titled_record(path, permalink, title))
+            .await
+            .unwrap();
+    }
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 2)]);
+    let other = store.lookup_id("home", "to-other").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, other).await,
+        None,
+        "not this write's target"
+    );
+}
+parity!(
+    resolve_references_to_leaves_other_targets_pending_on_both_backends,
+    resolve_references_to_leaves_other_targets_pending
+);
+
+/// A core [`crystalline_core::LinkResolver`] over the same engrams and the
+/// same spelling table the store holds, so the index verdict can be compared
+/// with `core::address::resolve`, the rule verify follows. `viewer` reads one
+/// actor's drafts over the base, their own row first, as the index's view does.
+struct SpelledLookup {
+    /// spelling -> local domain name
+    spellings: HashMap<String, String>,
+    /// (local domain, permalink, title, actor); an empty actor is a base row
+    engrams: Vec<(String, String, String, String)>,
+    viewer: Option<String>,
+}
+
+impl SpelledLookup {
+    fn find(
+        &self,
+        domain: &str,
+        matches: impl Fn(&str, &str) -> bool,
+    ) -> Option<crystalline_core::ResolvedRef> {
+        let local = self
+            .spellings
+            .get(domain)
+            .map(String::as_str)
+            .unwrap_or(domain);
+        let visible = |actor: &str| actor.is_empty() || Some(actor) == self.viewer.as_deref();
+        let mut hits: Vec<&(String, String, String, String)> = self
+            .engrams
+            .iter()
+            .filter(|(d, p, t, a)| d == local && visible(a) && matches(p, t))
+            .collect();
+        hits.sort_by_key(|(_, _, _, a)| a.is_empty());
+        hits.first()
+            .map(|(d, p, _, _)| crystalline_core::ResolvedRef {
+                domain: d.clone(),
+                permalink: p.clone(),
+            })
+    }
+}
+
+impl crystalline_core::LinkResolver for SpelledLookup {
+    fn by_permalink(&self, domain: &str, permalink: &str) -> Option<crystalline_core::ResolvedRef> {
+        self.find(domain, |p, _| p == permalink)
+    }
+
+    fn by_title(&self, domain: &str, title: &str) -> Option<crystalline_core::ResolvedRef> {
+        self.find(domain, |_, t| t.to_lowercase() == title.to_lowercase())
+    }
+
+    fn is_domain(&self, name: &str) -> bool {
+        self.spellings.contains_key(name)
+    }
+}
+
+/// What `core::address::resolve` names for `inner` written in `home`.
+fn core_verdict(lookup: &SpelledLookup, inner: &str) -> Option<(String, String)> {
+    match crystalline_core::address::resolve(
+        &crystalline_core::LinkTarget::parse(inner),
+        "home",
+        lookup,
+    ) {
+        crystalline_core::Resolution::Resolved(r) => Some((r.domain, r.permalink)),
+        _ => None,
+    }
+}
+
+/// The index and verify answer the same for every reference: for a table of
+/// bracket texts written in `home`, the engram the store binds equals the one
+/// `crystalline_core::address::resolve` names, down to which engram it is.
+///
+/// The spellings come from a real name table: `eng-knowledge` declares the
+/// canonical name `engineering` and the alias `eng`; `a1` and `a2` both
+/// declare `shared`, so that canonical name is contested and names no domain;
+/// `ops2` declares `platform`, which is shadowed by the domain registered
+/// under that local name. The same table runs once more for references in
+/// alice's drafts, read in her view, where her own draft may answer.
+async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store) {
+    let dirs: HashMap<&str, tempfile::TempDir> =
+        ["home", "eng-knowledge", "a1", "a2", "platform", "ops2"]
+            .into_iter()
+            .map(|d| (d, tempfile::tempdir().unwrap()))
+            .collect();
+    let base: Vec<(&str, &str, &str)> = vec![
+        ("home", "foo", "Foo"),
+        ("home", "runbook", "Runbook"),
+        ("home", "typo-foo", "typo:Foo"),
+        ("home", "eng-overview", "eng:Overview"),
+        ("home", "shared-runbook", "shared:Runbook"),
+        ("eng-knowledge", "runbook", "Runbook"),
+        ("eng-knowledge", "foo", "Foo"),
+        ("a1", "runbook", "Runbook"),
+        ("a2", "runbook", "Runbook"),
+        ("platform", "runbook", "Runbook"),
+        ("ops2", "runbook", "Runbook"),
+        ("ops2", "guide", "Guide"),
+    ];
+    for (domain, permalink, title) in &base {
+        write(
+            dirs[domain].path(),
+            &format!("{permalink}.md"),
+            &engram(title, permalink, "engram", "", "body\n"),
+        );
+    }
+    let cases = [
+        "ops:Runbook",
+        "osp:runbook",
+        "Home:Runbook",
+        "HOME:foo",
+        "home:Runbook",
+        "home:foo",
+        "eng:Runbook",
+        "engineering:runbook",
+        "eng-knowledge:Foo",
+        "Eng:Runbook",
+        "eng:Missing",
+        "eng:Overview",
+        "typo:Foo",
+        "Foo",
+        "runbook",
+        "Missing",
+        // A contested canonical name names no domain: the whole text at home.
+        "shared:Runbook",
+        "shared:Foo",
+        "a1:Runbook",
+        // A shadowed canonical name is the local name of another domain.
+        "platform:Runbook",
+        "platform:Guide",
+        "ops2:Guide",
+    ];
+    for (i, inner) in cases.iter().enumerate() {
+        write(
+            dirs["home"].path(),
+            &format!("src-{i}.md"),
+            &source_engram(&format!("Src {i}"), &format!("src-{i}"), inner),
+        );
+    }
+    for name in ["eng-knowledge", "a1", "a2", "platform", "ops2", "home"] {
+        sync_domain(store, name, dirs[name].path()).await.unwrap();
+    }
+    let (table, changed) = push_name_table(
+        store,
+        &[
+            name_input("home", None, &[]),
+            name_input("eng-knowledge", Some("engineering"), &["eng"]),
+            name_input("a1", Some("shared"), &[]),
+            name_input("a2", Some("shared"), &[]),
+            name_input("platform", None, &[]),
+            name_input("ops2", Some("platform"), &[]),
+        ],
+    )
+    .await;
+    assert_eq!(table.resolve("shared"), None, "contested");
+    assert_eq!(table.resolve("platform"), Some("platform"), "shadowed");
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    store.reset_references_to_spellings(&changed).await.unwrap();
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+
+    let mut lookup = SpelledLookup {
+        spellings: table.spellings().into_iter().collect(),
+        engrams: base
+            .iter()
+            .map(|(d, p, t)| (d.to_string(), p.to_string(), t.to_string(), String::new()))
+            .collect(),
+        viewer: None,
+    };
+    for (i, inner) in cases.iter().enumerate() {
+        let source = store
+            .lookup_id("home", &format!("src-{i}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            core_verdict(&lookup, inner),
+            "[[{inner}]]: the index and core disagree"
+        );
+    }
+
+    // Alice's drafts: a colon title only she has, and one draft source per
+    // case, bound in her view the way a draft write binds them.
+    let draft = |title: &str, permalink: &str, body: &str| {
+        let text = engram(title, permalink, "engram", "", body);
+        crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&text).unwrap(),
+            &format!("{permalink}.md"),
+            FileStamp {
+                mtime: 0,
+                size: text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        )
+    };
+    store
+        .upsert_overlay(home_id, "alice", &draft("typo:Bar", "typo-bar", "body\n"))
+        .await
+        .unwrap();
+    lookup.engrams.push((
+        "home".to_string(),
+        "typo-bar".to_string(),
+        "typo:Bar".to_string(),
+        "alice".to_string(),
+    ));
+    lookup.viewer = Some("alice".to_string());
+    let mut drafted = Vec::new();
+    for inner in cases.iter().copied().chain(["typo:Bar", "home:typo:Bar"]) {
+        let i = drafted.len();
+        let text_body = format!("- relates_to [[{inner}]]\n\nSee [[{inner}]] here.\n");
+        let id = store
+            .upsert_overlay(
+                home_id,
+                "alice",
+                &draft(&format!("Draft {i}"), &format!("draft-{i}"), &text_body),
+            )
+            .await
+            .unwrap();
+        drafted.push((inner, id));
+    }
+    store
+        .reresolve_actor_references(home_id, "alice")
+        .await
+        .unwrap();
+    for (inner, id) in drafted {
+        assert_eq!(
+            bound_target_as(store, id, Some("alice")).await,
+            core_verdict(&lookup, inner),
+            "[[{inner}]] in alice's draft: the index and core disagree"
+        );
+    }
+}
+parity!(
+    the_index_resolves_every_reference_the_way_core_does_on_both_backends,
+    the_index_resolves_every_reference_the_way_core_does
 );
 
 /// A row rename moves the name in place: the id stays, so every engram and
@@ -9445,4 +10205,81 @@ async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) 
 parity!(
     a_draft_never_reaches_a_base_count_or_the_base_graph,
     a_draft_reaches_no_base_answer_through_its_children
+);
+
+/// The shared domain-scoped lookup resolves by permalink and by title only.
+/// A file path never resolves, with or without `.md` and in any case: the
+/// miss names the permalink the identifier's slug is. Only a permalink is
+/// offered - a title hit on the slug is no hint - and an identifier whose
+/// slug is empty or is the identifier itself gets none (#111).
+async fn lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "guides/Agent Workflow Guide.md",
+        &engram(
+            "Workflow",
+            "guides/agent-workflow-guide",
+            "engram",
+            "",
+            "one\ntwo\nthree\n",
+        ),
+    );
+    write(
+        root,
+        "notes/meeting.md",
+        &engram("Standup", "standup", "engram", "", "one\n"),
+    );
+    write(
+        root,
+        "plan.md",
+        &engram("roadmap", "plan-2026", "engram", "", "two\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let lookup = |identifier: &'static str| async move {
+        crystalline_index::lookup_in_domain(store, "d", identifier)
+            .await
+            .unwrap()
+    };
+    for identifier in ["guides/agent-workflow-guide", "WORKFLOW", "standup"] {
+        assert!(
+            matches!(
+                lookup(identifier).await,
+                crystalline_index::DomainLookup::Found(_)
+            ),
+            "{identifier}"
+        );
+    }
+    let missing = |suggest: Option<&str>| crystalline_index::DomainLookup::Missing {
+        suggest: suggest.map(str::to_string),
+    };
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+        "guides/agent workflow guide",
+        "guides/agent-workflow-guide.md",
+    ] {
+        assert_eq!(
+            lookup(identifier).await,
+            missing(Some("guides/agent-workflow-guide")),
+            "{identifier}"
+        );
+    }
+    // The file's path is no identifier and names no permalink: `standup` is
+    // not what `notes/meeting` slugifies to.
+    for identifier in ["notes/meeting", "notes/meeting.md"] {
+        assert_eq!(lookup(identifier).await, missing(None), "{identifier}");
+    }
+    // `roadmap` is a TITLE, not a permalink: a title hit on the slug is no hint.
+    assert_eq!(lookup("Roadmap.md").await, missing(None));
+    // `.md` alone slugifies to nothing, and `nope` to itself.
+    assert_eq!(lookup(".md").await, missing(None));
+    assert_eq!(lookup("nope").await, missing(None));
+}
+
+parity!(
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug_on_both_backends,
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug
 );

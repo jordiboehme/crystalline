@@ -7,6 +7,28 @@
 //! in that shape belongs here, where there is one implementation and both
 //! sides call it.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Distinguishes one temp file from another within this process.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The sibling a write goes through before it is renamed onto `target`:
+/// `.<file name>.<purpose>.<pid>.<seq>`, hidden so that neither a sync, the
+/// daemon's watcher nor remote change detection ever takes one a crash left
+/// behind for an engram or a change to share. The whole file name is kept
+/// (`shot.png`, not `shot`), so a leftover still says whose it was, and the
+/// counter keeps two writes in one process off each other's temp file.
+pub fn hidden_temp_path(target: &Path, purpose: &str) -> PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = std::ffi::OsString::from(".");
+    if let Some(own) = target.file_name() {
+        name.push(own);
+    }
+    name.push(format!(".{purpose}.{}.{seq}", std::process::id()));
+    target.with_file_name(name)
+}
+
 /// Two paths' case-insensitive identity: what macOS and Windows treat as one
 /// path. Full Unicode lowercase rather than ASCII, since both filesystems
 /// fold well beyond ASCII, and locale-independent, so the answer is the same
@@ -35,6 +57,19 @@ pub fn fold_path_case(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hidden_temp_path_is_a_hidden_sibling_that_keeps_the_whole_name() {
+        let first = hidden_temp_path(Path::new("/kb/assets/shot.png"), "tmp");
+        let second = hidden_temp_path(Path::new("/kb/assets/shot.png"), "tmp");
+        assert_eq!(first.parent(), Some(Path::new("/kb/assets")));
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!(".shot.png.tmp.{}.", std::process::id())),
+            "{name}"
+        );
+        assert_ne!(first, second, "two calls never share a temp file");
+    }
 
     #[test]
     fn folding_is_case_insensitive_and_leaves_the_shape_alone() {

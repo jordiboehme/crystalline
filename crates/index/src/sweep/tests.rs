@@ -2070,9 +2070,140 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
     assert_eq!(finding.priority, 68, "base 60 plus the human boost of 8");
 }
 
+// ---------------------------------------------------------------------------
+// V111
+// ---------------------------------------------------------------------------
+
+/// An ingestion-record fact linking `permalink`, naming `resource` when given.
+fn ingestion_record(id: i64, permalink: &str, resource: Option<&str>) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.engram_type = "ingestion".to_string();
+    f.resource = resource.map(str::to_string);
+    f
+}
+
 #[test]
-fn the_catalog_carries_twenty_five_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 25);
+fn v111_flags_an_engram_an_ingestion_record_links_that_names_no_resource() {
+    let record = ingestion_record(
+        1,
+        "sources/ops-wiki",
+        Some("https://wiki.example/spaces/OPS"),
+    );
+    let derived = fact(2, "retry-policy");
+    let mut sweep = input(vec![record, derived]);
+    sweep.graph.edges = vec![wikilink(1, 2)];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V111");
+    assert_eq!(finding.permalink, "retry-policy");
+    assert_eq!(finding.class, Class::Judgment);
+    assert!(
+        finding
+            .evidence
+            .contains("ingestion record engineering/sources/ops-wiki"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        finding
+            .evidence
+            .contains("resource https://wiki.example/spaces/OPS"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        finding.evidence.ends_with("no resource"),
+        "{}",
+        finding.evidence
+    );
+    for cell in [&finding.finding, &finding.evidence, &finding.fix] {
+        assert!(!cell.contains(','), "TOON cells carry no commas: {cell}");
+    }
+    assert!(
+        finding.fix.contains("set_frontmatter key resource"),
+        "{}",
+        finding.fix
+    );
+}
+
+#[test]
+fn v111_stays_quiet_when_the_derived_engram_names_a_resource() {
+    let record = ingestion_record(1, "sources/ops-wiki", None);
+    let mut derived = fact(2, "retry-policy");
+    derived.resource = Some("https://wiki.example/pages/42".to_string());
+    let mut sweep = input(vec![record, derived]);
+    sweep.graph.edges = vec![wikilink(1, 2)];
+    assert!(!fired(&detect(&sweep)).contains(&"V111"));
+}
+
+#[test]
+fn v111_ignores_links_from_an_ordinary_engram() {
+    let hub = fact(1, "overview");
+    let target = fact(2, "retry-policy");
+    let mut sweep = input(vec![hub, target]);
+    sweep.graph.edges = vec![wikilink(1, 2)];
+    assert!(!fired(&detect(&sweep)).contains(&"V111"));
+}
+
+#[test]
+fn v111_flags_an_ingested_from_relation_resolved_or_not() {
+    let record = ingestion_record(1, "sources/ops-wiki", None);
+    let derived = fact(2, "retry-policy");
+    let mut sweep = input(vec![record, derived]);
+    sweep.graph.edges = vec![rel(2, 1, "ingested_from")];
+    assert_eq!(fired_on(&detect(&sweep), "retry-policy"), vec!["V111"]);
+
+    let lonely = fact(3, "orphaned-derivation");
+    let mut sweep = input(vec![lonely]);
+    sweep.unresolved = vec![UnresolvedRef {
+        rel_type: "ingested_from".to_string(),
+        kind: EdgeKind::Relation,
+        ..unresolved(3, "Gone Record")
+    }];
+    let finding = only(&detect(&sweep), "V111");
+    assert!(
+        finding.evidence.contains("ingested_from [[Gone Record]]"),
+        "{}",
+        finding.evidence
+    );
+}
+
+#[test]
+fn v111_never_flags_the_record_a_retired_engram_or_a_manifest() {
+    let record = ingestion_record(1, "sources/ops-wiki", None);
+    let other_record = ingestion_record(2, "sources/older-pass", None);
+    let mut retired = fact(3, "old-policy");
+    retired.status = "superseded".to_string();
+    let mut manifest = fact(4, "manifest");
+    manifest.engram_type = "manifest".to_string();
+    let mut sweep = input(vec![record, other_record, retired, manifest]);
+    sweep.graph.edges = vec![wikilink(1, 2), wikilink(1, 3), wikilink(1, 4)];
+    assert!(
+        !fired(&detect(&sweep)).contains(&"V111"),
+        "{:?}",
+        fired(&detect(&sweep))
+    );
+}
+
+#[test]
+fn v111_exempt_types_are_matched_case_insensitively() {
+    let record = ingestion_record(1, "sources/ops-wiki", None);
+    let mut manifest = fact(2, "manifest");
+    manifest.engram_type = "Manifest".to_string();
+    let mut schema = fact(3, "schema-def");
+    schema.engram_type = "SCHEMA".to_string();
+    let mut sweep = input(vec![record, manifest, schema]);
+    sweep.graph.edges = vec![wikilink(1, 2), wikilink(1, 3)];
+    assert!(
+        !fired(&detect(&sweep)).contains(&"V111"),
+        "an exempt type spelled in another case must still be exempt: {:?}",
+        fired(&detect(&sweep))
+    );
+}
+
+#[test]
+fn the_catalog_carries_twenty_six_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 26);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -2115,8 +2246,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         ids,
         vec![
             "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
-            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V110", "V201", "V202",
-            "V203", "V301", "V302",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V110", "V111", "V201",
+            "V202", "V203", "V301", "V302",
         ]
     );
     for rule in RULES {

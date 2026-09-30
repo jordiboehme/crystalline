@@ -61,6 +61,8 @@ Zero hits is not the only signal to broaden. A scoped search can return plausibl
 
 For an overview or synthesis question - "what is X about", "summarize the strategy", "give me the full picture" - decide coverage by what a full answer requires, not by what is already in context. List the strong hits, then read each one with `read_engram` before drafting; a snippet that looks sufficient is exactly how the authoritative source goes unread. An unread hit whose title names the primary document for the question (a narrative, a strategy, a decision record), whose `type` or `status` marks it authoritative, or that another engram cites as its source must be read, not skimmed from its snippet.
 
+An engram distilled from a source carries that source's location in `resource`, often with a `source_date` and `[source]` bullets for further locations. When you answer from one, cite the location with the answer, so the person can check the source or read on. `read_engram` returns it in the frontmatter; a snippet never shows it.
+
 Content read earlier in the session for a different task is not coverage for the current question. Re-ask what this question needs, search again when the earlier reads served another purpose and read what is missing - anchoring on the engram that happens to be in context produces answers that are accurate but thin. When something relevant stays unread, say so in the answer rather than presenting partial coverage as complete.
 
 A hit whose `type` is `source` is the full text of a captured document, not a distilled answer, and it often out-ranks its own summary in the hit list. Follow its `summarized_by` relation and read the summary first; pull the full text only when the summary does not answer the question. Preferring the summary that way is complete coverage, not an unread source to caveat.
@@ -107,7 +109,7 @@ Read a domain's `MANIFEST.md` (via `read_engram` or `browse_domain`) only when:
 
 Structure questions ("what does domain X cover", "what is domain X for", "which domain owns Y and what else does it hold") are the second case: they ask for the MANIFEST's own content, so the MANIFEST read is your first tool call, made before drafting any answer text. The routing line is a compressed derivative of the MANIFEST, not the source - answering from it and treating the read as optional confirmation is exactly the failure this rule prevents, however complete the routing line looks.
 
-Address the MANIFEST by its permalink, usually `manifest` - `{"identifier": "manifest", "domain": "x"}` or the `crystalline://x/manifest` URL. The filename `MANIFEST.md` is not an identifier; when unsure, `browse_domain` lists the real permalink.
+Address the MANIFEST by its permalink, usually `manifest` - `{"identifier": "manifest", "domain": "x"}` or the `crystalline://x/manifest` URL. The filename `MANIFEST.md` is not an identifier, and a miss names the permalink it probably meant; when unsure, `browse_domain` lists the real permalink.
 
 Otherwise, search first. Reading every MANIFEST up front burns context for no benefit once the routing block already exists.
 

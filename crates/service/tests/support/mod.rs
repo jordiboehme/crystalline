@@ -110,6 +110,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/domains/{domain}/move",
     "POST /api/v1/validate",
     "GET /api/v1/sync",
+    "GET /api/v1/events",
     "GET /api/v1/collab/{domain}/{permalink}",
     "GET /api/v1/search",
     "GET /api/v1/vocabulary",
@@ -540,6 +541,29 @@ impl MockProvider {
     pub fn set_proposal_state(&self, number: u64, state: ProposalState) {
         let mut inner = self.inner.lock().unwrap();
         inner.proposal_states.insert(number, state);
+        if state != ProposalState::Merged {
+            return;
+        }
+        // The forge moves the stack members above a merged layer, as the
+        // remote crate's mock does.
+        let (Some(branch), Some(base)) = (
+            inner.proposal_branches.get(&number).cloned(),
+            inner.proposal_bases.get(&number).cloned(),
+        ) else {
+            return;
+        };
+        let members: Vec<u64> = inner
+            .stacks
+            .values()
+            .filter(|members| members.contains(&number))
+            .flatten()
+            .copied()
+            .collect();
+        for member in members {
+            if member != number && inner.proposal_bases.get(&member) == Some(&branch) {
+                inner.proposal_bases.insert(member, base.clone());
+            }
+        }
     }
 
     /// The commit `branch` currently points at, or `None` if it was never
@@ -1058,7 +1082,7 @@ impl Provider for MockProvider {
 
     async fn list_open_proposals(
         &self,
-        _origin: &OriginSpec,
+        origin: &OriginSpec,
     ) -> Result<Vec<OpenProposalRef>, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push("list_open_proposals".to_string());
@@ -1080,6 +1104,12 @@ impl Provider for MockProvider {
                 number: *number,
                 branch,
                 head_sha,
+                base: inner
+                    .proposal_bases
+                    .get(number)
+                    .cloned()
+                    .unwrap_or_default(),
+                head_repo: Some(origin.repo.clone()),
             });
         }
         // `proposal_states` is a HashMap, so sort before returning: tests

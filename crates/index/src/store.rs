@@ -97,6 +97,17 @@ pub struct ObservationRecord {
 /// there, and - only when the row names a domain nobody registered - the whole
 /// bracket text as a permalink and then a title in the row's OWN domain.
 ///
+/// The target domain of a bare reference is the row's own domain. The target
+/// domain of a prefixed one is the domain its prefix spells and nothing else:
+/// an explicit `[[domain:Target]]` resolves only within the named domain, as
+/// core's rule says. A prefix that spells no domain has no target domain, so
+/// the first two readings find nothing and the bare target is never looked up
+/// at home; only the whole bracket text is. `[[ops:Runbook]]` written where
+/// `ops` is not registered stays unresolved even when the home domain holds a
+/// Runbook. It heals on the next resolve pass over home after `ops` is
+/// registered; the engine runs one over every domain right after a
+/// registration, so the link does not wait for home's next sync.
+///
 /// "Target domain" and "registered" both mean a row of `domain_spelling`: a
 /// reference may name its domain by the local name, the canonical name its
 /// MANIFEST declares or a former name, and every one of those that resolves
@@ -111,10 +122,16 @@ pub struct ObservationRecord {
 /// and only the spelling table can settle it. It stays a second question rather than
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
-/// true, so it resolves exactly as it did before until its engram is reindexed.
+/// true, so it never takes this reading until its engram is reindexed.
 pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
+    // A bare reference reads its own domain; a prefixed one reads only the
+    // domain its prefix spells, and a prefix that spells nothing gives NULL,
+    // which no engram's `domain_id` equals. There is no fallback to the row's
+    // own domain here: that is what the third and fourth arms are for, and
+    // they read the whole bracket text, never the bare target.
     let target_domain = format!(
-        "COALESCE((SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain), {table}.domain_id)"
+        "CASE WHEN {table}.to_domain IS NULL THEN {table}.domain_id \
+         ELSE (SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain) END"
     );
     let unregistered = format!(
         "{table}.to_domain IS NOT NULL \
@@ -188,9 +205,10 @@ pub(crate) enum ReferenceCandidates<'a> {
 /// The resolve pass over one reference table: bind every row whose `to_id` is
 /// still NULL to the engram its bracket text names.
 ///
-/// One statement. Target domain is `to_domain` when set, else the row's own
-/// domain. Prefer a permalink match, then a title match, then the whole
-/// bracket text at home - see [`reference_match`].
+/// One statement. Target domain is the domain `to_domain` spells when set
+/// (none when it spells nothing), else the row's own domain. Prefer a
+/// permalink match, then a title match, then - only for a prefix that spells
+/// no domain - the whole bracket text at home; see [`reference_match`].
 ///
 /// Shared by both backends because the text is the same in both dialects down
 /// to the bind placeholder, which is the one argument: `?1` for turso, `$1` for
@@ -227,6 +245,73 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
 pub fn reset_spelled_references_sql(table: &str, list: &str) -> String {
     format!(
         "UPDATE {table} SET to_id = NULL WHERE to_domain IS NOT NULL AND to_domain IN ({list}) AND to_id IS NOT NULL"
+    )
+}
+
+/// The pass behind [`Store::resolve_references_to_spellings`], one statement
+/// per reference table: bind the pending rows, in every domain, whose domain
+/// prefix is one of the spellings in `list` (the caller's placeholders).
+///
+/// A seek through the table's partial `to_domain` index, so it reads only the
+/// rows that carry one of the prefixes rather than every pending row of every
+/// domain. The binding is [`reference_match`] with the base candidates, the
+/// rule every resolve pass uses. The `to_domain IS NOT NULL` term repeats the
+/// partial index's own condition, as in [`reset_spelled_references_sql`].
+#[doc(hidden)]
+pub fn resolve_spelled_references_sql(table: &str, list: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} \
+         WHERE {table}.to_domain IS NOT NULL AND {table}.to_domain IN ({list}) \
+         AND {table}.to_id IS NULL AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
+/// The rows [`Store::resolve_references_to`] binds, as a `WHERE` clause over one
+/// reference table: pending rows in every domain but `domain` (the caller's
+/// placeholder), spelled with one of `spellings` and naming one of `targets`
+/// (placeholder lists; each target placeholder comes wrapped in `lower()`),
+/// that the base candidates now answer. The `to_domain IS NOT NULL` term
+/// repeats the partial index's own condition, as in
+/// [`reset_spelled_references_sql`].
+fn references_to_where(table: &str, domain: &str, spellings: &str, targets: &str) -> String {
+    format!(
+        "{table}.to_domain IS NOT NULL AND {table}.to_domain IN ({spellings}) \
+         AND {table}.to_id IS NULL AND {table}.domain_id <> {domain} \
+         AND lower({table}.to_target) IN ({targets}) \
+         AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
+/// The count half of [`Store::resolve_references_to`]: how many rows per
+/// domain the bind below will take. No `RETURNING`, so both dialects share
+/// one shape.
+#[doc(hidden)]
+pub fn count_references_to_sql(
+    table: &str,
+    domain: &str,
+    spellings: &str,
+    targets: &str,
+) -> String {
+    format!(
+        "SELECT {table}.domain_id, count(*) FROM {table} WHERE {} GROUP BY {table}.domain_id",
+        references_to_where(table, domain, spellings, targets)
+    )
+}
+
+/// The bind half of [`Store::resolve_references_to`].
+#[doc(hidden)]
+pub fn resolve_references_to_sql(
+    table: &str,
+    domain: &str,
+    spellings: &str,
+    targets: &str,
+) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} WHERE {}",
+        references_to_where(table, domain, spellings, targets),
+        resolved = reference_match(table, ReferenceCandidates::Base)
     )
 }
 
@@ -1975,6 +2060,37 @@ pub trait Store: Send + Sync {
     /// to wrap, as [`crate::resolve_forward_refs`] does.
     async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
 
+    /// Bind every pending relation and link row, in every domain and every
+    /// actor's included, whose `to_domain` is one of `spellings`. Answers the
+    /// number of rows bound. The pass a newly registered domain needs: a
+    /// reference elsewhere that already named it waited pending, and only the
+    /// rows spelled with its names can bind to it, so nothing else is read.
+    ///
+    /// Base candidates, as every resolve pass has: right for a domain that was
+    /// just registered, which holds no drafts and no tombstones yet.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Bind the pending relation and link rows in every domain but `domain`
+    /// (every actor's rows) whose `to_domain` is one of `spellings` and whose
+    /// target, lowercased, is one of `targets` lowercased, by the base rule
+    /// every resolve pass uses. Answers the number bound per domain, sorted by
+    /// id, domains with none left out. The pass a base write in `domain` needs
+    /// when it adds an engram or changes its permalink or title: `targets`
+    /// are that permalink and that title, `spellings` every name `domain`
+    /// answers to.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>>;
+
     /// Rename a domain row in place: `domain.name` becomes `new` and the id
     /// stays, so every engram and every bound reference stays attached. The
     /// row's own spelling follows it in the same transaction (taking `new`
@@ -2793,6 +2909,52 @@ pub trait Store: Send + Sync {
     async fn commit(&self) -> Result<()>;
     /// Roll back the current write transaction.
     async fn rollback(&self) -> Result<()>;
+}
+
+/// What a domain-scoped identifier names: an engram, or nothing plus the
+/// permalink it probably meant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DomainLookup {
+    /// The engram the identifier names.
+    Found(EngramDescriptor),
+    /// Nothing; `suggest` is the permalink the identifier's slug is, when an
+    /// engram in the domain answers to it, for the caller's not-found message.
+    Missing {
+        /// The permalink to name in a hint. `None` when nothing matched.
+        suggest: Option<String>,
+    },
+}
+
+/// The one domain-scoped lookup every identifier-taking surface shares: the
+/// permalink, then the title, both through [`Store::find_engram`] and nothing
+/// else. A file path is no identifier. A miss carries the permalink the
+/// identifier's slug ([`crystalline_core::path_permalink`]) is, when the slug
+/// differs from the identifier and an engram answers to it as its permalink,
+/// so a caller who copied a file path (`guides/Agent Workflow Guide.md`) is
+/// told the permalink to pass (`guides/agent-workflow-guide`). The hint is one
+/// more indexed lookup, never a listing, and a title hit on the slug is no
+/// hint: a title is not what the identifier spelled. A free function rather
+/// than a trait method, so neither backend changes. Callers skip it for a
+/// domain the reader may not see, which keeps a hidden domain's miss free of
+/// hints.
+pub async fn lookup_in_domain(
+    store: &dyn Store,
+    dom: &str,
+    identifier: &str,
+) -> Result<DomainLookup> {
+    if let Some(d) = store.find_engram(dom, identifier).await? {
+        return Ok(DomainLookup::Found(d));
+    }
+    let slug = crystalline_core::path_permalink(identifier);
+    let mut suggest = None;
+    if !slug.is_empty()
+        && slug != identifier
+        && let Some(d) = store.find_engram(dom, &slug).await?
+        && d.permalink == slug
+    {
+        suggest = Some(d.permalink);
+    }
+    Ok(DomainLookup::Missing { suggest })
 }
 
 #[cfg(test)]

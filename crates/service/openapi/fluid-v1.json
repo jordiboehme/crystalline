@@ -4841,7 +4841,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\n`kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4859,6 +4859,18 @@
                   },
                   "declined_proposals": [],
                   "domain": "eng",
+                  "kept_branches": [
+                    {
+                      "blocked_by": 12,
+                      "branch": "crystalline/share-7",
+                      "kind": "base",
+                      "message": "Branch crystalline/share-7 is kept: pull request #12 is based on it and could not be moved to main. The next sync tries again.",
+                      "number": 7,
+                      "onto": "main",
+                      "reason": "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.",
+                      "why": "merged"
+                    }
+                  ],
                   "last_checked": "2026-08-10T08:00:00Z",
                   "local_changes": 2,
                   "merged_unconsumed": [],
@@ -5340,7 +5352,7 @@
           "domains"
         ],
         "summary": "Withdraw one of a team domain's open proposals.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, retires its branch and records it as withdrawn. The branch is deleted unless an open pull request is based on it or comes from it; then it is kept and the sync status names it under `kept_branches`. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.",
         "operationId": "withdraw_domain_proposal",
         "parameters": [
           {
@@ -6020,6 +6032,73 @@
           },
           "404": {
             "description": "The caller minted no link with that id, and is not an admin of this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Live changes to the knowledge, as a server-sent event stream.",
+        "description": "A `text/event-stream` the web UI keeps open once per tab. Frames: `id: <epoch>:<seq>` + `event: engram` + `data: <EngramChanged>`; `id` + `event: domain` + `data: <DomainChanged>`; `event: reset` + `data: {}` with no id (invalidate everything and keep the connection); and a `: ping` comment every fifteen seconds. `Last-Event-ID` replays the ring after that id, or answers one `reset` when the epoch is not this process's or the id is older than the ring's oldest entry. Every frame is filtered by what the session may read; a `draft_of` frame reaches the draft's owner alone. Served read-only. OpenAPI cannot type a stream, so the body below is described as text and the schemas `EngramChanged`, `DomainChanged` and `ChangeKind` carry the shapes.",
+        "operationId": "stream_events",
+        "parameters": [
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "The `id` of the last frame this client saw, as the browser's `EventSource` sends it on reconnect.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "1758542400:17"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stream. Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many streams are open, for this account (32) or on this instance (4096). `Retry-After` says when to try again.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9117,6 +9196,16 @@
           }
         }
       },
+      "ChangeKind": {
+        "type": "string",
+        "description": "What happened to the engram: the four things the sync engine counts.",
+        "enum": [
+          "added",
+          "modified",
+          "deleted",
+          "moved"
+        ]
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -9370,6 +9459,24 @@
           }
         }
       },
+      "DomainChanged": {
+        "type": "object",
+        "description": "A whole domain moved: refetch everything of it.",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "type": "string"
+          }
+        }
+      },
       "DomainMember": {
         "type": "object",
         "description": "One membership row: who was invited to a private domain, at what level, by\nwhom and when.",
@@ -9395,6 +9502,64 @@
           "principal": {
             "type": "string",
             "description": "The member's login name, folded by [`normalize_account_name`]."
+          }
+        }
+      },
+      "EngramChanged": {
+        "type": "object",
+        "description": "One engram changed, as every subscriber hears it.",
+        "required": [
+          "domain",
+          "permalink",
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who made the change, as a display label. Null for a change the watcher\nfound on disk and for a write nobody signed."
+          },
+          "checksum": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lowercase hex SHA-256 of the new content, the value every write\nreceipt reports as `checksum`. Absent for `deleted`."
+          },
+          "domain": {
+            "type": "string"
+          },
+          "draft_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the change landed in this actor's draft overlay. Delivered to\nthat actor's own sessions and to nobody else."
+          },
+          "from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MovedFrom",
+                "description": "`moved` only."
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChangeKind"
+          },
+          "path": {
+            "type": "string",
+            "description": "Domain-relative, forward slashes, `.md`; after the change."
+          },
+          "permalink": {
+            "type": "string",
+            "description": "After the change; for `deleted`, what the row had before it went."
           }
         }
       },
@@ -10063,6 +10228,23 @@
             "type": "string",
             "description": "The engram to move, by permalink.",
             "example": "notes/beta"
+          }
+        }
+      },
+      "MovedFrom": {
+        "type": "object",
+        "description": "Where a moved engram came from.",
+        "required": [
+          "path",
+          "permalink"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Domain-relative, forward slashes, `.md`."
+          },
+          "permalink": {
+            "type": "string"
           }
         }
       },
@@ -11256,6 +11438,10 @@
     {
       "name": "maintenance",
       "description": "The consolidation queue: what the knowledge needs next. Read-only."
+    },
+    {
+      "name": "events",
+      "description": "Live changes to the knowledge, as one server-sent event stream per tab."
     },
     {
       "name": "users",

@@ -2598,6 +2598,151 @@ async fn screened_fixture() -> Fixture {
     f
 }
 
+/// A draft at a path no base row holds does not answer to that path without
+/// `.md`, the same way a base row does not: a domain-scoped identifier is a
+/// permalink or a title (#111).
+#[tokio::test]
+async fn a_draft_does_not_resolve_by_its_path_without_md() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    f.draft("team", "alice", "notes/Fresh Idea.md", ALICE_NEW)
+        .await;
+    let miss = f
+        .reads("notes/Fresh Idea", &alice)
+        .await
+        .expect_err("a path without .md is no identifier");
+    assert!(
+        miss.starts_with("no engram 'notes/Fresh Idea' in domain 'team'"),
+        "{miss}"
+    );
+    // Her draft still answers to its permalink.
+    let text = f
+        .reads("fresh", &alice)
+        .await
+        .expect("alice reads her draft by its permalink");
+    assert!(text.contains("a page only alice has"), "{text}");
+}
+
+/// A `crystalline://` URL addresses a permalink and nothing else, on a draft
+/// as on a base row: a draft renamed in place does not answer its old address
+/// through its file's path, which is what keeps a co-editing room over a
+/// draft from finding it again under its old key. A bare identifier does not
+/// reach it through the path either (#111).
+#[tokio::test]
+async fn a_url_never_reaches_a_draft_through_its_path() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let renamed = |permalink: &str| {
+        ALICE_NEW
+            .replace("permalink: fresh", &format!("permalink: {permalink}"))
+            .replace("title: Fresh", "title: Renamed Page")
+            .replace("# Fresh", "# Renamed Page")
+    };
+    f.draft("team", "alice", "fresh.md", &renamed("renamed"))
+        .await;
+    f.draft(
+        "team",
+        "alice",
+        "notes/Fresh Idea.md",
+        &renamed("renamed-idea"),
+    )
+    .await;
+    for identifier in [
+        "crystalline://team/fresh",
+        "crystalline://team/notes/Fresh Idea",
+    ] {
+        let miss = f
+            .reads(identifier, &alice)
+            .await
+            .expect_err("a URL names a permalink, never a path");
+        assert!(miss.contains("no engram"), "{identifier}: {miss}");
+    }
+    // A bare identifier is a permalink or a title, on a draft as on a base
+    // row: the old permalink of a draft renamed in place misses, and so does
+    // the bare path without `.md`.
+    for identifier in ["fresh", "notes/Fresh Idea"] {
+        let miss = f
+            .reads(identifier, &alice)
+            .await
+            .expect_err("no draft holds this permalink or title");
+        assert!(
+            miss.contains(&format!("no engram '{identifier}' in domain 'team'")),
+            "{identifier}: {miss}"
+        );
+    }
+    // The drafts answer to their permalinks.
+    let text = f
+        .reads("renamed-idea", &alice)
+        .await
+        .expect("the permalink reaches the draft");
+    assert!(text.contains("a page only alice has"), "{text}");
+}
+
+/// A miss at a URL names the permalink, the way the resolver's own URL miss
+/// does, also where the reader's tombstone is what answers (#111). read_engram
+/// and edit_engram share the rule: both print the bare permalink, never the
+/// crystalline:// URL the caller passed.
+#[tokio::test]
+async fn a_tombstoned_url_miss_names_the_bare_permalink() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let agent = Some("claude-code/2.0-for-alice");
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            agent,
+            &alice,
+        )
+        .await
+        .unwrap();
+    let err = f
+        .engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "crystalline://team/plan".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] after the deletion #team".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            },
+            agent,
+            &alice,
+        )
+        .await
+        .expect_err("her deletion holds at the URL");
+    assert_eq!(err.to_string(), "no engram 'plan' in domain 'team'");
+
+    // read_engram resolves through a different path than edit_engram
+    // (`Engine::resolve_shadowed` rather than `DomainView::resolve`), but the
+    // wording is the reader's, not the resolver's, so it must match exactly.
+    let read_err = f
+        .engine
+        .read_engram(
+            &ReadParams {
+                identifier: "crystalline://team/plan".to_string(),
+                domain: None,
+                share_link: None,
+            },
+            &alice,
+        )
+        .await
+        .expect_err("her deletion holds at the URL for read_engram too");
+    assert_eq!(read_err.to_string(), "no engram 'plan' in domain 'team'");
+}
+
 /// A draft is not a way around the domain screen. Alice's draft in a private
 /// domain reads for her and is the same nothing a stranger gets about every
 /// other engram in there - and, crucially, about the domain itself.
@@ -2647,6 +2792,18 @@ async fn a_draft_in_a_hidden_domain_is_invisible_to_a_reader_who_cannot_see_the_
             "and it is the miss an engram nobody wrote produces: {miss}"
         );
     }
+    // `PLAN.md` slugifies to the base permalink `plan`: a reader who may see
+    // the domain is told so, one who may not gets the plain miss, byte for byte.
+    let hinted = f
+        .reads("PLAN.md", &alice)
+        .await
+        .expect_err("PLAN.md is no path here");
+    assert!(hinted.contains("Did you mean `plan`?"), "{hinted}");
+    let plain = f
+        .reads("PLAN.md", &stranger)
+        .await
+        .expect_err("a stranger reads nothing");
+    assert_eq!(plain, "no engram 'PLAN.md' in domain 'team'");
 
     // The same question through the two graph verbs, anchored at the
     // stranger's OWN draft, because that is the anchor the screen has to
@@ -3696,12 +3853,10 @@ async fn a_draft_never_takes_a_permalink_another_path_holds() {
         )
         .await
         .expect_err("a create may not land on an address the team's folder already spends");
-    assert!(
-        taken
-            .to_string()
-            .contains("permalink 'nightly-ledger' already exists at another path")
-            && taken.to_string().contains("docs/ledger.md"),
-        "naming where it is held, not just that it is: {taken}"
+    assert_eq!(
+        taken.to_string(),
+        "permalink 'nightly-ledger' in domain 'team' belongs to 'docs/ledger.md' in folder 'docs', not in the domain root. An overwrite replaces an engram where it lives: move it with move_engram first, or change it in place with edit_engram",
+        "naming where it is held, not just that it is"
     );
 
     // -- and the addresses stayed unique, which is what the refusals are for:
@@ -6650,8 +6805,10 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         // one - a link outlives the draft it was for, and a join into a draft
         // that is gone is a join to nothing.
         ("engine.rs", "open_share_link"),
-        // The read a grant widens, at the one path the grant names.
-        ("engine.rs", "granted_read"),
+        // The read a grant widens, at the one draft the grant names, and the
+        // join refusal an unjoined edit or save of that same name gets. The
+        // owner is the grant row's.
+        ("engine.rs", "granted_answer"),
         // Which granted draft a name opens, for the two surfaces that have a
         // name rather than a path: the teaching refusal for a write that named
         // a draft the caller's own view cannot resolve, and the collab upgrade
@@ -6660,8 +6817,9 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         // may SAY whose draft they mean, and this is what checks it.
         ("engine.rs", "granted_draft_named"),
         // The freshness check in front of that refusal: a link whose draft has
-        // gone refuses nothing.
-        ("engine.rs", "screen_granted_path"),
+        // gone refuses nothing. `screen_granted_path` reaches it through this
+        // one, which a capture calls directly to name the path it built.
+        ("engine.rs", "screen_granted_path_named"),
         // Which of the owner's files a join carries: the references are read
         // off the granted draft itself.
         ("engine.rs", "screen_joined_attachment"),
@@ -7572,4 +7730,261 @@ async fn a_full_rename_of_a_reviewing_domain_writes_the_manifest_as_a_draft() {
         crystalline_core::config::load_yaml(&f.root.join("config.yaml")).unwrap();
     assert!(cfg.domains.contains_key("platform"), "{:?}", cfg.domains);
     assert!(!cfg.domains.contains_key("team"));
+}
+
+/// A draft's reference that an index upgrade unbound is bound again by the
+/// engine's startup pass, in the drafting actor's own view: `[[typo:Plan]]`
+/// names no domain, so it reads the whole bracket text at home, and only
+/// alice's own draft carries that title. A pass against the base alone would
+/// leave it pending. The upgrade is stood in for by the reset that unbinds
+/// every reference spelled `typo`.
+#[tokio::test]
+async fn the_startup_pass_binds_a_drafts_reference_in_its_actors_view() {
+    let f = review_fixture().await;
+    const COLON: &str = "---\ntype: engram\ntitle: typo:Plan\npermalink: typo-plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# typo:Plan\n\n- [idea] a colon title only alice has #team\n";
+    const SRC: &str = "---\ntype: engram\ntitle: Src\npermalink: src\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Src\n\n- relates_to [[typo:Plan]]\n";
+    let (colon, src) = {
+        let store = f.store.lock().await;
+        let id = f.domain_id(&*store, "team").await;
+        let colon = store
+            .upsert_overlay(id, "alice", &record(COLON, "typo-plan.md"))
+            .await
+            .unwrap();
+        let src = store
+            .upsert_overlay(id, "alice", &record(SRC, "src.md"))
+            .await
+            .unwrap();
+        store.reresolve_actor_references(id, "alice").await.unwrap();
+        (colon, src)
+    };
+    async fn bound(store: &dyn Store, src: crystalline_index::EngramId) -> bool {
+        let refs = store.outbound_refs(src, None).await.unwrap();
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        refs[0].resolved
+    }
+    assert!(
+        bound(&*f.store.lock().await, src).await,
+        "bound to alice's draft"
+    );
+
+    let unbound = f
+        .store
+        .lock()
+        .await
+        .reset_references_to_spellings(&["typo".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(unbound, 1);
+    assert!(!bound(&*f.store.lock().await, src).await);
+
+    f.engine.settle_after_initial_sync().await;
+    let store = f.store.lock().await;
+    assert!(bound(&*store, src).await, "bound again without a write");
+    let slice = store.neighbors(&[src], 1, Some("alice")).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == colon),
+        "to alice's own draft: {slice:?}"
+    );
+}
+
+/// A team domain's discard is a feed point run on somebody's behalf: the
+/// restored engram is announced once, under the discarding account's name,
+/// and never under nobody's. Catches the discard's targeted sync announcing
+/// with the watcher's empty label.
+#[tokio::test]
+async fn a_team_discard_announces_the_restored_engram_under_the_discarding_account() {
+    let f = origin_fixture().await;
+    let root = f.domain_root("team");
+    f.snapshot_origin("team");
+    for rel in ["MANIFEST.md", "plan.md"] {
+        crystalline_remote::state::write_base_file(
+            &f.origins.join("team"),
+            rel,
+            &std::fs::read(root.join(rel)).unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut rx = f.engine.changes().subscribe();
+    let report = f
+        .engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: Some(crate::support::sha256_hex(ALICE_DRAFT.as_bytes())),
+            }],
+            &ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["plan.md"]),
+        "{report}"
+    );
+    let heard = rx.try_recv().expect("the restore announced");
+    match &heard.change {
+        crystalline_service::changes::Change::Engram(change) => {
+            assert_eq!(
+                (change.domain.as_str(), change.path.as_str()),
+                ("team", "plan.md")
+            );
+            assert_eq!(
+                change.kind,
+                crystalline_service::changes::ChangeKind::Modified
+            );
+            assert_eq!(change.actor.as_deref(), Some("ada"));
+            assert_eq!(
+                change.checksum.as_deref(),
+                Some(crate::support::sha256_hex(PLAN.as_bytes()).as_str())
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "once");
+}
+
+/// Issue 113, Jordi's ruling: a share preview on a review-mode domain moves
+/// no pull request and deletes no branch, even when its pull consumes a
+/// merge. The share or the next sync does that.
+#[tokio::test]
+async fn a_review_mode_share_preview_does_no_branch_cleanup() {
+    use crystalline_remote::provider::{OriginSpec, ProposalRequest, ProposalState, Provider};
+    let f = reviewed_origin_fixture().await;
+    let forge = f.forge.clone().expect("the origin fixture carries a forge");
+    // The origin `build_fixture` registers (`overlay_domains.rs:200-202`).
+    let spec = OriginSpec {
+        repo: "acme/team".to_string(),
+        subpath: None,
+        branch: "main".to_string(),
+    };
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let share = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(share["outcome"], "proposed", "{share}");
+    let number = share["number"].as_u64().unwrap();
+    let branch = share["branch"].as_str().unwrap().to_string();
+    // Somebody bases a pull request of their own on the share branch.
+    let head = forge.branch_commit(&branch).unwrap();
+    Provider::create_branch(&*forge, &spec, "big-change", &head)
+        .await
+        .unwrap();
+    let hand = Provider::create_proposal(
+        &*forge,
+        &spec,
+        &ProposalRequest {
+            title: "by hand".to_string(),
+            body: String::new(),
+            branch: "big-change".to_string(),
+            base_branch: branch.clone(),
+        },
+    )
+    .await
+    .unwrap()
+    .number;
+    // The share merges.
+    forge.set_branch("main", &head);
+    forge.set_proposal_state(number, ProposalState::Merged);
+
+    let before = forge.calls().len();
+    f.engine
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            crystalline_service::engine::PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    let delta = forge.calls().split_off(before);
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("delete_branch") || c.starts_with("update_proposal")),
+        "{delta:?}"
+    );
+    assert_eq!(forge.proposal_base(hand).as_deref(), Some(branch.as_str()));
+
+    f.engine
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(forge.proposal_base(hand).as_deref(), Some("main"));
+    assert!(forge.calls().contains(&format!("delete_branch:{branch}")));
+}
+
+/// Item 3: a review-mode share runs the branch cleanup once, in the pull
+/// `ops::propose` makes, and never a second time in the staging pull before
+/// it. The queued branch stays kept by a backport opened from it, so every
+/// pass that runs lists the open pull requests: one listing is one pass.
+#[tokio::test]
+async fn a_review_mode_share_lists_the_open_pull_requests_once() {
+    use crystalline_remote::provider::{OriginSpec, ProposalRequest, ProposalState, Provider};
+    const LATER: &str = "---\ntype: engram\ntitle: Later\npermalink: later\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Later\n\n- [decision] a second change #team\n";
+    let f = reviewed_origin_fixture().await;
+    let forge = f.forge.clone().expect("the origin fixture carries a forge");
+    let spec = OriginSpec {
+        repo: "acme/team".to_string(),
+        subpath: None,
+        branch: "main".to_string(),
+    };
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let share = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(share["outcome"], "proposed", "{share}");
+    let number = share["number"].as_u64().unwrap();
+    let branch = share["branch"].as_str().unwrap().to_string();
+    // A backport opened from the share branch keeps it once the share merges.
+    Provider::create_proposal(
+        &*forge,
+        &spec,
+        &ProposalRequest {
+            title: "backport".to_string(),
+            body: String::new(),
+            branch: branch.clone(),
+            base_branch: "release-1.2".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let head = forge.branch_commit(&branch).unwrap();
+    forge.set_branch("main", &head);
+    forge.set_proposal_state(number, ProposalState::Merged);
+    // A sync consumes the merge and queues the branch, kept by the backport.
+    f.engine
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    f.draft("team", "owner", "later.md", LATER).await;
+
+    let before = forge.calls().len();
+    let second = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    let delta = forge.calls().split_off(before);
+    assert_eq!(
+        delta
+            .iter()
+            .filter(|call| *call == "list_open_proposals")
+            .count(),
+        1,
+        "{delta:?}"
+    );
+    assert!(
+        !delta.contains(&format!("delete_branch:{branch}")),
+        "the backport keeps it: {delta:?}"
+    );
 }

@@ -54,6 +54,7 @@ const REPORT: RenameReport = {
   localOnly: false,
   manifestWritten: true,
   manifestDraft: false,
+  note: null,
   rewritten: [{ domain: "ops", engrams: 2, references: 3 }],
   leftBehind: [],
   aliases: ["eng"],

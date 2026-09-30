@@ -80,7 +80,23 @@ function syncResponse(overrides: Record<string, unknown> = {}) {
     stack_wedged: [],
     repair_pending: false,
     stack_link_pending: false,
+    kept_branches: [],
     ...overrides,
+  };
+}
+
+/** A merged share branch the forge would not let go of, as the route sends it. */
+function keptBranch() {
+  return {
+    branch: "crystalline/share-1",
+    number: 3,
+    onto: "main",
+    why: "merged",
+    kind: "base",
+    blocked_by: 7,
+    reason: "GitHub returned an unexpected answer (status 422): nope",
+    message:
+      "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
   };
 }
 
@@ -499,6 +515,81 @@ describe("the proposals card", () => {
         "Repair pending - the next share or withdraw finishes it.",
       ),
     ).toBeVisible();
+  });
+
+  it("names a kept share branch and why it stays", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ kept_branches: [keptBranch()] }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    expect(
+      within(card).getByText(
+        "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(card).getByText(
+        "GitHub returned an unexpected answer (status 422): nope",
+      ),
+    ).toBeVisible();
+  });
+
+  it("still names a kept branch on a domain that now shares directly", async () => {
+    // A branch kept before the switch to direct sharing is still on the
+    // forge, so the notice sits outside the gate that hides the chain.
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ sharing: "direct", kept_branches: [keptBranch()] }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    expect(
+      within(card).getByText(
+        "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("shows no reason line under a refused delete, whose sentence holds it", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          kept_branches: [
+            {
+              branch: "crystalline/share-1",
+              number: 3,
+              onto: "main",
+              why: "merged",
+              kind: "delete_refused",
+              blocked_by: null,
+              reason:
+                "GitHub returned an unexpected answer (status 422): Reference update failed",
+              message:
+                "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    expect(
+      within(card).getByText(
+        "Branch crystalline/share-1 could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(card).queryByText(
+        "GitHub returned an unexpected answer (status 422): Reference update failed",
+      ),
+    ).toBeNull();
   });
 
   it("warns before withdrawing a layer that is carrying others", async () => {

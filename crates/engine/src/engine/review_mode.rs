@@ -674,12 +674,16 @@ impl Engine {
         // Rows and mirror together, for every actor, and over the overlay as it
         // stands NOW rather than as the plan found it: see step 4 of the
         // ordering.
+        let mut pending = PendingAnnouncements::new(self);
         for held in self.overlay_actor_drafts(domain, domain_id).await? {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), &held.actor)?;
+            view.collect_drops();
             for draft in &held.entries {
                 view.drop(domain_id, &draft.path).await?;
+                pending.push_drops_from(domain, &view);
             }
         }
+        drop(pending);
         // The files go with the rows, folded and discarded alike: whichever
         // answer each actor gave, drafting in this domain is over, and a files
         // overlay left behind would be bytes belonging to nobody in a domain

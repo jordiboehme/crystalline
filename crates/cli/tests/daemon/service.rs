@@ -325,6 +325,35 @@ impl Mcp {
         }
     }
 
+    /// Spawn an `mcp` client whose working directory is `dir`, with an
+    /// optional `--db` ahead of the subcommand, passed exactly as written: a
+    /// relative one stays relative, which is the point of the tests that use
+    /// this.
+    fn spawn_in(env: &Env, dir: &Path, db: Option<&str>) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.current_dir(dir);
+        if let Some(db) = db {
+            cmd.arg("--db").arg(db);
+        }
+        cmd.arg("mcp");
+        cmd.arg("--config").arg(env.config_path());
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
     /// Spawn an `mcp` client, and with it the daemon it starts, carrying one
     /// extra environment variable.
     ///
@@ -2431,7 +2460,7 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
     .unwrap();
     std::fs::write(
         docs.join("bad.md"),
-        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+        "---\ntype: engram\ntitle: \"Bad\npermalink: bad\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
     )
     .unwrap();
     let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
@@ -2483,13 +2512,13 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
             .map(|f| f["path"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>(),
         vec!["bad.md".to_string()],
-        "the duplicate-key file is the other class, not merely unsynced: {docs_report}"
+        "the broken file is the other class, not merely unsynced: {docs_report}"
     );
     assert!(
         docs_report["unsyncable"][0]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("duplicate entry with key"),
+            .contains("frontmatter YAML is invalid"),
         "the reason travels with it: {docs_report}"
     );
 
@@ -4844,6 +4873,160 @@ fn an_autostarted_daemon_reports_itself_as_autostarted() {
 
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A daemon told on its command line that its spawner's breakaway was
+/// refused says so twice: in its report, and as a warning in its log. On
+/// Windows the spawner adds the flag; here it is given by hand, which checks
+/// the plumbing on every platform.
+#[test]
+fn a_daemon_told_its_breakaway_was_refused_says_so() {
+    let env = Env::new("refused");
+    env.setup_domain("eng");
+
+    let stderr_path = env.dir.join("serve.stderr");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut daemon = cmd
+        .args(["serve", "--daemon", "--breakaway-refused"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+
+    let status = status_json(&env);
+    assert_eq!(
+        status["runs_in"]["breakaway_refused"],
+        json!(true),
+        "{status}"
+    );
+    let record = env.lock_record().unwrap();
+    assert_eq!(
+        record["runs_in"]["breakaway_refused"],
+        json!(true),
+        "service.json carries it too: {record}"
+    );
+    let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        log.contains("could not leave the job of the program that started it"),
+        "the warning reaches the daemon's log: {log}"
+    );
+
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    let _ = daemon.wait();
+}
+
+/// Issue #115: a daemon a client starts works in the state directory, never
+/// in the directory the client was started in. Windows locks a running
+/// process's working directory, so a daemon that kept its client's one
+/// blocked any rename of that folder (an app update) for as long as it ran.
+/// Unix never locks it, so here the proof is the directory the daemon
+/// reports; the rename is checked all the same, and is the real test on
+/// Windows (service_windows.rs).
+///
+/// `work` is a sibling of the state directory, never an ancestor: the daemon
+/// does hold its state directory, on purpose.
+#[test]
+fn an_autostarted_daemon_works_in_the_state_directory() {
+    let env = Env::new("cwd");
+    env.setup_domain("eng");
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // No daemon answers yet, so the one inspected below is the client's
+    // autostart.
+    let (running, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(!running, "no daemon before the client starts one: {out}");
+
+    let client = Mcp::spawn_in(&env, &work, None);
+    env.wait_ready();
+
+    let status = status_json(&env);
+    let runs_in = &status["runs_in"];
+    let working_dir = runs_in["working_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no working_dir: {status}"));
+    assert_eq!(
+        dunce::canonicalize(working_dir).unwrap(),
+        dunce::canonicalize(env.state_dir()).unwrap(),
+        "the daemon works in the state directory, not the client's: {status}"
+    );
+    for key in ["in_job", "job_allows_breakaway", "package"] {
+        assert!(
+            runs_in.get(key).is_some_and(Value::is_null),
+            "{key} is present and null off Windows: {status}"
+        );
+    }
+    assert_eq!(runs_in["breakaway_refused"], json!(false), "{status}");
+    let record = env.lock_record().unwrap();
+    assert_eq!(
+        record["runs_in"], *runs_in,
+        "service.json carries the same facts: {record}"
+    );
+
+    let (ok, human) = env.run(&["status"]);
+    assert!(ok, "{human}");
+    let line = human
+        .lines()
+        .find(|l| l.starts_with("Runs in: "))
+        .unwrap_or_else(|| panic!("status names where the daemon runs: {human}"));
+    assert_eq!(
+        line,
+        format!("Runs in: {working_dir}"),
+        "the same directory as the JSON report: {human}"
+    );
+
+    let (_, doctor) = env.run(&["doctor"]);
+    assert!(
+        doctor.contains("daemon working directory: "),
+        "doctor names it in full: {doctor}"
+    );
+    assert!(
+        !doctor.contains("daemon job:"),
+        "and has no Windows lines off Windows: {doctor}"
+    );
+
+    // The client pins its own working directory: end it first.
+    drop(client);
+    std::fs::rename(&work, env.dir.join("work-moved"))
+        .expect("nothing holds the client's directory any more");
+
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    wait_lock_released(&env);
+}
+
+/// The other half of the move: a relative `--db` given to the client still
+/// names the file in the client's directory, not one in the daemon's. Green
+/// before the working directory moved too (the daemon then shared the
+/// client's directory); it guards the pair.
+#[test]
+fn a_relative_db_still_reaches_the_file_the_client_meant() {
+    let env = Env::new("reldb");
+    env.setup_domain("eng");
+    let work = env.dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let client = Mcp::spawn_in(&env, &work, Some("rel.db"));
+    env.wait_ready();
+
+    let status = status_json(&env);
+    assert!(
+        work.join("rel.db").is_file(),
+        "the index opened where the client was: {status}"
+    );
+    assert!(
+        !env.state_dir().join("rel.db").exists(),
+        "and not in the daemon's own working directory: {status}"
+    );
+
+    drop(client);
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    wait_lock_released(&env);
 }
 
 /// The daemon route for the rows of a domain nobody registers any more: they

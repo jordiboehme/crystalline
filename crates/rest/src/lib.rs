@@ -7,7 +7,7 @@
 // every `crate::engine::`, `crate::scope::` (and so on) path in this crate
 // resolves exactly as it did in crystalline-service.
 pub(crate) use crystalline_engine::{
-    domain_view, engine, maintenance, origin, params, review, settings, similar, web_url,
+    changes, domain_view, engine, maintenance, origin, params, review, settings, similar, web_url,
 };
 // Named only by the unit tests.
 #[cfg(test)]
@@ -36,6 +36,7 @@ mod domains_admin;
 mod draft_links;
 mod engrams;
 mod error;
+mod events;
 mod evolve;
 mod files;
 mod github_identity;
@@ -127,6 +128,7 @@ use crate::scope::{DomainAccess, DomainRight};
         (name = "graph", description = "The neighborhood graph around an anchor."),
         (name = "attachments", description = "The files an engram carries: bytes in, bytes out, and what a domain holds."),
         (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
+        (name = "events", description = "Live changes to the knowledge, as one server-sent event stream per tab."),
         (name = "users", description = "Account management. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
         (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
@@ -192,6 +194,7 @@ use crate::scope::{DomainAccess, DomainRight};
         evolve::queue,
         evolve::acknowledge,
         evolve::unacknowledge,
+        events::stream_events,
         users_api::list,
         users_api::create,
         users_api::update,
@@ -306,6 +309,10 @@ use crate::scope::{DomainAccess, DomainRight};
         schemas::OauthGrantInfo,
         oauth::TokenForm,
         oauth::TokenResponse,
+        schemas::EngramChanged,
+        schemas::DomainChanged,
+        schemas::ChangeKind,
+        schemas::MovedFrom,
     )),
 )]
 struct ApiDoc;
@@ -368,6 +375,17 @@ pub struct RestState {
     /// startup from `auth.login.*` like the rest of the auth settings. See
     /// [`login_throttle`].
     login_throttle: Arc<LoginThrottle>,
+    /// The daemon's shutdown signal, which every open event stream ends on:
+    /// a stream that outlived the drain would hold `axum::serve`'s graceful
+    /// shutdown until its browser hung up. `None` on a router built by a
+    /// test or a caller with no daemon behind it, where a stream simply
+    /// ends when its connection does. Private like `setup_token`; the
+    /// `events` module is a child of this one and reads it.
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The open event streams, counted against their caps. One count for the
+    /// whole process: every clone of this state shares it. See
+    /// [`events::STREAMS_PER_ACCOUNT`].
+    streams: Arc<events::StreamSlots>,
 }
 
 impl RestState {
@@ -415,6 +433,8 @@ impl RestState {
             setup_token: None,
             login_slots: auth::login_slots(),
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
+            shutdown: None,
+            streams: Arc::new(events::StreamSlots::default()),
         })
     }
 
@@ -436,6 +456,13 @@ impl RestState {
     /// ever set.
     pub fn with_setup_token(mut self, token: Option<String>) -> RestState {
         self.setup_token = token.filter(|token| !token.trim().is_empty());
+        self
+    }
+
+    /// Hand this state the daemon's shutdown watch. A builder for the reason
+    /// `with_setup_token` is one: every test state stays as it is.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> RestState {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -708,6 +735,10 @@ fn routes(state: RestState) -> Router {
         // read like the per-domain GET above, and served the same way on a
         // read-only instance.
         .route("/sync", get(domains_admin::sync_summary))
+        // The change stream: a GET behind the guard like every read, so the
+        // session cookie is the whole of its auth and the CSRF exemption
+        // applies by method. Read-only instances serve it. See [`events`].
+        .route("/events", get(events::stream_events))
         // The share half of the same card. The preview is a GET that pulls,
         // so it is refused on a read-only instance like the writes below it;
         // the two conflict routes are offline verbs and need no connection.

@@ -34,8 +34,9 @@ use crystalline_remote::provider::{
     Feedback, OriginSpec, ProposalRequest, ProposalState, Provider,
 };
 use crystalline_remote::state::{
-    BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
-    ProposedFile, read_base_file, read_conflict_files,
+    BaseStamp, BranchKept, FeedbackItem, FeedbackKind, KeptKind, OriginState, Proposal,
+    ProposalStatus, ProposedChange, ProposedFile, QueuedBranch, RetireWhy, read_base_file,
+    read_conflict_files,
 };
 
 use mock::{MockProvider, sha256_hex};
@@ -10004,4 +10005,1445 @@ async fn a_case_folded_change_can_be_selected_by_either_spelling() {
         vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()],
         "and it travels upstream under the name the repository knows"
     );
+}
+
+// --- issue 113: pull requests based on a merged share branch ------------------
+
+/// Merges proposal `number` the way the forge does: the tracked branch moves
+/// onto the head of `branch` and the proposal reads merged.
+fn merge_into_main(mock: &MockProvider, number: u64, branch: &str) {
+    let head = mock.branch_commit(branch).expect("the layer's head");
+    mock.set_branch("main", &head);
+    mock.set_proposal_state(number, ProposalState::Merged);
+}
+
+#[tokio::test]
+async fn a_merged_share_moves_a_hand_made_pull_request_onto_main_before_its_branch_goes() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    merge_into_main(&mock, first.number, &first.branch);
+
+    let before = mock.calls().len();
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    let moved = call_at(&delta, &format!("update_proposal_base:{hand}:main"));
+    let deleted = call_at(&delta, &format!("delete_branch:{}", first.branch));
+    assert!(moved < deleted, "moved first, deleted after: {delta:?}");
+    let request = mock.proposal_request(hand).unwrap();
+    assert_eq!(request.base_branch, "main");
+    assert_eq!(request.title, "share big-change", "the title is untouched");
+    assert_eq!(request.body, "one layer", "and so is the body");
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), hand)
+            .await
+            .unwrap(),
+        ProposalState::Open,
+        "the hand-made pull request survived"
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_retarget_keeps_the_branch_and_the_next_sync_finishes_it() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    mock.fail_update_proposal(hand);
+    merge_into_main(&mock, first.number, &first.branch);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(
+        !mock
+            .calls()
+            .contains(&format!("delete_branch:{}", first.branch)),
+        "{:?}",
+        mock.calls()
+    );
+    assert!(
+        mock.branch_commit(&first.branch).is_some(),
+        "the branch stays"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.retire_queue.len(), 1);
+    let kept = state.retire_queue[0]
+        .kept
+        .as_ref()
+        .expect("kept, with a reason");
+    assert_eq!(kept.blocked_by, Some(hand));
+    assert!(
+        kept.reason.contains("injected update failure"),
+        "{}",
+        kept.reason
+    );
+
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.kept_branches.len(), 1);
+    assert_eq!(
+        report.kept_branches[0].kept_message().unwrap(),
+        format!(
+            "Branch {} is kept: pull request #{hand} is based on it and could not be moved to main. The next sync tries again.",
+            first.branch
+        )
+    );
+
+    mock.heal_update_proposal(hand);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(report.kept_branches.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_listing_keeps_every_queued_branch() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_open_proposals();
+    merge_into_main(&mock, first.number, &first.branch);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(
+        !mock
+            .calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state.history[0].number, first.number,
+        "the merge is still consumed"
+    );
+    let entry = &state.retire_queue[0];
+    assert_eq!(entry.kept.as_ref().unwrap().blocked_by, None);
+    assert_eq!(
+        entry.kept_message().unwrap(),
+        format!(
+            "Branch {} is kept: the open pull requests could not be listed. The next sync tries again.",
+            first.branch
+        )
+    );
+}
+
+#[tokio::test]
+async fn nothing_queued_means_no_listing_on_a_quiet_pull() {
+    let mock = MockProvider::new();
+    let (sub, _first) = shared_once(&mock).await;
+    let before = mock.calls().len();
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.contains(&"list_open_proposals".to_string()),
+        "{delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stacked_merge_moves_the_hand_made_pull_request_and_leaves_the_forge_its_own_layers() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &layers[0].branch).await;
+    merge_into_main(&mock, layers[0].number, &layers[0].branch);
+
+    let before = mock.calls().len();
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    call_at(&delta, &format!("update_proposal_base:{hand}:main"));
+    call_at(&delta, &format!("delete_branch:{}", layers[0].branch));
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with(&format!("update_proposal_base:{}:", layers[1].number))),
+        "the forge already moved our own layer: {delta:?}"
+    );
+    for number in [layers[1].number, layers[2].number, hand] {
+        assert_eq!(
+            Provider::proposal_state(&mock, &spec(), number)
+                .await
+                .unwrap(),
+            ProposalState::Open,
+            "#{number} survived"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_middle_layer_merged_into_the_layer_below_sends_its_pull_requests_there() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &layers[1].branch).await;
+    // Merged on the forge; the trunk did not move, so the pull settles up to
+    // date and consumes it there.
+    mock.set_proposal_state(layers[1].number, ProposalState::Merged);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mock.proposal_request(hand).unwrap().base_branch,
+        layers[0].branch
+    );
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", layers[1].branch))
+    );
+}
+
+#[tokio::test]
+async fn a_share_preview_leaves_merged_branches_and_pull_requests_alone() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    merge_into_main(&mock, first.number, &first.branch);
+
+    let before = mock.calls().len();
+    propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+    assert!(
+        !delta.contains(&"list_open_proposals".to_string()),
+        "{delta:?}"
+    );
+    assert!(
+        mock.branch_commit(&first.branch).is_some(),
+        "the branch stays"
+    );
+    assert_eq!(
+        mock.proposal_request(hand).unwrap().base_branch,
+        first.branch
+    );
+    // The merge is consumed and its branch queued, untouched, for later.
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.history[0].number, first.number);
+    assert_eq!(state.retire_queue.len(), 1);
+    assert_eq!(state.retire_queue[0].kept, None);
+
+    // The next sync does the cleanup.
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_pull_request_moved_by_one_entry_is_moved_again_by_the_next_entry_in_the_same_pass() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    // An older share merged into this one's branch in an earlier pull and
+    // kept there: its branch is queued with `onto` = this share's branch,
+    // and a pull request still stands on it.
+    let older = stacked_layer(&mock, "crystalline/share-older", &first.branch).await;
+    mock.set_proposal_state(older, ProposalState::Merged);
+    let on_top = stacked_layer(&mock, "on-top", "crystalline/share-older").await;
+    let mut state = load_state(&sub.state_dir);
+    state.retire_queue.push(QueuedBranch {
+        number: older,
+        branch: "crystalline/share-older".to_string(),
+        onto: first.branch.clone(),
+        why: RetireWhy::Merged,
+        kept: None,
+    });
+    state.save(&sub.state_dir).unwrap();
+    merge_into_main(&mock, first.number, &first.branch);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    // `on-top` went share-older -> this share's branch -> main in one pass,
+    // so neither deletion closed it.
+    assert_eq!(mock.proposal_request(on_top).unwrap().base_branch, "main");
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), on_top)
+            .await
+            .unwrap(),
+        ProposalState::Open
+    );
+    assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+}
+
+#[tokio::test]
+async fn a_re_baselining_pull_moves_a_hand_made_pull_request_before_the_branch_goes() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", &first.branch).await;
+    // The share merged while the trunk this domain records was rewritten out
+    // of existence, so the compare answers 404 and the pull re-baselines.
+    let mut state = load_state(&sub.state_dir);
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    merge_into_main(&mock, first.number, &first.branch);
+
+    let before = mock.calls().len();
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.re_baselined, "{report:?}");
+    let moved = call_at(&delta, &format!("update_proposal_base:{hand}:main"));
+    let deleted = call_at(&delta, &format!("delete_branch:{}", first.branch));
+    assert!(moved < deleted, "moved first, deleted after: {delta:?}");
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), hand)
+            .await
+            .unwrap(),
+        ProposalState::Open,
+        "the hand-made pull request survived"
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_kept_branch_follows_its_target_when_that_branch_is_retired() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let (bottom, middle) = (&layers[0], &layers[1]);
+    let hand = stacked_layer(&mock, "big-change", &middle.branch).await;
+    mock.fail_update_proposal(hand);
+
+    // The middle layer merges into the bottom one; its pull request cannot
+    // be moved, so the middle branch is kept, bound for the bottom branch.
+    mock.set_proposal_state(middle.number, ProposalState::Merged);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.retire_queue.len(), 1);
+    assert_eq!(state.retire_queue[0].onto, bottom.branch);
+    assert!(state.retire_queue[0].kept.is_some());
+
+    // The bottom layer merges and its branch is retired: the kept entry now
+    // goes where the bottom branch went, and reads as queued, not kept, so no
+    // message names the branch that is gone.
+    merge_into_main(&mock, bottom.number, &bottom.branch);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", bottom.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.retire_queue.len(), 1, "{:?}", state.retire_queue);
+    let entry = &state.retire_queue[0];
+    assert_eq!(entry.branch, middle.branch);
+    assert_eq!(entry.onto, "main", "the target followed the retired branch");
+    assert_eq!(entry.kept, None, "re-evaluated on the next pass");
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.kept_branches.is_empty(),
+        "{:?}",
+        report.kept_branches
+    );
+
+    // The next sync finishes it without anybody acting.
+    mock.heal_update_proposal(hand);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(mock.proposal_request(hand).unwrap().base_branch, "main");
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", middle.branch))
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+// --- issue 114: every share-branch deletion goes through one retire queue -----
+
+/// The one queued entry for `branch`, or a panic naming the queue.
+fn queued<'a>(state: &'a OriginState, branch: &str) -> &'a QueuedBranch {
+    state
+        .retire_queue
+        .iter()
+        .find(|entry| entry.branch == branch)
+        .unwrap_or_else(|| panic!("{branch} is not queued: {:?}", state.retire_queue))
+}
+
+/// What kept `entry`, as `(kind, blocked_by)`.
+fn kept_as(entry: &QueuedBranch) -> Option<(KeptKind, Option<u64>)> {
+    entry.kept.as_ref().map(|kept| (kept.kind, kept.blocked_by))
+}
+
+/// Declines `declined` on the forge, lets a pull see it, and shares again,
+/// which supersedes it.
+async fn decline_and_share_again(mock: &MockProvider, sub: &Subscribed, declined: u64) {
+    mock.set_proposal_state(declined, ProposalState::Declined);
+    pull(mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    write(&sub.domain_root.join("notes/next.md"), b"the next share\n");
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+}
+
+async fn sync(mock: &MockProvider, sub: &Subscribed) {
+    pull(mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+}
+
+async fn kept_messages(mock: &MockProvider, sub: &Subscribed) -> Vec<String> {
+    status(&spec(), &sub.domain_root, &sub.state_dir, Some(mock), false)
+        .await
+        .unwrap()
+        .kept_branches
+        .iter()
+        .filter_map(QueuedBranch::kept_message)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_declined_share_keeps_its_branch_while_a_pull_request_is_based_on_it() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let suggestion = stacked_layer(&mock, "suggest-60", &first.branch).await;
+    decline_and_share_again(&mock, &sub, first.number).await;
+
+    let calls = mock.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with(&format!("update_proposal_base:{suggestion}:"))),
+        "a declined share's pull requests are never moved: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, &first.branch);
+    assert_eq!(entry.why, RetireWhy::Declined);
+    assert_eq!(entry.onto, "main");
+    assert_eq!(kept_as(entry), Some((KeptKind::Base, Some(suggestion))));
+    assert_eq!(
+        kept_messages(&mock, &sub).await,
+        vec![format!(
+            "Branch {} is kept: pull request #{suggestion} is based on it. The share was declined, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch.",
+            first.branch
+        )]
+    );
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), suggestion)
+            .await
+            .unwrap(),
+        ProposalState::Open
+    );
+
+    mock.set_proposal_state(suggestion, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    assert!(
+        load_state(&sub.state_dir)
+            .retire_queue
+            .iter()
+            .all(|entry| entry.branch != first.branch)
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawn_share_keeps_its_branch_while_a_pull_request_is_based_on_it() {
+    // The plain path.
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    let suggestion = stacked_layer(&mock, "suggest-60", &first.branch).await;
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let calls = mock.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with(&format!("update_proposal_base:{suggestion}:"))),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, &first.branch);
+    assert_eq!(
+        (entry.why, entry.onto.as_str()),
+        (RetireWhy::Withdrawn, "main")
+    );
+    assert_eq!(kept_as(entry), Some((KeptKind::Base, Some(suggestion))));
+    assert_eq!(
+        entry.kept_message().unwrap(),
+        format!(
+            "Branch {} is kept: pull request #{suggestion} is based on it. The share was withdrawn, so Crystalline does not move the pull request. Once it is closed or moved, the next sync deletes the branch.",
+            first.branch
+        )
+    );
+
+    // The repair path: the middle layer of a stack, a suggestion on it.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let suggestion = stacked_layer(&mock, "suggest-61", &layers[1].branch).await;
+    stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    assert!(
+        !mock
+            .calls()
+            .contains(&format!("delete_branch:{}", layers[1].branch))
+    );
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, &layers[1].branch);
+    assert_eq!(entry.why, RetireWhy::Withdrawn);
+    assert_eq!(entry.onto, layers[0].branch, "the layer below");
+    assert_eq!(kept_as(entry), Some((KeptKind::Base, Some(suggestion))));
+}
+
+/// The branch is queued before the revert, so a revert that fails cannot
+/// lose it, and a withdraw tried again queues it once.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_withdraw_whose_revert_fails_has_queued_its_branch_and_a_retry_queues_it_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let suggestion = stacked_layer(&mock, "suggest-60", &first.branch).await;
+    let notes = sub.domain_root.join("notes");
+    let mode = |path: &Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+    };
+    mode(&notes.join("a.md"), 0o444);
+    mode(&notes, 0o555);
+    let failed = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        true,
+        false,
+    )
+    .await;
+    mode(&notes, 0o755);
+    mode(&notes.join("a.md"), 0o644);
+    let Err(_) = failed else {
+        eprintln!("skipped: the revert could write through read-only modes (running as root?)");
+        return;
+    };
+    let state = load_state(&sub.state_dir);
+    assert_eq!(queued(&state, &first.branch).why, RetireWhy::Withdrawn);
+
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state
+            .retire_queue
+            .iter()
+            .filter(|entry| entry.branch == first.branch)
+            .count(),
+        1,
+        "{:?}",
+        state.retire_queue
+    );
+    assert_eq!(
+        kept_as(queued(&state, &first.branch)),
+        Some((KeptKind::Base, Some(suggestion)))
+    );
+}
+
+/// The stacked withdraw queues the branch before its revert too, so a revert
+/// that fails after the repair moved the record to history cannot lose it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stacked_withdraw_whose_revert_fails_has_queued_its_branch() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let notes = sub.domain_root.join("notes");
+    let mode = |path: &Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+    };
+    mode(&notes, 0o555);
+    let failed = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(layers[1].number),
+        true,
+        true,
+    )
+    .await;
+    mode(&notes, 0o755);
+    let Err(_) = failed else {
+        eprintln!("skipped: the revert could write through read-only modes (running as root?)");
+        return;
+    };
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, &layers[1].branch);
+    assert_eq!(entry.why, RetireWhy::Withdrawn);
+    assert_eq!(entry.onto, layers[0].branch, "the layer below");
+}
+
+#[tokio::test]
+async fn a_merged_share_keeps_its_branch_while_a_pull_request_comes_from_it() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first) = shared_once(&mock).await;
+    mock.open_pull_request(70, &first.branch, Some("team/knowledge"), "release-1.2");
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("update_proposal_base:70:")),
+        "a head cannot be moved: {calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        kept_as(queued(&state, &first.branch)),
+        Some((KeptKind::Head, Some(70)))
+    );
+    assert_eq!(
+        kept_messages(&mock, &sub).await,
+        vec![format!(
+            "Branch {} is kept: pull request #70 comes from it.",
+            first.branch
+        )]
+    );
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), 70).await.unwrap(),
+        ProposalState::Open
+    );
+
+    mock.set_proposal_state(70, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_fork_pull_request_with_the_same_branch_name_does_not_keep_the_branch() {
+    for head_repo in [Some("fork/knowledge"), None] {
+        let mock = MockProvider::new();
+        let (sub, first) = shared_once(&mock).await;
+        mock.open_pull_request(70, &first.branch, head_repo, "main");
+        merge_into_main(&mock, first.number, &first.branch);
+        sync(&mock, &sub).await;
+        assert!(
+            mock.calls()
+                .contains(&format!("delete_branch:{}", first.branch)),
+            "{head_repo:?}: {:?}",
+            mock.calls()
+        );
+        assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_head_repo_in_other_letter_case_still_counts_as_ours() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.open_pull_request(70, &first.branch, Some("Team/Knowledge"), "release-1.2");
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+    assert_eq!(
+        kept_as(queued(&load_state(&sub.state_dir), &first.branch)),
+        Some((KeptKind::Head, Some(70)))
+    );
+}
+
+/// A merged entry `share-old` bound for `share-mid`, with a hand-made pull
+/// request on `share-old` whose move always fails. Returns that pull request.
+async fn merged_entry_bound_for_share_mid(mock: &MockProvider, sub: &Subscribed) -> u64 {
+    let old = stacked_layer(mock, "crystalline/share-old", "main").await;
+    mock.set_proposal_state(old, ProposalState::Merged);
+    let mid = stacked_layer(mock, "crystalline/share-mid", "main").await;
+    mock.set_proposal_state(mid, ProposalState::Declined);
+    let hand = stacked_layer(mock, "big-change", "crystalline/share-old").await;
+    mock.fail_update_proposal(hand);
+    let mut state = load_state(&sub.state_dir);
+    state.retire_queue.push(QueuedBranch {
+        number: old,
+        branch: "crystalline/share-old".to_string(),
+        onto: "crystalline/share-mid".to_string(),
+        why: RetireWhy::Merged,
+        kept: None,
+    });
+    state.save(&sub.state_dir).unwrap();
+    hand
+}
+
+#[tokio::test]
+async fn a_kept_move_whose_target_is_gone_stops_retrying() {
+    let mock = MockProvider::new();
+    let (sub, _first) = shared_once(&mock).await;
+    let hand = merged_entry_bound_for_share_mid(&mock, &sub).await;
+    sync(&mock, &sub).await;
+    assert_eq!(
+        kept_as(queued(&load_state(&sub.state_dir), "crystalline/share-old")),
+        Some((KeptKind::Base, Some(hand))),
+        "the target still exists: the ordinary kept notice"
+    );
+
+    mock.delete_branch_by_hand("crystalline/share-mid");
+    let before = mock.calls().len();
+    sync(&mock, &sub).await;
+    let delta = mock.calls().split_off(before);
+    let moved = call_at(
+        &delta,
+        &format!("update_proposal_base:{hand}:crystalline/share-mid"),
+    );
+    let probed = call_at(&delta, "branch_ref:crystalline/share-mid");
+    assert!(moved < probed, "{delta:?}");
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, "crystalline/share-old");
+    assert_eq!(kept_as(entry), Some((KeptKind::TargetGone, Some(hand))));
+    assert_eq!(
+        entry.kept_message().unwrap(),
+        format!(
+            "Branch crystalline/share-old is kept: pull request #{hand} is based on it and could not be moved to crystalline/share-mid, because that branch no longer exists. Move or close pull request #{hand} by hand."
+        )
+    );
+
+    let before = mock.calls().len();
+    sync(&mock, &sub).await;
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("update_proposal")),
+        "no retry once the target is gone: {delta:?}"
+    );
+    assert_eq!(
+        kept_as(queued(&load_state(&sub.state_dir), "crystalline/share-old")),
+        Some((KeptKind::TargetGone, Some(hand)))
+    );
+
+    mock.set_proposal_state(hand, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    assert!(
+        mock.calls()
+            .contains(&"delete_branch:crystalline/share-old".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_temporary_delete_failure_retries_quietly() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_delete_branch(&first.branch, 503, "Service Unavailable");
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+    let calls = mock.calls();
+    call_at(&calls, &format!("delete_branch:{}", first.branch));
+    call_at(&calls, &format!("branch_ref:{}", first.branch));
+    let state = load_state(&sub.state_dir);
+    assert_eq!(queued(&state, &first.branch).kept, None, "no notice");
+    assert!(kept_messages(&mock, &sub).await.is_empty());
+
+    mock.heal_delete_branch(&first.branch);
+    sync(&mock, &sub).await;
+    assert!(mock.branch_commit(&first.branch).is_none(), "deleted");
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_delete_is_named_and_only_probed_after() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_delete_branch(&first.branch, 422, "Reference update failed");
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, &first.branch);
+    assert_eq!(kept_as(entry), Some((KeptKind::DeleteRefused, None)));
+    assert_eq!(
+        entry.kept.as_ref().unwrap().reason,
+        "GitHub returned an unexpected answer (status 422): Reference update failed"
+    );
+    assert_eq!(
+        kept_messages(&mock, &sub).await,
+        vec![format!(
+            "Branch {} could not be deleted: GitHub returned an unexpected answer (status 422): Reference update failed. Delete it by hand.",
+            first.branch
+        )]
+    );
+
+    let before = mock.calls().len();
+    sync(&mock, &sub).await;
+    let delta = mock.calls().split_off(before);
+    call_at(&delta, &format!("branch_ref:{}", first.branch));
+    assert!(
+        !delta.contains(&format!("delete_branch:{}", first.branch)),
+        "never sent again: {delta:?}"
+    );
+
+    mock.delete_branch_by_hand(&first.branch);
+    sync(&mock, &sub).await;
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+    assert!(kept_messages(&mock, &sub).await.is_empty());
+}
+
+/// A failed listing names itself on every entry except one whose notice is
+/// about the branch itself: a refused delete stays refused.
+#[tokio::test]
+async fn a_failed_listing_leaves_a_refused_delete_notice_as_it_was() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_delete_branch(&first.branch, 422, "Reference update failed");
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+    let before = queued(&load_state(&sub.state_dir), &first.branch).clone();
+    mock.fail_open_proposals();
+    sync(&mock, &sub).await;
+    assert_eq!(
+        queued(&load_state(&sub.state_dir), &first.branch),
+        &before,
+        "the refusal notice is not replaced by the listing one"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_listing_leaves_a_target_gone_notice_as_it_was() {
+    let mock = MockProvider::new();
+    let (sub, _first) = shared_once(&mock).await;
+    let hand = merged_entry_bound_for_share_mid(&mock, &sub).await;
+    mock.delete_branch_by_hand("crystalline/share-mid");
+    sync(&mock, &sub).await;
+    let before = queued(&load_state(&sub.state_dir), "crystalline/share-old").clone();
+    assert_eq!(kept_as(&before), Some((KeptKind::TargetGone, Some(hand))));
+    mock.fail_open_proposals();
+    let count = mock.calls().len();
+    sync(&mock, &sub).await;
+    let delta = mock.calls().split_off(count);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("update_proposal")),
+        "{delta:?}"
+    );
+    assert_eq!(
+        queued(&load_state(&sub.state_dir), "crystalline/share-old"),
+        &before,
+        "the target_gone notice is not replaced by the listing one"
+    );
+}
+
+/// A merged entry `share-old` bound for `onto`, kept by a head pull request
+/// #70 so it stays in the queue.
+async fn head_kept_entry_bound_for(mock: &MockProvider, sub: &Subscribed, onto: &str) {
+    let old = stacked_layer(mock, "crystalline/share-old", "main").await;
+    mock.set_proposal_state(old, ProposalState::Merged);
+    mock.open_pull_request(
+        70,
+        "crystalline/share-old",
+        Some("team/knowledge"),
+        "release-1.2",
+    );
+    let mut state = load_state(&sub.state_dir);
+    state.retire_queue.push(QueuedBranch {
+        number: old,
+        branch: "crystalline/share-old".to_string(),
+        onto: onto.to_string(),
+        why: RetireWhy::Merged,
+        kept: None,
+    });
+    state.save(&sub.state_dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_delete_of_a_branch_already_gone_drops_quietly_and_rewrites() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    head_kept_entry_bound_for(&mock, &sub, &first.branch).await;
+    merge_into_main(&mock, first.number, &first.branch);
+    mock.delete_branch_by_hand(&first.branch);
+    mock.fail_delete_branch(&first.branch, 422, "Reference does not exist");
+    sync(&mock, &sub).await;
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.retire_queue.iter().all(|e| e.branch != first.branch),
+        "dropped quietly: {:?}",
+        state.retire_queue
+    );
+    let dependent = queued(&state, "crystalline/share-old");
+    assert_eq!(dependent.onto, "main", "the rewrite ran");
+    assert_eq!(kept_as(dependent), Some((KeptKind::Head, Some(70))));
+}
+
+#[tokio::test]
+async fn a_failed_delete_never_rewrites_other_entries() {
+    for status in [422, 503] {
+        let mock = MockProvider::new();
+        let (sub, first) = shared_once(&mock).await;
+        head_kept_entry_bound_for(&mock, &sub, &first.branch).await;
+        merge_into_main(&mock, first.number, &first.branch);
+        mock.fail_delete_branch(&first.branch, status, "no");
+        sync(&mock, &sub).await;
+        let state = load_state(&sub.state_dir);
+        assert_eq!(
+            queued(&state, "crystalline/share-old").onto,
+            first.branch,
+            "{status}: the branch is still there"
+        );
+    }
+}
+
+/// share-1 (ours, open), share-2 merged into it, and a hand-made pull request
+/// on share-2. Returns the subscription, share-1 and share-2's number.
+async fn merged_layer_over_share_one(
+    mock: &MockProvider,
+) -> (Subscribed, crystalline_remote::ops::ProposeReport, u64) {
+    let (sub, first) = shared_once(mock).await;
+    let second = stacked_layer(mock, "crystalline/share-2", &first.branch).await;
+    mock.set_proposal_state(second, ProposalState::Merged);
+    (sub, first, second)
+}
+
+fn merged_share_two(second: u64, onto: &str) -> QueuedBranch {
+    QueuedBranch {
+        number: second,
+        branch: "crystalline/share-2".to_string(),
+        onto: onto.to_string(),
+        why: RetireWhy::Merged,
+        kept: None,
+    }
+}
+
+#[tokio::test]
+async fn a_withdrawn_target_is_kept_while_a_move_waits_for_it() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", "crystalline/share-2").await;
+    mock.fail_update_proposal(hand);
+    let mut state = load_state(&sub.state_dir);
+    state
+        .retire_queue
+        .push(merged_share_two(second, &first.branch));
+    state.save(&sub.state_dir).unwrap();
+
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !mock
+            .calls()
+            .contains(&format!("delete_branch:{}", first.branch)),
+        "{:?}",
+        mock.calls()
+    );
+    let state = load_state(&sub.state_dir);
+    let withdrawn = queued(&state, &first.branch);
+    assert_eq!(kept_as(withdrawn), Some((KeptKind::Awaited, Some(hand))));
+    assert_eq!(
+        withdrawn.kept_message().unwrap(),
+        format!(
+            "Branch {} is kept: pull request #{hand} is still to move onto it.",
+            first.branch
+        )
+    );
+    assert_eq!(queued(&state, "crystalline/share-2").onto, first.branch);
+
+    mock.set_proposal_state(hand, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    let calls = mock.calls();
+    call_at(&calls, "delete_branch:crystalline/share-2");
+    call_at(&calls, &format!("delete_branch:{}", first.branch));
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
+}
+
+/// A withdrawn target is deleted once nothing waits for it, but the merged
+/// entry bound for it keeps pointing at it: its commits are nowhere else, so a
+/// pull request opened later on the merged branch is never moved to `main`,
+/// past commits it never proposed. Its move fails and it is kept as
+/// `target_gone`, for a person to move or close.
+#[tokio::test]
+async fn a_kept_entry_never_follows_a_withdrawn_target_it_was_bound_for() {
+    let mock = MockProvider::new();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    mock.open_pull_request(
+        70,
+        "crystalline/share-2",
+        Some("team/knowledge"),
+        "release-1.2",
+    );
+    let mut state = load_state(&sub.state_dir);
+    state
+        .retire_queue
+        .push(merged_share_two(second, &first.branch));
+    state.save(&sub.state_dir).unwrap();
+
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(
+        merged.onto, first.branch,
+        "a withdrawn share's onto is never passed on"
+    );
+    assert_eq!(kept_as(merged), Some((KeptKind::Head, Some(70))));
+
+    // Later a pull request is opened on share-2, and #70 closes. The move to
+    // the gone share-1 fails; nothing is ever sent to main.
+    mock.open_pull_request(
+        80,
+        "suggest-80",
+        Some("team/knowledge"),
+        "crystalline/share-2",
+    );
+    mock.fail_update_proposal(80);
+    mock.set_proposal_state(70, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    sync(&mock, &sub).await;
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&"update_proposal_base:80:main".to_string()),
+        "{calls:?}"
+    );
+    call_at(&calls, &format!("update_proposal_base:80:{}", first.branch));
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(merged.onto, first.branch);
+    assert_eq!(kept_as(merged), Some((KeptKind::TargetGone, Some(80))));
+    assert_eq!(
+        merged.kept_message().unwrap(),
+        format!(
+            "Branch crystalline/share-2 is kept: pull request #80 is based on it and could not be moved to {}, because that branch no longer exists. Move or close pull request #80 by hand.",
+            first.branch
+        )
+    );
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), 80).await.unwrap(),
+        ProposalState::Open
+    );
+}
+
+/// The declined twin of the test above: a declined target is deleted once
+/// nothing waits for it, and the merged entry bound for it keeps pointing at
+/// it, since a declined share's commits are nowhere else either.
+#[tokio::test]
+async fn a_kept_entry_never_follows_a_declined_target_it_was_bound_for() {
+    let mock = MockProvider::new();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    mock.open_pull_request(
+        70,
+        "crystalline/share-2",
+        Some("team/knowledge"),
+        "release-1.2",
+    );
+    let mut state = load_state(&sub.state_dir);
+    state
+        .retire_queue
+        .push(merged_share_two(second, &first.branch));
+    state.save(&sub.state_dir).unwrap();
+
+    decline_and_share_again(&mock, &sub, first.number).await;
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(
+        merged.onto, first.branch,
+        "a declined share's onto is never passed on"
+    );
+    assert_eq!(kept_as(merged), Some((KeptKind::Head, Some(70))));
+
+    // Later a pull request is opened on share-2, and #70 closes. The move to
+    // the gone share-1 fails; nothing is ever sent to main.
+    mock.open_pull_request(
+        80,
+        "suggest-80",
+        Some("team/knowledge"),
+        "crystalline/share-2",
+    );
+    mock.fail_update_proposal(80);
+    mock.set_proposal_state(70, ProposalState::Declined);
+    sync(&mock, &sub).await;
+    sync(&mock, &sub).await;
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&"update_proposal_base:80:main".to_string()),
+        "{calls:?}"
+    );
+    call_at(&calls, &format!("update_proposal_base:80:{}", first.branch));
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(merged.onto, first.branch);
+    assert_eq!(kept_as(merged), Some((KeptKind::TargetGone, Some(80))));
+}
+
+/// A declined entry bound for a merged layer takes the layer's `onto` when the
+/// layer's branch goes, and its own `base` notice stays: it is about a pull
+/// request on the declined branch, not about the old target.
+#[tokio::test]
+async fn a_declined_entry_keeps_its_notice_when_its_target_goes() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let declined = stacked_layer(&mock, "crystalline/share-d", &first.branch).await;
+    mock.set_proposal_state(declined, ProposalState::Declined);
+    let suggestion = stacked_layer(&mock, "suggest-60", "crystalline/share-d").await;
+    let mut state = load_state(&sub.state_dir);
+    state.retire_queue.push(QueuedBranch {
+        number: declined,
+        branch: "crystalline/share-d".to_string(),
+        onto: first.branch.clone(),
+        why: RetireWhy::Declined,
+        kept: None,
+    });
+    state.save(&sub.state_dir).unwrap();
+
+    merge_into_main(&mock, first.number, &first.branch);
+    sync(&mock, &sub).await;
+    call_at(&mock.calls(), &format!("delete_branch:{}", first.branch));
+    let state = load_state(&sub.state_dir);
+    let entry = queued(&state, "crystalline/share-d");
+    assert_eq!(entry.onto, "main", "it took the merged layer's onto");
+    assert_eq!(kept_as(entry), Some((KeptKind::Base, Some(suggestion))));
+}
+
+/// A merged entry whose delete GitHub refused never moves a pull request
+/// again, so one opened on its branch later does not keep the withdrawn
+/// target below it.
+#[tokio::test]
+async fn a_refused_merged_entry_does_not_keep_a_withdrawn_target() {
+    let mock = MockProvider::new();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", "crystalline/share-2").await;
+    let mut state = load_state(&sub.state_dir);
+    let mut merged = merged_share_two(second, &first.branch);
+    merged.kept = Some(BranchKept {
+        blocked_by: None,
+        reason: "GitHub returned an unexpected answer (status 422): no".to_string(),
+        kind: KeptKind::DeleteRefused,
+    });
+    state.retire_queue.push(merged);
+    state.save(&sub.state_dir).unwrap();
+
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let calls = mock.calls();
+    call_at(&calls, &format!("delete_branch:{}", first.branch));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with(&format!("update_proposal_base:{hand}:"))),
+        "{calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        kept_as(queued(&state, "crystalline/share-2")),
+        Some((KeptKind::DeleteRefused, None))
+    );
+    assert!(
+        state
+            .retire_queue
+            .iter()
+            .all(|entry| entry.branch != first.branch)
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawn_target_is_kept_while_a_head_kept_entry_still_has_a_move_to_make() {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    mock.open_pull_request(
+        70,
+        "crystalline/share-2",
+        Some("team/knowledge"),
+        "release-1.2",
+    );
+    let hand = stacked_layer(&mock, "big-change", "crystalline/share-2").await;
+    let mut state = load_state(&sub.state_dir);
+    state
+        .retire_queue
+        .push(merged_share_two(second, &first.branch));
+    state.save(&sub.state_dir).unwrap();
+
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with(&format!("update_proposal_base:{hand}:"))),
+        "a head-kept entry moves nothing: {calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    let merged = queued(&state, "crystalline/share-2");
+    assert_eq!(merged.onto, first.branch);
+    assert_eq!(kept_as(merged), Some((KeptKind::Head, Some(70))));
+    assert_eq!(
+        kept_as(queued(&state, &first.branch)),
+        Some((KeptKind::Awaited, Some(hand)))
+    );
+    assert_eq!(
+        Provider::proposal_state(&mock, &spec(), hand)
+            .await
+            .unwrap(),
+        ProposalState::Open
+    );
+}
+
+/// A withdrawn share-1 and a merged share-2 bound for it, queued in the order
+/// given, and a hand-made pull request on share-2 whose move succeeds.
+async fn work_the_pair(merged_first: bool) -> (MockProvider, Subscribed, String, u64) {
+    let mock = MockProvider::new();
+    mock.close_proposals_when_their_base_is_deleted();
+    let (sub, first, second) = merged_layer_over_share_one(&mock).await;
+    let hand = stacked_layer(&mock, "big-change", "crystalline/share-2").await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    let withdrawn = QueuedBranch {
+        number: first.number,
+        branch: first.branch.clone(),
+        onto: "main".to_string(),
+        why: RetireWhy::Withdrawn,
+        kept: None,
+    };
+    let merged = merged_share_two(second, &first.branch);
+    let mut state = load_state(&sub.state_dir);
+    state.retire_queue = if merged_first {
+        vec![merged, withdrawn]
+    } else {
+        vec![withdrawn, merged]
+    };
+    state.save(&sub.state_dir).unwrap();
+    sync(&mock, &sub).await;
+    (mock, sub, first.branch, hand)
+}
+
+#[tokio::test]
+async fn the_pass_works_dependents_first() {
+    for merged_first in [true, false] {
+        let (mock, sub, share_one, hand) = work_the_pair(merged_first).await;
+        assert_eq!(
+            mock.proposal_request(hand).unwrap().base_branch,
+            share_one,
+            "{merged_first}: moved onto the branch the merge went into, and no further"
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.contains(&format!("delete_branch:{share_one}")),
+            "{merged_first}: {calls:?}"
+        );
+        call_at(&calls, "delete_branch:crystalline/share-2");
+        let state = load_state(&sub.state_dir);
+        let withdrawn = queued(&state, &share_one);
+        assert_eq!(
+            (withdrawn.why, kept_as(withdrawn)),
+            (RetireWhy::Withdrawn, Some((KeptKind::Base, Some(hand)))),
+            "{merged_first}"
+        );
+    }
+}
+
+/// How many listings one share makes, with a kept entry queued so its own
+/// opening pull lists too.
+async fn listings_in_a_share(with_declined: bool) -> usize {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    head_kept_entry_bound_for(&mock, &sub, "main").await;
+    if with_declined {
+        mock.set_proposal_state(first.number, ProposalState::Declined);
+        sync(&mock, &sub).await;
+    }
+    write(&sub.domain_root.join("notes/next.md"), b"the next share\n");
+    let before = mock.calls().len();
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    mock.calls()
+        .split_off(before)
+        .iter()
+        .filter(|call| *call == "list_open_proposals")
+        .count()
+}
+
+#[tokio::test]
+async fn a_share_that_supersedes_a_declined_one_lists_twice_and_only_then() {
+    assert_eq!(listings_in_a_share(true).await, 2);
+    assert_eq!(listings_in_a_share(false).await, 1);
+}
+
+#[tokio::test]
+async fn a_withdrawn_share_s_own_pull_request_listed_as_open_does_not_keep_its_branch() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.list_as_open_once(first.number);
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch))
+    );
+    assert!(load_state(&sub.state_dir).retire_queue.is_empty());
 }

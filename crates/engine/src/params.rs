@@ -68,7 +68,10 @@ pub struct WriteParams {
     /// status and recorded_at, which have their own parameters.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
-    /// Overwrite an existing engram with the same permalink instead of erroring.
+    /// Replace the engram that already answers to this permalink instead of
+    /// erroring. It is replaced in its own file, whatever that file is
+    /// called; an engram that lives in another folder is refused (move it
+    /// with move_engram first).
     #[serde(default)]
     pub overwrite: bool,
     /// Your model id, for example claude-opus-5; recorded beside who wrote it
@@ -94,6 +97,8 @@ pub struct WriteParams {
 pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
+    /// A file path is not an identifier: a miss names the permalink it
+    /// probably meant.
     pub identifier: String,
     /// Restrict resolution to this domain.
     #[serde(default)]
@@ -118,6 +123,8 @@ pub struct ReadParams {
 pub struct EditParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
+    /// A file path is not an identifier: a miss names the permalink it
+    /// probably meant.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
@@ -131,17 +138,18 @@ pub struct EditParams {
     #[serde(default)]
     pub content: Option<String>,
     /// The frontmatter field to assign, for set_frontmatter. One of status,
-    /// valid_from, valid_to, stale_after, source_date, salience, verified or
-    /// evolve_ack. No other key is settable here: type, title, permalink, tags,
-    /// recorded_at and the generated provenance block carry identity and
-    /// provenance and are owned by their own tools.
+    /// valid_from, valid_to, stale_after, source_date, resource, source_version,
+    /// salience, verified or evolve_ack. No other key is settable here: type,
+    /// title, permalink, tags, recorded_at and the generated provenance block
+    /// carry identity and provenance and are owned by their own tools.
     #[serde(default)]
     pub key: Option<String>,
     /// The value to assign, for set_frontmatter. Omit it (or pass null) to
     /// remove the field, which is how a valid_to that should never have been
     /// set is cleared; status cannot be removed, since every engram needs one.
-    /// The four date keys take a plain ISO date (YYYY-MM-DD), salience a number
-    /// from 0 to 10. verified is the exception: it never removes, it stamps a
+    /// The four date keys take a plain ISO date (YYYY-MM-DD), resource and
+    /// source_version take plain text, salience a number from 0 to 10. verified
+    /// is the exception: it never removes, it stamps a
     /// verification record `{ by, at }` with the current instant, taking the
     /// value as the verifying actor and falling back to the caller's own
     /// identity when it is omitted. evolve_ack takes a rule id optionally
@@ -207,6 +215,8 @@ pub struct SaveParams {
     pub domain: String,
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
+    /// A file path is not an identifier: a miss names the permalink it
+    /// probably meant.
     pub identifier: String,
     /// The complete markdown text, frontmatter included, written verbatim.
     pub content: String,
@@ -278,6 +288,8 @@ pub struct SplitParams {
 pub struct MoveParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
+    /// A file path is not an identifier: a miss names the permalink it
+    /// probably meant.
     pub identifier: String,
     /// The engram's current domain.
     pub domain: String,
@@ -313,6 +325,8 @@ pub struct MoveParams {
 pub struct DeleteParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
+    /// A file path is not an identifier: a miss names the permalink it
+    /// probably meant.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,

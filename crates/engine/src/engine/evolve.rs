@@ -162,6 +162,7 @@ impl Engine {
                     p.include_acknowledged,
                     true,
                     scope,
+                    &hidden,
                 )
                 .await?
             else {
@@ -527,7 +528,16 @@ impl Engine {
         let (known_domains, respell) = self.sweep_domain_names(&hidden).await;
         let today = Utc::now().date_naive();
         let Some(swept) = self
-            .sweep_domain(domain, today, &known_domains, &respell, true, false, scope)
+            .sweep_domain(
+                domain,
+                today,
+                &known_domains,
+                &respell,
+                true,
+                false,
+                scope,
+                &hidden,
+            )
             .await?
         else {
             return Ok(Vec::new());
@@ -758,7 +768,11 @@ impl Engine {
     ///
     /// `count_pending` asks for `V302`'s truncation counts, which only a sweep
     /// that renders a queue needs; the acknowledgment path passes `false`.
-    // Eight, and the two flags are read by different halves of the sweep; a
+    ///
+    /// `hidden` is the set of domains this caller may not see. Every node from
+    /// one of them, and every edge with an end on one, leaves the graph before
+    /// any detector reads it.
+    // Nine, and the two flags are read by different halves of the sweep; a
     // struct around them would sit between two private callers for no reader.
     #[allow(clippy::too_many_arguments)]
     async fn sweep_domain(
@@ -770,6 +784,7 @@ impl Engine {
         include_acknowledged: bool,
         count_pending: bool,
         scope: &crate::scope::Scope,
+        hidden: &HashSet<String>,
     ) -> Result<Option<DomainSweep>> {
         let mut unparsed = 0usize;
         let source = self.content_source(name)?;
@@ -817,7 +832,13 @@ impl Engine {
         // Traversed in the caller's dimension too, or every draft would come
         // back with no edges at all and `V104` would report the engrams
         // somebody is working on hardest as orphans.
-        let graph = self.sweep_graph(&descs, overlay).await?;
+        let mut graph = self.sweep_graph(&descs, overlay).await?;
+        // The depth-1 ring reaches into every domain an edge crosses, the ones
+        // this caller may not see included. Dropped here, before the degrees
+        // below and before any detector reads the graph, so no rule that walks
+        // an edge (`V005`, `V103`, `V111` and whatever comes next) can name a
+        // hidden engram or reveal that something hidden links this one.
+        super::retain_visible(&mut graph, hidden);
         let mut inbound: HashMap<i64, usize> = HashMap::new();
         let mut outbound: HashMap<i64, usize> = HashMap::new();
         for edge in &graph.edges {
@@ -970,6 +991,12 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|h| !h.is_empty())
+                    .map(str::to_string),
+                resource: fm
+                    .resource
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
                     .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),

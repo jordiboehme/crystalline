@@ -192,6 +192,7 @@ impl Engine {
             // The files are in; the drafts no file describes come back from the
             // journal. A no-op on every sync but the first one after a rebuild.
             self.restore_overlays_quietly(name).await;
+            self.announce_report(name, &report, None);
             applied.push((domain, report));
         }
         // Every domain of this run is in now, so the references that pointed
@@ -204,6 +205,14 @@ impl Engine {
                 .map_err(|e| {
                     EngineError::Internal(format!("resolving forward references failed: {e}"))
                 })?;
+        }
+        // A reference bound late changes no engram's text but does change
+        // what the reading page, the backlinks and the graph show, and the
+        // pass names no engram, so the domain is announced whole.
+        for (_, report) in &applied {
+            if report.relations_resolved_late + report.links_resolved_late > 0 {
+                self.announce_domain(&report.domain, None, None);
+            }
         }
         // A synced MANIFEST may declare a new name, and a domain synced for
         // the first time has just been given the row its spellings hang on.
@@ -234,6 +243,19 @@ impl Engine {
     /// full fallback, the startup sync or a manual sync, so the targeted pass
     /// only has to be convergent, never perfect.
     pub async fn sync_paths(&self, name: &str, paths: Vec<String>) -> Result<SyncReport> {
+        self.sync_paths_as(name, paths, None).await
+    }
+
+    /// [`Engine::sync_paths`] with the label to announce the changes under:
+    /// `None` for the watcher (a change found on disk has no author the
+    /// index can name), the acting account for a discard run on somebody's
+    /// behalf.
+    pub async fn sync_paths_as(
+        &self,
+        name: &str,
+        paths: Vec<String>,
+        actor: Option<&str>,
+    ) -> Result<SyncReport> {
         let ContentSource::File { root } = self.content_source(name)? else {
             // A virtual domain has no files on disk; there is nothing to scan.
             return Ok(SyncReport {
@@ -290,6 +312,7 @@ impl Engine {
         if manifest_touched {
             self.refresh_names().await;
         }
+        self.announce_report(name, &report, actor);
         Ok(report)
     }
 

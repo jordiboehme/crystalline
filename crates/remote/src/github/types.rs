@@ -208,11 +208,20 @@ pub(super) struct IssueCommentResponse {
     pub(super) created_at: Option<String>,
 }
 
-/// `GET .../pulls?state=open` entry, trimmed to the head ref and sha.
+/// `GET .../pulls?state=open` entry, trimmed to the head and base refs.
 #[derive(Debug, Deserialize)]
 pub(super) struct OpenProposalListItem {
     pub(super) number: u64,
     pub(super) head: HeadRef,
+    pub(super) base: BaseRef,
+}
+
+/// The branch a listed pull request targets. Required: a row without one
+/// must fail the listing rather than read as based on nothing.
+#[derive(Debug, Deserialize)]
+pub(super) struct BaseRef {
+    #[serde(rename = "ref")]
+    pub(super) reference: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +229,15 @@ pub(super) struct HeadRef {
     #[serde(rename = "ref")]
     pub(super) reference: String,
     pub(super) sha: String,
+    /// The head's repository. Null for a deleted fork, and read as absent
+    /// when the key is missing.
+    #[serde(default)]
+    pub(super) repo: Option<HeadRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HeadRepo {
+    pub(super) full_name: String,
 }
 
 /// `POST .../stacks` and `POST .../stacks/{number}/add` request body: the

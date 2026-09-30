@@ -36,21 +36,21 @@ use crystalline_core::emit::{
 use crystalline_core::relink::Relink;
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, DOMAIN_NAME_KEY, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind,
-    LinkTarget, Manifest, YamlValue, domain_name_at, domain_name_of_source, is_lower_hyphen,
-    parse_engram, parse_engram_lossless, slugify,
+    CrystallineUrl, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind, LinkTarget,
+    Manifest, YamlValue, domain_name_at, domain_name_of_source, is_lower_hyphen, parse_engram,
+    parse_engram_lossless, slugify,
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
-    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
-    EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
-    InboundQuery, IndexError, RULES, RebuildKind, RecentFilter, ReindexHooks, SearchMode,
-    SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions,
-    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
-    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
-    reindex_domains, resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain,
-    scan_paths,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats,
+    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
+    EngramRecord, EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode,
+    GraphSlice, HostClaim, InboundQuery, IndexError, PathChange, RULES, RebuildKind, RecentFilter,
+    ReindexHooks, SearchMode, SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram,
+    SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram,
+    configured_model_id, detect, is_retired_status, lookup_in_domain, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, rank, reindex_domains, resolve_forward_refs,
+    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::changes::{LocalChange, LocalChanges};
 use crystalline_remote::ops::{self, DiscardTarget};
@@ -62,8 +62,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::changes::{
+    Change, ChangeKind, DomainAudience, DomainChanged, EngramChanged, MovedFrom, change_label,
+};
 use crate::collab::session::AgentPeer;
-use crate::domain_view::DomainView;
+use crate::domain_view::{DomainView, shown};
 use crate::origin;
 use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
@@ -187,18 +190,22 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
-/// the lifecycle surface an agent tends while keeping knowledge honest. Every
-/// other key is refused there, because identity (`permalink`, `title`, `type`),
-/// classification (`tags`), the record of when knowledge was captured
-/// (`recorded_at`) and the write provenance (`generated`) are owned by the
-/// tools that maintain them and a blind assignment would corrupt an address, a
-/// history or the index.
+/// the lifecycle surface an agent tends while keeping knowledge honest.
+/// `resource` and `source_version` are the source a piece of knowledge was
+/// taken from and the version of it that was read; a re-ingest moves both.
+/// Every other key is refused there, because identity (`permalink`, `title`,
+/// `type`), classification (`tags`), the record of when knowledge was
+/// captured (`recorded_at`) and the write provenance (`generated`) are owned
+/// by the tools that maintain them and a blind assignment would corrupt an
+/// address, a history or the index.
 pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "status",
     "valid_from",
     "valid_to",
     "stale_after",
     "source_date",
+    "resource",
+    "source_version",
     "salience",
     "verified",
     "evolve_ack",
@@ -951,6 +958,15 @@ pub struct Engine {
     // index's spellings. See `Engine::spelling_replaces_issued`.
     #[cfg(any(test, feature = "testing"))]
     spelling_replaces: std::sync::atomic::AtomicU64,
+    // The test seam for the spelling push's faults. See
+    // `Engine::set_spelling_push_fault`.
+    #[cfg(any(test, feature = "testing"))]
+    spelling_push_fault: std::sync::Mutex<Option<names::SpellingPushFault>>,
+    // The test seam for the granted-name check on an unjoined edit or save:
+    // how many times it reached the accounts store. See
+    // `Engine::granted_name_checks_run`.
+    #[cfg(any(test, feature = "testing"))]
+    granted_name_checks: std::sync::atomic::AtomicU64,
     // The test seam for the name adoption: how many times it ran. See
     // `Engine::adoptions_run`.
     #[cfg(any(test, feature = "testing"))]
@@ -967,6 +983,11 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // Every change the store commits, announced once, for `GET /api/v1/events`
+    // to stream. On the engine for the reason `list_subscribers` is: the
+    // watcher, the verbs, a room's save, a pull and a discard share nothing
+    // else with the route. See `crate::changes`.
+    changes: crate::changes::ChangeBus,
     // Serializes a domain registration against a domain removal, for the
     // whole of each: `Engine::unregister_domain` holds it across its sweep and
     // its tail, and the REST create holds it across its own registration
@@ -1058,6 +1079,11 @@ pub struct Engine {
     // gives up, when a test wants less than the real limit.
     #[cfg(any(test, feature = "testing"))]
     rename_drain_wait: std::sync::Mutex<Option<std::time::Duration>>,
+    // The event-stream seam: while armed, `hidden_domains` fails the way an
+    // accounts store that cannot answer does. See
+    // `Engine::fail_hidden_domains`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_hidden_domains: std::sync::atomic::AtomicBool,
 }
 
 /// One drafted engram, as the share-link surface hands it to the account a
@@ -1282,6 +1308,8 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+#[cfg(any(test, feature = "testing"))]
+pub use names::SpellingPushFault;
 
 /// What a write is told when it reaches a domain that reviews changes before
 /// they land and nobody can say whose draft it would join.
@@ -1333,12 +1361,34 @@ pub fn joined_write_is_elsewhere(owner: &str, draft: &str, path: &str) -> String
     )
 }
 
-pub fn granted_needs_join(owner: &str, path: &str) -> String {
+pub fn granted_needs_join(owner: &str, permalink: &str) -> String {
     format!(
-        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
+        "'{permalink}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
          Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or \
          draft your own copy in your own overlay and leave theirs as it stands."
     )
+}
+
+/// How a granted draft answers an identifier. Ordered: a permalink match
+/// beats a title match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GrantMatch {
+    Permalink,
+    Title,
+}
+
+/// Whether `draft` answers `identifier` (a `crystalline://` URL already
+/// reduced to its permalink): by its permalink, exactly, or by its title,
+/// lowercased on both sides the way the resolver's title step compares. A
+/// path or a path stem answers nothing, for a granted draft as for every
+/// other engram.
+pub(crate) fn grant_match(draft: &GrantedDraft, identifier: &str) -> Option<GrantMatch> {
+    if draft.permalink == identifier {
+        return Some(GrantMatch::Permalink);
+    }
+    let title = parse_engram(&draft.content).ok()?.frontmatter.title;
+    (!title.is_empty() && title.to_lowercase() == identifier.to_lowercase())
+        .then_some(GrantMatch::Title)
 }
 
 /// What somebody inside a join is told when the draft they joined is no longer
@@ -1971,9 +2021,14 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             spelling_replaces: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
+            spelling_push_fault: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            granted_name_checks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
             adoptions: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            changes: crate::changes::ChangeBus::new(),
             domain_admin: tokio::sync::Mutex::new(()),
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
@@ -1994,6 +2049,8 @@ impl Engine {
             rename_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_drain_wait: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            fail_hidden_domains: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2184,6 +2241,14 @@ impl Engine {
         }
     }
 
+    /// Arm (`true`) or disarm a failure of every [`Engine::hidden_domains`]
+    /// call, the answer a locked or unreadable accounts store gives.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_hidden_domains(&self, on: bool) {
+        self.fail_hidden_domains
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The private domains `scope` may not see, or `None` for no filtering at
     /// all.
     ///
@@ -2203,6 +2268,13 @@ impl Engine {
         &self,
         scope: &crate::scope::Scope,
     ) -> Result<Option<HashSet<String>>> {
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .fail_hidden_domains
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::Internal("armed".to_string()));
+        }
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };
@@ -2733,6 +2805,162 @@ impl Engine {
         &self.list_subscribers
     }
 
+    /// The change bus every `GET /api/v1/events` subscriber listens on.
+    pub fn changes(&self) -> &crate::changes::ChangeBus {
+        &self.changes
+    }
+
+    /// Announce one committed change. Never awaits, never blocks, never
+    /// fails: called after the store call returned and with the store lock
+    /// released (a verb's own per-path write lock may still be held; the
+    /// bus takes only its own short mutex), at every place a change lands in
+    /// the store and nowhere else.
+    pub(crate) fn announce(&self, change: Change) {
+        if let Some(id) = self.changes.announce(change) {
+            tracing::trace!(%id, "announced a change");
+        }
+    }
+
+    /// Announce what a sync report says it moved: each path as an `engram`
+    /// event at or below `COLLAPSE_THRESHOLD`, one `domain` event above it.
+    /// A generated listing is dropped before it is counted, so a
+    /// regeneration by `refresh_index_files` that the watcher then sees
+    /// announces nothing.
+    pub(crate) fn announce_report(&self, name: &str, report: &SyncReport, actor: Option<&str>) {
+        let changes: Vec<&PathChange> = report
+            .changes
+            .iter()
+            .filter(|change| !crystalline_core::is_reserved_path(&change.path))
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        if changes.len() > crate::changes::COLLAPSE_THRESHOLD {
+            self.announce_domain(name, actor, None);
+            return;
+        }
+        for change in changes {
+            let permalink = change
+                .permalink
+                .clone()
+                .unwrap_or_else(|| crystalline_core::path_permalink(&change.path));
+            let from = change.from.as_ref().map(|path| MovedFrom {
+                path: path.clone(),
+                permalink: change
+                    .from_permalink
+                    .clone()
+                    .unwrap_or_else(|| crystalline_core::path_permalink(path)),
+            });
+            self.announce(Change::Engram(EngramChanged {
+                domain: name.to_string(),
+                permalink,
+                path: change.path.clone(),
+                kind: change.kind.into(),
+                from,
+                checksum: change.checksum.clone(),
+                actor: actor.map(str::to_string),
+                draft_of: None,
+                audience: None,
+            }));
+        }
+    }
+
+    /// Announce a batch of changes one verb made in one domain, through the
+    /// same listing filter and collapse rule a sync report goes through.
+    pub(crate) fn announce_paths(&self, name: &str, changes: Vec<PathChange>, actor: Option<&str>) {
+        let report = SyncReport {
+            domain: name.to_string(),
+            changes,
+            ..SyncReport::default()
+        };
+        self.announce_report(name, &report, actor);
+    }
+
+    /// Announce the drafts one pass dropped in `domain`, collapsed the way a
+    /// sync report is: each one at or below `COLLAPSE_THRESHOLD`, one
+    /// `domain` event above it, so leaving review mode over a large overlay
+    /// does not evict the ring and reset every other tab.
+    pub(crate) fn announce_draft_drops(&self, domain: &str, batch: Vec<EngramChanged>) {
+        if batch.len() > crate::changes::COLLAPSE_THRESHOLD {
+            self.announce_domain(domain, None, None);
+            return;
+        }
+        for change in batch {
+            self.announce(Change::Engram(change));
+        }
+    }
+
+    /// Announce that a whole domain moved, when nothing finer can be said.
+    /// `audience` is `Some`, from [`Self::domain_audience`] read a moment
+    /// earlier, only for the old name leaving a rename and for a removal
+    /// (ruled 2026-09-27): that name's privacy record is about to disappear,
+    /// so the frame must not be filtered against a session's own cache or a
+    /// fresh `hidden_domains` call, either of which can answer from a
+    /// registry the change itself is emptying (or, symmetrically, still
+    /// answer "member" a moment after that stopped being true). Every other
+    /// call passes `None`: a rename's new name is re-keyed, not destroyed,
+    /// so it keeps the ordinary per-session lazy check.
+    pub(crate) fn announce_domain(
+        &self,
+        name: &str,
+        actor: Option<&str>,
+        audience: Option<DomainAudience>,
+    ) {
+        self.announce(Change::Domain(DomainChanged {
+            domain: name.to_string(),
+            actor: actor.map(str::to_string),
+            audience,
+        }));
+    }
+
+    /// The identities that may read `name` right now, read from the privacy
+    /// and membership records through [`crate::scope::DomainAccess::readers_of`].
+    /// Used only to capture a rename's old name and a removal's audience in
+    /// the instant before the change takes the name out of those records
+    /// (ruled 2026-09-27).
+    ///
+    /// Fails closed and never fails the caller: with no resolver installed
+    /// (a daemonless engine, or a daemon whose HTTP surface has not installed
+    /// one yet when a startup rename runs) or a record read that errs, the
+    /// answer is `Accounts` with nobody in it. The owner still hears the
+    /// event and nobody else does, and a notification never vetoes the
+    /// rename or the removal it describes.
+    pub(crate) async fn domain_audience(&self, name: &str) -> DomainAudience {
+        let nobody = || DomainAudience::Accounts(HashSet::new());
+        let Some(access) = self.domain_access.get() else {
+            return nobody();
+        };
+        match access.readers_of(name).await {
+            Ok(None) => DomainAudience::Everyone,
+            Ok(Some(accounts)) => DomainAudience::Accounts(accounts),
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    "reading who may see '{name}' failed ({e}); its rename or removal is announced to the machine owner only"
+                );
+                nobody()
+            }
+        }
+    }
+
+    /// Capture `name`'s audience on the bus for as long as the returned hold
+    /// lives: every event under that name, the domain event and the engram
+    /// events a rename or removal emits under it alike, carries the snapshot,
+    /// and so does every event the ring already holds for it, since a path
+    /// under the old name leaks the name as surely as the domain event does.
+    /// Taken before the change starts; dropped once its last event is out.
+    pub(crate) fn capture_audience(
+        &self,
+        name: &str,
+        audience: DomainAudience,
+    ) -> AudienceHold<'_> {
+        self.changes.capture(name, audience);
+        AudienceHold {
+            bus: &self.changes,
+            name: name.to_string(),
+        }
+    }
+
     /// How the shipped agent skills are served over MCP: the value this engine
     /// was **built** with, not the live setting.
     ///
@@ -3203,6 +3431,17 @@ impl Engine {
         };
         self.commit_overlay_row(desc.domain_id, actor, &record)
             .await?;
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: desc.permalink.clone(),
+            path: desc.path.clone(),
+            kind: ChangeKind::Deleted,
+            from: None,
+            checksum: None,
+            actor: Some(actor.to_string()),
+            draft_of: Some(actor.to_string()),
+            audience: None,
+        }));
         let warning = match crate::overlay_journal::journal_tombstone(
             &state_dir, domain, actor, &desc.path,
         ) {
@@ -3465,6 +3704,8 @@ impl Engine {
         let addresses = pulled_addresses(&state_dir, &touched)?;
 
         let mut cleared = 0u64;
+        // The drafts this pass ended, announced when it ends or stops, collapsed.
+        let mut pending = PendingAnnouncements::new(self);
         for ActorHolding {
             actor,
             entries,
@@ -3477,6 +3718,7 @@ impl Engine {
             // over the other. The view is used only as the writer that ends a
             // converged draft, which is why it screens nothing.
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+            view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
@@ -3484,6 +3726,7 @@ impl Engine {
                     Settle::Leave => {}
                     Settle::Clear => {
                         view.drop(domain_id, &entry.path).await?;
+                        pending.push_drops_from(domain, &view);
                         record.settle(actor, &entry.path);
                         cleared += 1;
                     }
@@ -3518,6 +3761,7 @@ impl Engine {
                     }
                 }
             }
+            pending.push_drops_from(domain, &view);
             // And their files, in the same pass and into the same record: a
             // conflict is one actor's conflict at one path, whatever kind of
             // thing stands there.
@@ -3562,6 +3806,7 @@ impl Engine {
                 store.reresolve_actor_references(domain_id, actor).await?;
             }
         }
+        drop(pending);
         record.cleared = cleared;
         let report = ConvergenceReport {
             cleared,
@@ -3954,6 +4199,87 @@ impl Engine {
     }
 }
 
+/// The title an engram's text declares, if it parses.
+fn engram_title(text: &str) -> Option<String> {
+    parse_engram(text)
+        .ok()
+        .map(|engram| engram.frontmatter.title)
+}
+
+/// An engram's `(permalink, title)` as its text declares them, the permalink
+/// falling back to `fallback_permalink` when the frontmatter names none.
+fn engram_names(text: &str, fallback_permalink: &str) -> (String, String) {
+    match parse_engram(text) {
+        Ok(engram) => (
+            engram
+                .frontmatter
+                .permalink
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| fallback_permalink.to_string()),
+            engram.frontmatter.title,
+        ),
+        Err(_) => (fallback_permalink.to_string(), String::new()),
+    }
+}
+
+/// What a batch owes the change bus for rows it has already committed, said
+/// when the guard drops: on the normal exit and on every early `?` alike, so a
+/// batch that fails halfway still tells open pages about what landed. A row is
+/// pushed only after its own store commit, which keeps the announce-after-
+/// commit rule, and [`Engine::announce`] never awaits, so dropping is safe
+/// anywhere. Never create one while holding the store guard across a push.
+pub(crate) struct PendingAnnouncements<'a> {
+    engine: &'a Engine,
+    paths: BTreeMap<String, Vec<PathChange>>,
+    drops: BTreeMap<String, Vec<EngramChanged>>,
+}
+
+impl<'a> PendingAnnouncements<'a> {
+    pub(crate) fn new(engine: &'a Engine) -> Self {
+        PendingAnnouncements {
+            engine,
+            paths: BTreeMap::new(),
+            drops: BTreeMap::new(),
+        }
+    }
+
+    /// A committed change to one path in `domain`, for [`Engine::announce_paths`].
+    pub(crate) fn push_path(&mut self, domain: &str, change: PathChange) {
+        self.paths
+            .entry(domain.to_string())
+            .or_default()
+            .push(change);
+    }
+
+    /// A committed draft drop in `domain`, for [`Engine::announce_draft_drops`].
+    pub(crate) fn push_drop(&mut self, domain: &str, change: EngramChanged) {
+        self.drops
+            .entry(domain.to_string())
+            .or_default()
+            .push(change);
+    }
+
+    /// Move what `view` has collected so far into the guard and keep it
+    /// collecting, so a drop that lands before a later `?` is still owed.
+    pub(crate) fn push_drops_from(&mut self, domain: &str, view: &DomainView) {
+        for change in view.take_drops() {
+            self.push_drop(domain, change);
+        }
+        view.collect_drops();
+    }
+}
+
+impl Drop for PendingAnnouncements<'_> {
+    fn drop(&mut self) {
+        for (domain, changes) in std::mem::take(&mut self.paths) {
+            self.engine.announce_paths(&domain, changes, None);
+        }
+        for (domain, batch) in std::mem::take(&mut self.drops) {
+            self.engine.announce_draft_drops(&domain, batch);
+        }
+    }
+}
+
 /// [`Engine::reread_config`] over its two inputs, so the read can run where the
 /// engine cannot be borrowed (the blocking pool).
 fn reread_config_at(path: Option<PathBuf>, overlay: &EnvOverlay) -> Option<GlobalConfig> {
@@ -4148,9 +4474,11 @@ impl Engine {
     /// absolute, cross-domain form - mirroring the `[[target]]` /
     /// `[[domain:target]]` wikilink pair. A scheme-less `domain/permalink`
     /// composite is not part of the grammar, since domain names are per-user
-    /// configuration and must never ride inside an identifier. Resolution
-    /// goes through the store, so a virtual domain (or any database-only
-    /// domain) resolves without a filesystem root.
+    /// configuration and must never ride inside an identifier. Neither is a
+    /// file path: a domain-scoped miss names the permalink the identifier's
+    /// slug is instead ([`lookup_in_domain`]). Resolution goes through the
+    /// store, so a virtual domain (or any database-only domain) resolves
+    /// without a filesystem root.
     async fn resolve(
         &self,
         identifier: &str,
@@ -4268,7 +4596,7 @@ impl Engine {
             // because this identifier did not.
             let (desc, source) = view
                 .shadow(identifier, Ok((desc, source)), || {
-                    format!("no engram matches '{identifier}'")
+                    format!("no engram matches '{}'", shown(identifier))
                 })
                 .await?;
             return Ok((desc, source, Some(actor)));
@@ -4284,7 +4612,7 @@ impl Engine {
         let base = self.resolve_scoped(identifier, domain, hidden).await;
         let (desc, source) = view
             .shadow(identifier, base, || {
-                format!("no engram '{identifier}' in domain '{name}'")
+                format!("no engram '{}' in domain '{name}'", shown(identifier))
             })
             .await?;
         Ok((desc, source, Some(actor.to_string())))
@@ -4295,10 +4623,13 @@ impl Engine {
     /// A hidden domain resolves as an empty one rather than as a refusal: the
     /// lookup is skipped and the miss falls through to the very same
     /// [`EngineError::NotFound`] an engram that was never written produces,
-    /// byte for byte, because it is produced by the same line. That equality is
-    /// the property this whole path exists for - a caller must not be able to
-    /// tell "you may not see this" from "there is nothing here" - and it holds
-    /// by construction rather than by two messages being kept in step.
+    /// byte for byte, because it is produced by the same function,
+    /// [`domain_miss`], with no suggestion: [`lookup_in_domain`] never runs
+    /// for a hidden domain, so no hint can name what is in there. That
+    /// equality is the property this whole path exists for - a caller must
+    /// not be able to tell "you may not see this" from "there is nothing
+    /// here" - and it holds by construction rather than by two messages being
+    /// kept in step.
     ///
     /// The bare cross-domain form filters its matches before it counts them, so
     /// a hidden domain neither makes an identifier ambiguous nor gets its name
@@ -4328,28 +4659,21 @@ impl Engine {
 
         if let Some(dom) = domain {
             let found = if hidden.contains(dom) {
-                None
+                DomainLookup::Missing { suggest: None }
             } else {
                 let store = self.store.lock().await;
-                store.find_engram(dom, identifier).await?
+                lookup_in_domain(&*store, dom, identifier).await?
             };
-            let d = found.ok_or_else(|| {
-                // The one wrong shape agents keep producing is the domain
-                // glued onto the permalink; the error teaches the fix so a
-                // stumble recovers in one step.
-                match identifier
-                    .strip_prefix(dom)
-                    .and_then(|r| r.strip_prefix('/'))
-                    .filter(|r| !r.is_empty())
-                {
-                    Some(rest) => EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{dom}'. An identifier without crystalline:// is domain-relative - retry with '{rest}'"
-                    )),
-                    None => EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{dom}'"
-                    )),
+            let d = match found {
+                DomainLookup::Found(d) => d,
+                DomainLookup::Missing { suggest } => {
+                    return Err(EngineError::NotFound(domain_miss(
+                        identifier,
+                        dom,
+                        suggest.as_deref(),
+                    )));
                 }
-            })?;
+            };
             let source = self.read_source(dom);
             return Ok((d, source));
         }
@@ -4523,6 +4847,55 @@ impl Engine {
                     desc.permalink, desc.domain
                 ))
             })
+    }
+}
+
+/// The not-found text for a domain-scoped identifier. The prefix is the one a
+/// never-written engram has always produced and stays byte for byte; the
+/// glued-domain hint wins, then the permalink the identifier probably meant.
+pub(crate) fn domain_miss(identifier: &str, dom: &str, suggest: Option<&str>) -> String {
+    // The one wrong shape agents keep producing is the domain glued onto the
+    // permalink; the error teaches the fix so a stumble recovers in one step.
+    if let Some(rest) = identifier
+        .strip_prefix(dom)
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|r| !r.is_empty())
+    {
+        return format!(
+            "no engram '{identifier}' in domain '{dom}'. An identifier without crystalline:// is domain-relative - retry with '{rest}'"
+        );
+    }
+    match suggest {
+        Some(permalink) => {
+            format!("no engram '{identifier}' in domain '{dom}'. Did you mean `{permalink}`?")
+        }
+        None => format!("no engram '{identifier}' in domain '{dom}'"),
+    }
+}
+
+#[cfg(test)]
+mod domain_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn a_domain_miss_keeps_its_prefix_and_lets_the_glued_hint_win() {
+        assert_eq!(
+            domain_miss("nope", "eng", None),
+            "no engram 'nope' in domain 'eng'"
+        );
+        assert_eq!(
+            domain_miss(
+                "guides/Agent Workflow Guide",
+                "eng",
+                Some("guides/agent-workflow-guide")
+            ),
+            "no engram 'guides/Agent Workflow Guide' in domain 'eng'. Did you mean `guides/agent-workflow-guide`?"
+        );
+        // The glued-domain hint wins over a suggestion.
+        assert_eq!(
+            domain_miss("eng/Guide", "eng", Some("eng/guide")),
+            "no engram 'eng/Guide' in domain 'eng'. An identifier without crystalline:// is domain-relative - retry with 'Guide'"
+        );
     }
 }
 
@@ -5660,6 +6033,29 @@ fn changed_anything(report: &SyncReport) -> bool {
     report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
 }
 
+/// A captured audience on the change bus, released when dropped, so a
+/// rename or removal that stops half way never leaves a name captured.
+pub(crate) struct AudienceHold<'a> {
+    bus: &'a crate::changes::ChangeBus,
+    name: String,
+}
+
+impl Drop for AudienceHold<'_> {
+    fn drop(&mut self) {
+        self.bus.release(&self.name);
+    }
+}
+
+/// The label a share actor's own changes are announced under: the account,
+/// or nobody for the machine owner and an unauthenticated HTTP agent, the
+/// rule `crate::changes::change_label` applies to a scope.
+fn share_actor_label(actor: &ShareActor) -> Option<String> {
+    match actor {
+        ShareActor::Account(name) => Some(name.clone()),
+        ShareActor::Owner | ShareActor::HttpAgent => None,
+    }
+}
+
 /// The refusal for a path whose filename is one of the OKF reserved names.
 /// Actionable: it says which name is reserved, why, and what to do instead.
 fn reserved_name_error(rel: &str) -> String {
@@ -5744,10 +6140,6 @@ fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, contents.as_bytes())
 }
 
-/// Distinguishes one write's temp file from another's within this process. See
-/// [`write_bytes`].
-static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
@@ -5756,22 +6148,11 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
         })?;
     }
     // Write to a sibling temp then rename so the watcher never sees a partial
-    // file. The name carries a process-lifetime counter as well as the pid:
-    // the pid alone gives every writer in this process the same temp path, so
-    // two writes to one file racing inside one daemon would interleave their
-    // bytes there and rename the blend into place. Per-file locking keeps the
-    // guarded verbs off each other, but the counter is what makes the temp
-    // file private to a single write whichever path produced it.
-    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // The suffix is appended to the whole filename rather than replacing its
-    // extension, so an attachment's temp file keeps naming the file it belongs
-    // to (`shot.png.tmp.<pid>.<seq>`) instead of claiming an extension it never
-    // had. For a `.md` engram the two spellings produce the same name.
-    let name = abs
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let tmp = abs.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+    // file. The name is hidden, so a crash between the write and the rename
+    // leaves nothing a sync or a share picks up, and its counter keeps two
+    // writes to one file inside one process apart: the pid alone would give
+    // both the same temp path and they would interleave their bytes there.
+    let tmp = crystalline_core::path::hidden_temp_path(abs, "tmp");
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,
@@ -7251,6 +7632,7 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
         if changed_anything(report) {
             self.engine.refresh_index_files(name).await;
         }
+        self.engine.announce_report(name, report, None);
     }
 }
 
@@ -8865,5 +9247,155 @@ mod share_actor_tests {
 
         let offline = enrich_write_error(RemoteError::Offline, Some("alice"), "team/knowledge");
         assert_eq!(offline.to_string(), RemoteError::Offline.to_string());
+    }
+}
+
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+    use crystalline_index::{PathChangeKind, TursoStore};
+
+    fn change(kind: PathChangeKind, path: &str) -> PathChange {
+        PathChange {
+            kind,
+            path: path.to_string(),
+            from: None,
+            from_permalink: None,
+            permalink: None,
+            checksum: None,
+        }
+    }
+
+    /// A batch that returns early still announces the rows it committed.
+    #[tokio::test]
+    async fn pending_announcements_are_made_on_an_early_return() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let mut rx = engine.changes().subscribe();
+        fn batch(engine: &Engine) -> Result<()> {
+            let mut pending = PendingAnnouncements::new(engine);
+            pending.push_path("eng", change(PathChangeKind::Modified, "a.md"));
+            pending.push_path("eng", change(PathChangeKind::Modified, "b.md"));
+            Err(EngineError::Internal("the third row failed".to_string()))
+        }
+        assert!(batch(&engine).is_err());
+        let heard: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|envelope| match envelope.change {
+                Change::Engram(change) => change.path,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(heard, vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    /// A generated listing never rides the bus, even when a report names
+    /// one: the sync's delete loop still takes a reserved row recorded
+    /// before the exclusion existed, and that deletion is not an engram's.
+    /// Catches a report announced without the listing filter.
+    #[tokio::test]
+    async fn a_listing_in_a_report_is_dropped_and_the_rest_is_announced() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let mut rx = engine.changes().subscribe();
+        engine.announce_paths(
+            "eng",
+            vec![
+                change(PathChangeKind::Deleted, "topic/index.md"),
+                change(PathChangeKind::Modified, "topic/a.md"),
+            ],
+            None,
+        );
+        let heard = rx.try_recv().unwrap();
+        match heard.change {
+            Change::Engram(engram) => {
+                assert_eq!(engram.path, "topic/a.md");
+                assert_eq!(
+                    engram.permalink, "topic/a",
+                    "the path's slug when none was read"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the listing was dropped");
+
+        // A report of nothing but listings announces nothing at all.
+        engine.announce_paths("eng", vec![change(PathChangeKind::Added, "index.md")], None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The collapse sits exactly above the threshold: 32 announced paths are
+    /// 32 engram events, 33 are one domain event.
+    #[tokio::test]
+    async fn thirty_two_paths_announce_each_and_thirty_three_collapse() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let paths = |n: usize| {
+            (0..n)
+                .map(|i| change(PathChangeKind::Added, &format!("p{i}.md")))
+                .collect::<Vec<_>>()
+        };
+        let mut rx = engine.changes().subscribe();
+        engine.announce_paths("eng", paths(crate::changes::COLLAPSE_THRESHOLD), None);
+        let mut heard = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            heard.push(envelope.change);
+        }
+        assert_eq!(heard.len(), crate::changes::COLLAPSE_THRESHOLD);
+        assert!(heard.iter().all(|c| matches!(c, Change::Engram(_))));
+
+        engine.announce_paths("eng", paths(crate::changes::COLLAPSE_THRESHOLD + 1), None);
+        let heard = rx.try_recv().unwrap();
+        assert!(matches!(heard.change, Change::Domain(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A pass that drops many drafts collapses the same way, so leaving
+    /// review mode over a large overlay does not evict the ring.
+    #[tokio::test]
+    async fn a_large_batch_of_draft_drops_collapses_to_one_domain_event() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        );
+        let drop = |i: usize| EngramChanged {
+            domain: "eng".to_string(),
+            permalink: format!("p{i}"),
+            path: format!("p{i}.md"),
+            kind: ChangeKind::Deleted,
+            from: None,
+            checksum: None,
+            actor: Some("ada".to_string()),
+            draft_of: Some("ada".to_string()),
+            audience: None,
+        };
+        let mut rx = engine.changes().subscribe();
+        engine.announce_draft_drops("eng", (0..3).map(drop).collect());
+        for _ in 0..3 {
+            assert!(matches!(rx.try_recv().unwrap().change, Change::Engram(_)));
+        }
+        engine.announce_draft_drops(
+            "eng",
+            (0..=crate::changes::COLLAPSE_THRESHOLD).map(drop).collect(),
+        );
+        assert!(matches!(rx.try_recv().unwrap().change, Change::Domain(_)));
+        assert!(rx.try_recv().is_err());
     }
 }

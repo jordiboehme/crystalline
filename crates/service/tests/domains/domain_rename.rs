@@ -8,6 +8,7 @@
 //! a note otherwise), through one store shared by `Arc` so a second engine
 //! over the same store stands for a restarted daemon.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use crystalline_core::config::{DomainEntry, GlobalConfig, NameOrigin};
 use crystalline_core::provision::receipt::{self, DomainSources, ProvisionReceipt};
 use crystalline_index::{Store, TursoStore};
+use crystalline_service::changes::{Change, DomainAudience, Envelope};
 use crystalline_service::engine::{Engine, EngineError, RenameStep};
 use crystalline_service::overlay::EnvOverlay;
 use crystalline_service::params::*;
@@ -1346,6 +1348,97 @@ both_backends!(
     a_local_rename_through_rename_domain_leaves_manifest_and_links_body
 );
 
+/// A full rename of `eng` over `manifest_text`, answering the MANIFEST it
+/// leaves behind without the `generated` stamp the edit path adds.
+async fn manifest_after_rename(store: Arc<Mutex<dyn Store>>, manifest_text: &str) -> String {
+    let m = machine(store).await;
+    std::fs::write(m.root.join("eng/MANIFEST.md"), manifest_text).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], true, "{report}");
+    std::fs::read_to_string(m.root.join("eng/MANIFEST.md"))
+        .unwrap()
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with("generated: "))
+        .collect()
+}
+
+/// A MANIFEST that names no domain yet gets `domain_name` right after the
+/// title, where a person adding it by hand puts it.
+async fn a_rename_puts_a_new_domain_name_right_after_the_title_body(store: Arc<Mutex<dyn Store>>) {
+    let renamed = manifest_after_rename(store, &manifest("Eng")).await;
+    assert_eq!(
+        renamed,
+        manifest("Eng").replacen("title: Eng\n", "title: Eng\ndomain_name: platform\n", 1)
+    );
+}
+both_backends!(
+    a_rename_puts_a_new_domain_name_right_after_the_title,
+    a_rename_puts_a_new_domain_name_right_after_the_title_body
+);
+
+/// A `domain_name` key spelled with quotes is the key: it is rewritten where
+/// it stands, never joined by a second copy the MANIFEST could not parse
+/// with.
+async fn a_rename_rewrites_a_quoted_domain_name_key_in_place_body(store: Arc<Mutex<dyn Store>>) {
+    let quoted = manifest("Eng").replacen(
+        "status: current\n",
+        "status: current\n\"domain_name\": eng-team\n",
+        1,
+    );
+    let renamed = manifest_after_rename(store, &quoted).await;
+    assert_eq!(
+        renamed,
+        manifest("Eng").replacen(
+            "status: current\n",
+            "status: current\ndomain_name: platform\n",
+            1
+        )
+    );
+}
+both_backends!(
+    a_rename_rewrites_a_quoted_domain_name_key_in_place,
+    a_rename_rewrites_a_quoted_domain_name_key_in_place_body
+);
+
+/// A MANIFEST in flow style cannot take the new name key by key: the
+/// rename leaves it byte for byte, reports it as not written and says why.
+async fn a_rename_reports_a_flow_style_manifest_as_not_written_body(store: Arc<Mutex<dyn Store>>) {
+    let m = machine(store).await;
+    let flow = "---\n{type: manifest, title: Eng, permalink: manifest, tags: [manifest], status: current, recorded_at: 2026-01-01, domain_name: eng-team}\n---\n\n# Eng\n\n## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n";
+    std::fs::write(m.root.join("eng/MANIFEST.md"), flow).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], false, "{report}");
+    let note = report["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("domain_name") && note.contains("by hand"),
+        "{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        flow
+    );
+    // The MANIFEST still declares the old name, and so does the record.
+    let cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    assert_eq!(
+        cfg.domains["platform"].canonical_seen.as_deref(),
+        Some("eng-team")
+    );
+}
+both_backends!(
+    a_rename_reports_a_flow_style_manifest_as_not_written,
+    a_rename_reports_a_flow_style_manifest_as_not_written_body
+);
+
 /// Two private domains of bob's beside the full-rename machine, `archive`
 /// (ada is a viewer) and `vault` (ada cannot see it), each with an `old.md`
 /// linking to `eng` by its canonical name. Answers that engram's text.
@@ -2052,3 +2145,323 @@ async fn adoption_leaves_a_domain_with_a_pending_rename_journal_alone() {
     engine.sync(None).await.unwrap();
     assert_fully_renamed(&f, &engine).await;
 }
+
+// --- item 11: a reviewing domain's MANIFEST ------------------------------------
+
+const FLOW_MANIFEST: &str = "---\n{type: manifest, title: Eng, permalink: manifest, tags: [manifest], status: current, recorded_at: 2026-01-01, domain_name: eng-team}\n---\n\n# Eng\n\n## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n";
+
+const KEPT_IN_DRAFT: &str = "The MANIFEST's frontmatter is in a form Crystalline cannot change key by key (such as {title: ...}), so its domain_name was left as it is; set it to 'platform' by hand in your draft of the MANIFEST.";
+
+fn draft_record(text: &str, path: &str) -> crystalline_index::EngramRecord {
+    let mut record = crystalline_index::EngramRecord::from_engram(
+        &crystalline_core::parse_engram(text).unwrap(),
+        path,
+        crystalline_index::FileStamp {
+            mtime: 0,
+            size: text.len() as u64,
+            sha256: "0".repeat(64),
+        },
+    );
+    record.content = text.to_string();
+    record
+}
+
+/// [`machine`], with `eng` reviewing changes, its MANIFEST holding `base`,
+/// and the owner's draft of that MANIFEST holding `draft` when one is given.
+async fn reviewing_eng(
+    store: Arc<Mutex<dyn Store>>,
+    base: &str,
+    draft: Option<&str>,
+) -> (Machine, Arc<Engine>) {
+    let m = machine(store).await;
+    std::fs::write(m.root.join("eng/MANIFEST.md"), base).unwrap();
+    let mut cfg = crystalline_service::overlay::load_file(&m.config_path()).unwrap();
+    cfg.domains.get_mut("eng").unwrap().review =
+        Some(crystalline_core::config::ReviewMode::Overlay);
+    crystalline_core::config::save_yaml(&m.config_path(), &cfg).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    if let Some(draft) = draft {
+        let id = domain_id(&m.store, "eng").await.expect("eng indexed");
+        m.store
+            .lock()
+            .await
+            .upsert_overlay(
+                crystalline_index::DomainId(id),
+                "owner",
+                &draft_record(draft, "MANIFEST.md"),
+            )
+            .await
+            .unwrap();
+        crystalline_service::overlay_journal::journal_write(
+            &m.state(),
+            "eng",
+            "owner",
+            "MANIFEST.md",
+            draft,
+        )
+        .unwrap();
+    }
+    (m, engine)
+}
+
+/// The owner's draft of the renamed domain's MANIFEST, if there is one.
+async fn owner_manifest_draft(m: &Machine) -> Option<String> {
+    let id = domain_id(&m.store, "platform").await.expect("renamed row");
+    let store = m.store.lock().await;
+    store
+        .overlay_entries(crystalline_index::DomainId(id), "owner")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.path == "MANIFEST.md" && !entry.tombstone)
+        .map(|entry| entry.content)
+}
+
+async fn a_reviewing_domain_with_a_flow_style_manifest_renames_and_leaves_it_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(store, FLOW_MANIFEST, None).await;
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_written"], false, "{report}");
+    assert_eq!(report["manifest_draft"], false, "{report}");
+    assert_eq!(report["note"], KEPT_IN_DRAFT, "{report}");
+    assert_eq!(owner_manifest_draft(&m).await, None, "nothing was drafted");
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        FLOW_MANIFEST
+    );
+    assert!(!m.journal().is_file(), "the rename finished");
+    assert!(!engine.is_renaming("eng") && !engine.is_renaming("platform"));
+}
+both_backends!(
+    a_reviewing_domain_with_a_flow_style_manifest_renames_and_leaves_it,
+    a_reviewing_domain_with_a_flow_style_manifest_renames_and_leaves_it_body
+);
+
+async fn a_flow_style_draft_over_a_block_style_base_is_judged_by_the_draft_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(
+        store,
+        &manifest_named("Eng", "eng-team"),
+        Some(FLOW_MANIFEST),
+    )
+    .await;
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_draft"], false, "{report}");
+    assert_eq!(report["note"], KEPT_IN_DRAFT, "{report}");
+    assert_eq!(
+        owner_manifest_draft(&m).await.as_deref(),
+        Some(FLOW_MANIFEST),
+        "the draft is left as it is"
+    );
+}
+both_backends!(
+    a_flow_style_draft_over_a_block_style_base_is_judged_by_the_draft,
+    a_flow_style_draft_over_a_block_style_base_is_judged_by_the_draft_body
+);
+
+async fn a_block_style_draft_over_a_flow_style_base_is_drafted_body(store: Arc<Mutex<dyn Store>>) {
+    let (m, engine) = reviewing_eng(
+        store,
+        FLOW_MANIFEST,
+        Some(&manifest_named("Eng", "eng-team")),
+    )
+    .await;
+    let report = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(report["manifest_draft"], true, "{report}");
+    assert!(report["note"].is_null(), "{report}");
+    let draft = owner_manifest_draft(&m).await.expect("the draft is there");
+    assert!(draft.contains("domain_name: platform"), "{draft}");
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        FLOW_MANIFEST,
+        "the reviewed file is untouched"
+    );
+}
+both_backends!(
+    a_block_style_draft_over_a_flow_style_base_is_drafted,
+    a_block_style_draft_over_a_flow_style_base_is_drafted_body
+);
+
+async fn a_full_rename_of_a_domain_without_a_manifest_is_still_refused_naming_local_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    std::fs::remove_file(m.root.join("eng/MANIFEST.md")).unwrap();
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    let err = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("a full rename needs a MANIFEST to write");
+    let said = err.to_string();
+    assert!(
+        said.contains("domain 'eng' has no MANIFEST to write the new name into")
+            && said.contains("--local"),
+        "{said}"
+    );
+}
+both_backends!(
+    a_full_rename_of_a_domain_without_a_manifest_is_still_refused_naming_local,
+    a_full_rename_of_a_domain_without_a_manifest_is_still_refused_naming_local_body
+);
+
+async fn a_reviewing_domain_without_a_manifest_is_refused_naming_local_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(store, FLOW_MANIFEST, None).await;
+    std::fs::remove_file(m.root.join("eng/MANIFEST.md")).unwrap();
+    engine.sync(None).await.unwrap();
+    let err = engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("a full rename needs a MANIFEST to write");
+    let said = err.to_string();
+    assert!(
+        said.contains("domain 'eng' has no MANIFEST to write the new name into")
+            && said.contains("--local"),
+        "{said}"
+    );
+    assert!(!m.journal().is_file(), "nothing was started");
+    assert!(!engine.is_renaming("eng"));
+}
+both_backends!(
+    a_reviewing_domain_without_a_manifest_is_refused_naming_local,
+    a_reviewing_domain_without_a_manifest_is_refused_naming_local_body
+);
+
+async fn a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let (m, engine) = reviewing_eng(store, FLOW_MANIFEST, None).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain("eng", "platform", false, &Scope::Unrestricted)
+        .await
+        .expect_err("the failpoint stops the rename");
+    assert!(m.journal().is_file(), "the journal stays");
+    drop(engine);
+
+    let restarted = m.engine(false).await;
+    let recovered = restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("a journal was left to finish");
+    assert_eq!(recovered["manifest_written"], false, "{recovered}");
+    assert_eq!(recovered["manifest_draft"], false, "{recovered}");
+    assert_eq!(recovered["note"], KEPT_IN_DRAFT, "{recovered}");
+    assert_eq!(owner_manifest_draft(&m).await, None, "nothing was drafted");
+    assert_eq!(
+        std::fs::read_to_string(m.root.join("eng/MANIFEST.md")).unwrap(),
+        FLOW_MANIFEST
+    );
+    assert!(!m.journal().is_file(), "the rename finished");
+}
+both_backends!(
+    a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note,
+    a_resumed_rename_of_a_reviewing_domain_keeps_the_manifest_and_the_note_body
+);
+
+// --- item 14: a resumed rename's audience --------------------------------------
+
+/// Every `domain` frame heard, as `(domain, audience)`.
+fn domain_frames(
+    rx: &mut tokio::sync::broadcast::Receiver<Envelope>,
+) -> Vec<(String, Option<DomainAudience>)> {
+    let mut frames = Vec::new();
+    while let Ok(envelope) = rx.try_recv() {
+        if let Change::Domain(domain) = envelope.change {
+            frames.push((domain.domain, domain.audience));
+        }
+    }
+    frames
+}
+
+fn nobody() -> Option<DomainAudience> {
+    Some(DomainAudience::Accounts(HashSet::new()))
+}
+
+/// A rename stopped after its index row, before the privacy records moved,
+/// so a resume that read the audience afresh would find ada among the old
+/// name's readers.
+async fn stopped_rename(m: &Machine) {
+    let engine = m.engine(true).await;
+    engine.fail_rename_after(Some(RenameStep::IndexRow));
+    engine
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the failpoint stops the rename");
+    assert!(m.journal().is_file(), "the journal stays");
+}
+
+fn assert_owner_only(m: &Machine, frames: &[(String, Option<DomainAudience>)]) {
+    let old: Vec<_> = frames.iter().filter(|(d, _)| *d == m.eng).collect();
+    assert!(!old.is_empty(), "the old name is announced: {frames:?}");
+    assert!(
+        old.iter().all(|(_, audience)| *audience == nobody()),
+        "to the machine owner only: {frames:?}"
+    );
+    assert!(
+        frames.contains(&(m.platform.clone(), None)),
+        "the new name keeps the ordinary check: {frames:?}"
+    );
+}
+
+async fn a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    stopped_rename(&m).await;
+    let restarted = m.engine(true).await;
+    let mut rx = restarted.changes().subscribe();
+    restarted
+        .recover_rename_journal()
+        .await
+        .unwrap()
+        .expect("a journal was left to finish");
+    assert_owner_only(&m, &domain_frames(&mut rx));
+}
+both_backends!(
+    a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only,
+    a_rename_recovered_at_start_announces_the_old_name_to_the_owner_only_body
+);
+
+async fn a_rename_sent_again_announces_the_old_name_to_the_owner_only_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    stopped_rename(&m).await;
+    let again = m.engine(true).await;
+    let mut rx = again.changes().subscribe();
+    again
+        .rename_domain_local(
+            &m.eng,
+            &m.platform,
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("the same rename sent again finishes the journal");
+    assert_owner_only(&m, &domain_frames(&mut rx));
+}
+both_backends!(
+    a_rename_sent_again_announces_the_old_name_to_the_owner_only,
+    a_rename_sent_again_announces_the_old_name_to_the_owner_only_body
+);

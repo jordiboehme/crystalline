@@ -1,0 +1,607 @@
+{
+  "version": 3,
+  "seed": 1474239603151452,
+  "domain": "station",
+  "permalink": "manifest",
+  "title": "Station Crystalline",
+  "archetype": "bridge",
+  "condition": "clean",
+  "width": 7,
+  "depth": 6,
+  "grid": [
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+    "......."
+  ],
+  "hall": {
+    "x0": 0,
+    "y0": 0,
+    "x1": 7,
+    "y1": 6
+  },
+  "bays": [],
+  "corridor": null,
+  "entrance": {
+    "x": 3,
+    "y": 5
+  },
+  "ceiling": 4.4,
+  "spawn": {
+    "x": 3,
+    "y": 5,
+    "yaw": 0
+  },
+  "fixtures": [
+    {
+      "kind": "placard",
+      "slot": {
+        "x": 2,
+        "y": 5,
+        "side": "s"
+      },
+      "lines": [
+        "Station Crystalline",
+        "TYPE manifest",
+        "STATUS stable",
+        "SALIENCE 7"
+      ]
+    },
+    {
+      "kind": "door",
+      "slot": {
+        "x": 1,
+        "y": 0,
+        "side": "n"
+      },
+      "style": "sliding",
+      "relType": "supersedes",
+      "label": "supersedes The Old Bridge",
+      "address": {
+        "domain": "station",
+        "permalink": "old-bridge"
+      },
+      "sealedLabel": null,
+      "seed": 3945860651236339
+    },
+    {
+      "kind": "door",
+      "slot": {
+        "x": 3,
+        "y": 0,
+        "side": "n"
+      },
+      "style": "blast",
+      "relType": "depends_on",
+      "label": "depends_on Reactor Core",
+      "address": {
+        "domain": "station",
+        "permalink": "reactor-core"
+      },
+      "sealedLabel": null,
+      "seed": 5736498266678518
+    },
+    {
+      "kind": "portal",
+      "slot": {
+        "x": 5,
+        "y": 0,
+        "side": "n"
+      },
+      "label": "Cargo Manifest",
+      "address": {
+        "domain": "logistics",
+        "permalink": "cargo-manifest"
+      },
+      "crossDomain": true,
+      "sealedLabel": null,
+      "seed": 8564350657864169
+    },
+    {
+      "kind": "terminal",
+      "slot": {
+        "x": 0,
+        "y": 4,
+        "side": "w"
+      },
+      "heading": "Scope",
+      "lines": [
+        "Everything the crew learned while keeping the station alive.",
+        "Decisions, runbooks and the odd warning about the reactor."
+      ],
+      "section": 0,
+      "seed": 2510781472804312,
+      "variant": 2
+    },
+    {
+      "kind": "terminal",
+      "slot": {
+        "x": 0,
+        "y": 2,
+        "side": "w"
+      },
+      "heading": "Routing",
+      "lines": [
+        "Engineering questions go to the reactor deck.",
+        "Cargo questions go through the portal to logistics."
+      ],
+      "section": 0,
+      "seed": 5259207943204841,
+      "variant": 0
+    },
+    {
+      "kind": "machine",
+      "slot": {
+        "x": 6,
+        "y": 1,
+        "side": "e"
+      },
+      "machine": "containment",
+      "tag": "navigation",
+      "hue": 196,
+      "seed": 1206274509564404,
+      "variant": 0
+    },
+    {
+      "kind": "machine",
+      "slot": {
+        "x": 6,
+        "y": 3,
+        "side": "e"
+      },
+      "machine": "fabricator",
+      "tag": "reactor",
+      "hue": 152,
+      "seed": 5755076367619376,
+      "variant": 2
+    },
+    {
+      "kind": "hatch",
+      "slot": {
+        "x": 5,
+        "y": 5,
+        "side": "s"
+      },
+      "label": "Crew Handbook links_to",
+      "address": {
+        "domain": "station",
+        "permalink": "crew-handbook"
+      },
+      "seed": 1781281134255863
+    },
+    {
+      "kind": "poster",
+      "slot": {
+        "x": 6,
+        "y": 5,
+        "side": "e"
+      },
+      "category": "warning",
+      "lines": [
+        "The reactor runs hot for an hour after every jump."
+      ],
+      "seed": 6790036374806322
+    }
+  ],
+  "decor": [],
+  "scaffold": [],
+  "heroes": [
+    {
+      "kind": "photo-console",
+      "variant": 0,
+      "x": 1.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 2529401834272219
+    }
+  ],
+  "props": [
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 1200267460172412
+    },
+    {
+      "kind": "sign-plate",
+      "variant": 4,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2817194555060214
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 8804435152404179
+    },
+    {
+      "kind": "keycard-reader",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2732439372879637
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 5592039301943200
+    },
+    {
+      "kind": "keycard-reader",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 7278185513487768
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2567849430954135
+    },
+    {
+      "kind": "light-strip",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 0.5,
+      "turn": 1,
+      "seed": 6510771300869815
+    },
+    {
+      "kind": "conduit-cabinet",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 7,
+      "y": 0.5,
+      "turn": 3,
+      "seed": 3214697599861437
+    },
+    {
+      "kind": "extinguisher",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0,
+      "y": 1.5,
+      "turn": 1,
+      "seed": 1988428737779548
+    },
+    {
+      "kind": "vent-grille",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 3.5,
+      "turn": 1,
+      "seed": 8424606828154710
+    },
+    {
+      "kind": "extinguisher",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 7,
+      "y": 4.5,
+      "turn": 3,
+      "seed": 7238002020838373
+    },
+    {
+      "kind": "conduit-cabinet",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 0,
+      "y": 5.5,
+      "turn": 1,
+      "seed": 6177168825915259
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 669630369330755
+    },
+    {
+      "kind": "locker-bank",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 2729718215741009
+    },
+    {
+      "kind": "cable-tray",
+      "variant": 0,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 3576725847611317
+    },
+    {
+      "kind": "sign-plate",
+      "variant": 1,
+      "anchor": "wall",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 7113353366359555
+    },
+    {
+      "kind": "crate-stack",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 6.5,
+      "y": 0.5,
+      "turn": 1,
+      "seed": 4140905444386157
+    },
+    {
+      "kind": "stool",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 0.5,
+      "y": 1.5,
+      "turn": 2,
+      "seed": 207621818426117
+    },
+    {
+      "kind": "stool",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 6.85,
+      "y": 2.5,
+      "turn": 3,
+      "seed": 793710617531822
+    },
+    {
+      "kind": "crate-stack",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 0.475,
+      "y": 3.5,
+      "turn": 1,
+      "seed": 6354344531687045
+    },
+    {
+      "kind": "crate",
+      "variant": 0,
+      "anchor": "floor",
+      "x": 1.5,
+      "y": 4.5,
+      "turn": 2,
+      "seed": 5867523987053919
+    },
+    {
+      "kind": "stool",
+      "variant": 1,
+      "anchor": "floor",
+      "x": 6.5,
+      "y": 4.5,
+      "turn": 2,
+      "seed": 5726256422500225
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 0.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 6096850922754809
+    },
+    {
+      "kind": "cable-loop",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 4613106510095990
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 2.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 1737311593401343
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 4.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 2622113022764495
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 6.5,
+      "y": 0,
+      "turn": 2,
+      "seed": 6640664286645682
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 0.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 1234190892904149
+    },
+    {
+      "kind": "beacon",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 5200900214491441
+    },
+    {
+      "kind": "ceiling-tray",
+      "variant": 1,
+      "anchor": "ceiling",
+      "x": 6.5,
+      "y": 6,
+      "turn": 0,
+      "seed": 6423194859584089
+    }
+  ],
+  "curios": [],
+  "finish": {
+    "accent": 2,
+    "hallWalls": 0,
+    "bayWalls": [],
+    "corridorWalls": 2
+  },
+  "decals": [
+    {
+      "kind": "stencil",
+      "on": "floor",
+      "x": 3.5,
+      "y": 4,
+      "turn": 0,
+      "along": 0,
+      "h": 0,
+      "width": 1,
+      "length": 0.3,
+      "variant": 0,
+      "seed": 475181656385895,
+      "stencil": {
+        "deck": 1,
+        "bay": 6,
+        "letter": 0,
+        "lines": 1
+      }
+    },
+    {
+      "kind": "stencil",
+      "on": "wall",
+      "x": 4.5,
+      "y": 6,
+      "turn": 0,
+      "along": 0,
+      "h": 1.5,
+      "width": 0.9,
+      "length": 0.3,
+      "variant": 0,
+      "seed": 475181656385895,
+      "stencil": {
+        "deck": 1,
+        "bay": 6,
+        "letter": 0,
+        "lines": 2
+      }
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 6.375,
+      "y": 3.5,
+      "turn": 3,
+      "along": 0,
+      "h": 0,
+      "width": 1.8,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 232453483196428
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 6.375,
+      "y": 1.5,
+      "turn": 3,
+      "along": 0,
+      "h": 0,
+      "width": 1.8,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 2788757694276330
+    },
+    {
+      "kind": "chevrons",
+      "on": "floor",
+      "x": 3.5,
+      "y": 0.235,
+      "turn": 2,
+      "along": 0,
+      "h": 0,
+      "width": 1.6,
+      "length": 0.3,
+      "variant": 1,
+      "seed": 3793846840796860
+    }
+  ],
+  "lights": [
+    {
+      "x0": 0,
+      "y0": 0,
+      "x1": 4,
+      "y1": 4,
+      "level": 220,
+      "special": "steady",
+      "seed": 7666351571739203
+    },
+    {
+      "x0": 4,
+      "y0": 0,
+      "x1": 7,
+      "y1": 4,
+      "level": 220,
+      "special": "steady",
+      "seed": 6667534287569816
+    },
+    {
+      "x0": 0,
+      "y0": 4,
+      "x1": 4,
+      "y1": 6,
+      "level": 220,
+      "special": "steady",
+      "seed": 860357435923776
+    },
+    {
+      "x0": 4,
+      "y0": 4,
+      "x1": 7,
+      "y1": 6,
+      "level": 220,
+      "special": "steady",
+      "seed": 2794952394870058
+    }
+  ],
+  "dropped": 0,
+  "inboundMore": 0
+}

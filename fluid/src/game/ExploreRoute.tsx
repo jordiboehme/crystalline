@@ -1,0 +1,489 @@
+/**
+ * The game route: every place of the station under `/π` (M3 C2, C4), read
+ * from the location itself with `addressOfGameLocation` - the airlock at
+ * `/π`, a domain's bridge at `/π/d/<domain>`, a deck at the same with
+ * `?path=<folder>` (and `&section=<n>`), an engram's room at
+ * `/π/d/<domain>/e/<permalink>`, and the airlock again for any other path
+ * under the prefix - and every room the player walks on to from there.
+ *
+ * The route ships in every build, as a lazy chunk of its own (see
+ * `routes.tsx`); the C64 screen behind the header's gem is its way in, and
+ * the launch primes the sound in its gesture (`launch.ts`).
+ *
+ * The URL and the session take turns. The URL is where the player means to
+ * be: the session is started on it, and a URL that changes under a running
+ * session (a manual edit, the browser's back and forward) sends the player
+ * there with `go`. The session is where the player is: when it lands in a
+ * room it replaces the URL with that room's route, so a reload comes back
+ * to the same room and the history is not filled with every door walked
+ * through. That replace changes the location too, and the route must not
+ * answer it with a second journey to the room the player just entered,
+ * which would reload the room and lose where the door put them. So the
+ * route keeps the one station address the URL is following: the one it
+ * last sent the session to, or, once the session lands somewhere of its
+ * own accord, the address it entered, set before the session's replace
+ * reaches the router. A new URL is followed exactly when it names another
+ * address (`sameStation`: kind, domain, folder and section, or
+ * permalink). It is not
+ * compared with the room the player stands in: going back to that room
+ * while another one is still loading must cancel the load, and going
+ * forward again to a room that failed to load must try it again.
+ *
+ * The device is refused before the first paint exactly as in the look
+ * demo, and a refused device releases the sound the launch primed, since
+ * nothing will ever borrow it (`releasePrimedAudio`). Otherwise the session
+ * is created in an effect once the canvas exists and disposed in its
+ * cleanup. The HUD is written by the session straight into
+ * the DOM (`useHud`); the CRT reader is mounted while a terminal is read,
+ * and closing it hands the keys back to the session.
+ *
+ * Typing `idclev` opens the level select over the station (`LevelSelect`):
+ * the session says so through `onLevels`, which only this route passes, so
+ * the look demo and the model gallery ignore the word. The select lists
+ * the domains, marks the one the URL names (none in the airlock), and on
+ * Enter or a click asks the
+ * session to `jump` to that domain's bridge, a journey like any other that
+ * replaces the URL when it lands. Esc hands the keys back through
+ * `closeLevels`.
+ *
+ * Space at a lift opens its stops over the station (`LiftSelect`): the
+ * session says so through `onLift`, which only this route passes, so the
+ * look demo and the model gallery ignore the key. The overlay lists the
+ * lift's own stops, in the lift's own order, and on Enter or a click asks
+ * the session to `ride` to that stop's index in the lift's stops, a journey
+ * like any other that replaces the URL when it lands. Esc hands the keys
+ * back through `closeLift`.
+ *
+ * Only this route passes the session its `consoleRoom` option, so only
+ * here does walking through a police box's open doors lead into the
+ * console room, and its inner doors out to a domain's bridge picked from
+ * the domain listing (`loadDomainRows`, the sidebar's own cached query).
+ * The console room has no address: the URL keeps naming the room walked
+ * in from, so a reload inside comes back there.
+ *
+ * F, in the room and in the CRT reader alike, opens the Fluid page of the
+ * address the player stands at (`fluidRouteOfStation`): `/` in the
+ * airlock, the domain page on a bridge, the folder on a deck, the engram's
+ * reading page in its room.
+ *
+ * The station pauses when the pointer lock ends or Esc is pressed with
+ * nothing else open (the session's own decision, `onPause`), and the route
+ * shows the pause screen (`PauseScreen`) over the still station, with the
+ * room's label and the time the lock ended taken from the session as it
+ * paused (the label again when a load lands under the pause). `CONT`
+ * resumes the session inside its own click or key, which asks for the
+ * lock again. `RUN/STOP` or Esc is the way out: the route
+ * replaces its own history entry with the Fluid page of the place the
+ * player is at (`fluidRouteOfStation`), so Back from that page never goes
+ * into the station again. Before the first room lands the session is at
+ * no place yet, and the way out leads to the page of the address the URL
+ * last sent it to; the unmount that follows disposes the session.
+ *
+ * The route owns the sound (M4 C28). With the session it makes a mixer
+ * (`audio/mixer.ts`) that borrows the context the launch primed in its
+ * gesture (`takePrimedAudio`, never closed here: the launch keeps it, so
+ * StrictMode's second mount borrows the same one, F29) or, on a reload with
+ * nothing primed, makes its own on the first click or key, and the director
+ * (`audio/director.ts`) the session sends its cues to. The context is
+ * suspended while the pause shows or the tab is hidden and resumed once
+ * neither holds; the mount resumes it too, since the first mount's cleanup
+ * in StrictMode suspended the one it borrowed. The unmount disposes the
+ * director, which closes the mixer: a context it made is closed, a borrowed
+ * one suspended and left to the launch.
+ *
+ * The route listens to the change stream itself (M4 C13): `Layout`, whose
+ * provider invalidates for every other screen, is not mounted here. The
+ * mount marks the whole cache stale once before the first `go`, since the
+ * stream restarted on the way in and frames in that gap are lost. Every
+ * frame then marks the keys `changeKeys` names stale (Fluid's own table
+ * and the game's rows), refetching nothing, and hands the frame to the
+ * session (`changed`), which decides whether the room reacts. The
+ * subscription passes Fluid's identity (the cached `/auth/me`), so a frame
+ * streamed as another account never reaches the station. A live change
+ * that follows a moved engram replaces the URL through the same
+ * `navigate` as a landing.
+ *
+ * The station dials in when it starts (M4 C26): on a mount whose context
+ * is running (a launch from the C64 screen primed it; a bare reload's
+ * waits for the first click) and once per tab session (`CONNECTED_KEY` in
+ * `sessionStorage`), the connecting screen (`Connecting`) shows over the
+ * first room while it loads, the session is held busy and the director
+ * dials the domain's number (`dialNumber`). The mixer is made first in the
+ * effect and read before anything resumes the context. When the screen is
+ * done or skipped the sound fades out and the session gets its keys back.
+ * The screen's state is kept in a ref across StrictMode's remount, so the
+ * second mount (whose context the first one's cleanup suspended, and which
+ * finds the key already set) holds its own session busy and dials on its
+ * own director. The same one subscription hears the carrier (C27): a drop
+ * hangs up (`director.carrier`) and flashes `NO CARRIER`, the return after
+ * it plays a short handshake, and `carrierGate` lets a pair sound at most
+ * once per `CARRIER_QUIET_MS`. A change heard while the connecting screen
+ * shows is held, never played over the dial-in: once the screen is done,
+ * the state the carrier is in then is said once (a drop, or nothing).
+ */
+
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router";
+
+import { ME_QUERY_KEY } from "../auth/keys";
+import { subscribeToChanges } from "../events/ChangeStreamProvider";
+import { createDirector } from "./audio/director";
+import { createMixer, makeAudioContext } from "./audio/mixer";
+import {
+  CARRIER_START,
+  CONNECTED_KEY,
+  carrierGate,
+  dialNumber,
+} from "./audio/modem";
+import { changeKeys } from "./data/changes";
+import { loadDomainRows } from "./data/source";
+import { detectEnvironment, refusalReason, type Refusal } from "./device";
+import { hasWebGL2 } from "./gl/context";
+import { releasePrimedAudio, takePrimedAudio } from "./launch";
+import {
+  addressOfGameLocation,
+  domainOf,
+  fluidRouteOfStation,
+  sameStation,
+} from "./paths";
+import { createSession, type Session } from "./session";
+import { Connecting } from "./ui/Connecting";
+import { DeviceRefusal } from "./ui/DeviceRefusal";
+import { GAME_LEGEND } from "./ui/keys";
+import { LevelSelect } from "./ui/LevelSelect";
+import { LiftSelect } from "./ui/LiftSelect";
+import { PauseScreen } from "./ui/PauseScreen";
+import { StationView } from "./ui/StationView";
+import { useHud } from "./ui/useHud";
+import type { LiftStop, StationAddress } from "./world/types";
+
+/** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
+function openFluid(path: string) {
+  window.open(path, "_blank", "noopener");
+}
+
+/** What the connecting screen shows: the number dialled and the place. */
+interface DialIn {
+  number: string;
+  name: string;
+}
+
+/** The notice over a dropped change stream (M4 C27). */
+const NO_CARRIER = "NO CARRIER";
+
+/** Whether this tab already dialled in (M4 C26); unreadable storage: no. */
+function dialledIn(): boolean {
+  try {
+    return window.sessionStorage.getItem(CONNECTED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markDialledIn(): void {
+  try {
+    window.sessionStorage.setItem(CONNECTED_KEY, "1");
+  } catch {
+    // Unwritable storage: the next mount dials in again.
+  }
+}
+
+/** The dial-in for `address`: its domain's number and name. */
+function dialInFor(address: StationAddress): DialIn {
+  const domain = domainOf(address);
+  return {
+    number: dialNumber(domain),
+    name: domain === null ? "STATION" : domain.toUpperCase(),
+  };
+}
+
+/**
+ * The station address a location names. The route only matches under the
+ * `π` prefix, so `addressOfGameLocation` answers an address there; the
+ * airlock stands in for the null it keeps for a path outside the prefix.
+ */
+function addressAt(pathname: string, search: string): StationAddress {
+  return addressOfGameLocation(pathname, search) ?? { kind: "airlock" };
+}
+
+/**
+ * The route's screen. See the module doc for how the URL and the session
+ * take turns.
+ *
+ * `navigate` is held in a ref rather than handed to the session's effect as
+ * a dependency: the router may make a new one whenever the location
+ * changes, and a session torn down and rebuilt for that would lose its room
+ * on every door. The address is held in a ref for the same reason: the
+ * session is created once, on the address the URL names at that moment,
+ * and every later address reaches it through `go`.
+ */
+export default function ExploreRoute() {
+  const { pathname, search } = useLocation();
+  const address = addressAt(pathname, search);
+  const client = useQueryClient();
+  const navigate = useNavigate();
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const navigateRef = useRef(navigate);
+  const addressRef = useRef<StationAddress>(address);
+  // The address the URL is following: the one this route last sent the
+  // session to, or the one the session last landed in of its own accord.
+  // The location effect follows a URL that names any other address.
+  const requestedRef = useRef<StationAddress | null>(null);
+  const { sink, view, connector, reader } = useHud();
+  const [refusal] = useState<Refusal | null>(() =>
+    refusalReason(detectEnvironment(hasWebGL2)),
+  );
+  const [levels, setLevels] = useState(false);
+  const [lift, setLift] = useState<{
+    stops: LiftStop[];
+    note: string | null;
+  } | null>(null);
+  // The connecting screen while it shows (M4 C26), in state for the render
+  // and in a ref that StrictMode's remount keeps; and the stop of its
+  // sound.
+  const [dialIn, setDialIn] = useState<DialIn | null>(null);
+  const dialInRef = useRef<DialIn | null>(null);
+  const hangUpRef = useRef<(() => void) | null>(null);
+  // A carrier change heard while the connecting screen shows, held until it
+  // is done (the latest one), and what says a change once it is.
+  const heldCarrierRef = useRef<boolean | null>(null);
+  const sayCarrierRef = useRef<((up: boolean) => void) | null>(null);
+  // The pause, with what the screen shows taken from the session as it
+  // paused: the room's label and when the lock ended. Null while running.
+  const [pause, setPause] = useState<{
+    where: string | null;
+    lockEndedAt: number;
+  } | null>(null);
+
+  useEffect(() => {
+    navigateRef.current = navigate;
+  }, [navigate]);
+
+  useEffect(() => {
+    if (refusal !== null) releasePrimedAudio();
+  }, [refusal]);
+
+  useEffect(() => {
+    addressRef.current = addressAt(pathname, search);
+  }, [pathname, search]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (refusal !== null || canvas === null) return;
+    // The mixer first: whether the launch's context runs is read before
+    // anything below resumes it (M4 C26, F41).
+    const mixer = createMixer({
+      borrow: takePrimedAudio,
+      make: makeAudioContext,
+    });
+    const dialling =
+      dialInRef.current ??
+      (mixer.running && !dialledIn() ? dialInFor(addressRef.current) : null);
+    const director = createDirector(mixer);
+    // Quiet while the pause shows or the tab is hidden, playing otherwise.
+    let paused = false;
+    const syncSound = () => {
+      if (paused || document.visibilityState === "hidden") director.suspend();
+      else director.resume();
+    };
+    syncSound();
+    document.addEventListener("visibilitychange", syncSound);
+    const session = createSession({
+      canvas,
+      client,
+      hud: sink,
+      navigate: (path) => {
+        // The session landed somewhere of its own accord: that is now the
+        // address the URL is following, not the one this route asked for.
+        requestedRef.current = sessionRef.current?.current ?? null;
+        // A load that landed under the pause: the screen names that room.
+        const where = sessionRef.current?.where ?? null;
+        setPause((p) => (p === null ? p : { ...p, where }));
+        void navigateRef.current(path, { replace: true });
+      },
+      openFluid,
+      forceRgba8: false,
+      onLevels: setLevels,
+      onLift: setLift,
+      sound: director,
+      onPause: (isPaused) => {
+        paused = isPaused;
+        syncSound();
+        const running = sessionRef.current;
+        setPause(
+          isPaused && running !== null
+            ? { where: running.where, lockEndedAt: running.lockEndedAt }
+            : null,
+        );
+      },
+      consoleRoom: { domains: (signal) => loadDomainRows(client, signal) },
+    });
+    sessionRef.current = session;
+    if (dialling !== null) {
+      // The connecting screen holds the station until it is done.
+      dialInRef.current = dialling;
+      markDialledIn();
+      session.setBusy(true);
+      hangUpRef.current = director.dial(dialling.number);
+      setDialIn(dialling);
+    } else {
+      session.setBusy(false);
+    }
+    // The carrier's sounds and notice, at most once a minute (M4 C27).
+    let carrier = CARRIER_START;
+    const sayCarrier = (up: boolean) => {
+      const gate = carrierGate(carrier, up, performance.now());
+      carrier = gate.state;
+      if (!gate.play) return;
+      director.carrier(up);
+      if (!up) session.flash(NO_CARRIER);
+    };
+    sayCarrierRef.current = sayCarrier;
+    // Not over the dial-in: the state it is in is said once it is done.
+    const onCarrier = (up: boolean) => {
+      if (dialInRef.current !== null) heldCarrierRef.current = up;
+      else sayCarrier(up);
+    };
+    // Frames lost while the stream restarted for this route (M4 C13):
+    // everything is marked stale, so the first room is read fresh.
+    void client.invalidateQueries({ refetchType: "none" });
+    const unsubscribe = subscribeToChanges(
+      (event) => {
+        const keys = changeKeys(event);
+        if (keys === "everything") {
+          void client.invalidateQueries({ refetchType: "none" });
+        } else {
+          for (const queryKey of keys)
+            void client.invalidateQueries({ queryKey, refetchType: "none" });
+        }
+        session.changed(event);
+      },
+      {
+        identity: {
+          held: () => client.getQueryData(ME_QUERY_KEY),
+          recheck: () => {
+            void client.invalidateQueries({ queryKey: ME_QUERY_KEY });
+          },
+        },
+        onCarrier,
+      },
+    );
+    const first = addressRef.current;
+    requestedRef.current = first;
+    session.go(first);
+    return () => {
+      unsubscribe();
+      hangUpRef.current = null;
+      sayCarrierRef.current = null;
+      sessionRef.current = null;
+      requestedRef.current = null;
+      session.dispose();
+      document.removeEventListener("visibilitychange", syncSound);
+      director.dispose();
+    };
+  }, [refusal, client, sink]);
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (session === null) return;
+    const next = addressAt(pathname, search);
+    if (sameStation(requestedRef.current, next)) return;
+    requestedRef.current = next;
+    session.go(next);
+  }, [pathname, search]);
+
+  // The connecting screen is done or skipped: the sound fades, the
+  // station gets its keys back, inside the key or click that skipped it.
+  const connected = useCallback(() => {
+    hangUpRef.current?.();
+    hangUpRef.current = null;
+    dialInRef.current = null;
+    sessionRef.current?.setBusy(false);
+    setDialIn(null);
+    const held = heldCarrierRef.current;
+    heldCarrierRef.current = null;
+    if (held !== null) sayCarrierRef.current?.(held);
+  }, []);
+  const closeReader = useCallback(() => {
+    sessionRef.current?.closeReader();
+  }, []);
+  const readerOpenFluid = useCallback(() => {
+    const page = sessionRef.current?.page;
+    if (page) openFluid(fluidRouteOfStation(page));
+  }, []);
+  const closeLevels = useCallback(() => {
+    sessionRef.current?.closeLevels();
+  }, []);
+  // The jump is the session's own journey (C10): it replaces the URL once
+  // the bridge lands, and the navigate callback above moves
+  // `requestedRef` with it, so the params effect does not travel twice.
+  const jump = useCallback((name: string) => {
+    sessionRef.current?.jump(name);
+  }, []);
+  const closeLift = useCallback(() => {
+    sessionRef.current?.closeLift();
+  }, []);
+  const ride = useCallback((stop: number) => {
+    sessionRef.current?.ride(stop);
+  }, []);
+  // Inside the click or key that continues, so the lock may be asked for.
+  const resume = useCallback(() => {
+    sessionRef.current?.resume();
+  }, []);
+  // The way out (M4 C7): the Fluid page of where the player is (`page`,
+  // which names a moved engram's new address before its room follows), or
+  // of the address the URL last sent the session to before any room
+  // landed, in place of the station's own history entry.
+  const leave = useCallback(() => {
+    const at = sessionRef.current?.page ??
+      requestedRef.current ?? { kind: "airlock" };
+    void navigateRef.current(fluidRouteOfStation(at), { replace: true });
+  }, []);
+
+  if (refusal !== null) return <DeviceRefusal />;
+  return (
+    <>
+      <StationView
+        canvasRef={canvasRef}
+        view={view}
+        connector={connector}
+        reader={reader}
+        onCloseReader={closeReader}
+        onOpenFluid={readerOpenFluid}
+        legend={GAME_LEGEND}
+      />
+      {levels && (
+        <LevelSelect
+          current={domainOf(address) ?? ""}
+          onJump={jump}
+          onClose={closeLevels}
+        />
+      )}
+      {lift !== null && (
+        <LiftSelect
+          stops={lift.stops}
+          note={lift.note}
+          onRide={ride}
+          onClose={closeLift}
+        />
+      )}
+      {dialIn !== null && (
+        <Connecting
+          number={dialIn.number}
+          name={dialIn.name}
+          onDone={connected}
+        />
+      )}
+      {pause !== null && (
+        <PauseScreen
+          where={pause.where}
+          lockEndedAt={pause.lockEndedAt}
+          onContinue={resume}
+          onLeave={leave}
+        />
+      )}
+    </>
+  );
+}

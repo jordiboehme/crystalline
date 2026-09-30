@@ -910,7 +910,7 @@ export interface paths {
         put?: never;
         /**
          * Withdraw one of a team domain's open proposals.
-         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, retires its branch and records it as withdrawn. The branch is deleted unless an open pull request is based on it or comes from it; then it is kept and the sync status names it under `kept_branches`. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
          */
         post: operations["withdraw_domain_proposal"];
         delete?: never;
@@ -1066,6 +1066,26 @@ export interface paths {
          * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. A session that was working inside the draft is put back outside it, so a grantee who had already joined stops writing into it rather than carrying on until they leave; anybody else holding a live link to the same draft is put outside it too and joins again in one press. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. The author may always end what she minted, whatever her role has become since - a live credential is never harder to take back than it was to hand out - and an instance admin may end any link, which is the third party a departed author's live link needs. Served on a read-only instance, like every other account-state route.
          */
         delete: operations["revoke_draft_link"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Live changes to the knowledge, as a server-sent event stream.
+         * @description A `text/event-stream` the web UI keeps open once per tab. Frames: `id: <epoch>:<seq>` + `event: engram` + `data: <EngramChanged>`; `id` + `event: domain` + `data: <DomainChanged>`; `event: reset` + `data: {}` with no id (invalidate everything and keep the connection); and a `: ping` comment every fifteen seconds. `Last-Event-ID` replays the ring after that id, or answers one `reset` when the epoch is not this process's or the id is older than the ring's oldest entry. Every frame is filtered by what the session may read; a `draft_of` frame reaches the draft's owner alone. Served read-only. OpenAPI cannot type a stream, so the body below is described as text and the schemas `EngramChanged`, `DomainChanged` and `ChangeKind` carry the shapes.
+         */
+        get: operations["stream_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1991,6 +2011,11 @@ export interface components {
             redirect_host: string;
         };
         /**
+         * @description What happened to the engram: the four things the sync engine counts.
+         * @enum {string}
+         */
+        ChangeKind: "added" | "modified" | "deleted" | "moved";
+        /**
          * @description The wire form of a 412: a problem detail carrying the version the server
          *     holds now, so a client can show a merge view instead of just failing.
          */
@@ -2155,6 +2180,11 @@ export interface components {
              */
             sha?: string | null;
         };
+        /** @description A whole domain moved: refetch everything of it. */
+        DomainChanged: {
+            actor?: string | null;
+            domain: string;
+        };
         /**
          * @description One membership row: who was invited to a private domain, at what level, by
          *     whom and when.
@@ -2172,6 +2202,31 @@ export interface components {
             level: components["schemas"]["MemberLevel"];
             /** @description The member's login name, folded by [`normalize_account_name`]. */
             principal: string;
+        };
+        /** @description One engram changed, as every subscriber hears it. */
+        EngramChanged: {
+            /**
+             * @description Who made the change, as a display label. Null for a change the watcher
+             *     found on disk and for a write nobody signed.
+             */
+            actor?: string | null;
+            /**
+             * @description Lowercase hex SHA-256 of the new content, the value every write
+             *     receipt reports as `checksum`. Absent for `deleted`.
+             */
+            checksum?: string | null;
+            domain: string;
+            /**
+             * @description Set when the change landed in this actor's draft overlay. Delivered to
+             *     that actor's own sessions and to nobody else.
+             */
+            draft_of?: string | null;
+            from?: null | components["schemas"]["MovedFrom"];
+            kind: components["schemas"]["ChangeKind"];
+            /** @description Domain-relative, forward slashes, `.md`; after the change. */
+            path: string;
+            /** @description After the change; for `deleted`, what the row had before it went. */
+            permalink: string;
         };
         /**
          * @description What one actor's drafts become when the domain stops reviewing changes.
@@ -2662,6 +2717,12 @@ export interface components {
              * @description The engram to move, by permalink.
              * @example notes/beta
              */
+            permalink: string;
+        };
+        /** @description Where a moved engram came from. */
+        MovedFrom: {
+            /** @description Domain-relative, forward slashes, `.md`. */
+            path: string;
             permalink: string;
         };
         /** @description An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`. */
@@ -7344,6 +7405,8 @@ export interface operations {
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              *
+             *     `kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.
+             *
              *     On a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.
              */
             200: {
@@ -7364,6 +7427,18 @@ export interface operations {
                      *       },
                      *       "declined_proposals": [],
                      *       "domain": "eng",
+                     *       "kept_branches": [
+                     *         {
+                     *           "blocked_by": 12,
+                     *           "branch": "crystalline/share-7",
+                     *           "kind": "base",
+                     *           "message": "Branch crystalline/share-7 is kept: pull request #12 is based on it and could not be moved to main. The next sync tries again.",
+                     *           "number": 7,
+                     *           "onto": "main",
+                     *           "reason": "GitHub returned an unexpected answer (status 422): Cannot change the base branch because the pull request is part of a stack.",
+                     *           "why": "merged"
+                     *         }
+                     *       ],
                      *       "last_checked": "2026-08-10T08:00:00Z",
                      *       "local_changes": 2,
                      *       "merged_unconsumed": [],
@@ -8237,6 +8312,59 @@ export interface operations {
             };
             /** @description The caller minted no link with that id, and is not an admin of this instance. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    stream_events: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The `id` of the last frame this client saw, as the browser's `EventSource` sends it on reconnect.
+                 * @example 1758542400:17
+                 */
+                "Last-Event-ID"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stream. Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Too many streams are open, for this account (32) or on this instance (4096). `Retry-After` says when to try again. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -43,6 +43,14 @@ use super::text::{Separator, collab_eligible, file_text, separator_of, session_t
 use crate::domain_view::DomainView;
 use crate::engine::{Engine, EngineError, EngramText};
 
+/// The address a room reads and saves its engram at: the `crystalline://`
+/// URL, the one absolute form, which names the room's domain and permalink
+/// together, so the address a room reads and saves at is its own key. A miss
+/// at it names the bare permalink, as before the room used the URL.
+fn room_address(domain: &str, permalink: &str) -> String {
+    format!("{}{domain}/{permalink}", crystalline_core::address::SCHEME)
+}
+
 /// The name of the one shared Y.Text every session document carries. The
 /// client binds the same name, so the two agree without negotiation.
 pub const TEXT_NAME: &str = "content";
@@ -890,7 +898,7 @@ impl CollabSession {
         // was the right to be in this document.
         let loaded = room_view(&engine, &key.0, key.2.as_deref())
             .map_err(JoinError::Engine)?
-            .engram_text(&key.1)
+            .engram_text(&room_address(&key.0, &key.1))
             .await
             .map_err(JoinError::Engine)?;
         if !collab_eligible(&loaded.content) {
@@ -1557,7 +1565,10 @@ impl CollabSession {
                             return None;
                         }
                     };
-                    let theirs = match view.engram_text(&state.permalink).await {
+                    let theirs = match view
+                        .engram_text(&room_address(&self.domain, &state.permalink))
+                        .await
+                    {
                         Ok(theirs) => theirs,
                         // The engram the CAS refused is not there to read: the
                         // write and the delete raced, so this is the deletion.
@@ -1646,7 +1657,7 @@ impl CollabSession {
         };
         let params = crate::params::SaveParams {
             domain: self.domain.clone(),
-            identifier: state.permalink.clone(),
+            identifier: room_address(&self.domain, &state.permalink),
             content: file.clone(),
             expected_checksum: state.checksum.clone(),
         };
@@ -1846,7 +1857,10 @@ impl CollabSession {
         let Ok(view) = self.view() else {
             return None;
         };
-        match view.engram_text(&state.permalink).await {
+        match view
+            .engram_text(&room_address(&self.domain, &state.permalink))
+            .await
+        {
             Ok(theirs) if theirs.checksum != state.checksum => {
                 let detail = format!(
                     "'{}' changed on disk while this session was idle",
