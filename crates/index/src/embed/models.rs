@@ -990,10 +990,12 @@ mod tests {
     const OLD_A: &str = "1111111111111111111111111111111111111111";
 
     /// A 64-hex etag for a test blob, the shape hf-hub names an LFS blob by.
+    #[cfg(unix)]
     fn etag(tag: &str, file: &str) -> String {
         use sha2::{Digest, Sha256};
         crate::hex_lower(&Sha256::digest(format!("{tag}-{file}").as_bytes()))
     }
+    #[cfg(unix)]
     const OLD_B: &str = "2222222222222222222222222222222222222222";
 
     /// A snapshot the way hf-hub writes one on unix: each file a relative
@@ -1025,6 +1027,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn set_main(root: &Path, model: &LocalModel, commit: &str) {
         let refs = root.join(model.cache_dir_name()).join("refs");
         std::fs::create_dir_all(&refs).unwrap();
