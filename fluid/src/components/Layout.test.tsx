@@ -1311,3 +1311,87 @@ describe("the text size", () => {
     expect(screen.getByRole("main")).toHaveAttribute("data-text", "large");
   });
 });
+
+describe("the help menu", () => {
+  it("leads to the Handbook in a new tab and to the shortcut map", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Help" }));
+    const handbook = await screen.findByRole("menuitem", {
+      name: "Handbook (opens in a new tab)",
+    });
+    expect(handbook).toHaveAttribute(
+      "href",
+      "https://jordiboehme.github.io/crystalline/",
+    );
+    expect(handbook).toHaveAttribute("target", "_blank");
+    expect(handbook.getAttribute("rel") ?? "").toMatch(/noreferrer/);
+
+    await user.click(
+      screen.getByRole("menuitem", { name: /^Keyboard shortcuts/ }),
+    );
+    const help = await screen.findByRole("dialog", {
+      name: /keyboard shortcuts/i,
+    });
+    const more = within(help).getByRole("link", { name: /Handbook/ });
+    expect(more).toHaveAttribute(
+      "href",
+      "https://jordiboehme.github.io/crystalline/",
+    );
+    expect(more).toHaveAttribute("target", "_blank");
+  });
+
+  it("works from the keyboard alone", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+    const user = userEvent.setup();
+
+    screen.getByRole("button", { name: "Help" }).focus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("menu");
+    // Radix focuses the first item on open; one step down is the shortcuts row.
+    await user.keyboard("{ArrowDown}{Enter}");
+
+    expect(
+      await screen.findByRole("dialog", { name: /keyboard shortcuts/i }),
+    ).toBeVisible();
+  });
+
+  it("is there for an anonymous reader too", async () => {
+    serve({
+      "/auth/me": () => meResponse({ anonymous: true }),
+      "/domains": domainsResponse,
+    });
+
+    renderApp("/");
+    await screen.findByRole("main");
+
+    expect(screen.getByRole("button", { name: "Help" })).toBeVisible();
+  });
+
+  it("opens the Handbook from the palette", async () => {
+    serveSignedIn();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+
+    renderApp("/");
+    await screen.findByRole("main");
+    const user = userEvent.setup();
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(
+      await screen.findByRole("option", { name: /open the handbook/i }),
+    );
+
+    expect(open).toHaveBeenCalledWith(
+      "https://jordiboehme.github.io/crystalline/",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    open.mockRestore();
+  });
+});

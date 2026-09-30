@@ -10,6 +10,7 @@
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
+import { HANDBOOK_URL } from "../handbook";
 import type { HelpOverlayProps } from "./HelpOverlay";
 
 /** The map itself: what to press, and what it does. */
@@ -57,6 +58,18 @@ export default function HelpOverlayBody({
               </div>
             ))}
           </dl>
+          <p className="mt-3 text-sm text-slate-500 dark:text-slate-400">
+            More in the{" "}
+            <a
+              href={HANDBOOK_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="text-accent-700 underline hover:no-underline dark:text-accent-300"
+            >
+              Handbook
+            </a>
+            .
+          </p>
           <div className="mt-4 flex justify-end">
             <Dialog.Close className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800">
               Close
