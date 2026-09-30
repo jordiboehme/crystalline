@@ -179,10 +179,19 @@ Crystalline is free and open source. If it earned its place in your workflow, yo
 
 Crystalline is local-first: no telemetry, no analytics, no accounts and no data collection by the developer. Every engram lives as a markdown file plus a local search index on your own machine, entirely under your control.
 
-Two outbound connections exist, each opt-in and user-initiated - nothing else ever leaves the machine:
+Crystalline never sends your knowledge to a language model: the model runs in your agent harness, which receives what Crystalline answers and passes it to the provider you chose there.
 
-- **GitHub**, only once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with - governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
-- **Hugging Face**, for a one-time download of the local embedding model, automatic on first start or explicit via `crystalline model download` - governed by the [Hugging Face privacy policy](https://huggingface.co/privacy).
+One outbound connection happens by default:
+
+- **Hugging Face**, for a one-time download of the local embedding model. It starts automatically on first start, or explicitly with `crystalline model download`, and sends no engram data. Once the model is cached, no further call is made. Point `HF_ENDPOINT` at a mirror, or `CRYSTALLINE_MODELS_DIR` at a pre-fetched copy, to avoid the connection. Governed by the [Hugging Face privacy policy](https://huggingface.co/privacy).
+
+Every other connection exists only after you turn it on:
+
+- **GitHub**, once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with. `github.api_url` points it at a GitHub Enterprise server instead. Governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) or your own server's terms.
+- **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
+- **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
+
+Nothing else leaves the machine.
 
 The developer shares nothing with anyone. Data retention is entirely user-controlled: deleting a domain or an engram deletes the data, and uninstalling Crystalline leaves your markdown untouched.
 
