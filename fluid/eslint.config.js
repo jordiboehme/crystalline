@@ -23,6 +23,9 @@ export default defineConfig([
       prettier,
     ],
     rules: {
+      // Not in recommendedTypeChecked: an enum member and its bare literal are
+      // not interchangeable, so a value of the wrong enum is a compile-time lie.
+      "@typescript-eslint/no-unsafe-enum-assignment": "error",
       // A leading underscore is the house way of saying "this parameter is
       // here for its position or its type, not to be read".
       "@typescript-eslint/no-unused-vars": [
