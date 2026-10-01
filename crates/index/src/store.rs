@@ -2221,6 +2221,21 @@ pub trait Store: Send + Sync {
         expected_sha: Option<&str>,
     ) -> Result<EngramId>;
 
+    /// Rewrite the base row at `record.path` only if it still exists and still
+    /// carries `expected_sha`, with the same guarded compare as
+    /// [`Store::upsert_engram_checked`]: `Ok(Some(id))` when it was rewritten,
+    /// `Ok(None)` when no row stands at the path any more (deleted or renamed
+    /// since it was read), [`crate::IndexError::StaleEdit`] when one stands
+    /// there with other content. Never inserts, which is what the reparse
+    /// after a parser change needs: it rewrites what it read, and a row that
+    /// vanished meanwhile must stay gone.
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>>;
+
     /// The full markdown content stored for the engram at a domain-relative
     /// path, or `None` when no such row exists. Serves the database read path
     /// (virtual domains and non-host reads) and reads current content for a

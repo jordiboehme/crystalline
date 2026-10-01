@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use crystalline_core::{PARSE_GENERATION, parse_engram};
 use crystalline_index::{
-    ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, Store, TursoStore, apply_scan,
-    reparse_stored_domain, scan_paths, sync_domain_with,
+    ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, ReparseSeam, ReparseStep, Store,
+    TursoStore, apply_scan, reparse_stored_domain, reparse_stored_domain_with, scan_paths,
+    sync_domain_with,
 };
 use tokio::sync::Mutex;
 
@@ -740,5 +741,136 @@ async fn a_concurrent_write_survives_the_reparse_on_postgres() {
         Some(newer.as_str()),
         "B's write is what stays"
     );
+    a.drop_schema().await.unwrap();
+}
+
+// --- fix round 2 -------------------------------------------------------------------
+
+/// A virtual engram another writer deletes after the reparse read it stays
+/// deleted: the reparse rewrites rows, it never inserts one. `other` is the
+/// second writer: the same store on Turso (its write lands inside the
+/// reparse's own transaction, the sequential stand-in), a second store on the
+/// same schema on Postgres.
+async fn a_row_deleted_during_the_reparse_stays_deleted(store: &dyn Store, other: &dyn Store) {
+    let domain = staged_virtual_domain(store).await;
+    let seam = |step: ReparseStep| -> ReparseSeam<'_> {
+        Box::pin(async move {
+            if step == ReparseStep::ContentsRead {
+                other.delete_engram(domain, "wrapped.md").await.unwrap();
+            }
+        })
+    };
+    let reparsed = reparse_stored_domain_with(store, "v", domain, &params(), &seam)
+        .await
+        .unwrap();
+    assert_eq!(reparsed, 1, "only the engram still there");
+    assert_eq!(
+        store.engram_content(domain, "wrapped.md").await.unwrap(),
+        None,
+        "the deletion stands"
+    );
+    assert_eq!(generation(store, domain).await, PARSE_GENERATION);
+}
+
+/// An edit that lands between the reparse's read of the stamps and its read
+/// of the contents leaves a row whose checksum is the checksum of the text it
+/// holds, so a later guarded edit against that checksum is accepted.
+async fn a_row_edited_between_the_reads_keeps_a_true_checksum(
+    store: &dyn Store,
+    other: &dyn Store,
+) {
+    let domain = staged_virtual_domain(store).await;
+    let newer = WRAPPED.replace("written the way", "now written the way");
+    let seam = |step: ReparseStep| -> ReparseSeam<'_> {
+        let newer = newer.clone();
+        Box::pin(async move {
+            if step == ReparseStep::StampsRead {
+                let mut record = EngramRecord::from_engram(
+                    &parse_engram(&newer).unwrap(),
+                    "wrapped.md",
+                    FileStamp {
+                        mtime: 1_700_000_100,
+                        size: newer.len() as u64,
+                        sha256: sha256(&newer),
+                    },
+                );
+                record.content = newer.clone();
+                other.upsert_engram(domain, &record).await.unwrap();
+            }
+        })
+    };
+    reparse_stored_domain_with(store, "v", domain, &params(), &seam)
+        .await
+        .unwrap();
+    let row = store
+        .all_engram_contents(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.path == "wrapped.md")
+        .unwrap();
+    assert_eq!(row.content, newer);
+    assert_eq!(row.sha256, sha256(&newer), "the checksum is the text's own");
+
+    let next = format!("{newer}- [fact] a later edit\n");
+    let mut record = EngramRecord::from_engram(
+        &parse_engram(&next).unwrap(),
+        "wrapped.md",
+        FileStamp {
+            mtime: 1_700_000_200,
+            size: next.len() as u64,
+            sha256: sha256(&next),
+        },
+    );
+    record.content = next.clone();
+    store
+        .upsert_engram_checked(domain, &record, Some(&row.sha256))
+        .await
+        .expect("a guarded edit against the row's own checksum");
+}
+
+#[tokio::test]
+async fn row_deleted_during_the_reparse_stays_deleted_on_turso() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    a_row_deleted_during_the_reparse_stays_deleted(&store, &store).await;
+}
+
+#[tokio::test]
+async fn row_edited_between_the_reads_keeps_a_true_checksum_on_turso() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    a_row_edited_between_the_reads_keeps_a_true_checksum(&store, &store).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn row_deleted_during_the_reparse_stays_deleted_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let a = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let b = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    a_row_deleted_during_the_reparse_stays_deleted(&a, &b).await;
+    a.drop_schema().await.unwrap();
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn row_edited_between_the_reads_keeps_a_true_checksum_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let a = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let b = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    a_row_edited_between_the_reads_keeps_a_true_checksum(&a, &b).await;
     a.drop_schema().await.unwrap();
 }

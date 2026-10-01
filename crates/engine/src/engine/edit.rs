@@ -1,5 +1,20 @@
 use super::*;
 
+/// How many times an edit without an `expected_checksum` is applied to a
+/// virtual engram before a race with another writer is reported: the first
+/// try and two more, each against the text stored at that moment. Three
+/// writers landing on one row inside the same few milliseconds three times in
+/// a row is not a race an agent can win by retrying faster either, so the
+/// last refusal comes back as the `Conflict` a guarded edit would get.
+const UNGUARDED_EDIT_ATTEMPTS: usize = 3;
+
+/// Whether an error is the store's stale compare-and-swap rather than any
+/// other conflict (a permalink another engram owns, say), which applying the
+/// edit again could never resolve.
+fn is_stale_edit(e: &EngineError) -> bool {
+    matches!(e, EngineError::Conflict(m) if m.starts_with("stale edit:"))
+}
+
 impl Engine {
     // --- edit ----------------------------------------------------------------
 
@@ -227,7 +242,7 @@ impl Engine {
         apply: F,
     ) -> Result<Option<String>>
     where
-        F: FnOnce(&str) -> Result<String>,
+        F: FnMut(&str) -> Result<String>,
     {
         // The live landing is dropped here rather than plumbed on: the callers
         // that reach this shorthand (a retirement, a split's tail, a
@@ -276,10 +291,10 @@ impl Engine {
         model: Option<&str>,
         scope: &crate::scope::Scope,
         peer: Option<&AgentPeer>,
-        apply: F,
+        mut apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
     where
-        F: FnOnce(&str) -> Result<String>,
+        F: FnMut(&str) -> Result<String>,
     {
         // Every arm below edits the LF form of what it read, whatever line
         // endings the file, the row or the draft held: the whole document is
@@ -287,7 +302,7 @@ impl Engine {
         // section heading) matches it. Each arm compares its
         // `expected_checksum` against the bytes it read BEFORE this
         // conversion, which is what a read handed out.
-        let apply = move |current: &str| apply(&crystalline_core::to_lf(current));
+        let mut apply = move |current: &str| apply(&crystalline_core::to_lf(current));
         // **The live arm, and it comes before every other one.** While a
         // co-editing room is open over this document, the room's text IS the
         // engram: somebody has it on screen, the file and the row are both
@@ -469,64 +484,95 @@ impl Engine {
                 )
             }
             ContentSource::Virtual => {
-                let current = {
-                    let store = self.store.lock().await;
-                    store
-                        .engram_content(desc.domain_id, &desc.path)
+                // An edit without a checksum is last-write-wins, and on a
+                // shared Postgres database that has to survive another
+                // instance writing the same row: the store's compare waits for
+                // that writer and then refuses, because the text this edit was
+                // applied to is gone. So the edit is applied again to what is
+                // stored now, up to `UNGUARDED_EDIT_ATTEMPTS` times, and lands
+                // on top of the other writer's text. An edit that presents a
+                // checksum is never retried: the refusal is what it asked for.
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    let current = {
+                        let store = self.store.lock().await;
+                        store
+                            .engram_content(desc.domain_id, &desc.path)
+                            .await
+                            .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
+                            .ok_or_else(|| {
+                                SourceEditFailure::before(EngineError::NotFound(format!(
+                                    "no content stored for '{}' in domain '{}'",
+                                    desc.permalink, desc.domain
+                                )))
+                            })?
+                    };
+                    let expected = expected_checksum
+                        .map(str::to_string)
+                        .unwrap_or_else(|| sha256_hex(current.as_bytes()));
+                    let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                    let edited = touch_generated(&edited, actor, model, now_offset());
+                    let edited =
+                        Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                    let (edited, count) = self
+                        .normalize_domain_spellings_for(&edited, scope)
                         .await
-                        .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
-                        .ok_or_else(|| {
-                            SourceEditFailure::before(EngineError::NotFound(format!(
-                                "no content stored for '{}' in domain '{}'",
-                                desc.permalink, desc.domain
-                            )))
-                        })?
-                };
-                let expected = expected_checksum
-                    .map(str::to_string)
-                    .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = apply(&current).map_err(SourceEditFailure::before)?;
-                let edited = touch_generated(&edited, actor, model, now_offset());
-                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-                let (edited, count) = self
-                    .normalize_domain_spellings_for(&edited, scope)
-                    .await
-                    .map_err(SourceEditFailure::before)?;
-                let stamp = virtual_stamp(&edited);
-                // The seam, on this arm: a token nothing can match, so the
-                // store raises its own compare-and-swap conflict and rolls the
-                // transaction back. See `Engine::fail_next_source_edit`.
-                let expected = if self.take_armed_failure() {
-                    "0".repeat(64)
-                } else {
-                    expected
-                };
-                let store = self.store.lock().await;
-                // Every failure here is a `before`, and that is exact rather
-                // than generous: `index_markdown` runs the compare and swap,
-                // the chunking and the reference resolution inside one store
-                // transaction and rolls it back on any error, so a virtual
-                // source that refuses still holds the bytes it held. A
-                // concurrent edit therefore comes back as the `Conflict` it is
-                // and the caller may undo whatever it wrote first, which is the
-                // failure that actually happens in the field.
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    &edited,
-                    stamp,
-                    Some(&expected),
-                    true,
-                )
-                .await
-                .map_err(SourceEditFailure::before)?;
-                (
-                    count,
-                    sha256_hex(edited.as_bytes()),
-                    engram_names(&current, &desc.permalink),
-                    engram_names(&edited, &desc.permalink),
-                )
+                        .map_err(SourceEditFailure::before)?;
+                    let stamp = virtual_stamp(&edited);
+                    // The seam, on this arm: a token nothing can match, so the
+                    // store raises its own compare-and-swap conflict and rolls
+                    // the transaction back. See `Engine::fail_next_source_edit`.
+                    // Never retried: it stands for a conflict, not a race.
+                    let armed = self.take_armed_failure();
+                    let expected = if armed { "0".repeat(64) } else { expected };
+                    let store = self.store.lock().await;
+                    // Every failure here is a `before`, and that is exact rather
+                    // than generous: `index_markdown` runs the compare and swap,
+                    // the chunking and the reference resolution inside one store
+                    // transaction and rolls it back on any error, so a virtual
+                    // source that refuses still holds the bytes it held. A
+                    // concurrent edit therefore comes back as the `Conflict` it
+                    // is and the caller may undo whatever it wrote first, which
+                    // is the failure that actually happens in the field.
+                    let indexed = self
+                        .index_markdown(
+                            &*store,
+                            desc.domain_id,
+                            &desc.path,
+                            &edited,
+                            stamp,
+                            Some(&expected),
+                            true,
+                        )
+                        .await;
+                    drop(store);
+                    match indexed {
+                        Ok(_) => {
+                            break (
+                                count,
+                                sha256_hex(edited.as_bytes()),
+                                engram_names(&current, &desc.permalink),
+                                engram_names(&edited, &desc.permalink),
+                            );
+                        }
+                        Err(e)
+                            if expected_checksum.is_none()
+                                && !armed
+                                && attempt < UNGUARDED_EDIT_ATTEMPTS
+                                && is_stale_edit(&e) =>
+                        {
+                            tracing::debug!(
+                                domain = desc.domain.as_str(),
+                                path = desc.path.as_str(),
+                                attempt,
+                                "an unguarded edit lost a race with another writer; \
+                                 applying it again to the stored text"
+                            );
+                        }
+                        Err(e) => return Err(SourceEditFailure::before(e)),
+                    }
+                }
             }
         };
 

@@ -1639,48 +1639,26 @@ impl Store for PostgresStore {
         // holds the transaction open (the pinned connection), so the compare and
         // the write are one atomic unit.
         //
-        // A plain SELECT is not that under READ COMMITTED: it reads the last
-        // committed sha without waiting for a writer that holds the row, so a
-        // second instance's uncommitted write would pass the compare and then
-        // be overwritten when it commits. The compare is therefore a guarded
-        // no-op UPDATE: it takes the row lock (waiting for that writer), then
-        // re-reads the row as committed and matches only while it still
-        // carries the expected sha. One row means the row is ours, locked to
-        // the end of the transaction; none means either no row at all (an
-        // insert, which nothing guards) or a row that moved on.
+        // No row at all is an insert, which nothing guards.
         if let Some(expected) = expected_sha {
-            let mut conn = self.acquire().await?;
-            let matched = sqlx::query(
-                "UPDATE engram SET sha256=sha256 \
-                 WHERE domain_id=$1 AND path=$2 AND actor = '' AND sha256=$3",
-            )
-            .bind(domain.0)
-            .bind(&record.path)
-            .bind(expected)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?
-            .rows_affected();
-            if matched == 0 {
-                let stored = sqlx::query(
-                    "SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''",
-                )
-                .bind(domain.0)
-                .bind(&record.path)
-                .fetch_optional(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?
-                .and_then(|r| cell_text(&r, 0));
-                if let Some(found) = stored {
-                    return Err(IndexError::StaleEdit {
-                        expected: expected.to_string(),
-                        found,
-                    });
-                }
-            }
-            drop(conn);
+            self.guarded_compare(domain, &record.path, expected).await?;
         }
         self.upsert_engram(domain, record).await
+    }
+
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>> {
+        if !self
+            .guarded_compare(domain, &record.path, expected_sha)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.upsert_engram(domain, record).await.map(Some)
     }
 
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
@@ -4008,6 +3986,50 @@ impl PostgresStore {
     /// Everything here is scoped to `actor`, the duplicate-permalink probe
     /// included: two actors may each hold `a` in their own dimension, and only
     /// a clash inside one actor's own is a conflict.
+    /// The compare of a compare-and-swap on the base row at `path`.
+    ///
+    /// A plain SELECT is not that under READ COMMITTED: it reads the last
+    /// committed sha without waiting for a writer that holds the row, so a
+    /// second instance's uncommitted write would pass the compare and then be
+    /// overwritten when it commits. The compare is therefore a guarded no-op
+    /// UPDATE: it takes the row lock (waiting for that writer), then re-reads
+    /// the row as committed and matches only while it still carries the
+    /// expected sha. `Ok(true)` when it matched (the row is the caller's,
+    /// locked to the end of the transaction), `Ok(false)` when there is no row
+    /// at all, and [`IndexError::StaleEdit`] when there is one that moved on.
+    async fn guarded_compare(&self, domain: DomainId, path: &str, expected: &str) -> Result<bool> {
+        let mut conn = self.acquire().await?;
+        let matched = sqlx::query(
+            "UPDATE engram SET sha256=sha256 \
+             WHERE domain_id=$1 AND path=$2 AND actor = '' AND sha256=$3",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .bind(expected)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?
+        .rows_affected();
+        if matched > 0 {
+            return Ok(true);
+        }
+        let stored =
+            sqlx::query("SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
+                .bind(domain.0)
+                .bind(path)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?
+                .and_then(|r| cell_text(&r, 0));
+        match stored {
+            Some(found) => Err(IndexError::StaleEdit {
+                expected: expected.to_string(),
+                found,
+            }),
+            None => Ok(false),
+        }
+    }
+
     async fn upsert_row(
         &self,
         domain: DomainId,

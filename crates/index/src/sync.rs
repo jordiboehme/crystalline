@@ -280,13 +280,15 @@ pub async fn reparse_due<S: Store + ?Sized>(store: &S, domain: DomainId) -> Resu
 /// domain is already current.
 ///
 /// The stored content is the domain's source of truth and stays byte for byte
-/// what it was: each row is re-upserted with its own content and its own
-/// recorded stamp (so its modification time does not move), which rebuilds
-/// its observations, relations, links and tags, and its chunks are reconciled
-/// through [`Store::replace_chunks`], which keeps every embedding whose text
-/// is unchanged. A row that changed since it was read is left to the write
-/// that changed it, which already parsed it with this parser, and a row whose
-/// content no longer parses keeps the rows it has.
+/// what it was: each row is rewritten with its own content, the checksum and
+/// size read with that content, and its recorded modification time (so that
+/// does not move), which rebuilds its observations, relations, links and
+/// tags, and its chunks are reconciled through [`Store::replace_chunks`],
+/// which keeps every embedding whose text is unchanged. Each write goes
+/// through [`Store::update_engram_checked`], so it never inserts: a row that
+/// changed since it was read is left to the write that changed it, which
+/// already parsed it with this parser; a row deleted or renamed meanwhile
+/// stays gone; and a row whose content no longer parses keeps the rows it has.
 ///
 /// One transaction: the stamp commits with the rows, so an interrupted run
 /// leaves the old generation and the next sync repeats it. Idempotent, which
@@ -299,13 +301,45 @@ pub async fn reparse_stored_domain<S: Store + ?Sized>(
     domain: DomainId,
     chunk_params: &ChunkParams,
 ) -> Result<usize> {
+    reparse_stored_domain_with(store, name, domain, chunk_params, &|_| Box::pin(async {})).await
+}
+
+/// Where a [`reparse_stored_domain_with`] seam runs: after the stamp map is
+/// read and before the contents are, and after both reads before the first
+/// write. The two windows another writer can land in.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReparseStep {
+    /// The recorded stamps are read; the contents are not yet.
+    StampsRead,
+    /// Stamps and contents are read; nothing is written yet.
+    ContentsRead,
+}
+
+/// What a [`reparse_stored_domain_with`] seam answers.
+#[doc(hidden)]
+pub type ReparseSeam<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// [`reparse_stored_domain`] with a seam awaited at each [`ReparseStep`]: a
+/// test-only way to put another writer's change exactly between two of the
+/// reparse's statements. Production passes a seam that does nothing.
+#[doc(hidden)]
+pub async fn reparse_stored_domain_with<'a, S: Store + ?Sized>(
+    store: &S,
+    name: &str,
+    domain: DomainId,
+    chunk_params: &ChunkParams,
+    seam: &'a (dyn Fn(ReparseStep) -> ReparseSeam<'a> + Sync),
+) -> Result<usize> {
     if !reparse_due(store, domain).await? {
         return Ok(0);
     }
     store.begin().await?;
     let result = async {
         let stamps = store.file_stamps(domain).await?;
+        seam(ReparseStep::StampsRead).await;
         let rows = store.all_engram_contents(domain).await?;
+        seam(ReparseStep::ContentsRead).await;
         // Said before the work, not after it: on a large domain this is the
         // one slow step of the first start after an upgrade, and the line is
         // what tells a person why.
@@ -320,18 +354,32 @@ pub async fn reparse_stored_domain<S: Store + ?Sized>(
             let Ok(engram) = parse_engram(&row.content) else {
                 continue;
             };
-            let stamp = stamps.get(&row.path).cloned().unwrap_or_else(|| FileStamp {
-                mtime: 0,
+            // The checksum and size come from the row the content came from,
+            // never from the stamp map: the two are separate statements, and
+            // an edit committed between them would otherwise leave a row
+            // whose checksum describes text it no longer holds, which every
+            // later edit would be refused against. The stamp map gives only
+            // the modification time, which is not compared against anything.
+            let stamp = FileStamp {
+                mtime: stamps.get(&row.path).map(|s| s.mtime).unwrap_or(0),
                 size: row.content.len() as u64,
                 sha256: row.sha256.clone(),
-            });
+            };
             let mut record = EngramRecord::from_engram(&engram, &row.path, stamp);
             record.content = row.content.clone();
             let id = match store
-                .upsert_engram_checked(domain, &record, Some(&row.sha256))
+                .update_engram_checked(domain, &record, &row.sha256)
                 .await
             {
-                Ok(id) => id,
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    tracing::debug!(
+                        domain = name,
+                        path = row.path.as_str(),
+                        "reparse: skipping an engram deleted or renamed since it was read"
+                    );
+                    continue;
+                }
                 Err(IndexError::StaleEdit { .. }) => continue,
                 Err(e) => return Err(e),
             };
@@ -475,8 +523,9 @@ pub async fn scan_domain(
                     source,
                 });
             }
-            Err(_) => {
+            Err(err) => {
                 unread += 1;
+                warn_unreadable_once(name, err.path(), &err.to_string());
                 continue;
             }
         };
@@ -513,9 +562,13 @@ pub async fn scan_domain(
         if crystalline_core::is_reserved_file(&fname) || !fname.to_lowercase().ends_with(".md") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            unread += 1;
-            continue;
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(err) => {
+                unread += 1;
+                warn_unreadable_once(name, Some(entry.path()), &err.to_string());
+                continue;
+            }
         };
         let mtime = file_mtime(&meta);
         current.insert(
@@ -1814,6 +1867,32 @@ enum ParseOutcome {
     /// derived by nothing this run.
     Unread(String, String),
     Vanished(String),
+}
+
+/// Say once per path and process that a walk entry cannot be read: the
+/// domain it is in stays behind the parser generation and every sync reparses
+/// it whole, and without this line nothing would say why. Remembered for the
+/// life of the process, so a watcher's full fallback over a directory that
+/// stays unreadable does not repeat it on every pass; the line comes back
+/// after a restart, which is also when the next reparse is tried.
+fn warn_unreadable_once(domain: &str, path: Option<&Path>, reason: &str) {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let path = path.map(Path::to_path_buf).unwrap_or_default();
+    let first = SAID
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut said| said.insert(path.clone()))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(
+            domain,
+            path = %path.display(),
+            "'{}' in domain '{domain}' cannot be read ({reason}); the domain is reparsed \
+             in full on every sync until it can be",
+            path.display()
+        );
+    }
 }
 
 fn is_hidden(name: &str) -> bool {

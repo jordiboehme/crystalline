@@ -79,9 +79,10 @@ pub use sweep::{
     SweepReport, UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
-    DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReindexHooks, SyncReport, apply_scan,
-    apply_scan_with_slab, refresh_tag_aliases, reindex_domains, reparse_due, reparse_stored_domain,
-    resolve_forward_refs, scan_domain, scan_paths, sync_domain, sync_domain_with,
+    DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReindexHooks, ReparseSeam, ReparseStep,
+    SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, reindex_domains,
+    reparse_due, reparse_stored_domain, reparse_stored_domain_with, resolve_forward_refs,
+    scan_domain, scan_paths, sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
 pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};

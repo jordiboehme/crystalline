@@ -412,6 +412,44 @@ impl TursoStore {
     /// Everything this statement touches is scoped to `actor`, including the
     /// duplicate-permalink probe: two actors may each hold `a` at their own
     /// path, and only a clash inside one actor's own dimension is a conflict.
+    /// The compare of a compare-and-swap on the base row at `path`, as a
+    /// guarded write: the same statement the Postgres twin needs to be safe
+    /// against a second writer, a no-op UPDATE that only matches the row while
+    /// it still carries the expected sha. `Ok(true)` when it matched (the row
+    /// is the caller's to rewrite), `Ok(false)` when there is no row at all,
+    /// and [`IndexError::StaleEdit`] when there is one that moved on.
+    async fn guarded_compare(&self, domain: DomainId, path: &str, expected: &str) -> Result<bool> {
+        let matched = self
+            .conn
+            .execute(
+                "UPDATE engram SET sha256=sha256 \
+                 WHERE domain_id=?1 AND path=?2 AND actor = '' AND sha256=?3",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(path.to_string()),
+                    Value::Text(expected.to_string()),
+                ],
+            )
+            .await?;
+        if matched > 0 {
+            return Ok(true);
+        }
+        let stored = query_first(
+            &self.conn,
+            "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?
+        .and_then(|r| cell_text(&r, 0));
+        match stored {
+            Some(found) => Err(IndexError::StaleEdit {
+                expected: expected.to_string(),
+                found,
+            }),
+            None => Ok(false),
+        }
+    }
+
     async fn upsert_row(
         &self,
         domain: DomainId,
@@ -1665,43 +1703,27 @@ impl Store for TursoStore {
         // Compare-and-swap: if a row exists at this path and the caller supplied
         // an expected sha that no longer matches the stored one, refuse. The
         // engine holds the transaction open around this, so the compare and the
-        // subsequent write are one atomic unit.
-        //
-        // The compare is a guarded write, the same statement the Postgres twin
-        // needs to be safe against a second writer: a no-op UPDATE that only
-        // matches the row while it still carries the expected sha. One row
-        // means the row is ours to rewrite; none means either no row at all
-        // (an insert, which nothing guards) or a row that moved on.
+        // subsequent write are one atomic unit. No row at all is an insert,
+        // which nothing guards.
         if let Some(expected) = expected_sha {
-            let matched = self
-                .conn
-                .execute(
-                    "UPDATE engram SET sha256=sha256 \
-                     WHERE domain_id=?1 AND path=?2 AND actor = '' AND sha256=?3",
-                    vec![
-                        Value::Integer(domain.0),
-                        Value::Text(record.path.clone()),
-                        Value::Text(expected.to_string()),
-                    ],
-                )
-                .await?;
-            if matched == 0 {
-                let stored = query_first(
-                    &self.conn,
-                    "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
-                    vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
-                )
-                .await?
-                .and_then(|r| cell_text(&r, 0));
-                if let Some(found) = stored {
-                    return Err(IndexError::StaleEdit {
-                        expected: expected.to_string(),
-                        found,
-                    });
-                }
-            }
+            self.guarded_compare(domain, &record.path, expected).await?;
         }
         self.upsert_engram(domain, record).await
+    }
+
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>> {
+        if !self
+            .guarded_compare(domain, &record.path, expected_sha)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.upsert_engram(domain, record).await.map(Some)
     }
 
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {

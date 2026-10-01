@@ -1284,7 +1284,7 @@ impl Engine {
                 None,
                 scope,
                 None,
-                move |_| Ok(remaining),
+                move |_| Ok(remaining.clone()),
             )
             .await;
         let source_warning = match edited {
