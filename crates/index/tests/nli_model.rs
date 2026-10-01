@@ -22,6 +22,7 @@
 use crystalline_index::nli::local::LocalNli;
 use crystalline_index::nli::{ContradictionScorer, NLI_MODELS, NliProfile, nli_model};
 use crystalline_index::sweep::{CONTRADICTION_STORE_FLOOR, ORDER_AGGREGATION};
+use crystalline_index::{ACCELERATION_ENV, CpuReason, DeviceKind, DeviceReport};
 
 /// Whether the real-model tests run. Asked for without a dedicated model
 /// directory, they fail loudly rather than download into the user's cache.
@@ -37,6 +38,28 @@ fn enabled() -> bool {
          the default is your real model cache, which a running daemon prunes"
     );
     true
+}
+
+/// The device the checkpoint loaded on, held to what this run asked for: on
+/// an Apple Silicon Mac the GPU, or the CPU when `CRYSTALLINE_ACCELERATION`
+/// is `off`; the CPU everywhere else. A silent fallback would otherwise make
+/// a "Metal" run a second CPU run with the same numbers.
+fn expected_device(nli: &LocalNli) -> DeviceReport {
+    let device = nli
+        .device()
+        .expect("a loaded checkpoint reports its device");
+    let off = std::env::var(ACCELERATION_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        if off {
+            assert_eq!(device.kind, DeviceKind::Cpu, "{device}");
+            assert_eq!(device.reason, Some(CpuReason::Off), "{device}");
+        } else {
+            assert_eq!(device, DeviceReport::metal(), "no silent CPU fallback");
+        }
+    } else {
+        assert_eq!(device, DeviceReport::cpu());
+    }
+    device
 }
 
 #[tokio::test]
@@ -71,6 +94,7 @@ async fn nli_parity_holds_as_one_padded_batch() {
             })
             .collect();
         let nli = LocalNli::load(model).await.unwrap();
+        let device = expected_device(&nli);
 
         // The token ids first: a logits miss with matching ids is the model's,
         // a miss with differing ids is the tokenizer's.
@@ -118,7 +142,7 @@ async fn nli_parity_holds_as_one_padded_batch() {
             }
         }
         eprintln!(
-            "parity {}: {} pairs, max abs logit diff {max_diff:e} (tolerance {tolerance})",
+            "parity {} on {device}: {} pairs, max abs logit diff {max_diff:e} (tolerance {tolerance})",
             model.id,
             pairs.len()
         );

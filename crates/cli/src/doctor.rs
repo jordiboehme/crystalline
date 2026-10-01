@@ -1172,13 +1172,19 @@ pub async fn run(
         Some(store) => Some(embedding_summary(store, cfg).await?),
         None => None,
     };
-    let embedding_device = cfg
+    // One probe for both local models: each opens a Metal device, and the
+    // contradiction model runs on the same pick as the embedding model.
+    let embedding_local = cfg
         .embeddings
         .as_ref()
-        .is_none_or(|e| e.provider.trim() == "local")
+        .is_none_or(|e| e.provider.trim() == "local");
+    let contradictions_on =
+        crystalline_index::nli::NliProfile::from_setting(cfg.evolve_contradictions()).is_some();
+    let probed_device = (embedding_local || contradictions_on)
         .then(crystalline_index::device::probe)
         .flatten()
         .map(|d| d.to_string());
+    let embedding_device = probed_device.clone().filter(|_| embedding_local);
 
     // Only when a daemon already answered this run's file stamps: reusing
     // that daemon's own numbers is one extra round trip on the route that
@@ -1193,7 +1199,11 @@ pub async fn run(
     } else {
         None
     };
-    let contradictions = Some(contradiction_summary(cfg, daemon_status.as_ref()));
+    let contradictions = Some(contradiction_summary(
+        cfg,
+        daemon_status.as_ref(),
+        probed_device.filter(|_| contradictions_on),
+    ));
 
     let harnesses = check_harnesses();
 
@@ -2993,10 +3003,13 @@ fn is_embedding_listing(repo: &str) -> bool {
 /// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
 /// `load_retry`, `read_only` and `embedding_pending` are read from there and never recomputed (lesson 36) -
 /// a direct read has no worker, so those stay null/false, the same shape
-/// `crystalline status`'s standalone fallback reports.
+/// `crystalline status`'s standalone fallback reports. `device` is the probed
+/// device a load of the model would pick here (as for the embedding model,
+/// probed, not loaded); it is reported only while a profile is on.
 fn contradiction_summary(
     cfg: &GlobalConfig,
     daemon_status: Option<&serde_json::Value>,
+    device: Option<String>,
 ) -> serde_json::Value {
     use crystalline_index::nli::{
         LOCAL_NLI_AVAILABLE, NLI_FEATURE_MISSING, NLI_MODELS, NliProfile, RETIRED_NLI_REPOS,
@@ -3063,6 +3076,7 @@ fn contradiction_summary(
                 "last_error": last_error, "load_failed": load_failed,
                 "load_retry": load_retry, "read_only": read_only,
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
+                "device": device,
             })
         }
     }
@@ -3779,6 +3793,10 @@ pub fn render_human(report: &DoctorReport) -> String {
                     for l in remedy {
                         let _ = writeln!(out, "{l}");
                     }
+                }
+                // Probed, not loaded, like the embedding model's device line.
+                if let Some(device) = c["device"].as_str() {
+                    let _ = writeln!(out, "  device: {device}");
                 }
             }
         }
@@ -5406,7 +5424,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _env = ModelsDirOverride::set(tmp.path());
         for removed in ["light", "english-only"] {
-            let summary = contradiction_summary(&cfg_with_profile(removed), None);
+            let summary = contradiction_summary(&cfg_with_profile(removed), None, None);
             assert_eq!(summary["model"], serde_json::Value::Null, "{summary}");
             assert_eq!(summary["profile"], removed);
             let mut report = report_with_orphans(IndexAccess::Direct, &[]);
@@ -5494,7 +5512,7 @@ mod tests {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ModelsDirOverride::set(tmp.path());
-        let summary = contradiction_summary(&GlobalConfig::default(), None);
+        let summary = contradiction_summary(&GlobalConfig::default(), None, None);
         assert_eq!(summary["profile"], "off");
         assert_eq!(summary["model"], serde_json::Value::Null);
         assert_eq!(summary["repo"], serde_json::Value::Null);
@@ -5518,7 +5536,7 @@ mod tests {
             "pending_pairs": 12, "failing_pairs": 0, "last_error": null,
             "load_failed": false, "embedding_pending": false,
         }});
-        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
         assert_eq!(summary["profile"], "full");
         assert_eq!(summary["model"], nli_model(NliProfile::Full).id);
         assert_eq!(summary["repo"], nli_model(NliProfile::Full).repo);
@@ -5544,13 +5562,45 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
         );
         let _env = ModelsDirOverride::set(tmp.path());
-        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
         assert_eq!(summary["downloaded"], false);
         assert!(summary["reason"].is_string(), "{summary}");
         assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
         seed_nli_snapshot(tmp.path(), full.repo, full.revision);
-        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
         assert_eq!(summary["downloaded"], true);
+    }
+
+    /// The contradiction model runs on the embedding model's device pick, so
+    /// doctor prints the probed device under its row the way it does under
+    /// the embeddings block; off prints none.
+    #[test]
+    fn the_contradictions_row_names_the_probed_device() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary =
+            contradiction_summary(&cfg_with_profile("full"), None, Some("metal".to_string()));
+        assert_eq!(summary["device"], "metal");
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.contradictions = Some(summary);
+        let out = render_human(&report);
+        let row = out
+            .lines()
+            .position(|l| l.starts_with("contradictions: full"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(out.lines().nth(row + 1), Some("  device: metal"), "{out}");
+
+        let off = contradiction_summary(&GlobalConfig::default(), None, None);
+        assert!(off.get("device").is_none(), "{off}");
+        report.contradictions = Some(off);
+        let out = render_human(&report);
+        assert!(
+            !out.lines()
+                .skip_while(|l| !l.starts_with("contradictions:"))
+                .any(|l| l == "  device: metal"),
+            "{out}"
+        );
     }
 
     /// Final review M1: the row takes `read_only` and `load_retry` from the
@@ -5567,7 +5617,7 @@ mod tests {
             "load_failed": true, "load_retry": false, "read_only": true,
             "embedding_pending": false,
         }});
-        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
         assert_eq!(summary["read_only"], true);
         assert_eq!(summary["load_retry"], false);
         let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
@@ -5587,7 +5637,7 @@ mod tests {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let _env = ModelsDirOverride::set(tmp.path());
-        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
         assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
         assert_ne!(summary["pending_pairs"], serde_json::json!(0), "{summary}");
         assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
@@ -5613,7 +5663,7 @@ mod tests {
             "last_error": "contradiction model error: offline",
             "load_failed": true, "embedding_pending": false,
         }});
-        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
         assert_eq!(summary["downloaded"], false);
         assert_eq!(summary["load_failed"], true);
         assert_eq!(summary["last_error"], "contradiction model error: offline");
@@ -5639,7 +5689,7 @@ mod tests {
             "last_error": "the batch failed", "load_failed": false,
             "embedding_pending": false,
         }});
-        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
         assert_eq!(summary["failing_pairs"], 2);
         assert_eq!(summary["last_error"], "the batch failed");
         assert_eq!(summary["load_failed"], false);
@@ -5661,7 +5711,7 @@ mod tests {
             "last_error": "contradiction model error: offline",
             "load_failed": true, "embedding_pending": false,
         }});
-        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon));
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
         assert_eq!(summary["load_failed"], true);
         assert_eq!(summary["failing_pairs"], 2);
         assert_eq!(
@@ -5682,7 +5732,7 @@ mod tests {
         let retired = crystalline_index::nli::RETIRED_NLI_REPOS[0];
         seed_nli_checkpoint(tmp.path(), retired);
         let _env = ModelsDirOverride::set(tmp.path());
-        let summary = contradiction_summary(&cfg_with_profile("full"), None);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
         let stale: Vec<&str> = summary["stale_checkpoints"]
             .as_array()
             .unwrap()

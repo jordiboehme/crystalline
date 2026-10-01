@@ -1,9 +1,15 @@
-//! The local NLI scorer: one checkpoint from [`super::models`] on CPU via
-//! candle, always in F32. mDeBERTa overflows in F16, so an F16 or BF16 file is
-//! upcast on load and no NLI model ever runs in half precision. The files are
+//! The local NLI scorer: one checkpoint from [`super::models`] via candle,
+//! always in F32. mDeBERTa overflows in F16, so an F16 or BF16 file is upcast
+//! on load and no NLI model ever runs in half precision. The files are
 //! fetched into the same cache as the embedding model through [`crate::hub`],
 //! with the same first-use notice and progress line, and a load failure from a
-//! corrupt cache wipes the repository and fetches once more.
+//! corrupt cache removes the failed snapshot and fetches once more.
+//!
+//! The device is the embedding model's pick ([`crate::device`]): the Metal GPU
+//! of an Apple Silicon Mac when the checkpoint builds there and scores a
+//! warm-up pair, the CPU otherwise. A GPU error or panic only falls back to
+//! the CPU, so the self-heal above runs on a CPU failure alone and never
+//! removes a good snapshot because of the GPU.
 //!
 //! candle's `DebertaV2SeqClassificationModel` reads `pooler.dense` and
 //! `classifier` through `vb.root()`, so it is handed `vb.pp("deberta")`. The
@@ -31,6 +37,7 @@ use super::models::NliModel;
 #[cfg(test)]
 use super::models::{NliProfile, nli_model};
 use super::{ContradictionScorer, MAX_LINE_TOKENS, contradiction_index};
+use crate::device::{DeviceReport, load_on_best_device};
 use crate::embed::models::{note_loaded_snapshot, remove_failed_snapshot};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read};
@@ -54,6 +61,7 @@ pub struct LocalNli {
     head: Box<DebertaV2SeqClassificationModel>,
     tokenizer: Tokenizer,
     device: Device,
+    report: DeviceReport,
     contradiction: usize,
 }
 
@@ -100,33 +108,26 @@ impl LocalNli {
     /// to and nothing to settle.
     pub async fn load(model: &'static NliModel) -> Result<LocalNli> {
         let cache_dir = models_cache_dir().map_err(as_fetch)?;
-        let files = ensure_files(&cache_dir, &hub_repo(model), true)
-            .await
-            .map_err(as_fetch)?;
-        let snapshot = files.snapshot_dir().map_err(as_fetch)?;
-        match build_on_blocking(files, model).await {
-            Ok(nli) => {
-                note_loaded_snapshot(&snapshot);
-                Ok(nli)
-            }
-            Err(first) => {
-                eprintln!(
-                    "crystalline: contradiction model failed to load ({first}); re-downloading once..."
-                );
-                remove_failed_snapshot(
-                    &cache_dir,
-                    &model.pinned(),
-                    config::models_dir_is_user_provided(),
-                );
-                let files = ensure_files(&cache_dir, &hub_repo(model), true)
-                    .await
-                    .map_err(as_fetch)?;
-                let snapshot = files.snapshot_dir().map_err(as_fetch)?;
-                let nli = build_on_blocking(files, model).await?;
-                note_loaded_snapshot(&snapshot);
-                Ok(nli)
-            }
-        }
+        let fetch = || async {
+            let files = ensure_files(&cache_dir, &hub_repo(model), true)
+                .await
+                .map_err(as_fetch)?;
+            let snapshot = files.snapshot_dir().map_err(as_fetch)?;
+            Ok((files, snapshot))
+        };
+        let build = |(files, snapshot): (HubFiles, std::path::PathBuf)| async move {
+            let nli = build_on_blocking(files, model).await?;
+            note_loaded_snapshot(&snapshot);
+            Ok(nli)
+        };
+        let heal = || {
+            remove_failed_snapshot(
+                &cache_dir,
+                &model.pinned(),
+                config::models_dir_is_user_provided(),
+            )
+        };
+        load_healing(fetch, build, heal).await
     }
 
     /// The token ids each `(premise, hypothesis)` pair runs as, padding
@@ -213,15 +214,64 @@ impl ContradictionScorer for LocalNli {
     fn model_repo(&self) -> &str {
         self.model.repo
     }
+
+    fn device(&self) -> Option<DeviceReport> {
+        Some(self.report.clone())
+    }
 }
 
+/// Fetch, then build; when the build fails, `heal` (remove the failed
+/// snapshot), fetch again and build once more. A fetch error is returned as
+/// it is and heals nothing. A GPU failure never reaches `heal` either:
+/// [`build_on_blocking`] falls back to the CPU inside the build, so only the
+/// CPU's error counts as a broken snapshot.
+async fn load_healing<Files, T, FetchFut, BuildFut>(
+    fetch: impl Fn() -> FetchFut,
+    build: impl Fn(Files) -> BuildFut,
+    heal: impl FnOnce(),
+) -> Result<T>
+where
+    FetchFut: std::future::Future<Output = Result<Files>>,
+    BuildFut: std::future::Future<Output = Result<T>>,
+{
+    match build(fetch().await?).await {
+        Ok(loaded) => Ok(loaded),
+        Err(first) => {
+            eprintln!(
+                "crystalline: contradiction model failed to load ({first}); re-downloading once..."
+            );
+            heal();
+            build(fetch().await?).await
+        }
+    }
+}
+
+/// [`build`] on a blocking thread, on the device [`crate::device`] picks: the
+/// GPU when the checkpoint builds there and scores [`warm_up`], the CPU
+/// otherwise. The error this returns is always the CPU's.
 async fn build_on_blocking(files: HubFiles, model: &'static NliModel) -> Result<LocalNli> {
-    tokio::task::spawn_blocking(move || build(&files, model))
-        .await
-        .map_err(|e| IndexError::Nli(format!("contradiction model load task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        let (mut nli, report) = load_on_best_device(
+            "contradiction model",
+            |device| build(&files, model, device),
+            warm_up,
+        )?;
+        nli.report = report;
+        Ok(nli)
+    })
+    .await
+    .map_err(|e| IndexError::Nli(format!("contradiction model load task failed: {e}")))?
 }
 
-fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
+/// One pair through the whole scoring path, logits read back to the host, so
+/// an op the GPU lacks (the I64 mask cast, a kernel) or an error it reports
+/// only at sync surfaces while the CPU is still there to fall back to.
+fn warm_up(nli: &LocalNli) -> Result<()> {
+    nli.logits(&[("warm-up".to_string(), "warm-up".to_string())])
+        .map(|_| ())
+}
+
+fn build(files: &HubFiles, model: &'static NliModel, device: &Device) -> Result<LocalNli> {
     let config_text = read(files.config()?)?;
     let raw: serde_json::Value = serde_json::from_str(&config_text)
         .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
@@ -251,7 +301,7 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
         }))
         .map_err(|e| IndexError::Nli(format!("configuring truncation: {e}")))?;
 
-    let device = Device::Cpu;
+    let device = device.clone();
     // Safety: a freshly verified download on the standard candle mmap path.
     // DType::F32 upcasts an F16 or BF16 file; nothing here runs in F16.
     let vb = unsafe {
@@ -274,6 +324,7 @@ fn build(files: &HubFiles, model: &'static NliModel) -> Result<LocalNli> {
         head,
         tokenizer,
         device,
+        report: DeviceReport::cpu(),
         contradiction,
     })
 }
@@ -492,6 +543,158 @@ mod tests {
             relabeled.to_string().contains("read-only file system"),
             "{relabeled}"
         );
+    }
+
+    /// The contradiction model's device pick and its self-heal, driven with
+    /// the CPU standing in for the GPU (the same seam `crate::device` tests
+    /// with): a GPU error or panic falls back to the CPU and never removes the
+    /// snapshot; only a CPU failure reaches the self-heal.
+    mod device_pick {
+        use std::cell::Cell;
+
+        use candle_core::Device;
+
+        use super::super::load_healing;
+        use crate::device::{Accelerator, DeviceKind, DeviceReport, load_with};
+        use crate::error::{IndexError, Result};
+
+        fn fake_gpu() -> Accelerator {
+            Accelerator::Device(Device::Cpu, DeviceKind::Metal)
+        }
+
+        /// One load the way `LocalNli::load` runs it: fetch (here nothing),
+        /// then the device pick with `build` and `warm`, healing on an error.
+        async fn load(
+            build: impl Fn(&Device) -> Result<u32>,
+            warm: impl Fn(&u32) -> Result<()>,
+            heals: &Cell<u32>,
+        ) -> Result<(u32, DeviceReport)> {
+            load_healing(
+                || async { Ok(()) },
+                |()| {
+                    let picked = load_with("contradiction model", fake_gpu(), &build, &warm);
+                    async move { picked }
+                },
+                || heals.set(heals.get() + 1),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_gpu_error_falls_back_to_the_cpu_and_never_heals() {
+            let (builds, heals) = (Cell::new(0), Cell::new(0));
+            let (model, report) = load(
+                |_| {
+                    builds.set(builds.get() + 1);
+                    match builds.get() {
+                        1 => Err(IndexError::Nli("building model: no metal kernel".into())),
+                        n => Ok(n),
+                    }
+                },
+                |_| Ok(()),
+                &heals,
+            )
+            .await
+            .unwrap();
+            assert_eq!(model, 2, "built again on the CPU");
+            assert_eq!(heals.get(), 0, "a GPU error never removes the snapshot");
+            assert_eq!(report.kind, DeviceKind::Cpu);
+            let reason = report.fallback().unwrap();
+            assert!(reason.starts_with("metal failed: "), "{reason}");
+            assert!(reason.contains("no metal kernel"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn a_gpu_panic_in_the_build_or_the_warm_up_falls_back_and_never_heals() {
+            let (builds, heals) = (Cell::new(0), Cell::new(0));
+            let (_, report) = load(
+                |_| {
+                    builds.set(builds.get() + 1);
+                    if builds.get() == 1 {
+                        panic!("called `Option::unwrap()` on a `None` value");
+                    }
+                    Ok(builds.get())
+                },
+                |_| Ok(()),
+                &heals,
+            )
+            .await
+            .unwrap();
+            assert_eq!(heals.get(), 0);
+            assert!(
+                report.fallback().unwrap().starts_with("metal panicked: "),
+                "{report}"
+            );
+
+            let (builds, heals) = (Cell::new(0), Cell::new(0));
+            let (_, report) = load(
+                |_| {
+                    builds.set(builds.get() + 1);
+                    Ok(builds.get())
+                },
+                |n| {
+                    if *n == 1 {
+                        panic!("{}", String::from("command buffer lost"));
+                    }
+                    Ok(())
+                },
+                &heals,
+            )
+            .await
+            .unwrap();
+            assert_eq!(heals.get(), 0);
+            assert_eq!(report.kind, DeviceKind::Cpu);
+            assert!(
+                report.fallback().unwrap().contains("command buffer lost"),
+                "{report}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_working_gpu_is_kept_and_reported() {
+            let heals = Cell::new(0);
+            let (_, report) = load(|_| Ok(1), |_| Ok(()), &heals).await.unwrap();
+            assert_eq!(report, DeviceReport::metal());
+            assert_eq!(heals.get(), 0);
+        }
+
+        #[tokio::test]
+        async fn only_a_cpu_failure_reaches_the_self_heal_once() {
+            let (builds, heals) = (Cell::new(0), Cell::new(0));
+            let err = load(
+                |_| {
+                    builds.set(builds.get() + 1);
+                    Err(IndexError::Nli(format!(
+                        "building model: corrupt weights {}",
+                        builds.get()
+                    )))
+                },
+                |_| Ok(()),
+                &heals,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(heals.get(), 1, "healed once, after the first CPU failure");
+            assert_eq!(builds.get(), 4, "GPU and CPU, twice");
+            assert!(err.to_string().contains("corrupt weights 4"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_fetch_error_is_returned_without_a_heal_or_a_build() {
+            let (builds, heals) = (Cell::new(0), Cell::new(0));
+            let err = load_healing(
+                || async { Err::<(), _>(IndexError::NliFetch("offline".into())) },
+                |()| {
+                    builds.set(builds.get() + 1);
+                    async { Ok(()) }
+                },
+                || heals.set(heals.get() + 1),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, IndexError::NliFetch(_)), "{err:?}");
+            assert_eq!((builds.get(), heals.get()), (0, 0));
+        }
     }
 
     /// Review focus 5, the half that runs without a download: the pad id is

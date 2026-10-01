@@ -2589,6 +2589,11 @@ pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
         None => "not counted yet".to_string(),
     };
     let mut line = format!("Contradictions: {profile} ({model}), {pending}");
+    // The loaded model's device, as on the embeddings line; absent while no
+    // model is in memory and from an older daemon, so no guess.
+    if let Some(device) = c["device"].as_str() {
+        line.push_str(&format!(", device: {device}"));
+    }
     if let Some(reason) = contradiction_wait_reason(c) {
         line.push_str(&format!(", {reason}"));
     }
@@ -4245,6 +4250,33 @@ mod contradictions_status_tests {
         }
         let off = json!({ "contradictions": { "profile": "off", "model": null }});
         assert_eq!(contradictions_lines(&off), vec!["Contradictions: off"]);
+    }
+
+    /// The device of the loaded model follows the pending count, the way the
+    /// embeddings line ends with its device; a reason still comes last.
+    #[test]
+    fn the_loaded_model_names_its_device() {
+        let data = json!({ "contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 3, "failing_pairs": 0, "scored_pairs": 40,
+            "last_error": null, "load_failed": false, "embedding_pending": true,
+            "device": "cpu (fallback: metal failed: out of memory)",
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec![
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 3 pairs pending, device: cpu (fallback: metal failed: out of memory), embedding not finished for some candidates"
+            ]
+        );
+        let mut metal = data.clone();
+        metal["contradictions"]["device"] = json!("metal");
+        metal["contradictions"]["embedding_pending"] = json!(false);
+        assert_eq!(
+            contradictions_lines(&metal),
+            vec![
+                "Contradictions: full (mdeberta-v3-base-xnli-2mil7), 3 pairs pending, device: metal"
+            ]
+        );
     }
 
     #[test]

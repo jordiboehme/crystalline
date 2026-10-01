@@ -118,9 +118,9 @@ pub const NLI_LOAD_HOLD_ENV: &str = "CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS";
 /// overlay state rather than being ignored.
 const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_MODELS_DIR",
-    // `crystalline_index::device`: `off` keeps the embedding model on the
-    // CPU on an Apple Silicon Mac. Read when the model loads, never through
-    // the settings registry.
+    // `crystalline_index::device`: `off` keeps the embedding model and the
+    // NLI model on the CPU on an Apple Silicon Mac. Read when a model loads,
+    // never through the settings registry.
     crystalline_index::ACCELERATION_ENV,
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",

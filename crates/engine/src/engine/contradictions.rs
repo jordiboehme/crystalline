@@ -135,7 +135,11 @@ impl Engine {
     /// setting cannot be set here, so only a restart retries a blocked load)
     /// and `embedding_pending` (a settled domain still has a possible
     /// candidate with no lead vector yet, so its pending count of zero is not
-    /// the whole story).
+    /// the whole story). `device` is where the loaded model runs, in the
+    /// embeddings line's words (`metal`, `cpu (fallback: ...)`), and `null`
+    /// while no model is in memory (never loaded, dropped after its idle
+    /// time, or a direct read with no worker): no guess at a device nothing
+    /// runs on.
     pub async fn contradictions_status(&self) -> Result<Value> {
         let profile = self
             .config
@@ -159,17 +163,29 @@ impl Engine {
         let load_failed = model.is_some_and(|m| state.load_failed == Some(m.repo));
         let load_retry = load_failed && state.load_retry_at.is_some();
         let embedding_pending = state.settled.values().any(|s| s.coverage.is_some());
+        let last_error = state.last_error.clone();
+        drop(state);
+        let device = model.and_then(|m| {
+            self.scorer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|h| h.repo == m.repo)
+                .and_then(|h| h.scorer.device())
+                .map(|d| d.to_string())
+        });
         Ok(json!({
             "profile": profile,
             "model": model.map(|m| m.id),
             "pending_pairs": pending_pairs,
             "failing_pairs": failing_pairs,
             "scored_pairs": scored,
-            "last_error": state.last_error,
+            "last_error": last_error,
             "load_failed": load_failed,
             "load_retry": load_retry,
             "read_only": self.read_only,
             "embedding_pending": embedding_pending,
+            "device": device,
         }))
     }
 

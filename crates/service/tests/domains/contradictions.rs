@@ -772,6 +772,55 @@ async fn a_failed_build_is_never_retried_by_the_tick() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
+/// A scorer that says it runs on the GPU: the stub's scores, the device a
+/// real checkpoint reports after a Metal load.
+struct OnMetal(Arc<StubScorer>);
+
+impl ContradictionScorer for OnMetal {
+    fn score(&self, pairs: &[(String, String)]) -> crystalline_index::Result<Vec<f32>> {
+        self.0.score(pairs)
+    }
+
+    fn model_repo(&self) -> &str {
+        self.0.model_repo()
+    }
+
+    fn device(&self) -> Option<crystalline_index::DeviceReport> {
+        Some(crystalline_index::DeviceReport::metal())
+    }
+}
+
+/// The status block names the device of the model in memory, the way the
+/// embeddings line does, and nothing while no model is loaded: before the
+/// first pass, after the idle drop, and for a scorer that runs no model.
+#[tokio::test]
+async fn the_status_names_the_device_only_while_the_model_is_loaded() {
+    let loads = Arc::new(AtomicUsize::new(0));
+    let (_tmp, engine) = engine_with(loader_of(Arc::new(OnMetal(stub())), loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    let status = engine.contradictions_status().await.unwrap();
+    assert!(status["device"].is_null(), "nothing loaded yet: {status}");
+    engine.score_contradictions().await.unwrap();
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["device"], "metal", "{status}");
+    let now = tokio::time::Instant::now();
+    engine.drop_idle_scorer_at(now + NLI_IDLE_DROP + std::time::Duration::from_secs(1));
+    let status = engine.contradictions_status().await.unwrap();
+    assert!(status["device"].is_null(), "dropped, no guess: {status}");
+
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert!(engine.contradiction_scorer_loaded());
+    let status = engine.contradictions_status().await.unwrap();
+    assert!(
+        status["device"].is_null(),
+        "the stub runs no model: {status}"
+    );
+}
+
 #[tokio::test]
 async fn the_scorer_drops_after_ten_idle_minutes_and_reloads_on_demand() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));

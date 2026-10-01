@@ -1,5 +1,6 @@
-//! Where the local embedding model runs: on the Metal GPU of an Apple Silicon
-//! Mac when one is usable, on the CPU otherwise.
+//! Where the local models run (the embedding model and the contradiction
+//! model): on the Metal GPU of an Apple Silicon Mac when one is usable, on the
+//! CPU otherwise. Each model makes the pick on its own load.
 //!
 //! On an Apple Silicon Mac the loader first tries Metal device 0, builds the
 //! model there and runs one warm-up forward pass, reading the result back so
@@ -127,6 +128,8 @@ pub fn probe() -> Option<DeviceReport> {
 
 #[cfg(feature = "local-embeddings")]
 pub(crate) use loader::load_on_best_device;
+#[cfg(all(feature = "local-embeddings", test))]
+pub(crate) use loader::{Accelerator, load_with};
 
 #[cfg(feature = "local-embeddings")]
 mod loader {
@@ -139,7 +142,7 @@ mod loader {
     use crate::error::Result;
 
     /// What the loader tries first.
-    pub(super) enum Accelerator {
+    pub(crate) enum Accelerator {
         /// No GPU on this platform: plain CPU.
         None,
         /// A GPU is possible but switched off by the environment.
@@ -245,7 +248,7 @@ mod loader {
 
     /// [`load_on_best_device`] with the accelerator handed in: the seam the
     /// fallback tests drive.
-    pub(super) fn load_with<T>(
+    pub(crate) fn load_with<T>(
         what: &str,
         accelerator: Accelerator,
         build: impl Fn(&Device) -> Result<T>,

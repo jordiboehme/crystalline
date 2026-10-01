@@ -47,8 +47,9 @@ pub const LOCAL_NLI_AVAILABLE: bool = cfg!(feature = "local-embeddings");
 pub const NLI_FEATURE_MISSING: &str =
     "contradiction scoring needs the local-embeddings feature, which this build does not carry";
 
-/// Scores ordered sentence pairs for contradiction. Synchronous: inference is
-/// CPU work, and the caller runs it on a blocking thread.
+/// Scores ordered sentence pairs for contradiction. Synchronous: inference
+/// blocks (on the CPU, or waiting for the GPU), and the caller runs it on a
+/// blocking thread.
 pub trait ContradictionScorer: Send + Sync {
     /// The softmax contradiction probability of each `(premise, hypothesis)`
     /// pair, in order. The caller batches by [`NLI_BATCH_SIZE`].
@@ -56,6 +57,12 @@ pub trait ContradictionScorer: Send + Sync {
 
     /// The Hugging Face repository the scores are stored against.
     fn model_repo(&self) -> &str;
+
+    /// The device the loaded model runs on ([`crate::device`]). `None` for a
+    /// scorer that runs no model (the test stub).
+    fn device(&self) -> Option<crate::device::DeviceReport> {
+        None
+    }
 }
 
 /// The classifier row that means "contradiction", read from the checkpoint's
