@@ -55,6 +55,20 @@ describe("fixtureReading at a terminal", () => {
       content: CANNED_WORKSHOP.content,
       section: { heading: terminal.heading, occurrence: terminal.section },
     });
+    // The second of two sections under one heading opens at occurrence 1.
+    const twice: PlaceInput = {
+      ...CANNED_WORKSHOP,
+      content: "# Log\n\n## Shift\nFirst.\n## Shift\nSecond.",
+    };
+    const room = generateRoom(twice);
+    const second = indexOf(
+      room,
+      (f) => f.kind === "terminal" && f.heading === "Shift" && f.section === 1,
+    );
+    expect(fixtureReading(room, second, twice)?.section).toEqual({
+      heading: "Shift",
+      occurrence: 1,
+    });
   });
 
   it("reads nothing with no place", () => {
@@ -133,10 +147,13 @@ describe("fixtureReading at the placard", () => {
       content: placard.lines.join("\n\n"),
       section: null,
     });
-    // The placard is the room's, so it reads with no place as well.
-    expect(fixtureReading(workshop, i, null)?.content).toBe(
-      placard.lines.join("\n\n"),
-    );
+    // The placard is the room's, so it reads with no place as well, under
+    // the room's own title.
+    expect(fixtureReading(workshop, i, null)).toEqual({
+      title: workshop.title,
+      content: placard.lines.join("\n\n"),
+      section: null,
+    });
   });
 });
 
@@ -238,6 +255,7 @@ describe("fixtureReading at a way", () => {
   it("reads nothing at a door, a portal, a hatch, a lift or an exit", () => {
     // Mutation caught: a way's label read as a reading (0.22 R12).
     const kinds = ["door", "portal", "hatch"] as const;
+    expect(kinds.length).toBeGreaterThan(0);
     for (const kind of kinds) {
       const i = indexOf(bridge, (f) => f.kind === kind);
       expect(fixtureReading(bridge, i, CANNED_BRIDGE)).toBeNull();
