@@ -1137,9 +1137,12 @@ export interface paths {
          *     finding - send this value back on the acknowledgment route to silence the
          *     pair that was read rather than whichever one the server would have picked.
          *     A `V302` row also carries `counterpart` (the other engram's permalink),
-         *     `counterpart_title`, `counterpart_line` and `probability`, so a page can
-         *     link the other engram and show the model's score without parsing the
-         *     evidence.
+         *     `counterpart_title`, `counterpart_line`, `probability`, `similarity` (the
+         *     two lines' cosine), `line_text` and `counterpart_line_text` (both lines,
+         *     cut to about 200 characters) and, when more line pairs of the same two
+         *     engrams stand, `more_line_pairs`, so a page can link both engrams and show
+         *     both lines without parsing the evidence. There is one `V302` row per pair
+         *     of engrams, its strongest line pair, at most ten per domain.
          *
          *     `today` is not exposed. The temporal rules are evaluated as of now, which is
          *     the only question a page asks; the tool takes a pinned date for a run that

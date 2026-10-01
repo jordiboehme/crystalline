@@ -256,14 +256,22 @@ impl Engine {
                     row["scope"] = Value::String(f.scope.clone());
                 }
                 // A V302 row names its counterpart flat, so a renderer links
-                // the other engram and shows the probability without parsing
-                // the evidence. Already rounded to the two decimals the text
-                // quotes, so the two never disagree.
+                // the other engram and shows the probability and the line
+                // similarity without parsing the evidence. Both are already
+                // rounded to the two decimals the text quotes, so the two
+                // never disagree. The two line texts ride the row once, in
+                // their own columns, never in the finding sentence.
                 if let Some(c) = &f.counterpart {
                     row["counterpart"] = Value::String(c.permalink.clone());
                     row["counterpart_title"] = Value::String(c.title.clone());
                     row["counterpart_line"] = json!(c.line);
                     row["probability"] = json!(c.probability);
+                    row["similarity"] = json!(c.similarity);
+                    row["line_text"] = Value::String(c.anchor_text.clone());
+                    row["counterpart_line_text"] = Value::String(c.text.clone());
+                    if c.more_line_pairs > 0 {
+                        row["more_line_pairs"] = json!(c.more_line_pairs);
+                    }
                 }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
@@ -491,11 +499,13 @@ impl Engine {
     /// **The unacknowledged finding wins when the rule fires more than once
     /// here**, which only the pair-scoped rules do
     /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
-    /// carries two `V301` findings, one whose lines read as contradicting two
-    /// others' carries two `V302` findings, and neither one is "the" finding. Taking
-    /// the first row every time made the second acknowledgment re-record the
-    /// pair the first already covered, so the other pair could never be
-    /// acknowledged at all. With every pair acknowledged the first row wins
+    /// carries two `V301` findings, one whose lines read as contradicting the
+    /// lines of two other engrams carries two `V302` findings, and an engram
+    /// pair with acknowledged line pairs carries those as suppressed `V302`
+    /// findings beside its one open line pair. None of them is "the" finding.
+    /// Taking the first row every time made the second acknowledgment
+    /// re-record the pair the first already covered, so the other pair could
+    /// never be acknowledged at all. With every pair acknowledged the first row wins
     /// again, which is what makes a re-acknowledgment update a note in place.
     async fn firing_scope(
         &self,
@@ -1054,6 +1064,7 @@ impl Engine {
             contradiction_candidates_capped: meaning.capped,
             contradiction_unembedded: meaning.unembedded,
             contradiction_vectors_capped: meaning.vectors_capped,
+            contradiction_no_line_floor: meaning.no_line_floor,
             include_acknowledged,
             // The sweep module's own constants, never literals repeated here:
             // the thresholds and the twin caps are one place, and nothing

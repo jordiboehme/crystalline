@@ -2040,14 +2040,28 @@ async fn evolve_raises_v302_from_stored_rows_and_never_scores_inline() {
     assert_eq!(rows.len(), 1, "{after}");
     let row = rows[0];
     assert_eq!(row["class"], "judgment");
+    let finding = row["finding"].as_str().unwrap();
     assert!(
-        row["finding"]
-            .as_str()
-            .unwrap()
-            .contains("read as a contradiction at probability 0.93"),
+        finding.starts_with("Possible contradiction: line 14 of ")
+            && finding.contains("read as contradicting at probability 0.93, line similarity "),
         "{row}"
     );
     assert_eq!(row["probability"], 0.93);
+    assert!(row["similarity"].as_f64().is_some(), "{row}");
+    let mut texts = [
+        row["line_text"].as_str().unwrap(),
+        row["counterpart_line_text"].as_str().unwrap(),
+    ];
+    texts.sort();
+    assert_eq!(
+        texts,
+        ["The build uses Node 18", "The build uses Node 20"],
+        "both lines ride the row: {row}"
+    );
+    assert!(
+        row.get("more_line_pairs").is_none(),
+        "one line pair, nothing more: {row}"
+    );
     assert!(
         matches!(row["counterpart"].as_str(), Some("eighteen" | "twenty")),
         "{row}"
@@ -2262,7 +2276,7 @@ async fn a_line_pair_acknowledgment_survives_a_renumbering_and_resurfaces_after_
     assert!(rows[0]["ack_stale"].is_null(), "{}", rows[0]);
 }
 
-/// Lesson 66: the queue is TOON for an agent, and a V302 row's four extra
+/// Lesson 66: the queue is TOON for an agent, and a V302 row's seven extra
 /// columns sit beside a V301 row that has none. The encoder fills the missing
 /// cells with null, so the queue stays one table; pinned byte for byte.
 #[tokio::test]
@@ -2280,6 +2294,12 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
         .map(|r| r["rule"].as_str().unwrap())
         .collect();
     assert_eq!(rules, vec!["V302", "V301"], "{value}");
+    // The json side of the same row: the new columns, typed.
+    let row = &value["queue"][0];
+    assert_eq!(row["line_text"], "The build uses Node 18");
+    assert_eq!(row["counterpart_line_text"], "The build uses Node 20");
+    assert_eq!(row["similarity"], 1.0);
+    assert!(row.get("more_line_pairs").is_none(), "{row}");
     let text = crystalline_engine::toon::render(&value);
     let lines: Vec<&str> = text.lines().collect();
     let at = lines
@@ -2291,16 +2311,123 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
     assert_eq!(
         lines[at..at + 3].to_vec(),
         vec![
-            "queue[2]{class,counterpart,counterpart_line,counterpart_title,domain,evidence,finding,fix,line,n,permalink,priority,probability,rule,scope,title}:".to_string(),
+            "queue[2]{class,counterpart,counterpart_line,counterpart_line_text,counterpart_title,domain,evidence,finding,fix,line,line_text,n,permalink,priority,probability,rule,scope,similarity,title}:".to_string(),
             format!(
-                "  judgment,twenty,14,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.93; model mdeberta-v3-base-xnli-2mil7,\"\\\"The build uses Node 18\\\" (Eighteen) against \\\"The build uses Node 20\\\" (Twenty) read as a contradiction at probability 0.93\",read both then supersede or close a window or acknowledge V302,14,1,eighteen,85,0.93,V302,\"{v302_scope}\",Eighteen"
+                "  judgment,twenty,14,The build uses Node 20,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.93; similarity 1.00; model mdeberta-v3-base-xnli-2mil7,\"Possible contradiction: line 14 of \\\"Eighteen\\\" and line 14 of \\\"Twenty\\\" read as contradicting at probability 0.93, line similarity 1.00\",read both then supersede or close a window or acknowledge V302,14,The build uses Node 18,1,eighteen,85,0.93,V302,\"{v302_scope}\",1.0,Eighteen"
             ),
             format!(
-                "  judgment,null,null,null,notes,\"lead-vector cosine 1.00 at or above 0.94; twin: notes/twenty\",semantic twin of notes/twenty,read both then merge and supersede or link and acknowledge,null,2,eighteen,75,null,V301,\"{v301_scope}\",Eighteen"
+                "  judgment,null,null,null,null,notes,\"lead-vector cosine 1.00 at or above 0.94; twin: notes/twenty\",semantic twin of notes/twenty,read both then merge and supersede or link and acknowledge,null,null,2,eighteen,75,null,V301,\"{v301_scope}\",null,Eighteen"
             ),
         ],
         "{text}"
     );
+}
+
+/// Review focus 4 and preflight M11: rows a model with a floor left behind
+/// never surface once the embedding model has none, and the queue says why
+/// in one line instead of reading as a clean domain.
+#[tokio::test]
+async fn a_missing_floor_is_silent_in_the_queue_even_with_rows_stored() {
+    let (tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(v302(&sweep(&engine).await).len(), 1, "a row is stored");
+    // A second engine on the same store, as a restart under a model with no
+    // measured floor.
+    let mut cfg = engine.config();
+    no_floor(&mut cfg);
+    let restarted = Engine::new(
+        engine.store(),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(tmp.path().join("config.yaml")),
+    );
+    assert_eq!(rows(&restarted, full().repo).await.len(), 1, "still stored");
+    let value = sweep(&restarted).await;
+    assert!(v302(&value).is_empty(), "{value}");
+    assert_eq!(
+        v302_truncations(&value),
+        vec![
+            "notes - V302 does not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor"
+                .to_string()
+        ]
+    );
+}
+
+/// The hand-off through the real write path: `evolve_ack` must keep one
+/// entry per line pair, or acknowledging the second line pair would drop the
+/// first and the engram pair would keep coming back.
+#[tokio::test]
+async fn acknowledging_two_line_pairs_of_one_engram_pair_silences_both() {
+    let s = Arc::new(
+        StubScorer::new(full().repo, 0.05)
+            .with(
+                "Staging needs a manual trigger on the queue",
+                "Staging retries the queue without a manual trigger",
+                0.92,
+            )
+            .with(
+                "The login session cookie lasts a day",
+                "Token auth uses a csrf cookie",
+                0.90,
+            ),
+    );
+    let (_tmp, engine) = engine_with(loader(s, Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Manual", STAGING_MANUAL))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Auto", STAGING_AUTO))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    let first = v302(&sweep(&engine).await)[0].clone();
+    assert_eq!(first["more_line_pairs"], 1, "{first}");
+    engine
+        .edit_engram(&ack(
+            first["permalink"].as_str().unwrap(),
+            "V302 staging differs by design",
+            first["scope"].as_str(),
+        ))
+        .await
+        .unwrap();
+    let value = sweep(&engine).await;
+    let second = v302(&value)[0].clone();
+    assert_ne!(
+        second["scope"], first["scope"],
+        "the next line pair surfaces"
+    );
+    assert!(second.get("ack_stale").is_none(), "{second}");
+    assert!(second.get("more_line_pairs").is_none(), "{second}");
+    assert_eq!(value["acknowledged"]["by_family"]["meaning"], 1, "{value}");
+    // Preflight H4: the acknowledged line pair is still a finding behind the
+    // queue, so its note can be changed in place while the other stands open.
+    engine
+        .edit_engram(&ack(
+            first["permalink"].as_str().unwrap(),
+            "V302 staging differs on purpose",
+            first["scope"].as_str(),
+        ))
+        .await
+        .expect("a re-acknowledgment of a suppressed line pair is accepted");
+    engine
+        .edit_engram(&ack(
+            second["permalink"].as_str().unwrap(),
+            "V302 cookies differ by design",
+            second["scope"].as_str(),
+        ))
+        .await
+        .unwrap();
+    let value = sweep(&engine).await;
+    assert!(
+        v302(&value).is_empty(),
+        "both acknowledgments hold: {value}"
+    );
+    assert_eq!(value["acknowledged"]["by_family"]["meaning"], 2, "{value}");
 }
 
 /// A file domain `notes` holding the Node 18 and Node 20 engrams, on an
@@ -2493,19 +2620,26 @@ async fn hashes_of(engine: &Engine, model: &str) -> Vec<String> {
     all
 }
 
+/// Point `cfg` at an embedding model with no measured line-similarity floor
+/// (a remote model).
+fn no_floor(cfg: &mut GlobalConfig) {
+    cfg.embeddings = Some(EmbeddingsConfig {
+        provider: "remote".to_string(),
+        model: "text-embedding-3-small".to_string(),
+        endpoint: Some("http://127.0.0.1:9".to_string()),
+        api_key_env: None,
+    });
+}
+
 /// An engine whose embedding model has no measured line-similarity floor (a
 /// remote model), with the stub loader counting its loads in `loads`.
 async fn engine_without_floor(loads: Arc<AtomicUsize>) -> (tempfile::TempDir, Arc<Engine>) {
-    let (tmp, engine) =
-        engine_with_config(Arc::new(crate::support::TopicEmbedder), &["notes"], |cfg| {
-            cfg.embeddings = Some(EmbeddingsConfig {
-                provider: "remote".to_string(),
-                model: "text-embedding-3-small".to_string(),
-                endpoint: Some("http://127.0.0.1:9".to_string()),
-                api_key_env: None,
-            });
-        })
-        .await;
+    let (tmp, engine) = engine_with_config(
+        Arc::new(crate::support::TopicEmbedder),
+        &["notes"],
+        no_floor,
+    )
+    .await;
     (tmp, with_loader(engine, loader(stub(), loads)))
 }
 

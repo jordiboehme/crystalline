@@ -368,6 +368,23 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
         {
             writeln!(out, "   {finding}")?;
         }
+        // A V302 row carries both lines in their own columns rather than in
+        // the sentence, so a reader sees what the model read.
+        if let Some(text) = item.get("line_text").and_then(Value::as_str) {
+            let line = item.get("line").and_then(Value::as_u64).unwrap_or(0);
+            writeln!(out, "   line {line}: \"{text}\"")?;
+        }
+        if let Some(text) = item.get("counterpart_line_text").and_then(Value::as_str) {
+            let other = item
+                .get("counterpart_title")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let line = item
+                .get("counterpart_line")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            writeln!(out, "   {other} line {line}: \"{text}\"")?;
+        }
         if let Some(evidence) = item.get("evidence").and_then(Value::as_str)
             && !evidence.is_empty()
         {
@@ -826,6 +843,34 @@ mod tests {
         let out = render_to_string(render_evolve, &v);
         assert!(out.contains("\n   crystalline://eng\n"), "{out}");
         assert!(!out.contains("crystalline://eng/"), "{out}");
+    }
+
+    /// A `V302` row prints both lines under its finding, each with its line
+    /// number and the other one with its engram's title.
+    #[test]
+    fn a_v302_row_prints_both_lines_under_its_finding() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-10-01" },
+            "engrams_scanned": 2,
+            "total": 1, "page": 1, "limit": 10, "count": 1,
+            "families": [{ "family": "meaning", "findings": 1 }],
+            "queue": [{
+                "n": 1, "priority": 85, "rule": "V302", "class": "judgment",
+                "domain": "eng", "permalink": "ci-runtime", "title": "CI runtime", "line": 7,
+                "finding": "Possible contradiction: line 7 of \"CI runtime\" and line 5 of \"Node version\" read as contradicting at probability 0.91, line similarity 0.90",
+                "evidence": "e", "fix": "f",
+                "counterpart": "node-version", "counterpart_title": "Node version",
+                "counterpart_line": 5, "probability": 0.91, "similarity": 0.9,
+                "line_text": "The build uses Node 20",
+                "counterpart_line_text": "The build uses Node 18",
+            }],
+            "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert!(
+            out.contains("read as contradicting at probability 0.91, line similarity 0.90\n   line 7: \"The build uses Node 20\"\n   Node version line 5: \"The build uses Node 18\"\n   evidence: e\n"),
+            "{out}"
+        );
     }
 
     /// A clean sweep says so rather than printing an empty list, and still

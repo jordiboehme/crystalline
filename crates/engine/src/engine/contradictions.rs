@@ -100,6 +100,10 @@ pub(crate) struct SweepContradictions {
     pub(crate) unembedded: usize,
     /// The lead vectors met when the scope is over the vector cap.
     pub(crate) vectors_capped: Option<usize>,
+    /// The embedding model id when it has no measured line-similarity floor:
+    /// `V302` does not run, the stored rows are not read, and the sweep says
+    /// why.
+    pub(crate) no_line_floor: Option<String>,
 }
 
 /// One domain's share of a walk.
@@ -1599,6 +1603,7 @@ impl Engine {
         let Some(floor) = self.line_floor() else {
             return Ok(SweepContradictions {
                 model: Some(model),
+                no_line_floor: Some(self.model_id.clone()),
                 ..SweepContradictions::default()
             });
         };

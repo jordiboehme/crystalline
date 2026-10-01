@@ -2,7 +2,7 @@
 //! contradiction. The rows are the daemon's; this module reads them and
 //! re-filters them against what the engrams say now. A sweep scores nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     Class, Counterpart, EngramFacts, Finding, FindingCap, SweepInput, SweepReport, leader,
@@ -36,9 +36,67 @@ struct Live<'a> {
     text_b: &'a str,
 }
 
+/// About how much of a line a `V302` finding quotes.
+const LINE_CHARS: usize = 200;
+
+/// `text` cut to [`LINE_CHARS`] characters, the last three replaced by
+/// `...` when it was longer. Counted in characters, never bytes, so a cut
+/// never lands inside one.
+fn cut(text: &str) -> String {
+    if text.chars().count() <= LINE_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(LINE_CHARS - 3).collect();
+    out.push_str("...");
+    out
+}
+
+/// The anchor of an engram pair (the engram `V301` would pick, so the two
+/// rules agree on where a pair lives) and the other.
+fn anchor_of<'a>(a: &'a EngramFacts, b: &'a EngramFacts) -> (&'a EngramFacts, &'a EngramFacts) {
+    let pair = [a, b];
+    if leader(&pair, &[0, 1]).unwrap_or(0) == 0 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The scope of one line pair: both addresses lower first, each hash beside
+/// its engram, whichever engram anchors it.
+fn scope_of(l: &Live<'_>) -> String {
+    let parts = if l.a.address() <= l.b.address() {
+        vec![
+            l.a.address(),
+            l.b.address(),
+            l.row.hash_a.clone(),
+            l.row.hash_b.clone(),
+        ]
+    } else {
+        vec![
+            l.b.address(),
+            l.a.address(),
+            l.row.hash_b.clone(),
+            l.row.hash_a.clone(),
+        ]
+    };
+    super::scope_for("V302", parts)
+}
+
+/// One line pair the detector emits: the evidence of its engram pair, or an
+/// acknowledged line pair of it that the acknowledgment pass suppresses and
+/// counts.
+struct Pick<'a> {
+    live: Live<'a>,
+    scope: String,
+    /// The other open line pairs of the engram pair; zero on an
+    /// acknowledged one.
+    more: usize,
+}
+
 pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport) {
     notes(input, report);
-    if input.contradictions.is_empty() {
+    if input.contradiction_no_line_floor.is_some() || input.contradictions.is_empty() {
         return;
     }
     // Base rows only: a draft is a row of its own and is never scored.
@@ -49,7 +107,9 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
         .map(|f| (f.id.0, f))
         .collect();
     let mut lines: HashMap<i64, HashMap<String, (usize, &str)>> = HashMap::new();
-    let mut live: Vec<Live<'_>> = Vec::new();
+    // Every standing line pair, by engram pair. The rows come in narrow
+    // (ids, lines, hashes, scores); the texts are the parsed engrams' own.
+    let mut groups: BTreeMap<(i64, i64), Vec<Live<'_>>> = BTreeMap::new();
     for row in &input.contradictions {
         let score = input
             .options
@@ -78,7 +138,8 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
         let Some((line_b, text_b)) = line_of(&mut lines, b, &row.hash_b) else {
             continue;
         };
-        live.push(Live {
+        let key = (row.a.0.min(row.b.0), row.a.0.max(row.b.0));
+        groups.entry(key).or_default().push(Live {
             row,
             score,
             a,
@@ -89,73 +150,58 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
             text_b,
         });
     }
-    live.sort_by(|x, y| {
+    // One open finding per engram pair: its strongest line pair the anchor
+    // has not acknowledged, with how many more stand. Every acknowledged
+    // line pair of the pair is emitted too, so the acknowledgment pass counts
+    // and suppresses it and the audit view still lists it.
+    let mut picks: Vec<Pick<'_>> = Vec::new();
+    for mut group in groups.into_values() {
+        group.sort_by(|x, y| {
+            y.score
+                .total_cmp(&x.score)
+                .then_with(|| (x.line_a, x.line_b).cmp(&(y.line_a, y.line_b)))
+        });
+        let (anchor, _) = anchor_of(group[0].a, group[0].b);
+        let scoped: Vec<(String, bool)> = group
+            .iter()
+            .map(|l| {
+                let scope = scope_of(l);
+                let acked = super::matching_ack_scope(&anchor.acks, "V302", &scope).is_some();
+                (scope, acked)
+            })
+            .collect();
+        let open = scoped.iter().filter(|(_, acked)| !acked).count();
+        let evidence = scoped.iter().position(|(_, acked)| !acked);
+        for (i, (live, (scope, acked))) in group.into_iter().zip(scoped).enumerate() {
+            if acked {
+                picks.push(Pick {
+                    live,
+                    scope,
+                    more: 0,
+                });
+            } else if Some(i) == evidence {
+                picks.push(Pick {
+                    live,
+                    scope,
+                    more: open - 1,
+                });
+            }
+        }
+    }
+    picks.sort_by(|x, y| {
+        let (x, y) = (&x.live, &y.live);
         y.score.total_cmp(&x.score).then_with(|| {
             (x.row.a.0, x.row.b.0, x.line_a, x.line_b)
                 .cmp(&(y.row.a.0, y.row.b.0, y.line_a, y.line_b))
         })
     });
-    // Capped after the acknowledgments are known, never before: a pair the
-    // anchor already acknowledged takes no slot, so ten acknowledged pairs
-    // never hide the eleventh.
+    // Capped after the acknowledgments are known, never before: a line pair
+    // the anchor already acknowledged takes no slot, so ten acknowledged
+    // pairs never hide the eleventh.
     let mut cap = FindingCap::new(input.options.max_contradiction_findings);
-    for l in live {
-        // The engram V301 would pick for the pair, so the two rules agree on
-        // where a pair lives.
-        let pair = [l.a, l.b];
-        let lead = leader(&pair, &[0, 1]).unwrap_or(0);
-        let (anchor, other, anchor_line, anchor_text, other_line, other_text) = if lead == 0 {
-            (l.a, l.b, l.line_a, l.text_a, l.line_b, l.text_b)
-        } else {
-            (l.b, l.a, l.line_b, l.text_b, l.line_a, l.text_a)
-        };
-        // The scope is ordered by address, whichever engram anchors it, so
-        // each hash stays beside its engram.
-        let (lo, hi) = if l.a.address() <= l.b.address() {
-            ((l.a, &l.row.hash_a), (l.b, &l.row.hash_b))
-        } else {
-            ((l.b, &l.row.hash_b), (l.a, &l.row.hash_a))
-        };
-        // Rounded once, so the text and the probability column say the
-        // same number.
-        let probability = (f64::from(l.score) * 100.0).round() / 100.0;
-        let fix = if l.row.period {
-            format!("{PERIOD} {FIX}")
-        } else {
-            FIX.to_string()
-        };
-        cap.push(
-            report,
-            anchor,
-            Finding::about("V302", anchor)
-                .with(
-                    Class::Judgment,
-                    format!(
-                        "\"{anchor_text}\" ({}) against \"{other_text}\" ({}) read as a contradiction at probability {probability:.2}",
-                        anchor.title, other.title
-                    ),
-                    format!(
-                        "{} line {anchor_line}; {} line {other_line}; probability {probability:.2}; model {}",
-                        anchor.address(),
-                        other.address(),
-                        input.contradiction_model
-                    ),
-                    fix,
-                )
-                .at_line(Some(anchor_line))
-                .scoped(vec![
-                    lo.0.address(),
-                    hi.0.address(),
-                    lo.1.clone(),
-                    hi.1.clone(),
-                ])
-                .with_counterpart(Counterpart {
-                    permalink: other.permalink.clone(),
-                    title: other.title.clone(),
-                    line: other_line,
-                    probability,
-                }),
-        );
+    for pick in picks {
+        let (anchor, finding) = finding_for(input, pick);
+        cap.push(report, anchor, finding);
     }
     if cap.cut {
         report.truncations.push(format!(
@@ -165,11 +211,75 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
     }
 }
 
+/// The `V302` finding for one picked line pair, and the engram it is about.
+fn finding_for<'a>(input: &SweepInput, pick: Pick<'a>) -> (&'a EngramFacts, Finding) {
+    let Pick {
+        live: l,
+        scope,
+        more,
+    } = pick;
+    let (anchor, other) = anchor_of(l.a, l.b);
+    let (anchor_line, anchor_text, other_line, other_text) = if std::ptr::eq(anchor, l.a) {
+        (l.line_a, l.text_a, l.line_b, l.text_b)
+    } else {
+        (l.line_b, l.text_b, l.line_a, l.text_a)
+    };
+    // Rounded once, so the text and the columns say the same numbers.
+    let probability = (f64::from(l.score) * 100.0).round() / 100.0;
+    let similarity = (f64::from(l.row.similarity) * 100.0).round() / 100.0;
+    let rest = match more {
+        0 => String::new(),
+        1 => ", and 1 more line pair".to_string(),
+        n => format!(", and {n} more line pairs"),
+    };
+    let fix = if l.row.period {
+        format!("{PERIOD} {FIX}")
+    } else {
+        FIX.to_string()
+    };
+    let finding = Finding::about("V302", anchor)
+        .with(
+            Class::Judgment,
+            format!(
+                "Possible contradiction: line {anchor_line} of \"{}\" and line {other_line} of \"{}\" read as contradicting at probability {probability:.2}, line similarity {similarity:.2}{rest}",
+                anchor.title, other.title
+            ),
+            format!(
+                "{} line {anchor_line}; {} line {other_line}; probability {probability:.2}; similarity {similarity:.2}; model {}",
+                anchor.address(),
+                other.address(),
+                input.contradiction_model
+            ),
+            fix,
+        )
+        .at_line(Some(anchor_line))
+        .scoped_as(scope)
+        .with_counterpart(Counterpart {
+            permalink: other.permalink.clone(),
+            title: other.title.clone(),
+            line: other_line,
+            probability,
+            similarity,
+            anchor_text: cut(anchor_text),
+            text: cut(other_text),
+            more_line_pairs: more,
+        });
+    (anchor, finding)
+}
+
 /// The truncation lines that keep a quiet `V302` from reading as a clean
 /// domain: what is not counted yet, what is not scored yet, what cannot be
 /// counted until it is embedded and what is never scored. All zero and
 /// `false` when the check is off, which says nothing.
 fn notes(input: &SweepInput, report: &mut SweepReport) {
+    // Without a floor the stored rows are not read and nothing is counted,
+    // so this one line replaces every other.
+    if let Some(model) = &input.contradiction_no_line_floor {
+        report.truncations.push(format!(
+            "V302 does not run: the embedding model '{model}' has no measured line-similarity floor"
+        ));
+        return;
+    }
     if let Some(compared) = input.contradiction_vectors_capped {
         report.truncations.push(format!(
             "V302 skipped: {compared} lead vectors over the {} cap, no related pairs are scored",

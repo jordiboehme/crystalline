@@ -157,7 +157,8 @@ pub const CONTRADICTION_STORE_FLOOR: f32 = 0.5;
 /// Both raw orders are stored, so a change needs no rescore.
 pub const ORDER_AGGREGATION: OrderAggregation = OrderAggregation::Min;
 
-/// The most `V302` findings one domain sweep emits, highest score first.
+/// The most `V302` findings one domain sweep emits, one per engram pair,
+/// highest score first.
 pub const MAX_CONTRADICTION_FINDINGS: usize = 10;
 
 /// The shortest normalized body `V201` will score. Below this the Dice
@@ -1123,6 +1124,9 @@ pub struct SweepInput {
     /// [`SweepOptions::max_twin_vectors`] and nothing was compared, reported
     /// the way `V301` reports its own skip. `None` when the walk ran.
     pub contradiction_vectors_capped: Option<usize>,
+    /// The embedding model id when it has no measured line-similarity floor:
+    /// `V302` does not run and one truncation line says why.
+    pub contradiction_no_line_floor: Option<String>,
     /// Return the findings acknowledgments suppressed anyway, each marked
     /// [`Finding::acknowledged`] with the scope and note that silenced it. An
     /// audit view: the queue a run hands out drops them.
@@ -1158,6 +1162,7 @@ impl SweepInput {
             contradiction_candidates_capped: false,
             contradiction_unembedded: 0,
             contradiction_vectors_capped: None,
+            contradiction_no_line_floor: None,
             include_acknowledged: false,
             options: SweepOptions::default(),
         }
@@ -1253,6 +1258,15 @@ pub struct Counterpart {
     /// The aggregated contradiction probability, rounded to two decimals:
     /// the same number the finding's text quotes.
     pub probability: f64,
+    /// The line similarity of the evidence pair, rounded to two decimals.
+    pub similarity: f64,
+    /// The anchor engram's line, cut to about 200 characters.
+    pub anchor_text: String,
+    /// The other engram's line, cut the same way.
+    pub text: String,
+    /// The other standing, unacknowledged line pairs of the same two engrams
+    /// at or above the finding line.
+    pub more_line_pairs: usize,
 }
 
 impl Finding {
@@ -1345,6 +1359,14 @@ impl Finding {
         self
     }
 
+    /// Set a scope the caller already shaped with [`scope_for`], so a
+    /// detector that tested it against the acknowledgments first carries the
+    /// very same bytes.
+    fn scoped_as(mut self, scope: String) -> Finding {
+        self.scope = scope;
+        self
+    }
+
     /// Name the other engram of a pair finding.
     fn with_counterpart(mut self, counterpart: Counterpart) -> Finding {
         self.counterpart = Some(counterpart);
@@ -1402,9 +1424,11 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
     (i64::from(base) + boost + hub + human).clamp(0, i64::from(MAX_PRIORITY)) as u8
 }
 
-/// Sort findings into queue order: priority descending, then rule, domain and
-/// permalink ascending. The sort is stable, so findings a rule emitted in a
-/// deterministic order keep that order when every key ties.
+/// Sort findings into queue order: priority descending, then rule and domain
+/// ascending, then a `V302` row's probability descending (its findings are
+/// sorted by score, highest first), then permalink ascending. The sort is
+/// stable, so findings a rule emitted in a deterministic order keep that order
+/// when every key ties.
 ///
 /// **That stability is load-bearing, not a convenience.** Two `V301` findings
 /// on one engram tie on every key here, and so do two `V302` findings - same
@@ -1420,6 +1444,13 @@ pub fn rank(findings: &mut [Finding]) {
             .cmp(&a.priority)
             .then_with(|| a.rule.cmp(b.rule))
             .then_with(|| a.domain.cmp(&b.domain))
+            // Only `V302` carries a counterpart, and the rule is compared
+            // first, so two rows reaching here either both carry one or
+            // neither does.
+            .then_with(|| match (&a.counterpart, &b.counterpart) {
+                (Some(x), Some(y)) => y.probability.total_cmp(&x.probability),
+                _ => std::cmp::Ordering::Equal,
+            })
             .then_with(|| a.permalink.cmp(&b.permalink))
     });
 }
@@ -1457,10 +1488,20 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 /// and for [`FindingCap`], so the cap and the suppression cannot disagree
 /// about which findings are silenced.
 fn matching_ack<'a>(entries: &'a [AckEntry], finding: &Finding) -> Option<&'a AckEntry> {
+    matching_ack_scope(entries, finding.rule, &finding.scope)
+}
+
+/// [`matching_ack`] for a rule and scope, so a detector can ask before it
+/// builds the finding (`V302` picks its evidence line pair this way).
+fn matching_ack_scope<'a>(
+    entries: &'a [AckEntry],
+    rule: &str,
+    scope: &str,
+) -> Option<&'a AckEntry> {
     entries
         .iter()
-        .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
-        .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope))
+        .filter(|a| a.rule.eq_ignore_ascii_case(rule))
+        .find(|a| a.scope.as_deref().is_none_or(|s| s == scope))
 }
 
 /// The per-domain cap of a pair rule (`V301`, `V302`), applied with the

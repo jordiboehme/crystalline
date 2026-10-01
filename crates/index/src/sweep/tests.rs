@@ -3003,7 +3003,7 @@ fn stored(
         hash_b: observation_hash(tb),
         score_ab: ab,
         score_ba: ba,
-        similarity: 0.0,
+        similarity: 0.9,
         period: false,
     }
 }
@@ -3021,19 +3021,45 @@ fn meaning_input(facts: Vec<EngramFacts>, rows: Vec<ContradictionRow>) -> SweepI
 }
 
 #[test]
-fn v302_quotes_both_lines_scopes_the_pair_of_lines_and_attaches_where_v301_would() {
-    let a = observed(1, "node-version", &[(5, "The build uses Node 18")]);
-    let b = observed(2, "ci-runtime", &[(7, "The build uses Node 20")]);
-    let rows = vec![stored(
+fn v302_names_both_lines_scores_and_similarity_and_counts_the_rest() {
+    let a = observed(
         1,
+        "node-version",
+        &[
+            (5, "The build uses Node 18"),
+            (6, "Deploys need a manual trigger"),
+        ],
+    );
+    let b = observed(
         2,
-        5,
-        "The build uses Node 18",
-        7,
-        "The build uses Node 20",
-        0.93,
-        0.89,
-    )];
+        "ci-runtime",
+        &[
+            (7, "The build uses Node 20"),
+            (8, "Deploys run without approval"),
+        ],
+    );
+    let rows = vec![
+        stored(
+            1,
+            2,
+            5,
+            "The build uses Node 18",
+            7,
+            "The build uses Node 20",
+            0.93,
+            0.89,
+        ),
+        stored(
+            1,
+            2,
+            6,
+            "Deploys need a manual trigger",
+            8,
+            "Deploys run without approval",
+            0.88,
+            0.87,
+        ),
+    ];
     let report = detect(&meaning_input(vec![a, b], rows));
     let f = only(&report, "V302");
     assert_eq!(f.family, Family::Meaning);
@@ -3046,11 +3072,11 @@ fn v302_quotes_both_lines_scopes_the_pair_of_lines_and_attaches_where_v301_would
     assert_eq!(f.line, Some(7));
     assert_eq!(
         f.finding,
-        "\"The build uses Node 20\" (ci runtime) against \"The build uses Node 18\" (node version) read as a contradiction at probability 0.91"
+        "Possible contradiction: line 7 of \"ci runtime\" and line 5 of \"node version\" read as contradicting at probability 0.91, line similarity 0.90, and 1 more line pair"
     );
     assert_eq!(
         f.evidence,
-        "engineering/ci-runtime line 7; engineering/node-version line 5; probability 0.91; model nli-x"
+        "engineering/ci-runtime line 7; engineering/node-version line 5; probability 0.91; similarity 0.90; model nli-x"
     );
     assert_eq!(
         f.fix,
@@ -3067,11 +3093,236 @@ fn v302_quotes_both_lines_scopes_the_pair_of_lines_and_attaches_where_v301_would
     );
     let c = f
         .counterpart
+        .as_ref()
         .expect("a V302 finding names the other engram");
-    assert_eq!((c.permalink.as_str(), c.line), ("node-version", 5));
-    assert_eq!(c.title, "node version");
+    assert_eq!(
+        (c.permalink.as_str(), c.title.as_str()),
+        ("node-version", "node version")
+    );
+    assert_eq!(c.anchor_text, "The build uses Node 20");
+    assert_eq!(c.text, "The build uses Node 18");
+    assert_eq!((c.line, c.more_line_pairs), (5, 1));
     assert!((c.probability - 0.91).abs() < 1e-6);
+    assert!((c.similarity - 0.90).abs() < 1e-9);
     assert!(report.truncations.is_empty(), "{:?}", report.truncations);
+}
+
+#[test]
+fn a_line_is_cut_at_two_hundred_characters_never_inside_a_character() {
+    let long = format!("{}ü{}", "a".repeat(196), "b".repeat(40));
+    let a = observed(1, "one", &[(5, &long)]);
+    let b = observed(2, "two", &[(7, "short")]);
+    let rows = vec![stored(1, 2, 5, &long, 7, "short", 0.95, 0.95)];
+    let f = only(&detect(&meaning_input(vec![a, b], rows)), "V302").clone();
+    let c = f.counterpart.unwrap();
+    let cut = if c.anchor_text == "short" {
+        c.text
+    } else {
+        c.anchor_text
+    };
+    assert_eq!(cut.chars().count(), 200);
+    assert!(cut.ends_with("ü..."), "{cut}");
+}
+
+#[test]
+fn one_finding_per_engram_pair_ranked_and_capped() {
+    let mut facts = vec![observed(99, "hub", &[(1, "hub fact"), (2, "hub other")])];
+    let mut rows = Vec::new();
+    for i in 1..=12 {
+        facts.push(observed(
+            i,
+            &format!("e{i:02}"),
+            &[(1, &format!("fact {i}")), (2, &format!("more {i}"))],
+        ));
+        let p = 0.85 + i as f32 * 0.01;
+        rows.push(stored(i, 99, 1, &format!("fact {i}"), 1, "hub fact", p, p));
+        rows.push(stored(
+            i,
+            99,
+            2,
+            &format!("more {i}"),
+            2,
+            "hub other",
+            p - 0.001,
+            p - 0.001,
+        ));
+    }
+    let report = detect(&meaning_input(facts, rows));
+    let v302: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(v302.len(), 10, "one per engram pair, ten kept");
+    let probs: Vec<f64> = v302
+        .iter()
+        .map(|f| f.counterpart.as_ref().unwrap().probability)
+        .collect();
+    assert!(
+        probs.windows(2).all(|w| w[0] >= w[1]),
+        "highest first: {probs:?}"
+    );
+    assert!(
+        v302.iter()
+            .all(|f| f.counterpart.as_ref().unwrap().more_line_pairs == 1)
+    );
+    assert!(
+        report
+            .truncations
+            .contains(&"V302 findings capped at 10".to_string())
+    );
+}
+
+#[test]
+fn an_acknowledged_line_pair_hands_the_engram_pair_to_the_next_line_pair() {
+    let a = observed(
+        1,
+        "node-version",
+        &[
+            (5, "The build uses Node 18"),
+            (6, "Deploys need a manual trigger"),
+        ],
+    );
+    let mut b = observed(
+        2,
+        "ci-runtime",
+        &[
+            (7, "The build uses Node 20"),
+            (8, "Deploys run without approval"),
+        ],
+    );
+    let rows = vec![
+        stored(
+            1,
+            2,
+            5,
+            "The build uses Node 18",
+            7,
+            "The build uses Node 20",
+            0.93,
+            0.89,
+        ),
+        stored(
+            1,
+            2,
+            6,
+            "Deploys need a manual trigger",
+            8,
+            "Deploys run without approval",
+            0.88,
+            0.87,
+        ),
+    ];
+    // ci-runtime anchors the pair; it acknowledges the strongest line pair.
+    let first = only(
+        &detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone())),
+        "V302",
+    )
+    .scope
+    .clone();
+    b.acks = vec![AckEntry {
+        rule: "V302".to_string(),
+        scope: Some(first.clone()),
+        note: None,
+    }];
+    let report = detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone()));
+    let f = only(&report, "V302");
+    assert_ne!(f.scope, first, "the next line pair is the evidence now");
+    assert!(
+        !f.ack_stale,
+        "a pair-scoped rule's other line pair is unanswered, never stale"
+    );
+    assert_eq!(f.line, Some(8));
+    assert_eq!(f.counterpart.as_ref().unwrap().more_line_pairs, 0);
+    assert_eq!(
+        report.acknowledged.meaning, 1,
+        "the acknowledged line pair is still counted"
+    );
+    // Every line pair acknowledged: nothing in the queue, both counted.
+    let second = f.scope.clone();
+    b.acks.push(AckEntry {
+        rule: "V302".to_string(),
+        scope: Some(second),
+        note: None,
+    });
+    let report = detect(&meaning_input(vec![a, b], rows));
+    assert!(!fired(&report).contains(&"V302"));
+    assert_eq!(report.acknowledged.meaning, 2);
+}
+
+/// Preflight H4: the queue shows one finding per engram pair, but the audit
+/// view still lists every acknowledged line pair of it, each marked.
+#[test]
+fn the_audit_view_lists_every_acknowledged_line_pair_beside_the_open_one() {
+    let mut a = observed(1, "one", &[(5, "x"), (6, "p"), (7, "m")]);
+    let b = observed(2, "two", &[(5, "y"), (6, "q"), (7, "n")]);
+    let rows = vec![
+        stored(1, 2, 5, "x", 5, "y", 0.95, 0.95),
+        stored(1, 2, 6, "p", 6, "q", 0.93, 0.93),
+        stored(1, 2, 7, "m", 7, "n", 0.91, 0.91),
+    ];
+    let first = detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone()));
+    assert_eq!(only(&first, "V302").line, Some(5));
+    // The anchor is `one`, the lower address; acknowledge the two strongest.
+    for (lx, ly) in [("x", "y"), ("p", "q")] {
+        a.acks.push(AckEntry {
+            rule: "V302".to_string(),
+            scope: Some(format!(
+                "engineering/one, engineering/two, {}, {}",
+                observation_hash(lx),
+                observation_hash(ly)
+            )),
+            note: Some("read".to_string()),
+        });
+    }
+    let mut audit = meaning_input(vec![a, b], rows);
+    audit.include_acknowledged = true;
+    let report = detect(&audit);
+    let v302: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(v302.len(), 3, "{:?}", fired(&report));
+    let open: Vec<&&Finding> = v302.iter().filter(|f| !f.acknowledged).collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].line, Some(7));
+    assert_eq!(report.acknowledged.meaning, 2);
+}
+
+/// Review focus 4, the sweep half: leftover rows from a model with a floor
+/// never surface under one without, and the silence is explained.
+#[test]
+fn v302_without_a_floor_emits_nothing_and_says_why() {
+    let a = observed(1, "one", &[(5, "The build uses Node 18")]);
+    let b = observed(2, "two", &[(7, "The build uses Node 20")]);
+    let rows = vec![stored(
+        1,
+        2,
+        5,
+        "The build uses Node 18",
+        7,
+        "The build uses Node 20",
+        0.99,
+        0.99,
+    )];
+    let mut sweep = meaning_input(vec![a, b], rows);
+    sweep.contradiction_no_line_floor = Some("bge-small-en-v1.5".to_string());
+    sweep.contradictions_pending = 3;
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V302"));
+    let v302: Vec<&String> = report
+        .truncations
+        .iter()
+        .filter(|t| t.starts_with("V302"))
+        .collect();
+    assert_eq!(
+        v302,
+        vec![
+            "V302 does not run: the embedding model 'bge-small-en-v1.5' has no measured line-similarity floor"
+        ],
+        "the one reason, and no pending line that promises a pass"
+    );
 }
 
 #[test]
@@ -3510,7 +3761,7 @@ fn v302_rounds_the_probability_once() {
         .expect("the other engram")
         .probability;
     assert!(
-        f.finding.ends_with(&format!("probability {p:.2}")),
+        f.finding.contains(&format!("probability {p:.2},")),
         "{} against {p}",
         f.finding
     );
