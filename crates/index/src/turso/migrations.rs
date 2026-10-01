@@ -639,6 +639,14 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // kept by `reindex --full` because a vector keyed by its text stays valid.
 // The primary key serves every read, which all name the model and one hash
 // (a hash list on postgres).
+//
+// `domain.parse_generation` is the parser generation
+// (`crystalline_core::PARSE_GENERATION`) the domain's rows were last derived
+// with. An index this migration upgrades has every row at 0, older than any
+// parser that records one, so the first sync after the upgrade reparses each
+// domain once and stamps it; a domain row created later is stamped with the
+// current generation on insert, so a fresh index reparses nothing. Unreleased
+// when it joined this migration, so it rides here rather than in one of its own.
 const SCHEMA_V18: &str = r#"
 CREATE TABLE contradiction_pair (
     domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -680,6 +688,8 @@ CREATE TABLE observation_vector (
     vector BLOB NOT NULL,
     PRIMARY KEY (model, hash)
 );
+
+ALTER TABLE domain ADD COLUMN parse_generation INTEGER NOT NULL DEFAULT 0;
 "#;
 
 const SCHEMA_V9: &str = r#"

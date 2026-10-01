@@ -69,7 +69,9 @@ pub use manifest::{
     starter_stanzas, tag_alias_pairs,
 };
 pub use names::{NameInput, NameTable};
-pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
+pub use parse::{
+    LosslessEngram, PARSE_GENERATION, ParseError, parse_engram, parse_engram_lossless,
+};
 pub use path::fold_path_case;
 pub use prompt::{
     CONNECTOR_SNIPPET, INSTRUCTIONS_BUDGET, PromptDomain, PromptOutput, behavior_bullets,

@@ -91,7 +91,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
-use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_path};
+use crystalline_core::{
+    MAX_ATTACHMENT_BYTES, PARSE_GENERATION, attachment_mime, parse_engram, validate_asset_path,
+};
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
@@ -244,8 +246,102 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         )
         .await?;
     let stamps = store.file_stamps(domain).await?;
-    let scan = scan_domain(name, root, stamps, chunk_params, false).await?;
+    let force = reparse_due(store, domain).await?;
+    let scan = scan_domain(name, root, stamps, chunk_params, force).await?;
     apply_scan(store, domain, scan).await
+}
+
+/// Whether a domain's rows were derived by an older parser than this one, so
+/// its next sync must reparse every engram rather than only the changed ones.
+///
+/// A file domain does that by walking with `force` set, exactly as
+/// `reindex --full` does: every file is re-read and re-parsed and nothing on
+/// disk is written, and the apply that commits the walk stamps the current
+/// [`PARSE_GENERATION`] in the same transaction (see [`apply_scan`]). A
+/// virtual domain does it through [`reparse_stored_domain`]. Either way a run
+/// that dies before its commit leaves the old generation standing, so the
+/// next sync repeats it, and repeating it is harmless: a reparse of unchanged
+/// text writes the rows it already wrote.
+pub async fn reparse_due<S: Store + ?Sized>(store: &S, domain: DomainId) -> Result<bool> {
+    Ok(store.parse_generation(domain).await? < PARSE_GENERATION)
+}
+
+/// Reparse every base engram of a virtual domain from the content the
+/// database stores for it, once after a parser change, and stamp the current
+/// [`PARSE_GENERATION`]. Answers how many engrams were reparsed, `0` when the
+/// domain is already current.
+///
+/// The stored content is the domain's source of truth and stays byte for byte
+/// what it was: each row is re-upserted with its own content and its own
+/// recorded stamp (so its modification time does not move), which rebuilds
+/// its observations, relations, links and tags, and its chunks are reconciled
+/// through [`Store::replace_chunks`], which keeps every embedding whose text
+/// is unchanged. A row that changed since it was read is left to the write
+/// that changed it, which already parsed it with this parser, and a row whose
+/// content no longer parses keeps the rows it has.
+///
+/// One transaction: the stamp commits with the rows, so an interrupted run
+/// leaves the old generation and the next sync repeats it. Idempotent, which
+/// is what makes it safe on a shared Postgres database: two instances that
+/// both find the domain behind write the same rows and the same stamp.
+/// Drafts (actor rows) are not touched; each is reparsed on its next write.
+pub async fn reparse_stored_domain<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    chunk_params: &ChunkParams,
+) -> Result<usize> {
+    if !reparse_due(store, domain).await? {
+        return Ok(0);
+    }
+    store.begin().await?;
+    let result = async {
+        let stamps = store.file_stamps(domain).await?;
+        let rows = store.all_engram_contents(domain).await?;
+        let mut reparsed = 0usize;
+        for row in rows {
+            let Ok(engram) = parse_engram(&row.content) else {
+                continue;
+            };
+            let stamp = stamps.get(&row.path).cloned().unwrap_or_else(|| FileStamp {
+                mtime: 0,
+                size: row.content.len() as u64,
+                sha256: row.sha256.clone(),
+            });
+            let mut record = EngramRecord::from_engram(&engram, &row.path, stamp);
+            record.content = row.content.clone();
+            let id = match store
+                .upsert_engram_checked(domain, &record, Some(&row.sha256))
+                .await
+            {
+                Ok(id) => id,
+                Err(IndexError::StaleEdit { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            let chunks = chunk_engram(
+                &record.title,
+                record.description.as_deref(),
+                &record.content,
+                chunk_params,
+            );
+            store.replace_chunks(id, &chunks).await?;
+            reparsed += 1;
+        }
+        store.resolve_pending_relations(domain).await?;
+        store.resolve_pending_links(domain).await?;
+        store.set_parse_generation(domain, PARSE_GENERATION).await?;
+        Ok(reparsed)
+    }
+    .await;
+    match result {
+        Ok(n) => {
+            store.commit().await?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = store.rollback().await;
+            Err(e)
+        }
+    }
 }
 
 /// The filesystem side of a sync, ready to apply against a store.
@@ -284,9 +380,12 @@ pub struct DomainScan {
     /// so the apply may delete every row it did not see.
     assets_complete: bool,
     /// Whether this scan is the disk half of a forced rebuild, so the apply's
-    /// transaction also clears the domain's rebuild marker. Only a forced
-    /// [`scan_domain`] sets it: a targeted watcher pass landing during someone
-    /// else's rebuild must not clear a marker whose rebuild never finished.
+    /// transaction also clears the domain's rebuild marker and stamps the
+    /// current [`PARSE_GENERATION`]: a forced walk re-parsed every file, so the
+    /// domain's rows are this parser's. Only a forced [`scan_domain`] sets it:
+    /// a targeted watcher pass landing during someone else's rebuild must not
+    /// clear a marker whose rebuild never finished, nor stamp a domain it
+    /// parsed only a few files of.
     ends_rebuild: bool,
     /// `unchanged` and `failed` from the scan; the apply fills in the rest.
     report: SyncReport,
@@ -838,6 +937,13 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         let _ = store.rollback().await;
         return Err(e);
     }
+    // Every file was re-parsed, so the domain's rows are this parser's: the
+    // stamp commits with them, and a run that died before here leaves the old
+    // generation for the next sync to repeat.
+    if ends_rebuild && let Err(e) = store.set_parse_generation(domain, PARSE_GENERATION).await {
+        let _ = store.rollback().await;
+        return Err(e);
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = store.record_sync(domain, &now).await {
@@ -930,7 +1036,7 @@ pub async fn reindex_domains(
     let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
 
     for (name, root) in targets {
-        let Some((domain, snapshot)) = ({
+        let Some((domain, snapshot, force_domain)) = ({
             let store = store.lock().await;
             let claimed = hooks
                 .before_domain(&*store, name, root)
@@ -956,7 +1062,12 @@ pub async fn reindex_domains(
                     .file_stamps(domain)
                     .await
                     .map_err(|e| in_domain("reindex", name, e))?;
-                Some((domain, snapshot))
+                // A domain an older parser derived is walked whole even on an
+                // incremental reindex, once, as a sync would walk it.
+                let due = reparse_due(&*store, domain)
+                    .await
+                    .map_err(|e| in_domain("reindex", name, e))?;
+                Some((domain, snapshot, force || due))
             } else {
                 None
             }
@@ -970,7 +1081,7 @@ pub async fn reindex_domains(
         if force && let Some(hold) = rebuild_hold() {
             tokio::time::sleep(hold).await;
         }
-        let scan = scan_domain(name, root, snapshot, chunk_params, force)
+        let scan = scan_domain(name, root, snapshot, chunk_params, force_domain)
             .await
             .map_err(|e| in_domain("reindex", name, e))?;
         let report = {

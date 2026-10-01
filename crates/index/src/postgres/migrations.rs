@@ -534,6 +534,14 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // the folded text; it holds no text and no engram id, and its primary key
 // serves every read - see the Turso twin's comment. A plain `BYTEA`, not a
 // `vector` column: nothing searches these vectors in SQL.
+//
+// `domain.parse_generation` is the parser generation
+// (`crystalline_core::PARSE_GENERATION`) the domain's rows were last derived
+// with. An index this migration (the Turso v18 twin) upgrades has every row at 0, older than any
+// parser that records one, so the first sync after the upgrade reparses each
+// domain once and stamps it; a domain row created later is stamped with the
+// current generation on insert, so a fresh index reparses nothing. Unreleased
+// when it joined this migration (the Turso v18 twin), so it rides here rather than in one of its own.
 const SCHEMA_V17: &str = r#"
 CREATE TABLE IF NOT EXISTS contradiction_pair (
     domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -575,6 +583,8 @@ CREATE TABLE IF NOT EXISTS observation_vector (
     vector BYTEA NOT NULL,
     PRIMARY KEY (model, hash)
 );
+
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS parse_generation BIGINT NOT NULL DEFAULT 0;
 "#;
 
 const SCHEMA_V8: &str = r#"

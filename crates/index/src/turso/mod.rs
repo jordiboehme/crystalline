@@ -1257,12 +1257,16 @@ impl Store for TursoStore {
         let kind = kind_str(kind);
         self.conn
             .execute(
-                "INSERT INTO domain(name, path, kind) VALUES(?1, ?2, ?3) \
+                // A new row is stamped with the current parser generation, so
+                // a fresh index never reparses what it has only just parsed; an
+                // existing row keeps the generation it has.
+                "INSERT INTO domain(name, path, kind, parse_generation) VALUES(?1, ?2, ?3, ?4) \
                  ON CONFLICT(name) DO UPDATE SET path=excluded.path, kind=excluded.kind",
                 vec![
                     Value::Text(name.to_string()),
                     Value::Text(path.to_string()),
                     Value::Text(kind.to_string()),
+                    Value::Integer(i64::from(crystalline_core::PARSE_GENERATION)),
                 ],
             )
             .await?;
@@ -3238,6 +3242,32 @@ impl Store for TursoStore {
             .execute(
                 "UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=?1",
                 vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32> {
+        let row = query_first(
+            &self.conn,
+            "SELECT parse_generation FROM domain WHERE id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(row
+            .and_then(|r| cell_i64(&r, 0))
+            .map(|g| u32::try_from(g).unwrap_or(0))
+            .unwrap_or(0))
+    }
+
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET parse_generation=?2 WHERE id=?1",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Integer(i64::from(generation)),
+                ],
             )
             .await?;
         Ok(())

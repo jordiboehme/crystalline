@@ -685,15 +685,17 @@ pub(crate) async fn sync_domain_direct(
     let params = chunk_params(&cfg);
     // First lock window: resolve the domain id and snapshot its stamps. The scan
     // then runs with no lock held; the second window applies transactionally.
-    let (domain, snapshot) = {
+    let (domain, snapshot, force) = {
         let store = store.lock().await;
         let domain = store
             .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
             .await?;
         let snapshot = store.file_stamps(domain).await?;
-        (domain, snapshot)
+        // A domain an older parser derived is walked whole, once.
+        let force = crystalline_index::reparse_due(&*store, domain).await?;
+        (domain, snapshot, force)
     };
-    let scan = scan_domain(name, root, snapshot, &params, false).await?;
+    let scan = scan_domain(name, root, snapshot, &params, force).await?;
     let store = store.lock().await;
     apply_scan(&*store, domain, scan)
         .await
@@ -2062,15 +2064,17 @@ pub async fn sync(
         // First lock window: snapshot the stamps; scan with no lock held so the
         // walk-and-hash pass does not block concurrent readers; second window:
         // apply transactionally with the TOCTOU guards.
-        let (domain, snapshot) = {
+        let (domain, snapshot, force) = {
             let store = store.lock().await;
             let domain = store
                 .upsert_domain(&name, Some(&path.to_string_lossy()), DomainKind::File)
                 .await?;
             let snapshot = store.file_stamps(domain).await?;
-            (domain, snapshot)
+            // A domain an older parser derived is walked whole, once.
+            let force = crystalline_index::reparse_due(&*store, domain).await?;
+            (domain, snapshot, force)
         };
-        let scan = scan_domain(&name, &path, snapshot, &params, false).await?;
+        let scan = scan_domain(&name, &path, snapshot, &params, force).await?;
         let report = {
             let store = store.lock().await;
             apply_scan(&*store, domain, scan)

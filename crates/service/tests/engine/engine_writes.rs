@@ -2690,3 +2690,124 @@ async fn a_hidden_domain_is_never_normalized_into() {
     let stored = std::fs::read_to_string(tmp.path().join("platform/keeper-link.md")).unwrap();
     assert!(stored.contains("[[eng:x]]"), "{stored}");
 }
+
+// ---------------------------------------------------------------------------
+// the reparse after a parser change
+// ---------------------------------------------------------------------------
+
+/// Rewrite one engram's rows to what the parser before generation 1 derived
+/// from a bullet that wraps: the observation is its first line, without the
+/// tag its continuation line carries. Everything else, the stamp and the
+/// stored content included, stays as it is.
+async fn stage_fragment(
+    store: &dyn crystalline_index::Store,
+    domain: crystalline_index::DomainId,
+    path: &str,
+    content: &str,
+    keep_content: bool,
+) {
+    let stamp = store.file_stamps(domain).await.unwrap()[path].clone();
+    let engram = crystalline_core::parse_engram(content).unwrap();
+    let mut record = crystalline_index::EngramRecord::from_engram(&engram, path, stamp);
+    if keep_content {
+        record.content = content.to_string();
+    }
+    let obs = record
+        .observations
+        .iter_mut()
+        .find(|o| o.tags.contains(&"purge".to_string()))
+        .expect("the wrapped bullet carries #purge");
+    obs.content = "the purge runs before every mix swap,".to_string();
+    obs.tags.clear();
+    store.upsert_engram(domain, &record).await.unwrap();
+    store.set_parse_generation(domain, 0).await.unwrap();
+}
+
+async fn purge_observations(store: &dyn crystalline_index::Store, domain: &str) -> i64 {
+    store
+        .vocabulary(Some(domain), None)
+        .await
+        .unwrap()
+        .tags
+        .iter()
+        .find(|t| t.name == "purge")
+        .map(|t| t.observations)
+        .unwrap_or(0)
+}
+
+/// The upgrade as a daemon sees it: an index an older parser built, a file
+/// domain and a virtual domain both holding a wrapped bullet as a fragment,
+/// and the startup sync. Both domains come out with the joined observation,
+/// nothing on disk or in the stored documents changed, and nobody ran a
+/// reindex.
+#[tokio::test]
+async fn the_sync_after_a_parser_change_reparses_file_and_virtual_domains_once() {
+    let (tmp, engine) = engine_fixture().await;
+    let wrapped_body = "The purge rules.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n";
+    let file = format!(
+        "---\ntype: engram\ntitle: Purge\npermalink: purge\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Purge\n\n{wrapped_body}"
+    );
+    let file_path = tmp.path().join("eng/purge.md");
+    std::fs::write(&file_path, &file).unwrap();
+    engine.sync(None).await.unwrap();
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Purge Notes".to_string(),
+            content: wrapped_body.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let store = engine.store();
+    let stored_before = {
+        let store = store.lock().await;
+        let eng = store.domain_id("eng").await.unwrap().unwrap();
+        let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+        assert_eq!(purge_observations(&*store, "eng").await, 1);
+        assert_eq!(purge_observations(&*store, "scratch").await, 1);
+        stage_fragment(&*store, eng, "purge.md", &file, false).await;
+        let rows = store.all_engram_contents(scratch).await.unwrap();
+        let row = rows.iter().find(|r| r.content.contains("#purge")).unwrap();
+        stage_fragment(&*store, scratch, &row.path, &row.content, true).await;
+        assert_eq!(purge_observations(&*store, "eng").await, 0);
+        assert_eq!(purge_observations(&*store, "scratch").await, 0);
+        rows
+    };
+
+    engine.sync(None).await.unwrap();
+
+    let store = store.lock().await;
+    assert_eq!(purge_observations(&*store, "eng").await, 1);
+    assert_eq!(purge_observations(&*store, "scratch").await, 1);
+    for name in ["eng", "scratch"] {
+        let id = store.domain_id(name).await.unwrap().unwrap();
+        assert_eq!(
+            store.parse_generation(id).await.unwrap(),
+            crystalline_core::PARSE_GENERATION,
+            "{name} is stamped current"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&file_path).unwrap(), file);
+    let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+    let stored_after = store.all_engram_contents(scratch).await.unwrap();
+    assert_eq!(
+        stored_after
+            .iter()
+            .map(|r| (&r.path, &r.content, &r.sha256))
+            .collect::<Vec<_>>(),
+        stored_before
+            .iter()
+            .map(|r| (&r.path, &r.content, &r.sha256))
+            .collect::<Vec<_>>(),
+        "the stored documents are byte for byte what they were"
+    );
+}

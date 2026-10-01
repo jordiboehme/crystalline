@@ -21,6 +21,23 @@ use crate::engram::{
 };
 use crate::yaml::YamlValue;
 
+/// The generation of what the parser extracts from an engram: its
+/// observations, relations, links, headings and tags.
+///
+/// **Bump it in the same change whenever the parser starts extracting
+/// something different from the same text.** The index records the
+/// generation each domain was last parsed with, and a sync that finds an
+/// older one reparses every engram of that domain once - a file domain from
+/// its files, a virtual domain from the content the database stores -
+/// without rewriting a byte of either, and then records this value. Without
+/// the bump, an engram nobody edits keeps the rows an older parser derived
+/// until its next write.
+///
+/// - 0: every index before the generation was recorded.
+/// - 1: a bullet that wraps onto further lines is one observation or
+///   relation (0.22).
+pub const PARSE_GENERATION: u32 = 1;
+
 /// An error encountered while parsing an Engram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParseError {

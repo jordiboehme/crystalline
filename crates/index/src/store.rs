@@ -2831,6 +2831,18 @@ pub trait Store: Send + Sync {
     /// not finish one.
     async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
 
+    /// The parser generation ([`crystalline_core::PARSE_GENERATION`]) the
+    /// domain's rows were last derived with: 0 for a domain an upgrade found,
+    /// the current generation for a row created since. A sync that reads an
+    /// older value than the current one reparses the domain whole once.
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32>;
+
+    /// Record the parser generation a domain's rows were derived with. Called
+    /// inside the transaction that commits a whole-domain reparse, so the
+    /// stamp moves exactly when that reparse is complete and a run that died
+    /// before it leaves the old value standing for the next one to repeat.
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()>;
+
     /// The unreadable database this store was opened beside, when it was opened
     /// resiliently and found one. `None` for every ordinary open, and for every
     /// backend but the embedded one: corruption recovery is a local file

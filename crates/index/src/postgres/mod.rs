@@ -1211,13 +1211,17 @@ impl Store for PostgresStore {
         // A virtual domain stores `path = NULL`; `kind` discriminates on both
         // backends.
         let mut conn = self.acquire().await?;
+        // A new row is stamped with the current parser generation, so a fresh
+        // index never reparses what it has only just parsed; an existing row
+        // keeps the generation it has.
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO domain(name, path, kind) VALUES($1,$2,$3) \
+            "INSERT INTO domain(name, path, kind, parse_generation) VALUES($1,$2,$3,$4) \
              ON CONFLICT(name) DO UPDATE SET path=EXCLUDED.path, kind=EXCLUDED.kind RETURNING id",
         )
         .bind(name)
         .bind(path)
         .bind(kind_str(kind))
+        .bind(i64::from(crystalline_core::PARSE_GENERATION))
         .fetch_one(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
@@ -3307,6 +3311,27 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         sqlx::query("UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=$1")
             .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32> {
+        let mut conn = self.acquire().await?;
+        let row: Option<(i64,)> = sqlx::query_as("SELECT parse_generation FROM domain WHERE id=$1")
+            .bind(domain.0)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.map(|(g,)| u32::try_from(g).unwrap_or(0)).unwrap_or(0))
+    }
+
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET parse_generation=$2 WHERE id=$1")
+            .bind(domain.0)
+            .bind(i64::from(generation))
             .execute(conn.as_mut())
             .await
             .map_err(IndexError::from)?;

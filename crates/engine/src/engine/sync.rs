@@ -111,6 +111,10 @@ impl Engine {
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
+        // The virtual domains have no files to walk, but an older parser may
+        // have derived their rows too: they are reparsed from the content the
+        // database stores, once, before the file domains are walked.
+        self.reparse_virtual_domains(only).await?;
         let collab = !self.instance_id.is_empty();
         // Each domain this run applied, paired with the report its apply
         // produced, for the final cross-domain resolution pass. A domain that
@@ -139,7 +143,7 @@ impl Engine {
                 skipped.push(json!({ "domain": name, "renaming": true }));
                 continue;
             };
-            let (domain, snapshot) = {
+            let (domain, snapshot, force) = {
                 let store = self.store.lock().await;
                 if collab {
                     match self.claim_file_host(&*store, name, root, take_over).await? {
@@ -166,9 +170,13 @@ impl Engine {
                     .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
                 let snapshot = store.file_stamps(domain).await?;
-                (domain, snapshot)
+                // A domain an older parser derived is walked whole, once: every
+                // file is re-read and re-parsed, nothing on disk is written,
+                // and the apply stamps the current generation as it commits.
+                let force = crystalline_index::reparse_due(&*store, domain).await?;
+                (domain, snapshot, force)
             };
-            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, false).await {
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, force).await {
                 Ok(scan) => scan,
                 Err(e) if only.is_none() => {
                     // One denied domain must not block the rest of the
@@ -356,6 +364,52 @@ impl Engine {
             "full": full,
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
         }))
+    }
+
+    /// Reparse every virtual domain in scope whose rows an older parser
+    /// derived, from the content the database stores for it, which stays
+    /// byte for byte what it was (see
+    /// [`crystalline_index::reparse_stored_domain`]). A domain already at the
+    /// current generation costs one read of its stamp, and a domain the index
+    /// holds no row for yet has nothing to reparse.
+    async fn reparse_virtual_domains(&self, only: Option<&str>) -> Result<()> {
+        let names: Vec<String> = match only {
+            Some(name) => match self.content_source(name)? {
+                ContentSource::Virtual => vec![name.to_string()],
+                ContentSource::File { .. } => Vec::new(),
+            },
+            None => {
+                let config = self.config.read().unwrap();
+                config
+                    .domains
+                    .iter()
+                    .filter(|(_, entry)| entry.is_virtual())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            }
+        };
+        for name in names {
+            let store = self.store.lock().await;
+            let Some(domain) = store.domain_id(&name).await? else {
+                continue;
+            };
+            let reparsed =
+                crystalline_index::reparse_stored_domain(&*store, domain, &self.chunk_params)
+                    .await
+                    .map_err(|e| {
+                        EngineError::Internal(format!("reparse of '{name}' failed: {e}"))
+                    })?;
+            drop(store);
+            if reparsed > 0 {
+                tracing::info!(
+                    domain = name.as_str(),
+                    reparsed,
+                    "reparsed {reparsed} engram(s) of '{name}' after a parser change"
+                );
+                self.announce_domain(&name, None, None);
+            }
+        }
+        Ok(())
     }
 
     /// The file domains to sync, as `(name, root)` pairs. Virtual domains have
