@@ -306,7 +306,7 @@ pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
 /// created when the source has none. A frontmatter that cannot be cut into
 /// key blocks (flow style such as `{title: KB}`, among others) is returned
 /// unchanged: a line written into it could leave it unparsable. New lines
-/// use the frontmatter's own line ending.
+/// end in `\n`, the one line ending Crystalline writes.
 pub fn set_frontmatter_field_after(source: &str, key: &str, value: &str, after: &str) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
     if !has_fm {
@@ -333,7 +333,7 @@ pub fn set_frontmatter_field_after(source: &str, key: &str, value: &str, after: 
         .iter()
         .find(|b| b.parsed_key == named(after))
         .map(|b| b.line - 2);
-    let ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let ending = "\n";
     let new_line = format_scalar_line(key, value);
     let mut new_raw = String::with_capacity(raw.len() + new_line.len() + ending.len());
     let mut in_anchor = false;
@@ -535,8 +535,9 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
 /// rewritten in place, while a value that was written as a block mapping or a
 /// block sequence is replaced whole rather than beheaded.
 ///
-/// The new block is written with the frontmatter's own line ending, so a CRLF
-/// file stays CRLF throughout.
+/// The new block ends its lines in `\n`, the one line ending Crystalline
+/// writes; a CRLF source still reads, since every line is matched with its
+/// `\r` trimmed.
 fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
     if !has_fm {
@@ -544,8 +545,8 @@ fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) ->
     }
 
     let raw = &source[fm_span.clone()];
-    let ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut replacement = new_block.replace('\n', ending);
+    let ending = "\n";
+    let mut replacement = new_block;
     replacement.push_str(ending);
     // Which key actually appears decides which value is rewritten, so a file
     // carrying both the canonical and the legacy spelling has the canonical one
@@ -1192,12 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn a_crlf_list_is_replaced_whole_and_written_with_crlf() {
+    fn a_crlf_list_is_replaced_whole_and_written_with_lf() {
+        // Every line of the old list goes, its `\r` read through; the new
+        // block is LF. The engine writes the whole file as LF, so the CRLF
+        // lines left around the block here never reach a disk.
         let source = "---\r\ntype: engram\r\ntags:\r\n  - x\r\n-\r\n- y\r\nstatus: stable\r\n---\r\n\r\nbody\r\n";
         let out = set_frontmatter_list(source, "tags", &["a".to_string(), "b".to_string()]);
         assert_eq!(
             out,
-            "---\r\ntype: engram\r\ntags:\r\n  - a\r\n  - b\r\nstatus: stable\r\n---\r\n\r\nbody\r\n"
+            "---\r\ntype: engram\r\ntags:\n  - a\n  - b\nstatus: stable\r\n---\r\n\r\nbody\r\n"
         );
         let parsed = crate::parse_engram(&out).unwrap();
         assert_eq!(
@@ -1289,11 +1293,11 @@ mod tests {
     }
 
     #[test]
-    fn a_crlf_frontmatter_gets_a_crlf_line() {
+    fn a_crlf_frontmatter_gets_an_lf_line() {
         let source = "---\r\ntitle: KB\r\nstatus: stable\r\n---\r\n";
         assert_eq!(
             set_frontmatter_field_after(source, "domain_name", "kb", "title"),
-            "---\r\ntitle: KB\r\ndomain_name: kb\r\nstatus: stable\r\n---\r\n"
+            "---\r\ntitle: KB\r\ndomain_name: kb\nstatus: stable\r\n---\r\n"
         );
     }
 
