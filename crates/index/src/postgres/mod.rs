@@ -381,17 +381,37 @@ impl PostgresStore {
         explained
     }
 
-    /// Run `ANALYZE`, so the planner has statistics for the rows a fixture just
-    /// seeded. Test scaffolding for the plan registry: a planner that has never
-    /// seen a row plans everything as a scan, and a statistics-free fixture
-    /// would make the whole guard vacuous.
+    /// Run `ANALYZE` on every table of this store's own schema, so the planner
+    /// has statistics for the rows a fixture just seeded. Test scaffolding for
+    /// the plan registry: a planner that has never seen a row plans everything
+    /// as a scan, and a statistics-free fixture would make the whole guard
+    /// vacuous.
+    ///
+    /// Never a bare `ANALYZE`: that walks every table of every schema in the
+    /// database, including the schemas concurrent tests create and drop, and
+    /// in a busy workspace run it left two near-equal plans for one statement
+    /// to a coin toss. `ANALYZE` takes no schema name, so each table is named
+    /// schema-qualified.
     #[doc(hidden)]
     pub async fn analyze(&self) -> Result<()> {
         let mut conn = self.acquire().await?;
-        sqlx::query("ANALYZE")
+        let tables: Vec<(String, String)> = sqlx::query_as(
+            "SELECT schemaname::text, tablename::text FROM pg_catalog.pg_tables \
+             WHERE schemaname = current_schema()",
+        )
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        for (schema, table) in tables {
+            sqlx::query(AssertSqlSafe(format!(
+                "ANALYZE {}.{}",
+                quote_ident(&schema),
+                quote_ident(&table)
+            )))
             .execute(conn.as_mut())
             .await
             .map_err(IndexError::from)?;
+        }
         Ok(())
     }
 

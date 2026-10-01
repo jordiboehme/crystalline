@@ -655,7 +655,11 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected: &[],
             scan_expected_pg: None,
             turso_must_seek: &["idx_contradiction_pair_domain"],
-            postgres_must_seek: &["idx_contradiction_pair_domain"],
+            // Postgres costs `idx_contradiction_pair_domain` and
+            // `idx_contradiction_pair_model` plus a Sort within a fraction of a
+            // point on this fixture, and a concurrent workspace run tips it
+            // either way. Both seek; the postgres guard names them.
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::scored_pair_count",
@@ -1231,6 +1235,16 @@ mod postgres_plans {
                     "{} must be served by {index} by name; the plan read {seen:?}. \
                      Statement: {sql}",
                     entry.issued_by
+                );
+            }
+            if entry.issued_by == "Store::contradiction_pairs_scored" {
+                assert!(
+                    seen.iter().any(|name| {
+                        name == "idx_contradiction_pair_domain"
+                            || name == "idx_contradiction_pair_model"
+                    }),
+                    "Store::contradiction_pairs_scored must seek one of its two indexes; \
+                     the plan read {seen:?}. Statement: {sql}"
                 );
             }
             // The lexical prefilter's real claim, the same one the turso leg
