@@ -3,7 +3,6 @@
 
 use std::collections::BTreeSet;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 
 use crate::common::fixtures_dir;
@@ -27,8 +26,7 @@ fn issue_set(v: &serde_json::Value) -> BTreeSet<IssueKey> {
 
 #[test]
 fn domain_good_passes_with_zero_issues() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-good"])
         .assert()
@@ -38,8 +36,7 @@ fn domain_good_passes_with_zero_issues() {
 
 #[test]
 fn domain_good_json_has_no_issues() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-good", "--format", "json"])
         .assert()
@@ -56,8 +53,7 @@ fn domain_good_json_has_no_issues() {
 
 #[test]
 fn domain_bad_exits_1_with_the_expected_issue_set() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--format", "json"])
         .assert()
@@ -84,8 +80,7 @@ fn domain_bad_exits_1_with_the_expected_issue_set() {
 
 #[test]
 fn domain_bad_covers_every_rule_family() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--format", "json"])
         .assert()
@@ -111,8 +106,7 @@ fn domain_bad_covers_every_rule_family() {
 
 #[test]
 fn json_format_matches_the_stable_schema() {
-    let output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--format", "json"])
         .assert()
@@ -141,8 +135,7 @@ fn json_format_matches_the_stable_schema() {
 
 #[test]
 fn github_format_emits_workflow_commands() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--format", "github"])
         .assert()
@@ -156,8 +149,7 @@ fn github_format_emits_workflow_commands() {
 fn strict_promotes_a_warning_rule_to_error() {
     // `domain-good` is clean at default severities, so it stays clean under
     // `--strict` too (there is nothing to promote).
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-good", "--strict"])
         .assert()
@@ -166,8 +158,7 @@ fn strict_promotes_a_warning_rule_to_error() {
     // `domain-bad` carries real Warning-severity issues (for example
     // `M101`), so `--strict` must move some of them into the error count
     // without changing the total number of issues produced.
-    let default_output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let default_output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--format", "json"])
         .assert()
@@ -177,8 +168,7 @@ fn strict_promotes_a_warning_rule_to_error() {
         .clone();
     let default_report: serde_json::Value = serde_json::from_slice(&default_output).unwrap();
 
-    let strict_output = Command::cargo_bin("crystalline")
-        .unwrap()
+    let strict_output = crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["verify", "domain-bad", "--strict", "--format", "json"])
         .assert()
@@ -216,8 +206,7 @@ fn strict_promotes_a_warning_rule_to_error() {
 
 #[test]
 fn global_json_flag_is_shorthand_for_format_json() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir())
         .args(["--json", "verify", "domain-bad"])
         .assert()
@@ -227,8 +216,7 @@ fn global_json_flag_is_shorthand_for_format_json() {
 
 #[test]
 fn nonexistent_path_is_a_usage_error() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .args(["verify", "/no/such/path/at/all/really"])
         .assert()
         .code(2);
@@ -236,8 +224,7 @@ fn nonexistent_path_is_a_usage_error() {
 
 #[test]
 fn defaults_to_current_directory_when_no_paths_given() {
-    Command::cargo_bin("crystalline")
-        .unwrap()
+    crate::common::crystalline()
         .current_dir(fixtures_dir().join("domain-good"))
         .args(["verify"])
         .assert()

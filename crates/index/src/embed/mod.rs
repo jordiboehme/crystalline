@@ -73,6 +73,12 @@ pub trait EmbeddingProvider: Send + Sync {
     async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed(texts).await
     }
+
+    /// The device a local model runs on. `None` for a provider that runs no
+    /// model in this process (the remote endpoint).
+    fn device(&self) -> Option<crate::device::DeviceReport> {
+        None
+    }
 }
 
 /// The model id implied by a config, defaulting to the local model when none is

@@ -10,6 +10,7 @@
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
+import { HANDBOOK_URL } from "../handbook";
 import type { HelpOverlayProps } from "./HelpOverlay";
 
 /** The map itself: what to press, and what it does. */
@@ -26,7 +27,8 @@ const SHORTCUTS: { keys: string; does: string }[] = [
 
 export default function HelpOverlayBody({
   onClose,
-}: Pick<HelpOverlayProps, "onClose">): ReactElement {
+  returnFocusTo,
+}: Pick<HelpOverlayProps, "onClose" | "returnFocusTo">): ReactElement {
   return (
     <Dialog.Root
       open
@@ -38,7 +40,16 @@ export default function HelpOverlayBody({
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        <Dialog.Content
+          onCloseAutoFocus={(event) => {
+            const target = returnFocusTo;
+            if (target) {
+              event.preventDefault();
+              target.focus();
+            }
+          }}
+          className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900"
+        >
           <Dialog.Title className="text-lg font-semibold">
             Keyboard shortcuts
           </Dialog.Title>
@@ -57,6 +68,18 @@ export default function HelpOverlayBody({
               </div>
             ))}
           </dl>
+          <p className="mt-3 text-sm text-slate-500 dark:text-slate-400">
+            More in the{" "}
+            <a
+              href={HANDBOOK_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="text-accent-700 underline hover:no-underline dark:text-accent-300"
+            >
+              Handbook <span className="sr-only">(opens in a new tab)</span>
+            </a>
+            .
+          </p>
           <div className="mt-4 flex justify-end">
             <Dialog.Close className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800">
               Close

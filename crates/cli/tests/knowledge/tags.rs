@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 fn write(dir: &Path, rel: &str, content: &str) {

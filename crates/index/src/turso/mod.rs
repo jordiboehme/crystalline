@@ -282,6 +282,9 @@ impl TursoStore {
         //   Drop-close and this store never calls `close()`. wal_checkpoint
         //   (TRUNCATE) above is reclamation of that high-water mark, not a
         //   substitute for growth control the engine already provides.
+        // - Re-read at turso 0.8.0: PRAGMA names are now matched
+        //   case-insensitively, and `wal_autocheckpoint` is still not a
+        //   recognised PRAGMA, so the two findings above stand unchanged.
         conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
 
         let schema_version = migrations::apply(&conn).await?;
@@ -385,6 +388,12 @@ impl TursoStore {
     /// back to (ideally) zero bytes. Confirmed to work by the runtime probe
     /// documented on `build()`. The pragma returns one row (`busy`, `log`,
     /// `checkpointed`) so it goes through the query path, not `execute`.
+    ///
+    /// Since turso 0.8.0 (#8032) this fails with Busy, "cannot checkpoint while
+    /// another statement is active", when any other statement on the same
+    /// connection is mid-flight; 0.7.2 ran it anyway. Every read helper drains
+    /// its rows before returning, so a live `Rows` here is a bug in a caller.
+    /// `a_checkpoint_after_every_read_helper_is_never_busy` pins that.
     async fn truncate_wal(&self) -> Result<()> {
         query_all(&self.conn, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await?;
         Ok(())

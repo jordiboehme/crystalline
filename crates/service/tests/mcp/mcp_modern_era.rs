@@ -4689,7 +4689,7 @@ async fn an_era_call_carrying_a_session_id_is_still_a_stateless_peer() {
 /// get to overrule it.**
 ///
 /// The half of rmcp's rule a version comparison alone cannot see.
-/// `uses_legacy_lifecycle` is `!uses_discover_lifecycle && is_legacy_version`,
+/// `uses_legacy_lifecycle` is `!uses_discover_lifecycle && ProtocolVersion::has_initialize`,
 /// and `uses_discover_lifecycle` asks only whether the era's two required
 /// `_meta` keys are PRESENT - never what revision the first of them names
 /// (rmcp 3.2.0 `tower.rs:390-398`, `model/meta.rs:518-530`). So a request

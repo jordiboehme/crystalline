@@ -11,7 +11,7 @@ use crate::common::isolate;
 use crate::common::isolation_env;
 
 fn bin() -> Command {
-    Command::cargo_bin("crystalline").unwrap()
+    crate::common::crystalline()
 }
 
 // `isolate` and `isolation_env` (both from `common`) redirect every base
@@ -585,7 +585,7 @@ fn find_auth_db(home: &std::path::Path) -> Option<std::path::PathBuf> {
 // is unix-only today.
 //
 // `AuthStore` opens `web-auth.db` with turso's experimental multiprocess WAL
-// so that two processes can hold it at once. turso 0.7.2 grants that only on
+// so that two processes can hold it at once. turso 0.7.2 (and 0.8.1) grants that only on
 // an IO backend that reports `supports_shared_wal_coordination`, and on
 // Windows the default backend (`WindowsIO`) does not: the trait default is
 // `false` and only `WindowsIOCP`, behind the off-by-default
@@ -686,7 +686,7 @@ fn holds_the_auth_db() {
 /// difference: it holds the database open in a second, real process.
 ///
 /// Unix-only, for the upstream reason spelled out above the constants: turso
-/// 0.7.2's default Windows IO backend reports no shared WAL coordination, so
+/// 0.7.2's (and 0.8.1's) default Windows IO backend reports no shared WAL coordination, so
 /// the multiprocess open is refused there and the legacy fallback's exclusive
 /// file lock refuses the second process.
 #[cfg(unix)]
