@@ -123,8 +123,9 @@ pub(crate) struct LineCoverage {
     pub(crate) eligible: usize,
     /// How many of those carry a vector now.
     pub(crate) embedded: usize,
-    /// Every eligible line's hash: the lines in use, for pruning.
-    pub(crate) hashes: HashSet<String>,
+    /// Every eligible line's hash: the lines in use, for pruning. The same
+    /// set the domain's settled record keeps.
+    pub(crate) hashes: Arc<HashSet<String>>,
     /// Why some lines have no vector, when a batch was refused or no
     /// provider is loaded.
     pub(crate) error: Option<String>,
@@ -157,9 +158,9 @@ impl Engine {
     /// batch that failed while scoring), `load_retry` (that failure was a
     /// download, which the daemon tries again on its own), `read_only` (the
     /// setting cannot be set here, so only a restart retries a blocked load)
-    /// and `embedding_pending` (a settled domain still has a possible
-    /// candidate with no lead vector yet, so its pending count of zero is not
-    /// the whole story). `device` is where the loaded model runs, in the
+    /// and `embedding_pending` (a domain the last walk counted, settled or
+    /// not, still has a possible candidate with no lead vector yet, so its
+    /// pending count of zero is not the whole story). `device` is where the loaded model runs, in the
     /// embeddings line's words (`metal`, `cpu (fallback: ...)`), and `null`
     /// while no model is in memory (never loaded, dropped after its idle
     /// time, or a direct read with no worker): no guess at a device nothing
@@ -193,7 +194,10 @@ impl Engine {
             model.and_then(|m| state.pending.as_ref().map(|_| failed_count(&state, m.repo)));
         let load_failed = model.is_some_and(|m| state.load_failed == Some(m.repo));
         let load_retry = load_failed && state.load_retry_at.is_some();
-        let embedding_pending = state.settled.values().any(|s| s.coverage.is_some());
+        // Every domain a walk counted, settled or not: a domain that cannot
+        // settle because its lines cannot be embedded either (the provider
+        // is down) still waits for a lead vector, and must say so.
+        let embedding_pending = state.counted.values().any(|c| c.coverage.is_some());
         let last_error = state.last_error.clone();
         let (lines_embedded, lines_eligible) = match (model, &state.pending) {
             (Some(_), Some(_)) => (
@@ -539,10 +543,12 @@ impl Engine {
                 return Err(e.into());
             }
         }
+        // A parsed domain's settle record carries the lines this walk saw, a
+        // skipped one's the lines of the walk that settled it, which its
+        // unchanged digest says are still the lines in use.
         let in_use: HashSet<&str> = work
             .iter()
-            .filter_map(|w| w.lines.as_ref())
-            .flat_map(|l| l.hashes.iter().map(String::as_str))
+            .flat_map(|w| w.settle.line_hashes.iter().map(String::as_str))
             .collect();
         let stored = {
             let store = self.store.lock().await;
@@ -623,15 +629,27 @@ impl Engine {
                                     .collect();
                                 // A refused write is one batch's failure, not
                                 // the walk's: its lines stay without a vector.
+                                // The profile is read again under the store
+                                // lock, which the off switch's clear takes
+                                // too, so nothing lands after that clear.
                                 let written = {
                                     let store = self.store.lock().await;
-                                    store
-                                        .store_observation_vectors(&self.model_id, &rows)
-                                        .await
+                                    if self.contradiction_model().map(|m| m.repo)
+                                        != Some(model.repo)
+                                    {
+                                        None
+                                    } else {
+                                        Some(
+                                            store
+                                                .store_observation_vectors(&self.model_id, &rows)
+                                                .await,
+                                        )
+                                    }
                                 };
                                 match written {
-                                    Ok(()) => stored += rows.len(),
-                                    Err(e) => {
+                                    None => break,
+                                    Some(Ok(())) => stored += rows.len(),
+                                    Some(Err(e)) => {
                                         error = Some(format!(
                                             "observation line vectors could not be stored: {e}"
                                         ))
@@ -665,7 +683,7 @@ impl Engine {
         Ok(LineCoverage {
             eligible: lines.len(),
             embedded,
-            hashes: lines.into_keys().collect(),
+            hashes: Arc::new(lines.into_keys().collect()),
             error,
         })
     }
@@ -718,8 +736,8 @@ impl Engine {
             .find_map(|w| w.lines.as_ref().and_then(|l| l.error.clone()));
         // Pruned here, before the return below for a walk with nothing
         // pending: that is most walks after a delete, the one that leaves
-        // vectors unused. Only after a walk that parsed every domain in
-        // scope and embedded every line, and never on a shared database.
+        // vectors unused. Only after a walk that knows every domain's lines
+        // in use and embedded every line, and never on a shared database.
         let shared = self.store.lock().await.shares_database();
         if complete && line_error.is_none() && !shared {
             match self.prune_line_vectors(&work).await {
@@ -912,6 +930,13 @@ impl Engine {
             checksum_b: b.checksum.clone(),
         };
         let store = self.store.lock().await;
+        // Read again under the store lock, which the off switch's clear takes
+        // too: a pair scored while the check was turned off is not stored
+        // after that clear. The walk then publishes nothing, since the
+        // profile moved.
+        if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
+            return Ok(batches);
+        }
         store
             .replace_contradictions(
                 domain,
@@ -979,10 +1004,10 @@ impl Engine {
 
     /// The first half of a walk: every domain in scope with its pending pairs
     /// and its lines embedded. Known failures are left alone unless `retry`.
-    /// The `bool` says every known domain was parsed this walk: none skipped
-    /// as settled, out of this instance's scope, or for a missing content
-    /// source or domain row. Only such a walk knows every line in use, so
-    /// only such a walk may prune.
+    /// The `bool` says the walk knows every known domain's lines in use:
+    /// each was parsed, or skipped as settled with the lines its settle
+    /// record keeps; none was out of this instance's scope or skipped for a
+    /// missing content source or domain row. Only such a walk may prune.
     async fn contradiction_work(
         &self,
         model: &'static NliModel,
@@ -1049,7 +1074,8 @@ impl Engine {
                 (settled, known)
             };
             if let Some(settle) = settled {
-                complete = false;
+                // Skipped, but its lines in use are known: its settle record
+                // carries them, so the walk stays complete.
                 out.push(DomainWork {
                     name,
                     id: domain_id,
@@ -1083,6 +1109,7 @@ impl Engine {
                 digest,
                 coverage: waiting.then_some(coverage),
                 failing: false,
+                line_hashes: Arc::clone(&lines.hashes),
             };
             let mut count = DomainCount {
                 digest: settle.digest.clone(),

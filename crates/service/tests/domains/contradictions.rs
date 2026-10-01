@@ -1457,7 +1457,7 @@ async fn a_setting_change_during_the_last_pair_is_not_lost() {
 }
 
 /// Review round 1, finding 7: turning the check off ends the walk in flight
-/// after the pair it is on, and lets go of the model.
+/// after the pair it is on, which is not stored, and lets go of the model.
 #[tokio::test]
 async fn turning_the_check_off_stops_the_walk_in_flight() {
     let entered = Arc::new(AtomicBool::new(false));
@@ -1486,13 +1486,24 @@ async fn turning_the_check_off_stops_the_walk_in_flight() {
     .expect("the pass reached the scorer");
     set(&engine, "evolve.contradictions", "off").await;
     release.send(()).unwrap();
-    pass.await.unwrap();
+    // One release only: a walk that went on to another pair would park in
+    // the scorer for its ten seconds, so a quick end is the walk stopping.
+    tokio::time::timeout(std::time::Duration::from_secs(5), pass)
+        .await
+        .expect("the walk stopped after the pair in flight")
+        .unwrap();
     let pairs = {
         let store = engine.store();
         let store = store.lock().await;
         store.scored_pair_count(full().repo).await.unwrap()
     };
-    assert_eq!(pairs, 1, "the pair in flight is finished, no other");
+    // The pair in flight finishes scoring, but it is no longer stored: the
+    // profile is read again under the store lock, and off deletes the scores
+    // anyway, so nothing may land after that clear.
+    assert_eq!(
+        pairs, 0,
+        "the pair in flight is not stored, no other is scored"
+    );
     assert!(
         !engine.contradiction_scorer_loaded(),
         "the model went with the walk"
@@ -2573,7 +2584,6 @@ async fn an_instance_id_on_an_unshared_store_still_clears_and_prunes() {
     assert_eq!(line_hashes(&engine).await.len(), 5);
     engine.delete_engram(&delete_fridays()).await.unwrap();
     engine.embed_pending().await.unwrap();
-    set(&engine, "evolve.contradictions", "full").await;
     engine.score_contradictions().await.unwrap();
     assert_eq!(line_hashes(&engine).await.len(), 3, "pruned with an id set");
     set(&engine, "evolve.contradictions", "off").await;
@@ -2681,14 +2691,148 @@ async fn vectors_of_lines_nobody_uses_are_pruned_after_a_full_walk() {
     assert_eq!(line_hashes(&engine).await.len(), 5);
     engine.delete_engram(&delete_fridays()).await.unwrap();
     engine.embed_pending().await.unwrap();
-    // A setting change makes the next walk parse every domain again.
-    set(&engine, "evolve.contradictions", "full").await;
     engine.score_contradictions().await.unwrap();
     assert_eq!(
         line_hashes(&engine).await.len(),
         3,
         "Fridays' two lines are used by no current engram"
     );
+}
+
+/// Review fix 1: pruning in steady state. A walk that skips a settled domain
+/// still knows that domain's lines in use from its settled record, so a
+/// delete in another domain prunes with no setting change and no restart,
+/// and the skipped domain keeps its vectors.
+#[tokio::test]
+async fn a_walk_that_skips_a_settled_domain_still_prunes_another() {
+    let (_tmp, engine) = engine_with_domains(
+        Arc::new(crate::support::TopicEmbedder),
+        &["notes", "harbour"],
+    )
+    .await;
+    let engine = with_loader(engine, loader(stub(), Arc::new(AtomicUsize::new(0))));
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine
+        .write_engram(&WriteParams {
+            domain: "harbour".to_string(),
+            ..write(
+                "Ferry",
+                "The harbour ferry timetable.\n\n- [fact] The ferry leaves at noon\n- [fact] The harbour closes at dusk",
+            )
+        })
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    let all = line_hashes(&engine).await;
+    assert_eq!(all.len(), 7, "five lines in notes, two in harbour");
+    // Both domains settled; the next walk parses nothing.
+    let walks = engine.contradiction_fact_walks();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(engine.contradiction_fact_walks(), walks);
+
+    engine.delete_engram(&delete_fridays()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        walks + 1,
+        "notes is parsed again, harbour is skipped as settled"
+    );
+    let left = line_hashes(&engine).await;
+    assert_eq!(left.len(), 5, "Fridays' two lines are pruned");
+    let harbour = [
+        crystalline_index::nli::observation_hash("The ferry leaves at noon"),
+        crystalline_index::nli::observation_hash("The harbour closes at dusk"),
+    ];
+    for h in &harbour {
+        assert!(left.contains(h), "the skipped domain keeps its vectors");
+    }
+}
+
+/// Embeds like the topic provider, and refuses every batch while `down`,
+/// chunks and observation lines alike: a provider that is fully down.
+struct DownTopicEmbedder {
+    down: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for DownTopicEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(IndexError::Embedding("the provider is down".to_string()));
+        }
+        Ok(texts
+            .iter()
+            .map(|t| crate::support::TopicEmbedder::embed_one(t))
+            .collect())
+    }
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+    fn dims(&self) -> usize {
+        4
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+/// Review fix 2, lessons 37 and 62: with the provider fully down a domain
+/// can settle neither on its lead vectors nor on its lines, and status still
+/// says a candidate waits for its vector instead of reading as checked.
+#[tokio::test]
+async fn a_provider_that_is_fully_down_keeps_embedding_pending() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let provider = Arc::new(DownTopicEmbedder {
+        down: AtomicBool::new(false),
+    });
+    let (_tmp, engine) = engine_on(provider.clone()).await;
+    let engine = with_loader(engine, loader(s, loads));
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Eighteen", NODE_18))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    provider.down.store(true, Ordering::SeqCst);
+    engine
+        .write_engram(&write("Twenty", NODE_20))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0),
+        "Twenty has no lead vector yet"
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["pending_pairs"], 0);
+    assert_eq!(
+        status["embedding_pending"], true,
+        "0 pending while a candidate still lacks a lead vector: {status}"
+    );
+    assert!(
+        status["lines_embedded"].as_u64() < status["lines_eligible"].as_u64(),
+        "{status}"
+    );
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("observation lines could not be embedded")),
+        "{status}"
+    );
+    // Up again: the lines and the lead vector arrive and the pair is scored.
+    provider.down.store(false, Ordering::SeqCst);
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 4, 0)
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["embedding_pending"], false, "{status}");
+    assert!(status["last_error"].is_null(), "{status}");
 }
 
 /// Preflight M12: a changed embedding model means a restart, and the first

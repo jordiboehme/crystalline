@@ -1839,6 +1839,11 @@ pub(crate) struct SettledDomain {
     /// Whether the domain settled with pairs a failed batch left: a walk the
     /// tick marked as a retry walks it again, any other walk skips it.
     pub(crate) failing: bool,
+    /// The row hashes of the domain's eligible observation lines at that
+    /// walk. The digest pins the files, so they are still the lines in use
+    /// while the domain is skipped, and a walk that skips it can still prune
+    /// the line vectors no domain uses. Shared, so a skip copies no set.
+    pub(crate) line_hashes: Arc<HashSet<String>>,
 }
 
 /// What a walk counted for one domain it parsed, kept for the sweep. The
