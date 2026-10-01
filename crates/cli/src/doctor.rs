@@ -2006,7 +2006,9 @@ async fn check_domain_checks(
 /// dropped and the newer text stays. The error is the note the report shows.
 fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
     let tmp = fix_temp_path(file);
-    let written = std::fs::write(&tmp, text).and_then(|()| {
+    // Every domain file is stored as LF, whatever the text it came from held.
+    let text = crystalline_core::to_lf(text);
+    let written = std::fs::write(&tmp, text.as_bytes()).and_then(|()| {
         let permissions = std::fs::metadata(file)?.permissions();
         std::fs::set_permissions(&tmp, permissions)
     });
@@ -3001,9 +3003,13 @@ fn is_embedding_listing(repo: &str) -> bool {
 /// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
 /// status`'s answer when a daemon served this run's file stamps; its
 /// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
-/// `load_retry`, `read_only`, `embedding_pending`, `lines_embedded` and `lines_eligible` are read from there and never recomputed (lesson 36) -
-/// a direct read has no worker, so those stay null/false, the same shape
-/// `crystalline status`'s standalone fallback reports. `device` is the probed
+/// `load_retry`, `read_only`, `embedding_pending`, `embedding_model`,
+/// `line_floor`, `line_floor_missing`, `lines_embedded` and `lines_eligible`
+/// are read from there and never recomputed (lesson 36) - a direct read has
+/// no worker, so the counts and flags stay null/false, the same shape
+/// `crystalline status`'s standalone fallback reports. Only the three floor
+/// fields fall back to the config's embedding model, when no daemon answers
+/// or an older daemon omits them. `device` is the probed
 /// device a load of the model would pick here (as for the embedding model,
 /// probed, not loaded); it is reported only while a profile is on.
 fn contradiction_summary(
@@ -3040,10 +3046,21 @@ fn contradiction_summary(
     let embedding_pending = live.is_some_and(|c| c["embedding_pending"].as_bool().unwrap_or(false));
     let lines_embedded = live.and_then(|c| c["lines_embedded"].as_u64());
     let lines_eligible = live.and_then(|c| c["lines_eligible"].as_u64());
-    // The floor belongs to the configured embedding model, so doctor reads it
-    // from the config like `status`'s direct path does, with no daemon needed.
-    let embedding_model = crystalline_index::embed::configured_model_id(cfg.embeddings.as_ref());
-    let line_floor = crystalline_index::embed::line_similarity_floor(&embedding_model);
+    // The daemon's own answer wins (lesson 36); the config is the fallback
+    // when no daemon answers or an older daemon omits the key.
+    let config_model = crystalline_index::embed::configured_model_id(cfg.embeddings.as_ref());
+    let config_floor = crystalline_index::embed::line_similarity_floor(&config_model);
+    let embedding_model = live
+        .and_then(|c| c["embedding_model"].as_str())
+        .map_or(config_model, str::to_string);
+    // The daemon's flag decides which side the floor comes from: an older
+    // daemon without the key falls back to the config as a whole.
+    let daemon_flag = live.and_then(|c| c["line_floor_missing"].as_bool());
+    let line_floor = match daemon_flag {
+        Some(_) => live.and_then(|c| c["line_floor"].as_f64()),
+        None => config_floor,
+    };
+    let line_floor_missing = daemon_flag.unwrap_or(config_floor.is_none());
     let last_error = live
         .and_then(|c| c["last_error"].as_str())
         .map(str::to_string);
@@ -3085,7 +3102,7 @@ fn contradiction_summary(
                 "load_retry": load_retry, "read_only": read_only,
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
                 "device": device, "embedding_model": embedding_model,
-                "line_floor": line_floor, "line_floor_missing": line_floor.is_none(),
+                "line_floor": line_floor, "line_floor_missing": line_floor_missing,
                 "lines_embedded": lines_embedded, "lines_eligible": lines_eligible,
             })
         }
@@ -5641,8 +5658,6 @@ mod tests {
         assert!(!out.contains("crystalline config set"), "{out}");
     }
 
-    /// L7/lesson 62: no daemon answered (a direct read, or one that has not
-    /// walked yet), so the pending count is unknown - `null`, never `0`.
     /// V302: a remote embedding model has no measured line floor, so doctor
     /// names the reason from the config (a daemon's answer is not needed) and
     /// the row says the check does not run.
@@ -5703,6 +5718,73 @@ mod tests {
         );
     }
 
+    /// A daemon's own floor answer wins over the config's model.
+    #[test]
+    fn contradiction_summary_takes_the_line_floor_from_the_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        // Config: default local model (has a floor). Daemon: a remote one without.
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 2, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+            "embedding_model": "text-embedding-3-small",
+            "line_floor": null, "line_floor_missing": true,
+            "lines_embedded": 5, "lines_eligible": 9,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+        assert_eq!(summary["line_floor"], serde_json::Value::Null);
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("2 pairs pending, lines 5/9 embedded, not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor"),
+            "{out}"
+        );
+        // The other way round: the daemon has a floor, the config does not.
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 0, "embedding_model": "granite-x",
+            "line_floor": 0.86, "line_floor_missing": false,
+        }});
+        let summary = contradiction_summary(&cfg, Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], false, "{summary}");
+        assert_eq!(summary["line_floor"], 0.86);
+        assert_eq!(summary["embedding_model"], "granite-x");
+    }
+
+    /// An older daemon that omits the floor keys leaves the config's answer.
+    #[test]
+    fn contradiction_summary_falls_back_to_the_config_for_an_older_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg, Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+    }
+
     /// Off prints no coverage and no floor reason, even with a remote model.
     #[test]
     fn contradiction_summary_off_has_no_floor_reason_with_a_remote_model() {
@@ -5723,6 +5805,8 @@ mod tests {
         assert_eq!(summary["lines_embedded"], serde_json::Value::Null);
     }
 
+    /// L7/lesson 62: no daemon answered (a direct read, or one that has not
+    /// walked yet), so the pending count is unknown - `null`, never `0`.
     #[test]
     fn contradiction_summary_with_no_daemon_answer_leaves_the_count_unknown_not_zero() {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
@@ -5849,6 +5933,17 @@ mod tests {
             name.starts_with(&format!(".dup.md.doctor-fix.{}.", std::process::id())),
             "{name}"
         );
+    }
+
+    /// `--fix` stores LF only: a CRLF file it rewrites leaves no `\r`.
+    #[test]
+    fn write_fix_writes_lf_over_a_crlf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old\r\nline\r\n").unwrap();
+        write_fix(&file, "old\r\nline\r\n", "new\r\nline\r\n").unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert_eq!(bytes, b"new\nline\n");
     }
 
     /// The fixed file keeps the original's permissions.

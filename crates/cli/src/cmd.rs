@@ -2509,11 +2509,12 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
 
 /// The one-line reason the contradiction check is not simply "N pairs
 /// pending": the configured embedding model has no measured line-similarity
-/// floor so V302 does not run, the model itself could not be loaded, a batch failed on some of
-/// the pending pairs and they are parked, or a settled domain still has a
-/// candidate waiting on its embedding. At most one reason, in that priority
-/// order - L1 asks for a single short phrase naming the reason, not a list -
-/// and `None` when nothing beyond an ordinary unfinished pass is going on.
+/// floor so V302 does not run, the model itself could not be loaded, a batch
+/// failed on some of the pending pairs and they are parked, or a settled
+/// domain still has a candidate waiting on its embedding. At most one reason,
+/// in that priority order - L1 asks for a single short phrase naming the
+/// reason, not a list - and `None` when nothing beyond an ordinary unfinished
+/// pass is going on.
 /// Shared by [`contradictions_lines`] and doctor's row so the two surfaces
 /// can never give a different diagnosis for the same state (lesson 36).
 pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String> {
