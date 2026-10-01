@@ -183,25 +183,15 @@ mod tests {
     use super::*;
 
     /// Set an entry's mtime far enough into the past that the sweep sees it as
-    /// stale. `filetime` is not a dependency, so this goes through `utimensat`
-    /// on unix and is skipped elsewhere.
+    /// stale. Works on a directory too: unix lets a directory be opened
+    /// read-only, and `File::set_times` goes through `futimens`.
     #[cfg(unix)]
     fn age(path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let old = libc::timespec {
-            tv_sec: (SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                - 7200) as libc::time_t,
-            tv_nsec: 0,
-        };
-        let times = [old, old];
-        assert_eq!(
-            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) },
-            0
-        );
+        let old = SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
     }
 
     #[cfg(unix)]

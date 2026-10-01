@@ -800,7 +800,7 @@ async fn post(
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// A modern POST: the era's `_meta` in the body and the SEP-2243 standard
@@ -4442,7 +4442,7 @@ async fn post_as_at(
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// One stateless `tools/call`, as this era's peer makes it.

@@ -16,7 +16,7 @@ version = "0.21.3"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
-rust-version = "1.96"
+rust-version = "1.99"
 repository = "https://github.com/jordiboehme/crystalline"
 
 [workspace.dependencies]

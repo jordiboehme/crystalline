@@ -3628,7 +3628,7 @@ pub(crate) fn healthcheck(addr: &str) -> Result<()> {
             Err(e) => bail!("reading the health response from {connect_addr}: {e}"),
         }
     }
-    let response = String::from_utf8_lossy(&response).into_owned();
+    let response = String::from_utf8_lossy_owned(response);
 
     let status_line = response
         .lines()

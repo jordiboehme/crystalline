@@ -270,7 +270,7 @@ async fn post(addr: std::net::SocketAddr, body: &str, session_id: Option<&str>) 
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// The `mcp-session-id` response header, case-insensitively.

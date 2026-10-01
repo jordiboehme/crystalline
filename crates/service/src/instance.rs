@@ -1021,7 +1021,7 @@ fn process_exe_path(pid: u32) -> Option<String> {
             return None;
         }
         buf.truncate(written as usize);
-        Some(String::from_utf8_lossy(&buf).to_string())
+        Some(String::from_utf8_lossy_owned(buf))
     }
     #[cfg(windows)]
     {

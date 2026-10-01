@@ -160,7 +160,7 @@ impl Env {
         let out = cmd.args(args).output().unwrap();
         (
             out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy_owned(out.stdout),
         )
     }
 
@@ -172,8 +172,8 @@ impl Env {
         let out = cmd.args(args).output().unwrap();
         (
             out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy_owned(out.stdout),
+            String::from_utf8_lossy_owned(out.stderr),
         )
     }
 
@@ -4458,7 +4458,7 @@ fn a_responsive_daemon_survives_doctor_fix() {
         .output()
         .unwrap();
     let ok = raw.status.success();
-    let out = String::from_utf8_lossy(&raw.stdout).into_owned();
+    let out = String::from_utf8_lossy_owned(raw.stdout);
     assert!(
         ok,
         "a healthy service is not a problem: {out}{}",

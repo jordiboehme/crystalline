@@ -1438,7 +1438,6 @@ dependencies = [
  "globset",
  "http",
  "indexmap 2.14.2",
- "libc",
  "percent-encoding",
  "schemars 1.2.2",
  "serde",

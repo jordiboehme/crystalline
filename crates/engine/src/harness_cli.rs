@@ -90,7 +90,7 @@ pub fn run_harness_cli_capture(harness: HarnessKind, args: &[&str]) -> CliCaptur
             .output()
         {
             Ok(out) if out.status.success() => CliCapture::Ok {
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stdout: String::from_utf8_lossy_owned(out.stdout),
             },
             Ok(_) => CliCapture::Failed,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliCapture::NotFound,
@@ -129,7 +129,7 @@ fn run_cli_output(program: &str, args: &[&str]) -> CliOutput {
     {
         Ok(out) if out.status.success() => CliOutput::Ok,
         Ok(out) => CliOutput::Failed {
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: String::from_utf8_lossy_owned(out.stderr),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliOutput::NotFound,
         Err(_) => CliOutput::Failed {

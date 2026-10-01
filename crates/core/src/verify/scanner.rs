@@ -129,7 +129,7 @@ where
                     let bytes = e.into_bytes();
                     let line = bytes[..valid].iter().filter(|b| **b == b'\n').count() + 1;
                     (
-                        String::from_utf8_lossy(&bytes).into_owned(),
+                        String::from_utf8_lossy_owned(bytes),
                         Err(parse::ParseError::NotUtf8 { line }),
                     )
                 }

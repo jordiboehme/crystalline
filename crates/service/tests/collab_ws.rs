@@ -927,7 +927,7 @@ fn refusal_detail(err: &tungstenite::Error) -> String {
         panic!("the upgrade was refused with an HTTP answer");
     };
     let body = response.body().clone().unwrap_or_default();
-    String::from_utf8_lossy(&body).to_string()
+    String::from_utf8_lossy_owned(body)
 }
 
 /// A grantee who joined types into the OWNER's document: the same room the

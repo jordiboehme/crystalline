@@ -645,8 +645,8 @@ fn prompt_output(home: &Path, bin_dir: &Path) -> (String, String) {
         String::from_utf8_lossy(&out.stderr)
     );
     (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8_lossy_owned(out.stdout),
+        String::from_utf8_lossy_owned(out.stderr),
     )
 }
 
