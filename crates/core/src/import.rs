@@ -6,7 +6,8 @@
 //! temporal metadata, drops sentinel open-ended dates, strips a leading
 //! source-tree permalink prefix and adds missing write provenance
 //! (`generated`). Every other
-//! frontmatter key and the body are preserved exactly: each file is read with
+//! frontmatter key and the body are preserved exactly (written with LF line
+//! endings, the one line ending Crystalline stores): each file is read with
 //! [`crate::parse::parse_engram_lossless`], the typed frontmatter is edited in
 //! place and the result is written back with [`crate::emit::emit_engram`],
 //! which keeps unknown keys in their original order and the body verbatim.
@@ -315,6 +316,9 @@ fn convert_markdown(
         // Write-then-rename (crate::config::write_atomic), not a direct
         // write: a crash mid-write can no longer leave a truncated engram
         // file at `dest`.
+        // Written as LF, the one line ending Crystalline stores: the body is
+        // carried over verbatim apart from its line endings.
+        let output = crate::to_lf(&output);
         crate::config::write_atomic(&dest, output.as_bytes()).map_err(io_err(&dest))?;
     }
 

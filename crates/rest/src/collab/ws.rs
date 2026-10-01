@@ -70,7 +70,6 @@ pub struct JoinQuery {
         (status = 403, description = "Viewer role, read-only instance, or a missing/foreign Origin.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 404, description = "No such engram.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 422, description = "`overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second.", body = ProblemDetail, content_type = "application/problem+json"),
-        (status = 409, description = "Mixed line endings: this file cannot hold a shared session; edit solo.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 503, description = "Session or participant capacity reached.", body = ProblemDetail, content_type = "application/problem+json"),
     ),
 )]
@@ -324,10 +323,6 @@ fn require_same_host_origin(headers: &HeaderMap) -> Result<(), ApiError> {
 fn join_error(err: JoinError) -> ApiError {
     match err {
         JoinError::Engine(engine) => engine.into(),
-        JoinError::MixedEndings => ApiError::conflict(
-            "this file mixes CRLF and LF line endings, which a shared session \
-             cannot hold without rewriting bytes; it opens in solo mode instead",
-        ),
         JoinError::ServerFull => busy("this server is at its concurrent session limit"),
         JoinError::SessionFull => busy("this engram's session is at its participant limit"),
     }
@@ -536,10 +531,6 @@ mod tests {
     #[test]
     fn every_join_refusal_maps_to_the_status_its_client_branches_on() {
         use axum::http::StatusCode;
-        assert_eq!(
-            join_error(JoinError::MixedEndings).status,
-            StatusCode::CONFLICT
-        );
         assert_eq!(
             join_error(JoinError::ServerFull).status,
             StatusCode::SERVICE_UNAVAILABLE

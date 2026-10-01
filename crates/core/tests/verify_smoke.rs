@@ -1043,3 +1043,31 @@ fn a_bare_link_to_another_domains_title_names_the_prefixed_link() {
             .all(|i| i.severity == Severity::Warning)
     );
 }
+
+/// A file that is not UTF-8 is reported under the encoding rule, `E006`, and
+/// the rest of the domain is still verified: it never aborts the scan.
+#[test]
+fn a_file_that_is_not_utf8_is_an_e006_error_and_the_scan_goes_on() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Encoding facts\n\n## When to Use\n\n- When asked about encodings\n",
+    );
+    fs::write(
+        dir.path().join("latin1.md"),
+        b"---\ntype: engram\ntitle: Latin\npermalink: latin\ntags:\n- t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nCaf\xe9 au lait.\n",
+    )
+    .unwrap();
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let e006 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "E006" && i.path.ends_with("latin1.md"))
+        .expect("E006 present");
+    assert_eq!(e006.severity, Severity::Error);
+    assert!(e006.message.contains("not valid UTF-8"), "{}", e006.message);
+    assert_eq!(e006.line, Some(11));
+    assert_eq!(report.summary.files_scanned, 2);
+}

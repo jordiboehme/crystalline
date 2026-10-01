@@ -1,4 +1,4 @@
-//! The external-change merge: three-way in LF space (frontmatter key by key,
+//! The external-change merge: three-way over LF text (frontmatter key by key,
 //! body line by line, see `crystalline_core::frontmatter`), applied into
 //! the live document as a minimal edit script. Conflict markers are never
 //! output - diffy's marked text is discarded and the room resolves instead.
@@ -7,28 +7,24 @@ use crystalline_core::frontmatter::{MergedText, merge_text};
 use similar::{ChangeTag, TextDiff};
 use yrs::{Text, TextRef, TransactionMut};
 
-use super::text::{collab_eligible, session_text};
+use crystalline_core::to_lf;
 
 /// What a three-way merge of an external change against the live session says.
 pub enum MergeOutcome {
-    /// The merged text, in SESSION (LF) space, ready to apply into the doc.
+    /// The merged text, LF only, ready to apply into the doc.
     Clean(String),
-    /// Concurrent edits collide (or theirs is mixed-endings): the room decides.
+    /// Concurrent edits collide: the room decides.
     Conflict,
 }
 
-/// base and theirs arrive in FILE space, mine in session space; everything is
-/// merged in LF space (frontmatter key by key, body line by line, see
-/// `crystalline_core::frontmatter`). diffy's Err carries conflict-marked
-/// text - discarded.
+/// base and theirs arrive as the file holds them, mine as the room's LF text;
+/// everything is merged as LF (frontmatter key by key, body line by line, see
+/// `crystalline_core::frontmatter`), so a CRLF or mixed side merges like any
+/// other. diffy's Err carries conflict-marked text - discarded.
 pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> MergeOutcome {
-    if !collab_eligible(theirs_file) {
-        // Merging would force a silent line-ending rewrite on save; the room
-        // gets the conflict view instead.
-        return MergeOutcome::Conflict;
-    }
-    let base = session_text(base_file);
-    let theirs = session_text(theirs_file);
+    let base = to_lf(base_file);
+    let theirs = to_lf(theirs_file);
+    let mine_session = &*to_lf(mine_session);
     // Frontmatter by key, body by line, and never a result that stops
     // parsing where both sides parsed. diffy's marked text is discarded
     // inside `line_merge`: conflict markers must never reach an engram file
@@ -120,9 +116,22 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_endings_theirs_is_a_conflict_not_a_rewrite() {
-        let outcome = three_way("a\r\n", "a\n", "a\r\nb\nmixed\r\n");
-        assert!(matches!(outcome, MergeOutcome::Conflict));
+    fn a_mixed_endings_theirs_merges_as_lf() {
+        let MergeOutcome::Clean(merged) = three_way("a\r\n", "a\n", "a\r\nb\nmixed\r\n") else {
+            panic!("a mixed theirs merges as LF");
+        };
+        assert_eq!(merged, "a\nb\nmixed\n");
+    }
+
+    #[test]
+    fn a_crlf_base_with_lf_sides_merges_clean_as_lf() {
+        let base = "# T\r\n\r\nSection A: original\r\n\r\nSection B: original\r\n";
+        let mine = "# T\n\nSection A: mine\n\nSection B: original\n";
+        let theirs = "# T\n\nSection A: original\n\nSection B: theirs\n";
+        let MergeOutcome::Clean(merged) = three_way(base, mine, theirs) else {
+            panic!("a CRLF base never makes LF sides conflict");
+        };
+        assert_eq!(merged, "# T\n\nSection A: mine\n\nSection B: theirs\n");
     }
 
     #[test]
@@ -174,9 +183,9 @@ mod tests {
         let theirs = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
         let mine = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
         let MergeOutcome::Clean(merged) = three_way(&base, &mine, &theirs) else {
-            panic!("session space is LF on every side");
+            panic!("every side is merged as LF");
         };
-        assert_eq!(merged, session_text(&theirs));
+        assert_eq!(merged, to_lf(&theirs));
     }
 
     #[test]

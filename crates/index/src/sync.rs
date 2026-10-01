@@ -1415,6 +1415,10 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                     size: scanned.size,
                     sha256,
                 };
+                // The index holds LF only. The stamp above stays the one of
+                // the bytes on disk, which a sync never rewrites: a CRLF file
+                // is indexed as LF and turns LF on disk on its next write.
+                let content = crystalline_core::to_lf(&content);
                 match crystalline_core::parse_engram(&content) {
                     Ok(engram) => {
                         let record = EngramRecord::from_engram(&engram, &scanned.rel, stamp);

@@ -402,16 +402,16 @@ async fn the_upgrade_guards_hold_before_any_protocol_traffic() {
     .await
     .unwrap_err();
     assert_eq!(refusal_status(&err), Some(404));
-    // Mixed line endings: 409, the solo-fallback signal.
-    let err = connect(
+    // A file that mixes line endings opens a room like any other: its text
+    // is LF in the room and is saved as LF.
+    let mixed = connect(
         fx.addr,
         "/api/v1/collab/eng/mixed",
         Some(&editor.0),
         same_host(fx.addr),
     )
-    .await
-    .unwrap_err();
-    assert_eq!(refusal_status(&err), Some(409));
+    .await;
+    assert!(mixed.is_ok(), "a mixed-endings file hosts a session");
     // And the happy path upgrades.
     let socket = connect(fx.addr, path, Some(&editor.0), same_host(fx.addr)).await;
     assert!(socket.is_ok(), "an editor from the same host connects");

@@ -20,6 +20,7 @@ mod engine_writes;
 mod file_stamps;
 mod graph;
 mod index_files;
+mod line_endings;
 mod model_upgrade;
 mod move_permalink;
 mod name_report;

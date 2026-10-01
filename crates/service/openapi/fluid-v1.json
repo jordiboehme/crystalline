@@ -816,16 +816,6 @@
               }
             }
           },
-          "409": {
-            "description": "Mixed line endings: this file cannot hold a shared session; edit solo.",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetail"
-                }
-              }
-            }
-          },
           "422": {
             "description": "`overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second.",
             "content": {

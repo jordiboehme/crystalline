@@ -116,7 +116,8 @@ async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
     let joined = sessions.join("eng", "crlf", None).await.unwrap();
 
     let messages = messages_of(&joined.greeting);
-    // Message 1: the hello control carrying the recorded separator.
+    // Message 1: the hello control. Its separator is always LF: the room's
+    // text is LF whatever the file held, and so is every save of it.
     let Message::Custom(tag, payload) = &messages[0] else {
         panic!("greeting opens with the hello control");
     };
@@ -131,7 +132,7 @@ async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
     else {
         panic!("hello parses");
     };
-    assert_eq!(separator, "\r\n");
+    assert_eq!(separator, "\n");
     assert_eq!(permalink, "crlf");
     assert_eq!(save_state, "ok");
     assert_eq!(epoch, joined.session.epoch());
@@ -156,9 +157,11 @@ async fn a_client_syncs_and_reads_the_lf_session_text() {
     assert!(!synced.contains("\r\n"), "the shared text is LF space");
     assert!(synced.contains("windows body"));
 
-    // And the session hands it back in file space, byte for byte.
+    // And the session hands it back as LF, which is what a save writes; a
+    // room that was only opened is not dirty, so it never writes at all.
     let (file_now, dirty) = joined.session.snapshot().await;
-    assert!(file_now.contains("windows body\r\n"), "{file_now:?}");
+    assert!(file_now.contains("windows body\n"), "{file_now:?}");
+    assert!(!file_now.contains('\r'), "{file_now:?}");
     assert!(!dirty, "an untouched session is not dirty");
 }
 
@@ -340,14 +343,21 @@ async fn a_malformed_frame_is_dropped_without_killing_the_session() {
 }
 
 #[tokio::test]
-async fn mixed_endings_and_full_rooms_are_refused() {
+async fn a_mixed_endings_file_hosts_a_session_and_full_rooms_are_refused() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let refused = sessions.join("eng", "mixed", None).await.unwrap_err();
-    assert!(matches!(
-        refused,
-        crystalline_service::collab::session::JoinError::MixedEndings
-    ));
+    // A file that mixes CRLF and LF opens like any other, as its LF text.
+    let mixed = sessions.join("eng", "mixed", None).await.unwrap();
+    let doc = synced_client(&mixed.session, mixed.conn).await;
+    let text = doc.get_or_insert_text("content");
+    let synced = text.get_string(&doc.transact());
+    assert!(!synced.contains('\r'), "{synced:?}");
+    assert!(
+        synced.contains("a CRLF file\nwith a lone LF\n"),
+        "{synced:?}"
+    );
+    let (_, dirty) = mixed.session.snapshot().await;
+    assert!(!dirty, "opening a mixed file is not an edit of it");
 
     let mut joined = Vec::new();
     for _ in 0..MAX_PARTICIPANTS {

@@ -77,7 +77,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let p = &self.localized_for(p, scope).await?;
+        let p = &self.localized_for(p, scope).await?.lf_only();
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,
@@ -281,6 +281,13 @@ impl Engine {
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        // Every arm below edits the LF form of what it read, whatever line
+        // endings the file, the row or the draft held: the whole document is
+        // written back as LF, and an edit's own LF text (a find_text, a
+        // section heading) matches it. Each arm compares its
+        // `expected_checksum` against the bytes it read BEFORE this
+        // conversion, which is what a read handed out.
+        let apply = move |current: &str| apply(&crystalline_core::to_lf(current));
         // **The live arm, and it comes before every other one.** While a
         // co-editing room is open over this document, the room's text IS the
         // engram: somebody has it on screen, the file and the row are both
@@ -415,12 +422,8 @@ impl Engine {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| {
-                    SourceEditFailure::before(EngineError::Io {
-                        path: abs.display().to_string(),
-                        source,
-                    })
-                })?;
+                let current = std::fs::read_to_string(&abs)
+                    .map_err(|source| SourceEditFailure::before(text_read_error(&abs, source)))?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
                 // compares.

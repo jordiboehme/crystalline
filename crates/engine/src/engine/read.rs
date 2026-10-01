@@ -406,8 +406,14 @@ impl Engine {
         };
         let is_live = live.is_some();
         let content = live.unwrap_or(content);
-        let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        // The checksum is of the bytes the file or the row holds, taken before
+        // the text is handed back as LF: it is the token an edit or a save
+        // compares against what it reads there, and an origin's base stamp is
+        // of those bytes too. A CRLF file therefore reads back as LF with the
+        // checksum of its CRLF bytes, and the next write lands it as LF.
         let checksum = sha256_hex(content.as_bytes());
+        let content = crystalline_core::to_lf(&content).into_owned();
+        let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
 
         // Enrich the response with reference resolution: which outbound links
         // land, and who points back in. The descriptor carries the ids, so this

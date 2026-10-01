@@ -851,6 +851,54 @@ domain_args!(ResolveConflictParams { one domain });
 domain_args!(WithdrawProposalParams { one domain });
 domain_args!(ProvisionParams { opt domain });
 
+// Every text a tool parameter carries may arrive with CRLF line endings, and is
+// taken as the LF text it means: what Crystalline stores is LF only, and a
+// find_text or a section heading sent with CRLF has to match that LF text. The
+// conversion is `crystalline_core::to_lf`, applied once where each write verb
+// takes its parameters.
+
+fn lf(text: &mut String) {
+    if let std::borrow::Cow::Owned(converted) = crystalline_core::to_lf(text) {
+        *text = converted;
+    }
+}
+
+fn lf_opt(text: &mut Option<String>) {
+    if let Some(text) = text {
+        lf(text);
+    }
+}
+
+impl WriteParams {
+    /// These parameters with every text in them as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf(&mut self.content);
+        self
+    }
+}
+
+impl EditParams {
+    /// These parameters with every text in them as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf_opt(&mut self.content);
+        lf_opt(&mut self.value);
+        lf_opt(&mut self.section);
+        lf_opt(&mut self.find_text);
+        if let Some(values) = &mut self.values {
+            values.iter_mut().for_each(lf);
+        }
+        self
+    }
+}
+
+impl SaveParams {
+    /// These parameters with the document as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf(&mut self.content);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

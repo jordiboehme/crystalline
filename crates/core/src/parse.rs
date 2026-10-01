@@ -44,6 +44,13 @@ pub enum ParseError {
     /// The frontmatter parsed to something other than a mapping.
     #[error("frontmatter is not a mapping")]
     FrontmatterNotMapping,
+    /// The file's bytes are not UTF-8 text. Raised by whoever reads the
+    /// bytes, since a `&str` can never hold such a file.
+    #[error("file is not valid UTF-8 (first bad byte on line {line})")]
+    NotUtf8 {
+        /// One-based line holding the first invalid sequence.
+        line: usize,
+    },
 }
 
 /// A parsed Engram plus enough of the original source to edit it losslessly.

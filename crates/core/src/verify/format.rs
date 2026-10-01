@@ -3,7 +3,8 @@
 //!
 //! `E001`-`E006` are unconditional errors: a well-formed Engram must parse,
 //! carry the four required fields and use a lowercase slug permalink with
-//! clean UTF-8. `E007` (tag format) and the outside-the-recommended-set half
+//! clean UTF-8 (`E006`: no byte order mark, no null byte, and valid UTF-8 at
+//! all). `E007` (tag format) and the outside-the-recommended-set half
 //! of `E003` are softer: Crystalline never enforces a closed `type` or
 //! `status` vocabulary, so those two only ever inform. `E008` warns when a
 //! permalink starts with the domain's own name: a permalink is
@@ -42,6 +43,17 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
                 Severity::Error,
                 "file starts with a UTF-8 byte order mark",
                 Some("save the file as UTF-8 without a BOM".into()),
+            );
+            return;
+        }
+        Err(ParseError::NotUtf8 { line }) => {
+            sink.emit(
+                &file.path,
+                Some(*line),
+                "E006",
+                Severity::Error,
+                "file is not valid UTF-8",
+                Some("re-save the file as UTF-8 text".into()),
             );
             return;
         }

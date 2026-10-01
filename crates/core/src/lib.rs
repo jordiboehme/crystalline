@@ -24,6 +24,7 @@ pub mod frontmatter;
 pub mod harness;
 pub mod import;
 pub mod index;
+pub mod line_endings;
 pub mod manifest;
 pub mod names;
 pub mod parse;
@@ -58,6 +59,7 @@ pub use index::{
     INDEX_FILE, IndexEntry, LOG_FILE, OKF_VERSION, is_index_file, is_index_path, is_reserved_file,
     is_reserved_path, render_index,
 };
+pub use line_endings::{NotUtf8, to_lf, utf8_to_lf};
 pub use manifest::{
     ArtifactType, DOMAIN_NAME_KEY, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, PolicyKey,
     PolicyKind, PolicyRole, ProblemKind, ProvisioningDecl, ProvisioningProblem,

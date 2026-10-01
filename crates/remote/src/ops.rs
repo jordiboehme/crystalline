@@ -454,7 +454,7 @@ pub async fn subscribe(
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
         if !wt_path.exists() {
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
             files_written += 1;
         }
         state::write_base_file(state_dir, rel, content)?;
@@ -696,7 +696,7 @@ pub async fn pull_with(
         // who edited after sharing (hashes differ) falls through to merge.
         if proposal_override_applies(&merged_to_consume, rel, local.as_deref()) {
             match &edit.content {
-                Some(bytes) => write_working_file(&wt_path, bytes)?,
+                Some(bytes) => write_pulled_file(&wt_path, bytes)?,
                 None => remove_working_file(&wt_path)?,
             }
             applied.push(rel.clone());
@@ -705,7 +705,7 @@ pub async fn pull_with(
 
         match merge_file(base.as_deref(), local.as_deref(), upstream) {
             FileMerge::Apply(bytes) => {
-                write_working_file(&wt_path, &bytes)?;
+                write_pulled_file(&wt_path, &bytes)?;
                 applied.push(rel.clone());
                 if is_three_way_merge(base.as_deref(), local.as_deref(), upstream) {
                     merged.push(rel.clone());
@@ -5232,14 +5232,14 @@ pub fn resolve(
             let local = detect_local_changes(domain_root, &state.files)?;
             let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
             match upstream {
-                Some(bytes) => write_working_file(&wt_path, &bytes)?,
+                Some(bytes) => write_pulled_file(&wt_path, &bytes)?,
                 None => remove_working_file(&wt_path)?,
             }
         }
         Resolution::Merged(content) => {
             let local = detect_local_changes(domain_root, &state.files)?;
             let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
         }
     }
 
@@ -5373,7 +5373,7 @@ async fn rebaseline(
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(rel))?;
         if !wt_path.exists() {
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
             applied.push(rel.clone());
         }
     }
@@ -5862,6 +5862,29 @@ fn write_working_file(path: &Path, content: &[u8]) -> Result<(), RemoteError> {
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Writes a file a pull, a subscribe or a resolution brings in from the
+/// origin. A markdown file that is UTF-8 text lands with LF line endings, the
+/// one line ending Crystalline writes, whatever the origin holds; every other
+/// file, and markdown that is not UTF-8, lands byte for byte. The base snapshot
+/// keeps the origin's own bytes, which is what tells the next pull what the
+/// origin changed.
+///
+/// The paths that put a recorded version back (a discard, a layer revert, a
+/// base materialisation) write through [`write_working_file`] instead: their
+/// whole point is to leave the file holding exactly the bytes its stamp
+/// records.
+fn write_pulled_file(path: &Path, content: &[u8]) -> Result<(), RemoteError> {
+    let is_markdown = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    match std::str::from_utf8(content) {
+        Ok(text) if is_markdown => {
+            write_working_file(path, crystalline_core::to_lf(text).as_bytes())
+        }
+        _ => write_working_file(path, content),
+    }
 }
 
 /// Removes a working-tree file; removing one already gone is not an error.

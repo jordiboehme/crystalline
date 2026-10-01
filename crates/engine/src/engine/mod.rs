@@ -1137,7 +1137,9 @@ pub struct GrantedDraft {
 /// `draft` and `draft_owner`, which are what keep a draft standing where the
 /// team's page stands from being mistaken for it.
 fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result<Value> {
-    let engram = parse_engram(&draft.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    // Handed back as LF, with the checksum of the row as it is held.
+    let content = crystalline_core::to_lf(&draft.content);
+    let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
     let relations: Vec<Value> = engram
         .relations
         .iter()
@@ -1168,7 +1170,7 @@ fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result
         "status": engram.frontmatter.status.clone().unwrap_or_default(),
         "path": draft.path,
         "url": format!("crystalline://{domain}/{}", draft.permalink),
-        "content": draft.content,
+        "content": content,
         "checksum": draft.checksum,
         "frontmatter": engram.frontmatter,
         "observations": engram.observations,
@@ -3430,6 +3432,9 @@ impl Engine {
     /// `content` column, and the permalink the row will answer to - the
     /// frontmatter's when it carries one, the path's slug when it does not.
     pub(crate) fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
+        // A draft row holds LF only, and its stamp describes what it holds.
+        let text = crystalline_core::to_lf(text);
+        let text = text.as_ref();
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
         record.content = text.to_string();
@@ -4786,6 +4791,17 @@ impl Engine {
         expected_sha: Option<&str>,
         store_full: bool,
     ) -> Result<EngramId> {
+        // The index holds LF only, whatever line endings the text came with: a
+        // file domain's CRLF file is indexed as LF (its stamp stays the one of
+        // the bytes on disk, which a read never rewrites), and a virtual row
+        // stores the LF text with a stamp that describes it.
+        let text = crystalline_core::to_lf(text);
+        let mut stamp = stamp;
+        if store_full && let std::borrow::Cow::Owned(lf) = &text {
+            stamp.size = lf.len() as u64;
+            stamp.sha256 = sha256_hex(lf.as_bytes());
+        }
+        let text = text.as_ref();
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, rel, stamp);
         if store_full {
@@ -4854,8 +4870,8 @@ impl Engine {
             size: meta.len(),
             sha256: sha256_hex(&bytes),
         };
-        let text = String::from_utf8(bytes)
-            .map_err(|_| EngineError::Invalid(format!("{} is not valid UTF-8", abs.display())))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| EngineError::Invalid(not_utf8_message(&abs)))?;
         // A file domain stores the body only; its source of truth is the file.
         self.index_markdown(store, domain_id, rel, &text, stamp, None, false)
             .await
@@ -6194,8 +6210,33 @@ fn normalize_md(dest: &str) -> String {
     }
 }
 
+/// The one line a write path answers with when the file it would rewrite is
+/// not UTF-8 text: nothing is written, and the person is told how to fix it.
+pub(crate) fn not_utf8_message(abs: &Path) -> String {
+    format!(
+        "{} is not valid UTF-8, so it cannot be read or written as text; save it as UTF-8 and try again",
+        abs.display()
+    )
+}
+
+/// An io error from reading a text file, with the not-UTF-8 case said in the
+/// words [`not_utf8_message`] uses rather than as a bare io error.
+pub(crate) fn text_read_error(abs: &Path, source: std::io::Error) -> EngineError {
+    if source.kind() == std::io::ErrorKind::InvalidData {
+        return EngineError::Invalid(not_utf8_message(abs));
+    }
+    EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    }
+}
+
+/// Write an engram, a MANIFEST or any other domain text file: always as UTF-8
+/// with LF line endings, the whole file, whatever the text it was given held.
+/// Attachments, whose bytes are never text to convert, go through
+/// [`write_bytes`] instead.
 fn write_file(abs: &Path, contents: &str) -> Result<()> {
-    write_bytes(abs, contents.as_bytes())
+    write_bytes(abs, crystalline_core::to_lf(contents).as_bytes())
 }
 
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {

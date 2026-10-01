@@ -6652,3 +6652,52 @@ async fn tool_descriptions_teach_kept_branches() {
         .to_string();
     assert!(text.contains("kept_branches"), "{text}");
 }
+
+/// Over MCP a CRLF file reads back as LF, and the checksum the read hands out
+/// guards an edit that then lands the whole file as LF. (`resources/read`
+/// serves skills and attachments, never an engram's text, and an attachment
+/// is bytes that are never converted.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crlf_engram_reads_as_lf_over_mcp_and_its_checksum_guards_an_edit() {
+    let h = Harness::new(&["eng"]).await;
+    let path = h.root.join("eng/windows.md");
+    std::fs::write(
+        &path,
+        "---\r\ntype: engram\r\ntitle: Windows\r\npermalink: windows\r\ntags:\r\n  - eng\r\nstatus: stable\r\nrecorded_at: 2026-01-01\r\n---\r\n\r\n# Windows\r\n\r\nWritten on a windows machine.\r\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let read = call(
+        peer,
+        "read_engram",
+        json!({"identifier": "windows", "domain": "eng"}),
+    )
+    .await
+    .unwrap();
+    let content = read["content"].as_str().unwrap();
+    assert!(!content.contains('\r'), "{content:?}");
+    assert!(
+        content.contains("Written on a windows machine.\n"),
+        "{content:?}"
+    );
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "windows",
+            "domain": "eng",
+            "operation": "append",
+            "content": "Edited over MCP.",
+            "expected_checksum": read["checksum"],
+        }),
+    )
+    .await
+    .unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains('\r'), "{on_disk:?}");
+    assert!(on_disk.contains("Edited over MCP."), "{on_disk:?}");
+}

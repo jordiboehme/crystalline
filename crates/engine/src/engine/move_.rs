@@ -234,6 +234,9 @@ impl Engine {
             }
             ContentSource::Virtual => self.load_content(&src_source, &src).await?,
         };
+        // A move writes the engram anew, so it lands as LF whatever line
+        // endings it was read with, a plain rename included.
+        let original = crystalline_core::to_lf(&original).into_owned();
         // The text the engram lands with, when the move has to change it: the
         // permalink line, and its own references to itself. `None` is the
         // plain rename, which carries the bytes across untouched.
@@ -747,6 +750,8 @@ impl Engine {
                 }
             }
         };
+        // Rewritten as LF, the whole file, like every write.
+        let text = crystalline_core::to_lf(&text).into_owned();
         let (relinked, count) =
             crystalline_core::relink::relink(&text, &linker.domain, &linker.domain, spec);
         if count == 0 {
@@ -942,6 +947,7 @@ impl Engine {
                     let Ok(text) = std::fs::read_to_string(&abs) else {
                         continue;
                     };
+                    let text = crystalline_core::to_lf(&text);
                     let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
                         continue;
                     };
@@ -958,6 +964,7 @@ impl Engine {
                         store.engram_content(desc.domain_id, &desc.path).await?
                     };
                     let Some(text) = current else { continue };
+                    let text = crystalline_core::to_lf(&text);
                     let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
                         continue;
                     };
@@ -1007,6 +1014,7 @@ impl Engine {
                             alias_skipped.push(name.clone());
                             continue;
                         };
+                        let text = crystalline_core::to_lf(&text);
                         match decide_alias_record(&text, &old_f, &new_f) {
                             AliasRecord::Recorded(edited) => {
                                 write_file(&abs, &edited)?;
@@ -1029,6 +1037,7 @@ impl Engine {
                             alias_skipped.push(name.clone());
                             continue;
                         };
+                        let text = crystalline_core::to_lf(&text);
                         match decide_alias_record(&text, &old_f, &new_f) {
                             AliasRecord::Recorded(edited) => {
                                 let stamp = virtual_stamp(&edited);

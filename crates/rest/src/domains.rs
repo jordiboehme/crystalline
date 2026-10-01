@@ -902,7 +902,14 @@ pub async fn save_manifest(
         .save_manifest(&domain, &body.markdown, &token)
         .await
     {
-        Ok(_) => manifest_response(&domain, body.markdown, StatusCode::OK, None),
+        // What landed is the LF form of what was sent, so that is what the
+        // answer carries and what its checksum is of.
+        Ok(_) => manifest_response(
+            &domain,
+            crystalline_core::to_lf(&body.markdown).into_owned(),
+            StatusCode::OK,
+            None,
+        ),
         // The same stale-edit translation `engrams::save` makes, repeated
         // rather than shared for the same reason.
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
@@ -911,7 +918,7 @@ pub async fn save_manifest(
             Ok(precondition_failed(
                 message,
                 &versioned_etag(&checksum),
-                current,
+                crystalline_core::to_lf(&current).into_owned(),
             ))
         }
         Err(e) => Err(e.into()),
@@ -1084,7 +1091,10 @@ fn manifest_response(
     status: StatusCode,
     extra: Option<(&str, Value)>,
 ) -> Result<Response, ApiError> {
+    // The checksum is of the MANIFEST as it is stored, the token a save
+    // compares; the markdown handed back is LF, whatever the file holds.
     let checksum = manifest_checksum(&markdown);
+    let markdown = crystalline_core::to_lf(&markdown).into_owned();
     let etag = HeaderValue::from_str(&format!("\"{}\"", versioned_etag(&checksum)))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
     let sections = ManifestSections::of(&markdown, domain);

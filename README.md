@@ -127,7 +127,7 @@ A chat memory is a hidden blob. One vendor owns it, it is tied to one model, and
 
 ## What sets it apart
 
-- **Plain markdown, an open format.** An engram is a markdown file with YAML frontmatter in [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf). Any tool reads it, nothing locks you in and the index is disposable: `crystalline reindex --full` rebuilds it from the files.
+- **Plain markdown, an open format.** An engram is a markdown file with YAML frontmatter in [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf). Any tool reads it, nothing locks you in and the index is disposable: `crystalline reindex --full` rebuilds it from the files. Files are written as UTF-8 with LF line endings; a file with CRLF line endings is read as it is and converted to LF on its next write.
 - **Scales past a folder of files.** Domains with MANIFEST routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering: the ten-thousandth engram is as findable as the tenth.
 - **Knowledge retires, it does not disappear.** A fact that stopped holding is superseded, not overwritten. The old engram stays addressable by date ("what applied last June"), retired knowledge fades in ranking instead of vanishing and `crystalline evolve` tells you what the archive needs next.
 - **Agents and people share one intelligence.** Agents work over MCP, people work in Fluid, and a team shares through GitHub pull requests, with review mode and private drafts for a domain that wants a gate.
