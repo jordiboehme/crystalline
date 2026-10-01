@@ -1431,13 +1431,16 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
 /// when every key ties.
 ///
 /// **That stability is load-bearing, not a convenience.** Two `V301` findings
-/// on one engram tie on every key here, and so do two `V302` findings - same
-/// anchor, so the same priority - and the engine's `evolve_ack` write path
-/// acknowledges "the first finding still standing" for a rule on an engram. A
-/// switch to `sort_unstable_by` would make which pair an acknowledgment lands
-/// on depend on the sort's internals, so keep the stable sort and let each
-/// detector's deterministic emission order (`find_twins`' for `V301`, highest
-/// score first for `V302`) settle the ties.
+/// on one engram tie on every key here, and two `V302` findings on one engram
+/// (same anchor, so the same priority) tie when their probabilities are equal;
+/// otherwise they order by probability, which is the detector's own emission
+/// order. The engine's `evolve_ack` write path acknowledges "the first finding
+/// still standing" for a rule on an engram, so it lands on the strongest open
+/// line pair. A switch to `sort_unstable_by` would make which pair an
+/// acknowledgment lands on depend on the sort's internals for the exact ties,
+/// so keep the stable sort and let each detector's deterministic emission
+/// order (`find_twins`' for `V301`, highest score first for `V302`) settle
+/// them.
 pub fn rank(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.priority
