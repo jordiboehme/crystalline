@@ -1365,19 +1365,23 @@ impl Engine {
         if pending.is_empty() {
             return Ok((facts, Vec::new()));
         }
-        let wanted: Vec<String> = {
+        // The hashes are taken off the runtime too, once per engram however
+        // many pairs it is in.
+        let (facts, pending, wanted) = tokio::task::spawn_blocking(move || {
+            let engrams: BTreeSet<usize> = pending.iter().flat_map(|p| [p.a, p.b]).collect();
             let mut set: HashSet<String> = HashSet::new();
-            for p in &pending {
-                for f in [&facts[p.a], &facts[p.b]] {
-                    for o in &f.observations {
-                        if !fold(&o.text).is_empty() {
-                            set.insert(observation_hash(&o.text));
-                        }
+            for i in engrams {
+                for o in &facts[i].observations {
+                    if !fold(&o.text).is_empty() {
+                        set.insert(observation_hash(&o.text));
                     }
                 }
             }
-            set.into_iter().collect()
-        };
+            let wanted: Vec<String> = set.into_iter().collect();
+            (facts, pending, wanted)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("contradiction line hashing failed: {e}")))?;
         // Only the vectors of the model the floor belongs to.
         let mut vectors: HashMap<String, Vec<f32>> = HashMap::with_capacity(wanted.len());
         for run in wanted.chunks(OBSERVATION_VECTOR_CHUNK) {

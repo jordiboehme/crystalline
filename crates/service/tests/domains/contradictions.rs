@@ -8,10 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crystalline_core::config::{
     DomainEntry, EmbeddingsConfig, EvolveConfig, GlobalConfig, ResponseFormat, ServiceConfig,
 };
-use crystalline_index::embed::DEFAULT_MODEL_ID;
+use crystalline_index::embed::{DEFAULT_MODEL_ID, line_similarity_floor};
 use crystalline_index::nli::{
-    ContradictionScorer, NliModel, NliProfile, RETIRED_NLI_REPOS, StubScorer, nli_model,
+    ContradictionScorer, LineRules, NliModel, NliProfile, RETIRED_NLI_REPOS, StubScorer, nli_model,
+    observation_hash, scoring_checksum,
 };
+use crystalline_index::sweep::{FactObservation, MAX_LINE_PAIRS_PER_ENGRAM_PAIR};
 use crystalline_index::{
     ContradictionRow, EmbeddingProvider, IndexError, ObservationVector, TursoStore,
 };
@@ -579,32 +581,33 @@ async fn a_pass_is_bounded_and_the_next_one_finishes() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
     set(&engine, "evolve.contradictions", "full").await;
-    // Thirty-three engrams on one axis with two lines each: every line is on
-    // the retry axis with its own text, so each of the 528 pairs keeps all
-    // four of its line pairs (the per-pair limit), 2112 in all, over the 2000
-    // a pass may score.
-    for i in 0..33 {
-        let bullets: String = (0..2)
-            .map(|j| format!("\n- [fact] Retry fact {i} {j}"))
-            .collect();
+    // Thirty-eight engrams on the retry axis, each with one line all of them
+    // share and one of its own. The shared line is the same text on both
+    // sides and never a pair, so each of the 703 pairs keeps three line
+    // pairs, 2109 in all, over the 2000 a pass may score. Three does not
+    // divide 2000, whatever order the pairs come in.
+    for i in 0..38 {
         engine
             .write_engram(&write(
                 &format!("Retry note {i}"),
-                &format!("The retry queue note {i}.\n{bullets}"),
+                &format!(
+                    "The retry queue note {i}.\n\n- [fact] Retries back off on the queue\n- [fact] Retry fact {i}"
+                ),
             ))
             .await
             .unwrap();
     }
     engine.embed_pending().await.unwrap();
-    // 500 whole pairs fill the 2000 exactly; 28 are left.
+    // 666 whole pairs take 1998; the next one holds three line pairs, more
+    // than the two left, so it is turned away whole, not split. 37 are left.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(500, 2000, 28)
+        scored(666, 1998, 37)
     );
     assert!(engine.contradictions_wanted(), "pairs remain");
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(28, 112, 0)
+        scored(37, 111, 0)
     );
 }
 
@@ -1363,7 +1366,7 @@ async fn a_failed_store_write_skips_the_pair_and_the_walk_goes_on() {
         ]
         .iter()
         .map(|t| ObservationVector {
-            hash: crystalline_index::nli::observation_hash(t),
+            hash: observation_hash(t),
             vector: crate::support::TopicEmbedder::embed_one(t),
         })
         .collect();
@@ -3076,8 +3079,7 @@ async fn rows_from_older_rules_are_rescored() {
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
     engine.score_contradictions().await.unwrap();
-    // Stamp the pair as a build before this change would have: the plain
-    // observation digest, a row with no similarity.
+    // Stamp the pair as scored under other line rules, with no rows.
     {
         let store = engine.store();
         let store = store.lock().await;
@@ -3086,8 +3088,33 @@ async fn rows_from_older_rules_are_rescored() {
             .contradiction_pairs_scored(domain, full().repo)
             .await
             .unwrap();
+        // The only pair is Eighteen (lower id, written first) against Twenty.
+        // Its stored checksum is Eighteen's lines under today's rules; store
+        // it again as a build with another floor would have.
+        let lines = [
+            FactObservation {
+                line: 0,
+                text: "The build uses Node 18".to_string(),
+            },
+            FactObservation {
+                line: 0,
+                text: "Retries back off on the queue".to_string(),
+            },
+        ];
+        let rules = LineRules {
+            embedding_model: DEFAULT_MODEL_ID,
+            floor: line_similarity_floor(DEFAULT_MODEL_ID).unwrap(),
+            max_line_pairs: MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
+        };
+        assert_eq!(scored[0].checksum_a, scoring_checksum(&lines, &rules));
         let mut old = scored[0].clone();
-        old.checksum_a = "plain-digest".to_string();
+        old.checksum_a = scoring_checksum(
+            &lines,
+            &LineRules {
+                floor: rules.floor + 0.02,
+                ..rules
+            },
+        );
         store
             .replace_contradictions(domain, &old, 0.9, full().repo, "t", &[])
             .await
@@ -3158,4 +3185,71 @@ async fn pairs_stored_empty_do_not_keep_the_model_from_idling_out() {
         "a walk that read nothing does not keep the model"
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1);
+}
+
+/// Both reading orders land on the right line pair of the right engram pair
+/// when two pairs share a group: four distinct directional scores, so a
+/// swapped order or a second-order score put on the other pair fails.
+#[tokio::test]
+async fn both_reading_orders_land_on_their_own_pair_in_a_shared_group() {
+    let (n18, n19, n20) = (
+        "The build uses Node 18",
+        "The build breaks on Node 19",
+        "The build uses Node 20",
+    );
+    let s = Arc::new(
+        StubScorer::new(full().repo, 0.05)
+            .with_directional(n18, n20, 0.91)
+            .with_directional(n20, n18, 0.81)
+            .with_directional(n18, n19, 0.71)
+            .with_directional(n19, n18, 0.61),
+    );
+    let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    // Written in this order, so Eighteen has the lowest id and is the `a`
+    // side (first-order premise) of both pairs it is in.
+    for (title, content) in [
+        ("Eighteen", NODE_18),
+        ("Twenty", NODE_20),
+        ("Nineteen", NODE_19),
+    ] {
+        engine.write_engram(&write(title, content)).await.unwrap();
+    }
+    engine.embed_pending().await.unwrap();
+    // Three pairs of one kept line pair each (the Node lines), one group.
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(3, 3, 0)
+    );
+    // Three first orders, then the two at or above 0.5 read back.
+    assert_eq!(s.forwards(), 5);
+    let mut got: Vec<(String, String, f32, f32, usize)> = rows(&engine, full().repo)
+        .await
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.line_a, r.line_b, "both Node lines are the first bullet");
+            (r.hash_a, r.hash_b, r.score_ab, r.score_ba, r.line_a)
+        })
+        .collect();
+    got.sort_by(|x, y| y.2.total_cmp(&x.2));
+    let line = got[0].4;
+    assert_eq!(
+        got,
+        vec![
+            (
+                observation_hash(n18),
+                observation_hash(n20),
+                0.91,
+                0.81,
+                line
+            ),
+            (
+                observation_hash(n18),
+                observation_hash(n19),
+                0.71,
+                0.61,
+                line
+            ),
+        ]
+    );
 }
