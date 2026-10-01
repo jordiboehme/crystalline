@@ -314,3 +314,47 @@ async fn an_edit_of_a_file_that_is_not_utf8_is_refused_in_one_line() {
     assert!(!err.contains('\n'), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing was written");
 }
+
+/// The read path refuses a file that is no longer UTF-8 rather than falling
+/// back to the index row, which for a file domain holds the body only: an
+/// answer without the frontmatter would be wrong, and a draft edit built on
+/// it (the review-mode arm reads through the same loader) would write a
+/// document with the frontmatter gone.
+#[tokio::test]
+async fn a_read_of_a_file_that_is_not_utf8_is_refused_not_answered_from_the_row() {
+    let (tmp, engine) = fixture().await;
+    let path = tmp.path().join("eng/windows.md");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"\xff\xfe broken\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let err = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "windows".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not valid UTF-8"), "{err}");
+    assert!(!err.contains('\n'), "{err}");
+}
+
+/// An export (and the archive download, which reads through the same
+/// function) hands a CRLF engram over as LF.
+#[tokio::test]
+async fn an_export_hands_a_crlf_engram_over_as_lf() {
+    let (tmp, engine) = fixture().await;
+    let dest = tmp.path().join("exported");
+    engine
+        .export_domain("eng", &dest, false, false)
+        .await
+        .unwrap();
+    for rel in ["windows.md", "mixed.md"] {
+        let text = std::fs::read_to_string(dest.join(rel)).unwrap();
+        assert!(!text.contains('\r'), "{rel}: {text:?}");
+    }
+}

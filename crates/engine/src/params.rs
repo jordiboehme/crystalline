@@ -225,7 +225,8 @@ pub struct SaveParams {
     /// A file path is not an identifier: a miss names the permalink it
     /// probably meant.
     pub identifier: String,
-    /// The complete markdown text, frontmatter included, written verbatim.
+    /// The complete markdown text, frontmatter included, written as sent
+    /// apart from its line endings, which are stored as LF.
     pub content: String,
     /// The checksum from the read this save is based on. The save is refused
     /// as a conflict when the stored version no longer matches, on file and

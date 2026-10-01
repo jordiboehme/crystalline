@@ -2000,7 +2000,8 @@ impl CollabSession {
         let file = Self::file_text_locked(state);
         // Normalized and converged first, exactly as `save_attempt` does and
         // for the same reason: `restore_engram` itself is deliberately exempt
-        // (it restores prior bytes exactly, see its own doc comment), so this
+        // (it restores the prior text as it is apart from its line endings,
+        // see its own doc comment), so this
         // is the one place that has to make sure what gets restored, what the
         // document shows and what `last_saved_text` is set to below all agree
         // on the canonical spelling, rather than restoring - and then living

@@ -4907,8 +4907,16 @@ impl Engine {
     ) -> Result<String> {
         if let ContentSource::File { root } = source {
             let abs = join_rel(root, &desc.path);
-            if let Ok(text) = std::fs::read_to_string(&abs) {
-                return Ok(text);
+            match std::fs::read_to_string(&abs) {
+                Ok(text) => return Ok(text),
+                // A file that is there but not UTF-8 is refused, never
+                // answered from the row: a file domain's row holds the body
+                // only, so the answer would lose the frontmatter, and an edit
+                // built on it would write the document without it.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(text_read_error(&abs, e));
+                }
+                Err(_) => {}
             }
         }
         let store = self.store.lock().await;

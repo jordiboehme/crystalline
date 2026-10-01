@@ -1278,10 +1278,11 @@ impl Engine {
     /// reason - there is no stored version to compare against.
     ///
     /// Deliberately exempt from domain-spelling normalization: this restores
-    /// the exact prior bytes a room held after an external deletion, a
-    /// recovery of what was already there rather than a new authoring act,
-    /// and `content` is what the caller already normalized (or chose not to)
-    /// on its way in.
+    /// the prior text a room held after an external deletion, a recovery of
+    /// what was already there rather than a new authoring act, and `content`
+    /// is what the caller already normalized (or chose not to) on its way in.
+    /// Its line endings are the one thing changed: it lands as LF, like every
+    /// write.
     ///
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].
