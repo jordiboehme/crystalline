@@ -147,6 +147,14 @@ mod loader {
         /// A GPU could not be opened: CPU, with the reason.
         Unusable(String),
         /// Try this device first.
+        ///
+        /// Only Apple Silicon builds construct it outside the tests; elsewhere
+        /// it is matched but never built, so the lint is allowed there (not
+        /// expected: the test build constructs it on every platform).
+        #[cfg_attr(
+            not(all(target_os = "macos", target_arch = "aarch64")),
+            allow(dead_code)
+        )]
         Device(Device, DeviceKind),
     }
 
