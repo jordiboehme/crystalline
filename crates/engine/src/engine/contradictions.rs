@@ -21,9 +21,10 @@ use crystalline_index::embed::line_similarity_floor;
 use crystalline_index::nli::{
     CandidateFacts, CandidatePair, ContradictionScorer, KeptLine, LineRules,
     MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE, NLI_GROUP_LINE_PAIRS, NliModel, NliProfile,
-    contradiction_candidates, eligible, eligible_lines, first_order_inputs, fold, length_order,
-    line_rows, max_related_pairs, nli_model, observation_hash, pending_pairs, related_threshold,
-    scoring_checksum, second_order_input, second_order_needed, similar_line_pairs,
+    contradiction_candidates, eligible, eligible_lines, expired, first_order_inputs, fold,
+    length_order, line_rows, max_related_pairs, nli_model, observation_hash, pending_pairs,
+    related_threshold, scoring_checksum, second_order_input, second_order_needed,
+    similar_line_pairs,
 };
 use crystalline_index::sweep::{MAX_LINE_PAIRS_PER_ENGRAM_PAIR, ORDER_AGGREGATION};
 use crystalline_index::{
@@ -421,15 +422,17 @@ impl Engine {
     }
 
     /// The date the contradiction check reads validity windows against: the
-    /// local date of this machine. An engram whose `valid_to` is before it
-    /// takes no part in `V302`, and the walk digest carries it, so every
-    /// domain is walked again once a day.
+    /// UTC date, the one every other temporal rule and the sweep's default
+    /// `today` use, so the walk and the sweep never disagree about an engram
+    /// near midnight. An engram whose `valid_to` is before it takes no part
+    /// in `V302`, and the walk digest carries it, so every domain is walked
+    /// again once a day. The sweep's pending-count digest reads it here too.
     pub(crate) fn contradiction_today(&self) -> NaiveDate {
         #[cfg(any(test, feature = "testing"))]
         if let Some(today) = *self.contradiction_today_override.lock().unwrap() {
             return today;
         }
-        chrono::Local::now().date_naive()
+        Utc::now().date_naive()
     }
 
     /// Move the contradiction check's date to `today`, so a test can step a
@@ -1405,7 +1408,7 @@ impl Engine {
     ) {
         let expired: HashSet<i64> = facts
             .iter()
-            .filter(|f| f.valid_to.is_some_and(|to| to < today))
+            .filter(|f| expired(f.valid_to, today))
             .map(|f| f.id.0)
             .collect();
         if expired.is_empty() {
@@ -1853,8 +1856,8 @@ async fn score_group(
 }
 
 /// What a domain looked like to a walk: the NLI model, the related line, the
-/// line rules (whose key carries the embedding model), the date validity is
-/// read against (an engram can expire overnight with no file changed), the
+/// line rules (whose key carries the embedding model), the UTC date validity
+/// is read against (an engram can expire overnight with no file changed), the
 /// domain's id and every path with its checksum. Built
 /// from the stamps alone, never from the vectors, so checking it costs one
 /// narrow read. The id is there for a domain removed and added back under

@@ -3389,3 +3389,40 @@ async fn an_engram_that_expires_between_walks_leaves_the_queue_without_an_edit()
         "counted for the new day: {after}"
     );
 }
+
+/// The walk reads the same date the sweep does by default (UTC): with no
+/// date set, an engram whose window ends on the UTC date is scored by the
+/// walk, shown by a sweep that names no date, and the domain reads as
+/// counted, so the walk's digest and the sweep's agree.
+#[tokio::test]
+async fn the_walk_and_a_default_sweep_read_the_same_utc_date() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    let today = chrono::Utc::now().date_naive().to_string();
+    valid_to(&engine, "eighteen", &today).await;
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    let value = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["notes".to_string()],
+                families: vec!["meaning".to_string()],
+                limit: Some(50),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v302(&value).len(), 1, "{value}");
+    assert!(
+        v302_truncations(&value).is_empty(),
+        "counted under the same date: {value}"
+    );
+    assert!(!engine.contradictions_wanted());
+}

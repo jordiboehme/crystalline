@@ -73,7 +73,14 @@ pub struct Candidates {
 pub fn eligible(status: &str, valid_to: Option<NaiveDate>, today: NaiveDate) -> bool {
     is_current_status(status)
         && !SPECULATIVE_STATUSES.contains(&status)
-        && valid_to.is_none_or(|to| to >= today)
+        && !expired(valid_to, today)
+}
+
+/// Whether a validity window closed before `today`: strictly before, so a
+/// window that ends today is still open, and an absent `valid_to` never
+/// closes.
+pub fn expired(valid_to: Option<NaiveDate>, today: NaiveDate) -> bool {
+    valid_to.is_some_and(|to| to < today)
 }
 
 /// Whether `[from_a, to_a]` and `[from_b, to_b]` overlap; an absent bound is
@@ -622,6 +629,9 @@ mod tests {
         assert!(!eligible("stable", Some(day("2026-09-30")), today));
         assert!(!eligible("draft", None, today));
         assert!(!eligible("superseded", None, today));
+        assert!(expired(Some(day("2026-09-30")), today));
+        assert!(!expired(Some(today), today));
+        assert!(!expired(None, today));
     }
 
     #[test]
