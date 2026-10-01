@@ -3104,3 +3104,58 @@ async fn rows_from_older_rules_are_rescored() {
     assert!(s.forwards() > before, "the pair was read again");
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
 }
+
+/// A walk that only stores pairs with no line pair to read never reads the
+/// model, so it must not keep a loaded model in memory past its idle time.
+#[tokio::test(start_paused = true)]
+async fn pairs_stored_empty_do_not_keep_the_model_from_idling_out() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) =
+        engine_with_domains(Arc::new(crate::support::TopicEmbedder), &["notes", "other"]).await;
+    let engine = with_loader(engine, loader(s.clone(), loads.clone()));
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    // One kept line pair, Node 18 against Node 20: the model is read.
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    assert!(engine.contradiction_scorer_loaded());
+    let read = s.forwards();
+
+    tokio::time::advance(NLI_IDLE_DROP / 2 + std::time::Duration::from_secs(60)).await;
+    // In another domain, so no line meets a line of the first three: a
+    // related pair with no line on a shared axis, stored empty.
+    let body = "The retry queue backoff, retries and dead-letter queue ttl.";
+    for (title, bullets) in [
+        ("Queue", "\n\n- [fact] Retries back off on the queue"),
+        (
+            "Elsewhere",
+            "\n\n- [fact] Docking clamps seat in bay three\n- [fact] The login session cookie lasts a day",
+        ),
+    ] {
+        engine
+            .write_engram(&WriteParams {
+                domain: "other".to_string(),
+                ..write(title, &format!("{body}{bullets}"))
+            })
+            .await
+            .unwrap();
+    }
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 0, 0)
+    );
+    assert_eq!(s.forwards(), read, "the empty pair never reached the model");
+
+    // Ten minutes and a minute since the model was last read, five and a
+    // bit since the walk that stored the empty pair.
+    tokio::time::advance(NLI_IDLE_DROP / 2).await;
+    engine.drop_idle_scorer();
+    assert!(
+        !engine.contradiction_scorer_loaded(),
+        "a walk that read nothing does not keep the model"
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+}

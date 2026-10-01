@@ -932,10 +932,14 @@ impl Engine {
         if self.contradiction_model().is_none() {
             *self.scorer.lock().unwrap() = None;
         }
+        // Only a walk that read the model keeps it: pairs stored empty never
+        // touch it, so they must not hold it in memory past its idle time.
+        if batches > 0
+            && let Some(held) = self.scorer.lock().unwrap().as_mut()
+        {
+            held.last_used = tokio::time::Instant::now();
+        }
         if pairs_done > 0 {
-            if let Some(held) = self.scorer.lock().unwrap().as_mut() {
-                held.last_used = tokio::time::Instant::now();
-            }
             tracing::info!(
                 model = model.id,
                 pairs = pairs_done,
@@ -1572,8 +1576,9 @@ impl Engine {
     /// The scorer for `model`, loaded on first use. Another profile's model is
     /// dropped before the new one loads, so two never sit in memory together.
     /// Handing out a loaded scorer does not count as use: only a walk that
-    /// scored a pair does, so walks that retry a failing pair and score
-    /// nothing let the model idle out.
+    /// read the model does (one batch or more), so walks that retry a failing
+    /// pair, or store pairs with no line pair to read, let the model idle
+    /// out.
     async fn scorer_for(
         &self,
         model: &'static NliModel,
