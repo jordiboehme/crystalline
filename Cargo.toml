@@ -243,6 +243,15 @@ tiktoken-rs = "0.12.0"
 [profile.dev]
 debug = "line-tables-only"
 
+# Password hashing dominates the account-creating test binaries, and argon2 at
+# opt-level 0 costs about 14x what it does optimised. The test profile inherits
+# dev, so cargo nextest picks this up too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
