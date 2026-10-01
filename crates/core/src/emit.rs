@@ -534,6 +534,9 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
 /// a canonical key first and a legacy spelling second and have the legacy line
 /// rewritten in place, while a value that was written as a block mapping or a
 /// block sequence is replaced whole rather than beheaded.
+///
+/// The new block is written with the frontmatter's own line ending, so a CRLF
+/// file stays CRLF throughout.
 fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
     if !has_fm {
@@ -541,6 +544,9 @@ fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) ->
     }
 
     let raw = &source[fm_span.clone()];
+    let ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut replacement = new_block.replace('\n', ending);
+    replacement.push_str(ending);
     // Which key actually appears decides which value is rewritten, so a file
     // carrying both the canonical and the legacy spelling has the canonical one
     // updated whatever order they sit in.
@@ -548,33 +554,17 @@ fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) ->
         raw.split_inclusive('\n')
             .any(|l| line_sets_key(l.strip_suffix('\n').unwrap_or(l), k))
     });
-    let mut new_raw = String::with_capacity(raw.len() + new_block.len());
-    // 0: the key has not been seen; 1: it was just replaced and continuation
-    // lines are being dropped; 2: the old value is fully behind us.
-    let mut phase = 0u8;
-    for line in raw.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        match phase {
-            0 if target.is_some_and(|k| line_sets_key(content, k)) => {
-                new_raw.push_str(&new_block);
-                new_raw.push('\n');
-                phase = 1;
+    let new_raw = match target.and_then(|k| replace_value(raw, k, &replacement)) {
+        Some(new_raw) => new_raw,
+        None => {
+            let mut new_raw = raw.to_string();
+            if !new_raw.is_empty() && !new_raw.ends_with('\n') {
+                new_raw.push_str(ending);
             }
-            1 if is_value_continuation(content) => {}
-            1 => {
-                phase = 2;
-                new_raw.push_str(line);
-            }
-            _ => new_raw.push_str(line),
+            new_raw.push_str(&replacement);
+            new_raw
         }
-    }
-    if phase == 0 {
-        if !new_raw.is_empty() && !new_raw.ends_with('\n') {
-            new_raw.push('\n');
-        }
-        new_raw.push_str(&new_block);
-        new_raw.push('\n');
-    }
+    };
     format!(
         "{}{}{}",
         &source[..fm_span.start],
@@ -592,38 +582,62 @@ fn remove_frontmatter_block(source: &str, key: &str) -> String {
     if !has_fm {
         return source.to_string();
     }
+    match replace_value(&source[fm_span.clone()], key, "") {
+        Some(new_raw) => format!(
+            "{}{}{}",
+            &source[..fm_span.start],
+            new_raw,
+            &source[fm_span.end..]
+        ),
+        None => source.to_string(),
+    }
+}
 
-    let raw = &source[fm_span.clone()];
-    let mut new_raw = String::with_capacity(raw.len());
-    // 0: the key has not been seen; 1: it was dropped and continuation lines
-    // are going with it; 2: the old value is fully behind us.
+/// The frontmatter text `raw` with the first value of `key` - its key line and
+/// every continuation line under it - replaced by `replacement`, or `None`
+/// when no line sets `key`.
+///
+/// A blank line or a column-0 `#` comment does not end the value by itself,
+/// since a hand-written list may hold one between its items: such lines are
+/// held back, dropped when a continuation line follows them, and kept after
+/// the replacement when the value ends instead.
+fn replace_value(raw: &str, key: &str, replacement: &str) -> Option<String> {
+    let mut new_raw = String::with_capacity(raw.len() + replacement.len());
+    let mut held = String::new();
+    // 0: the key has not been seen; 1: it was replaced and its continuation
+    // lines are being dropped; 2: the old value is fully behind us.
     let mut phase = 0u8;
     for line in raw.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = line.trim_end_matches(['\n', '\r']);
         match phase {
-            0 if line_sets_key(content, key) => phase = 1,
-            1 if is_value_continuation(content) => {}
+            0 if line_sets_key(content, key) => {
+                new_raw.push_str(replacement);
+                phase = 1;
+            }
+            1 if is_value_continuation(content) => held.clear(),
+            1 if content.trim().is_empty() || content.starts_with('#') => held.push_str(line),
             1 => {
                 phase = 2;
+                new_raw.push_str(&std::mem::take(&mut held));
                 new_raw.push_str(line);
             }
             _ => new_raw.push_str(line),
         }
     }
     if phase == 0 {
-        return source.to_string();
+        return None;
     }
-    format!(
-        "{}{}{}",
-        &source[..fm_span.start],
-        new_raw,
-        &source[fm_span.end..]
-    )
+    // A value running to the end of the frontmatter leaves what was held
+    // after it.
+    new_raw.push_str(&held);
+    Some(new_raw)
 }
 
 /// True when a frontmatter line continues the value of the key above it rather
-/// than starting a new one: an indented line or a block sequence item.
+/// than starting a new one: an indented line or a block sequence item. The
+/// carriage return of a CRLF line is not part of what is read.
 fn is_value_continuation(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
     line.starts_with(' ')
         || line.starts_with('\t')
         || line == "-"
@@ -1144,6 +1158,12 @@ mod tests {
             "tags: [x,\n  y]\n",
             "tags: x, y\n",
             "tags:\n",
+            // A blank line or a column-0 comment between items is still
+            // inside the list, so it goes with the items around it.
+            "tags:\n  - x\n\n  - y\n",
+            "tags:\n  - x\n   \n  - y\n",
+            "tags:\n- x\n# old one\n- y\n",
+            "tags:\n  - x\n\n# note\n\n  - y\n",
         ] {
             let source = format!("---\ntype: engram\n{old}status: stable\n---\n\nbody\n");
             let items = ["a".to_string(), "b".to_string()];
@@ -1153,6 +1173,52 @@ mod tests {
                 "{old:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_blank_line_or_comment_after_the_list_stays_with_what_follows() {
+        let source =
+            "---\ntype: engram\ntags:\n  - x\n\n# lifecycle\nstatus: stable\n---\n\nbody\n";
+        assert_eq!(
+            set_frontmatter_list(source, "tags", &["a".to_string()]),
+            "---\ntype: engram\ntags:\n  - a\n\n# lifecycle\nstatus: stable\n---\n\nbody\n"
+        );
+        // At the end of the frontmatter too.
+        let source = "---\ntype: engram\ntags:\n  - x\n# end\n---\n\nbody\n";
+        assert_eq!(
+            set_frontmatter_list(source, "tags", &["a".to_string()]),
+            "---\ntype: engram\ntags:\n  - a\n# end\n---\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_list_is_replaced_whole_and_written_with_crlf() {
+        let source = "---\r\ntype: engram\r\ntags:\r\n  - x\r\n-\r\n- y\r\nstatus: stable\r\n---\r\n\r\nbody\r\n";
+        let out = set_frontmatter_list(source, "tags", &["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            out,
+            "---\r\ntype: engram\r\ntags:\r\n  - a\r\n  - b\r\nstatus: stable\r\n---\r\n\r\nbody\r\n"
+        );
+        let parsed = crate::parse_engram(&out).unwrap();
+        assert_eq!(
+            parsed.frontmatter.tags,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn removing_a_list_takes_items_across_blank_lines_and_comments() {
+        let source =
+            "---\ntype: engram\ntags:\n  - x\n\n# old\n  - y\nstatus: stable\n---\n\nbody\n";
+        assert_eq!(
+            set_frontmatter_list(source, "tags", &[]),
+            "---\ntype: engram\nstatus: stable\n---\n\nbody\n"
+        );
+        let crlf = "---\r\ntags:\r\n- x\r\n-\r\nstatus: stable\r\n---\r\n";
+        assert_eq!(
+            set_frontmatter_list(crlf, "tags", &[]),
+            "---\r\nstatus: stable\r\n---\r\n"
+        );
     }
 
     #[test]

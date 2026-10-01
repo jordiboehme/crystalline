@@ -146,8 +146,9 @@ pub struct EditParams {
     pub key: Option<String>,
     /// The whole new list, for set_frontmatter on tags (add a tag, remove a
     /// tag, set tags): read the engram, then pass every tag it should carry.
-    /// Each is folded to lowercase-with-hyphens and deduplicated; an empty
-    /// list removes the key.
+    /// Each is folded to lowercase-with-hyphens and deduplicated, and a tag
+    /// that cannot be folded is refused by name; an empty list removes the
+    /// key.
     #[serde(default)]
     pub values: Option<Vec<String>>,
     /// The value to assign, for set_frontmatter. Omit it (or pass null) to

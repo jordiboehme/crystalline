@@ -36,25 +36,39 @@ pub fn is_lower_hyphen(s: &str) -> bool {
 }
 
 /// Fold a tag as an agent spelled it into the canonical lowercase-with-hyphens
-/// form: lowercased, every run of whitespace and underscores turned into one
-/// hyphen, and hyphens trimmed from both ends. A hyphen the caller wrote is
-/// kept as written, so a tag already in canonical form comes back unchanged.
-/// `None` when the result is not a tag [`is_lower_hyphen`] accepts (empty, or
-/// holding a character other than an ASCII letter, a digit or a hyphen), so
-/// the caller refuses it rather than writing a tag verify's E007 would flag.
+/// form: lowercased, every run of separators (whitespace, underscores and
+/// hyphens) that holds at least one whitespace or underscore turned into one
+/// hyphen, and hyphens trimmed from both ends. A run of hyphens alone is kept
+/// as written, so a tag already in canonical form (`a--b` included) comes
+/// back unchanged. `None` when the result is not a tag [`is_lower_hyphen`]
+/// accepts (empty, or holding a character other than an ASCII letter, a digit
+/// or a hyphen), so the caller refuses it rather than writing a tag verify's
+/// E007 would flag.
 pub fn fold_tag(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
-    let mut pending_hyphen = false;
-    for c in raw.chars().flat_map(char::to_lowercase) {
-        if c.is_whitespace() || c == '_' {
-            pending_hyphen = true;
-            continue;
-        }
-        if pending_hyphen && !out.is_empty() {
+    // The separator run being read: its length in hyphens, and whether it
+    // held anything other than hyphens.
+    let mut hyphens = 0usize;
+    let mut folds = false;
+    let flush = |out: &mut String, hyphens: &mut usize, folds: &mut bool| {
+        if *folds {
             out.push('-');
+        } else {
+            out.extend(std::iter::repeat_n('-', *hyphens));
         }
-        pending_hyphen = false;
-        out.push(c);
+        *hyphens = 0;
+        *folds = false;
+    };
+    for c in raw.chars().flat_map(char::to_lowercase) {
+        match c {
+            '-' => hyphens += 1,
+            '_' => folds = true,
+            c if c.is_whitespace() => folds = true,
+            c => {
+                flush(&mut out, &mut hyphens, &mut folds);
+                out.push(c);
+            }
+        }
     }
     let out = out.trim_matches('-');
     is_lower_hyphen(out).then(|| out.to_string())
@@ -593,6 +607,11 @@ mod tests {
         assert_eq!(fold_tag("  API_v2  ").as_deref(), Some("api-v2"));
         assert_eq!(fold_tag("a \t_ b").as_deref(), Some("a-b"));
         assert_eq!(fold_tag("-edge-").as_deref(), Some("edge"));
+        // A run mixing hyphens with whitespace or underscores is one hyphen.
+        assert_eq!(fold_tag("a - b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a_-_b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a -b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a- b").as_deref(), Some("a-b"));
     }
 
     #[test]

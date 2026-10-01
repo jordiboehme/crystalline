@@ -3017,6 +3017,22 @@ fn edit_set_frontmatter_sets_tags_from_a_comma_list() {
         "{text}"
     );
 
+    // --values with nothing after it is the empty list: every tag goes.
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "tags",
+        "--values",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter empty tags: {out}");
+    let text = std::fs::read_to_string(env.dir.join("kb-eng/seed.md")).unwrap();
+    assert!(!text.contains("tags:"), "{text}");
+    assert!(!text.contains("retry-policy"), "{text}");
+
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
