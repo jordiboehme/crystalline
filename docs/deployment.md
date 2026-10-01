@@ -216,6 +216,8 @@ The GPU takes the embedding work off the CPU, which matters for a daemon that sh
 
 `crystalline status` shows the device the loaded model runs on, for example `device: metal`, `device: cpu (fallback: <reason>)` or `device: cpu (off by CRYSTALLINE_ACCELERATION)`. `crystalline doctor` shows the device a model load would pick on this machine; it does not load the model, so a failure that shows only when the model runs is reported by `status`.
 
+The fallback covers the load only. If the GPU fails later, after the model has loaded, embedding and every hybrid or semantic search answer with an error until the daemon restarts. The way out is to set `CRYSTALLINE_ACCELERATION=off` and restart the daemon, which puts the model back on the CPU.
+
 ```mermaid
 flowchart LR
     S[Daemon start] --> Q{Apple Silicon and not off?}
