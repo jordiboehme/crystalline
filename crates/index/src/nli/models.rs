@@ -146,10 +146,15 @@ pub const NLI_MODELS: [NliModel; 1] = [NliModel {
     languages: "multilingual",
     files: NLI_FILES,
     download_mb: 558,
-    // Measured on the probes corpus (research/2026-09-30-contradiction-measurement.md);
-    // to be confirmed on real knowledge. With the Min aggregation, 0.70 gave
-    // precision 1.00 and recall 0.915 on 400 planted pairs.
-    threshold: 0.70,
+    // Measured on the probes corpus and on real domains
+    // (research/2026-10-01-v302-line-filter-measurement.md): with the Min
+    // aggregation, 0.90 keeps 158 of 200 planted flips and no planted
+    // negative, cuts the real domains from 99 engram pairs to 35, and every
+    // real contradiction seen scored 0.977 or more, while the small domains'
+    // noise sat at 0.80 to 0.85. Rows are still stored from
+    // `CONTRADICTION_STORE_FLOOR`, so the line can move again without a
+    // rescore.
+    threshold: 0.90,
 }];
 
 /// The model a profile runs.

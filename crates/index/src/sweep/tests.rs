@@ -3478,6 +3478,24 @@ fn the_order_aggregation_decides_what_clears_the_line() {
     );
 }
 
+/// The product's own line, read from the defaults rather than pinned: the
+/// measurement moved it from 0.70 to 0.90, so 0.85 (where the small domains'
+/// noise sat) is no finding and 0.90 is.
+#[test]
+fn the_product_line_is_090_so_085_is_no_finding() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let at = |score: f32| {
+        let mut sweep = input(vec![a.clone(), b.clone()]);
+        sweep.contradictions = vec![stored(1, 2, 5, "x", 5, "y", score, score)];
+        sweep.contradiction_model = "nli-x".to_string();
+        assert_eq!(sweep.options.contradiction_threshold, 0.90);
+        fired(&detect(&sweep)).contains(&"V302")
+    };
+    assert!(!at(0.85), "0.85 stays below the line");
+    assert!(at(0.90), "0.90 is on the line");
+}
+
 #[test]
 fn a_line_that_names_a_period_points_at_the_window() {
     let a = observed(1, "one", &[(5, "Since 2024 the build uses Node 20")]);

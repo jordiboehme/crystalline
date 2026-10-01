@@ -3629,3 +3629,155 @@ async fn a_wrapped_bullet_is_embedded_and_scored_as_its_whole_text() {
         "the first-line fragment never was: {embedded:?}"
     );
 }
+
+// --- every line pair above the floor is read, up to the cap ------------------
+
+/// Embeds a line from its table as the hand-built vector and everything else
+/// (titles, chunks) like [`crate::support::TopicEmbedder`], so two engrams
+/// about the retry queue stay related while their line pairs sit at chosen
+/// cosines.
+struct HandBuilt(std::collections::HashMap<String, Vec<f32>>);
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for HandBuilt {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                self.0
+                    .get(t)
+                    .cloned()
+                    .unwrap_or_else(|| crate::support::TopicEmbedder::embed_one(t))
+            })
+            .collect())
+    }
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+    fn dims(&self) -> usize {
+        4
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+/// Two engrams about one subject, `na` lines against `nb`: every `a` line on
+/// one vector, `b`'s line `j` at cosine `cos(0.02 * (j + 1))` to it, so the
+/// line pairs rank by `j` first and by document order among equals, all far
+/// above the floor. `a`'s line `ca` and `b`'s line `cb` carry the texts the
+/// stub scores as a contradiction.
+async fn dense_pair(
+    na: usize,
+    nb: usize,
+    (ca, cb): (usize, usize),
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    Arc<StubScorer>,
+    String,
+    String,
+) {
+    let line_a = |i: usize| {
+        if i == ca {
+            "The relay listens on port 8080".to_string()
+        } else {
+            format!("Relay note alpha {i}")
+        }
+    };
+    let line_b = |j: usize| {
+        if j == cb {
+            "The relay listens on port 9090".to_string()
+        } else {
+            format!("Relay note beta {j}")
+        }
+    };
+    let mut vectors = std::collections::HashMap::new();
+    for i in 0..na {
+        vectors.insert(line_a(i), vec![1.0, 0.0, 0.0, 0.0]);
+    }
+    for j in 0..nb {
+        let t = 0.02 * (j + 1) as f32;
+        vectors.insert(line_b(j), vec![t.cos(), t.sin(), 0.0, 0.0]);
+    }
+    let body = |lines: Vec<String>| {
+        let bullets: Vec<String> = lines.iter().map(|l| format!("- [fact] {l}")).collect();
+        format!("The retry queue relay settings.\n\n{}", bullets.join("\n"))
+    };
+    let (contra_a, contra_b) = (line_a(ca), line_b(cb));
+    let s = Arc::new(StubScorer::new(full().repo, 0.05).with(&contra_a, &contra_b, 0.97));
+    let (tmp, engine) = engine_on(Arc::new(HandBuilt(vectors))).await;
+    let engine = with_loader(engine, loader(s.clone(), Arc::new(AtomicUsize::new(0))));
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Relay alpha", &body((0..na).map(line_a).collect())))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Relay beta", &body((0..nb).map(line_b).collect())))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    (tmp, engine, s, contra_a, contra_b)
+}
+
+/// The measurement's case: a dense pair of engrams, 4 lines against 6, all 24
+/// line pairs about the same subject, and the contradiction only the seventh
+/// by similarity (`b`'s second line against `a`'s third). The old limit of
+/// four read the first four and never saw it; now every line pair is read
+/// and the contradiction is the finding.
+#[tokio::test]
+async fn a_contradiction_seventh_by_similarity_is_scored_and_becomes_the_finding() {
+    let (_tmp, engine, s, contra_a, contra_b) = dense_pair(4, 6, (2, 1)).await;
+    let (logs, _guard) = crate::support::capture_logs();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 24, 0)
+    );
+    // 24 first orders, then the one at or above the store floor read back.
+    assert_eq!(s.forwards(), 25);
+    assert!(
+        !logs.any_contains("line pair cap bound"),
+        "24 is under the cap: {:?}",
+        logs.lines()
+    );
+    let found = sweep(&engine).await;
+    let rows = v302(&found);
+    assert_eq!(rows.len(), 1, "{found}");
+    let mut texts = [
+        rows[0]["line_text"].as_str().unwrap(),
+        rows[0]["counterpart_line_text"].as_str().unwrap(),
+    ];
+    texts.sort();
+    assert_eq!(texts, [contra_a.as_str(), contra_b.as_str()], "{found}");
+    assert_eq!(rows[0]["probability"], 0.97);
+}
+
+/// The cap: 5 lines against 8 put 40 line pairs above the floor. The 32 most
+/// similar are read (`b`'s lines 0 to 5 against every `a` line, then `b`'s
+/// line 6 against `a`'s first two), and the walk says once that the cap
+/// bound, with the count of pairs and no line text.
+#[tokio::test]
+async fn the_cap_reads_the_32_most_similar_and_says_it_bound() {
+    // `a`'s line 1 against `b`'s line 6 is the 32nd, the last one inside.
+    let (_tmp, engine, s, contra_a, _) = dense_pair(5, 8, (1, 6)).await;
+    let (logs, _guard) = crate::support::capture_logs();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 32, 0)
+    );
+    assert_eq!(s.forwards(), 33, "32 first orders, one read back");
+    let bound: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("line pair cap bound"))
+        .collect();
+    assert_eq!(bound.len(), 1, "{:?}", logs.lines());
+    assert!(
+        bound[0].starts_with("INFO") && bound[0].contains("pairs=1") && bound[0].contains("cap=32"),
+        "{bound:?}"
+    );
+    assert!(!bound[0].contains(&contra_a), "no line text: {bound:?}");
+    assert!(!bound[0].contains("Relay note"), "no line text: {bound:?}");
+    assert_eq!(v302(&sweep(&engine).await).len(), 1);
+}

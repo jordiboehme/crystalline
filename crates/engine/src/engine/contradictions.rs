@@ -19,12 +19,11 @@
 use super::*;
 use crystalline_index::embed::line_similarity_floor;
 use crystalline_index::nli::{
-    CandidateFacts, CandidatePair, ContradictionScorer, KeptLine, LineRules,
+    CandidateFacts, CandidatePair, ContradictionScorer, KeptLine, LinePairs, LineRules,
     MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE, NLI_GROUP_LINE_PAIRS, NliModel, NliProfile,
     contradiction_candidates, eligible, eligible_lines, expired, first_order_inputs, fold,
-    length_order, line_rows, max_related_pairs, nli_model, observation_hash, pending_pairs,
-    related_threshold, scoring_checksum, second_order_input, second_order_needed,
-    similar_line_pairs,
+    length_order, line_pairs, line_rows, max_related_pairs, nli_model, observation_hash,
+    pending_pairs, related_threshold, scoring_checksum, second_order_input, second_order_needed,
 };
 use crystalline_index::sweep::{MAX_LINE_PAIRS_PER_ENGRAM_PAIR, ORDER_AGGREGATION};
 use crystalline_index::{
@@ -132,6 +131,9 @@ struct DomainWork {
 struct PairPlan {
     pair: CandidatePair,
     lines: Option<Vec<KeptLine>>,
+    /// Whether [`MAX_LINE_PAIRS_PER_ENGRAM_PAIR`] bound: more line pairs
+    /// stood at or above the floor than were kept.
+    capped: bool,
 }
 
 impl PairPlan {
@@ -785,6 +787,19 @@ impl Engine {
         // the day the walk is recorded under.
         let today = self.contradiction_today();
         let (work, complete) = self.contradiction_work(model, retry, today).await?;
+        // Once per walk, on this task rather than the pairing thread, and
+        // never with a line's text.
+        let capped = work
+            .iter()
+            .map(|w| w.pending.iter().filter(|p| p.capped).count())
+            .sum::<usize>();
+        if capped > 0 {
+            tracing::info!(
+                pairs = capped,
+                cap = MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
+                "the line pair cap bound: only the most similar line pairs of these related pairs are scored"
+            );
+        }
         let line_error = work
             .iter()
             .find_map(|w| w.lines.as_ref().and_then(|l| l.error.clone()));
@@ -1437,7 +1452,7 @@ impl Engine {
     }
 
     /// Pair the lines of each pending engram pair by similarity
-    /// ([`similar_line_pairs`]): read the vectors of every line of the
+    /// ([`line_pairs`]): read the vectors of every line of the
     /// engrams in `pending` (the store lock per run of
     /// [`OBSERVATION_VECTOR_CHUNK`] hashes, so a large domain never holds it
     /// for long), then pair on a blocking thread, since every line of one
@@ -1477,15 +1492,19 @@ impl Engine {
         tokio::task::spawn_blocking(move || {
             let plans: Vec<PairPlan> = pending
                 .into_iter()
-                .map(|pair| PairPlan {
-                    lines: similar_line_pairs(
+                .map(|pair| {
+                    let found = line_pairs(
                         &facts[pair.a].observations,
                         &facts[pair.b].observations,
                         &vectors,
                         floor,
                         MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
-                    ),
-                    pair,
+                    );
+                    PairPlan {
+                        capped: found.as_ref().is_some_and(LinePairs::capped),
+                        lines: found.map(|f| f.kept),
+                        pair,
+                    }
                 })
                 .collect();
             (facts, plans)

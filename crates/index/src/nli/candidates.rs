@@ -321,12 +321,13 @@ pub fn eligible_lines(facts: &[CandidateFacts<'_>], today: NaiveDate) -> BTreeMa
 }
 
 /// The line pairs of one engram pair the model reads: every line of `a`
-/// against every line of `b` by the cosine of their vectors, those at or
-/// above `floor`, at most `limit`, the most similar first and document order
-/// among equals. A line with no words is skipped, a repeated line inside one
-/// engram counts once (its first occurrence), and two lines with the same
-/// text are never a pair: a line does not contradict itself, and a copied
-/// bullet would otherwise take a slot from two lines that differ.
+/// against every line of `b` by the cosine of their vectors, every pair at or
+/// above `floor`, up to the safety cap `limit`, the most similar first and
+/// document order among equals. A line with no words is skipped, a repeated
+/// line inside one engram counts once (its first occurrence), and two lines
+/// with the same text are never a pair: a line does not contradict itself,
+/// and a copied bullet would otherwise take a slot from two lines that
+/// differ.
 ///
 /// `vectors` must come from the embedding model the rules name (the one
 /// `floor` belongs to): a vector of another width reads as cosine 0, so the
@@ -342,6 +343,36 @@ pub fn similar_line_pairs(
     floor: f64,
     limit: usize,
 ) -> Option<Vec<KeptLine>> {
+    line_pairs(a, b, vectors, floor, limit).map(|p| p.kept)
+}
+
+/// What [`line_pairs`] found for one engram pair: the kept line pairs and
+/// how many stood at or above the floor before the cap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinePairs {
+    /// The line pairs the model reads, the most similar first.
+    pub kept: Vec<KeptLine>,
+    /// Every distinct line pair at or above the floor, kept or not.
+    pub above_floor: usize,
+}
+
+impl LinePairs {
+    /// Whether the cap bound: some line pair at or above the floor was left
+    /// out.
+    pub fn capped(&self) -> bool {
+        self.above_floor > self.kept.len()
+    }
+}
+
+/// [`similar_line_pairs`] with the count of line pairs at or above the floor,
+/// so a caller can tell when the cap `limit` bound.
+pub fn line_pairs(
+    a: &[FactObservation],
+    b: &[FactObservation],
+    vectors: &HashMap<String, Vec<f32>>,
+    floor: f64,
+    limit: usize,
+) -> Option<LinePairs> {
     let sa = embedded_side(a, vectors)?;
     let sb = embedded_side(b, vectors)?;
     // (similarity, index into sa, index into sb), the best `limit` so far.
@@ -350,6 +381,7 @@ pub fn similar_line_pairs(
         y.0.total_cmp(&x.0)
             .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
     };
+    let mut above_floor = 0usize;
     for (x, (_, ha, va)) in sa.iter().enumerate() {
         for (y, (_, hb, vb)) in sb.iter().enumerate() {
             if ha == hb {
@@ -359,13 +391,24 @@ pub fn similar_line_pairs(
             if s.is_nan() || f64::from(s) < floor {
                 continue;
             }
-            best.push((s, x, y));
+            above_floor += 1;
+            let candidate = (s, x, y);
+            // A full list keeps only what beats its weakest entry.
+            if best.len() == limit
+                && best
+                    .last()
+                    .is_none_or(|w| order(&candidate, w) != std::cmp::Ordering::Less)
+            {
+                continue;
+            }
+            best.push(candidate);
             best.sort_by(order);
             best.truncate(limit);
         }
     }
-    Some(
-        best.into_iter()
+    Some(LinePairs {
+        kept: best
+            .into_iter()
             .map(|(similarity, x, y)| KeptLine {
                 ia: sa[x].0,
                 ib: sb[y].0,
@@ -374,7 +417,8 @@ pub fn similar_line_pairs(
                 similarity,
             })
             .collect(),
-    )
+        above_floor,
+    })
 }
 
 /// One side's lines with words, deduplicated by hash in document order, each
@@ -912,10 +956,102 @@ mod tests {
             .map(|o| (observation_hash(&o.text), vec![1.0, 0.0]))
             .collect();
         let v: HashMap<String, Vec<f32>> = same.into_iter().collect();
-        let kept = similar_line_pairs(&a, &b, &v, 0.86, MAX_LINE_PAIRS_PER_ENGRAM_PAIR).unwrap();
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, 4).unwrap();
         assert_eq!(kept.len(), 4, "nine pairs at 1.0, four kept");
         let at: Vec<(usize, usize)> = kept.iter().map(|k| (k.ia, k.ib)).collect();
         assert_eq!(at, vec![(0, 0), (0, 1), (0, 2), (1, 0)]);
+        let all = line_pairs(&a, &b, &v, 0.86, MAX_LINE_PAIRS_PER_ENGRAM_PAIR).unwrap();
+        assert_eq!(
+            all.kept.len(),
+            9,
+            "under the product cap every pair is read"
+        );
+        assert!(!all.capped());
+    }
+
+    /// `a` and `b` lines on a quarter circle: `a`'s line `i` and `b`'s line
+    /// `j` sit at cosine `cos(base + step * (i + j))`, all of them above the
+    /// floor, distinct per `i + j`.
+    fn fan(
+        na: usize,
+        nb: usize,
+        step: f32,
+    ) -> (
+        Vec<FactObservation>,
+        Vec<FactObservation>,
+        HashMap<String, Vec<f32>>,
+    ) {
+        let a: Vec<FactObservation> = (0..na)
+            .map(|i| obs(i + 1, &format!("a line {i}")))
+            .collect();
+        let b: Vec<FactObservation> = (0..nb)
+            .map(|j| obs(100 + j, &format!("b line {j}")))
+            .collect();
+        let mut v = HashMap::new();
+        for (i, o) in a.iter().enumerate() {
+            let t = step * i as f32;
+            v.insert(observation_hash(&o.text), vec![t.cos(), t.sin()]);
+        }
+        for (j, o) in b.iter().enumerate() {
+            let t = -step * j as f32;
+            v.insert(observation_hash(&o.text), vec![t.cos(), t.sin()]);
+        }
+        (a, b, v)
+    }
+
+    /// The old limit of four picked by similarity before scoring: a pair of
+    /// engrams with 24 same-subject line pairs read only its four most
+    /// similar. Every one above the floor is read now, the seventh too.
+    #[test]
+    fn every_line_pair_above_the_floor_is_kept_up_to_the_cap() {
+        let (a, b, v) = fan(4, 6, 0.01);
+        let found = line_pairs(&a, &b, &v, 0.86, MAX_LINE_PAIRS_PER_ENGRAM_PAIR).unwrap();
+        assert_eq!(found.above_floor, 24);
+        assert_eq!(found.kept.len(), 24, "every line pair above the floor");
+        assert!(!found.capped());
+        assert!(
+            found
+                .kept
+                .windows(2)
+                .all(|w| w[0].similarity >= w[1].similarity)
+        );
+        let seventh = &found.kept[6];
+        assert!(
+            found.kept[..4]
+                .iter()
+                .all(|k| k.similarity > seventh.similarity),
+            "the seventh by similarity was beyond the old limit of four"
+        );
+    }
+
+    /// The cap bounds the worst case: 40 line pairs above the floor keep the
+    /// 32 most similar, and the count says it bound.
+    #[test]
+    fn the_cap_keeps_the_most_similar_and_says_it_bound() {
+        let (a, b, v) = fan(5, 8, 0.01);
+        let found = line_pairs(&a, &b, &v, 0.86, MAX_LINE_PAIRS_PER_ENGRAM_PAIR).unwrap();
+        assert_eq!(found.above_floor, 40);
+        assert_eq!(found.kept.len(), 32);
+        assert!(found.capped());
+        let mut all: Vec<(f32, usize, usize)> = (0..5)
+            .flat_map(|i| (0..8).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                let k = similar_line_pairs(&a[i..=i], &b[j..=j], &v, 0.86, 1).unwrap();
+                (k[0].similarity, i, j)
+            })
+            .collect();
+        all.sort_by(|x, y| {
+            y.0.total_cmp(&x.0)
+                .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
+        });
+        let want: Vec<(usize, usize)> = all[..32].iter().map(|&(_, i, j)| (i, j)).collect();
+        let got: Vec<(usize, usize)> = found.kept.iter().map(|k| (k.ia, k.ib)).collect();
+        assert_eq!(
+            got, want,
+            "the 32 most similar, document order among equals"
+        );
+        let weakest_kept = found.kept.last().unwrap().similarity;
+        assert!(all[32..].iter().all(|x| x.0 <= weakest_kept));
     }
 
     /// Review focus 2: every line of a long engram takes part, the cut is the

@@ -15,10 +15,11 @@ pub mod period;
 mod stub;
 
 pub use candidates::{
-    CandidateFacts, CandidatePair, Candidates, KeptLine, LineRules, contradiction_candidates,
-    eligible, eligible_lines, expired, first_order_inputs, fold, length_order, line_rows,
-    max_related_pairs, observation_hash, observations_digest, pending_pairs, related_threshold,
-    scoring_checksum, second_order_input, second_order_needed, similar_line_pairs, windows_overlap,
+    CandidateFacts, CandidatePair, Candidates, KeptLine, LinePairs, LineRules,
+    contradiction_candidates, eligible, eligible_lines, expired, first_order_inputs, fold,
+    length_order, line_pairs, line_rows, max_related_pairs, observation_hash, observations_digest,
+    pending_pairs, related_threshold, scoring_checksum, second_order_input, second_order_needed,
+    similar_line_pairs, windows_overlap,
 };
 pub use models::{
     CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliModel, NliProfile, RETIRED_NLI_REPOS,
@@ -34,8 +35,10 @@ use crate::error::Result;
 pub const NLI_BATCH_SIZE: usize = 16;
 
 /// How many kept line pairs one scoring group takes across engram pairs, so
-/// the length-sorted batches of [`NLI_BATCH_SIZE`] fill up even though one
-/// engram pair has at most four line pairs.
+/// the length-sorted batches of [`NLI_BATCH_SIZE`] fill up even though most
+/// engram pairs keep only a few line pairs. A group holds whole engram pairs:
+/// it closes once it reaches this many, so it holds at most this many plus
+/// [`crate::sweep::MAX_LINE_PAIRS_PER_ENGRAM_PAIR`] minus one.
 pub const NLI_GROUP_LINE_PAIRS: usize = 128;
 
 /// Each line is cut to this many model tokens, so a pair and its separators

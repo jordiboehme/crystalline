@@ -134,13 +134,17 @@ pub const RELATED_THRESHOLD: f64 = 0.80;
 /// The eval harness overrides it with `CRYSTALLINE_NLI_MAX_PAIRS`.
 pub const MAX_RELATED_PAIRS: usize = 2000;
 
-/// The most observation line pairs the NLI model reads per engram pair: the
-/// most similar ones at or above the embedding model's line-similarity floor
-/// (`crate::embed::line_similarity_floor`), every line of one engram against
-/// every line of the other. Measured: four kept 178 of 200 planted flips and
-/// cut the real domains from 2100 engram pairs to 73
-/// (research/2026-10-01-v302-line-filter-experiment.md).
-pub const MAX_LINE_PAIRS_PER_ENGRAM_PAIR: usize = 4;
+/// The safety cap on the observation line pairs the NLI model reads per
+/// engram pair. Every line pair at or above the embedding model's
+/// line-similarity floor (`crate::embed::line_similarity_floor`) is read,
+/// every line of one engram against every line of the other; only when more
+/// than this many stand above the floor are the most similar kept, and the
+/// daemon logs once per walk how many engram pairs the cap bound on. An
+/// earlier limit of four picked by similarity before scoring and dropped a
+/// real contradiction ranked seventh among 24 same-subject line pairs
+/// (research/2026-10-01-v302-line-filter-measurement.md); 32 only bounds the
+/// worst case.
+pub const MAX_LINE_PAIRS_PER_ENGRAM_PAIR: usize = 32;
 
 /// A line pair is stored when its first reading order (the lower-id engram's
 /// line as premise) is at or above this under `Min`, which is also the only
