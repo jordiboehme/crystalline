@@ -1638,26 +1638,47 @@ impl Store for PostgresStore {
         // expected sha no longer matches the stored one, refuse. The engine
         // holds the transaction open (the pinned connection), so the compare and
         // the write are one atomic unit.
+        //
+        // A plain SELECT is not that under READ COMMITTED: it reads the last
+        // committed sha without waiting for a writer that holds the row, so a
+        // second instance's uncommitted write would pass the compare and then
+        // be overwritten when it commits. The compare is therefore a guarded
+        // no-op UPDATE: it takes the row lock (waiting for that writer), then
+        // re-reads the row as committed and matches only while it still
+        // carries the expected sha. One row means the row is ours, locked to
+        // the end of the transaction; none means either no row at all (an
+        // insert, which nothing guards) or a row that moved on.
         if let Some(expected) = expected_sha {
             let mut conn = self.acquire().await?;
-            let stored = sqlx::query(
-                "SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''",
+            let matched = sqlx::query(
+                "UPDATE engram SET sha256=sha256 \
+                 WHERE domain_id=$1 AND path=$2 AND actor = '' AND sha256=$3",
             )
             .bind(domain.0)
             .bind(&record.path)
-            .fetch_optional(conn.as_mut())
+            .bind(expected)
+            .execute(conn.as_mut())
             .await
             .map_err(IndexError::from)?
-            .and_then(|r| cell_text(&r, 0));
-            drop(conn);
-            if let Some(found) = stored
-                && found != expected
-            {
-                return Err(IndexError::StaleEdit {
-                    expected: expected.to_string(),
-                    found,
-                });
+            .rows_affected();
+            if matched == 0 {
+                let stored = sqlx::query(
+                    "SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''",
+                )
+                .bind(domain.0)
+                .bind(&record.path)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?
+                .and_then(|r| cell_text(&r, 0));
+                if let Some(found) = stored {
+                    return Err(IndexError::StaleEdit {
+                        expected: expected.to_string(),
+                        found,
+                    });
+                }
             }
+            drop(conn);
         }
         self.upsert_engram(domain, record).await
     }

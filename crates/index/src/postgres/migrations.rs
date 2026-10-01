@@ -1336,4 +1336,58 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// The Turso v18 upgrade test's twin: a schema at v16 with a domain row
+    /// in it, built and stamped migration by migration as `apply` would have,
+    /// then opened by the store (which runs v17) and synced once.
+    #[tokio::test]
+    async fn a_schema_from_before_v17_reparses_on_its_first_sync() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("d");
+        let schema = format!("mig_reparse_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            MIGRATIONS[16].version, 17,
+            "the seventeenth migration is v17"
+        );
+        for m in &MIGRATIONS[..16] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
+                .bind(m.version)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO domain(name, path, kind) VALUES ('d', $1, 'file')")
+            .bind(root.to_string_lossy().into_owned())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
+        store.drop_schema().await.unwrap();
+    }
 }

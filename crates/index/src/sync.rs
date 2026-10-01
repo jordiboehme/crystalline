@@ -184,6 +184,14 @@ pub struct SyncReport {
     /// both sides: the wire shape of a report is its counts.
     #[serde(skip)]
     pub changes: Vec<PathChange>,
+    /// Files the walk skipped or the scan or the apply could not read: what
+    /// `failed` lists for want of the bytes, plus the walk entries that could
+    /// not even be stat'd (a file that read but did not parse is not counted).
+    /// A whole-domain reparse is not stamped while it is non-zero, so a file
+    /// unreadable during the reparse is read again by the next one. Not part
+    /// of the wire shape.
+    #[serde(skip)]
+    pub unread: usize,
 }
 
 /// A file found on disk during the walk.
@@ -287,6 +295,7 @@ pub async fn reparse_due<S: Store + ?Sized>(store: &S, domain: DomainId) -> Resu
 /// Drafts (actor rows) are not touched; each is reparsed on its next write.
 pub async fn reparse_stored_domain<S: Store + ?Sized>(
     store: &S,
+    name: &str,
     domain: DomainId,
     chunk_params: &ChunkParams,
 ) -> Result<usize> {
@@ -297,6 +306,15 @@ pub async fn reparse_stored_domain<S: Store + ?Sized>(
     let result = async {
         let stamps = store.file_stamps(domain).await?;
         let rows = store.all_engram_contents(domain).await?;
+        // Said before the work, not after it: on a large domain this is the
+        // one slow step of the first start after an upgrade, and the line is
+        // what tells a person why.
+        tracing::info!(
+            domain = name,
+            engrams = rows.len(),
+            "reparsing {} engram(s) of '{name}' after a parser change",
+            rows.len()
+        );
         let mut reparsed = 0usize;
         for row in rows {
             let Ok(engram) = parse_engram(&row.content) else {
@@ -427,6 +445,9 @@ pub async fn scan_domain(
     // Walk the folder, skipping dot-directories, dot-files and non-markdown.
     let mut current: HashMap<String, Scanned> = HashMap::new();
     let mut assets: Vec<AssetCandidate> = Vec::new();
+    // Entries the walk could not read: a forced walk that skipped one has not
+    // re-parsed the whole domain, so it must not stamp the parser generation.
+    let mut unread = 0usize;
     for entry in WalkDir::new(root)
         .into_iter()
         // Prune dot-directories and dot-files, but never the walk root itself
@@ -454,7 +475,10 @@ pub async fn scan_domain(
                     source,
                 });
             }
-            Err(_) => continue,
+            Err(_) => {
+                unread += 1;
+                continue;
+            }
         };
         if !entry.file_type().is_file() {
             continue;
@@ -489,7 +513,10 @@ pub async fn scan_domain(
         if crystalline_core::is_reserved_file(&fname) || !fname.to_lowercase().ends_with(".md") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(meta) = entry.metadata() else {
+            unread += 1;
+            continue;
+        };
         let mtime = file_mtime(&meta);
         current.insert(
             rel.clone(),
@@ -527,6 +554,7 @@ pub async fn scan_domain(
     scan.assets = assets;
     scan.assets_complete = true;
     scan.ends_rebuild = force;
+    scan.report.unread += unread;
     Ok(scan)
 }
 
@@ -940,7 +968,12 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     // Every file was re-parsed, so the domain's rows are this parser's: the
     // stamp commits with them, and a run that died before here leaves the old
     // generation for the next sync to repeat.
-    if ends_rebuild && let Err(e) = store.set_parse_generation(domain, PARSE_GENERATION).await {
+    // A file the walk or the read could not reach kept the rows an older
+    // parser derived, so the domain is not stamped until a run reads it.
+    if ends_rebuild
+        && report.unread == 0
+        && let Err(e) = store.set_parse_generation(domain, PARSE_GENERATION).await
+    {
         let _ = store.rollback().await;
         return Err(e);
     }
@@ -1510,7 +1543,7 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return ParseOutcome::Vanished(scanned.rel);
                     }
-                    Err(e) => return ParseOutcome::Failed(scanned.rel, e.to_string()),
+                    Err(e) => return ParseOutcome::Unread(scanned.rel, e.to_string()),
                 };
                 let mut hasher = Sha256::new();
                 hasher.update(&bytes);
@@ -1547,7 +1580,7 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
             .await;
             match parsed {
                 Ok(outcome) => outcome,
-                Err(e) => ParseOutcome::Failed(String::new(), e.to_string()),
+                Err(e) => ParseOutcome::Unread(String::new(), e.to_string()),
             }
         });
         ids.insert(handle.id(), rel);
@@ -1597,6 +1630,10 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                 tracing::debug!(path = %path, "sync: deferring a change whose file vanished mid-sync");
             }
             Ok((id, ParseOutcome::Failed(path, err))) => {
+                ids.remove(&id);
+                report.failed.push((path, err));
+            }
+            Ok((id, ParseOutcome::Unread(path, err))) => {
                 // A blocking task that panicked outright loses the path with it,
                 // so fall back to the task-id map to keep the failure attributable.
                 let mapped = ids.remove(&id);
@@ -1606,6 +1643,7 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                     path
                 };
                 report.failed.push((path, err));
+                report.unread += 1;
             }
             Err(join_err) => {
                 let rel = ids
@@ -1614,6 +1652,7 @@ async fn parse_and_apply_slab<S: Store + ?Sized>(
                 report
                     .failed
                     .push((rel, format!("task panicked: {join_err}")));
+                report.unread += 1;
             }
         }
     }
@@ -1653,6 +1692,7 @@ async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanne
                 // the changed set, so its row (if any) stays untouched and the
                 // next pass retries it.
                 report.failed.push((scanned.rel, e.to_string()));
+                report.unread += 1;
             }
             Err(join_err) => {
                 let rel = ids
@@ -1661,6 +1701,7 @@ async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanne
                 report
                     .failed
                     .push((rel, format!("task panicked: {join_err}")));
+                report.unread += 1;
             }
         }
     }
@@ -1767,7 +1808,11 @@ fn asset_candidate(
 /// that vanished between the scan and its slab.
 enum ParseOutcome {
     Ok(Box<EngramRecord>, Vec<NewChunk>, bool),
+    /// Read, but not an engram: not UTF-8, or the parser refused it.
     Failed(String, String),
+    /// Not read at all (an I/O error or a task that died), so its rows were
+    /// derived by nothing this run.
+    Unread(String, String),
     Vanished(String),
 }
 
@@ -1791,4 +1836,72 @@ fn rel_path(root: &Path, path: &Path) -> String {
 
 fn duration_ms(d: Duration) -> u64 {
     d.as_millis().min(u64::MAX as u128) as u64
+}
+
+/// The upgrade path from a database an older binary built, shared by the two
+/// backends' migration tests: they build the old schema their own way, with a
+/// domain row `d` already in it, open the store over it (which runs the
+/// migration that adds the generation column) and hand it here.
+#[cfg(test)]
+pub(crate) mod upgrade_fixture {
+    use std::path::Path;
+
+    use super::*;
+
+    const WRAPPED: &str = "---\ntype: engram\ntitle: Wrapped\npermalink: wrapped\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Wrapped\n\nThe pump rules, written the way people write them.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n";
+
+    async fn purge_observations(store: &dyn Store) -> i64 {
+        store
+            .vocabulary(Some("d"), None)
+            .await
+            .unwrap()
+            .tags
+            .iter()
+            .find(|t| t.name == "purge")
+            .map(|t| t.observations)
+            .unwrap_or(0)
+    }
+
+    /// The row the migration left at 0 is behind, so the first plain sync
+    /// reparses a file whose stamp says nothing changed. The engram's rows are
+    /// staged as an older parser left them, under the exact stamp of the file
+    /// on disk, so only the generation can make the sync look again.
+    pub(crate) async fn first_sync_after_the_upgrade_reparses(store: &dyn Store, root: &Path) {
+        let domain = store.domain_id("d").await.unwrap().expect("the old row");
+        assert_eq!(
+            store.parse_generation(domain).await.unwrap(),
+            0,
+            "a domain row from before the migration reads generation 0"
+        );
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("wrapped.md");
+        std::fs::write(&path, WRAPPED).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let stamp = FileStamp {
+            mtime: file_mtime(&meta),
+            size: meta.len(),
+            sha256: {
+                let mut h = Sha256::new();
+                h.update(WRAPPED.as_bytes());
+                crate::hex_lower(&h.finalize())
+            },
+        };
+        let engram = parse_engram(WRAPPED).unwrap();
+        let mut record = EngramRecord::from_engram(&engram, "wrapped.md", stamp);
+        record.observations[0].content = "the purge runs before every mix swap,".to_string();
+        record.observations[0].tags.clear();
+        store.upsert_engram(domain, &record).await.unwrap();
+        assert_eq!(purge_observations(store).await, 0, "staged as a fragment");
+
+        let report = sync_domain_with(store, "d", root, &ChunkParams::default())
+            .await
+            .unwrap();
+        assert_eq!(report.updated, 1, "{report:?}");
+        assert_eq!(purge_observations(store).await, 1);
+        assert_eq!(
+            store.parse_generation(domain).await.unwrap(),
+            PARSE_GENERATION
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), WRAPPED);
+    }
 }

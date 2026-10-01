@@ -2811,3 +2811,82 @@ async fn the_sync_after_a_parser_change_reparses_file_and_virtual_domains_once()
         "the stored documents are byte for byte what they were"
     );
 }
+
+/// A virtual domain whose reparse fails never holds up the sync: the failure
+/// is reported under `failed`, the domain stays behind so the next sync tries
+/// again, and the file domains are synced as on any other day. The failure is
+/// a stored row whose document claims a permalink another row owns, which the
+/// index refuses.
+#[tokio::test]
+async fn a_failing_virtual_reparse_does_not_stop_the_sync() {
+    let (tmp, engine) = engine_fixture().await;
+    for (title, content) in [
+        ("First Note", "The first note, long enough to stand."),
+        ("Second Note", "The second note, long enough to stand."),
+    ] {
+        engine
+            .write_engram(&crystalline_service::params::WriteParams {
+                domain: "scratch".to_string(),
+                title: title.to_string(),
+                content: content.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec![],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+    }
+    let store = engine.store();
+    let scratch = {
+        let store = store.lock().await;
+        let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+        let rows = store.all_engram_contents(scratch).await.unwrap();
+        let (first, second) = (&rows[0], &rows[1]);
+        // The second row's stored document now claims the first one's
+        // permalink, while its index row still answers to its own.
+        let clash = second.content.replace(
+            &format!("permalink: {}", second.permalink),
+            &format!("permalink: {}", first.permalink),
+        );
+        assert_ne!(clash, second.content);
+        let engram = crystalline_core::parse_engram(&clash).unwrap();
+        let stamp = store.file_stamps(scratch).await.unwrap()[&second.path].clone();
+        let mut record = crystalline_index::EngramRecord::from_engram(&engram, &second.path, stamp);
+        record.permalink = second.permalink.clone();
+        record.content = clash.clone();
+        record.stamp.sha256 = {
+            use sha2::Digest;
+            crystalline_index::hex_lower(&sha2::Sha256::digest(clash.as_bytes()))
+        };
+        store.upsert_engram(scratch, &record).await.unwrap();
+        store.set_parse_generation(scratch, 0).await.unwrap();
+        scratch
+    };
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nA file that arrived while the reparse was failing.\n",
+    )
+    .unwrap();
+
+    let result = engine.sync(None).await.expect("the sync goes on");
+    let failed = result["failed"].as_array().unwrap();
+    assert!(
+        failed.iter().any(|f| f["domain"] == "scratch"),
+        "the failure is reported: {result}"
+    );
+    let store = store.lock().await;
+    assert_eq!(
+        store.parse_generation(scratch).await.unwrap(),
+        0,
+        "behind, so the next sync tries again"
+    );
+    assert!(
+        store.find_engram("eng", "beta").await.unwrap().is_some(),
+        "the file domain was synced"
+    );
+}

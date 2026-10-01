@@ -15,7 +15,7 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::engram::{
     EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, SchemaDef, Verified,
 };
-use crate::parse::{locate, parse_heading};
+use crate::parse::{continues_bullet, locate, parse_heading};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,
 /// swapped for the flow mapping afterwards. The YAML crate only emits block
@@ -1114,7 +1114,18 @@ pub fn insert_after_section_reporting(
     })?;
     let (content, heading_stripped) = strip_repeated_heading(&headings[p], content);
     let at = headings[p].line_end;
-    let block = format!("\n{}\n", content.trim_matches('\n'));
+    let mut block = format!("\n{}\n", content.trim_matches('\n'));
+    // A line directly under the heading that a bullet would absorb (prose, as
+    // CommonMark's lazy continuation reads it) gets a blank line between it
+    // and the inserted block, so an inserted bullet stays its own observation
+    // instead of swallowing the section's first paragraph.
+    if source[at..]
+        .split('\n')
+        .next()
+        .is_some_and(|next| continues_bullet(next.trim_end_matches('\r')))
+    {
+        block.push('\n');
+    }
     Ok(SectionEdit {
         text: format!("{}{}{}", &source[..at], block, &source[at..]),
         heading_stripped,

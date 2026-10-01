@@ -113,8 +113,10 @@ impl Engine {
         let targets = self.sync_targets(only)?;
         // The virtual domains have no files to walk, but an older parser may
         // have derived their rows too: they are reparsed from the content the
-        // database stores, once, before the file domains are walked.
-        self.reparse_virtual_domains(only).await?;
+        // database stores, once, before the file domains are walked. A domain
+        // whose reparse fails is reported and retried on the next sync; it
+        // never holds up the others or the file domains.
+        let mut failed = self.reparse_virtual_domains(only).await?;
         let collab = !self.instance_id.is_empty();
         // Each domain this run applied, paired with the report its apply
         // produced, for the final cross-domain resolution pass. A domain that
@@ -122,7 +124,6 @@ impl Engine {
         // not in the list at all.
         let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
         let mut skipped = Vec::new();
-        let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
         // walk-and-hash pass of a large domain no longer blocks every concurrent
         // read behind the mutex. The first window claims the host, resolves the
@@ -372,7 +373,12 @@ impl Engine {
     /// [`crystalline_index::reparse_stored_domain`]). A domain already at the
     /// current generation costs one read of its stamp, and a domain the index
     /// holds no row for yet has nothing to reparse.
-    async fn reparse_virtual_domains(&self, only: Option<&str>) -> Result<()> {
+    ///
+    /// A reparse that fails rolls back and leaves the domain's generation
+    /// where it was, so the next sync tries again; it is logged and answered
+    /// as a `failed` entry of the sync, never as the sync's error, so one
+    /// virtual domain that cannot be reparsed never stops the rest.
+    async fn reparse_virtual_domains(&self, only: Option<&str>) -> Result<Vec<Value>> {
         let names: Vec<String> = match only {
             Some(name) => match self.content_source(name)? {
                 ContentSource::Virtual => vec![name.to_string()],
@@ -388,18 +394,38 @@ impl Engine {
                     .collect()
             }
         };
+        let mut failed = Vec::new();
         for name in names {
             let store = self.store.lock().await;
-            let Some(domain) = store.domain_id(&name).await? else {
-                continue;
+            let domain = match store.domain_id(&name).await {
+                Ok(Some(domain)) => domain,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(domain = name.as_str(), error = %e, "reparse of '{name}' skipped: {e}");
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
             };
-            let reparsed =
-                crystalline_index::reparse_stored_domain(&*store, domain, &self.chunk_params)
-                    .await
-                    .map_err(|e| {
-                        EngineError::Internal(format!("reparse of '{name}' failed: {e}"))
-                    })?;
+            let outcome = crystalline_index::reparse_stored_domain(
+                &*store,
+                &name,
+                domain,
+                &self.chunk_params,
+            )
+            .await;
             drop(store);
+            let reparsed = match outcome {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        domain = name.as_str(),
+                        error = %e,
+                        "reparse of '{name}' after a parser change failed; the next sync tries again: {e}"
+                    );
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
+            };
             if reparsed > 0 {
                 tracing::info!(
                     domain = name.as_str(),
@@ -409,7 +435,7 @@ impl Engine {
                 self.announce_domain(&name, None, None);
             }
         }
-        Ok(())
+        Ok(failed)
     }
 
     /// The file domains to sync, as `(name, root)` pairs. Virtual domains have

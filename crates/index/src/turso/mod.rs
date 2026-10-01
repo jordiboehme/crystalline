@@ -1666,21 +1666,39 @@ impl Store for TursoStore {
         // an expected sha that no longer matches the stored one, refuse. The
         // engine holds the transaction open around this, so the compare and the
         // subsequent write are one atomic unit.
+        //
+        // The compare is a guarded write, the same statement the Postgres twin
+        // needs to be safe against a second writer: a no-op UPDATE that only
+        // matches the row while it still carries the expected sha. One row
+        // means the row is ours to rewrite; none means either no row at all
+        // (an insert, which nothing guards) or a row that moved on.
         if let Some(expected) = expected_sha {
-            let stored = query_first(
-                &self.conn,
-                "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
-                vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
-            )
-            .await?
-            .and_then(|r| cell_text(&r, 0));
-            if let Some(found) = stored
-                && found != expected
-            {
-                return Err(IndexError::StaleEdit {
-                    expected: expected.to_string(),
-                    found,
-                });
+            let matched = self
+                .conn
+                .execute(
+                    "UPDATE engram SET sha256=sha256 \
+                     WHERE domain_id=?1 AND path=?2 AND actor = '' AND sha256=?3",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Text(record.path.clone()),
+                        Value::Text(expected.to_string()),
+                    ],
+                )
+                .await?;
+            if matched == 0 {
+                let stored = query_first(
+                    &self.conn,
+                    "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
+                    vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
+                )
+                .await?
+                .and_then(|r| cell_text(&r, 0));
+                if let Some(found) = stored {
+                    return Err(IndexError::StaleEdit {
+                        expected: expected.to_string(),
+                        found,
+                    });
+                }
             }
         }
         self.upsert_engram(domain, record).await

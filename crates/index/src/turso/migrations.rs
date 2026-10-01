@@ -2039,4 +2039,39 @@ mod tests {
             "the refusal touches nothing; the recorded version is untouched"
         );
     }
+
+    /// An index an older binary built, at v17 with a domain row in it: opening
+    /// it runs v18, whose `parse_generation` default leaves that row behind,
+    /// and the first plain sync reparses its files and stamps it. Built the way
+    /// the other upgrade tests build an old database, on a file so the store
+    /// can open it afterwards.
+    #[tokio::test]
+    async fn an_index_from_before_v18_reparses_on_its_first_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("d");
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                MIGRATIONS[17].version, 18,
+                "the eighteenth migration is v18"
+            );
+            apply_migrations(&conn, &MIGRATIONS[..17]).await.unwrap();
+            conn.execute(
+                "INSERT INTO domain(name, path, kind) VALUES (?1, ?2, 'file')",
+                vec![
+                    turso::Value::Text("d".to_string()),
+                    turso::Value::Text(root.to_string_lossy().into_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let store = crate::TursoStore::open(&db_path).await.unwrap();
+        crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
+    }
 }

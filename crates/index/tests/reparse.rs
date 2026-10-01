@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use crystalline_core::{PARSE_GENERATION, parse_engram};
 use crystalline_index::{
-    ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, Store, TursoStore,
-    reparse_stored_domain, sync_domain_with,
+    ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, Store, TursoStore, apply_scan,
+    reparse_stored_domain, scan_paths, sync_domain_with,
 };
 use tokio::sync::Mutex;
 
@@ -243,7 +243,7 @@ async fn a_virtual_domain_behind_is_reparsed_from_its_stored_content(store: Arc<
     let before = store.all_engram_contents(domain).await.unwrap();
     let stamps_before = store.file_stamps(domain).await.unwrap();
 
-    let reparsed = reparse_stored_domain(&*store, domain, &params())
+    let reparsed = reparse_stored_domain(&*store, "v", domain, &params())
         .await
         .unwrap();
     assert_eq!(reparsed, 2);
@@ -269,7 +269,7 @@ async fn a_virtual_domain_behind_is_reparsed_from_its_stored_content(store: Arc<
     );
 
     assert_eq!(
-        reparse_stored_domain(&*store, domain, &params())
+        reparse_stored_domain(&*store, "v", domain, &params())
             .await
             .unwrap(),
         0,
@@ -311,7 +311,7 @@ async fn an_interrupted_virtual_reparse_repeats(store: Arc<Mutex<dyn Store>>) {
     }
     store.set_parse_generation(domain, 0).await.unwrap();
 
-    reparse_stored_domain(&*store, domain, &params())
+    reparse_stored_domain(&*store, "v", domain, &params())
         .await
         .expect_err("the second row's reparse collides");
     assert_eq!(generation(&*store, domain).await, 0, "nothing was stamped");
@@ -325,7 +325,7 @@ async fn an_interrupted_virtual_reparse_repeats(store: Arc<Mutex<dyn Store>>) {
     // finishes what the interrupted one started.
     store.delete_engram(domain, "a-first.md").await.unwrap();
     assert_eq!(
-        reparse_stored_domain(&*store, domain, &params())
+        reparse_stored_domain(&*store, "v", domain, &params())
             .await
             .unwrap(),
         1
@@ -416,3 +416,329 @@ parity!(
     interrupted_virtual_reparse_repeats,
     an_interrupted_virtual_reparse_repeats
 );
+
+// --- fix round 1 -------------------------------------------------------------------
+
+/// A forced walk that could not read one file has not reparsed the whole
+/// domain: the unreadable file keeps the rows an older parser derived, so the
+/// domain stays behind and the next sync reads everything again. Without
+/// this, a file unreadable during the upgrade sync would keep its old rows for
+/// good, since a permission fix moves neither its mtime nor its size.
+async fn an_unreadable_file_leaves_the_domain_behind(store: Arc<Mutex<dyn Store>>) {
+    use std::os::unix::fs::PermissionsExt;
+    let store = store.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    let domain = staged_file_domain(&*store, &root).await;
+    let other = root.join("other.md");
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = sync_domain_with(&*store, "d", &root, &params())
+        .await
+        .unwrap();
+    assert!(!report.failed.is_empty(), "{report:?}");
+    assert_eq!(
+        generation(&*store, domain).await,
+        0,
+        "a walk that missed a file does not stamp"
+    );
+
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let report = sync_domain_with(&*store, "d", &root, &params())
+        .await
+        .unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.updated, 2, "read whole again: {report:?}");
+    assert_eq!(generation(&*store, domain).await, PARSE_GENERATION);
+}
+
+/// A targeted pass (the watcher's) parses only the paths it was handed, so it
+/// never stamps the domain, even when it reparses a file of a domain behind.
+async fn a_targeted_pass_never_stamps(store: Arc<Mutex<dyn Store>>) {
+    let store = store.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    let domain = staged_file_domain(&*store, &root).await;
+    std::fs::write(
+        root.join("wrapped.md"),
+        format!("{WRAPPED}- [fact] one more line\n"),
+    )
+    .unwrap();
+
+    let snapshot = store.file_stamps(domain).await.unwrap();
+    let scan = scan_paths(
+        "d",
+        &root,
+        snapshot,
+        vec!["wrapped.md".to_string()],
+        &params(),
+    )
+    .await;
+    let report = apply_scan(&*store, domain, scan).await.unwrap();
+    assert_eq!(report.updated, 1, "{report:?}");
+    assert_eq!(
+        wrapped_counts(&*store, "d").await,
+        (1, 1),
+        "the file it read"
+    );
+    assert_eq!(
+        generation(&*store, domain).await,
+        0,
+        "one file is not the domain"
+    );
+}
+
+/// The compare-and-swap the virtual reparse writes through: a row whose
+/// stored content moved on since the caller read it is refused, and the newer
+/// content stays. On Turso the store is the only writer, so this is the
+/// sequential case; the Postgres race below is the concurrent one.
+async fn a_stale_compare_keeps_the_newer_content(store: Arc<Mutex<dyn Store>>) {
+    let store = store.lock().await;
+    let domain = staged_virtual_domain(&*store).await;
+    let old = store
+        .all_engram_contents(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.path == "wrapped.md")
+        .unwrap();
+    let newer = WRAPPED.replace("written the way", "now written the way");
+    let mut record = EngramRecord::from_engram(
+        &parse_engram(&newer).unwrap(),
+        "wrapped.md",
+        FileStamp {
+            mtime: 1_700_000_100,
+            size: newer.len() as u64,
+            sha256: sha256(&newer),
+        },
+    );
+    record.content = newer.clone();
+    store.upsert_engram(domain, &record).await.unwrap();
+
+    // What a reparse that read the row before that write would write back.
+    let mut stale = EngramRecord::from_engram(
+        &parse_engram(&old.content).unwrap(),
+        "wrapped.md",
+        FileStamp {
+            mtime: 1_700_000_000,
+            size: old.content.len() as u64,
+            sha256: old.sha256.clone(),
+        },
+    );
+    stale.content = old.content.clone();
+    store.begin().await.unwrap();
+    let err = store
+        .upsert_engram_checked(domain, &stale, Some(&old.sha256))
+        .await
+        .expect_err("the row moved on");
+    store.rollback().await.unwrap();
+    assert!(
+        matches!(err, crystalline_index::IndexError::StaleEdit { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        store
+            .engram_content(domain, "wrapped.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(newer.as_str())
+    );
+}
+
+parity!(
+    unreadable_file_leaves_the_domain_behind,
+    an_unreadable_file_leaves_the_domain_behind
+);
+parity!(targeted_pass_never_stamps, a_targeted_pass_never_stamps);
+parity!(
+    stale_compare_keeps_the_newer_content,
+    a_stale_compare_keeps_the_newer_content
+);
+
+/// After a sync whose stamp was refused: the domain is still behind and its
+/// rows are the ones from before the run, because the stamp and the rows it
+/// vouches for commit together.
+async fn assert_rolled_back(store: &dyn Store, domain: DomainId) {
+    assert_eq!(generation(store, domain).await, 0, "nothing was stamped");
+    assert_eq!(
+        wrapped_counts(store, "d").await,
+        (0, 0),
+        "the rows went back with the stamp"
+    );
+}
+
+/// The next sync with the stamp allowed again repeats the whole reparse.
+async fn assert_repeats(store: &dyn Store, root: &Path, domain: DomainId) {
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(report.updated, 2, "the whole domain again: {report:?}");
+    assert_eq!(wrapped_counts(store, "d").await, (1, 1));
+    assert_eq!(generation(store, domain).await, PARSE_GENERATION);
+}
+
+/// A reparse whose stamp is refused, a trigger standing in for a crash
+/// between the rows and the stamp, rolls its rows back too and is repeated
+/// by the next sync. Turso: the trigger is set up through a connection of its
+/// own while no store holds the file.
+#[tokio::test]
+async fn a_refused_stamp_rolls_the_reparse_back_and_it_repeats_on_turso() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("index.db");
+    let root = tmp.path().join("d");
+    let domain = {
+        let store = TursoStore::open(&db).await.unwrap();
+        staged_file_domain(&store, &root).await
+    };
+    let raw = async |sql: &str| {
+        let database = turso::Builder::new_local(db.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        database.connect().unwrap().execute(sql, ()).await.unwrap();
+    };
+    raw(
+        "CREATE TRIGGER refuse_stamp BEFORE UPDATE OF parse_generation ON domain \
+         WHEN NEW.parse_generation > 0 BEGIN SELECT RAISE(ABORT, 'stamp refused'); END",
+    )
+    .await;
+    {
+        let store = TursoStore::open(&db).await.unwrap();
+        sync_domain_with(&store, "d", &root, &params())
+            .await
+            .expect_err("the stamp is refused");
+        assert_rolled_back(&store, domain).await;
+    }
+    raw("DROP TRIGGER refuse_stamp").await;
+    let store = TursoStore::open(&db).await.unwrap();
+    assert_repeats(&store, &root, domain).await;
+}
+
+/// The same on Postgres, with the trigger set up over a plain connection to
+/// the store's schema.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_refused_stamp_rolls_the_reparse_back_and_it_repeats_on_postgres() {
+    use sqlx::Connection;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    let domain = staged_file_domain(&store, &root).await;
+    let mut raw = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO {schema}, public; \
+         CREATE FUNCTION refuse_stamp() RETURNS trigger AS $$ BEGIN \
+           IF NEW.parse_generation > 0 THEN RAISE EXCEPTION 'stamp refused'; END IF; \
+           RETURN NEW; END $$ LANGUAGE plpgsql; \
+         CREATE TRIGGER refuse_stamp BEFORE UPDATE OF parse_generation ON domain \
+           FOR EACH ROW EXECUTE FUNCTION refuse_stamp();"
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+
+    sync_domain_with(&store, "d", &root, &params())
+        .await
+        .expect_err("the stamp is refused");
+    assert_rolled_back(&store, domain).await;
+
+    sqlx::raw_sql("DROP TRIGGER refuse_stamp ON domain")
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    assert_repeats(&store, &root, domain).await;
+    store.drop_schema().await.unwrap();
+}
+
+/// Two instances on one Postgres schema: B holds an uncommitted write of a
+/// virtual engram while A, a reparse that read the row before it, writes the
+/// old text back through the compare-and-swap. A waits for B's row lock, then
+/// finds the row moved on and is refused, and B's text is what stays. Under
+/// READ COMMITTED a compare that only read the row would have passed and
+/// overwritten B's write once it committed.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_concurrent_write_survives_the_reparse_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let a = Arc::new(
+        crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap(),
+    );
+    let b = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let domain = staged_virtual_domain(&*a).await;
+    let old = a
+        .all_engram_contents(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.path == "wrapped.md")
+        .unwrap();
+    let record_of = |text: &str, mtime: i64| {
+        let mut record = EngramRecord::from_engram(
+            &parse_engram(text).unwrap(),
+            "wrapped.md",
+            FileStamp {
+                mtime,
+                size: text.len() as u64,
+                sha256: sha256(text),
+            },
+        );
+        record.content = text.to_string();
+        record
+    };
+
+    // B's write, held open.
+    let newer = WRAPPED.replace("written the way", "now written the way");
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &record_of(&newer, 1_700_000_100))
+        .await
+        .unwrap();
+
+    // A's reparse of the row it read before B's write.
+    let stale = record_of(&old.content, 1_700_000_000);
+    let expected = old.sha256.clone();
+    let writer = Arc::clone(&a);
+    let reparse = tokio::spawn(async move {
+        writer.begin().await.unwrap();
+        let outcome = writer
+            .upsert_engram_checked(domain, &stale, Some(&expected))
+            .await;
+        match &outcome {
+            Ok(_) => writer.commit().await.unwrap(),
+            Err(_) => writer.rollback().await.unwrap(),
+        }
+        outcome
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!reparse.is_finished(), "A waits for B's row lock");
+    b.commit().await.unwrap();
+
+    let outcome = reparse.await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Err(crystalline_index::IndexError::StaleEdit { .. })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        a.engram_content(domain, "wrapped.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(newer.as_str()),
+        "B's write is what stays"
+    );
+    a.drop_schema().await.unwrap();
+}

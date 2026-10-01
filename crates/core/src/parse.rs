@@ -583,11 +583,21 @@ fn scan_body(
 /// is indented under the bullet or, as a lazy continuation, not indented at
 /// all. The first of these ends the bullet's text: a blank line, a code fence,
 /// a heading, another list item (a nested `  - ...` is its own bullet), a
-/// block quote or a thematic break. Returns `start` for a bullet on one line.
+/// block quote, a thematic break, an HTML block start (`<`) or a table row
+/// (`|`). Returns `start` for a bullet on one line.
+///
+/// A line that ends inside an unclosed `[[` link, or a bullet's first line
+/// whose `[category` bracket is still open, is not joined with the next one:
+/// the wikilink rename and the near-miss check read one line at a time, so a
+/// link or a category split over two lines stays the per-line typo it always
+/// was rather than becoming a relation or an observation they cannot see.
 pub(crate) fn bullet_end(lines: &[BodyLine<'_>], start: usize) -> usize {
+    if unclosed_category(lines[start].text) {
+        return start;
+    }
     let mut end = start;
     for (offset, bl) in lines.iter().enumerate().skip(start + 1) {
-        if bl.in_fence || !continues_bullet(bl.text) {
+        if bl.in_fence || !continues_bullet(bl.text) || ends_inside_link(lines[end].text) {
             break;
         }
         end = offset;
@@ -596,8 +606,10 @@ pub(crate) fn bullet_end(lines: &[BodyLine<'_>], start: usize) -> usize {
 }
 
 /// Whether a line that follows a bullet's text continues it rather than
-/// ending it. See [`bullet_end`] for the rule.
-fn continues_bullet(line: &str) -> bool {
+/// ending it. See [`bullet_end`] for the rule. Also what the section editors
+/// ask before they put a block directly above an existing line, so an
+/// inserted bullet never swallows the prose under it.
+pub(crate) fn continues_bullet(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || parse_heading(line).is_some() {
         return false;
@@ -607,7 +619,31 @@ fn continues_bullet(line: &str) -> bool {
     if fence_marker(trimmed).is_some() {
         return false;
     }
-    !(starts_list_item(trimmed) || trimmed.starts_with('>') || is_thematic_break(trimmed))
+    !(starts_list_item(trimmed)
+        || trimmed.starts_with('>')
+        || trimmed.starts_with('<')
+        || trimmed.starts_with('|')
+        || is_thematic_break(trimmed))
+}
+
+/// Whether the line's last `[[` (outside inline code) has no `]]` after it.
+fn ends_inside_link(line: &str) -> bool {
+    let masked: Cow<'_, str> = if line.contains('`') {
+        Cow::Owned(mask_inline_code(line))
+    } else {
+        Cow::Borrowed(line)
+    };
+    match masked.rfind("[[") {
+        Some(open) => !masked[open + 2..].contains("]]"),
+        None => false,
+    }
+}
+
+/// Whether a top-level bullet line opens a `[category` bracket it never
+/// closes on that line.
+fn unclosed_category(line: &str) -> bool {
+    line.strip_prefix("- [")
+        .is_some_and(|rest| !rest.contains(']'))
 }
 
 /// Whether trimmed line text opens a list item that may interrupt a
@@ -1070,6 +1106,36 @@ mod tests {
         assert_eq!(obs[0].tags, vec!["tag"]);
         assert!(!obs[0].content.contains('\r'));
         assert_eq!((obs[0].line, obs[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn a_line_ending_inside_an_open_link_or_category_is_not_joined() {
+        // Read per line, as the rename and the near-miss check read it: no
+        // relation to `Long Name` and no observation of category `cat egory`.
+        let (obs, relations, links, _) =
+            scan_body("- relates_to [[Long\n  Name]]\n- [cat\n  egory] text\n", 1);
+        assert!(relations.is_empty(), "{relations:?}");
+        assert!(links.is_empty(), "{links:?}");
+        assert!(obs.is_empty(), "{obs:?}");
+        // A link closed on its own line still lets the bullet wrap, and one
+        // inside inline code is not a link at all.
+        let obs = observations_of(
+            "- [fact] see [[Done]] and\n  more\n- [fact] code `[[x` here\n  wraps\n",
+        );
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["see [[Done]] and more", "code `[[x` here wraps"]
+        );
+    }
+
+    #[test]
+    fn an_html_block_or_a_table_row_ends_a_bullet() {
+        let obs = observations_of(
+            "- [fact] one\n<!-- note -->\n- [fact] two\n| a | b |\n|---|---|\n- [fact] three\n  <b>inline</b> is html too\n",
+        );
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(contents, vec!["one", "two", "three"]);
     }
 
     #[test]

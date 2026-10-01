@@ -9734,10 +9734,11 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 164,
+        census.sites, 166,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         66 per backend in mod.rs (the two `EXISTS` probes of the contradiction pair \
-         write are the newest, waived by id; before them the emptiness probe of \
+         67 per backend in mod.rs (the guarded compare of `upsert_engram_checked` is the \
+         newest, on the base row; before it the two `EXISTS` probes of the contradiction \
+         pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
          of `engrams_referencing_domains`, the move's `readdress_engram` and \
          `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 14 in the shared \
