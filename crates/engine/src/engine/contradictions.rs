@@ -17,12 +17,14 @@
 //! through a download would keep the process alive until the watchdog.
 
 use super::*;
+use crystalline_index::embed::line_similarity_floor;
 use crystalline_index::nli::{
     CandidateFacts, CandidatePair, ContradictionScorer, MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE,
-    NliModel, NliProfile, contradiction_candidates, eligible, line_pairs, max_related_pairs,
-    nli_model, observations_digest, pending_pairs, related_threshold, score_rows, scorer_inputs,
+    NliModel, NliProfile, contradiction_candidates, eligible, eligible_lines, line_pairs,
+    max_related_pairs, nli_model, observations_digest, pending_pairs, related_threshold,
+    score_rows, scorer_inputs,
 };
-use crystalline_index::{ContradictionRow, ScoredPair};
+use crystalline_index::{ContradictionRow, ObservationVector, ScoredPair};
 
 /// The key whose change lifts a failed load and makes pending unknown again.
 const CONTRADICTIONS_KEY: &str = "evolve.contradictions";
@@ -111,6 +113,28 @@ struct DomainWork {
     /// walk publishes. `None` for a domain skipped as settled, whose earlier
     /// record still holds.
     count: Option<DomainCount>,
+    /// What the walk's line step saw. `None` for a domain skipped as settled.
+    lines: Option<LineCoverage>,
+}
+
+/// What a walk's line step saw of one parsed domain.
+pub(crate) struct LineCoverage {
+    /// Distinct eligible lines.
+    pub(crate) eligible: usize,
+    /// How many of those carry a vector now.
+    pub(crate) embedded: usize,
+    /// Every eligible line's hash: the lines in use, for pruning.
+    pub(crate) hashes: HashSet<String>,
+    /// Why some lines have no vector, when a batch was refused or no
+    /// provider is loaded.
+    pub(crate) error: Option<String>,
+}
+
+impl LineCoverage {
+    /// Whether every eligible line has its vector.
+    fn complete(&self) -> bool {
+        self.embedded >= self.eligible
+    }
 }
 
 impl Engine {
@@ -139,7 +163,14 @@ impl Engine {
     /// embeddings line's words (`metal`, `cpu (fallback: ...)`), and `null`
     /// while no model is in memory (never loaded, dropped after its idle
     /// time, or a direct read with no worker): no guess at a device nothing
-    /// runs on.
+    /// runs on. `embedding_model` is the id the line vectors are stored
+    /// under, `line_floor` that model's line-similarity floor (`null` when it
+    /// has none), and `line_floor_missing` says the check is on but `V302`
+    /// cannot run because the model has no floor. `lines_eligible` and
+    /// `lines_embedded` are the distinct observation lines that can take part
+    /// and how many of them carry a vector, as the last walk counted them,
+    /// and `null` like `pending_pairs` until a walk ran or while the check is
+    /// off.
     pub async fn contradictions_status(&self) -> Result<Value> {
         let profile = self
             .config
@@ -164,7 +195,27 @@ impl Engine {
         let load_retry = load_failed && state.load_retry_at.is_some();
         let embedding_pending = state.settled.values().any(|s| s.coverage.is_some());
         let last_error = state.last_error.clone();
+        let (lines_embedded, lines_eligible) = match (model, &state.pending) {
+            (Some(_), Some(_)) => (
+                Some(
+                    state
+                        .counted
+                        .values()
+                        .map(|c| c.lines_embedded)
+                        .sum::<usize>(),
+                ),
+                Some(
+                    state
+                        .counted
+                        .values()
+                        .map(|c| c.lines_eligible)
+                        .sum::<usize>(),
+                ),
+            ),
+            _ => (None, None),
+        };
         drop(state);
+        let line_floor = self.line_floor();
         let device = model.and_then(|m| {
             self.scorer
                 .lock()
@@ -186,7 +237,19 @@ impl Engine {
             "read_only": self.read_only,
             "embedding_pending": embedding_pending,
             "device": device,
+            "embedding_model": self.model_id,
+            "line_floor": line_floor,
+            "line_floor_missing": model.is_some() && line_floor.is_none(),
+            "lines_embedded": lines_embedded,
+            "lines_eligible": lines_eligible,
         }))
+    }
+
+    /// The line-similarity floor of the embedding model this engine stores
+    /// vectors under; `None` when that model has none, and `V302` then does
+    /// not run.
+    pub fn line_floor(&self) -> Option<f64> {
+        line_similarity_floor(&self.model_id)
     }
 
     /// Called by `configure` after every set or unset: a change of
@@ -200,6 +263,12 @@ impl Engine {
             return;
         }
         self.reset_contradiction_state();
+        // Switched off: the next pass clears. Switched on: the next pass
+        // embeds and scores. Either way it is asked for now, not at the next
+        // write.
+        self.contradiction_data_cleared
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.request_contradictions();
     }
 
     /// Forget what the pass remembers about the domain `name`: called when
@@ -271,6 +340,9 @@ impl Engine {
         let Some(model) = self.contradiction_model() else {
             return false;
         };
+        if self.line_floor().is_none() {
+            return false;
+        }
         if self.contradictions_in_flight() {
             return false;
         }
@@ -352,8 +424,13 @@ impl Engine {
         let Some(first) = self.contradiction_model() else {
             self.reset_contradiction_state();
             *self.scorer.lock().unwrap() = None;
+            self.clear_contradiction_data_once().await?;
             return Ok(ContradictionOutcome::Off);
         };
+        if self.line_floor().is_none() {
+            *self.scorer.lock().unwrap() = None;
+            return Ok(ContradictionOutcome::NoLineFloor);
+        }
         if self.load_blocked(first) {
             return Ok(ContradictionOutcome::ModelUnavailable);
         }
@@ -408,6 +485,191 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// The off switch: delete the stored scores and the line vectors, once
+    /// per process and once per setting change. On a store this instance
+    /// owns alone, the whole of both tables: the first off pass after a start
+    /// runs before the startup sync claims any file domain, so a scope read
+    /// then would hold the virtual domains only and leave the file domains'
+    /// rows behind for good. On a shared database, only the scores of the
+    /// domains in this instance's scope, and no line vectors, which other
+    /// instances' domains may use. A failure leaves the flag unset, so the
+    /// next off pass tries again.
+    async fn clear_contradiction_data_once(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.contradiction_data_cleared.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let done = async {
+            let store = self.store.lock().await;
+            if store.shares_database() {
+                let scope = self.embed_scope(&*store).await?;
+                store.clear_contradictions(scope.as_deref()).await?;
+            } else {
+                store.clear_contradictions(None).await?;
+                store.clear_observation_vectors().await?;
+            }
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        if done.is_err() {
+            self.contradiction_data_cleared
+                .store(false, Ordering::SeqCst);
+        }
+        done
+    }
+
+    /// Delete the line vectors no current eligible line uses, after a walk
+    /// that parsed every domain in scope; and, once per process, every
+    /// vector of another embedding model. Only on a store this instance owns
+    /// alone: on a shared database another instance's domains use vectors
+    /// this one never sees.
+    async fn prune_line_vectors(&self, work: &[DomainWork]) -> Result<usize> {
+        use std::sync::atomic::Ordering;
+        if !self.line_vectors_model_pruned.swap(true, Ordering::SeqCst) {
+            let done = {
+                let store = self.store.lock().await;
+                store
+                    .delete_observation_vectors_except(&self.model_id)
+                    .await
+            };
+            if let Err(e) = done {
+                // Tried again on the next full walk.
+                self.line_vectors_model_pruned
+                    .store(false, Ordering::SeqCst);
+                return Err(e.into());
+            }
+        }
+        let in_use: HashSet<&str> = work
+            .iter()
+            .filter_map(|w| w.lines.as_ref())
+            .flat_map(|l| l.hashes.iter().map(String::as_str))
+            .collect();
+        let stored = {
+            let store = self.store.lock().await;
+            store.observation_vector_hashes(&self.model_id).await?
+        };
+        let unused: Vec<String> = stored
+            .into_iter()
+            .filter(|h| !in_use.contains(h.as_str()))
+            .collect();
+        if unused.is_empty() {
+            return Ok(0);
+        }
+        let store = self.store.lock().await;
+        Ok(store
+            .delete_observation_vectors(&self.model_id, &unused)
+            .await? as usize)
+    }
+
+    /// Give every eligible line of `facts` a vector: read which already have
+    /// one, embed the rest in batches through the active provider (the same
+    /// device as the chunks) and store them. The store lock is taken per read
+    /// and per batch write, never across an embed. A batch the provider
+    /// refuses, or the store does not take, is skipped and named in `error`;
+    /// its lines stay without a vector, so the domain does not settle and the
+    /// next walk tries again.
+    async fn embed_lines(
+        &self,
+        model: &'static NliModel,
+        facts: &[ContradictionFact],
+    ) -> Result<LineCoverage> {
+        let lines = {
+            let views: Vec<CandidateFacts<'_>> =
+                facts.iter().map(ContradictionFact::view).collect();
+            eligible_lines(&views)
+        };
+        let hashes: Vec<String> = lines.keys().cloned().collect();
+        let present = if hashes.is_empty() {
+            HashSet::new()
+        } else {
+            let store = self.store.lock().await;
+            store
+                .observation_vectors_present(&self.model_id, &hashes)
+                .await?
+        };
+        let missing: Vec<(&String, &String)> = lines
+            .iter()
+            .filter(|(h, _)| !present.contains(*h))
+            .collect();
+        let mut embedded = present.len();
+        let mut error = None;
+        if !missing.is_empty() {
+            match self.provider() {
+                None => {
+                    error = Some(
+                        "observation lines could not be embedded: the embedding provider is not loaded yet"
+                            .to_string(),
+                    )
+                }
+                Some(provider) => {
+                    let started = std::time::Instant::now();
+                    let mut stored = 0usize;
+                    for batch in missing.chunks(EMBED_BATCH) {
+                        // Off, or another profile, ends the step at once.
+                        if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
+                            break;
+                        }
+                        let texts: Vec<String> =
+                            batch.iter().map(|(_, t)| (*t).clone()).collect();
+                        match provider.embed(&texts).await {
+                            Ok(vectors) if vectors.len() == batch.len() => {
+                                let rows: Vec<ObservationVector> = batch
+                                    .iter()
+                                    .zip(vectors)
+                                    .map(|((hash, _), vector)| ObservationVector {
+                                        hash: (*hash).clone(),
+                                        vector,
+                                    })
+                                    .collect();
+                                // A refused write is one batch's failure, not
+                                // the walk's: its lines stay without a vector.
+                                let written = {
+                                    let store = self.store.lock().await;
+                                    store
+                                        .store_observation_vectors(&self.model_id, &rows)
+                                        .await
+                                };
+                                match written {
+                                    Ok(()) => stored += rows.len(),
+                                    Err(e) => {
+                                        error = Some(format!(
+                                            "observation line vectors could not be stored: {e}"
+                                        ))
+                                    }
+                                }
+                            }
+                            Ok(vectors) => {
+                                error = Some(format!(
+                                    "observation lines could not be embedded: the provider returned {} vectors for {} lines",
+                                    vectors.len(),
+                                    batch.len()
+                                ))
+                            }
+                            Err(e) => {
+                                error =
+                                    Some(format!("observation lines could not be embedded: {e}"))
+                            }
+                        }
+                    }
+                    embedded += stored;
+                    if stored > 0 {
+                        tracing::info!(
+                            lines = stored,
+                            ms = started.elapsed().as_millis() as u64,
+                            "embedded observation lines for the contradiction check"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(LineCoverage {
+            eligible: lines.len(),
+            embedded,
+            hashes: lines.into_keys().collect(),
+            error,
+        })
+    }
+
     /// Whether `model`'s last load failed and nothing has lifted it since.
     /// A failure recorded for another model is forgotten here: the profile
     /// moved, which is a setting change. A failed download whose wait is over
@@ -450,7 +712,24 @@ impl Engine {
             (state.generation, due)
         };
         let retry = retry && self.contradiction_scorer_loaded();
-        let work = self.contradiction_work(model, retry).await?;
+        let (work, complete) = self.contradiction_work(model, retry).await?;
+        let line_error = work
+            .iter()
+            .find_map(|w| w.lines.as_ref().and_then(|l| l.error.clone()));
+        // Pruned here, before the return below for a walk with nothing
+        // pending: that is most walks after a delete, the one that leaves
+        // vectors unused. Only after a walk that parsed every domain in
+        // scope and embedded every line, and never on a shared database.
+        let shared = self.store.lock().await.shares_database();
+        if complete && line_error.is_none() && !shared {
+            match self.prune_line_vectors(&work).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(vectors = n, "pruned unused observation line vectors"),
+                Err(e) => {
+                    tracing::warn!("could not prune unused observation line vectors: {e}")
+                }
+            }
+        }
         let mut pending: BTreeMap<String, usize> = work
             .iter()
             .map(|w| (w.name.clone(), w.pending.len() + w.known_failing))
@@ -461,7 +740,7 @@ impl Engine {
             .collect();
         if work.iter().all(|w| w.pending.is_empty()) {
             let remaining = pending.values().sum();
-            self.publish_walk(model, generation, &work, pending, failures, None);
+            self.publish_walk(model, generation, &work, pending, failures, line_error);
             return Ok(ContradictionOutcome::Scored {
                 pairs: 0,
                 line_pairs: 0,
@@ -594,7 +873,14 @@ impl Engine {
             );
         }
         let remaining = pending.values().sum();
-        self.publish_walk(model, generation, &work, pending, failures, batch_error);
+        self.publish_walk(
+            model,
+            generation,
+            &work,
+            pending,
+            failures,
+            batch_error.or(line_error),
+        );
         Ok(ContradictionOutcome::Scored {
             pairs: pairs_done,
             line_pairs: lines_done,
@@ -660,7 +946,10 @@ impl Engine {
         for w in work {
             let failing = failures.remove(&w.name).unwrap_or_default();
             let left = pending.get(&w.name).copied().unwrap_or(0);
-            if left == failing.len() {
+            // A line without its vector keeps the domain unsettled, so the
+            // next walk parses it again and tries the embedding once more.
+            let lines_complete = w.lines.as_ref().is_none_or(LineCoverage::complete);
+            if left == failing.len() && lines_complete {
                 state.settled.insert(
                     w.name.clone(),
                     SettledDomain {
@@ -688,13 +977,17 @@ impl Engine {
         true
     }
 
-    /// The first half of a walk: every domain in scope with its pending pairs.
-    /// Known failures are left alone unless `retry`.
+    /// The first half of a walk: every domain in scope with its pending pairs
+    /// and its lines embedded. Known failures are left alone unless `retry`.
+    /// The `bool` says every known domain was parsed this walk: none skipped
+    /// as settled, out of this instance's scope, or for a missing content
+    /// source or domain row. Only such a walk knows every line in use, so
+    /// only such a walk may prune.
     async fn contradiction_work(
         &self,
         model: &'static NliModel,
         retry: bool,
-    ) -> Result<Vec<DomainWork>> {
+    ) -> Result<(Vec<DomainWork>, bool)> {
         let (scope, coverage) = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
@@ -710,18 +1003,25 @@ impl Engine {
         names.dedup();
         let (threshold, max_pairs) = (related_threshold(), max_related_pairs());
         let mut out = Vec::new();
+        let mut complete = true;
         for name in names {
             let Ok(source) = self.content_source(&name) else {
+                complete = false;
                 continue;
             };
             let (domain_id, stamps) = {
                 let store = self.store.lock().await;
                 let Some(domain_id) = store.domain_id(&name).await? else {
+                    complete = false;
                     continue;
                 };
                 (domain_id, store.file_stamps(domain_id).await?)
             };
+            // Out of scope is not parsed either: a daemon's file domains are
+            // out of its scope until the startup sync claims them, and their
+            // lines must not read as unused meanwhile.
             if scope.as_ref().is_some_and(|ids| !ids.contains(&domain_id)) {
+                complete = false;
                 continue;
             }
             let digest = walk_digest(model, threshold, &self.model_id, domain_id, &stamps);
@@ -749,6 +1049,7 @@ impl Engine {
                 (settled, known)
             };
             if let Some(settle) = settled {
+                complete = false;
                 out.push(DomainWork {
                     name,
                     id: domain_id,
@@ -758,12 +1059,14 @@ impl Engine {
                     failures: known,
                     settle,
                     count: None,
+                    lines: None,
                 });
                 continue;
             }
             let facts = self
                 .contradiction_facts(&source, &name, domain_id, &stamps, true)
                 .await?;
+            let lines = self.embed_lines(model, &facts).await?;
             // Coverage below 100 percent never holds a pair back: an engram
             // with a lead vector is a candidate whatever else is unembedded.
             // It only decides whether a later embedding can add a pair
@@ -788,6 +1091,8 @@ impl Engine {
                 capped: false,
                 vectors_capped: None,
                 unembedded,
+                lines_eligible: lines.eligible,
+                lines_embedded: lines.embedded,
             };
             let scored = {
                 let store = self.store.lock().await;
@@ -846,9 +1151,10 @@ impl Engine {
                 failures,
                 settle,
                 count: Some(count),
+                lines: Some(lines),
             });
         }
-        Ok(out)
+        Ok((out, complete))
     }
 
     /// The contradiction check's facts for one domain's base engrams: the
@@ -954,6 +1260,14 @@ impl Engine {
         let Some(model) = self.contradiction_model() else {
             return Ok(SweepContradictions::default());
         };
+        // No measured floor for this embedding model: V302 does not run, and
+        // rows another model's floor left behind are not read.
+        if self.line_floor().is_none() {
+            return Ok(SweepContradictions {
+                model: Some(model),
+                ..SweepContradictions::default()
+            });
+        }
         let (rows, now) = {
             let store = self.store.lock().await;
             let rows = store

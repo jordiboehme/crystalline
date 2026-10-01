@@ -6,19 +6,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crystalline_core::config::{
-    DomainEntry, EvolveConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+    DomainEntry, EmbeddingsConfig, EvolveConfig, GlobalConfig, ResponseFormat, ServiceConfig,
 };
+use crystalline_index::embed::DEFAULT_MODEL_ID;
 use crystalline_index::nli::{
     ContradictionScorer, NliModel, NliProfile, RETIRED_NLI_REPOS, StubScorer, nli_model,
 };
-use crystalline_index::{ContradictionRow, EmbeddingProvider, IndexError, TursoStore};
+use crystalline_index::{
+    ContradictionRow, EmbeddingProvider, IndexError, ObservationVector, TursoStore,
+};
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::engine::{
     ConfigureAction, ContradictionOutcome, NLI_FETCH_RETRY_FIRST, NLI_FETCH_RETRY_MAX,
     NLI_IDLE_DROP, ScorerLoader,
 };
-use crystalline_service::params::{EditParams, EvolveParams, MoveParams, WriteParams};
+use crystalline_service::params::{
+    DeleteParams, EditParams, EvolveParams, MoveParams, WriteParams,
+};
 use tokio::sync::Mutex;
 
 /// One virtual domain `notes` on an engine with the topic provider, so two
@@ -231,6 +236,36 @@ const NODE_18: &str = "The retry queue build runs on a pinned runtime.\n\n- [fac
 const NODE_20: &str = "The retry queue build runs on a pinned runtime.\n\n- [fact] The build uses Node 20\n- [fact] Retries back off on the queue";
 const NODE_19: &str = "The retry queue build runs on a pinned runtime.\n\n- [fact] The build breaks on Node 19\n- [fact] Retries back off on the queue";
 const FRIDAYS: &str = "Docking clamps seat in bay three under thrust.\n\n- [fact] Deployments run on Fridays\n- [fact] The clamps misread below eight degrees";
+const POISONED: &str = "The retry queue build runs on a pinned runtime.\n\n- [fact] The retry queue is poisoned\n- [fact] Retries back off on the queue";
+
+/// Embeds like [`crate::support::TopicEmbedder`] but refuses a batch that
+/// holds exactly the line "The retry queue is poisoned", which only a line
+/// embedding ever is: a chunk carries the title and body around it.
+struct PoisonLine;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for PoisonLine {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|t| t == "The retry queue is poisoned") {
+            return Err(IndexError::Embedding(
+                "the provider refused a line".to_string(),
+            ));
+        }
+        Ok(texts
+            .iter()
+            .map(|t| crate::support::TopicEmbedder::embed_one(t))
+            .collect())
+    }
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+    fn dims(&self) -> usize {
+        4
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
 
 fn full() -> &'static NliModel {
     nli_model(NliProfile::Full)
@@ -486,15 +521,15 @@ async fn a_repeated_observation_line_is_scored_once_and_the_pass_drains() {
     assert!(!engine.contradictions_wanted());
 }
 
-/// Turn the check off, let a pass see it, and turn it on again: the pass
-/// forgets its settled digests, so the next walk parses every domain.
+/// Set the profile again: the pass forgets its settled digests and its
+/// pending count, so the next walk parses every domain. Not by way of off,
+/// which now deletes the stored scores and line vectors as well.
 async fn reparse_next(engine: &Engine) {
-    set(engine, "evolve.contradictions", "off").await;
-    assert_eq!(
-        engine.score_contradictions().await.unwrap(),
-        ContradictionOutcome::Off
-    );
     set(engine, "evolve.contradictions", "full").await;
+    assert!(
+        engine.contradictions_status().await.unwrap()["pending_pairs"].is_null(),
+        "pending is unknown again"
+    );
 }
 
 /// Review focus 2: an engram with no observations never enters the pending
@@ -971,7 +1006,10 @@ async fn a_chunk_the_provider_always_rejects_does_not_hold_the_pass() {
     );
 }
 
-/// Embeds like the topic provider, and rejects every batch while `closed`.
+/// Embeds like the topic provider, and rejects every chunk batch while
+/// `closed`. A chunk carries the title above its body, so it holds a line
+/// break; an observation line is folded and never does, so the walk's line
+/// embeddings go through and only the lead vectors wait.
 struct GatedTopicEmbedder {
     closed: AtomicBool,
 }
@@ -979,7 +1017,7 @@ struct GatedTopicEmbedder {
 #[async_trait::async_trait]
 impl EmbeddingProvider for GatedTopicEmbedder {
     async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) && texts.iter().any(|t| t.contains('\n')) {
             return Err(IndexError::Embedding("not yet".to_string()));
         }
         Ok(texts
@@ -2372,4 +2410,342 @@ async fn a_frontmatter_edit_rescores_nothing_and_a_changed_line_rescores_the_pai
     );
     assert_eq!(loads.load(Ordering::SeqCst), 2);
     assert!(s.forwards() > forwards);
+}
+
+// --- line vectors (V302 line filter) ------------------------------------------
+
+/// The line vectors the engine's own model keeps.
+async fn line_hashes(engine: &Engine) -> Vec<String> {
+    hashes_of(engine, DEFAULT_MODEL_ID).await
+}
+
+/// The line vectors `model` keeps.
+async fn hashes_of(engine: &Engine, model: &str) -> Vec<String> {
+    let store = engine.store();
+    let store = store.lock().await;
+    let mut all = store.observation_vector_hashes(model).await.unwrap();
+    all.sort();
+    all
+}
+
+/// An engine whose embedding model has no measured line-similarity floor (a
+/// remote model), with the stub loader counting its loads in `loads`.
+async fn engine_without_floor(loads: Arc<AtomicUsize>) -> (tempfile::TempDir, Arc<Engine>) {
+    let (tmp, engine) =
+        engine_with_config(Arc::new(crate::support::TopicEmbedder), &["notes"], |cfg| {
+            cfg.embeddings = Some(EmbeddingsConfig {
+                provider: "remote".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                endpoint: Some("http://127.0.0.1:9".to_string()),
+                api_key_env: None,
+            });
+        })
+        .await;
+    (tmp, with_loader(engine, loader(stub(), loads)))
+}
+
+/// Embeds like [`crate::support::TopicEmbedder`] and records every text it
+/// was handed, so a test can tell line embeddings from chunk embeddings.
+struct Recording(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for Recording {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        self.0.lock().unwrap().extend(texts.iter().cloned());
+        Ok(texts
+            .iter()
+            .map(|t| crate::support::TopicEmbedder::embed_one(t))
+            .collect())
+    }
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+    fn dims(&self) -> usize {
+        4
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+fn delete_fridays() -> DeleteParams {
+    DeleteParams {
+        identifier: "fridays".to_string(),
+        domain: "notes".to_string(),
+        expected_checksum: None,
+    }
+}
+
+#[tokio::test]
+async fn line_vectors_stay_empty_while_off() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert!(
+        line_hashes(&engine).await.is_empty(),
+        "off embeds and stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn line_vectors_are_embedded_once_per_text_and_shared() {
+    let recording = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+    let (_tmp, engine) = engine_on(recording.clone()).await;
+    let engine = with_loader(engine, loader(stub(), Arc::new(AtomicUsize::new(0))));
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    recording.0.lock().unwrap().clear();
+    engine.score_contradictions().await.unwrap();
+    // Eighteen, Twenty and Fridays hold five distinct lines; "Retries back
+    // off on the queue" is in two engrams and is embedded once.
+    assert_eq!(line_hashes(&engine).await.len(), 5);
+    let lines: Vec<String> = recording.0.lock().unwrap().clone();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|t| *t == "Retries back off on the queue")
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    // An edit embeds only the line whose text is new.
+    engine.edit_engram(&append_to_twenty()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    recording.0.lock().unwrap().clear();
+    engine.score_contradictions().await.unwrap();
+    let lines: Vec<String> = recording.0.lock().unwrap().clone();
+    assert_eq!(lines, vec!["The queue drains hourly".to_string()]);
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["lines_eligible"], 6);
+    assert_eq!(status["lines_embedded"], 6);
+    assert_eq!(status["line_floor"], 0.86);
+    assert_eq!(status["line_floor_missing"], false);
+    assert_eq!(status["embedding_model"], DEFAULT_MODEL_ID);
+}
+
+#[tokio::test]
+async fn turning_off_clears_line_vectors_and_scores() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert!(!line_hashes(&engine).await.is_empty());
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+    set(&engine, "evolve.contradictions", "off").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert!(line_hashes(&engine).await.is_empty());
+    assert!(rows(&engine, full().repo).await.is_empty());
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["scored_pairs"], 0);
+    assert!(
+        status["lines_embedded"].is_null(),
+        "off counts nothing: {status}"
+    );
+    // On again: embedded and scored anew.
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+    assert_eq!(line_hashes(&engine).await.len(), 5);
+}
+
+/// Preflight H1: a daemon always carries an instance id, so the off switch
+/// and the prune are gated on a shared database, never on the id. On turso
+/// with an id, off still deletes the line vectors and a full walk still
+/// prunes.
+#[tokio::test]
+async fn an_instance_id_on_an_unshared_store_still_clears_and_prunes() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    let engine = Arc::new(
+        Arc::try_unwrap(engine)
+            .ok()
+            .expect("one owner")
+            .with_instance_id("x".to_string()),
+    );
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(line_hashes(&engine).await.len(), 5);
+    engine.delete_engram(&delete_fridays()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(line_hashes(&engine).await.len(), 3, "pruned with an id set");
+    set(&engine, "evolve.contradictions", "off").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert!(
+        line_hashes(&engine).await.is_empty(),
+        "cleared with an id set"
+    );
+    assert!(rows(&engine, full().repo).await.is_empty());
+}
+
+/// Review focus 5.
+#[tokio::test]
+async fn a_setting_turned_off_while_the_daemon_was_down_clears_on_the_first_pass() {
+    let (tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    // A second engine on the same store, as a restart with the setting off.
+    let mut cfg = engine.config();
+    cfg.evolve = Some(EvolveConfig {
+        contradictions: Some("off".to_string()),
+    });
+    let restarted = Engine::new(
+        engine.store(),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(tmp.path().join("config.yaml")),
+    );
+    assert_eq!(
+        restarted.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert!(line_hashes(&restarted).await.is_empty());
+    assert!(rows(&restarted, full().repo).await.is_empty());
+}
+
+/// The same for a file domain on a restarted daemon: its first off pass runs
+/// before the startup sync claims any file domain, so the instance's scope
+/// holds none yet. On an unshared store the clear is the whole table's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_off_restart_clears_a_file_domain_before_any_claim() {
+    let (tmp, _dir, engine) = file_engine(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
+    assert!(!line_hashes(&engine).await.is_empty());
+    let mut cfg = engine.config();
+    cfg.evolve = Some(EvolveConfig {
+        contradictions: Some("off".to_string()),
+    });
+    let restarted = Engine::new(
+        engine.store(),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(tmp.path().join("config.yaml")),
+    )
+    .with_instance_id("x".to_string());
+    assert_eq!(
+        restarted.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert!(line_hashes(&restarted).await.is_empty());
+    assert!(rows(&restarted, full().repo).await.is_empty());
+}
+
+/// Review focus 4, the engine half.
+#[tokio::test]
+async fn an_embedding_model_without_a_floor_runs_no_v302_and_says_why() {
+    let loads = Arc::new(AtomicUsize::new(0));
+    let (_tmp, engine) = engine_without_floor(loads.clone()).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::NoLineFloor
+    );
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        0,
+        "no model is loaded for nothing"
+    );
+    assert!(!engine.contradictions_wanted(), "the tick never asks");
+    assert!(
+        hashes_of(&engine, "text-embedding-3-small")
+            .await
+            .is_empty(),
+        "nothing is embedded for a model without a floor"
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["line_floor_missing"], true);
+    assert!(status["line_floor"].is_null());
+    assert_eq!(status["embedding_model"], "text-embedding-3-small");
+}
+
+#[tokio::test]
+async fn vectors_of_lines_nobody_uses_are_pruned_after_a_full_walk() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(line_hashes(&engine).await.len(), 5);
+    engine.delete_engram(&delete_fridays()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    // A setting change makes the next walk parse every domain again.
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        line_hashes(&engine).await.len(),
+        3,
+        "Fridays' two lines are used by no current engram"
+    );
+}
+
+/// Preflight M12: a changed embedding model means a restart, and the first
+/// full walk under the new one drops every line vector of the old one.
+#[tokio::test]
+async fn a_model_switch_drops_the_old_models_line_vectors() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        store
+            .store_observation_vectors(
+                "bge-small-en-v1.5",
+                &[ObservationVector {
+                    hash: "a".repeat(64),
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(hashes_of(&engine, "bge-small-en-v1.5").await.len(), 1);
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    assert!(hashes_of(&engine, "bge-small-en-v1.5").await.is_empty());
+    assert_eq!(line_hashes(&engine).await.len(), 5);
+}
+
+#[tokio::test]
+async fn a_domain_with_a_missing_line_vector_never_settles() {
+    let (_tmp, engine) = engine_on(Arc::new(PoisonLine)).await;
+    let engine = with_loader(engine, loader(stub(), Arc::new(AtomicUsize::new(0))));
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine
+        .write_engram(&write("Poisoned", POISONED))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    engine.score_contradictions().await.unwrap();
+    let walks = engine.contradiction_fact_walks();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        walks + 1,
+        "a missing line vector keeps the domain from settling, so it is parsed again"
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert!(
+        status["lines_embedded"].as_u64() < status["lines_eligible"].as_u64(),
+        "{status}"
+    );
+    assert!(
+        status["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("observation lines could not be embedded")),
+        "{status}"
+    );
 }

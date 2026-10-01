@@ -779,6 +779,14 @@ pub struct Engine {
     scorer: std::sync::Mutex<Option<LoadedScorer>>,
     // How a scorer is built; a test seam, the real loader otherwise.
     scorer_loader: ScorerLoader,
+    // Set once the off switch has cleared the stored scores and line vectors
+    // in this process, and unset by every change of `evolve.contradictions`:
+    // so the first off pass after a start clears what a setting changed while
+    // the daemon was down left behind, and later off passes cost nothing.
+    contradiction_data_cleared: std::sync::atomic::AtomicBool,
+    // Set once the line vectors of every other embedding model were deleted
+    // in this process; the model cannot change without a restart.
+    line_vectors_model_pruned: std::sync::atomic::AtomicBool,
     // A test seam like `detection_walks`: how many times the contradiction
     // pass has parsed a domain's engrams. A settled domain is skipped, and a
     // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
@@ -1779,6 +1787,10 @@ pub enum ContradictionOutcome {
     /// reported by status; the load is tried again only once the setting is
     /// set again or the daemon starts again.
     ModelUnavailable,
+    /// The embedding model has no measured line-similarity floor, so `V302`
+    /// does not run: nothing is embedded, loaded or scored, and status and
+    /// doctor say why.
+    NoLineFloor,
     /// This call scored `pairs` engram pairs over `line_pairs` line pairs and
     /// left `remaining` pending for the next pass.
     Scored {
@@ -1847,6 +1859,10 @@ pub(crate) struct DomainCount {
     pub(crate) vectors_capped: Option<usize>,
     /// Current engrams with observations and no lead vector yet.
     pub(crate) unembedded: usize,
+    /// Distinct observation lines of engrams that can take part.
+    pub(crate) lines_eligible: usize,
+    /// How many of those carry a vector for the embedding model.
+    pub(crate) lines_embedded: usize,
 }
 
 /// One engram pair the scorer or the store failed on, at the checksums and
@@ -1995,6 +2011,8 @@ impl Engine {
             contradiction_state: std::sync::Mutex::default(),
             scorer: std::sync::Mutex::new(None),
             scorer_loader: default_scorer_loader(),
+            contradiction_data_cleared: std::sync::atomic::AtomicBool::new(false),
+            line_vectors_model_pruned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]

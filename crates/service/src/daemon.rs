@@ -430,6 +430,12 @@ pub async fn run_serve(
         engine.clone(),
         contradiction_rx,
     ));
+    // Off at start: one pass clears what a setting changed while the daemon
+    // was down left behind, even when no provider ever loads and so no embed
+    // pass hands over. On, the embed worker's handover asks as before.
+    if engine.contradiction_model().is_none() {
+        engine.request_contradictions();
+    }
     if let Some(park) = parked_blocking_task() {
         // Said out loud, so the test that sets it can tell its own parked
         // task from any other blocking work that happens to be running.

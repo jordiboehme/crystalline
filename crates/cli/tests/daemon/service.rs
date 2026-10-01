@@ -833,7 +833,11 @@ fn a_stopping_daemon_does_not_wait_for_a_contradiction_model_load() {
         }),
         embeddings: Some(config::EmbeddingsConfig {
             provider: "openai-compatible".to_string(),
-            model: "flat".to_string(),
+            // Named after the default model only for its line-similarity
+            // floor: a model without one runs no contradiction pass at all.
+            // The loopback endpoint answers the same flat vector whatever
+            // the name.
+            model: "granite-embedding-97m-multilingual-r2".to_string(),
             endpoint: Some(endpoint),
             api_key_env: None,
         }),
