@@ -459,7 +459,7 @@ jobs:
           # The workspace pin, so the action's container does not resolve a
           # different toolchain than the build. Move it together with
           # rust-toolchain.toml.
-          rust-version: '1.98.0'
+          rust-version: '1.99.0'
           arguments: --all-features --locked
           command: check
 
