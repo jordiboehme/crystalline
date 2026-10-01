@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A newer push to a pull request cancels the run it supersedes. A push to main
+# keeps one group per commit and never cancels, so dev.yml sees every main run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Documentation-only changes skip the heavy jobs. The filter is per job and
   # deliberately NOT a `paths-ignore:` on the trigger above. Two reasons, and
@@ -39,6 +45,7 @@ jobs:
   # a `changes` job that fails outright runs everything instead of skipping it.
   changes:
     name: changes
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.classify.outputs.code }}
@@ -123,6 +130,10 @@ jobs:
               # would read a root file like LICENSE_KEYS.rs as prose.
               LICENSE|LICENSE.md|LICENSE.txt) verdict=docs ;;
               .github/*.md)        verdict=docs ;;
+              # The skill-training harness's Python dependencies and scripts:
+              # no Rust test or build script reads them (the NLI parity fixture
+              # lives under evals/nli, not here). Its fixtures stay code.
+              evals/skill-training/pyproject.toml|evals/skill-training/uv.lock|evals/skill-training/*.py) verdict=docs ;;
               # Anything else in a subdirectory, markdown included.
               */*)                 verdict=code ;;
               *.md)                verdict=docs ;;
@@ -143,6 +154,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 90
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.os }}
@@ -170,8 +182,14 @@ jobs:
           tool: nextest@0.9.146
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Named, so fluid-smoke reads this very entry (same job key as before).
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo fmt --all --check
 
       - name: cargo clippy
@@ -188,6 +206,7 @@ jobs:
 
   postgres-parity:
     name: postgres-parity
+    timeout-minutes: 15
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
@@ -213,6 +232,8 @@ jobs:
         run: rustup show
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Create the pgvector extension
         # Pre-create it in public so the migration's defensive CREATE EXTENSION
@@ -228,6 +249,7 @@ jobs:
   # nor hold it up.
   fluid:
     name: fluid
+    timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
@@ -322,6 +344,7 @@ jobs:
   # own because it needs the Rust toolchain as well as Node.
   fluid-smoke:
     name: fluid-smoke
+    timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
@@ -335,6 +358,10 @@ jobs:
         run: rustup show
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The ubuntu test leg's entry (same profile, same target dir). Read only.
+          shared-key: test
+          save-if: false
 
       # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
       # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
@@ -398,6 +425,7 @@ jobs:
   # the entrypoint renders is one nginx accepts.
   fluid-image:
     name: fluid-image
+    timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
@@ -431,6 +459,7 @@ jobs:
 
   style:
     name: style
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -451,6 +480,7 @@ jobs:
   # and it should show on the next pull request, whatever that touches.
   cargo-deny:
     name: cargo-deny
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -469,6 +499,7 @@ jobs:
   # tools (vite, vitest, eslint) never reach a reader.
   fluid-audit:
     name: fluid-audit
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
@@ -493,6 +524,7 @@ jobs:
 
   musl-spike:
     name: musl-spike
+    timeout-minutes: 30
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
@@ -511,6 +543,11 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The release musl entry the dev channel writes from main (build.yml key
+          # release-<target>, job id build). Read only.
+          shared-key: release-x86_64-unknown-linux-musl-build
+          save-if: false
 
       - name: Build crystalline for musl
         run: cargo build --release --locked --target x86_64-unknown-linux-musl -p crystalline
@@ -521,6 +558,7 @@ jobs:
   # this job guards against) would fail at the download step.
   verify-action:
     name: verify-action
+    timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
