@@ -87,8 +87,8 @@ export const ROW_INSET = 0.5;
  * taller than wide: its quad in `models/lift.ts` takes its height from
  * this aspect and its width, so the two cannot drift apart. A `station` is
  * a station wall screen (M3 C20, C24): a terminal's style on a quad about
- * four fifths as wide as its glass (wider still and a dithered look no
- * longer reads a line letter by letter at 2 m), and `SCREEN_LINES` rows
+ * four fifths as wide as its glass (wider still and the glyphs no
+ * longer read letter by letter at 2 m), and `SCREEN_LINES` rows
  * instead of a terminal's nine; its quad in `models/lift.ts` takes its
  * width from this aspect.
  */

@@ -85,14 +85,14 @@ export const PAD_TOP = PAD_PLATE + DECAL_LIFT;
 /**
  * How dark a pad's coat is against the look's floor colour. The coat is
  * lit as a decal (no edge lines), so the plate reads as one flat dark
- * square on a gridded floor in every look.
+ * square on a gridded floor.
  */
 export const PAD_COAT = 0.55;
 
 /**
  * How dark the gantries' steel is against the look's bare metal: dark
  * enough that the truss and its legs stand out against the pale walls and
- * ceiling, the flat palette's among them.
+ * ceiling.
  */
 export const GANTRY_SHADE = 0.4;
 

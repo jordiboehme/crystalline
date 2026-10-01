@@ -109,6 +109,7 @@ const SESSION_SIDE = [
   "ui",
   "render",
   "session",
+  "textFlow",
 ] as const;
 
 /** True when `importer` may not import `spec` (M4 Global Constraints). */
@@ -136,6 +137,8 @@ describe("the generator side's imports", () => {
       "../render/kit",
       "../session",
       "../../game/session.ts",
+      "../textFlow",
+      "../textFlow.ts",
     ];
     const allowed = [
       "./sites",

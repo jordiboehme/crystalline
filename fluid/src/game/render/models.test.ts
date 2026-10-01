@@ -765,7 +765,7 @@ describe("fixture models", () => {
             const h = Math.max(...hs) - Math.min(...hs);
             expect(w / h).toBeCloseTo(ASPECT.station, 6);
             // 1.25 m of 1.52 m glass at `ASPECT.station` 1.6: the text keeps
-            // a glyph width a dithered look still reads at 2 m.
+            // a glyph width that still reads at 2 m.
             expect(w).toBeGreaterThanOrEqual(0.8 * 2 * SCREEN_GLASS.half);
             expect(w).toBeLessThanOrEqual(2 * SCREEN_GLASS.half);
           });

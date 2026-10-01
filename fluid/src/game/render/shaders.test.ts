@@ -140,8 +140,8 @@ it("swaps a prop's own mark for the look's accent at the instance's pick, the ro
 describe("the scene shader's decal branch", () => {
   it("alpha-tests a decal against the ordered threshold and never draws its edges (2.7 C20)", () => {
     // Mutation caught: no discard (every decal an opaque square), the test on
-    // the tinted colour instead of the texel's alpha (the untextured 8-bit
-    // look would lose the shapes), or edge lines on decals.
+    // the tinted colour instead of the texel's alpha (an untextured mesh
+    // would lose the shapes), or edge lines on decals.
     expect(FLAG.decal).toBe(14);
     expect(SCENE_FS).toContain("float bayer4(vec2 p)");
     expect(SCENE_FS).toMatch(

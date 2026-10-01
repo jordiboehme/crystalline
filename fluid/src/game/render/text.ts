@@ -21,6 +21,13 @@
  * call panel (`panel`) lists up to `LIFT_LINES` stops and two more lines
  * in amber on black, with no heading. A station wall screen (`station`)
  * is drawn in the terminal's style, `SCREEN_LINES` rows on a wide quad.
+ *
+ * A terminal's screen, the placard and a poster wrap: the text keeps the
+ * kind's glyph size, its first line is the heading row and the rest fills the
+ * body rows, each line reduced to its text (a link shows its words) and
+ * wrapped at word boundaries to the columns that fit (`fitRows`); a row cut
+ * for want of room ends with `CUT_MARK`. A lift's panel and a station screen
+ * keep one row per line.
  */
 
 import { LIFT_LINES, SCREEN_LINES } from "../world/lifts";
@@ -33,6 +40,7 @@ import {
   type TextKind,
   type TextRequest,
 } from "./layers";
+import { fitRows } from "../textFlow";
 import type { Look, Rgb } from "./looks";
 
 /** A copy of RGBA rows in reverse order. */
@@ -193,7 +201,25 @@ function drawRequest(
     const rows = ROWS[request.kind];
     const px = logicalHeight / (rows + 1);
     const glyph = px * 0.85;
-    lines.slice(0, rows).forEach((line, i) => {
+    const wraps =
+      request.kind === "screen" ||
+      request.kind === "placard" ||
+      request.kind === "poster";
+    let shown: string[];
+    if (wraps) {
+      ctx.font = `${glyph}px ui-monospace, Menlo, Consolas, monospace`;
+      const columns = Math.max(
+        1,
+        Math.floor((size - px) / ctx.measureText("M").width),
+      );
+      shown = [
+        ...fitRows([lines[0] ?? ""], columns, 1),
+        ...fitRows(lines.slice(1), columns, rows - 1),
+      ];
+    } else {
+      shown = lines.slice(0, rows);
+    }
+    shown.forEach((line, i) => {
       const heading = i === 0 && request.kind !== "panel";
       ctx.font = `${heading ? "bold " : ""}${glyph}px ui-monospace, Menlo, Consolas, monospace`;
       if (heading && crt(request.kind)) {
