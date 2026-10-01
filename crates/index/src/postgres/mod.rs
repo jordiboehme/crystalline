@@ -1026,6 +1026,16 @@ pub const CLEAR_DOMAIN_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction WHE
 pub const CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE domain_id=$1";
 
+/// Every line row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction";
+
+/// Every pair row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTION_PAIRS_SQL: &str = "DELETE FROM contradiction_pair";
+
 /// The pruning read behind [`Store::observation_vector_hashes`]: the primary
 /// key `(model, hash)` serves `model=$1` as its leading column.
 #[doc(hidden)]
@@ -3025,8 +3035,11 @@ impl Store for PostgresStore {
         model: &str,
         hashes: &[String],
     ) -> Result<HashSet<String>> {
-        let mut conn = self.acquire().await?;
         let mut out = HashSet::with_capacity(hashes.len());
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut conn = self.acquire().await?;
         for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
             let sql = observation_vectors_present_sql(run.len());
             let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
@@ -3047,8 +3060,11 @@ impl Store for PostgresStore {
         model: &str,
         hashes: &[String],
     ) -> Result<HashMap<String, Vec<f32>>> {
-        let mut conn = self.acquire().await?;
         let mut out = HashMap::with_capacity(hashes.len());
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut conn = self.acquire().await?;
         for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
             let sql = observation_vectors_sql(run.len());
             let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
@@ -3168,8 +3184,8 @@ impl Store for PostgresStore {
             match domains {
                 None => {
                     for sql in [
-                        "DELETE FROM contradiction",
-                        "DELETE FROM contradiction_pair",
+                        CLEAR_ALL_CONTRADICTIONS_SQL,
+                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
                     ] {
                         sqlx::query(sql)
                             .execute(&mut *c)
@@ -4112,6 +4128,63 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
+    /// A line vector whose stored blob disagrees with its `dims` column is
+    /// skipped, not returned: a blob of one float under `dims` 4, and a blob
+    /// that is not a whole number of floats, beside one good row. Runs when
+    /// `CRYSTALLINE_TEST_POSTGRES_URL` is set, like the parity legs.
+    #[tokio::test]
+    async fn a_line_vector_whose_width_disagrees_with_its_dims_is_skipped() {
+        use super::*;
+        let url = match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!(
+                    "note: skipping the postgres width test (CRYSTALLINE_TEST_POSTGRES_URL is unset)"
+                );
+                return;
+            }
+        };
+        let schema = format!("ovw_{}", std::process::id());
+        let store = PostgresStore::open_in_schema(&url, &schema).await.unwrap();
+        store
+            .store_observation_vectors(
+                "m",
+                &[ObservationVector {
+                    hash: "good".to_string(),
+                    vector: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+            )
+            .await
+            .unwrap();
+        for (hash, blob) in [("narrow", vec![0u8; 4]), ("ragged", vec![0u8; 17])] {
+            sqlx::query(
+                "INSERT INTO observation_vector (model, hash, dims, vector) VALUES ($1, $2, 4, $3)",
+            )
+            .bind("m")
+            .bind(hash)
+            .bind(blob)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let asked: Vec<String> = ["good", "narrow", "ragged"]
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let got = store.observation_vectors("m", &asked).await.unwrap();
+        assert_eq!(got.len(), 1, "only the good row comes back: {got:?}");
+        assert_eq!(got["good"], vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(
+            store
+                .observation_vectors_present("m", &asked)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        store.drop_schema().await.unwrap();
+    }
+
     /// The text columns this backend can sort on. A sort key that names one of
     /// these has to carry an explicit collation, because a Postgres database
     /// created under a locale collation orders text differently from Turso's

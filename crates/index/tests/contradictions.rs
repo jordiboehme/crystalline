@@ -622,6 +622,30 @@ async fn line_vectors_round_trip_by_model_and_hash(store: &dyn Store) {
     let mut all = store.observation_vector_hashes("m1").await.unwrap();
     all.sort();
     assert_eq!(all, hashes(&["ha", "hb"]));
+    // Empty input asks nothing and changes nothing.
+    assert!(
+        store
+            .observation_vectors_present("m1", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .observation_vectors("m1", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.delete_observation_vectors("m1", &[]).await.unwrap(),
+        0
+    );
+    store.store_observation_vectors("m1", &[]).await.unwrap();
+    assert_eq!(
+        store.observation_vector_hashes("m1").await.unwrap().len(),
+        2
+    );
 }
 parity!(
     line_vectors_round_trip_parity,

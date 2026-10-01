@@ -1035,6 +1035,16 @@ pub const CLEAR_DOMAIN_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction WHE
 pub const CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE domain_id=?1";
 
+/// Every line row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction";
+
+/// Every pair row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTION_PAIRS_SQL: &str = "DELETE FROM contradiction_pair";
+
 /// The pruning read behind [`Store::observation_vector_hashes`]: the primary
 /// key `(model, hash)` serves `model=?1` as its leading column.
 #[doc(hidden)]
@@ -3101,8 +3111,8 @@ impl Store for TursoStore {
             match domains {
                 None => {
                     for sql in [
-                        "DELETE FROM contradiction",
-                        "DELETE FROM contradiction_pair",
+                        CLEAR_ALL_CONTRADICTIONS_SQL,
+                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
                     ] {
                         self.conn.execute(sql, ()).await?;
                     }
@@ -3787,6 +3797,55 @@ mod tests {
 
     use super::*;
     use crate::store::{FileStamp, ObservationRecord};
+
+    /// A line vector whose stored blob disagrees with its `dims` column is
+    /// skipped, not returned: a blob of one float under `dims` 4, and a blob
+    /// that is not a whole number of floats, beside one good row.
+    #[tokio::test]
+    async fn a_line_vector_whose_width_disagrees_with_its_dims_is_skipped() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        store
+            .store_observation_vectors(
+                "m",
+                &[ObservationVector {
+                    hash: "good".to_string(),
+                    vector: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+            )
+            .await
+            .unwrap();
+        for (hash, blob) in [("narrow", vec![0u8; 4]), ("ragged", vec![0u8; 17])] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO observation_vector (model, hash, dims, vector) VALUES (?1, ?2, 4, ?3)",
+                    vec![
+                        Value::Text("m".to_string()),
+                        Value::Text(hash.to_string()),
+                        Value::Blob(blob),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let asked: Vec<String> = ["good", "narrow", "ragged"]
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let got = store.observation_vectors("m", &asked).await.unwrap();
+        assert_eq!(got.len(), 1, "only the good row comes back: {got:?}");
+        assert_eq!(got["good"], vec![0.1, 0.2, 0.3, 0.4]);
+        // Present still reports the rows: presence is about the key, the
+        // width check is the reader's.
+        assert_eq!(
+            store
+                .observation_vectors_present("m", &asked)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 
     #[test]
     fn observation_insert_is_one_statement_with_a_tuple_per_row() {

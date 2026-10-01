@@ -637,7 +637,8 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // reads it: it is derived and disposable, pruned by the daemon when no current
 // line uses a hash, cleared when the check is switched off and by `wipe`, and
 // kept by `reindex --full` because a vector keyed by its text stays valid.
-// The primary key serves every read, which all name the model and a hash list.
+// The primary key serves every read, which all name the model and one hash
+// (a hash list on postgres).
 const SCHEMA_V18: &str = r#"
 CREATE TABLE contradiction_pair (
     domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,

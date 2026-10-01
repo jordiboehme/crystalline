@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, forty-two entries, each named by the function that issues it, so a
+//! One place, forty-four entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -758,6 +758,35 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             turso_must_seek: &["idx_contradiction_pair_domain"],
             postgres_must_seek: &["idx_contradiction_pair_domain"],
+        },
+        // The same off switch over every domain: whole-table deletes by design.
+        HotStatement {
+            issued_by: "Store::clear_contradictions (every contradiction)",
+            turso: || crystalline_index::turso::CLEAR_ALL_CONTRADICTIONS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CLEAR_ALL_CONTRADICTIONS_SQL.to_string(),
+            literals: &[],
+            literals_pg: None,
+            scan_expected: &[(
+                "contradiction",
+                "every row, the contradiction check's off switch",
+            )],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::clear_contradictions (every contradiction_pair)",
+            turso: || crystalline_index::turso::CLEAR_ALL_CONTRADICTION_PAIRS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CLEAR_ALL_CONTRADICTION_PAIRS_SQL.to_string(),
+            literals: &[],
+            literals_pg: None,
+            scan_expected: &[(
+                "contradiction_pair",
+                "every row, the contradiction check's off switch",
+            )],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         // The line vectors: every read names the model and one hash (turso)
         // or a hash list (postgres), so the primary key (model, hash) serves
