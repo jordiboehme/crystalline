@@ -455,6 +455,60 @@ parity!(
     deleting_an_engram_takes_its_pairs_and_rows
 );
 
+/// Task 5b: deleting one pair for one model takes its pair row and its line
+/// rows, and leaves another model's scoring of the same pair and another
+/// pair alone.
+async fn deleting_one_pair_takes_only_that_pair_for_that_model(store: &dyn Store) {
+    let (tmp, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let kept = two_in(store, other.path(), "other").await;
+    score(store, &kept).await;
+    let t = two_in(store, tmp.path(), "notes").await;
+    score(store, &t).await;
+    store
+        .replace_contradictions(
+            t.domain,
+            &pair(t.a, t.b, &t.ca, &t.cb),
+            0.9,
+            "nli-y",
+            "2026-09-27T10:00:00Z",
+            &[row(t.a, t.b, 5, 5, 0.9, 0.9, false)],
+        )
+        .await
+        .unwrap();
+    store
+        .delete_contradiction_pair("nli-x", t.a, t.b)
+        .await
+        .unwrap();
+    assert_eq!(held(store, t.domain).await, (0, 0), "the pair and its rows");
+    assert_eq!(
+        store
+            .contradiction_pairs_scored(t.domain, "nli-y")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "another model's scoring stays"
+    );
+    assert_eq!(
+        store
+            .contradictions(t.domain, "nli-y", 0.0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(held(store, kept.domain).await, (1, 1), "another pair stays");
+    // Deleting what is not there is no error.
+    store
+        .delete_contradiction_pair("nli-x", t.a, t.b)
+        .await
+        .unwrap();
+}
+parity!(
+    delete_one_contradiction_pair_parity,
+    deleting_one_pair_takes_only_that_pair_for_that_model
+);
+
 /// A clear takes its own domain's rows and no other's; a wipe takes all.
 async fn clear_domain_and_wipe_clear_both_tables(store: &dyn Store) {
     let (tmp, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

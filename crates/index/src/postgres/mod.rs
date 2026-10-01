@@ -995,6 +995,20 @@ pub const INSERT_CONTRADICTION_PAIR_SQL: &str = "INSERT INTO contradiction_pair 
      SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
      WHERE EXISTS (SELECT 1 FROM engram e WHERE e.id=$2) AND EXISTS (SELECT 1 FROM engram e WHERE e.id=$3)";
 
+/// One pair's line rows for one model, deleted by
+/// [`Store::replace_contradictions`] before a rescore and by
+/// [`Store::delete_contradiction_pair`]: the primary key serves all three
+/// columns.
+#[doc(hidden)]
+pub const DELETE_PAIR_CONTRADICTIONS_SQL: &str =
+    "DELETE FROM contradiction WHERE engram_a=$1 AND engram_b=$2 AND model=$3";
+
+/// One pair row for one model, deleted like [`DELETE_PAIR_CONTRADICTIONS_SQL`]
+/// through the primary key `(engram_a, engram_b, model)`.
+#[doc(hidden)]
+pub const DELETE_CONTRADICTION_PAIR_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE engram_a=$1 AND engram_b=$2 AND model=$3";
+
 /// One engram's line rows, deleted by [`Store::delete_engram`]: the primary
 /// key serves `engram_a`, `idx_contradiction_engram_b` serves `engram_b`.
 #[doc(hidden)]
@@ -2931,10 +2945,7 @@ impl Store for PostgresStore {
         in_transaction(self, async {
             let mut conn = self.acquire().await?;
             let c = conn.as_mut();
-            for sql in [
-                "DELETE FROM contradiction WHERE engram_a=$1 AND engram_b=$2 AND model=$3",
-                "DELETE FROM contradiction_pair WHERE engram_a=$1 AND engram_b=$2 AND model=$3",
-            ] {
+            for sql in [DELETE_PAIR_CONTRADICTIONS_SQL, DELETE_CONTRADICTION_PAIR_SQL] {
                 sqlx::query(sql)
                     .bind(pair.a.0)
                     .bind(pair.b.0)
@@ -2980,6 +2991,27 @@ impl Store for PostgresStore {
                 .execute(&mut *c)
                 .await
                 .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for sql in [
+                DELETE_PAIR_CONTRADICTIONS_SQL,
+                DELETE_CONTRADICTION_PAIR_SQL,
+            ] {
+                sqlx::query(sql)
+                    .bind(a.0)
+                    .bind(b.0)
+                    .bind(model)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
             }
             Ok(())
         })

@@ -3253,3 +3253,139 @@ async fn both_reading_orders_land_on_their_own_pair_in_a_shared_group() {
         ]
     );
 }
+
+// --- an engram past its valid_to takes no part (Task 5b) --------------------
+
+fn day(s: &str) -> chrono::NaiveDate {
+    s.parse().unwrap()
+}
+
+/// Close `permalink`'s validity window at `date`.
+async fn valid_to(engine: &Engine, permalink: &str, date: &str) {
+    engine
+        .edit_engram(&EditParams {
+            identifier: permalink.to_string(),
+            domain: "notes".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some("valid_to".to_string()),
+            value: Some(date.to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// The `V302` queue as of `today`, the same date the walk reads.
+async fn sweep_on(engine: &Engine, today: &str) -> serde_json::Value {
+    engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["notes".to_string()],
+                families: vec!["meaning".to_string()],
+                limit: Some(50),
+                today: Some(today.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+}
+
+/// An engram whose `valid_to` is before today is never paired and its lines
+/// are not embedded for `V302`; one whose `valid_to` is today still counts.
+#[tokio::test]
+async fn an_engram_past_its_valid_to_is_never_paired_and_one_ending_today_is() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    engine.set_contradiction_today(day("2026-10-01"));
+    set(&engine, "evolve.contradictions", "full").await;
+    for (title, content) in [
+        ("Eighteen", NODE_18),
+        ("Nineteen", NODE_19),
+        ("Twenty", NODE_20),
+    ] {
+        engine.write_engram(&write(title, content)).await.unwrap();
+    }
+    valid_to(&engine, "eighteen", "2026-09-30").await;
+    valid_to(&engine, "nineteen", "2026-10-01").await;
+    engine.embed_pending().await.unwrap();
+    // Nineteen against Twenty only, one kept line pair (the Node lines).
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    let held = line_hashes(&engine).await;
+    assert!(
+        !held.contains(&observation_hash("The build uses Node 18")),
+        "an expired engram's lines are not embedded"
+    );
+    assert!(held.contains(&observation_hash("The build breaks on Node 19")));
+    assert!(held.contains(&observation_hash("The build uses Node 20")));
+}
+
+/// Nothing is written when an engram expires: the next day's walk drops it,
+/// its rows go, the queue stops showing it even before that walk, and its
+/// line vectors are pruned.
+#[tokio::test]
+async fn an_engram_that_expires_between_walks_leaves_the_queue_without_an_edit() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s, loads)).await;
+    engine.set_contradiction_today(day("2026-10-01"));
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    valid_to(&engine, "eighteen", "2026-10-01").await;
+    engine.embed_pending().await.unwrap();
+    // Eighteen against Twenty, the 0.93 Node pair.
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    assert_eq!(v302(&sweep_on(&engine, "2026-10-01").await).len(), 1);
+    assert!(!engine.contradictions_wanted(), "drained for the day");
+
+    // A day on: Eighteen's window closed yesterday.
+    engine.set_contradiction_today(day("2026-10-02"));
+    assert!(
+        engine.contradictions_wanted(),
+        "a new day asks for a walk, with no write"
+    );
+    let before = sweep_on(&engine, "2026-10-02").await;
+    assert!(
+        v302(&before).is_empty(),
+        "the sweep reads the date itself, before any walk: {before}"
+    );
+    assert_eq!(rows(&engine, full().repo).await.len(), 1, "not deleted yet");
+
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+    assert!(rows(&engine, full().repo).await.is_empty(), "rows gone");
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        let domain = store.list_engrams("notes", None, None).await.unwrap()[0].domain_id;
+        assert!(
+            store
+                .contradiction_pairs_scored(domain, full().repo)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pair row went too, so a reopened window scores it again"
+        );
+    }
+    assert!(
+        !line_hashes(&engine)
+            .await
+            .contains(&observation_hash("The build uses Node 18")),
+        "its own line is no longer in use and is pruned"
+    );
+    assert!(!engine.contradictions_wanted());
+    let after = sweep_on(&engine, "2026-10-02").await;
+    assert!(v302(&after).is_empty(), "{after}");
+    assert!(
+        v302_truncations(&after).is_empty(),
+        "counted for the new day: {after}"
+    );
+}

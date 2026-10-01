@@ -3103,10 +3103,12 @@ fn v302_is_quiet_below_the_line_when_off_and_on_a_retired_speculative_or_disjoin
         ));
         assert!(!fired(&r).contains(&"V302"), "{status}");
     }
+    // Both windows lie after today, so only their overlap decides: an
+    // engram past its valid_to is out for a reason of its own (below).
     let mut closed = a.clone();
-    closed.valid_to = Some(day("2026-01-01"));
+    closed.valid_to = Some(day("2026-12-01"));
     let mut later = b.clone();
-    later.valid_from = Some(day("2026-02-01"));
+    later.valid_from = Some(day("2027-01-01"));
     let w = detect(&meaning_input(
         vec![closed, later],
         vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)],
@@ -3114,6 +3116,30 @@ fn v302_is_quiet_below_the_line_when_off_and_on_a_retired_speculative_or_disjoin
     assert!(
         !fired(&w).contains(&"V302"),
         "a window closed before the other opened is two periods"
+    );
+}
+
+/// Task 5b: a stored row whose engram is past its `valid_to` as of the
+/// sweep's date never surfaces, even before the next walk deletes it; a
+/// window that ends on the sweep's date still counts.
+#[test]
+fn v302_drops_a_row_whose_engram_expired_by_the_sweeps_date() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let rows = vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)];
+    let mut ends_today = a.clone();
+    ends_today.valid_to = Some(today());
+    let open = detect(&meaning_input(vec![ends_today, b.clone()], rows.clone()));
+    assert!(
+        fired(&open).contains(&"V302"),
+        "a window ending today counts"
+    );
+    let mut expired = a.clone();
+    expired.valid_to = today().pred_opt();
+    let gone = detect(&meaning_input(vec![expired, b], rows));
+    assert!(
+        !fired(&gone).contains(&"V302"),
+        "an engram past its valid_to takes no part"
     );
 }
 

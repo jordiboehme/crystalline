@@ -63,8 +63,10 @@ pub(super) fn detect_contradictions(input: &SweepInput, report: &mut SweepReport
         else {
             continue;
         };
-        if !eligible(&a.status)
-            || !eligible(&b.status)
+        // The same rule the walk applies, as of the sweep's date: an engram
+        // that expired since the last walk never surfaces.
+        if !eligible(&a.status, a.valid_to, input.today)
+            || !eligible(&b.status, b.valid_to, input.today)
             || !windows_overlap(a.valid_from, a.valid_to, b.valid_from, b.valid_to)
         {
             continue;

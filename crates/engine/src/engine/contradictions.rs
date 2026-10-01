@@ -358,7 +358,8 @@ impl Engine {
     /// Whether the tick should ask for a pass: the check is on, nothing is
     /// scoring, the model's last load did not fail (or failed to download and
     /// its wait is over), and pending is unknown (a
-    /// fresh start, a changed setting), holds a pair no batch has failed on
+    /// fresh start, a changed setting), the last walk ran on another day (an
+    /// engram may have expired since), holds a pair no batch has failed on
     /// (a pass the budget cut short), or holds a failed pair while the model
     /// is loaded (the tick's retry).
     pub fn contradictions_wanted(&self) -> bool {
@@ -380,6 +381,8 @@ impl Engine {
         }
         match &state.pending {
             None => true,
+            // A new day: an engram may have expired with nothing written.
+            Some(_) if state.walked_on != Some(self.contradiction_today()) => true,
             Some(pending) => {
                 let total = pending.values().sum::<usize>();
                 let failing = failed_count(&state, model.repo);
@@ -415,6 +418,25 @@ impl Engine {
     pub fn contradiction_walks(&self) -> u64 {
         self.contradiction_walks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The date the contradiction check reads validity windows against: the
+    /// local date of this machine. An engram whose `valid_to` is before it
+    /// takes no part in `V302`, and the walk digest carries it, so every
+    /// domain is walked again once a day.
+    pub(crate) fn contradiction_today(&self) -> NaiveDate {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(today) = *self.contradiction_today_override.lock().unwrap() {
+            return today;
+        }
+        chrono::Local::now().date_naive()
+    }
+
+    /// Move the contradiction check's date to `today`, so a test can step a
+    /// day on. Test-only.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_contradiction_today(&self, today: NaiveDate) {
+        *self.contradiction_today_override.lock().unwrap() = Some(today);
     }
 
     /// Drop the loaded model once it has sat unused for [`NLI_IDLE_DROP`], or
@@ -599,11 +621,12 @@ impl Engine {
         &self,
         model: &'static NliModel,
         facts: &[ContradictionFact],
+        today: NaiveDate,
     ) -> Result<LineCoverage> {
         let lines = {
             let views: Vec<CandidateFacts<'_>> =
                 facts.iter().map(ContradictionFact::view).collect();
-            eligible_lines(&views)
+            eligible_lines(&views, today)
         };
         let hashes: Vec<String> = lines.keys().cloned().collect();
         let present = if hashes.is_empty() {
@@ -751,7 +774,10 @@ impl Engine {
             (state.generation, due)
         };
         let retry = retry && self.contradiction_scorer_loaded();
-        let (work, complete) = self.contradiction_work(model, retry).await?;
+        // One date for the whole walk: what is eligible, the digests, and
+        // the day the walk is recorded under.
+        let today = self.contradiction_today();
+        let (work, complete) = self.contradiction_work(model, retry, today).await?;
         let line_error = work
             .iter()
             .find_map(|w| w.lines.as_ref().and_then(|l| l.error.clone()));
@@ -784,7 +810,9 @@ impl Engine {
             .all(|w| w.pending.iter().all(|p| p.lines.is_none()))
         {
             let remaining = pending.values().sum();
-            self.publish_walk(model, generation, &work, pending, failures, line_error);
+            self.publish_walk(
+                model, generation, today, &work, pending, failures, line_error,
+            );
             return Ok(ContradictionOutcome::Scored {
                 pairs: 0,
                 line_pairs: 0,
@@ -846,6 +874,7 @@ impl Engine {
                         state.load_failed = Some(model.repo);
                         record_counts(&mut state, &work, &pending);
                         state.pending = Some(pending);
+                        state.walked_on = Some(today);
                     }
                     return Ok(ContradictionOutcome::ModelUnavailable);
                 }
@@ -953,6 +982,7 @@ impl Engine {
         self.publish_walk(
             model,
             generation,
+            today,
             &work,
             pending,
             failures,
@@ -1108,10 +1138,12 @@ impl Engine {
     /// is still current and the setting still names its model: a walk under
     /// a profile the setting has since left must not overwrite the unknown
     /// pending the change asked for.
+    #[allow(clippy::too_many_arguments)]
     fn publish_walk(
         &self,
         model: &'static NliModel,
         generation: u64,
+        today: NaiveDate,
         work: &[DomainWork],
         pending: BTreeMap<String, usize>,
         mut failures: HashMap<String, HashSet<FailedPair>>,
@@ -1147,6 +1179,7 @@ impl Engine {
         }
         record_counts(&mut state, work, &pending);
         state.pending = Some(pending);
+        state.walked_on = Some(today);
         match batch_error {
             Some(e) => state.last_error = Some(e),
             None if failed_count(&state, model.repo) == 0 => state.last_error = None,
@@ -1166,6 +1199,7 @@ impl Engine {
         &self,
         model: &'static NliModel,
         retry: bool,
+        today: NaiveDate,
     ) -> Result<(Vec<DomainWork>, bool)> {
         let (scope, coverage) = {
             let store = self.store.lock().await;
@@ -1214,7 +1248,7 @@ impl Engine {
                 complete = false;
                 continue;
             }
-            let digest = walk_digest(model, threshold, &rules, domain_id, &stamps);
+            let digest = walk_digest(model, threshold, &rules, today, domain_id, &stamps);
             let (settled, known) = {
                 let state = self.contradiction_state.lock().unwrap();
                 let settled = state
@@ -1257,7 +1291,7 @@ impl Engine {
             let facts = self
                 .contradiction_facts(&source, &name, domain_id, &stamps, true, &rules)
                 .await?;
-            let lines = self.embed_lines(model, &facts).await?;
+            let lines = self.embed_lines(model, &facts, today).await?;
             // Coverage below 100 percent never holds a pair back: an engram
             // with a lead vector is a candidate whatever else is unembedded.
             // It only decides whether a later embedding can add a pair
@@ -1266,7 +1300,9 @@ impl Engine {
             let unembedded = facts
                 .iter()
                 .filter(|f| {
-                    f.lead_vector.is_none() && eligible(&f.status) && !f.observations.is_empty()
+                    f.lead_vector.is_none()
+                        && eligible(&f.status, f.valid_to, today)
+                        && !f.observations.is_empty()
                 })
                 .count();
             let waiting = unembedded > 0;
@@ -1292,6 +1328,8 @@ impl Engine {
                     .contradiction_pairs_scored(domain_id, model.repo)
                     .await?
             };
+            self.delete_expired_pairs(model, &facts, &scored, today)
+                .await;
             // The all-pairs cosine walk and the diff against the stored rows
             // run on a blocking thread: a write to a large domain asks for
             // this walk every time, and on a runtime worker it would hold up
@@ -1301,7 +1339,7 @@ impl Engine {
                 let (full, vectors_capped, all) = {
                     let views: Vec<CandidateFacts<'_>> =
                         facts.iter().map(ContradictionFact::view).collect();
-                    let found = contradiction_candidates(&views, threshold, max_pairs);
+                    let found = contradiction_candidates(&views, threshold, max_pairs, today);
                     let all = pending_pairs(&views, &found.pairs, &scored);
                     (found.full, found.capped.then_some(found.compared), all)
                 };
@@ -1348,6 +1386,47 @@ impl Engine {
             });
         }
         Ok((out, complete))
+    }
+
+    /// Delete the stored pairs, rows and all, that name an engram past its
+    /// `valid_to` as of `today`: it takes no part any more, and with the pair
+    /// row gone, a window opened again later makes the pair pending rather
+    /// than scored with nothing to say. Only expiry: a pair that stopped
+    /// being a candidate for another reason keeps its rows, which the sweep
+    /// filters as it reads them. The store lock is taken per pair and the
+    /// profile read again under it, as for every write of the walk; a failed
+    /// delete is logged and tried again by the next walk.
+    async fn delete_expired_pairs(
+        &self,
+        model: &'static NliModel,
+        facts: &[ContradictionFact],
+        scored: &[ScoredPair],
+        today: NaiveDate,
+    ) {
+        let expired: HashSet<i64> = facts
+            .iter()
+            .filter(|f| f.valid_to.is_some_and(|to| to < today))
+            .map(|f| f.id.0)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for s in scored
+            .iter()
+            .filter(|s| expired.contains(&s.a.0) || expired.contains(&s.b.0))
+        {
+            let store = self.store.lock().await;
+            if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
+                return;
+            }
+            if let Err(e) = store.delete_contradiction_pair(model.repo, s.a, s.b).await {
+                tracing::warn!(
+                    a = s.a.0,
+                    b = s.b.0,
+                    "could not delete a contradiction pair whose engram expired; the next walk tries again: {e}"
+                );
+            }
+        }
     }
 
     /// Pair the lines of each pending engram pair by similarity
@@ -1541,7 +1620,14 @@ impl Engine {
                     .await?
                     .embedded_for(&self.model_id);
                 Some((
-                    walk_digest(model, related_threshold(), &rules, domain_id, &stamps),
+                    walk_digest(
+                        model,
+                        related_threshold(),
+                        &rules,
+                        self.contradiction_today(),
+                        domain_id,
+                        &stamps,
+                    ),
                     coverage,
                 ))
             } else {
@@ -1767,8 +1853,9 @@ async fn score_group(
 }
 
 /// What a domain looked like to a walk: the NLI model, the related line, the
-/// line rules (whose key carries the embedding model), the domain's id and
-/// every path with its checksum. Built
+/// line rules (whose key carries the embedding model), the date validity is
+/// read against (an engram can expire overnight with no file changed), the
+/// domain's id and every path with its checksum. Built
 /// from the stamps alone, never from the vectors, so checking it costs one
 /// narrow read. The id is there for a domain removed and added back under
 /// its old name: its rows were cleared with it. The id alone is not the
@@ -1778,6 +1865,7 @@ fn walk_digest(
     model: &NliModel,
     threshold: f64,
     rules: &LineRules<'_>,
+    today: NaiveDate,
     domain: DomainId,
     stamps: &HashMap<String, FileStamp>,
 ) -> String {
@@ -1786,6 +1874,8 @@ fn walk_digest(
     h.update([0]);
     h.update(threshold.to_bits().to_le_bytes());
     h.update(rules.key().as_bytes());
+    h.update([0]);
+    h.update(today.to_string().as_bytes());
     h.update([0]);
     h.update(domain.0.to_le_bytes());
     let mut paths: Vec<(&String, &FileStamp)> = stamps.iter().collect();
@@ -1833,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_digest_moves_with_a_stamp_the_models_the_rules_or_the_domain_only() {
+    fn the_walk_digest_moves_with_a_stamp_the_models_the_rules_the_date_or_the_domain_only() {
         let full = nli_model(NliProfile::Full);
         // A second model, as a later release's table would carry.
         let other: &'static NliModel = Box::leak(Box::new(NliModel {
@@ -1851,39 +1941,48 @@ mod tests {
             floor: 0.86,
             max_line_pairs: 4,
         };
-        let base = walk_digest(full, 0.8, &rules, d, &stamps);
-        assert_eq!(base, walk_digest(full, 0.8, &rules, d, &stamps.clone()));
+        let t: NaiveDate = "2026-10-01".parse().unwrap();
+        let base = walk_digest(full, 0.8, &rules, t, d, &stamps);
+        assert_eq!(base, walk_digest(full, 0.8, &rules, t, d, &stamps.clone()));
         let mut edited = stamps.clone();
         edited.insert("b.md".to_string(), stamp("3"));
-        assert_ne!(base, walk_digest(full, 0.8, &rules, d, &edited));
+        assert_ne!(base, walk_digest(full, 0.8, &rules, t, d, &edited));
         let mut touched = stamps.clone();
         touched.get_mut("a.md").unwrap().mtime = 99;
         assert_eq!(
             base,
-            walk_digest(full, 0.8, &rules, d, &touched),
+            walk_digest(full, 0.8, &rules, t, d, &touched),
             "a touch that keeps the content keeps the digest"
         );
-        assert_ne!(base, walk_digest(other, 0.8, &rules, d, &stamps));
-        assert_ne!(base, walk_digest(full, 0.7, &rules, d, &stamps));
+        assert_ne!(base, walk_digest(other, 0.8, &rules, t, d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.7, &rules, t, d, &stamps));
         let bge = LineRules {
             embedding_model: "bge",
             ..rules
         };
-        assert_ne!(base, walk_digest(full, 0.8, &bge, d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.8, &bge, t, d, &stamps));
         let higher = LineRules {
             floor: 0.88,
             ..rules
         };
-        assert_ne!(base, walk_digest(full, 0.8, &higher, d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.8, &higher, t, d, &stamps));
         let more = LineRules {
             max_line_pairs: 5,
             ..rules
         };
-        assert_ne!(base, walk_digest(full, 0.8, &more, d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.8, &more, t, d, &stamps));
         assert_ne!(
             base,
-            walk_digest(full, 0.8, &rules, DomainId(2), &stamps),
+            walk_digest(full, 0.8, &rules, t, DomainId(2), &stamps),
             "the same files under another domain id are another domain"
+        );
+        // Task 5b: another day is another walk, since an engram can expire
+        // overnight; the same day is the same digest.
+        let next = t.succ_opt().unwrap();
+        assert_ne!(base, walk_digest(full, 0.8, &rules, next, d, &stamps));
+        assert_eq!(
+            walk_digest(full, 0.8, &rules, next, d, &stamps),
+            walk_digest(full, 0.8, &rules, next, d, &stamps.clone())
         );
     }
 

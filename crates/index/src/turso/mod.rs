@@ -1004,6 +1004,20 @@ pub const INSERT_CONTRADICTION_PAIR_SQL: &str = "INSERT INTO contradiction_pair 
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
      WHERE EXISTS (SELECT 1 FROM engram e WHERE e.id=?2) AND EXISTS (SELECT 1 FROM engram e WHERE e.id=?3)";
 
+/// One pair's line rows for one model, deleted by
+/// [`Store::replace_contradictions`] before a rescore and by
+/// [`Store::delete_contradiction_pair`]: the primary key serves all three
+/// columns.
+#[doc(hidden)]
+pub const DELETE_PAIR_CONTRADICTIONS_SQL: &str =
+    "DELETE FROM contradiction WHERE engram_a=?1 AND engram_b=?2 AND model=?3";
+
+/// One pair row for one model, deleted like [`DELETE_PAIR_CONTRADICTIONS_SQL`]
+/// through the primary key `(engram_a, engram_b, model)`.
+#[doc(hidden)]
+pub const DELETE_CONTRADICTION_PAIR_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE engram_a=?1 AND engram_b=?2 AND model=?3";
+
 /// One engram's line rows, deleted by [`Store::delete_engram`]: the primary
 /// key serves `engram_a`, `idx_contradiction_engram_b` serves `engram_b`.
 #[doc(hidden)]
@@ -2860,16 +2874,10 @@ impl Store for TursoStore {
                 Value::Text(model.to_string()),
             ];
             self.conn
-                .execute(
-                    "DELETE FROM contradiction WHERE engram_a=?1 AND engram_b=?2 AND model=?3",
-                    key.clone(),
-                )
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
                 .await?;
             self.conn
-                .execute(
-                    "DELETE FROM contradiction_pair WHERE engram_a=?1 AND engram_b=?2 AND model=?3",
-                    key,
-                )
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
                 .await?;
             let stored = self
                 .conn
@@ -2913,6 +2921,24 @@ impl Store for TursoStore {
                     )
                     .await?;
             }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(a.0),
+                Value::Integer(b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
+                .await?;
+            self.conn
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
+                .await?;
             Ok(())
         })
         .await

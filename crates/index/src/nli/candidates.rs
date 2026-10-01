@@ -65,9 +65,15 @@ pub struct Candidates {
     pub full: bool,
 }
 
-/// Current and not speculative: the statuses a pair may be scored in.
-pub fn eligible(status: &str) -> bool {
-    is_current_status(status) && !SPECULATIVE_STATUSES.contains(&status)
+/// Whether an engram takes part in `V302` as of `today`: a current status
+/// that is not speculative, and not past its `valid_to`. Expired means
+/// strictly before `today`; a window that ends today still counts, and an
+/// absent `valid_to` never expires. The one rule the candidates, the lines
+/// the walk embeds and the sweep's read all apply.
+pub fn eligible(status: &str, valid_to: Option<NaiveDate>, today: NaiveDate) -> bool {
+    is_current_status(status)
+        && !SPECULATIVE_STATUSES.contains(&status)
+        && valid_to.is_none_or(|to| to >= today)
 }
 
 /// Whether `[from_a, to_a]` and `[from_b, to_b]` overlap; an absent bound is
@@ -113,19 +119,20 @@ fn max_pairs_from(raw: Option<&str>) -> usize {
         .unwrap_or(MAX_RELATED_PAIRS)
 }
 
-/// Every eligible, window-overlapping pair of engrams with observations whose
-/// lead vectors sit at or above `related_threshold`, at most `max_pairs`,
-/// highest cosine first. The twin finder's all-pairs walk at a lower line, so
+/// Every eligible (as of `today`), window-overlapping pair of engrams with
+/// observations whose lead vectors sit at or above `related_threshold`, at
+/// most `max_pairs`, highest cosine first. The twin finder's all-pairs walk at a lower line, so
 /// the vector cap and the bounded retention behave as `V301`'s do.
 pub fn contradiction_candidates(
     facts: &[CandidateFacts<'_>],
     related_threshold: f64,
     max_pairs: usize,
+    today: NaiveDate,
 ) -> Candidates {
     let vectors: Vec<Option<&[f32]>> = facts
         .iter()
         .map(|f| {
-            if eligible(f.status) && !f.observations.is_empty() {
+            if eligible(f.status, f.valid_to, today) && !f.observations.is_empty() {
                 f.lead_vector
             } else {
                 None
@@ -285,14 +292,15 @@ pub fn scoring_checksum(observations: &[FactObservation], rules: &LineRules<'_>)
 }
 
 /// Every distinct observation line, folded and keyed by its row hash, of the
-/// engrams that can take part in `V302`: current, not speculative, with
-/// observations (the candidate rule's eligibility, without the lead vector).
-/// These are the lines the walk keeps a vector for.
-pub fn eligible_lines(facts: &[CandidateFacts<'_>]) -> BTreeMap<String, String> {
+/// engrams that can take part in `V302` as of `today`: current, not
+/// speculative, not past their `valid_to`, with observations (the candidate
+/// rule's eligibility, without the lead vector). These are the lines the walk
+/// keeps a vector for.
+pub fn eligible_lines(facts: &[CandidateFacts<'_>], today: NaiveDate) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for f in facts
         .iter()
-        .filter(|f| eligible(f.status) && !f.observations.is_empty())
+        .filter(|f| eligible(f.status, f.valid_to, today) && !f.observations.is_empty())
     {
         for o in f.observations {
             let folded = fold(&o.text);
@@ -597,6 +605,53 @@ mod tests {
         all.iter().map(Owned::view).collect()
     }
 
+    /// A date before every window in these tests, so only the status and
+    /// window rules decide.
+    fn long_ago() -> NaiveDate {
+        day("2000-01-01")
+    }
+
+    /// Task 5b: past its `valid_to` is out, ending today is in, no
+    /// `valid_to` never expires, and the status rule still holds.
+    #[test]
+    fn eligibility_reads_the_status_and_whether_the_window_closed_before_today() {
+        let today = day("2026-10-01");
+        assert!(eligible("stable", None, today));
+        assert!(eligible("stable", Some(day("2026-10-01")), today));
+        assert!(eligible("current", Some(day("2027-01-01")), today));
+        assert!(!eligible("stable", Some(day("2026-09-30")), today));
+        assert!(!eligible("draft", None, today));
+        assert!(!eligible("superseded", None, today));
+    }
+
+    #[test]
+    fn an_expired_engram_is_neither_a_candidate_nor_a_line_to_embed() {
+        let mut expired = owned(1, &[1.0, 0.0]);
+        expired.to = Some(day("2026-09-30"));
+        expired.obs = vec![obs(1, "Expired line")];
+        let mut ends_today = owned(2, &[1.0, 0.0]);
+        ends_today.to = Some(day("2026-10-01"));
+        ends_today.obs = vec![obs(1, "Ends today")];
+        let mut open = owned(3, &[1.0, 0.0]);
+        open.obs = vec![obs(1, "Open")];
+        let all = vec![expired, ends_today, open];
+        let today = day("2026-10-01");
+        let found = contradiction_candidates(&views(&all), 0.80, 2000, today);
+        let ids: Vec<(i64, i64)> = found
+            .pairs
+            .iter()
+            .map(|p| (all[p.a].id, all[p.b].id))
+            .collect();
+        assert_eq!(ids, vec![(2, 3)]);
+        let lines = eligible_lines(&views(&all), today);
+        let texts: Vec<&str> = lines.values().map(String::as_str).collect();
+        assert_eq!(texts.len(), 2);
+        assert!(!texts.contains(&"Expired line"), "{texts:?}");
+        // The same engrams a day earlier: all three take part.
+        let before = contradiction_candidates(&views(&all), 0.80, 2000, day("2026-09-30"));
+        assert_eq!(before.pairs.len(), 3);
+    }
+
     #[test]
     fn windows_overlap_treats_absent_bounds_as_unbounded() {
         assert!(windows_overlap(None, None, None, None));
@@ -636,7 +691,7 @@ mod tests {
         let mut retired = owned(8, &[1.0, 0.0, 0.0]);
         retired.status = "superseded".to_string();
         let all = vec![a, b, c, d, e, far, unembedded, retired];
-        let found = contradiction_candidates(&views(&all), 0.80, 2000);
+        let found = contradiction_candidates(&views(&all), 0.80, 2000, long_ago());
         let ids: Vec<(i64, i64)> = found
             .pairs
             .iter()
@@ -675,7 +730,7 @@ mod tests {
         silent.obs.clear();
         let all = vec![a, silent];
         assert!(
-            contradiction_candidates(&views(&all), 0.80, 2000)
+            contradiction_candidates(&views(&all), 0.80, 2000, long_ago())
                 .pairs
                 .is_empty()
         );
@@ -684,7 +739,7 @@ mod tests {
     #[test]
     fn the_kept_list_is_capped_and_says_so() {
         let all: Vec<Owned> = (1..=4).map(|i| owned(i, &[1.0, 0.0])).collect();
-        let found = contradiction_candidates(&views(&all), 0.80, 3);
+        let found = contradiction_candidates(&views(&all), 0.80, 3, long_ago());
         assert_eq!(found.pairs.len(), 3);
         assert!(found.full, "six related pairs, three kept");
     }
@@ -697,7 +752,7 @@ mod tests {
             owned(3, &[1.0, 0.0]),
         ];
         let v = views(&all);
-        let found = contradiction_candidates(&v, 0.80, 2000);
+        let found = contradiction_candidates(&v, 0.80, 2000, long_ago());
         assert_eq!(found.pairs.len(), 3);
         let scored = vec![
             ScoredPair {
@@ -760,7 +815,7 @@ mod tests {
     #[test]
     fn exactly_max_pairs_is_not_full() {
         let all: Vec<Owned> = (1..=3).map(|i| owned(i, &[1.0, 0.0])).collect();
-        let found = contradiction_candidates(&views(&all), 0.80, 3);
+        let found = contradiction_candidates(&views(&all), 0.80, 3, long_ago());
         assert_eq!(found.pairs.len(), 3);
         assert!(!found.full, "three related pairs, three kept, none dropped");
     }
@@ -776,7 +831,7 @@ mod tests {
         late.from = Some(day("2026-01-01"));
         let near = owned(3, &[0.9, 0.436]); // cosine about 0.9 to both
         let all = vec![early, late, near];
-        let found = contradiction_candidates(&views(&all), 0.80, 2);
+        let found = contradiction_candidates(&views(&all), 0.80, 2, long_ago());
         let mut ids: Vec<(i64, i64)> = found
             .pairs
             .iter()
@@ -785,7 +840,7 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![(1, 3), (2, 3)], "both overlapping pairs are kept");
         assert!(!found.full, "nothing that overlaps was dropped");
-        let one = contradiction_candidates(&views(&all), 0.80, 1);
+        let one = contradiction_candidates(&views(&all), 0.80, 1, long_ago());
         assert_eq!(one.pairs.len(), 1);
         assert!(one.full, "two overlapping pairs, one kept");
     }
@@ -963,7 +1018,7 @@ mod tests {
         unembedded.vector = None;
         unembedded.obs = vec![obs(1, "No lead vector yet")];
         let all = vec![one, two, draft, unembedded];
-        let lines = eligible_lines(&views(&all));
+        let lines = eligible_lines(&views(&all), long_ago());
         let texts: Vec<&str> = lines.values().map(String::as_str).collect();
         assert_eq!(lines.len(), 3, "{texts:?}");
         assert_eq!(lines[&observation_hash("Node 18")], "Node 18", "folded");

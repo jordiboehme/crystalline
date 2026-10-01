@@ -796,6 +796,11 @@ pub struct Engine {
     // can see a worker that keeps asking.
     #[cfg(any(test, feature = "testing"))]
     contradiction_walks: std::sync::atomic::AtomicU64,
+    // The date the contradiction check reads validity against, set by a
+    // test to move a day on without waiting for one. See
+    // `Engine::set_contradiction_today`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_today_override: std::sync::Mutex<Option<NaiveDate>>,
     // What the last successful embedding-model load pruned from the model
     // cache, so `ctl status` after a start says what that start freed. Empty on
     // every install that had nothing to prune, which is every install that
@@ -1895,6 +1900,10 @@ pub(crate) struct ContradictionState {
     /// a failed batch left included. `None` until a walk has run, and again
     /// once the setting changes: unknown, which is what makes the tick ask.
     pub(crate) pending: Option<BTreeMap<String, usize>>,
+    /// The date the last published walk read validity against. A new day
+    /// asks for a walk with nothing written, since an engram can expire
+    /// overnight.
+    pub(crate) walked_on: Option<NaiveDate>,
     /// Per domain, the pairs the scorer or the store failed on. Skipped by
     /// every walk but a retry walk, which the tick asks for at most once per
     /// tick and only while the model is loaded anyway.
@@ -2022,6 +2031,8 @@ impl Engine {
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             contradiction_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_today_override: std::sync::Mutex::new(None),
             model_cache_pruned: std::sync::RwLock::new(Vec::new()),
             provider: std::sync::RwLock::new(provider),
             model_id,

@@ -2682,6 +2682,14 @@ pub trait Store: Send + Sync {
         rows: &[ContradictionRow],
     ) -> Result<()>;
 
+    /// Delete what `model` stored for the pair `a`, `b` (lower id first): its
+    /// pair row and its line rows, in one transaction, through the primary
+    /// keys. The contradiction walk's delete for a pair one of whose engrams is
+    /// past its `valid_to`: with the pair row gone, a window opened again later
+    /// makes the pair pending, not scored with nothing to say. Refuses inside
+    /// an open `begin`.
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()>;
+
     /// Every stored line pair in `domain` for `model` whose higher reading
     /// order is at or above `min_score`, ordered by `(a, b, line_a, line_b)`.
     /// The sweep's read: it filters by status, window and line hash itself, so

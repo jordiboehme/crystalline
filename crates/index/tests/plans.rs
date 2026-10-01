@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, forty-four entries, each named by the function that issues it, so a
+//! One place, forty-six entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -701,6 +701,30 @@ pub fn registry() -> Vec<HotStatement> {
             turso: || crystalline_index::turso::INSERT_CONTRADICTION_PAIR_SQL.to_string(),
             postgres: || crystalline_index::postgres::INSERT_CONTRADICTION_PAIR_SQL.to_string(),
             literals: &["1", "5", "6", "'ca'", "'cb'", "0.9", "'m'", "'t'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        // The two per-pair deletes of a rescore and of an expired engram's
+        // pair: the primary key `(engram_a, engram_b, model)` serves both.
+        HotStatement {
+            issued_by: "Store::replace_contradictions and Store::delete_contradiction_pair (contradiction)",
+            turso: || crystalline_index::turso::DELETE_PAIR_CONTRADICTIONS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::DELETE_PAIR_CONTRADICTIONS_SQL.to_string(),
+            literals: &["5", "6", "'m'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::replace_contradictions and Store::delete_contradiction_pair (contradiction_pair)",
+            turso: || crystalline_index::turso::DELETE_CONTRADICTION_PAIR_SQL.to_string(),
+            postgres: || crystalline_index::postgres::DELETE_CONTRADICTION_PAIR_SQL.to_string(),
+            literals: &["5", "6", "'m'"],
             literals_pg: None,
             scan_expected: &[],
             scan_expected_pg: None,
