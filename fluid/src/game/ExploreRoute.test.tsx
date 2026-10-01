@@ -857,7 +857,7 @@ describe("ExploreRoute", () => {
     // The word's I was taken back.
     expect(window.localStorage.getItem(INVERT_KEY)).not.toBe("1");
 
-    const field = within(dialog).getByRole("textbox", { name: "Domain name" });
+    const field = within(dialog).getByRole("combobox", { name: "Domain name" });
     fireEvent.change(field, { target: { value: "EN" } });
     fireEvent.keyDown(field, { key: "Enter" });
     expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
@@ -888,7 +888,7 @@ describe("ExploreRoute", () => {
 
     await typeWord("idclev");
     const dialog = await screen.findByRole("dialog", LEVELS);
-    const field = within(dialog).getByRole("textbox", { name: "Domain name" });
+    const field = within(dialog).getByRole("combobox", { name: "Domain name" });
     fireEvent.keyDown(field, { key: "Escape" });
     expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
     await settle(300);
@@ -965,7 +965,7 @@ describe("ExploreRoute", () => {
     expect(rideSpy).toHaveBeenCalledTimes(1);
     expect(rideSpy).toHaveBeenCalledWith(1);
 
-    const field = within(dialog).getByRole("textbox", { name: "Stop name" });
+    const field = within(dialog).getByRole("combobox", { name: "Stop name" });
     fireEvent.keyDown(field, { key: "Escape" });
     expect(closeLiftSpy).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("dialog", LIFT)).toBeNull();
@@ -1118,7 +1118,7 @@ describe("ExploreRoute", () => {
     // The level select.
     await typeWord("idclev");
     const levels = await screen.findByRole("dialog", LEVELS);
-    await esc(within(levels).getByRole("textbox", { name: "Domain name" }));
+    await esc(within(levels).getByRole("combobox", { name: "Domain name" }));
     expect(screen.queryByRole("dialog", LEVELS)).toBeNull();
     expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
     expect(made.pauses).toEqual([]);
@@ -1132,7 +1132,7 @@ describe("ExploreRoute", () => {
     await settle(300);
     await space();
     const lift = await screen.findByRole("dialog", LIFT);
-    await esc(within(lift).getByRole("textbox", { name: "Stop name" }));
+    await esc(within(lift).getByRole("combobox", { name: "Stop name" }));
     expect(screen.queryByRole("dialog", LIFT)).toBeNull();
     expect(screen.queryByRole("dialog", PAUSED)).toBeNull();
     expect(made.pauses).toEqual([]);

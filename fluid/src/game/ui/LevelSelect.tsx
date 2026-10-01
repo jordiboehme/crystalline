@@ -19,13 +19,20 @@
  * if still held, types nothing (C17). While the listing loads, fails or
  * matches nothing, one line says so and Enter does nothing (C16).
  *
+ * The field is a combobox over the listbox: `aria-expanded` while rows show,
+ * `aria-controls` naming the list, and `aria-activedescendant` on the selected
+ * option while it shows (absent when a status line stands in for the list).
+ * Each option carries its place in the filtered list (`aria-setsize`,
+ * `aria-posinset`), the status line is a `status`, and a key pressed during
+ * an IME composition does nothing.
+ *
  * The session already released the pointer lock and stopped reading keys
  * when it opened the select; the host unmounts it when the session says
  * the select closed.
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../../api/domains";
 import { GAME_STALE_MS } from "../data/source";
@@ -44,6 +51,7 @@ import {
   hereKey,
   levelWindow,
   levelsOf,
+  optionId,
   sortLevels,
   stepSelection,
 } from "./levels";
@@ -68,6 +76,8 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
     queryFn: fetchDomains,
     staleTime: GAME_STALE_MS,
   });
+  const listId = useId();
+  const footerId = useId();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const field = useRef<HTMLInputElement>(null);
@@ -94,6 +104,9 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
 
   useLayoutEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // An IME composition owns Enter and the arrows. Safari sends the
+      // composition's final Enter with `isComposing` false and keyCode 229.
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.key) {
         case "ArrowUp":
@@ -145,13 +158,21 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
       <div className="w-full max-w-lg border border-white/30 bg-black/70 p-3 text-sm">
         <div className="flex justify-between gap-4 tracking-wider">
           <span>{LEVELS_TITLE}</span>
-          <span>{position}</span>
+          <span aria-hidden="true">{position}</span>
         </div>
         <input
           ref={field}
           type="text"
           value={query}
           aria-label={LEVELS_FIELD}
+          role="combobox"
+          aria-expanded={status === null}
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-describedby={footerId}
+          {...(status === null
+            ? { "aria-activedescendant": optionId(listId, at) }
+            : {})}
           autoComplete="off"
           spellCheck={false}
           className="mt-2 w-full border-b border-white/40 bg-transparent py-1 text-base text-white outline-none"
@@ -172,13 +193,18 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
           style={{ minHeight: `${String(LEVEL_ROWS * 1.5)}rem` }}
         >
           {status !== null ? (
-            <p className="py-1">{status}</p>
+            <p role="status" className="py-1">
+              {status}
+            </p>
           ) : (
-            <ul role="listbox" aria-label={LEVELS_LIST}>
+            <ul id={listId} role="listbox" aria-label={LEVELS_LIST}>
               {shown.slice(start, end).map((level, n) => {
                 const on = start + n === at;
                 return (
                   <li
+                    id={optionId(listId, start + n)}
+                    aria-setsize={shown.length}
+                    aria-posinset={start + n + 1}
                     key={level.key}
                     role="option"
                     aria-selected={on}
@@ -199,7 +225,10 @@ export function LevelSelect({ current, onJump, onClose }: LevelSelectProps) {
             </ul>
           )}
         </div>
-        <div className="mt-2 whitespace-pre text-xs text-white/60">
+        <div
+          id={footerId}
+          className="mt-2 whitespace-pre text-xs text-white/60"
+        >
           {LEVELS_FOOTER}
         </div>
       </div>

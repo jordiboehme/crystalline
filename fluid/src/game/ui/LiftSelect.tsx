@@ -23,12 +23,19 @@
  * (never a filter's doing) says so with its own distinct line, `NO STOPS`,
  * so an empty listing never misreads as a filter miss.
  *
+ * The field is a combobox over the listbox: `aria-expanded` while rows show,
+ * `aria-controls` naming the list, and `aria-activedescendant` on the selected
+ * option while it shows (absent when a status line stands in for the list).
+ * Each option carries its place in the filtered list (`aria-setsize`,
+ * `aria-posinset`), the status line is a `status`, and a key pressed during
+ * an IME composition does nothing.
+ *
  * The session already released the pointer lock and stopped reading keys
  * when it opened the overlay; the host unmounts it when the session says
  * the overlay closed.
  */
 
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { LiftStop } from "../world/types";
 import {
@@ -43,7 +50,13 @@ import {
   NO_SUCH_STOP,
   liftRows,
 } from "./lift";
-import { LEVEL_ROWS, filterLevels, levelWindow, stepSelection } from "./levels";
+import {
+  LEVEL_ROWS,
+  filterLevels,
+  levelWindow,
+  optionId,
+  stepSelection,
+} from "./levels";
 
 /** The props of the lift overlay. */
 export interface LiftSelectProps {
@@ -79,6 +92,8 @@ function KeyGlyph() {
 
 /** The overlay. See the module doc. */
 export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
+  const listId = useId();
+  const footerId = useId();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const field = useRef<HTMLInputElement>(null);
@@ -101,6 +116,9 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
 
   useLayoutEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      // An IME composition owns Enter and the arrows. Safari sends the
+      // composition's final Enter with `isComposing` false and keyCode 229.
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.key) {
         case "ArrowUp":
@@ -146,13 +164,21 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
       <div className="w-full max-w-lg border border-white/30 bg-black/70 p-3 text-sm">
         <div className="flex justify-between gap-4 tracking-wider">
           <span>{LIFT_TITLE}</span>
-          <span>{position}</span>
+          <span aria-hidden="true">{position}</span>
         </div>
         <input
           ref={field}
           type="text"
           value={query}
           aria-label={LIFT_FIELD}
+          role="combobox"
+          aria-expanded={status === null}
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-describedby={footerId}
+          {...(status === null
+            ? { "aria-activedescendant": optionId(listId, at) }
+            : {})}
           autoComplete="off"
           spellCheck={false}
           className="mt-2 w-full border-b border-white/40 bg-transparent py-1 text-base text-white outline-none"
@@ -173,13 +199,18 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
           style={{ minHeight: `${String(LEVEL_ROWS * 1.5)}rem` }}
         >
           {status !== null ? (
-            <p className="py-1">{status}</p>
+            <p role="status" className="py-1">
+              {status}
+            </p>
           ) : (
-            <ul role="listbox" aria-label={LIFT_LIST}>
+            <ul id={listId} role="listbox" aria-label={LIFT_LIST}>
               {shown.slice(start, end).map((row, n) => {
                 const on = start + n === at;
                 return (
                   <li
+                    id={optionId(listId, start + n)}
+                    aria-setsize={shown.length}
+                    aria-posinset={start + n + 1}
                     key={row.index}
                     role="option"
                     aria-selected={on}
@@ -216,7 +247,10 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
             {note}
           </div>
         )}
-        <div className="mt-2 whitespace-pre text-xs text-white/60">
+        <div
+          id={footerId}
+          className="mt-2 whitespace-pre text-xs text-white/60"
+        >
           {LIFT_FOOTER}
         </div>
       </div>

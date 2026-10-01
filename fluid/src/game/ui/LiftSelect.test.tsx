@@ -24,7 +24,7 @@ function renderSelect(stops: LiftStop[], note: string | null = null) {
   render(
     <LiftSelect stops={stops} note={note} onRide={onRide} onClose={onClose} />,
   );
-  const field = screen.getByRole("textbox", { name: "Stop name" });
+  const field = screen.getByRole("combobox", { name: "Stop name" });
   return { onRide, onClose, field };
 }
 
@@ -248,5 +248,60 @@ describe("LiftSelect's first key", () => {
     } finally {
       unmount();
     }
+  });
+});
+
+describe("LiftSelect's combobox pattern", () => {
+  // Mutation caught: the active descendant computed from the window position
+  // instead of the filtered index, or a missing aria-controls link.
+  it("is a combobox over its listbox, the active descendant following the selection", () => {
+    const { field } = renderSelect([stop("A"), stop("B"), stop("C")]);
+    expect(field).toHaveAttribute("aria-expanded", "true");
+    expect(field).toHaveAttribute("aria-autocomplete", "list");
+    const list = screen.getByRole("listbox", { name: "Stops" });
+    expect(field).toHaveAttribute("aria-controls", list.id);
+    const options = screen.getAllByRole("option");
+    expect(field).toHaveAttribute("aria-activedescendant", options[0]!.id);
+    fireEvent.keyDown(field, { key: "ArrowDown" });
+    expect(field).toHaveAttribute("aria-activedescendant", options[1]!.id);
+    expect(new Set(options.map((o) => o.id)).size).toBe(3);
+    const footer = document.getElementById(
+      field.getAttribute("aria-describedby") ?? "",
+    );
+    expect(footer?.textContent).toBe(LIFT_FOOTER);
+  });
+
+  // Mutation caught: aria-expanded or aria-activedescendant kept while a
+  // status line stands in for the list, or the status line not a status.
+  it("collapses and drops the active descendant while a status line shows", () => {
+    const { field } = renderSelect([stop("A")]);
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-activedescendant");
+    expect(screen.getByRole("status")).toHaveTextContent(NO_SUCH_STOP);
+  });
+
+  // Mutation caught: the window index used for posinset or setsize.
+  it("numbers an option past the window by its place in the filtered list", () => {
+    const stops = Array.from({ length: 25 }, (_, i) => stop(`s${String(i)}`));
+    const { field } = renderSelect(stops);
+    expect(stops.length).toBeGreaterThan(LEVEL_ROWS);
+    for (let i = 0; i < 24; i++) fireEvent.keyDown(field, { key: "ArrowDown" });
+    const on = screen.getByRole("option", { selected: true });
+    expect(on).toHaveAttribute("aria-posinset", "25");
+    expect(on).toHaveAttribute("aria-setsize", "25");
+    expect(field).toHaveAttribute("aria-activedescendant", on.id);
+  });
+
+  // Mutation caught: the composition guard missing from the key handler.
+  it("does nothing on Enter or an arrow during an IME composition", () => {
+    const { field, onRide, onClose } = renderSelect([stop("A"), stop("B")]);
+    fireEvent.keyDown(field, { key: "ArrowDown", isComposing: true });
+    expect(selected()).toBe("A");
+    fireEvent.keyDown(field, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(field, { key: "Enter", keyCode: 229 });
+    fireEvent.keyDown(field, { key: "Escape", isComposing: true });
+    expect(onRide).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
