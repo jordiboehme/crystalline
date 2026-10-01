@@ -409,6 +409,58 @@ fn vocabulary_json_shape_and_human_sections() {
     }
 }
 
+/// V302: a direct status read with the check on and a remote embedding
+/// model (no measured line floor) says so, and never invents line counts.
+#[test]
+fn direct_status_reports_a_missing_line_floor_for_a_remote_embedding_model() {
+    let work = tempfile::tempdir().unwrap();
+    let domain_dir = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    bin()
+        .args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    bin()
+        .args(["domain", "add", "eng"])
+        .arg(&domain_dir)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "evolve:\n  contradictions: full\nembeddings:\n  provider: openai-compatible\n  model: text-embedding-3-small\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let out = bin()
+        .args(["--json", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let c = &status["contradictions"];
+    assert_eq!(c["line_floor_missing"], serde_json::json!(true), "{c}");
+    assert_eq!(
+        c["embedding_model"],
+        serde_json::json!("text-embedding-3-small")
+    );
+    assert!(c["line_floor"].is_null());
+    assert!(c["lines_embedded"].is_null());
+    assert!(c["lines_eligible"].is_null());
+}
+
 #[test]
 fn init_add_sync_status_end_to_end() {
     let work = tempfile::tempdir().unwrap();

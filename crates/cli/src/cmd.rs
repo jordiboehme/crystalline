@@ -2460,6 +2460,7 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
     let contradiction_model =
         crystalline_index::nli::NliProfile::from_setting(&contradiction_setting)
             .map(crystalline_index::nli::nli_model);
+    let line_floor = crystalline_index::embed::line_similarity_floor(&active_model);
     let scored_pairs = match contradiction_model {
         Some(m) => store
             .scored_pair_count(m.repo)
@@ -2494,12 +2495,21 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             "load_retry": false,
             "read_only": false,
             "embedding_pending": false,
+            // The line floor belongs to the configured embedding model, so a
+            // direct read can name a missing one; line counts are a daemon's
+            // own walk and stay null here (lesson 37/62).
+            "embedding_model": active_model,
+            "line_floor": line_floor,
+            "line_floor_missing": contradiction_model.is_some() && line_floor.is_none(),
+            "lines_embedded": null,
+            "lines_eligible": null,
         },
     }))
 }
 
 /// The one-line reason the contradiction check is not simply "N pairs
-/// pending": the model itself could not be loaded, a batch failed on some of
+/// pending": the configured embedding model has no measured line-similarity
+/// floor so V302 does not run, the model itself could not be loaded, a batch failed on some of
 /// the pending pairs and they are parked, or a settled domain still has a
 /// candidate waiting on its embedding. At most one reason, in that priority
 /// order - L1 asks for a single short phrase naming the reason, not a list -
@@ -2507,6 +2517,14 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
 /// Shared by [`contradictions_lines`] and doctor's row so the two surfaces
 /// can never give a different diagnosis for the same state (lesson 36).
 pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String> {
+    if c["line_floor_missing"].as_bool().unwrap_or(false) {
+        let model = c["embedding_model"]
+            .as_str()
+            .unwrap_or("the configured model");
+        return Some(format!(
+            "not run: the embedding model '{model}' has no measured line-similarity floor"
+        ));
+    }
     if c["load_failed"].as_bool().unwrap_or(false) {
         return c["last_error"]
             .as_str()
@@ -2521,6 +2539,15 @@ pub(crate) fn contradiction_wait_reason(c: &serde_json::Value) -> Option<String>
         return Some("embedding not finished for some candidates".to_string());
     }
     None
+}
+
+/// ", lines E/L embedded" when the report carries both counts, else nothing.
+/// Shared with doctor's row.
+pub(crate) fn lines_embedded_suffix(c: &serde_json::Value) -> String {
+    match (c["lines_embedded"].as_u64(), c["lines_eligible"].as_u64()) {
+        (Some(embedded), Some(eligible)) => format!(", lines {embedded}/{eligible} embedded"),
+        _ => String::new(),
+    }
 }
 
 /// "pair" for one, "pairs" otherwise.
@@ -2589,6 +2616,7 @@ pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
         None => "not counted yet".to_string(),
     };
     let mut line = format!("Contradictions: {profile} ({model}), {pending}");
+    line.push_str(&lines_embedded_suffix(c));
     // The loaded model's device, as on the embeddings line; absent while no
     // model is in memory and from an older daemon, so no guess.
     if let Some(device) = c["device"].as_str() {
@@ -4194,6 +4222,38 @@ mod contradictions_status_tests {
         ];
         assert_eq!(contradictions_lines(&block(true, false)), retrying);
         assert_eq!(contradictions_lines(&block(true, true)), retrying);
+    }
+
+    #[test]
+    fn line_coverage_is_shown_beside_the_pending_count() {
+        let data = json!({"contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": 3, "failing_pairs": 0, "scored_pairs": 40,
+            "last_error": null, "load_failed": false, "embedding_pending": false,
+            "embedding_model": "granite-embedding-97m-multilingual-r2",
+            "line_floor": 0.86, "line_floor_missing": false,
+            "lines_embedded": 812, "lines_eligible": 830,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec!["Contradictions: full (mdeberta-v3-base-xnli-2mil7), 3 pairs pending, lines 812/830 embedded".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_missing_floor_is_the_reason_named_first() {
+        let data = json!({"contradictions": {
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "pending_pairs": null, "failing_pairs": null, "scored_pairs": 0,
+            "last_error": null, "load_failed": false, "embedding_pending": false,
+            "embedding_model": "text-embedding-3-small",
+            "line_floor": null, "line_floor_missing": true,
+            "lines_embedded": null, "lines_eligible": null,
+        }});
+        assert_eq!(
+            contradictions_lines(&data),
+            vec!["Contradictions: full (mdeberta-v3-base-xnli-2mil7), not counted yet, not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor".to_string()]
+        );
     }
 
     /// L7/lesson 62: partial embedding coverage is named, so a bare "0 pairs

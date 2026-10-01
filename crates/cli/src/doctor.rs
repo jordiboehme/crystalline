@@ -3001,7 +3001,7 @@ fn is_embedding_listing(repo: &str) -> bool {
 /// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
 /// status`'s answer when a daemon served this run's file stamps; its
 /// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
-/// `load_retry`, `read_only` and `embedding_pending` are read from there and never recomputed (lesson 36) -
+/// `load_retry`, `read_only`, `embedding_pending`, `lines_embedded` and `lines_eligible` are read from there and never recomputed (lesson 36) -
 /// a direct read has no worker, so those stay null/false, the same shape
 /// `crystalline status`'s standalone fallback reports. `device` is the probed
 /// device a load of the model would pick here (as for the embedding model,
@@ -3038,6 +3038,12 @@ fn contradiction_summary(
     let load_retry = live.is_some_and(|c| c["load_retry"].as_bool().unwrap_or(false));
     let read_only = live.is_some_and(|c| c["read_only"].as_bool().unwrap_or(false));
     let embedding_pending = live.is_some_and(|c| c["embedding_pending"].as_bool().unwrap_or(false));
+    let lines_embedded = live.and_then(|c| c["lines_embedded"].as_u64());
+    let lines_eligible = live.and_then(|c| c["lines_eligible"].as_u64());
+    // The floor belongs to the configured embedding model, so doctor reads it
+    // from the config like `status`'s direct path does, with no daemon needed.
+    let embedding_model = crystalline_index::embed::configured_model_id(cfg.embeddings.as_ref());
+    let line_floor = crystalline_index::embed::line_similarity_floor(&embedding_model);
     let last_error = live
         .and_then(|c| c["last_error"].as_str())
         .map(str::to_string);
@@ -3047,7 +3053,9 @@ fn contradiction_summary(
             "reason": null, "pending_pairs": null, "failing_pairs": null,
             "last_error": null, "load_failed": false, "load_retry": false,
             "read_only": read_only, "embedding_pending": false,
-            "stale_checkpoints": stale,
+            "embedding_model": embedding_model, "line_floor": line_floor,
+            "line_floor_missing": false, "lines_embedded": null,
+            "lines_eligible": null, "stale_checkpoints": stale,
         }),
         Some(m) => {
             // The pinned commit only: the loader fetches it whatever other
@@ -3076,7 +3084,9 @@ fn contradiction_summary(
                 "last_error": last_error, "load_failed": load_failed,
                 "load_retry": load_retry, "read_only": read_only,
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
-                "device": device,
+                "device": device, "embedding_model": embedding_model,
+                "line_floor": line_floor, "line_floor_missing": line_floor.is_none(),
+                "lines_embedded": lines_embedded, "lines_eligible": lines_eligible,
             })
         }
     }
@@ -3785,6 +3795,7 @@ pub fn render_human(report: &DoctorReport) -> String {
                     "contradictions: {}, {model} ({state}), {pending}",
                     c["profile"].as_str().unwrap_or_default()
                 );
+                line.push_str(&crate::cmd::lines_embedded_suffix(c));
                 if let Some(reason) = crate::cmd::contradiction_wait_reason(c) {
                     line.push_str(&format!(", {reason}"));
                 }
@@ -5632,6 +5643,86 @@ mod tests {
 
     /// L7/lesson 62: no daemon answered (a direct read, or one that has not
     /// walked yet), so the pending count is unknown - `null`, never `0`.
+    /// V302: a remote embedding model has no measured line floor, so doctor
+    /// names the reason from the config (a daemon's answer is not needed) and
+    /// the row says the check does not run.
+    #[test]
+    fn contradiction_summary_names_a_missing_line_floor_from_the_config() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let summary = contradiction_summary(&cfg, None, None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["line_floor"], serde_json::Value::Null);
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor"
+            ),
+            "{out}"
+        );
+    }
+
+    /// V302: line coverage comes from the daemon's answer and is shown after
+    /// the pending count; the floor is the configured model's.
+    #[test]
+    fn contradiction_summary_carries_line_coverage_from_a_running_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 3, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+            "lines_embedded": 812, "lines_eligible": 830,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["lines_embedded"], 812);
+        assert_eq!(summary["lines_eligible"], 830);
+        assert_eq!(summary["line_floor_missing"], false);
+        assert!(summary["line_floor"].as_f64().is_some(), "{summary}");
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("3 pairs pending, lines 812/830 embedded"),
+            "{out}"
+        );
+    }
+
+    /// Off prints no coverage and no floor reason, even with a remote model.
+    #[test]
+    fn contradiction_summary_off_has_no_floor_reason_with_a_remote_model() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let cfg = GlobalConfig {
+            embeddings: Some(crate::config::EmbeddingsConfig {
+                provider: "openai-compatible".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                endpoint: None,
+                api_key_env: None,
+            }),
+            ..GlobalConfig::default()
+        };
+        let summary = contradiction_summary(&cfg, None, None);
+        assert_eq!(summary["line_floor_missing"], false);
+        assert_eq!(summary["lines_embedded"], serde_json::Value::Null);
+    }
+
     #[test]
     fn contradiction_summary_with_no_daemon_answer_leaves_the_count_unknown_not_zero() {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
