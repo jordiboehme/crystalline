@@ -15,11 +15,10 @@ pub mod period;
 mod stub;
 
 pub use candidates::{
-    CandidateFacts, CandidatePair, Candidates, KeptLine, LinePair, LineRules,
-    contradiction_candidates, eligible, eligible_lines, first_order_inputs, fold, length_order,
-    line_pairs, line_rows, max_related_pairs, observation_hash, observations_digest, pending_pairs,
-    related_threshold, score_rows, scorer_inputs, scoring_checksum, second_order_input,
-    second_order_needed, similar_line_pairs, windows_overlap,
+    CandidateFacts, CandidatePair, Candidates, KeptLine, LineRules, contradiction_candidates,
+    eligible, eligible_lines, first_order_inputs, fold, length_order, line_rows, max_related_pairs,
+    observation_hash, observations_digest, pending_pairs, related_threshold, scoring_checksum,
+    second_order_input, second_order_needed, similar_line_pairs, windows_overlap,
 };
 pub use models::{
     CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliModel, NliProfile, RETIRED_NLI_REPOS,

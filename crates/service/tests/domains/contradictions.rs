@@ -367,13 +367,16 @@ async fn the_pass_is_off_until_a_profile_is_set_then_scores_related_pairs() {
 
     set(&engine, "evolve.contradictions", "full").await;
     // Eighteen and Twenty share the retry axis; Fridays is the docking axis.
-    // Two lines against two lines, each scored in both orders.
+    // One kept line pair: Node 18 against Node 20 (both unmarked, 1.0); the
+    // retry bullet is the same text on both sides and on another axis than
+    // the Node lines.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1, "loaded lazily, once");
-    assert_eq!(s.forwards(), 8);
+    // One first order, and the 0.93 pair read back in the second.
+    assert_eq!(s.forwards(), 2);
     let stored = rows(&engine, full().repo).await;
     assert_eq!(
         stored.len(),
@@ -386,7 +389,7 @@ async fn the_pass_is_off_until_a_profile_is_set_then_scores_related_pairs() {
         engine.score_contradictions().await.unwrap(),
         scored(0, 0, 0)
     );
-    assert_eq!(s.forwards(), 8, "an up-to-date pair is not asked again");
+    assert_eq!(s.forwards(), 2, "an up-to-date pair is not asked again");
     assert!(
         !engine.contradictions_wanted(),
         "nothing pending, nothing to ask for"
@@ -404,8 +407,8 @@ async fn an_edit_requeues_the_pair() {
     engine.embed_pending().await.unwrap();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 6, 0),
-        "two lines against three"
+        scored(1, 2, 0),
+        "two kept of two lines against three: Node 18 against Node 20, and the retry bullet against the new queue line (one axis, other texts)"
     );
 }
 
@@ -463,9 +466,10 @@ async fn a_failed_load_is_asked_for_again_only_when_the_setting_is_set_again() {
     set(&engine, "evolve.contradictions", "full").await;
     assert!(engine.contradiction_last_error().is_none());
     assert!(engine.contradictions_wanted());
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -495,13 +499,13 @@ async fn a_repeated_observation_line_is_scored_once_and_the_pass_drains() {
     engine.embed_pending().await.unwrap();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 2, 0),
-        "one of the two copies against two lines"
+        scored(1, 1, 0),
+        "one of the two copies against Node 20; the retry bullet is on another axis"
     );
     assert_eq!(
         s.forwards(),
-        4,
-        "two line pairs, both orders, nothing twice"
+        2,
+        "one line pair, both orders (0.93), nothing twice"
     );
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
     // Off and on again forgets the settled digest, so the next walk parses
@@ -517,7 +521,7 @@ async fn a_repeated_observation_line_is_scored_once_and_the_pass_drains() {
         walks + 1,
         "the domain was parsed again"
     );
-    assert_eq!(s.forwards(), 4);
+    assert_eq!(s.forwards(), 2);
     assert!(!engine.contradictions_wanted());
 }
 
@@ -548,9 +552,10 @@ async fn a_drained_scope_asks_for_nothing_more() {
         .await
         .unwrap();
     engine.embed_pending().await.unwrap();
+    // Eighteen against Twenty, one kept line pair; the prose has no lines.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert!(!engine.contradictions_wanted());
     let before = s.forwards();
@@ -574,10 +579,12 @@ async fn a_pass_is_bounded_and_the_next_one_finishes() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
     set(&engine, "evolve.contradictions", "full").await;
-    // Nine engrams on one axis with eight lines each: 36 pairs of 64 line
-    // pairs is 2304, over the 2000 a pass may score.
-    for i in 0..9 {
-        let bullets: String = (0..8)
+    // Thirty-three engrams on one axis with two lines each: every line is on
+    // the retry axis with its own text, so each of the 528 pairs keeps all
+    // four of its line pairs (the per-pair limit), 2112 in all, over the 2000
+    // a pass may score.
+    for i in 0..33 {
+        let bullets: String = (0..2)
             .map(|j| format!("\n- [fact] Retry fact {i} {j}"))
             .collect();
         engine
@@ -589,14 +596,15 @@ async fn a_pass_is_bounded_and_the_next_one_finishes() {
             .unwrap();
     }
     engine.embed_pending().await.unwrap();
+    // 500 whole pairs fill the 2000 exactly; 28 are left.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(31, 1984, 5)
+        scored(500, 2000, 28)
     );
     assert!(engine.contradictions_wanted(), "pairs remain");
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(5, 320, 0)
+        scored(28, 112, 0)
     );
 }
 
@@ -631,7 +639,8 @@ async fn the_pass_is_single_flight() {
     gate.notify_one();
     // The running pass walks once more for the turned-away request, and that
     // walk finds nothing left.
-    assert_eq!(first.await.unwrap(), scored(1, 4, 0));
+    // One kept line pair, Node 18 against Node 20.
+    assert_eq!(first.await.unwrap(), scored(1, 1, 0));
 }
 
 /// The T4 ruling: the loader wipes and downloads about 500 MB again on any
@@ -765,8 +774,8 @@ async fn a_failed_download_is_retried_on_the_tick_with_a_backoff() {
     assert!(engine.contradictions_wanted());
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0),
-        "back online: loaded and scored"
+        scored(1, 1, 0),
+        "back online: loaded and scored (one kept line pair)"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     let status = engine.contradictions_status().await.unwrap();
@@ -891,9 +900,10 @@ async fn a_settled_domain_is_skipped_until_a_stamp_changes() {
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
     let start = engine.contradiction_fact_walks();
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert_eq!(engine.contradiction_fact_walks(), start + 1);
     assert_eq!(
@@ -907,9 +917,11 @@ async fn a_settled_domain_is_skipped_until_a_stamp_changes() {
     );
     engine.edit_engram(&append_to_twenty()).await.unwrap();
     engine.embed_pending().await.unwrap();
+    // Two kept: Node 18 against Node 20, the retry bullet against the new
+    // queue line.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 6, 0)
+        scored(1, 2, 0)
     );
     assert_eq!(
         engine.contradiction_fact_walks(),
@@ -983,9 +995,11 @@ async fn a_chunk_the_provider_always_rejects_does_not_hold_the_pass() {
         engine.embedding_backlog().await.unwrap() > 0,
         "the poisoned chunk stays unembedded"
     );
+    // Eighteen against Twenty, one kept line pair; the poisoned engram has
+    // no lead vector, so it is no candidate.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     let walks = engine.contradiction_fact_walks();
     assert_eq!(
@@ -1083,8 +1097,8 @@ async fn a_lead_vector_that_arrives_later_walks_a_settled_domain_again() {
     engine.embed_pending().await.unwrap();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0),
-        "the vector arrived without a stamp change and the pair is scored"
+        scored(1, 1, 0),
+        "the vector arrived without a stamp change and the pair is scored (one kept line pair)"
     );
     assert_eq!(engine.contradiction_fact_walks(), walks + 1);
     assert_eq!(
@@ -1144,12 +1158,15 @@ async fn a_failing_batch_sets_last_error_and_the_pass_scores_the_rest() {
         .await
         .unwrap();
     three(&engine).await;
-    // Three retry engrams make three pairs; the two with Nineteen fail.
+    // Three retry engrams make three pairs of one kept line pair each (the
+    // Node lines); the two with Nineteen fail.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 2)
+        scored(1, 1, 2)
     );
-    assert_eq!(failing.failed.load(Ordering::SeqCst), 2);
+    // The three pairs share one group, whose batch fails once; each pair is
+    // then scored alone, and the two with Nineteen fail again.
+    assert_eq!(failing.failed.load(Ordering::SeqCst), 3);
     assert!(
         engine
             .contradiction_last_error()
@@ -1183,7 +1200,7 @@ async fn a_failing_batch_sets_last_error_and_the_pass_scores_the_rest() {
     );
     assert_eq!(
         failing.failed.load(Ordering::SeqCst),
-        2,
+        3,
         "a walk nobody marked leaves known failures alone"
     );
     assert_eq!(
@@ -1197,9 +1214,10 @@ async fn a_failing_batch_sets_last_error_and_the_pass_scores_the_rest() {
         engine.score_contradictions().await.unwrap(),
         scored(0, 0, 2)
     );
+    // The two as one group (one failed batch), then each alone (two).
     assert_eq!(
         failing.failed.load(Ordering::SeqCst),
-        4,
+        6,
         "the marked walk retried both once"
     );
     assert!(engine.contradiction_last_error().is_some());
@@ -1209,7 +1227,7 @@ async fn a_failing_batch_sets_last_error_and_the_pass_scores_the_rest() {
     );
     assert_eq!(
         failing.failed.load(Ordering::SeqCst),
-        4,
+        6,
         "the mark is spent"
     );
 }
@@ -1231,9 +1249,10 @@ async fn a_failing_pair_is_not_rewalked_on_every_write_and_the_model_idles_out()
         .await
         .unwrap();
     three(&engine).await;
+    // Eighteen against Twenty, one kept line pair; the two with Nineteen fail.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 2)
+        scored(1, 1, 2)
     );
     let (walks, failed) = (
         engine.contradiction_fact_walks(),
@@ -1295,9 +1314,10 @@ async fn a_stale_retry_mark_after_an_idle_drop_loads_nothing() {
         .await
         .unwrap();
     three(&engine).await;
+    // Eighteen against Twenty, one kept line pair; the two with Nineteen fail.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 2)
+        scored(1, 1, 2)
     );
     assert!(engine.mark_contradiction_retry(), "marked while loaded");
     engine.drop_idle_scorer_at(
@@ -1330,6 +1350,30 @@ async fn a_failed_store_write_skips_the_pair_and_the_walk_goes_on() {
     let (_tmp, engine) = engine_with(loader(s, loads)).await;
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
+    // The line vectors are in place first: the open transaction below would
+    // refuse their write too, and the pair would then wait for its lines
+    // instead of failing at the score write this test is about.
+    {
+        let lines: Vec<ObservationVector> = [
+            "The build uses Node 18",
+            "The build uses Node 20",
+            "Retries back off on the queue",
+            "Deployments run on Fridays",
+            "The clamps misread below eight degrees",
+        ]
+        .iter()
+        .map(|t| ObservationVector {
+            hash: crystalline_index::nli::observation_hash(t),
+            vector: crate::support::TopicEmbedder::embed_one(t),
+        })
+        .collect();
+        let store = engine.store();
+        let store = store.lock().await;
+        store
+            .store_observation_vectors(DEFAULT_MODEL_ID, &lines)
+            .await
+            .unwrap();
+    }
     // An open transaction makes `replace_contradictions` refuse.
     let store = engine.store();
     store.lock().await.begin().await.unwrap();
@@ -1341,9 +1385,10 @@ async fn a_failed_store_write_skips_the_pair_and_the_walk_goes_on() {
     assert!(engine.contradiction_last_error().is_some());
     store.lock().await.rollback().await.unwrap();
     assert!(engine.mark_contradiction_retry());
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert!(engine.contradiction_last_error().is_none());
 }
@@ -1560,7 +1605,8 @@ async fn the_worker_settles_after_a_request_with_a_failing_pair() {
         settled,
         "the worker does not ask itself again"
     );
-    assert_eq!(failing.failed.load(Ordering::SeqCst), 2);
+    // One failed group batch, then the two pairs with Nineteen alone.
+    assert_eq!(failing.failed.load(Ordering::SeqCst), 3);
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
 }
 
@@ -1587,8 +1633,8 @@ async fn a_capitalised_status_is_read_in_lowercase() {
     engine.embed_pending().await.unwrap();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0),
-        "Eighteen and Twenty only"
+        scored(1, 1, 0),
+        "Eighteen and Twenty only, one kept line pair"
     );
 }
 
@@ -1740,7 +1786,8 @@ async fn shutdown_steps_never_wait_on_a_scoring_batch() {
     .expect("the pass reached the scorer");
     shutdown_steps(&engine).await;
     release.send(()).unwrap();
-    assert_eq!(pass.await.unwrap(), scored(1, 4, 0));
+    // One kept line pair, Node 18 against Node 20.
+    assert_eq!(pass.await.unwrap(), scored(1, 1, 0));
 }
 
 /// The engine half of the daemon's `Departure` steps, each bounded well
@@ -2309,9 +2356,10 @@ async fn a_domain_removed_and_added_back_is_scored_again() {
     let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
     let (_tmp, dir, engine) = file_engine(loader(s, loads)).await;
     set(&engine, "evolve.contradictions", "full").await;
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
     assert_eq!(
@@ -2337,7 +2385,7 @@ async fn a_domain_removed_and_added_back_is_scored_again() {
     );
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0),
+        scored(1, 1, 0),
         "the re-added domain is scored again"
     );
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
@@ -2355,9 +2403,10 @@ async fn a_frontmatter_edit_rescores_nothing_and_a_changed_line_rescores_the_pai
     let (_tmp, engine) = engine_with(loader(s.clone(), loads.clone())).await;
     set(&engine, "evolve.contradictions", "full").await;
     three(&engine).await;
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     let idle = || {
         engine.drop_idle_scorer_at(
@@ -2415,9 +2464,11 @@ async fn a_frontmatter_edit_rescores_nothing_and_a_changed_line_rescores_the_pai
     let forwards = s.forwards();
     engine.edit_engram(&append_to_twenty()).await.unwrap();
     engine.embed_pending().await.unwrap();
+    // Two kept: Node 18 against Node 20, the retry bullet against the new
+    // queue line.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 6, 0)
+        scored(1, 2, 0)
     );
     assert_eq!(loads.load(Ordering::SeqCst), 2);
     assert!(s.forwards() > forwards);
@@ -2826,9 +2877,10 @@ async fn a_provider_that_is_fully_down_keeps_embedding_pending() {
     // Up again: the lines and the lead vector arrive and the pair is scored.
     provider.down.store(false, Ordering::SeqCst);
     engine.embed_pending().await.unwrap();
+    // One kept line pair, Node 18 against Node 20.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
-        scored(1, 4, 0)
+        scored(1, 1, 0)
     );
     let status = engine.contradictions_status().await.unwrap();
     assert_eq!(status["embedding_pending"], false, "{status}");
@@ -2892,4 +2944,163 @@ async fn a_domain_with_a_missing_line_vector_never_settles() {
             .is_some_and(|e| e.contains("observation lines could not be embedded")),
         "{status}"
     );
+}
+
+// --- scoring through the line filter ---------------------------------------
+
+// The bodies carry six retry-axis words, so both lead vectors sit on the
+// retry axis (lead cosine about 0.93 under the topic provider) whatever the
+// bullets add.
+const STAGING_MANUAL: &str = "The retry queue pipeline retries with backoff and a dead-letter queue.\n\n- [fact] Staging needs a manual trigger on the queue\n- [fact] Docking clamps seat in bay three\n- [fact] The login session cookie lasts a day";
+const STAGING_AUTO: &str = "The retry queue pipeline retries with backoff and a dead-letter queue.\n\n- [fact] Staging retries the queue without a manual trigger\n- [fact] Token auth uses a csrf cookie";
+
+/// Only line pairs about the same subject reach the model: under the topic
+/// provider, a retry-queue line against a retry-queue line, a login line
+/// against a login line, never the docking line against either.
+#[tokio::test]
+async fn only_lines_about_the_same_subject_reach_the_model() {
+    let s = Arc::new(StubScorer::new(full().repo, 0.05).with(
+        "Staging needs a manual trigger on the queue",
+        "Staging retries the queue without a manual trigger",
+        0.92,
+    ));
+    let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Manual", STAGING_MANUAL))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Auto", STAGING_AUTO))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 2, 0)
+    );
+    // Two kept line pairs read once each, the staging pair (0.92) a second
+    // time; the cookie pair (0.05) never in the other order.
+    assert_eq!(s.forwards(), 3);
+    let stored = rows(&engine, full().repo).await;
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!((stored[0].similarity - 1.0).abs() < 1e-6, "same topic axis");
+}
+
+#[tokio::test]
+async fn a_pair_with_no_line_above_the_floor_is_scored_empty_and_not_asked_again() {
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let (_tmp, engine) = engine_with(loader(s.clone(), loads.clone())).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    // Same lead topic (seven retry-axis words in each body, lead cosine about
+    // 0.86), no line on a shared axis: the queue line against a docking line
+    // and a login line.
+    let body = "The retry queue backoff, retries and dead-letter queue ttl.";
+    engine
+        .write_engram(&write(
+            "Queue",
+            &format!("{body}\n\n- [fact] Retries back off on the queue"),
+        ))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write(
+            "Elsewhere",
+            &format!(
+                "{body}\n\n- [fact] Docking clamps seat in bay three\n- [fact] The login session cookie lasts a day"
+            ),
+        ))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 0, 0)
+    );
+    assert_eq!(s.forwards(), 0, "nothing reached the model");
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        0,
+        "a pair with nothing to read loads no model"
+    );
+    assert!(rows(&engine, full().repo).await.is_empty());
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+}
+
+/// Review focus 3.
+#[tokio::test]
+async fn a_line_the_provider_rejects_keeps_its_pair_pending_and_says_why() {
+    let (_tmp, engine) = engine_on(Arc::new(PoisonLine)).await;
+    let engine = with_loader(engine, loader(stub(), Arc::new(AtomicUsize::new(0))));
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write("Eighteen", NODE_18))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Poisoned", POISONED))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    // The refused batch held every line of both engrams, so the pair waits.
+    // pairs 0 with one remaining: the worker does not ask again at once
+    // (run_contradiction_worker re-asks only after a pass that scored).
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 1),
+        "the pair waits for its line vectors"
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(status["pending_pairs"], 1);
+    assert!(
+        status["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("observation lines could not be embedded"),
+        "{status}"
+    );
+    assert!(
+        engine.contradictions_wanted(),
+        "the tick retries it, every five minutes"
+    );
+}
+
+#[tokio::test]
+async fn rows_from_older_rules_are_rescored() {
+    let s = stub();
+    let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    engine.score_contradictions().await.unwrap();
+    // Stamp the pair as a build before this change would have: the plain
+    // observation digest, a row with no similarity.
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        let domain = store.list_engrams("notes", None, None).await.unwrap()[0].domain_id;
+        let scored = store
+            .contradiction_pairs_scored(domain, full().repo)
+            .await
+            .unwrap();
+        let mut old = scored[0].clone();
+        old.checksum_a = "plain-digest".to_string();
+        store
+            .replace_contradictions(domain, &old, 0.9, full().repo, "t", &[])
+            .await
+            .unwrap();
+    }
+    set(&engine, "evolve.contradictions", "full").await;
+    let before = s.forwards();
+    // One kept line pair: Node 18 against Node 20 (both on the unmarked
+    // axis); the shared retry bullet is the same text on both sides.
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    assert!(s.forwards() > before, "the pair was read again");
+    assert_eq!(rows(&engine, full().repo).await.len(), 1);
 }

@@ -13,8 +13,8 @@ use super::period::names_period;
 use crate::store::{ContradictionRow, EngramId, ScoredPair, is_current_status};
 use crate::sweep::twins::find_twins_where;
 use crate::sweep::{
-    CONTRADICTION_STORE_FLOOR, FactObservation, MAX_LINE_PAIRS_PER_PAIR, MAX_RELATED_PAIRS,
-    RELATED_THRESHOLD, SPECULATIVE_STATUSES, SweepOptions,
+    CONTRADICTION_STORE_FLOOR, FactObservation, MAX_RELATED_PAIRS, RELATED_THRESHOLD,
+    SPECULATIVE_STATUSES, SweepOptions,
 };
 
 /// What candidate selection reads about one base engram.
@@ -63,19 +63,6 @@ pub struct Candidates {
     /// `max_pairs`, so the less related ones were dropped. Exactly
     /// `max_pairs` is not full.
     pub full: bool,
-}
-
-/// One observation line of `a` against one of `b`, with both row hashes.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LinePair<'a> {
-    /// The line from the lower-id engram.
-    pub a: &'a FactObservation,
-    /// The line from the higher-id engram.
-    pub b: &'a FactObservation,
-    /// [`observation_hash`] of `a`'s text.
-    pub hash_a: String,
-    /// [`observation_hash`] of `b`'s text.
-    pub hash_b: String,
 }
 
 /// Current and not speculative: the statuses a pair may be scored in.
@@ -242,88 +229,6 @@ pub fn observation_hash(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(fold(text).as_bytes());
     crate::hex_lower(&h.finalize())
-}
-
-/// The line pairs of one engram pair, in document order, at most
-/// [`MAX_LINE_PAIRS_PER_PAIR`]: the first eight of each side when both exceed
-/// eight, otherwise every line of the short side against as many of the long
-/// side as the cap allows. A line with no words is skipped, and a repeated
-/// hash pair (a copied bullet) is kept once, the first occurrence.
-pub fn line_pairs<'a>(a: &'a [FactObservation], b: &'a [FactObservation]) -> Vec<LinePair<'a>> {
-    let words = |o: &&FactObservation| !fold(&o.text).is_empty();
-    let a: Vec<&FactObservation> = a.iter().filter(words).collect();
-    let b: Vec<&FactObservation> = b.iter().filter(words).collect();
-    if a.is_empty() || b.is_empty() {
-        return Vec::new();
-    }
-    let side = 8usize;
-    let (na, nb) = if a.len() <= side {
-        (a.len(), b.len().min(MAX_LINE_PAIRS_PER_PAIR / a.len()))
-    } else if b.len() <= side {
-        (a.len().min(MAX_LINE_PAIRS_PER_PAIR / b.len()), b.len())
-    } else {
-        (side, side)
-    };
-    let hashes_a: Vec<String> = a[..na].iter().map(|o| observation_hash(&o.text)).collect();
-    let hashes_b: Vec<String> = b[..nb].iter().map(|o| observation_hash(&o.text)).collect();
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
-    let mut out = Vec::with_capacity(na * nb);
-    for (x, hx) in a[..na].iter().zip(&hashes_a) {
-        for (y, hy) in b[..nb].iter().zip(&hashes_b) {
-            if seen.insert((hx.as_str(), hy.as_str())) {
-                out.push(LinePair {
-                    a: x,
-                    b: y,
-                    hash_a: hx.clone(),
-                    hash_b: hy.clone(),
-                });
-            }
-        }
-    }
-    out
-}
-
-/// The scorer input for `lines`: each pair in both orders, `a` as premise
-/// first, folded.
-pub fn scorer_inputs(lines: &[LinePair<'_>]) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(lines.len() * 2);
-    for lp in lines {
-        let (x, y) = (fold(&lp.a.text), fold(&lp.b.text));
-        out.push((x.clone(), y.clone()));
-        out.push((y, x));
-    }
-    out
-}
-
-/// The rows to store for `lines`, given the scorer's probabilities in
-/// [`scorer_inputs`] order: every line pair whose higher order is at or above
-/// [`CONTRADICTION_STORE_FLOOR`], both orders kept, with the period hint.
-pub fn score_rows(
-    a: EngramId,
-    b: EngramId,
-    lines: &[LinePair<'_>],
-    probabilities: &[f32],
-) -> Vec<ContradictionRow> {
-    // Two scores per line pair, one per reading order. A short answer would
-    // zip away the tail silently and store the pair as scored.
-    debug_assert_eq!(probabilities.len(), lines.len() * 2);
-    lines
-        .iter()
-        .zip(probabilities.as_chunks::<2>().0)
-        .filter(|(_, [ab, ba])| ab.max(*ba) >= CONTRADICTION_STORE_FLOOR)
-        .map(|(lp, &[ab, ba])| ContradictionRow {
-            a,
-            b,
-            line_a: lp.a.line,
-            line_b: lp.b.line,
-            hash_a: lp.hash_a.clone(),
-            hash_b: lp.hash_b.clone(),
-            score_ab: ab,
-            score_ba: ba,
-            similarity: 0.0,
-            period: names_period(&lp.a.text) || names_period(&lp.b.text),
-        })
-        .collect()
 }
 
 /// One kept line pair of an engram pair: indices into each engram's
@@ -824,48 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn line_pairs_are_capped_at_the_first_eight_of_each_side() {
-        let a: Vec<FactObservation> = (1..=12).map(|i| obs(i, &format!("a{i}"))).collect();
-        let b: Vec<FactObservation> = (1..=12).map(|i| obs(i, &format!("b{i}"))).collect();
-        let pairs = line_pairs(&a, &b);
-        assert_eq!(pairs.len(), MAX_LINE_PAIRS_PER_PAIR);
-        assert!(pairs.iter().all(|p| p.a.line <= 8 && p.b.line <= 8));
-        assert_eq!((pairs[0].a.line, pairs[0].b.line), (1, 1));
-        assert_eq!((pairs[63].a.line, pairs[63].b.line), (8, 8));
-        assert_eq!(
-            line_pairs(&a[..3], &b).len(),
-            36,
-            "three against twelve all fit"
-        );
-        let long: Vec<FactObservation> = (1..=40).map(|i| obs(i, &format!("b{i}"))).collect();
-        assert_eq!(
-            line_pairs(&a[..2], &long).len(),
-            64,
-            "the long side is cut at 32"
-        );
-        assert!(line_pairs(&[], &b).is_empty());
-    }
-
-    /// Review focus 1: a copied bullet would collide on the table's primary
-    /// key and wedge the pair; it is scored once.
-    #[test]
-    fn line_pairs_dedupe_a_repeated_line_by_its_hash_pair() {
-        let a = vec![
-            obs(5, "The build uses Node 18"),
-            obs(9, "The  build uses Node 18"),
-        ];
-        let b = vec![obs(3, "The build uses Node 20")];
-        let pairs = line_pairs(&a, &b);
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].a.line, 5, "the first occurrence in document order");
-        let blank = vec![obs(4, "   ")];
-        assert!(
-            line_pairs(&blank, &b).is_empty(),
-            "an observation with no words is no line"
-        );
-    }
-
-    #[test]
     fn the_row_hash_survives_whitespace_and_never_the_words() {
         assert_eq!(
             observation_hash("The build  uses\tNode 18 "),
@@ -876,54 +739,6 @@ mod tests {
             observation_hash("The build uses Node 20")
         );
         assert_eq!(observation_hash("x").len(), 64);
-    }
-
-    #[test]
-    fn scorer_inputs_are_both_orders_folded() {
-        let a = vec![obs(1, "Node  18")];
-        let b = vec![obs(2, "Node 20")];
-        let lines = line_pairs(&a, &b);
-        assert_eq!(
-            scorer_inputs(&lines),
-            vec![
-                ("Node 18".to_string(), "Node 20".to_string()),
-                ("Node 20".to_string(), "Node 18".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn score_rows_keep_the_higher_order_above_the_floor_and_mark_periods() {
-        let a = vec![
-            obs(1, "Since 2024 the build uses Node 18"),
-            obs(2, "Deploys run on Fridays"),
-        ];
-        let b = vec![obs(7, "The build uses Node 20")];
-        let lines = line_pairs(&a, &b);
-        let rows = score_rows(EngramId(1), EngramId(2), &lines, &[0.2, 0.9, 0.4, 0.3]);
-        assert_eq!(
-            rows.len(),
-            1,
-            "only the first line pair clears the floor in either order"
-        );
-        let r = &rows[0];
-        assert_eq!((r.line_a, r.line_b), (1, 7));
-        assert_eq!((r.score_ab, r.score_ba), (0.2, 0.9));
-        assert!(r.period, "a line naming a year sets the hint");
-        assert_eq!(
-            r.hash_a,
-            observation_hash("Since 2024 the build uses Node 18")
-        );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn score_rows_refuses_a_short_answer_in_a_debug_build() {
-        let a = vec![obs(1, "The build uses Node 18")];
-        let b = vec![obs(7, "The build uses Node 20")];
-        let lines = line_pairs(&a, &b);
-        score_rows(EngramId(1), EngramId(2), &lines, &[0.9]);
     }
 
     #[test]

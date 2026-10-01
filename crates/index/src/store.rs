@@ -1570,11 +1570,12 @@ pub struct ScoredPair {
     pub a: EngramId,
     /// The engram with the higher id.
     pub b: EngramId,
-    /// `a`'s observation digest at scoring time
-    /// ([`crate::nli::observations_digest`]): what the model read, not the
-    /// file's checksum, so a frontmatter-only edit keeps the pair scored.
+    /// `a`'s scoring checksum at scoring time
+    /// ([`crate::nli::scoring_checksum`]): what the model read under the line
+    /// rules, not the file's checksum, so a frontmatter-only edit keeps the
+    /// pair scored and a change of the rules scores it again.
     pub checksum_a: String,
-    /// `b`'s observation digest at scoring time.
+    /// `b`'s scoring checksum at scoring time.
     pub checksum_b: String,
 }
 

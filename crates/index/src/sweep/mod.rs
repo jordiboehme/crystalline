@@ -134,10 +134,6 @@ pub const RELATED_THRESHOLD: f64 = 0.80;
 /// The eval harness overrides it with `CRYSTALLINE_NLI_MAX_PAIRS`.
 pub const MAX_RELATED_PAIRS: usize = 2000;
 
-/// The most observation line pairs scored per engram pair: the first eight of
-/// each side when both exceed eight, in document order.
-pub const MAX_LINE_PAIRS_PER_PAIR: usize = 64;
-
 /// The most observation line pairs the NLI model reads per engram pair: the
 /// most similar ones at or above the embedding model's line-similarity floor
 /// (`crate::embed::line_similarity_floor`), every line of one engram against

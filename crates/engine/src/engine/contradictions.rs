@@ -19,12 +19,16 @@
 use super::*;
 use crystalline_index::embed::line_similarity_floor;
 use crystalline_index::nli::{
-    CandidateFacts, CandidatePair, ContradictionScorer, MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE,
-    NliModel, NliProfile, contradiction_candidates, eligible, eligible_lines, line_pairs,
-    max_related_pairs, nli_model, observations_digest, pending_pairs, related_threshold,
-    score_rows, scorer_inputs,
+    CandidateFacts, CandidatePair, ContradictionScorer, KeptLine, LineRules,
+    MAX_INFERENCES_PER_PASS, NLI_BATCH_SIZE, NLI_GROUP_LINE_PAIRS, NliModel, NliProfile,
+    contradiction_candidates, eligible, eligible_lines, first_order_inputs, fold, length_order,
+    line_rows, max_related_pairs, nli_model, observation_hash, pending_pairs, related_threshold,
+    scoring_checksum, second_order_input, second_order_needed, similar_line_pairs,
 };
-use crystalline_index::{ContradictionRow, ObservationVector, ScoredPair};
+use crystalline_index::sweep::{MAX_LINE_PAIRS_PER_ENGRAM_PAIR, ORDER_AGGREGATION};
+use crystalline_index::{
+    ContradictionRow, OBSERVATION_VECTOR_CHUNK, ObservationVector, ScoredPair,
+};
 
 /// The key whose change lifts a failed load and makes pending unknown again.
 const CONTRADICTIONS_KEY: &str = "evolve.contradictions";
@@ -41,10 +45,11 @@ pub(crate) struct ContradictionFact {
     pub(crate) valid_from: Option<NaiveDate>,
     /// End of the validity window; absent is unbounded.
     pub(crate) valid_to: Option<NaiveDate>,
-    /// The observation digest ([`observations_digest`]): what the model
-    /// reads of the engram, which is what a scored pair and a parked failure
-    /// are keyed by. The file stamps only decide whether a domain is parsed
-    /// again ([`walk_digest`]).
+    /// The scoring checksum ([`scoring_checksum`]): what the model reads of
+    /// the engram under the line rules, which is what a scored pair and a
+    /// parked failure are keyed by. A changed line, floor, limit or
+    /// embedding model moves it; the file stamps only decide whether a
+    /// domain is parsed again ([`walk_digest`]).
     pub(crate) checksum: String,
     /// The lead vector for the active embedding model, when asked for and
     /// stored.
@@ -101,8 +106,8 @@ struct DomainWork {
     name: String,
     id: DomainId,
     facts: Vec<ContradictionFact>,
-    /// The pairs this walk scores.
-    pending: Vec<CandidatePair>,
+    /// The pairs this walk scores, each with its kept line pairs.
+    pending: Vec<PairPlan>,
     /// Known failures this walk leaves alone (every walk but a retry walk).
     known_failing: usize,
     /// The known failures still pending at their checksums, as the walk
@@ -115,6 +120,21 @@ struct DomainWork {
     count: Option<DomainCount>,
     /// What the walk's line step saw. `None` for a domain skipped as settled.
     lines: Option<LineCoverage>,
+}
+
+/// One pending engram pair and its kept line pairs; `lines` is `None` while
+/// a line of either engram has no vector, and the pair then stays pending.
+struct PairPlan {
+    pair: CandidatePair,
+    lines: Option<Vec<KeptLine>>,
+}
+
+impl PairPlan {
+    /// How many kept line pairs the model reads for this pair; none while it
+    /// waits for a line vector.
+    fn line_count(&self) -> usize {
+        self.lines.as_ref().map_or(0, Vec::len)
+    }
 }
 
 /// What a walk's line step saw of one parsed domain.
@@ -160,14 +180,15 @@ impl Engine {
     /// setting cannot be set here, so only a restart retries a blocked load)
     /// and `embedding_pending` (a domain the last walk counted, settled or
     /// not, still has a possible candidate with no lead vector yet, so its
-    /// pending count of zero is not the whole story). `device` is where the loaded model runs, in the
-    /// embeddings line's words (`metal`, `cpu (fallback: ...)`), and `null`
-    /// while no model is in memory (never loaded, dropped after its idle
-    /// time, or a direct read with no worker): no guess at a device nothing
-    /// runs on. `embedding_model` is the id the line vectors are stored
-    /// under, `line_floor` that model's line-similarity floor (`null` when it
-    /// has none), and `line_floor_missing` says the check is on but `V302`
-    /// cannot run because the model has no floor. `lines_eligible` and
+    /// pending count of zero is not the whole story). `device` is where the
+    /// loaded model runs, in the embeddings line's words (`metal`,
+    /// `cpu (fallback: ...)`), and `null` while no model is in memory (never
+    /// loaded, dropped after its idle time, or a direct read with no
+    /// worker): no guess at a device nothing runs on. `embedding_model` is
+    /// the id the line vectors are stored under, `line_floor` that model's
+    /// line-similarity floor (`null` when it has none), and
+    /// `line_floor_missing` says the check is on but `V302` cannot run
+    /// because the model has no floor. `lines_eligible` and
     /// `lines_embedded` are the distinct observation lines that can take part
     /// and how many of them carry a vector, as the last walk counted them,
     /// and `null` like `pending_pairs` until a walk ran or while the check is
@@ -756,7 +777,12 @@ impl Engine {
             .iter()
             .map(|w| (w.name.clone(), w.failures.clone()))
             .collect();
-        if work.iter().all(|w| w.pending.is_empty()) {
+        // A pair whose line vectors are missing waits and costs nothing, so a
+        // walk where every pending pair waits has nothing to score.
+        if work
+            .iter()
+            .all(|w| w.pending.iter().all(|p| p.lines.is_none()))
+        {
             let remaining = pending.values().sum();
             self.publish_walk(model, generation, &work, pending, failures, line_error);
             return Ok(ContradictionOutcome::Scored {
@@ -765,56 +791,67 @@ impl Engine {
                 remaining,
             });
         }
-        let scorer = match self.scorer_for(model).await {
-            Ok(scorer) => {
-                let mut state = self.contradiction_state.lock().unwrap();
-                state.load_backoff = None;
-                state.load_retry_at = None;
-                scorer
-            }
-            Err(e) => {
-                let current = self.contradiction_model().map(|m| m.repo);
-                let mut state = self.contradiction_state.lock().unwrap();
-                if state.generation == generation && current == Some(model.repo) {
-                    if matches!(e, IndexError::NliFetch(_)) {
-                        // A download that failed is tried again later, each
-                        // failure waiting twice as long, up to an hour.
-                        let wait = state
-                            .load_backoff
-                            .map_or(NLI_FETCH_RETRY_FIRST, |w| (w * 2).min(NLI_FETCH_RETRY_MAX));
-                        state.load_backoff = Some(wait);
-                        state.load_retry_at = Some(tokio::time::Instant::now() + wait);
-                        if !state.error_logged {
-                            tracing::warn!(
-                                model = model.repo,
-                                "the contradiction model could not be downloaded; it is tried again in {} minutes: {e}",
-                                wait.as_secs() / 60
-                            );
-                            state.error_logged = true;
-                        } else {
-                            tracing::info!(
-                                model = model.repo,
-                                "the contradiction model could still not be downloaded; it is tried again in {} minutes: {e}",
-                                wait.as_secs() / 60
-                            );
-                        }
-                    } else {
-                        state.load_retry_at = None;
-                        if !state.error_logged {
-                            tracing::warn!(
-                                model = model.repo,
-                                "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
-                            );
-                            state.error_logged = true;
-                        }
-                    }
-                    state.last_error = Some(e.to_string());
-                    state.load_failed = Some(model.repo);
-                    record_counts(&mut state, &work, &pending);
-                    state.pending = Some(pending);
+        // The model is loaded only when some pair has a line pair to read. A
+        // pair with none above the floor, the common case for a related
+        // pair, is stored empty without it.
+        let needs_model = work
+            .iter()
+            .any(|w| w.pending.iter().any(|p| p.line_count() > 0));
+        let scorer = if needs_model {
+            match self.scorer_for(model).await {
+                Ok(scorer) => {
+                    let mut state = self.contradiction_state.lock().unwrap();
+                    state.load_backoff = None;
+                    state.load_retry_at = None;
+                    Some(scorer)
                 }
-                return Ok(ContradictionOutcome::ModelUnavailable);
+                Err(e) => {
+                    let current = self.contradiction_model().map(|m| m.repo);
+                    let mut state = self.contradiction_state.lock().unwrap();
+                    if state.generation == generation && current == Some(model.repo) {
+                        if matches!(e, IndexError::NliFetch(_)) {
+                            // A download that failed is tried again later,
+                            // each failure waiting twice as long, up to an
+                            // hour.
+                            let wait = state.load_backoff.map_or(NLI_FETCH_RETRY_FIRST, |w| {
+                                (w * 2).min(NLI_FETCH_RETRY_MAX)
+                            });
+                            state.load_backoff = Some(wait);
+                            state.load_retry_at = Some(tokio::time::Instant::now() + wait);
+                            if !state.error_logged {
+                                tracing::warn!(
+                                    model = model.repo,
+                                    "the contradiction model could not be downloaded; it is tried again in {} minutes: {e}",
+                                    wait.as_secs() / 60
+                                );
+                                state.error_logged = true;
+                            } else {
+                                tracing::info!(
+                                    model = model.repo,
+                                    "the contradiction model could still not be downloaded; it is tried again in {} minutes: {e}",
+                                    wait.as_secs() / 60
+                                );
+                            }
+                        } else {
+                            state.load_retry_at = None;
+                            if !state.error_logged {
+                                tracing::warn!(
+                                    model = model.repo,
+                                    "the contradiction model could not be loaded; it is tried again once evolve.contradictions is set again or the daemon starts again: {e}"
+                                );
+                                state.error_logged = true;
+                            }
+                        }
+                        state.last_error = Some(e.to_string());
+                        state.load_failed = Some(model.repo);
+                        record_counts(&mut state, &work, &pending);
+                        state.pending = Some(pending);
+                    }
+                    return Ok(ContradictionOutcome::ModelUnavailable);
+                }
             }
+        } else {
+            None
         };
         let _activity = ActivityState::begin(&self.activity, "contradictions", None);
         let started = std::time::Instant::now();
@@ -822,55 +859,73 @@ impl Engine {
         let (mut pairs_done, mut lines_done, mut batches) = (0usize, 0usize, 0usize);
         let mut batch_error: Option<String> = None;
         'domains: for w in &work {
-            for pair in &w.pending {
-                // The profile is read between pairs, so off, or another
+            // Whole pairs within the budget, in the order the walk found
+            // them; a pair whose line vectors are missing waits and costs
+            // nothing.
+            let mut take: Vec<&PairPlan> = Vec::new();
+            let mut out_of_budget = false;
+            for plan in &w.pending {
+                let Some(lines) = &plan.lines else {
+                    continue;
+                };
+                if lines.len() > budget {
+                    out_of_budget = true;
+                    break;
+                }
+                budget -= lines.len();
+                take.push(plan);
+            }
+            for group in groups_of(&take, NLI_GROUP_LINE_PAIRS) {
+                // The profile is read between groups, so off, or another
                 // profile, ends this walk at once and lets go of the model.
                 if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
                     break 'domains;
                 }
-                let (a, b) = (&w.facts[pair.a], &w.facts[pair.b]);
-                let lines = line_pairs(&a.observations, &b.observations);
-                if lines.len() > budget {
-                    break 'domains;
-                }
-                let key = failed_key(model, a, b);
-                // One failing batch or store write skips its pair, which stays
-                // pending and unstored, and the pass goes on with the others:
-                // a pair is stored whole or not at all.
-                let done = self
-                    .score_pair(model, w.id, pair.cosine, a, b, &lines, &scorer)
+                let (results, n) = self
+                    .score_and_store_group(model, w.id, &w.facts, group, scorer.as_ref())
                     .await;
+                batches += n;
                 let set = failures.entry(w.name.clone()).or_default();
-                match done {
-                    Ok(n) => {
-                        batches += n;
-                        set.remove(&key);
-                    }
-                    Err(e) => {
-                        if w.failures.contains(&key) {
-                            tracing::debug!(
-                                a = a.id.0,
-                                b = b.id.0,
-                                "a pair the contradiction check failed on failed again: {e}"
-                            );
-                        } else {
-                            tracing::warn!(
-                                a = a.id.0,
-                                b = b.id.0,
-                                "skipping a pair the contradiction check failed on; the tick retries it: {e}"
-                            );
+                for (plan, done) in group.iter().zip(results) {
+                    let (a, b) = (&w.facts[plan.pair.a], &w.facts[plan.pair.b]);
+                    let key = failed_key(model, a, b);
+                    // One failing batch or store write fails its own pair,
+                    // which stays pending and unstored, and the walk goes on
+                    // with the others: a pair is stored whole or not at all.
+                    match done {
+                        Ok(true) => {
+                            set.remove(&key);
+                            pairs_done += 1;
+                            lines_done += plan.line_count();
+                            if let Some(left) = pending.get_mut(&w.name) {
+                                *left -= 1;
+                            }
                         }
-                        batch_error = Some(e.to_string());
-                        set.insert(key);
-                        continue;
+                        // The profile moved before the write: nothing was
+                        // stored, so nothing is counted, and the walk ends.
+                        Ok(false) => break 'domains,
+                        Err(e) => {
+                            if w.failures.contains(&key) {
+                                tracing::debug!(
+                                    a = a.id.0,
+                                    b = b.id.0,
+                                    "a pair the contradiction check failed on failed again: {e}"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    a = a.id.0,
+                                    b = b.id.0,
+                                    "skipping a pair the contradiction check failed on; the tick retries it: {e}"
+                                );
+                            }
+                            batch_error = Some(e.to_string());
+                            set.insert(key);
+                        }
                     }
                 }
-                budget -= lines.len();
-                pairs_done += 1;
-                lines_done += lines.len();
-                if let Some(left) = pending.get_mut(&w.name) {
-                    *left -= 1;
-                }
+            }
+            if out_of_budget {
+                break 'domains;
             }
         }
         drop(scorer);
@@ -906,23 +961,118 @@ impl Engine {
         })
     }
 
-    /// Score one pair and store it, returning the batches it took. The store
-    /// lock is taken only for the write, never across a batch.
-    #[allow(clippy::too_many_arguments)]
-    async fn score_pair(
+    /// Score a group of pending pairs and store each one. A scoring failure
+    /// for the whole group is retried pair by pair, so one bad pair fails
+    /// alone (lesson 2); a store failure fails its own pair only. Returns one
+    /// result per pair, in order (`Ok(false)` for a pair not stored because
+    /// the profile moved, and for every pair after it), and the batches the
+    /// group took. With no `scorer`, only pairs with no kept line pair are
+    /// stored; the walk loads the model whenever another pair is pending.
+    async fn score_and_store_group(
+        &self,
+        model: &'static NliModel,
+        domain: DomainId,
+        facts: &[ContradictionFact],
+        group: &[&PairPlan],
+        scorer: Option<&Arc<dyn ContradictionScorer>>,
+    ) -> (Vec<Result<bool>>, usize) {
+        let items: Vec<GroupItem<'_>> = group
+            .iter()
+            .map(|p| {
+                (
+                    &facts[p.pair.a],
+                    &facts[p.pair.b],
+                    p.lines.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut batches = 0usize;
+        let scored: Vec<Result<OrderScores>> = match scorer {
+            None => items
+                .iter()
+                .map(|(_, _, lines)| {
+                    if lines.is_empty() {
+                        Ok((Vec::new(), Vec::new()))
+                    } else {
+                        Err(EngineError::Internal(
+                            "a pair with line pairs to read reached the store without a contradiction model"
+                                .to_string(),
+                        ))
+                    }
+                })
+                .collect(),
+            Some(scorer) => match score_group(scorer, &items).await {
+                Ok((ab, ba, n)) => {
+                    batches += n;
+                    ab.into_iter().zip(ba).map(Ok).collect()
+                }
+                Err(_) if items.len() > 1 => {
+                    let mut one_by_one = Vec::with_capacity(items.len());
+                    for item in &items {
+                        match score_group(scorer, std::slice::from_ref(item)).await {
+                            Ok((mut ab, mut ba, n)) => {
+                                batches += n;
+                                one_by_one.push(Ok((ab.remove(0), ba.remove(0))));
+                            }
+                            Err(e) => one_by_one.push(Err(e)),
+                        }
+                    }
+                    one_by_one
+                }
+                Err(e) => vec![Err(e)],
+            },
+        };
+        let mut out = Vec::with_capacity(items.len());
+        let mut moved = false;
+        for ((plan, (a, b, lines)), result) in group.iter().zip(&items).zip(scored) {
+            if moved {
+                out.push(Ok(false));
+                continue;
+            }
+            let done = match result {
+                Err(e) => Err(e),
+                Ok((ab, ba)) => match line_rows(
+                    a.id,
+                    b.id,
+                    &a.observations,
+                    &b.observations,
+                    lines,
+                    &ab,
+                    &ba,
+                    ORDER_AGGREGATION,
+                ) {
+                    // An incomplete answer never reads as a scored pair with
+                    // no rows: the pair stays pending.
+                    None => Err(EngineError::Internal(format!(
+                        "the contradiction scores of engrams {} and {} do not match their {} line pairs",
+                        a.id.0,
+                        b.id.0,
+                        lines.len()
+                    ))),
+                    Some(rows) => {
+                        self.store_pair(model, domain, plan.pair.cosine, a, b, &rows)
+                            .await
+                    }
+                },
+            };
+            moved = matches!(done, Ok(false));
+            out.push(done);
+        }
+        (out, batches)
+    }
+
+    /// Record one scored pair: its pair row at the current checksums and its
+    /// line rows. The store lock is taken for the write only, never across a
+    /// batch. `false` when the profile moved and nothing was stored.
+    async fn store_pair(
         &self,
         model: &'static NliModel,
         domain: DomainId,
         cosine: f64,
         a: &ContradictionFact,
         b: &ContradictionFact,
-        lines: &[crystalline_index::nli::LinePair<'_>],
-        scorer: &Arc<dyn ContradictionScorer>,
-    ) -> Result<usize> {
-        let inputs = scorer_inputs(lines);
-        let batches = inputs.len().div_ceil(NLI_BATCH_SIZE);
-        let probabilities = run_scorer(Arc::clone(scorer), inputs).await?;
-        let rows = score_rows(a.id, b.id, lines, &probabilities);
+        rows: &[ContradictionRow],
+    ) -> Result<bool> {
         let scored = ScoredPair {
             a: a.id,
             b: b.id,
@@ -935,7 +1085,7 @@ impl Engine {
         // after that clear. The walk then publishes nothing, since the
         // profile moved.
         if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
-            return Ok(batches);
+            return Ok(false);
         }
         store
             .replace_contradictions(
@@ -944,10 +1094,10 @@ impl Engine {
                 cosine,
                 model.repo,
                 &Utc::now().to_rfc3339(),
-                &rows,
+                rows,
             )
             .await?;
-        Ok(batches)
+        Ok(true)
     }
 
     /// Record what a walk found, but only when the generation it started under
@@ -1027,6 +1177,17 @@ impl Engine {
         names.sort();
         names.dedup();
         let (threshold, max_pairs) = (related_threshold(), max_related_pairs());
+        // `score_contradictions` answers `NoLineFloor` before any walk.
+        let Some(floor) = self.line_floor() else {
+            return Err(EngineError::Internal(
+                "a contradiction walk started without a line-similarity floor".to_string(),
+            ));
+        };
+        let rules = LineRules {
+            embedding_model: &self.model_id,
+            floor,
+            max_line_pairs: MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
+        };
         let mut out = Vec::new();
         let mut complete = true;
         for name in names {
@@ -1049,7 +1210,7 @@ impl Engine {
                 complete = false;
                 continue;
             }
-            let digest = walk_digest(model, threshold, &self.model_id, domain_id, &stamps);
+            let digest = walk_digest(model, threshold, &rules, domain_id, &stamps);
             let (settled, known) = {
                 let state = self.contradiction_state.lock().unwrap();
                 let settled = state
@@ -1090,7 +1251,7 @@ impl Engine {
                 continue;
             }
             let facts = self
-                .contradiction_facts(&source, &name, domain_id, &stamps, true)
+                .contradiction_facts(&source, &name, domain_id, &stamps, true, &rules)
                 .await?;
             let lines = self.embed_lines(model, &facts).await?;
             // Coverage below 100 percent never holds a pair back: an engram
@@ -1169,6 +1330,7 @@ impl Engine {
                     .collect();
                 (fresh, failures.len())
             };
+            let (facts, pending) = self.plan_pairs(facts, pending, floor).await?;
             out.push(DomainWork {
                 name,
                 id: domain_id,
@@ -1184,9 +1346,63 @@ impl Engine {
         Ok((out, complete))
     }
 
+    /// Pair the lines of each pending engram pair by similarity
+    /// ([`similar_line_pairs`]): read the vectors of every line of the
+    /// engrams in `pending` (the store lock per run of
+    /// [`OBSERVATION_VECTOR_CHUNK`] hashes, so a large domain never holds it
+    /// for long), then pair on a blocking thread, since every line of one
+    /// engram meets every line of the other. The facts move in and come back.
+    async fn plan_pairs(
+        &self,
+        facts: Vec<ContradictionFact>,
+        pending: Vec<CandidatePair>,
+        floor: f64,
+    ) -> Result<(Vec<ContradictionFact>, Vec<PairPlan>)> {
+        if pending.is_empty() {
+            return Ok((facts, Vec::new()));
+        }
+        let wanted: Vec<String> = {
+            let mut set: HashSet<String> = HashSet::new();
+            for p in &pending {
+                for f in [&facts[p.a], &facts[p.b]] {
+                    for o in &f.observations {
+                        if !fold(&o.text).is_empty() {
+                            set.insert(observation_hash(&o.text));
+                        }
+                    }
+                }
+            }
+            set.into_iter().collect()
+        };
+        // Only the vectors of the model the floor belongs to.
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::with_capacity(wanted.len());
+        for run in wanted.chunks(OBSERVATION_VECTOR_CHUNK) {
+            let store = self.store.lock().await;
+            vectors.extend(store.observation_vectors(&self.model_id, run).await?);
+        }
+        tokio::task::spawn_blocking(move || {
+            let plans: Vec<PairPlan> = pending
+                .into_iter()
+                .map(|pair| PairPlan {
+                    lines: similar_line_pairs(
+                        &facts[pair.a].observations,
+                        &facts[pair.b].observations,
+                        &vectors,
+                        floor,
+                        MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
+                    ),
+                    pair,
+                })
+                .collect();
+            (facts, plans)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("contradiction line pairing failed: {e}")))
+    }
+
     /// The contradiction check's facts for one domain's base engrams: the
     /// listing, each engram parsed through `source` (frontmatter status and
-    /// window, observations), its observation digest, and, when
+    /// window, observations), its scoring checksum under `rules`, and, when
     /// `with_lead_vectors`, its lead vector for the active embedding model.
     /// The one assembly of the check: the sweep never builds its own, it
     /// reads the counts the walk kept from this one
@@ -1203,6 +1419,7 @@ impl Engine {
         domain_id: DomainId,
         stamps: &HashMap<String, FileStamp>,
         with_lead_vectors: bool,
+        rules: &LineRules<'_>,
     ) -> Result<Vec<ContradictionFact>> {
         #[cfg(any(test, feature = "testing"))]
         self.contradiction_fact_walks
@@ -1251,7 +1468,7 @@ impl Engine {
                 status,
                 valid_from: fm.valid_from,
                 valid_to: fm.valid_to,
-                checksum: observations_digest(&observations),
+                checksum: scoring_checksum(&observations, rules),
                 lead_vector: vectors.remove(&d.id.0),
                 observations,
             });
@@ -1289,12 +1506,17 @@ impl Engine {
         };
         // No measured floor for this embedding model: V302 does not run, and
         // rows another model's floor left behind are not read.
-        if self.line_floor().is_none() {
+        let Some(floor) = self.line_floor() else {
             return Ok(SweepContradictions {
                 model: Some(model),
                 ..SweepContradictions::default()
             });
-        }
+        };
+        let rules = LineRules {
+            embedding_model: &self.model_id,
+            floor,
+            max_line_pairs: MAX_LINE_PAIRS_PER_ENGRAM_PAIR,
+        };
         let (rows, now) = {
             let store = self.store.lock().await;
             let rows = store
@@ -1311,13 +1533,7 @@ impl Engine {
                     .await?
                     .embedded_for(&self.model_id);
                 Some((
-                    walk_digest(
-                        model,
-                        related_threshold(),
-                        &self.model_id,
-                        domain_id,
-                        &stamps,
-                    ),
+                    walk_digest(model, related_threshold(), &rules, domain_id, &stamps),
                     coverage,
                 ))
             } else {
@@ -1440,17 +1656,48 @@ fn failed_key(
     }
 }
 
-/// Score `inputs` in batches of [`NLI_BATCH_SIZE`], each on a blocking thread
-/// of its own, so no blocking unit outlasts one batch. A batch that fails, or
-/// answers with the wrong number of scores, fails the call.
+/// One engram pair of a scoring group: both engrams and the kept line pairs.
+type GroupItem<'f> = (&'f ContradictionFact, &'f ContradictionFact, &'f [KeptLine]);
+
+/// One pair's scores: the first order per kept line pair, and the second
+/// where it was read.
+type OrderScores = (Vec<f32>, Vec<Option<f32>>);
+
+/// Cut `plans` into groups of whole pairs holding about `lines` kept line
+/// pairs each; a pair with no kept line pair rides along at no cost.
+fn groups_of<'p>(plans: &'p [&'p PairPlan], lines: usize) -> Vec<&'p [&'p PairPlan]> {
+    let mut out = Vec::new();
+    let (mut start, mut held) = (0usize, 0usize);
+    for (i, plan) in plans.iter().enumerate() {
+        held += plan.line_count();
+        if held >= lines {
+            out.push(&plans[start..=i]);
+            start = i + 1;
+            held = 0;
+        }
+    }
+    if start < plans.len() {
+        out.push(&plans[start..]);
+    }
+    out
+}
+
+/// Score `inputs` in batches of [`NLI_BATCH_SIZE`], sorted by length first
+/// ([`length_order`]) so a batch pads to a near neighbour, each batch on a
+/// blocking thread of its own, so no blocking unit outlasts one batch. The
+/// probabilities come back in the order of `inputs`, with the batch count. A
+/// batch that fails, or answers with the wrong number of scores, fails the
+/// call.
 async fn run_scorer(
     scorer: Arc<dyn ContradictionScorer>,
     inputs: Vec<(String, String)>,
-) -> Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(inputs.len());
-    for batch in inputs.chunks(NLI_BATCH_SIZE) {
-        let (scorer, batch) = (Arc::clone(&scorer), batch.to_vec());
-        let expected = batch.len();
+) -> Result<(Vec<f32>, usize)> {
+    let order = length_order(&inputs);
+    let mut out = vec![f32::NAN; inputs.len()];
+    let mut batches = 0usize;
+    for run in order.chunks(NLI_BATCH_SIZE) {
+        let batch: Vec<(String, String)> = run.iter().map(|&i| inputs[i].clone()).collect();
+        let (scorer, expected) = (Arc::clone(&scorer), batch.len());
         let scores = tokio::task::spawn_blocking(move || scorer.score(&batch))
             .await
             .map_err(|e| EngineError::Internal(format!("contradiction scoring task failed: {e}")))?
@@ -1461,13 +1708,58 @@ async fn run_scorer(
                 scores.len()
             )));
         }
-        out.extend(scores);
+        for (&i, s) in run.iter().zip(scores) {
+            out[i] = s;
+        }
+        batches += 1;
     }
-    Ok(out)
+    Ok((out, batches))
+}
+
+/// Both reading orders for a group of engram pairs: the first order of every
+/// kept line pair in one run, then the second order only where
+/// [`second_order_needed`] says so. Per pair, the first-order scores, the
+/// second-order scores (`None` where not read), and the group's batch count.
+async fn score_group(
+    scorer: &Arc<dyn ContradictionScorer>,
+    group: &[GroupItem<'_>],
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<Option<f32>>>, usize)> {
+    let mut first = Vec::new();
+    let mut spans = Vec::with_capacity(group.len());
+    for (a, b, lines) in group {
+        let start = first.len();
+        first.extend(first_order_inputs(&a.observations, &b.observations, lines));
+        spans.push(start..first.len());
+    }
+    let (ab_all, mut batches) = run_scorer(Arc::clone(scorer), first).await?;
+    let mut second = Vec::new();
+    let mut slots: Vec<(usize, usize)> = Vec::new();
+    for (p, ((a, b, lines), span)) in group.iter().zip(&spans).enumerate() {
+        let needed = second_order_needed(&ab_all[span.clone()], ORDER_AGGREGATION);
+        for (i, need) in needed.into_iter().enumerate() {
+            if need {
+                second.push(second_order_input(
+                    &a.observations,
+                    &b.observations,
+                    &lines[i],
+                ));
+                slots.push((p, i));
+            }
+        }
+    }
+    let (ba_all, more) = run_scorer(Arc::clone(scorer), second).await?;
+    batches += more;
+    let mut ba: Vec<Vec<Option<f32>>> = spans.iter().map(|s| vec![None; s.len()]).collect();
+    for ((p, i), v) in slots.into_iter().zip(ba_all) {
+        ba[p][i] = Some(v);
+    }
+    let ab = spans.iter().map(|s| ab_all[s.clone()].to_vec()).collect();
+    Ok((ab, ba, batches))
 }
 
 /// What a domain looked like to a walk: the NLI model, the related line, the
-/// embedding model, the domain's id and every path with its checksum. Built
+/// line rules (whose key carries the embedding model), the domain's id and
+/// every path with its checksum. Built
 /// from the stamps alone, never from the vectors, so checking it costs one
 /// narrow read. The id is there for a domain removed and added back under
 /// its old name: its rows were cleared with it. The id alone is not the
@@ -1476,7 +1768,7 @@ async fn run_scorer(
 fn walk_digest(
     model: &NliModel,
     threshold: f64,
-    embedding_model: &str,
+    rules: &LineRules<'_>,
     domain: DomainId,
     stamps: &HashMap<String, FileStamp>,
 ) -> String {
@@ -1484,7 +1776,7 @@ fn walk_digest(
     h.update(model.repo.as_bytes());
     h.update([0]);
     h.update(threshold.to_bits().to_le_bytes());
-    h.update(embedding_model.as_bytes());
+    h.update(rules.key().as_bytes());
     h.update([0]);
     h.update(domain.0.to_le_bytes());
     let mut paths: Vec<(&String, &FileStamp)> = stamps.iter().collect();
@@ -1532,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_digest_moves_with_a_stamp_the_model_the_embedding_model_or_the_domain_only() {
+    fn the_walk_digest_moves_with_a_stamp_the_models_the_rules_or_the_domain_only() {
         let full = nli_model(NliProfile::Full);
         // A second model, as a later release's table would carry.
         let other: &'static NliModel = Box::leak(Box::new(NliModel {
@@ -1545,25 +1837,91 @@ mod tests {
             ("b.md".to_string(), stamp("2")),
         ]
         .into();
-        let base = walk_digest(full, 0.8, "granite", d, &stamps);
-        assert_eq!(base, walk_digest(full, 0.8, "granite", d, &stamps.clone()));
+        let rules = LineRules {
+            embedding_model: "granite",
+            floor: 0.86,
+            max_line_pairs: 4,
+        };
+        let base = walk_digest(full, 0.8, &rules, d, &stamps);
+        assert_eq!(base, walk_digest(full, 0.8, &rules, d, &stamps.clone()));
         let mut edited = stamps.clone();
         edited.insert("b.md".to_string(), stamp("3"));
-        assert_ne!(base, walk_digest(full, 0.8, "granite", d, &edited));
+        assert_ne!(base, walk_digest(full, 0.8, &rules, d, &edited));
         let mut touched = stamps.clone();
         touched.get_mut("a.md").unwrap().mtime = 99;
         assert_eq!(
             base,
-            walk_digest(full, 0.8, "granite", d, &touched),
+            walk_digest(full, 0.8, &rules, d, &touched),
             "a touch that keeps the content keeps the digest"
         );
-        assert_ne!(base, walk_digest(other, 0.8, "granite", d, &stamps));
-        assert_ne!(base, walk_digest(full, 0.7, "granite", d, &stamps));
-        assert_ne!(base, walk_digest(full, 0.8, "bge", d, &stamps));
+        assert_ne!(base, walk_digest(other, 0.8, &rules, d, &stamps));
+        assert_ne!(base, walk_digest(full, 0.7, &rules, d, &stamps));
+        let bge = LineRules {
+            embedding_model: "bge",
+            ..rules
+        };
+        assert_ne!(base, walk_digest(full, 0.8, &bge, d, &stamps));
+        let higher = LineRules {
+            floor: 0.88,
+            ..rules
+        };
+        assert_ne!(base, walk_digest(full, 0.8, &higher, d, &stamps));
+        let more = LineRules {
+            max_line_pairs: 5,
+            ..rules
+        };
+        assert_ne!(base, walk_digest(full, 0.8, &more, d, &stamps));
         assert_ne!(
             base,
-            walk_digest(full, 0.8, "granite", DomainId(2), &stamps),
+            walk_digest(full, 0.8, &rules, DomainId(2), &stamps),
             "the same files under another domain id are another domain"
+        );
+    }
+
+    /// Scores each pair by the premise's length and records the order the
+    /// premises arrived in.
+    struct ByLength(std::sync::Mutex<Vec<String>>);
+
+    impl ContradictionScorer for ByLength {
+        fn score(&self, pairs: &[(String, String)]) -> crystalline_index::Result<Vec<f32>> {
+            let mut seen = self.0.lock().unwrap();
+            Ok(pairs
+                .iter()
+                .map(|(p, _)| {
+                    seen.push(p.clone());
+                    p.len() as f32 / 100.0
+                })
+                .collect())
+        }
+        fn model_repo(&self) -> &str {
+            "repo/x"
+        }
+    }
+
+    /// 11c: the batches see the inputs shortest first, and the scores come
+    /// back in the order the inputs were given.
+    #[tokio::test]
+    async fn the_scorer_sees_inputs_by_length_and_answers_in_input_order() {
+        let premises: Vec<String> = (0..40).map(|i| "x".repeat(1 + (i * 7) % 40)).collect();
+        let inputs: Vec<(String, String)> = premises
+            .iter()
+            .map(|p| (p.clone(), "h".to_string()))
+            .collect();
+        let scorer = Arc::new(ByLength(std::sync::Mutex::new(Vec::new())));
+        let (scores, batches) = run_scorer(scorer.clone(), inputs).await.unwrap();
+        assert_eq!(batches, 3, "40 inputs in batches of 16");
+        let expected: Vec<f32> = premises.iter().map(|p| p.len() as f32 / 100.0).collect();
+        assert_eq!(scores, expected);
+        {
+            let seen = scorer.0.lock().unwrap();
+            assert!(
+                seen.windows(2).all(|w| w[0].len() <= w[1].len()),
+                "shortest first"
+            );
+        }
+        assert_eq!(
+            run_scorer(scorer.clone(), Vec::new()).await.unwrap(),
+            (Vec::new(), 0)
         );
     }
 }
