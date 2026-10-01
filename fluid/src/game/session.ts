@@ -103,7 +103,12 @@
  * terminal, a machine, a poster, the placard or a screen opens the CRT
  * reader with what that fixture reads (`fixtureReading` in
  * `world/reading.ts`, through `openReading`); a terminal or a poster in a
- * room with no place reads nothing and opens nothing. While the CRT
+ * room with no place reads nothing and opens nothing. Space at a computer
+ * among the furniture, props, heroes and curios (`computerFocus` over the
+ * use points `computersOf` gives on every entry) opens the reader with the
+ * room's reading (`roomReading`): the computer comes last, only when no
+ * fixture and no police box is in focus, so it never takes Space from
+ * anything offered before it (spec 3a, 0.22 R13). While the CRT
  * reader is open it reads the keys itself: the session ignores its own
  * commands and all movement until the host calls `closeReader`.
  *
@@ -314,7 +319,14 @@ import {
 import { LIFT_RIDE_MS } from "./timing";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
 import { readerBody } from "./ui/crt";
-import { fixtureReading, type Reading } from "./world/reading";
+import {
+  computerFocus,
+  computersOf,
+  fixtureReading,
+  roomReading,
+  type ComputerPoint,
+  type Reading,
+} from "./world/reading";
 import { roomFor } from "./world/station";
 import type {
   Box,
@@ -745,6 +757,11 @@ export function createSession(opts: SessionOptions): Session {
   let player: Player | null = null;
   let previous: Player | null = null;
   let prefetched = new Set<string>();
+  /**
+   * The room's computers' use points (`computersOf`), worked out on every
+   * entry of a room.
+   */
+  let computers: ComputerPoint[] = [];
   let latched: number | null = null;
   let readerOpen = false;
   /** Whether the level select is open (only with `onLevels`). */
@@ -1127,6 +1144,7 @@ export function createSession(opts: SessionOptions): Session {
     }
     previous = player;
     prefetched = new Set();
+    computers = computersOf(room, place);
     latched = null;
     boxLatched = null;
     exitLatched = false;
@@ -2147,6 +2165,12 @@ export function createSession(opts: SessionOptions): Session {
         ? null
         : boxFocus(room, player, boxes);
     const focus = reads && boxAt !== null ? null : offered;
+    // A computer comes last (spec 3a): only with no fixture and no box in
+    // focus.
+    const computerAt =
+      modal() || focus !== null || boxAt !== null
+        ? null
+        : computerFocus(computers, player, room.title);
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
     let pressedBox: number | null = null;
@@ -2172,6 +2196,8 @@ export function createSession(opts: SessionOptions): Session {
       }
     } else if (used && boxAt !== null) {
       pressedBox = boxAt.index;
+    } else if (used && computerAt !== null) {
+      openReading(roomReading(room, place));
     }
     // The way's latch holds until the player has once stood
     // `UP_LATCH_CLEAR` from its wall point (M3 C28, 0.22 R1).
@@ -2231,7 +2257,9 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
     setPrompt(
-      modal() || loading ? null : (focus?.prompt ?? boxAt?.prompt ?? null),
+      modal() || loading
+        ? null
+        : (focus?.prompt ?? boxAt?.prompt ?? computerAt?.prompt ?? null),
     );
     listenForAnswer(loading ? null : focus);
 

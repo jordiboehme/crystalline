@@ -23,13 +23,37 @@
  *   instead, and the lift's note after them, since its `+N MORE` line cuts
  *   the list (0.22 R18).
  *
- * Only fixtures are read (0.22 R12): a prop is decoration, and a way's
- * label is already its whole text. With no place, a terminal and a poster
- * read nothing.
+ * Of the wall elements only fixtures are read (0.22 R12): a prop's painted
+ * mark is decoration, and a way's label is already its whole text. With no
+ * place, a terminal and a poster read nothing.
+ *
+ * The computers among the furniture, props, heroes and curios (the kinds in
+ * `COMPUTER_DECOR`, `COMPUTER_PROPS`, `COMPUTER_HEROES` and
+ * `COMPUTER_CURIOS`, 0.22 R14) read what a machine reads (`roomReading`).
+ * Each has one use point (`computersOf`), worked out once per room: a
+ * hero's front face, a wall prop's wall point, the centre of anything that
+ * stands free. `computerFocus` picks the one the player uses by
+ * `focusOf`'s rule, and a thing on a wall is used only from its front
+ * (0.22 R16). A room whose computers would read nothing has no use points
+ * at all (0.22 R15).
  */
 
+import { FOOTPRINTS, HERO_FRONT, heroFootprint, heroTurn } from "./footprints";
 import { NOTES } from "./generate";
-import type { Fixture, PlaceInput, RoomSpec } from "./types";
+import { HERO_CATALOGUE } from "./heroes";
+import { FACING, REACH, relative, type WallPoint } from "./interact";
+import type { Player } from "./move";
+import type {
+  CurioKind,
+  DecorKind,
+  Fixture,
+  Hero,
+  HeroKind,
+  PlaceInput,
+  PropKind,
+  RoomSpec,
+} from "./types";
+import { CELL } from "./units";
 
 /** What the reader shows: a title, markdown, and the `##` section to open at (null: the top). */
 export interface Reading {
@@ -158,4 +182,132 @@ export function fixtureReading(
     case "exit":
       return null;
   }
+}
+
+/** The computer kinds of the furniture (spec 3a table, 0.22 R14). */
+export const COMPUTER_DECOR: ReadonlySet<DecorKind> = new Set<DecorKind>([
+  "command-console",
+]);
+
+/** The computer kinds of the props (spec 3a table, 0.22 R14). */
+export const COMPUTER_PROPS: ReadonlySet<PropKind> = new Set<PropKind>([
+  "wall-monitor",
+  "designer-tower",
+  "gravity-console",
+]);
+
+/** The computer kinds of the heroes (spec 3a table, 0.22 R14). */
+export const COMPUTER_HEROES: ReadonlySet<HeroKind> = new Set<HeroKind>([
+  "core-wall",
+  "photo-console",
+  "laser-desk",
+]);
+
+/** The computer kinds of the curios (spec 3a table, 0.22 R14). */
+export const COMPUTER_CURIOS: ReadonlySet<CurioKind> = new Set<CurioKind>([
+  "beige-laptop",
+  "breadbin-computer",
+  "slim-computer",
+]);
+
+/**
+ * One computer's use point, in metres: its front (`inward` points out of it
+ * into the room); `wall` when it stands on a wall. `list` and `index` name
+ * the thing in the room's list it stands in.
+ */
+export interface ComputerPoint {
+  list: "decor" | "props" | "heroes" | "curios";
+  index: number;
+  point: WallPoint;
+  wall: boolean;
+}
+
+/** A point at `(x, z)` metres facing the way quarter turn `turn` faces. */
+function facingPoint(x: number, z: number, turn: number): WallPoint {
+  const t = ((Math.round(turn) % 4) + 4) % 4;
+  const [fx, fz] = HERO_FRONT[t] ?? [0, -1];
+  return { x, z, inward: [fx, fz], along: [fz, -fx] };
+}
+
+/**
+ * A hero's front face: the centre of its footprint moved half its depth
+ * along its front, so the point sits on the face whether the hero stands
+ * free (centred on its anchor) or runs out from its wall point.
+ */
+function heroPoint(h: Hero): WallPoint {
+  const turn = heroTurn(h);
+  const depth = FOOTPRINTS.hero[h.kind][h.variant]?.depth ?? 0;
+  const box = heroFootprint(h);
+  const centre = facingPoint(
+    (box.x0 + box.x1) / 2,
+    (box.z0 + box.z1) / 2,
+    turn,
+  );
+  return {
+    ...centre,
+    x: centre.x + centre.inward[0] * (depth / 2),
+    z: centre.z + centre.inward[1] * (depth / 2),
+  };
+}
+
+/** The room's computers, or [] when `roomReading(room, place)` is null (0.22 R15). */
+export function computersOf(
+  room: RoomSpec,
+  place: PlaceInput | null,
+): ComputerPoint[] {
+  if (roomReading(room, place) === null) return [];
+  const points: ComputerPoint[] = [];
+  for (const [index, d] of room.decor.entries()) {
+    if (!COMPUTER_DECOR.has(d.kind)) continue;
+    const point = facingPoint(d.x * CELL, d.y * CELL, d.turn);
+    points.push({ list: "decor", index, point, wall: false });
+  }
+  for (const [index, p] of room.props.entries()) {
+    if (!COMPUTER_PROPS.has(p.kind)) continue;
+    const point = facingPoint(p.x * CELL, p.y * CELL, p.turn);
+    points.push({ list: "props", index, point, wall: p.anchor === "wall" });
+  }
+  for (const [index, h] of room.heroes.entries()) {
+    if (!COMPUTER_HEROES.has(h.kind)) continue;
+    const placement = HERO_CATALOGUE[h.kind].placement;
+    const wall = placement === "wall" || placement === "backed";
+    points.push({ list: "heroes", index, point: heroPoint(h), wall });
+  }
+  for (const [index, c] of room.curios.entries()) {
+    if (!COMPUTER_CURIOS.has(c.kind)) continue;
+    const point = facingPoint(c.x * CELL, c.y * CELL, c.turn);
+    points.push({ list: "curios", index, point, wall: false });
+  }
+  return points;
+}
+
+/**
+ * The computer the player faces and can use, or null: `focusOf`'s rule
+ * over the points (the nearest within `REACH` and within `FACING` of the
+ * view); a wall point also needs the player in front of it, so nothing is
+ * used through a wall, while a free one is used from any side (0.22 R16).
+ * The prompt is `SPACE READ <title>`, the room's title.
+ */
+export function computerFocus(
+  points: readonly ComputerPoint[],
+  player: Player,
+  title: string,
+): { point: ComputerPoint; prompt: string } | null {
+  const fx = -Math.sin(player.yaw);
+  const fz = -Math.cos(player.yaw);
+  const cosFacing = Math.cos(FACING);
+  let best: ComputerPoint | null = null;
+  let bestDistance = Infinity;
+  for (const c of points) {
+    const w = c.point;
+    if (c.wall && relative(w, player.x, player.z).depth <= 0) continue;
+    const dx = w.x - player.x;
+    const dz = w.z - player.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance > REACH || distance >= bestDistance) continue;
+    if (distance > 0 && (dx * fx + dz * fz) / distance < cosFacing) continue;
+    best = c;
+    bestDistance = distance;
+  }
+  return best === null ? null : { point: best, prompt: `SPACE READ ${title}` };
 }

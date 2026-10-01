@@ -21,8 +21,16 @@ import { consoleRoom } from "./consoleRoom";
 import { generateDeck } from "./deck";
 import { NOTES, POSTER_LINES, generateRoom } from "./generate";
 import { SCREEN_LINES } from "./lifts";
-import { fixtureReading, roomReading } from "./reading";
-import type { Fixture, PlaceInput, RoomSpec } from "./types";
+import { heroFootprint } from "./footprints";
+import type { Player } from "./move";
+import {
+  computerFocus,
+  computersOf,
+  fixtureReading,
+  roomReading,
+  type ComputerPoint,
+} from "./reading";
+import type { Fixture, Hero, PlaceInput, RoomSpec } from "./types";
 
 /** The index of the first fixture that passes `test`, or a failed test. */
 function indexOf(room: RoomSpec, test: (f: Fixture) => boolean): number {
@@ -316,5 +324,218 @@ describe("roomReading (0.22 R15)", () => {
     expect(roomReading(airlock, null)).toBeNull();
     expect(roomReading(airlock, CANNED_BRIDGE)).toBeNull();
     expect(roomReading(consoleRoom(), null)).toBeNull();
+  });
+});
+
+/**
+ * `base` with one of each computer kind (0.22 R14) set by hand, as the
+ * dev demo rooms set their lists, and a thing of another kind beside each
+ * list's computers.
+ */
+function computerRoom(base: RoomSpec): RoomSpec {
+  const hero = (kind: Hero["kind"], x: number, y: number, turn: number) => ({
+    kind,
+    variant: 0,
+    x,
+    y,
+    turn,
+    seed: 1,
+  });
+  const curio = (kind: RoomSpec["curios"][number]["kind"], x: number) => ({
+    kind,
+    variant: 0,
+    x,
+    y: 3.5,
+    h: 0.9,
+    turn: 0,
+    seed: 1,
+  });
+  return {
+    ...base,
+    decor: [
+      { kind: "captain-chair", x: 2, y: 2, turn: 0, seed: 1 },
+      { kind: "command-console", x: 3, y: 2, turn: 0, seed: 1 },
+    ],
+    props: [
+      {
+        kind: "crate",
+        variant: 0,
+        anchor: "floor",
+        x: 1.5,
+        y: 1.5,
+        turn: 0,
+        seed: 1,
+      },
+      {
+        kind: "wall-monitor",
+        variant: 0,
+        anchor: "wall",
+        x: 1.5,
+        y: 0,
+        turn: 2,
+        seed: 1,
+      },
+      {
+        kind: "designer-tower",
+        variant: 0,
+        anchor: "floor",
+        x: 2.5,
+        y: 1.5,
+        turn: 1,
+        seed: 1,
+      },
+      {
+        kind: "locker-bank",
+        variant: 0,
+        anchor: "wall",
+        x: 2.5,
+        y: 0,
+        turn: 2,
+        seed: 1,
+      },
+      {
+        kind: "gravity-console",
+        variant: 0,
+        anchor: "floor",
+        x: 3.5,
+        y: 1.5,
+        turn: 3,
+        seed: 1,
+      },
+    ],
+    heroes: [
+      hero("arcade-cabinet", 0, 1.5, 1),
+      hero("core-wall", 0, 3, 1),
+      hero("photo-console", 3.5, 0, 2),
+      hero("laser-desk", 4, 4, 1),
+    ],
+    curios: [
+      curio("tape-drive", 1.5),
+      curio("beige-laptop", 2.5),
+      curio("breadbin-computer", 3.5),
+      curio("slim-computer", 4.5),
+      curio("pocket-console", 5.5),
+    ],
+  };
+}
+
+/** A player at `(x, z)` metres looking along `yaw`. */
+function playerAt(x: number, z: number, yaw: number): Player {
+  return { x, z, vx: 0, vz: 0, yaw, pitch: 0, bob: 0 };
+}
+
+/** A use point at `(x, z)` whose front faces south (+z). */
+function pointAt(x: number, z: number, wall: boolean): ComputerPoint {
+  return {
+    list: "curios",
+    index: 0,
+    point: { x, z, inward: [0, 1], along: [1, 0] },
+    wall,
+  };
+}
+
+describe("computersOf (0.22 R14, R15)", () => {
+  const room = computerRoom(workshop);
+
+  it("lists exactly the computer kinds, in list order", () => {
+    // Mutation caught: a kind left out of its set (one point fewer), or a
+    // neighbour let in (the arcade cabinet, the captain's chair, the crate,
+    // the locker bank, the tape drive or the pocket console).
+    const points = computersOf(room, CANNED_WORKSHOP);
+    expect(points.map((p) => [p.list, p.index, p.wall])).toEqual([
+      ["decor", 1, false],
+      ["props", 1, true],
+      ["props", 2, false],
+      ["props", 4, false],
+      ["heroes", 1, true],
+      ["heroes", 2, true],
+      ["heroes", 3, false],
+      ["curios", 1, false],
+      ["curios", 2, false],
+      ["curios", 3, false],
+    ]);
+  });
+
+  it("puts a wall prop on its wall point and a free thing on its centre", () => {
+    // Mutation caught: cell units taken for metres (no `CELL`), or the
+    // thing's turn not read for its front.
+    const points = computersOf(room, CANNED_WORKSHOP);
+    const monitor = points.find((p) => p.list === "props" && p.index === 1);
+    expect(monitor?.point.x).toBe(3);
+    expect(monitor?.point.z).toBe(0);
+    expect(monitor?.point.inward).toEqual([0, 1]);
+    const laptop = points.find((p) => p.list === "curios" && p.index === 1);
+    expect(laptop?.point.x).toBe(5);
+    expect(laptop?.point.z).toBe(7);
+    expect(laptop?.point.inward).toEqual([0, -1]);
+  });
+
+  it("lists nothing where the computers would read nothing", () => {
+    // Mutation caught: the points listed whatever `roomReading` says, so
+    // the airlock's or a placeless room's laptop offers a reader that
+    // opens nothing.
+    const airlock = computerRoom(
+      airlockRoom({ domains: CANNED_DOMAINS, here: null }),
+    );
+    expect(airlock.curios.length).toBeGreaterThan(0);
+    expect(computersOf(airlock, CANNED_WORKSHOP)).toEqual([]);
+    expect(computersOf(room, null)).toEqual([]);
+  });
+
+  it("lists a deck's computers with no place, since a deck reads its listing", () => {
+    // Mutation caught: a deck's computers dropped for want of a place.
+    expect(computersOf(computerRoom(deck), null)).toHaveLength(10);
+  });
+
+  it("puts a hero's point half its footprint's depth in front of its centre", () => {
+    // Mutation caught: the police box's construction copied as it is (half
+    // the depth out from the anchor), which puts a backed hero's point
+    // inside its own body, half way between its wall and its face.
+    const points = computersOf(room, CANNED_WORKSHOP);
+    const at = (index: number) =>
+      points.find((p) => p.list === "heroes" && p.index === index)?.point;
+    // The photo console stands backed on a north wall, 0.9 m deep, its
+    // front south: its face is 0.9 m out from the wall at z 0.
+    const backed = room.heroes[2];
+    if (backed === undefined) throw new Error("no photo console");
+    const box = heroFootprint(backed);
+    expect(at(2)?.x).toBeCloseTo((box.x0 + box.x1) / 2, 9);
+    expect(at(2)?.z).toBeCloseTo(box.z1, 9);
+    expect(at(2)?.z).toBeCloseTo(0.9, 9);
+    // The laser desk stands free at (8, 8) facing east, 3 m deep.
+    expect(at(3)?.x).toBeCloseTo(9.5, 9);
+    expect(at(3)?.z).toBeCloseTo(8, 9);
+    expect(at(3)?.inward).toEqual([1, 0]);
+  });
+});
+
+describe("computerFocus (0.22 R16)", () => {
+  it("takes the nearest within reach and facing", () => {
+    // Mutation caught: the first point taken instead of the nearest, or
+    // the reach or the facing check dropped.
+    const near = pointAt(0, -1, false);
+    const far = { ...pointAt(0, -1.5, false), index: 1 };
+    const player = playerAt(0, 0, 0);
+    expect(computerFocus([far, near], player, "LAB")).toEqual({
+      point: near,
+      prompt: "SPACE READ LAB",
+    });
+    expect(computerFocus([pointAt(0, -2.5, false)], player, "LAB")).toBeNull();
+    // 1 m away, but 60 degrees off the view.
+    const off = pointAt(Math.sin(Math.PI / 3), -Math.cos(Math.PI / 3), false);
+    expect(computerFocus([off], player, "LAB")).toBeNull();
+  });
+
+  it("refuses a wall point from behind its wall and takes a free one", () => {
+    // Mutation caught: no depth check on a wall point (used through the
+    // wall), or the depth check made on a free point too (a laptop never
+    // read from behind its lid).
+    // The points face south; the player stands north of them, facing south.
+    const behind = playerAt(0, -1, Math.PI);
+    expect(computerFocus([pointAt(0, 0, true)], behind, "LAB")).toBeNull();
+    expect(computerFocus([pointAt(0, 0, false)], behind, "LAB")).not.toBeNull();
+    // In front of its wall, the wall point is taken.
+    const front = playerAt(0, 1, 0);
+    expect(computerFocus([pointAt(0, 0, true)], front, "LAB")).not.toBeNull();
   });
 });

@@ -76,8 +76,15 @@ import {
   wallFacingSpawn,
   wallPoint,
 } from "./world/interact";
+import { computerFocus, computersOf, roomReading } from "./world/reading";
+import { wallAnchor } from "./world/sites";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
-import { MAX_PITCH, PLAYER_RADIUS, blockersFor } from "./world/move";
+import {
+  MAX_PITCH,
+  PLAYER_RADIUS,
+  blockersFor,
+  type Player,
+} from "./world/move";
 import {
   DIP_SWAP_MS,
   FLICKER_MS,
@@ -88,6 +95,7 @@ import {
 import { withPadHeroes } from "./world/hangar";
 import { roomFor } from "./world/station";
 import type {
+  Curio,
   Fixture,
   Hero,
   PlaceInput,
@@ -104,10 +112,13 @@ vi.mock("../api/client", async (importOriginal) => {
 /**
  * The kind of fixture a room `roomFor` builds puts the player in front of,
  * or null for the room's own spawn: a seam for the live-change tests,
- * which need a terminal or a door in reach without walking there.
+ * which need a terminal or a door in reach without walking there. `edit`,
+ * when set, changes the room `roomFor` built after that (the computer
+ * tests put a curio in it).
  */
 const facing = vi.hoisted(() => ({
   kind: null as "terminal" | "door" | "machine" | "poster" | null,
+  edit: null as ((room: RoomSpec) => RoomSpec) | null,
 }));
 
 vi.mock("./world/station", async (importOriginal) => {
@@ -118,11 +129,15 @@ vi.mock("./world/station", async (importOriginal) => {
     roomFor: (...args: Parameters<typeof actual.roomFor>) => {
       const built = actual.roomFor(...args);
       const fixture = built.room.fixtures.find((f) => f.kind === facing.kind);
-      if (fixture === undefined) return built;
-      return {
-        ...built,
-        room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
-      };
+      const faced =
+        fixture === undefined
+          ? built
+          : {
+              ...built,
+              room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
+            };
+      if (facing.edit === null) return faced;
+      return { ...faced, room: facing.edit(faced.room) };
     },
   };
 });
@@ -391,6 +406,7 @@ beforeEach(() => {
   openFluid = vi.fn();
   sessions = [];
   facing.kind = null;
+  facing.edit = null;
   now = 0;
   pending = null;
   window.history.replaceState(null, "", "/");
@@ -1190,6 +1206,166 @@ describe("reading the walls (0.22 spec 3b)", () => {
     expect(
       Math.hypot(moved[0] - still[0], moved[1] - still[1]),
     ).toBeGreaterThan(0.01);
+  });
+});
+
+describe("the computers (0.22 spec 3a)", () => {
+  /** A loader that answers every engram with `place`. */
+  const engramLoad =
+    (place: PlaceInput): PlaceLoader =>
+    () =>
+      Promise.resolve({ kind: "engram", place, folder: "" });
+
+  /** Goes to `place`'s room through the `roomFor` seam and lands there. */
+  async function enterPlace(place: PlaceInput): Promise<void> {
+    start({ load: engramLoad(place) }).go({
+      kind: "engram",
+      domain: place.domain,
+      permalink: place.permalink,
+    });
+    await flush();
+    frames(1);
+  }
+
+  /** Where the player stands at `room`'s spawn, as `arrivalSpawn` puts it. */
+  function spawnPlayer(room: RoomSpec): Player {
+    return {
+      x: (room.spawn.x + 0.5) * CELL,
+      z: (room.spawn.y + 0.5) * CELL,
+      vx: 0,
+      vz: 0,
+      yaw: room.spawn.yaw,
+      pitch: 0,
+      bob: 0,
+    };
+  }
+
+  /** A curio computer standing `ahead` metres in front of `player`. */
+  function laptopAhead(player: Player, ahead: number): Curio {
+    return {
+      kind: "beige-laptop",
+      variant: 0,
+      x: (player.x - Math.sin(player.yaw) * ahead) / CELL,
+      y: (player.z - Math.cos(player.yaw) * ahead) / CELL,
+      h: 0,
+      turn: 0,
+      seed: 1,
+    };
+  }
+
+  /** Presses and releases Space over one tick. */
+  function use() {
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+  }
+
+  it("opens the reader at the top of the engram at a curio computer", async () => {
+    // Mutation caught: the computer focus never consulted, or Space at it
+    // left out of the use branch, so Space at the laptop opens nothing.
+    const shown: { room: RoomSpec | null } = { room: null };
+    facing.edit = (built) => {
+      const faced = { ...built, spawn: { ...built.spawn, yaw: 0 } };
+      const laptop = laptopAhead(spawnPlayer(faced), CELL);
+      shown.room = { ...faced, curios: [...faced.curios, laptop] };
+      return shown.room;
+    };
+    await enterPlace(CANNED_WORKSHOP);
+    const room = shown.room;
+    if (room === null) throw new Error("no room shown");
+    // Nothing else is offered there, so only the laptop can answer Space.
+    expect(focusOf(room, spawnPlayer(room))).toBeNull();
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${room.title}`);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: CANNED_WORKSHOP.title,
+      content: CANNED_WORKSHOP.content,
+      section: null,
+    });
+  });
+
+  it("reads the terminal in focus, not a nearer computer", async () => {
+    // Mutation caught: the computer consulted before the fixture focus, so
+    // the laptop in front of the terminal takes Space and the reader opens
+    // at the top instead of at the terminal's section.
+    facing.kind = "terminal";
+    const shown: { room: RoomSpec | null } = { room: null };
+    facing.edit = (built) => {
+      const laptop = laptopAhead(spawnPlayer(built), 0.5);
+      shown.room = { ...built, curios: [...built.curios, laptop] };
+      return shown.room;
+    };
+    await enterPlace(CANNED_WORKSHOP);
+    const room = shown.room;
+    if (room === null) throw new Error("no room shown");
+    const player = spawnPlayer(room);
+    const terminal = focusOf(room, player);
+    expect(terminal?.kind).toBe("terminal");
+    const at = computerFocus(
+      computersOf(room, CANNED_WORKSHOP),
+      player,
+      room.title,
+    );
+    expect(at).not.toBeNull();
+    const fixture = room.fixtures[terminal?.index ?? -1];
+    if (fixture?.kind !== "terminal") throw new Error("not a terminal");
+    const w = wallPoint(fixture.slot);
+    const p = at?.point.point ?? { x: Infinity, z: Infinity };
+    expect(Math.hypot(p.x - player.x, p.z - player.z)).toBeLessThan(
+      Math.hypot(w.x - player.x, w.z - player.z),
+    );
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: CANNED_WORKSHOP.title,
+      content: CANNED_WORKSHOP.content,
+      section: { heading: fixture.heading, occurrence: fixture.section },
+    });
+  });
+
+  it("reads a deck screen in focus, not a nearer computer", () => {
+    // Mutation caught: a computer ranked above the reading offers, so the
+    // laptop in front of the screen reads the deck's listing instead.
+    const deck = generateDeck(CANNED_DECK, 1);
+    const screen = deck.fixtures.find((f) => f.kind === "screen");
+    if (screen?.kind !== "screen") throw new Error("no screen");
+    const faced = { ...deck, spawn: wallFacingSpawn(screen.slot) };
+    const player = spawnPlayer(faced);
+    const room = { ...faced, curios: [laptopAhead(player, 0.5)] };
+    expect(focusOf(room, player)?.kind).toBe("screen");
+    expect(
+      computerFocus(computersOf(room, null), player, room.title),
+    ).not.toBeNull();
+    start({ client: null }).showRoom(room);
+    frames(1);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: screen.lines[0],
+      content: screen.lines.slice(1).join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("opens the deck's listing at a wall monitor on a deck", () => {
+    // Mutation caught: the wall monitor left out of the computer props, or
+    // a deck given no use points since it has no place.
+    const deck = generateDeck(CANNED_DECK, 1);
+    const faced = { ...deck, spawn: { ...deck.spawn, yaw: 0 } };
+    const at = wallAnchor({ x: faced.spawn.x, y: faced.spawn.y, side: "n" });
+    const room: RoomSpec = {
+      ...faced,
+      props: [
+        ...faced.props,
+        { kind: "wall-monitor", variant: 0, anchor: "wall", ...at, seed: 1 },
+      ],
+    };
+    expect(focusOf(room, spawnPlayer(room))).toBeNull();
+    start({ client: null }).showRoom(room);
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${room.title}`);
+    use();
+    const listing = roomReading(room, null);
+    expect(listing?.content).toContain("- ");
+    expect(hud.reader).toHaveBeenLastCalledWith(listing);
   });
 });
 
