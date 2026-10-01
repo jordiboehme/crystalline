@@ -2469,9 +2469,6 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
     }))
 }
 
-/// Render a status report (the daemon's or the in-process one) as human
-/// text. `daemon_note` says where the numbers come from - the one line that
-/// keeps a fallback read from masquerading as the daemon's view.
 /// The status line about embeddings: coverage, model and default search, then
 /// the device the loaded local model runs on when the report carries one (a
 /// remote provider, no provider and an older daemon's report carry none).
@@ -2493,6 +2490,9 @@ pub(crate) fn embeddings_line(emb: &serde_json::Value) -> String {
     line
 }
 
+/// Render a status report (the daemon's or the in-process one) as human
+/// text. `daemon_note` says where the numbers come from - the one line that
+/// keeps a fallback read from masquerading as the daemon's view.
 pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     use serde_json::Value;
 
