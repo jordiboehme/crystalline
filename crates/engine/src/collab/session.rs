@@ -102,6 +102,19 @@ pub struct Frame {
     pub bytes: Bytes,
 }
 
+/// An open room's text and the checksum that stands for it: the version
+/// token a read over the room hands out and a guarded write over it accepts.
+#[derive(Debug, Clone)]
+pub struct LiveText {
+    /// The room's text, LF only.
+    pub text: String,
+    /// The checksum of the stored bytes while the room is clean (its text is
+    /// what it loaded or last saved), so a guard taken before the room opened
+    /// or after it closes still holds even when the file is CRLF; the
+    /// checksum of `text` once anything was typed.
+    pub checksum: String,
+}
+
 /// Why a join did not produce a session.
 #[derive(Debug)]
 pub enum JoinError {
@@ -531,9 +544,9 @@ impl CollabSessions {
         domain: &str,
         permalink: &str,
         overlay: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<LiveText> {
         let session = self.live_room(domain, permalink, overlay).await?;
-        Some(session.snapshot().await.0)
+        Some(session.live().await)
     }
 
     /// Compose `target` into the live document as one transaction tagged with
@@ -1346,9 +1359,22 @@ impl CollabSession {
         self.state.lock().await.conns.is_empty()
     }
 
-    /// The session text, and whether it differs from the last saved text. The dirty FLAG says "an update arrived"; the equality
-    /// check is what stops a no-op session from ever writing (the byte
-    /// fidelity property for open-then-close).
+    /// The room's text and the checksum that stands for it; see [`LiveText`].
+    pub async fn live(&self) -> LiveText {
+        let state = self.state.lock().await;
+        let text = Self::file_text_locked(&state);
+        let checksum = if text == state.last_saved_text {
+            state.checksum.clone()
+        } else {
+            crate::engine::sha256_hex(text.as_bytes())
+        };
+        LiveText { text, checksum }
+    }
+
+    /// The session text, and whether it differs from the last saved text.
+    /// The dirty FLAG says "an update arrived"; the equality check is what
+    /// stops a no-op session from ever writing (open-then-close never touches
+    /// the file, whatever line endings it holds).
     pub async fn snapshot(&self) -> (String, bool) {
         let state = self.state.lock().await;
         let file = Self::file_text_locked(&state);
@@ -2122,7 +2148,7 @@ impl CollabSession {
         });
     }
 
-    /// Morph the live text into `target` (SESSION space) as one minimal edit
+    /// Morph the live text into `target` (LF text) as one minimal edit
     /// script in ONE transaction - every client sees a single update rather
     /// than a flicker of half-applied lines - broadcast that update to the
     /// room and tell it the external change is in.

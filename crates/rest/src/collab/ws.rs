@@ -526,8 +526,8 @@ mod tests {
         assert!(!ok(&[("origin", "http://notes.example")]));
     }
 
-    /// Capacity is a 503 and the two content refusals keep their own statuses,
-    /// so a client can tell "try again later" from "this file cannot".
+    /// Capacity is a 503 and an engram that cannot be read keeps its own
+    /// status, so a client can tell "try again later" from "this file cannot".
     #[test]
     fn every_join_refusal_maps_to_the_status_its_client_branches_on() {
         use axum::http::StatusCode;

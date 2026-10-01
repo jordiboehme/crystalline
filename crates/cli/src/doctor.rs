@@ -3,9 +3,10 @@
 //!
 //! Checks: (a) DB orphans, an indexed file whose path no longer exists on
 //! disk; (b) files on disk that are not yet indexed; (c) encoding problems
-//! (BOM or null bytes), which reuses `verify`'s `E006` rule rather than
-//! re-implementing the check; (d) stale service artifacts, a lock file with a
-//! dead pid or a socket file left behind by a killed daemon; (e) config
+//! (a BOM, a null byte or bytes that are not UTF-8), which reuses `verify`'s
+//! `E006` rule rather than re-implementing the check; (d) stale service
+//! artifacts, a lock file with a dead pid or a socket file left behind by a
+//! killed daemon; (e) config
 //! sanity, a registered domain whose path is missing or lacks a
 //! `MANIFEST.md`; (f) an embedding staleness summary, the stored model
 //! against the configured one, plus the cached model directories with sizes,
@@ -154,7 +155,8 @@ pub struct DomainDoctor {
     /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
     /// again never resolves these; the frontmatter itself needs a fix.
     pub unsyncable: Vec<UnsyncableFile>,
-    /// Encoding problems, sourced from `verify`'s `E006` rule.
+    /// Encoding problems (a BOM, a null byte or bytes that are not UTF-8),
+    /// sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
     /// Files whose frontmatter holds a key more than once (`verify` rule
     /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.

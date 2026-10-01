@@ -47,7 +47,10 @@ use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
 
 use crate::archive::{extract_repo_subtree, extract_tarball};
-use crate::changes::{LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_local_changes};
+use crate::changes::{
+    LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_local_changes,
+    detect_local_changes_against,
+};
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
 use crate::provider::{
@@ -463,7 +466,7 @@ pub async fn subscribe(
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
     let local_changes = if adopted {
-        detect_local_changes(domain_root, &files)?.substantive_count()
+        detect_local_changes_against(domain_root, &files, state_dir)?.substantive_count()
     } else {
         0
     };
@@ -1444,7 +1447,7 @@ pub async fn status(
 
     // After the probe, not before: a layer the forge just reported declined
     // hands its files back to this count.
-    let local = detect_local_changes(domain_root, &unshared_base(&state))?;
+    let local = detect_local_changes_against(domain_root, &unshared_base(&state), state_dir)?;
 
     let open_proposals = state
         .proposals
@@ -2233,7 +2236,10 @@ pub async fn propose(
             Some(_) => effective_tip_files(&state),
             None => state.files.clone(),
         };
-        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        let local = select_share_files(
+            detect_local_changes_against(domain_root, &base, state_dir)?,
+            options.files,
+        )?;
         if local.changes.is_empty() {
             return Ok(ProposeOutcome::NothingToShare {
                 skipped_large: local.skipped_large,
@@ -2566,7 +2572,7 @@ pub async fn propose_preview(
     // the same reason the share does: nothing below this line is about a
     // commit onto the connected branch.
     if options.sharing == Sharing::Direct {
-        return preview_direct(spec, domain_root, domain_name, &state, options);
+        return preview_direct(spec, domain_root, domain_name, state_dir, &state, options);
     }
     // The same capability question a real share asks, and the same cached
     // answer: a preview that guessed would name an action the share then
@@ -2593,7 +2599,10 @@ pub async fn propose_preview(
         } else {
             state.files.clone()
         };
-        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        let local = select_share_files(
+            detect_local_changes_against(domain_root, &base, state_dir)?,
+            options.files,
+        )?;
         if !state.conflicts.is_empty() {
             return Ok(SharePlan {
                 action: PlannedAction::ConflictsPending {
@@ -2708,7 +2717,10 @@ pub async fn propose_preview(
     } else {
         state.files.clone()
     };
-    let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+    let local = select_share_files(
+        detect_local_changes_against(domain_root, &base, state_dir)?,
+        options.files,
+    )?;
 
     if !state.conflicts.is_empty() {
         return Ok(SharePlan {
@@ -2843,6 +2855,7 @@ fn preview_direct(
     spec: &OriginSpec,
     domain_root: &Path,
     domain_name: &str,
+    state_dir: &Path,
     state: &OriginState,
     options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
@@ -2850,7 +2863,7 @@ fn preview_direct(
         return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
     }
     let local = select_share_files(
-        detect_local_changes(domain_root, &state.files)?,
+        detect_local_changes_against(domain_root, &state.files, state_dir)?,
         options.files,
     )?;
     let plan = |action: PlannedAction, effective_title: String| SharePlan {
@@ -2922,7 +2935,7 @@ async fn commit_direct(
         });
     }
     let mut local = select_share_files(
-        detect_local_changes(domain_root, &state.files)?,
+        detect_local_changes_against(domain_root, &state.files, state_dir)?,
         options.files,
     )?;
     if local.changes.is_empty() {
@@ -3011,7 +3024,7 @@ async fn commit_direct(
                     });
                 }
                 local = select_share_files(
-                    detect_local_changes(domain_root, &state.files)?,
+                    detect_local_changes_against(domain_root, &state.files, state_dir)?,
                     options.files,
                 )?;
                 if local.changes.is_empty() {
@@ -3841,7 +3854,7 @@ async fn amend_layer(
     // This share's own work is what stands against the chain tip; the layer's
     // recorded files are already proposed and are not it.
     let fresh = select_share_files(
-        detect_local_changes(domain_root, &effective_tip_files(&state))?,
+        detect_local_changes_against(domain_root, &effective_tip_files(&state), state_dir)?,
         files,
     )?;
     if fresh.changes.is_empty() {
@@ -5867,7 +5880,9 @@ fn write_working_file(path: &Path, content: &[u8]) -> Result<(), RemoteError> {
 /// Writes a file a pull, a subscribe or a resolution brings in from the
 /// origin. A markdown file that is UTF-8 text lands with LF line endings, the
 /// one line ending Crystalline writes, whatever the origin holds; every other
-/// file, and markdown that is not UTF-8, lands byte for byte. The base snapshot
+/// file lands byte for byte. So does a `.md` file the origin holds as bytes
+/// that are not UTF-8: it is mirrored as it is, never repaired or refused
+/// here, and `validate` reports it under `E006`. The base snapshot
 /// keeps the origin's own bytes, which is what tells the next pull what the
 /// origin changed.
 ///

@@ -315,15 +315,20 @@ impl Engine {
                 // a moment ago, so it is what the guard compares against - the
                 // file's checksum would refuse every guarded edit made while
                 // anybody had the page open.
+                //
+                // A clean room stands for the stored bytes and accepts their
+                // checksum, so a guard taken before it opened still holds;
+                // the checksum of its text is accepted too, since that is the
+                // same document.
                 if let Some(expected) = expected_checksum {
-                    let found = sha256_hex(live.as_bytes());
-                    if found != expected {
+                    let text_sum = sha256_hex(live.text.as_bytes());
+                    if expected != live.checksum && expected != text_sum {
                         return Err(SourceEditFailure::before(EngineError::Conflict(
-                            stale_edit_message(expected, &found),
+                            stale_edit_message(expected, &live.checksum),
                         )));
                     }
                 }
-                let edited = apply(&live).map_err(SourceEditFailure::before)?;
+                let edited = apply(&live.text).map_err(SourceEditFailure::before)?;
                 // The same two passes every other arm makes, in the same
                 // order. An edit that skipped them would put a document in
                 // front of a person that the saver then refuses, minutes

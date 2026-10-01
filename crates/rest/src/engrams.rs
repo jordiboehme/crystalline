@@ -636,12 +636,13 @@ pub struct CreateEngramBody {
 }
 
 /// What `PUT /domains/{domain}/engrams/{permalink}` takes: the complete file
-/// text, frontmatter included, written verbatim.
+/// text, frontmatter included, written verbatim apart from line endings.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[schema(description = "The complete file text, frontmatter included. It is \
-                        written verbatim: nothing here rebuilds the \
-                        frontmatter or stamps provenance, so what a client \
-                        reads back is what its author typed.")]
+                        written verbatim apart from line endings, which are \
+                        stored as LF: nothing here rebuilds the frontmatter \
+                        or stamps provenance, so what a client reads back is \
+                        what its author typed.")]
 pub struct SaveEngramBody {
     /// The full markdown text as the editor holds it.
     #[schema(example = "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n")]
@@ -934,9 +935,10 @@ pub async fn create(
     tag = "engrams",
     operation_id = "save_engram",
     summary = "Save an engram's complete markdown text.",
-    description = "The text lands verbatim, frontmatter included: nothing \
-                   rebuilds it and nothing stamps provenance, so a client that \
-                   saves what it read writes back byte-identical bytes.\n\nThe \
+    description = "The text lands verbatim, frontmatter included, apart \
+                   from line endings, which are stored as LF: nothing rebuilds \
+                   it and nothing stamps provenance, so a client that saves \
+                   what it read writes back the bytes it read.\n\nThe \
                    write is guarded by `If-Match`, whose token is the `ETag` of \
                    the detail read it is based on: a save that arrives without \
                    one is answered 428, and one whose token is stale is \

@@ -517,7 +517,7 @@ export interface paths {
         get: operations["get_engram"];
         /**
          * Save an engram's complete markdown text.
-         * @description The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.
+         * @description The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back the bytes it read.
          *
          *     The write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.
          *
@@ -639,7 +639,7 @@ export interface paths {
         get: operations["get_domain_manifest"];
         /**
          * Save a domain's MANIFEST markdown, guarded by If-Match.
-         * @description The text lands verbatim, frontmatter included, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
+         * @description The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
          */
         put: operations["save_domain_manifest"];
         post?: never;
@@ -3139,7 +3139,7 @@ export interface components {
          * @enum {string}
          */
         RoutingSource: "when_to_use" | "scope" | "none";
-        /** @description The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed. */
+        /** @description The complete file text, frontmatter included. It is written verbatim apart from line endings, which are stored as LF: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed. */
         SaveEngramBody: {
             /**
              * @description The full markdown text as the editor holds it.
@@ -3152,7 +3152,7 @@ export interface components {
              */
             content: string;
         };
-        /** @description The full MANIFEST markdown as the editor holds it, written verbatim: nothing here rebuilds the frontmatter or stamps provenance. */
+        /** @description The full MANIFEST markdown as the editor holds it, written verbatim apart from line endings, which are stored as LF: nothing here rebuilds the frontmatter or stamps provenance. */
         SaveManifestBody: {
             /**
              * @description The full MANIFEST markdown as the editor holds it.

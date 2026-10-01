@@ -569,8 +569,13 @@ fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
     let manifest = root.join("MANIFEST.md");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
-    let updated = crystalline_core::manifest::set_declared_name(&text, name);
-    if updated != text {
+    // Written as LF, the whole file, like every write; compared in LF so a
+    // CRLF MANIFEST that already declares the name is left alone.
+    let current = crystalline_core::to_lf(&text);
+    let updated =
+        crystalline_core::to_lf(&crystalline_core::manifest::set_declared_name(&text, name))
+            .into_owned();
+    if updated != current {
         std::fs::write(&manifest, updated)
             .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
     }

@@ -292,9 +292,10 @@ pub(crate) fn status_report_json(
 /// rather than threaded through every reader who did not.
 pub(crate) fn local_change_detail(domain_root: &Path, state_dir: &Path) -> Option<Value> {
     let state = OriginState::load(state_dir).ok().flatten()?;
-    let detected = crystalline_remote::changes::detect_local_changes(
+    let detected = crystalline_remote::changes::detect_local_changes_against(
         domain_root,
         &crystalline_remote::ops::unshared_base(&state),
+        state_dir,
     )
     .ok()?;
     let mut added: Vec<&str> = Vec::new();
@@ -741,9 +742,10 @@ impl UnsharedWork {
 /// that went round review entirely.
 pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWork> {
     let state = OriginState::load(state_dir).ok().flatten()?;
-    let detected = crystalline_remote::changes::detect_local_changes(
+    let detected = crystalline_remote::changes::detect_local_changes_against(
         domain_root,
         &crystalline_remote::ops::unshared_base(&state),
+        state_dir,
     )
     .ok()?;
     let paths: Vec<String> = detected

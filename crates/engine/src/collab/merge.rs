@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn disjoint_edits_merge_clean_across_spaces() {
         let base = "# T\r\n\r\nSection A: original\r\n\r\nSection B: original\r\n";
-        let mine = "# T\n\nSection A: mine\n\nSection B: original\n"; // session space
+        let mine = "# T\n\nSection A: mine\n\nSection B: original\n"; // the room's LF text
         let theirs = "# T\r\n\r\nSection A: original\r\n\r\nSection B: theirs\r\n";
         let MergeOutcome::Clean(merged) = three_way(base, mine, theirs) else {
             panic!("disjoint edits merge");

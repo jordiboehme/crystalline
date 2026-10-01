@@ -999,7 +999,7 @@ impl Engine {
             // re-retirement appends nothing twice whichever of the three the
             // successor is living in at that moment.
             let current = match self.live_text_at(succ_desc, &view).await {
-                Some(live) => live,
+                Some(live) => live.text,
                 None => match overlay {
                     Some(_) => view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
                         EngineError::NotFound(format!(
@@ -1197,13 +1197,18 @@ impl Engine {
                 None => self.load_content(&source, &desc).await,
             }
         };
-        let content = match self.live_text_at(&desc, &view).await {
-            Some(live) => live,
+        let live = self.live_text_at(&desc, &view).await;
+        let room_token = live.as_ref().map(|live| live.checksum.clone());
+        let content = match live {
+            Some(live) => live.text,
             None => stored().await?,
         };
         let checksum = sha256_hex(content.as_bytes());
+        // A clean room also accepts the stored bytes' checksum it hands out
+        // (see `LiveText`).
         if let Some(expected) = p.expected_checksum.as_deref()
             && expected != checksum
+            && room_token.as_deref() != Some(expected)
         {
             return Err(EngineError::Conflict(stale_edit_message(
                 expected, &checksum,

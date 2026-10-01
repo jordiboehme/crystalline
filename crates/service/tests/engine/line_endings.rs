@@ -267,6 +267,18 @@ async fn a_read_of_a_crlf_file_returns_lf_and_its_checksum_guards_an_edit() {
     assert!(!bytes.contains(&b'\r'));
     let second = read(&engine, "eng", "windows").await;
     assert_eq!(second["checksum"], sha256_hex(&bytes));
+
+    // The CRLF checksum described the file before that edit, so it is stale.
+    let err = engine
+        .edit_engram(&EditParams {
+            content: Some("again".to_string()),
+            expected_checksum: Some(first["checksum"].as_str().unwrap().to_string()),
+            ..edit("windows", "append")
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stale edit"), "{err}");
 }
 
 #[tokio::test]

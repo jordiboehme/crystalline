@@ -205,7 +205,57 @@ pub fn detect_local_changes(
         domain_root,
         base,
         crystalline_core::generated_indexes_at(domain_root),
+        None,
     )
+}
+
+/// [`detect_local_changes`], with the origin state directory whose base
+/// snapshot copies say what a stamp's bytes were.
+///
+/// Crystalline writes a markdown file as LF while the base snapshot keeps the
+/// origin's own bytes, so a file the origin holds as CRLF differs from its
+/// stamp the moment it lands, with nothing changed but its line endings. Such
+/// a file is not a local change: when a `.md` file's sha differs from its
+/// stamp, the base copy is read, and when that copy is what the stamp
+/// describes and both read the same as LF, the file counts as unchanged. The
+/// extra read is paid only on a mismatch.
+pub fn detect_local_changes_against(
+    domain_root: &Path,
+    base: &BTreeMap<String, BaseStamp>,
+    state_dir: &Path,
+) -> Result<LocalChanges, RemoteError> {
+    detect_local_changes_with(
+        domain_root,
+        base,
+        crystalline_core::generated_indexes_at(domain_root),
+        Some(state_dir),
+    )
+}
+
+fn same_text_as_base(state_dir: Option<&Path>, rel: &str, stamp: &BaseStamp, disk: &[u8]) -> bool {
+    state_dir.is_some_and(|dir| matches_base_as_lf(dir, rel, stamp, disk))
+}
+
+/// Whether `disk`, a markdown file whose bytes differ from `stamp`, is the
+/// base copy under `state_dir` apart from its line endings: the copy is what
+/// the stamp describes, and both read the same as LF.
+pub fn matches_base_as_lf(state_dir: &Path, rel: &str, stamp: &BaseStamp, disk: &[u8]) -> bool {
+    let is_markdown = Path::new(rel)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        return false;
+    }
+    let Ok(Some(copy)) = crate::state::read_base_file(state_dir, rel) else {
+        return false;
+    };
+    if sha256_hex(&copy) != stamp.sha256 {
+        return false;
+    }
+    match (std::str::from_utf8(disk), std::str::from_utf8(&copy)) {
+        (Ok(disk), Ok(copy)) => crystalline_core::to_lf(disk) == crystalline_core::to_lf(copy),
+        _ => false,
+    }
 }
 
 /// [`detect_local_changes`] with the domain's generated-index policy supplied
@@ -217,6 +267,7 @@ pub(crate) fn detect_local_changes_with(
     domain_root: &Path,
     base: &BTreeMap<String, BaseStamp>,
     indexes: GeneratedIndexes,
+    base_copies: Option<&Path>,
 ) -> Result<LocalChanges, RemoteError> {
     let mut changes = Vec::new();
     let mut skipped_large = Vec::new();
@@ -284,7 +335,9 @@ pub(crate) fn detect_local_changes_with(
             Some(stamp) => {
                 let bytes = std::fs::read(entry.path())?;
                 let sha256 = sha256_hex(&bytes);
-                if stamp.size != size || stamp.sha256 != sha256 {
+                if (stamp.size != size || stamp.sha256 != sha256)
+                    && !same_text_as_base(base_copies, &rel, stamp, &bytes)
+                {
                     changes.push(LocalChange::Modified { path: rel, sha256 });
                 }
             }
@@ -644,12 +697,12 @@ mod tests {
     /// Detection for a domain that keeps its generated indexes local: the
     /// default, and what every MANIFEST that declares nothing gets.
     fn local(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
-        detect_local_changes_with(dir, base, GeneratedIndexes::Local).unwrap()
+        detect_local_changes_with(dir, base, GeneratedIndexes::Local, None).unwrap()
     }
 
     /// Detection for a domain that lets them travel.
     fn shared(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
-        detect_local_changes_with(dir, base, GeneratedIndexes::Shared).unwrap()
+        detect_local_changes_with(dir, base, GeneratedIndexes::Shared, None).unwrap()
     }
 
     /// A write the daemon was killed in the middle of leaves its temp file
@@ -862,6 +915,34 @@ mod tests {
             other => panic!("expected Added, got {other:?}"),
         }
         assert!(result.skipped_large.is_empty());
+    }
+
+    /// A markdown file this machine wrote as LF over an origin base held as
+    /// CRLF is not a local change; an edit of it still is, and so is the same
+    /// file when no base copy is there to say what the stamp was.
+    #[test]
+    fn an_lf_rewrite_of_a_crlf_base_is_not_a_local_change_but_an_edit_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let rel = "notes/one.md";
+        let crlf = b"---\r\ntitle: One\r\n---\r\n\r\nBody.\r\n";
+        crate::state::write_base_file(state.path(), rel, crlf).unwrap();
+        let mut base = BTreeMap::new();
+        base.insert(rel.to_string(), stamp_for(crlf));
+
+        write(dir.path(), rel, b"---\ntitle: One\n---\n\nBody.\n");
+        let result = detect_local_changes_against(dir.path(), &base, state.path()).unwrap();
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+        let raw = detect_local_changes(dir.path(), &base).unwrap();
+        assert_eq!(raw.changes.len(), 1, "without base copies it is raw bytes");
+
+        write(dir.path(), rel, b"---\ntitle: One\n---\n\nEdited.\n");
+        let result = detect_local_changes_against(dir.path(), &base, state.path()).unwrap();
+        assert!(
+            matches!(&result.changes[..], [LocalChange::Modified { path, .. }] if path == rel),
+            "{:?}",
+            result.changes
+        );
     }
 
     #[test]

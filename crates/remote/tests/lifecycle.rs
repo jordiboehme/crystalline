@@ -273,6 +273,49 @@ async fn scenario_01_subscribe_writes_tree_base_and_state() {
     assert!(st.ref_etag.is_some());
 }
 
+/// A repository that holds CRLF markdown subscribes as LF on disk, keeps the
+/// origin's bytes in the base, and reports no local change for it; a real
+/// edit afterwards is still a local change.
+#[tokio::test]
+async fn subscribing_a_crlf_repository_writes_lf_and_reports_no_local_change() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            (
+                "MANIFEST.md",
+                b"---\r\ntype: manifest\r\n---\r\n\r\n# Manifest\r\n",
+            ),
+            ("notes/a.md", b"alpha\r\nbeta\r\n"),
+            ("assets/data.csv", b"a,b\r\n1,2\r\n"),
+        ]),
+        None,
+    );
+    let (sub, report) = subscribe_at(&mock, &c1).await;
+    assert_eq!(report.files_written, 3);
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha\nbeta\n");
+    assert_eq!(
+        read(&sub.domain_root.join("assets/data.csv")),
+        b"a,b\r\n1,2\r\n",
+        "an attachment is bytes and is never converted"
+    );
+    assert_eq!(
+        crystalline_remote::state::read_base_file(&sub.state_dir, "notes/a.md").unwrap(),
+        Some(b"alpha\r\nbeta\r\n".to_vec()),
+        "the base keeps the origin's bytes"
+    );
+
+    let st = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(st.local_changes, 0, "line endings alone are not a change");
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha\nedited\n");
+    let st = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(st.local_changes, 1, "a real edit still is");
+}
+
 #[tokio::test]
 async fn scenario_01_subscribe_without_manifest_is_not_a_domain_and_writes_nothing() {
     let mock = MockProvider::new();

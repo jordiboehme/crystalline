@@ -292,6 +292,38 @@ async fn a_mixed_endings_file_hosts_a_room_and_saves_as_lf() {
     );
 }
 
+/// A lone `\r` is line content, not a line ending: it rides through a room
+/// over a CRLF file and its save untouched, while every CRLF pair turns LF.
+#[tokio::test]
+async fn a_lone_cr_survives_a_room_and_its_save() {
+    let (tmp, engine, _scratch) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/cr.md"),
+        "---\r\ntitle: Cr\r\npermalink: cr\r\ntags:\r\n  - eng\r\nstatus: stable\r\ntype: engram\r\n---\r\n\r\nbefore\rafter\r\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng", "cr", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let synced = doc
+        .get_or_insert_text("content")
+        .get_string(&doc.transact());
+    assert!(synced.contains("before\rafter\n"), "{synced:?}");
+    append_line(&joined, &doc, "typed").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/cr.md")).unwrap();
+    assert!(on_disk.ends_with("before\rafter\ntyped\n"), "{on_disk:?}");
+    assert!(!on_disk.contains("\r\n"), "{on_disk:?}");
+}
+
 #[tokio::test]
 async fn an_untouched_session_never_writes() {
     let (tmp, engine, _scratch) = engine_fixture().await;

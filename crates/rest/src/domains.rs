@@ -728,8 +728,9 @@ fn tag_alias_problem_kind(kind: TagAliasProblemKind) -> &'static str {
 /// What `PUT /domains/{domain}/manifest` takes: the complete MANIFEST source.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[schema(description = "The full MANIFEST markdown as the editor holds it, \
-                        written verbatim: nothing here rebuilds the \
-                        frontmatter or stamps provenance.")]
+                        written verbatim apart from line endings, which are \
+                        stored as LF: nothing here rebuilds the frontmatter \
+                        or stamps provenance.")]
 pub struct SaveManifestBody {
     /// The full MANIFEST markdown as the editor holds it.
     #[schema(
@@ -757,7 +758,8 @@ pub struct SaveManifestBody {
     tag = "domains",
     operation_id = "save_domain_manifest",
     summary = "Save a domain's MANIFEST markdown, guarded by If-Match.",
-    description = "The text lands verbatim, frontmatter included, guarded the \
+    description = "The text lands verbatim, frontmatter included, apart from \
+                   line endings, which are stored as LF, guarded the \
                    same way an engram save is: 428 with no `If-Match`, 412 \
                    when the token is stale (carrying the version the server \
                    holds now), 200 once it lands. A read-only instance \

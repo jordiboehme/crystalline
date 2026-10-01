@@ -3395,7 +3395,11 @@ impl Engine {
     /// `no_engine_function_composes_into_a_room_under_a_file_write_lock` scans
     /// for exactly that and names `.live_text(` among its needles, so a caller
     /// that gets this wrong fails the suite rather than the field.
-    async fn live_text_at(&self, desc: &EngramDescriptor, view: &DomainView<'_>) -> Option<String> {
+    async fn live_text_at(
+        &self,
+        desc: &EngramDescriptor,
+        view: &DomainView<'_>,
+    ) -> Option<crate::collab::session::LiveText> {
         let rooms = self.collab_rooms()?;
         rooms
             .live_text(&desc.domain, &desc.permalink, view.actor())

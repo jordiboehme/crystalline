@@ -1177,6 +1177,34 @@ fn domain_add_without_a_name_or_manifest_declaration_uses_the_basename_and_write
     );
 }
 
+/// A CRLF MANIFEST that `domain add` writes the name back into comes out LF
+/// as a whole, never with mixed line endings.
+#[test]
+fn domain_add_writes_a_crlf_manifest_back_as_lf() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("notes");
+    write(
+        &dir,
+        "MANIFEST.md",
+        &manifest_without_a_declared_name("Notes").replace('\n', "\r\n"),
+    );
+
+    let out = bin()
+        .args(["--json", "domain", "add", "--path"])
+        .arg(&dir)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let manifest = std::fs::read_to_string(dir.join("MANIFEST.md")).unwrap();
+    assert!(manifest.contains("domain_name: notes"), "{manifest:?}");
+    assert!(!manifest.contains('\r'), "{manifest:?}");
+}
+
 #[test]
 fn domain_add_without_a_name_adopts_an_existing_registration_of_the_same_folder() {
     let work = tempfile::tempdir().unwrap();
