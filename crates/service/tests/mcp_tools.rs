@@ -3711,8 +3711,120 @@ async fn edit_engram_set_frontmatter_refuses_to_remove_status() {
     );
 }
 
-/// The keyset is a safe list: identity, classification and provenance keys are
-/// refused by name, and the error states what is settable.
+/// tags is set as a whole list over MCP: the new tag lands in the file as a
+/// block list, folded to the canonical spelling, and the reindex after the
+/// write makes it searchable and lists it in the vocabulary. The edit is
+/// guarded by expected_checksum like every other edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_values_adds_a_tag_that_search_and_vocabulary_see() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry Rule", "tags": ["retries"], "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/retry-rule.md");
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "retry-rule" }),
+    )
+    .await
+    .unwrap();
+    let checksum = read["checksum"].as_str().unwrap().to_string();
+
+    // A stale checksum is refused and the file stays as it was.
+    let before = std::fs::read_to_string(&path).unwrap();
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "retry-rule", "operation": "set_frontmatter",
+            "key": "tags", "values": ["retries", "backoff"],
+            "expected_checksum": "0".repeat(64),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(!err.is_empty());
+    assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "retry-rule", "operation": "set_frontmatter",
+            "key": "tags", "values": ["retries", "Network Policy"],
+            "expected_checksum": checksum,
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("tags:\n  - retries\n  - network-policy\n"),
+        "{text}"
+    );
+
+    let hits = call(
+        peer,
+        "search_engrams",
+        json!({ "domains": ["eng"], "tags": ["network-policy"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits["total"], 1, "the new tag is searchable: {hits}");
+    let vocab = call(peer, "vocabulary", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert!(
+        vocab.to_string().contains("network-policy"),
+        "the vocabulary lists the new tag: {vocab}"
+    );
+
+    // value on tags points at values and writes nothing.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "retry-rule", "operation": "set_frontmatter",
+            "key": "tags", "value": "backoff",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("tags is a list: pass the whole new list as values"),
+        "{err}"
+    );
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+}
+
+/// The edit_engram schema advertises values as a list of strings, so a client
+/// can send a tag list without guessing its shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_schema_exposes_values_as_a_string_list() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let edit = tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram listed");
+    let schema = serde_json::to_value(&edit.input_schema).unwrap();
+    let values = &schema["properties"]["values"];
+    assert_eq!(values["type"], json!("array"), "{values}");
+    assert_eq!(values["items"]["type"], json!("string"), "{values}");
+    let doc = values["description"].as_str().unwrap_or_default();
+    assert!(doc.contains("tags"), "{doc}");
+}
+
+/// The keyset is a safe list: identity and provenance keys are refused by
+/// name, and the error states what is settable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
     let h = Harness::new(&["eng"]).await;
@@ -3729,14 +3841,7 @@ async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
     let path = h.root.join("eng/identity.md");
     let before = std::fs::read_to_string(&path).unwrap();
 
-    for key in [
-        "permalink",
-        "title",
-        "type",
-        "tags",
-        "recorded_at",
-        "generated",
-    ] {
+    for key in ["permalink", "title", "type", "recorded_at", "generated"] {
         let err = call(
             peer,
             "edit_engram",

@@ -473,6 +473,22 @@ pub fn set_evolve_ack(source: &str, entries: &[EvolveAck]) -> String {
     set_frontmatter_block(source, EVOLVE_ACK_KEY, evolve_ack_block(entries))
 }
 
+/// Replace the frontmatter value of `key` with `items` as a block list, one
+/// `  - item` line each, leaving every other byte untouched. The old value goes
+/// whole whatever shape it was written in - a block list, a flow list on one
+/// line or several, a comma-separated scalar - so no old item is left behind
+/// under the new list. An empty `items` removes the key with its items.
+pub fn set_frontmatter_list(source: &str, key: &str, items: &[String]) -> String {
+    if items.is_empty() {
+        return remove_frontmatter_block(source, key);
+    }
+    let mut block = format!("{key}:");
+    for item in items {
+        block.push_str(&format!("\n  - {}", flow_scalar(item)));
+    }
+    set_frontmatter_block(source, key, block)
+}
+
 fn evolve_ack_block(entries: &[EvolveAck]) -> String {
     if let [only] = entries {
         return format!("{EVOLVE_ACK_KEY}: {}", evolve_ack_flow(only));
@@ -1117,6 +1133,59 @@ pub fn prepend_body(source: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_replaces_every_shape_of_the_old_value_with_a_block_list() {
+        let want = "---\ntype: engram\ntags:\n  - a\n  - b\nstatus: stable\n---\n\nbody\n";
+        for old in [
+            "tags:\n  - x\n  - y\n",
+            "tags:\n- x\n- y\n",
+            "tags: [x, y]\n",
+            "tags: [x,\n  y]\n",
+            "tags: x, y\n",
+            "tags:\n",
+        ] {
+            let source = format!("---\ntype: engram\n{old}status: stable\n---\n\nbody\n");
+            let items = ["a".to_string(), "b".to_string()];
+            assert_eq!(
+                set_frontmatter_list(&source, "tags", &items),
+                want,
+                "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_is_appended_when_the_key_is_absent_and_parses_back() {
+        let source = "---\ntype: engram\nstatus: stable\n---\n\nbody\n";
+        let out = set_frontmatter_list(source, "tags", &["new-tag".to_string()]);
+        assert_eq!(
+            out,
+            "---\ntype: engram\nstatus: stable\ntags:\n  - new-tag\n---\n\nbody\n"
+        );
+        let parsed = crate::parse_engram(&out).unwrap();
+        assert_eq!(parsed.frontmatter.tags, vec!["new-tag".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_list_removes_the_key_and_its_items() {
+        let source = "---\ntype: engram\ntags:\n  - x\n  - y\nstatus: stable\n---\n\nbody\n";
+        assert_eq!(
+            set_frontmatter_list(source, "tags", &[]),
+            "---\ntype: engram\nstatus: stable\n---\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn a_list_item_a_block_sequence_could_misread_is_quoted() {
+        let source = "---\ntype: engram\n---\n\nbody\n";
+        let out = set_frontmatter_list(source, "tags", &["a: b".to_string(), "#x".to_string()]);
+        let parsed = crate::parse_engram(&out).unwrap();
+        assert_eq!(
+            parsed.frontmatter.tags,
+            vec!["a: b".to_string(), "#x".to_string()]
+        );
+    }
 
     #[test]
     fn a_missing_field_goes_right_after_the_named_key_and_its_continuation_lines() {

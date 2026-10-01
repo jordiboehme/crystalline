@@ -162,6 +162,7 @@ async fn an_edit_that_changes_the_title_updates_the_listing() {
             content: Some("title: Final".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: Some("title: Draft".to_string()),
             expected_replacements: None,

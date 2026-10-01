@@ -2725,6 +2725,7 @@ async fn a_reference_dropped_only_in_a_draft_still_never_orphans_a_shared_file()
                 content: Some("the deck is elsewhere now".to_string()),
                 key: None,
                 value: None,
+                values: None,
                 expected_replacements: None,
                 section: None,
                 include_subsections: false,

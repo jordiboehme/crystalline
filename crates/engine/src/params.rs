@@ -137,13 +137,19 @@ pub struct EditParams {
     /// set_frontmatter, which takes key and value instead.
     #[serde(default)]
     pub content: Option<String>,
-    /// The frontmatter field to assign, for set_frontmatter. One of status,
-    /// valid_from, valid_to, stale_after, source_date, resource, source_version,
-    /// salience, verified or evolve_ack. No other key is settable here: type,
-    /// title, permalink, tags, recorded_at and the generated provenance block
-    /// carry identity and provenance and are owned by their own tools.
+    /// The frontmatter field to assign, for set_frontmatter. tags takes values
+    /// (a list); status, valid_from, valid_to, stale_after, source_date,
+    /// resource, source_version, salience, verified and evolve_ack take value.
+    /// No other key is settable here: type, title, permalink, recorded_at and
+    /// the generated provenance block carry identity and provenance.
     #[serde(default)]
     pub key: Option<String>,
+    /// The whole new list, for set_frontmatter on tags (add a tag, remove a
+    /// tag, set tags): read the engram, then pass every tag it should carry.
+    /// Each is folded to lowercase-with-hyphens and deduplicated; an empty
+    /// list removes the key.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
     /// The value to assign, for set_frontmatter. Omit it (or pass null) to
     /// remove the field, which is how a valid_to that should never have been
     /// set is cleared; status cannot be removed, since every engram needs one.

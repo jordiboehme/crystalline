@@ -733,6 +733,23 @@ impl Engine {
                 ))
             })?;
         let value = p.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        // A list key takes the whole new list and nothing else, and a scalar
+        // key takes one value: each mix-up is refused with the other form
+        // named, rather than guessed at. A key outside the settable set falls
+        // through to the refusal that names that set.
+        if LIST_FRONTMATTER_KEYS.contains(&key) {
+            return match (&p.values, value) {
+                (Some(values), None) => Self::set_tags(source, values),
+                _ => Err(EngineError::Invalid(format!(
+                    "{key} is a list: pass the whole new list as values"
+                ))),
+            };
+        }
+        if p.values.is_some() && SETTABLE_FRONTMATTER_KEYS.contains(&key) {
+            return Err(EngineError::Invalid(format!(
+                "{key} takes one value: pass value"
+            )));
+        }
         Self::guard_one_line_scalar(source, key, value, permalink)?;
 
         match key {
@@ -888,6 +905,31 @@ impl Engine {
         }
     }
 
+    /// Replace an engram's whole `tags` list, the list form of
+    /// `set_frontmatter`. Each entry is trimmed and folded to the canonical
+    /// lowercase-with-hyphens spelling ([`crystalline_core::fold_tag`]), blanks
+    /// are dropped and repeats are kept once in first order. One entry that
+    /// cannot fold refuses the whole edit by name rather than writing a tag
+    /// verify would flag. The list is written as a block list whatever shape
+    /// the old value had; an empty list removes the key.
+    fn set_tags(source: &str, values: &[String]) -> Result<String> {
+        let mut tags: Vec<String> = Vec::with_capacity(values.len());
+        for raw in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            let tag = crystalline_core::fold_tag(raw).ok_or_else(|| {
+                EngineError::Invalid(format!(
+                    "'{}' cannot be a tag: a tag is lowercase letters, digits and hyphens, such as confluence-source",
+                    raw.escape_debug()
+                ))
+            })?;
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        Ok(crystalline_core::emit::set_frontmatter_list(
+            source, "tags", &tags,
+        ))
+    }
+
     fn require_content<'a>(&self, p: &'a EditParams) -> Result<&'a str> {
         p.content.as_deref().ok_or_else(|| {
             EngineError::Invalid(format!("operation '{}' requires content", p.operation))
@@ -943,12 +985,14 @@ mod settable_keys_tests {
     }
 
     fn set(key: &str) -> Result<String> {
+        let list = LIST_FRONTMATTER_KEYS.contains(&key);
         let p = EditParams {
             identifier: "t".to_string(),
             domain: "d".to_string(),
             operation: "set_frontmatter".to_string(),
             key: Some(key.to_string()),
-            value: value_for(key),
+            value: if list { None } else { value_for(key) },
+            values: list.then(|| vec!["x".to_string()]),
             ..EditParams::default()
         };
         Engine::apply_set_frontmatter(SOURCE, &p, "t", "tester", None, None)
@@ -969,11 +1013,17 @@ mod settable_keys_tests {
         }
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"resource"));
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"source_version"));
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"tags"));
+        for key in LIST_FRONTMATTER_KEYS {
+            assert!(
+                SETTABLE_FRONTMATTER_KEYS.contains(key),
+                "{key} is a list key but not settable"
+            );
+        }
         for key in [
             "title",
             "permalink",
             "type",
-            "tags",
             "recorded_at",
             "generated",
             "not_a_key",
@@ -1080,5 +1130,143 @@ mod settable_keys_tests {
         let removed = set_on(&one, "resource", None).unwrap();
         assert!(!removed.contains("resource"), "{removed}");
         crystalline_core::parse_engram(&removed).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod list_keys_tests {
+    use super::*;
+
+    fn engram(tags: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: T\npermalink: t\n{tags}status: stable\nrecorded_at: 2026-01-01\n---\n\nbody\n"
+        )
+    }
+
+    fn params(key: &str, value: Option<&str>, values: Option<&[&str]>) -> EditParams {
+        EditParams {
+            identifier: "t".to_string(),
+            domain: "d".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(key.to_string()),
+            value: value.map(str::to_string),
+            values: values.map(|v| v.iter().map(|s| s.to_string()).collect()),
+            ..EditParams::default()
+        }
+    }
+
+    fn set_values(source: &str, key: &str, values: &[&str]) -> Result<String> {
+        Engine::apply_set_frontmatter(
+            source,
+            &params(key, None, Some(values)),
+            "t",
+            "tester",
+            None,
+            None,
+        )
+    }
+
+    fn tags_of(source: &str) -> Vec<String> {
+        crystalline_core::parse_engram(source)
+            .unwrap()
+            .frontmatter
+            .tags
+    }
+
+    #[test]
+    fn a_tag_is_added_whatever_shape_the_old_tags_had() {
+        for old in [
+            "tags:\n  - old\n",
+            "tags: [old]\n",
+            "tags:\n- old\n",
+            "tags: old\n",
+        ] {
+            let out = set_values(&engram(old), "tags", &["old", "new"]).unwrap();
+            assert_eq!(tags_of(&out), ["old", "new"], "{old:?}: {out}");
+            assert!(out.contains("tags:\n  - old\n  - new\n"), "{old:?}: {out}");
+            assert_eq!(out.matches("old").count(), 1, "{old:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn tags_are_written_where_there_were_none() {
+        let out = set_values(&engram(""), "tags", &["first"]).unwrap();
+        assert_eq!(tags_of(&out), ["first"], "{out}");
+    }
+
+    #[test]
+    fn a_shorter_list_removes_a_tag_and_an_empty_one_removes_the_key() {
+        let source = engram("tags:\n  - a\n  - b\n");
+        let out = set_values(&source, "tags", &["b"]).unwrap();
+        assert_eq!(tags_of(&out), ["b"], "{out}");
+        let out = set_values(&source, "tags", &[]).unwrap();
+        assert!(!out.contains("tags"), "{out}");
+        assert!(tags_of(&out).is_empty());
+        // Entries that are blank after trimming count as nothing.
+        let out = set_values(&source, "tags", &["  ", ""]).unwrap();
+        assert!(!out.contains("tags"), "{out}");
+    }
+
+    #[test]
+    fn tags_are_folded_and_deduped_in_first_order() {
+        let out = set_values(
+            &engram(""),
+            "tags",
+            &[
+                "Confluence Source",
+                "api",
+                "confluence-source",
+                "API",
+                "a_b",
+            ],
+        )
+        .unwrap();
+        assert_eq!(tags_of(&out), ["confluence-source", "api", "a-b"], "{out}");
+    }
+
+    #[test]
+    fn a_tag_that_cannot_fold_is_refused_by_name() {
+        let source = engram("tags:\n  - a\n");
+        let e = set_values(&source, "tags", &["ok", "c++"])
+            .expect_err("c++ is not a tag")
+            .to_string();
+        assert!(e.contains("'c++'"), "{e}");
+        assert!(!e.contains('\n'), "one line: {e}");
+    }
+
+    #[test]
+    fn value_on_a_list_key_points_at_values() {
+        let p = params("tags", Some("new"), None);
+        let e = Engine::apply_set_frontmatter(&engram(""), &p, "t", "tester", None, None)
+            .expect_err("value on tags")
+            .to_string();
+        assert!(
+            e.contains("tags is a list: pass the whole new list as values"),
+            "{e}"
+        );
+        // Neither given is the same mistake, not a removal.
+        let p = params("tags", None, None);
+        let e = Engine::apply_set_frontmatter(&engram(""), &p, "t", "tester", None, None)
+            .expect_err("nothing on tags")
+            .to_string();
+        assert!(e.contains("pass the whole new list as values"), "{e}");
+    }
+
+    #[test]
+    fn values_on_a_scalar_key_points_at_value() {
+        for key in ["status", "resource", "valid_to", "salience"] {
+            let e = set_values(&engram(""), key, &["x"])
+                .expect_err(key)
+                .to_string();
+            assert!(
+                e.contains(&format!("{key} takes one value: pass value")),
+                "{key}: {e}"
+            );
+        }
+        // An identity key is refused as unsettable, whatever form it came in.
+        let e = set_values(&engram(""), "title", &["x"])
+            .expect_err("title")
+            .to_string();
+        assert!(e.contains("cannot set 'title'"), "{e}");
     }
 }

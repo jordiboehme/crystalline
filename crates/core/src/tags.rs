@@ -35,6 +35,29 @@ pub fn is_lower_hyphen(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Fold a tag as an agent spelled it into the canonical lowercase-with-hyphens
+/// form: lowercased, every run of whitespace, underscores and hyphens turned
+/// into one hyphen, and hyphens trimmed from both ends. `None` when the result
+/// is not a tag [`is_lower_hyphen`] accepts (empty, or holding a character
+/// other than an ASCII letter, a digit or a separator), so the caller refuses
+/// it rather than writing a tag verify's E007 would flag.
+pub fn fold_tag(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_hyphen = false;
+    for c in raw.chars().flat_map(char::to_lowercase) {
+        if c.is_whitespace() || c == '_' || c == '-' {
+            pending_hyphen = true;
+            continue;
+        }
+        if pending_hyphen && !out.is_empty() {
+            out.push('-');
+        }
+        pending_hyphen = false;
+        out.push(c);
+    }
+    is_lower_hyphen(&out).then_some(out)
+}
+
 /// Rewrite every occurrence of tag `old` to `new` in one Engram's markdown
 /// `source`, string-surgically. Returns the rewritten source and the number of
 /// tag tokens changed, or `None` when the tag does not occur (nothing to write).
@@ -553,6 +576,29 @@ mod tests {
         assert!(!is_lower_hyphen("Foo"));
         assert!(!is_lower_hyphen("a_b"));
         assert!(!is_lower_hyphen("a b"));
+    }
+
+    #[test]
+    fn fold_tag_lowercases_and_turns_separator_runs_into_one_hyphen() {
+        assert_eq!(
+            fold_tag("Confluence Source").as_deref(),
+            Some("confluence-source")
+        );
+        assert_eq!(
+            fold_tag("confluence-source").as_deref(),
+            Some("confluence-source")
+        );
+        assert_eq!(fold_tag("  API_v2  ").as_deref(), Some("api-v2"));
+        assert_eq!(fold_tag("a \t_ b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a - b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("-edge-").as_deref(), Some("edge"));
+    }
+
+    #[test]
+    fn fold_tag_refuses_what_cannot_become_a_canonical_tag() {
+        for raw in ["", "   ", "_-_", "c++", "caf\u{e9}", "a/b", "#tag"] {
+            assert_eq!(fold_tag(raw), None, "{raw:?}");
+        }
     }
 
     #[test]

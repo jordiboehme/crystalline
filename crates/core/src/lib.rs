@@ -86,7 +86,7 @@ pub use schema::{
 };
 pub use similarity::{dice_coefficient, normalize};
 pub use skills::{SKILL_ASSETS, SkillAsset, skill};
-pub use tags::{is_lower_hyphen, retag};
+pub use tags::{fold_tag, is_lower_hyphen, retag};
 pub use temporal::{
     DATE_FIELDS, DateFieldError, VerifiedFieldError, normalize_temporal_fields, normalize_verified,
 };

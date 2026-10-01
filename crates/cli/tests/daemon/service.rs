@@ -2992,6 +2992,34 @@ fn edit_set_frontmatter_assigns_a_field_without_reading_stdin() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// `crystalline edit ... set_frontmatter --key tags --values a,b` replaces the
+/// tag list with the folded, comma-separated one.
+#[test]
+fn edit_set_frontmatter_sets_tags_from_a_comma_list() {
+    let env = Env::new("set-fm-tags");
+    env.setup_domain("eng");
+
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "tags",
+        "--values",
+        "api,Retry Policy",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter tags: {out}");
+    let text = std::fs::read_to_string(env.dir.join("kb-eng/seed.md")).unwrap();
+    assert!(
+        text.contains("tags:\n  - api\n  - retry-policy\n"),
+        "{text}"
+    );
+
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The CLI-daemon seam must stay format-independent. A daemon on the TOON
 /// response-format default still answers a CLI data command with structured
 /// engine JSON, because the command routes over the ctl `tool` command rather

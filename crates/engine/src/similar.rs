@@ -255,6 +255,7 @@ mod tests {
             content: Some(long("retry", 40)),
             key: Some("status".into()),
             value: Some("stable".into()),
+            values: None,
             section: None,
             find_text: None,
             expected_checksum: None,
