@@ -408,6 +408,10 @@ pub fn eligible_lines(facts: &[CandidateFacts<'_>]) -> BTreeMap<String, String> 
 /// text are never a pair: a line does not contradict itself, and a copied
 /// bullet would otherwise take a slot from two lines that differ.
 ///
+/// `vectors` must come from the embedding model the rules name (the one
+/// `floor` belongs to): a vector of another width reads as cosine 0, so the
+/// pair would count as scored with no rows.
+///
 /// `None` when a line of either side has no vector in `vectors` yet: the pair
 /// waits for it rather than reading as scored. Only the best `limit` are ever
 /// held, so a long engram costs time, never memory.
@@ -531,6 +535,12 @@ pub fn second_order_needed(first: &[f32], how: OrderAggregation) -> Vec<bool> {
 /// is stored when its first order reached [`CONTRADICTION_STORE_FLOOR`];
 /// under `Mean` when either order did. Both orders, the line similarity and
 /// the period hint are kept.
+///
+/// `None` when the answer is incomplete: `first` or `second` does not hold
+/// exactly one entry per line pair, or a second order that
+/// [`second_order_needed`] asks for is `None`. The caller then leaves the
+/// pair pending; an incomplete answer never reads as a scored pair with no
+/// rows. A second order that is not needed may be `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn line_rows(
     a: EngramId,
@@ -541,36 +551,43 @@ pub fn line_rows(
     first: &[f32],
     second: &[Option<f32>],
     how: OrderAggregation,
-) -> Vec<ContradictionRow> {
+) -> Option<Vec<ContradictionRow>> {
     // One score per order per line pair; a short answer would zip away the
-    // tail silently and store the pair as scored.
-    debug_assert_eq!(first.len(), lines.len());
-    debug_assert_eq!(second.len(), lines.len());
-    lines
-        .iter()
-        .zip(first)
-        .zip(second)
-        .filter_map(|((l, &ab), ba)| {
-            let ba = (*ba)?;
-            let stored = if how.skips_second_order_below_floor() {
-                ab >= CONTRADICTION_STORE_FLOOR
-            } else {
-                ab >= CONTRADICTION_STORE_FLOOR || ba >= CONTRADICTION_STORE_FLOOR
-            };
-            stored.then(|| ContradictionRow {
-                a,
-                b,
-                line_a: obs_a[l.ia].line,
-                line_b: obs_b[l.ib].line,
-                hash_a: l.hash_a.clone(),
-                hash_b: l.hash_b.clone(),
-                score_ab: ab,
-                score_ba: ba,
-                similarity: l.similarity,
-                period: names_period(&obs_a[l.ia].text) || names_period(&obs_b[l.ib].text),
+    // tail silently and store the pair as scored, in release builds too.
+    if first.len() != lines.len() || second.len() != lines.len() {
+        return None;
+    }
+    let needed = second_order_needed(first, how);
+    if needed.iter().zip(second).any(|(n, ba)| *n && ba.is_none()) {
+        return None;
+    }
+    Some(
+        lines
+            .iter()
+            .zip(first)
+            .zip(second)
+            .filter_map(|((l, &ab), ba)| {
+                let ba = (*ba)?;
+                let stored = if how.skips_second_order_below_floor() {
+                    ab >= CONTRADICTION_STORE_FLOOR
+                } else {
+                    ab >= CONTRADICTION_STORE_FLOOR || ba >= CONTRADICTION_STORE_FLOOR
+                };
+                stored.then(|| ContradictionRow {
+                    a,
+                    b,
+                    line_a: obs_a[l.ia].line,
+                    line_b: obs_b[l.ib].line,
+                    hash_a: l.hash_a.clone(),
+                    hash_b: l.hash_b.clone(),
+                    score_ab: ab,
+                    score_ba: ba,
+                    similarity: l.similarity,
+                    period: names_period(&obs_a[l.ia].text) || names_period(&obs_b[l.ib].text),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// The indices of `inputs` sorted by the byte length of premise plus
@@ -1255,7 +1272,8 @@ mod tests {
             &[0.9, 0.3],
             &[Some(0.4), None],
             OrderAggregation::Min,
-        );
+        )
+        .expect("the one needed second order was read");
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         assert_eq!((r.line_a, r.line_b), (1, 7));
@@ -1271,9 +1289,63 @@ mod tests {
             &[0.3, 0.2],
             &[Some(0.6), Some(0.1)],
             OrderAggregation::Mean,
-        );
+        )
+        .expect("both orders were read");
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].score_ab, rows[0].score_ba), (0.3, 0.6));
+    }
+
+    /// A reading order the aggregation needs and nobody read keeps the pair
+    /// pending: it must never come back as a clean pair with no rows.
+    #[test]
+    fn a_missing_needed_order_or_a_short_answer_keeps_the_pair_pending() {
+        let a = vec![
+            obs(1, "The build uses Node 18"),
+            obs(2, "Deploys run on Fridays"),
+        ];
+        let b = vec![obs(7, "The build uses Node 20")];
+        let lines = vec![kept(0, 0, &a, &b, 0.91), kept(1, 0, &a, &b, 0.87)];
+        let rows = |first: &[f32], second: &[Option<f32>], how| {
+            line_rows(EngramId(1), EngramId(2), &a, &b, &lines, first, second, how)
+        };
+        // Min, first order at the floor, second missing.
+        assert_eq!(
+            rows(&[0.5, 0.3], &[None, None], OrderAggregation::Min),
+            None
+        );
+        // Mean needs both orders of every line pair.
+        assert_eq!(
+            rows(&[0.3, 0.2], &[Some(0.6), None], OrderAggregation::Mean),
+            None
+        );
+        // A short answer in either order.
+        assert_eq!(
+            rows(&[0.9], &[Some(0.9), None], OrderAggregation::Min),
+            None
+        );
+        assert_eq!(rows(&[0.9, 0.3], &[Some(0.9)], OrderAggregation::Min), None);
+        assert_eq!(
+            rows(
+                &[0.9, 0.3, 0.1],
+                &[Some(0.9), None, None],
+                OrderAggregation::Min
+            ),
+            None
+        );
+        // Not needed and not read: the pair is scored, with the rows it earns.
+        assert_eq!(
+            rows(&[0.3, 0.2], &[None, None], OrderAggregation::Min),
+            Some(Vec::new())
+        );
+        let stored = rows(&[0.2, 0.7], &[None, Some(0.8)], OrderAggregation::Min)
+            .expect("the only needed order was read");
+        assert_eq!(stored.len(), 1);
+        assert_eq!((stored[0].line_a, stored[0].line_b), (2, 7));
+        // A NaN first order is never needed under Min.
+        assert_eq!(
+            rows(&[f32::NAN, 0.2], &[None, None], OrderAggregation::Min),
+            Some(Vec::new())
+        );
     }
 
     #[test]
